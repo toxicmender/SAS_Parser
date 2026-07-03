@@ -302,7 +302,7 @@ class SasCorpus(BaseModel):
 
     This is the entry point for multi-file batching.  Build it by chunking
     each file independently and passing the results to
-    :class:`~sas_chunker.batcher.MultiFileBatcher`.
+    :class:`~chunker.batcher.MultiFileBatcher`.
 
     Attributes
     ----------
@@ -432,7 +432,7 @@ class SasBatch(BaseModel):
 
 class SasBatchResult(BaseModel):
     """
-    Output of :class:`~sas_chunker.batcher.SasChunkBatcher` (single file).
+    Output of :class:`~chunker.batcher.SasChunkBatcher` (single file).
     """
 
     source_id: str | None = None
@@ -463,7 +463,7 @@ class SasBatchResult(BaseModel):
 
 class SasMultiBatchResult(BaseModel):
     """
-    Output of :class:`~sas_chunker.batcher.MultiFileBatcher`.
+    Output of :class:`~chunker.batcher.MultiFileBatcher`.
 
     Structurally identical to :class:`SasBatchResult` but carries the full
     set of source files and exposes cross-file batch statistics.

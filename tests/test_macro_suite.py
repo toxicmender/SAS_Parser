@@ -15,7 +15,7 @@ separate so neither interferes with the other:
      `unittest.TestSuite` at runtime, so the complete dedicated-macro
      surface can be executed in a single process via:
 
-         python sas_chunker/tests/test_macro_suite.py
+         python chunker/tests/test_macro_suite.py
 
      This does NOT import or re-expose those TestCase classes as
      module-level names here.  Pytest's default collection (no
@@ -23,7 +23,7 @@ separate so neither interferes with the other:
      pyproject.toml, so discovery uses stock settings) finds TestCase
      subclasses by scanning each collected module's *own* namespace — if
      this file re-exported the same classes by import, a plain
-     `pytest sas_chunker/tests/` run would discover and execute every one
+     `pytest chunker/tests/` run would discover and execute every one
      of them *twice* (once from its defining module, once from here).
      Building the suite dynamically via `unittest.TestLoader` at runtime
      sidesteps that entirely: pytest never sees a second class definition
@@ -122,16 +122,16 @@ their narrative context lives:
          alongside the file's other cross-file dataset-flow scenarios.
 
 Run everything macro-related, including the cross-cutting tests above:
-    pytest sas_chunker/tests/ -k "macro or Macro"
+    pytest chunker/tests/ -k "macro or Macro"
 
 Run only the four fully-dedicated files via pytest (each independently
 collected and run exactly once, no double-counting):
-    pytest sas_chunker/tests/test_macro_classification.py \\
-           sas_chunker/tests/test_macro_body_resolution.py \\
-           sas_chunker/tests/test_macro_variable_flow.py -v
+    pytest chunker/tests/test_macro_classification.py \\
+           chunker/tests/test_macro_body_resolution.py \\
+           chunker/tests/test_macro_variable_flow.py -v
 
 Run the dedicated suite as one process via this file's manifest:
-    python sas_chunker/tests/test_macro_suite.py
+    python chunker/tests/test_macro_suite.py
 """
 
 from __future__ import annotations
@@ -141,11 +141,11 @@ import sys
 import unittest
 
 _THIS_DIR = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(_THIS_DIR.parents[1]))  # makes `sas_chunker` importable
+sys.path.insert(0, str(_THIS_DIR.parents[1]))  # makes `chunker` importable
 sys.path.insert(0, str(_THIS_DIR))  # makes sibling test modules importable
-# (sas_chunker/tests/ has no __init__.py,
+# (chunker/tests/ has no __init__.py,
 # so these are plain top-level imports,
-# not a sas_chunker.tests sub-package)
+# not a chunker.tests sub-package)
 
 # Imported only as modules (never their TestCase classes), specifically to
 # avoid the pytest double-collection problem described above.

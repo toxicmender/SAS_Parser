@@ -17,7 +17,7 @@ header, or an explicit RUN/QUIT, closes the current block.
 
 Logging
 -------
-Logger: ``sas_chunker.chunker``
+Logger: ``chunker.chunker``
 
   Level    When emitted
   -------  ---------------------------------------------------------------

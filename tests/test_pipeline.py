@@ -1,5 +1,5 @@
 """
-Smoke tests for pipeline.py's integration with persistence.py.
+Smoke tests for pipeline.py's integration with memory.short_mem.py.
 
 These tests deliberately avoid any live LLM call: SasLLMPipeline is
 constructed with a FakeListChatModel so we can verify the actual thing
@@ -17,17 +17,18 @@ import pytest
 
 pyspark = pytest.importorskip("pyspark")
 
+from chunker.persistent_memory import DatabricksMemory
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from pyspark.sql import SparkSession
-from sas_chunker.models import (
+
+from chunker.models import (
     SasBatch,
     SasChunk,
     SasChunkKind,
     SasChunkMetadata,
 )
-from sas_chunker.persistent_memory import DatabricksMemory
-from sas_chunker.pipeline import (
+from chunker.pipeline import (
     SasLLMPipeline,
     _format_batch_message,
     _format_chunk_message,
@@ -42,7 +43,7 @@ from sas_chunker.pipeline import (
 def spark():
     s = (
         SparkSession.builder.master("local[1]")
-        .appName("sas_chunker_pipeline_tests")
+        .appName("chunker_pipeline_tests")
         .getOrCreate()
     )
     yield s

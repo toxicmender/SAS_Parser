@@ -33,7 +33,7 @@ Cross-file specifics
 
 Logging
 -------
-Logger: ``sas_chunker.batcher``
+Logger: ``chunker.batcher``
 
   Level    When emitted
   -------  ---------------------------------------------------------------
@@ -906,8 +906,8 @@ class MultiFileBatcher:
     -----
     ::
 
-        from sas_chunker import SasSemanticChunker, SasCorpus
-        from sas_chunker.batcher import MultiFileBatcher
+        from chunker import SasSemanticChunker, SasCorpus
+        from chunker.batcher import MultiFileBatcher
 
         chunker = SasSemanticChunker()
         corpus  = SasCorpus(file_results=[
@@ -956,7 +956,7 @@ class MultiFileBatcher:
             Ordered list of ``.sas`` file paths.  Order establishes the
             default execution sequence for resolving tie-breaks.
         chunker_kwargs
-            Forwarded to :class:`~sas_chunker.chunker.SasSemanticChunker`.
+            Forwarded to :class:`~chunker.chunker.SasSemanticChunker`.
         **batcher_kwargs
             Forwarded to :class:`MultiFileBatcher`.
         """

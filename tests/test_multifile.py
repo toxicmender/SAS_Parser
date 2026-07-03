@@ -32,14 +32,14 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
-from sas_chunker import (
+from chunker import (
     SasBatch,
     SasChunk,
     SasCorpus,
     SasMultiBatchResult,
     SasSemanticChunker,
 )
-from sas_chunker.batcher import MultiFileBatcher
+from chunker.batcher import MultiFileBatcher
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -112,7 +112,7 @@ class TestCorpusConstruction(unittest.TestCase):
         self.assertEqual(len(br.singletons), 0)
 
     def test_single_file_corpus_matches_single_batcher(self):
-        from sas_chunker import SasChunkBatcher
+        from chunker import SasChunkBatcher
 
         src = "data work.a; set mylib.raw; run;\nproc print data=work.a; run;\n"
         cr = _CHUNKER.chunk_text(src, source_id="f.sas")
@@ -340,7 +340,7 @@ class TestCrossFileMacroInvocation(unittest.TestCase):
         """Same macro name defined in two files — last definition wins; warning logged."""
         import logging
 
-        with self.assertLogs("sas_chunker.batcher", level="WARNING") as cm:
+        with self.assertLogs("chunker.batcher", level="WARNING") as cm:
             br = _batch(
                 "%macro helper; data work.v1; run; %mend;",
                 "%macro helper; data work.v2; run; %mend;",  # redefines

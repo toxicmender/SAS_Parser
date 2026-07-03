@@ -1,9 +1,9 @@
 """
-sas_chunker — SAS semantic chunker, dependency batcher, and LangChain pipeline.
+chunker — SAS semantic chunker, dependency batcher, and LangChain pipeline.
 
 Single-file workflow
 --------------------
-    from sas_chunker import SasSemanticChunker, SasChunkBatcher
+    from chunker import SasSemanticChunker, SasChunkBatcher
 
     chunker = SasSemanticChunker()
     result  = chunker.chunk_file("program.sas")
@@ -13,8 +13,8 @@ Single-file workflow
 
 Multi-file workflow
 -------------------
-    from sas_chunker import SasSemanticChunker, SasCorpus
-    from sas_chunker.batcher import MultiFileBatcher
+    from chunker import SasSemanticChunker, SasCorpus
+    from chunker.batcher import MultiFileBatcher
 
     chunker = SasSemanticChunker()
     corpus  = SasCorpus(file_results=[

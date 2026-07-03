@@ -1,6 +1,6 @@
 """
 pipeline.py — glue layer: SAS chunker/batcher -> LangChain chat-memory
-threads (persistence.py / persistent_memory.py) -> LLM.
+threads (memory.short_mem.py / persistent_memory.py) -> LLM.
 
 Architecture
 ------------
@@ -26,15 +26,15 @@ Architecture
                           v
                      LLM responses, one per batch/singleton
 
-persistence.py (persistent_memory.py) is never imported by chunker.py,
+memory.short_mem.py (persistent_memory.py) is never imported by chunker.py,
 models.py, or batcher.py, and this module never reaches into its
 internals beyond the public DatabricksMemory facade — pipeline.py is
 the sole integration point between the chunker/batcher stack and the
-memory backend, so persistence.py stays independently usable/testable.
+memory backend, so memory.short_mem.py stays independently usable/testable.
 
 Logging
 -------
-Logger name: ``sas_chunker.pipeline``
+Logger name: ``chunker.pipeline``
 
   Level    When emitted
   -------  ---------------------------------------------------------------
@@ -215,7 +215,7 @@ def _format_batch_message(
 class SasLLMPipeline:
     """
     End-to-end pipeline: SAS source(s) -> semantic chunks -> dependency
-    batches -> LLM responses, with a persistence.py-backed chat-memory
+    batches -> LLM responses, with a memory.short_mem.py-backed chat-memory
     thread per run.
 
     All batches and singleton chunks produced for a single ``run_file`` /
@@ -241,7 +241,7 @@ class SasLLMPipeline:
     include_options_chunks, include_comment_chunks : bool
         Forwarded to the batchers.
     memory : DatabricksMemory | None
-        Pre-built persistence facade. If omitted, one is constructed from
+        Pre-built memory.short_mem facade. If omitted, one is constructed from
         ``spark``/``delta_table``.
     spark : SparkSession | None
         Forwarded to :class:`DatabricksMemory` if ``memory`` is omitted.
@@ -332,7 +332,7 @@ class SasLLMPipeline:
             logger.info("SasLLMPipeline: no SparkSession provided, starting local one")
             spark = (
                 SparkSession.builder.master("local[*]")
-                .appName("sas_chunker_pipeline")
+                .appName("chunker_pipeline")
                 .getOrCreate()
             )
         return DatabricksMemory(spark=spark, table=delta_table)
@@ -400,7 +400,7 @@ class SasLLMPipeline:
         """
         Export the entire persistence-layer store (all threads + kv).
         Delegates straight to :meth:`DatabricksMemory.snapshot` — pipeline
-        does not re-implement export logic that persistence.py already owns.
+        does not re-implement export logic that memory.short_mem.py already owns.
         """
         logger.info("snapshot: delegating to DatabricksMemory")
         return self._memory.snapshot()

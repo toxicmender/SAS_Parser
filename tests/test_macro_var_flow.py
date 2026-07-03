@@ -26,14 +26,14 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
-from sas_chunker import (
+from chunker import (
     SasChunkBatcher,
     SasChunkKind,
     SasCorpus,
     SasSemanticChunker,
 )
-from sas_chunker.batcher import MultiFileBatcher
-from sas_chunker.chunker import (
+from chunker.batcher import MultiFileBatcher
+from chunker.chunker import (
     _clean_literal,
     _enumerate_numbered_range,
     _extract_call_execute_macros,

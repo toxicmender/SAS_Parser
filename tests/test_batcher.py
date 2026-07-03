@@ -16,9 +16,9 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
-from sas_chunker import SasSemanticChunker
-from sas_chunker.batcher import SasChunkBatcher
-from sas_chunker.models import SasBatch, SasChunk, SasChunkKind
+from chunker import SasSemanticChunker
+from chunker.batcher import SasChunkBatcher
+from chunker.models import SasBatch, SasChunk, SasChunkKind
 
 # ── helpers ────────────────────────────────────────────────────────────────
 

@@ -11,7 +11,7 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from sas_chunker import SasChunkKind, SasSemanticChunker
+from chunker import SasChunkKind, SasSemanticChunker
 
 
 class TestSasSemanticChunker(unittest.TestCase):
