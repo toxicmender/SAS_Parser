@@ -82,7 +82,7 @@ import pathlib
 import sys
 import unittest
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from chunker import SasChunkBatcher, SasChunkKind, SasSemanticChunker
 from chunker.chunker import (

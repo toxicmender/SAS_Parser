@@ -13,13 +13,18 @@ Requires: pyspark, langchain-core (FakeListChatModel).
 
 from __future__ import annotations
 
+import pathlib
+import sys
+
 import pytest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 pyspark = pytest.importorskip("pyspark")
 
-from chunker.persistent_memory import DatabricksMemory
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, HumanMessage
+from memory.short_mem import DatabricksMemory
 from pyspark.sql import SparkSession
 
 from chunker.models import (

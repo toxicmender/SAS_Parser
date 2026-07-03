@@ -55,6 +55,7 @@ from langchain_core.messages import BaseMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableConfig, RunnableLambda
 from langchain_core.runnables.history import RunnableWithMessageHistory
+from memory.short_mem import DatabricksMemory
 
 from .batcher import MultiFileBatcher, SasChunkBatcher
 from .chunker import SasSemanticChunker
@@ -64,7 +65,6 @@ from .models import (
     SasCorpus,
     SasDiagnostic,
 )
-from .persistent_memory import DatabricksMemory
 from .pipeline_constants import (
     _BATCH_CONTEXT_TEMPLATE,
     _BATCH_MEMBER_TEMPLATE,
@@ -140,7 +140,7 @@ def _format_chunk_message(
         consumed_macrovars=_fmt_list(m.consumes_macrovars),
         global_statement_keyword=m.global_statement_keyword or "none",
         control_flow_op=m.control_flow_op or "none",
-        sas_functions=_fmt_list(m.recognized_functions or m.referenced_sas_functions),
+        sas_functions=_fmt_list(m.recognized_functions),
         call_routines=_fmt_list(m.recognized_call_routines),
         automatic_vars=_fmt_list(m.referenced_automatic_vars),
         symput_hazard=(

@@ -258,6 +258,131 @@ _STANDARD_AUTOCALL_MACROS = frozenset(
     }
 )
 
+# ---------------------------------------------------------------------------
+# SAS DATA-step functions and CALL routines — SAS 9.4 Functions and CALL
+# Routines: Reference, Fifth Edition (the "Dictionary of Functions and CALL
+# Routines" chapter, and the "Functions and CALL Routines by Category"
+# summary table).  Every name below is a documented dictionary entry title
+# in that manual, lower-cased and with the ``CALL`` prefix stripped from
+# routine names.
+#
+# Purpose: recognising which built-ins a chunk uses gives an LLM translator
+# an at-a-glance inventory of the functions/routines it must map to the
+# target language — many of which (INTNX/INTCK date arithmetic, PUT/INPUT
+# format application, the PRX* regex family, CALL SYMPUT/EXECUTE, ...) have
+# no one-to-one equivalent and need explicit handling.  These are advisory
+# metadata only; they never gate chunking or batching decisions.
+# ---------------------------------------------------------------------------
+_SAS_FUNCTIONS = frozenset(
+    {
+        'abs', 'addr', 'addrlong', 'airy', 'allcomb', 'allperm', 'anyalnum', 'anyalpha',
+        'anycntrl', 'anydigit', 'anyfirst', 'anygraph', 'anylower', 'anyname', 'anyprint',
+        'anypunct', 'anyspace', 'anyupper', 'anyxdigit', 'arcos', 'arcosh', 'arsin', 'arsinh',
+        'artanh', 'atan', 'atan2', 'attrc', 'attrn', 'band', 'beta', 'betainv', 'blackclprc',
+        'blackptprc', 'blkshclprc', 'blkshptprc', 'blshift', 'bnot', 'bor', 'brshift', 'bxor',
+        'byte', 'cat', 'catq', 'cats', 'catt', 'catx', 'cdf', 'ceil', 'ceilz', 'cexist', 'char',
+        'choosec', 'choosen', 'cinv', 'close', 'cmiss', 'cnonct', 'coalesce', 'coalescec',
+        'collate', 'comb', 'compare', 'compbl', 'compfuzz', 'compged', 'complev', 'compound',
+        'compress', 'compsrv_oval', 'compsrv_unquote2', 'constant', 'convx', 'convxp', 'cos',
+        'cosh', 'cot', 'count', 'countc', 'countw', 'csc', 'css', 'cumipmt', 'cumprinc',
+        'curobs', 'cv', 'daccdb', 'daccdbsl', 'daccsl', 'daccsyd', 'dacctab', 'dairy', 'datdif',
+        'date', 'datejul', 'datepart', 'datetime', 'day', 'dclose', 'dcreate', 'depdb',
+        'depdbsl', 'depsl', 'depsyd', 'deptab', 'dequote', 'deviance', 'dhms', 'dif', 'digamma',
+        'dim', 'dinfo', 'distribution', 'divide', 'dnum', 'dopen', 'doptname', 'doptnum',
+        'dosubl', 'dread', 'dropnote', 'dsname', 'dsncatlgd', 'dur', 'durp', 'effrate',
+        'envlen', 'erf', 'erfc', 'euclid', 'exist', 'exp', 'fact', 'fappend', 'fclose', 'fcol',
+        'fcopy', 'fdelete', 'fetch', 'fetchobs', 'fexist', 'fget', 'fileexist', 'fileref',
+        'finance', 'find', 'findc', 'findw', 'finfo', 'finv', 'fipname', 'fipnamel', 'fipstate',
+        'first', 'floor', 'floorz', 'fmtinfo', 'fnonct', 'fnote', 'fopen', 'foptname',
+        'foptnum', 'fpoint', 'fpos', 'fput', 'fread', 'frewind', 'frlen', 'fsep', 'fuzz',
+        'fwrite', 'gaminv', 'gamma', 'garkhclprc', 'garkhptprc', 'gcd', 'geodist', 'geomean',
+        'geomeanz', 'getvarc', 'getvarn', 'git_branch_chkout', 'git_branch_delete',
+        'git_branch_merge', 'git_branch_new', 'git_clone', 'git_commit', 'git_commit_free',
+        'git_commit_get', 'git_commit_log', 'git_delete_repo', 'git_diff', 'git_diff_file_idx',
+        'git_diff_free', 'git_diff_get', 'git_diff_to_file', 'git_fetch', 'git_index_add',
+        'git_index_remove', 'git_init_repo', 'git_pull', 'git_push', 'git_rebase',
+        'git_rebase_op', 'git_reset', 'git_reset_file', 'git_stash', 'git_stash_apply',
+        'git_stash_drop', 'git_stash_pop', 'git_status', 'git_status_free', 'git_status_get',
+        'git_version', 'gitfn_clone', 'gitfn_co_branch', 'gitfn_commit', 'gitfn_commit_get',
+        'gitfn_commit_log', 'gitfn_commitfree', 'gitfn_del_branch', 'gitfn_diff',
+        'gitfn_diff_free', 'gitfn_diff_get', 'gitfn_diff_idx_f', 'gitfn_idx_add',
+        'gitfn_idx_remove', 'gitfn_mrg_branch', 'gitfn_new_branch', 'gitfn_pull', 'gitfn_push',
+        'gitfn_reset', 'gitfn_reset_file', 'gitfn_status', 'gitfn_status_get',
+        'gitfn_statusfree', 'gitfn_version', 'graycode', 'harmean', 'harmeanz', 'hashing',
+        'hashing_file', 'hashing_hmac', 'hashing_hmac_file', 'hashing_hmac_init',
+        'hashing_init', 'hashing_part', 'hashing_term', 'hbound', 'hms', 'holiday', 'holidayck',
+        'holidaycount', 'holidayname', 'holidaynx', 'holidayny', 'holidaytest', 'hour',
+        'htmldecode', 'htmlencode', 'ibessel', 'ifc', 'ifn', 'index', 'indexc', 'indexw',
+        'input', 'inputc', 'inputn', 'int', 'intcindex', 'intck', 'intcycle', 'intfit',
+        'intfmt', 'intget', 'intindex', 'intnest', 'intnx', 'intrr', 'intseas', 'intshift',
+        'inttest', 'intz', 'iorcmsg', 'ipmt', 'iqr', 'irr', 'jbessel', 'juldate', 'juldate7',
+        'kurtosis', 'lag', 'largest', 'lbound', 'lcm', 'lcomb', 'left', 'length', 'lengthc',
+        'lengthm', 'lengthn', 'lexcomb', 'lexcombi', 'lexperk', 'lexperm', 'lfact', 'lgamma',
+        'libname', 'libref', 'log', 'log10', 'log1px', 'log2', 'logbeta', 'logcdf', 'logistic',
+        'logpdf', 'logsdf', 'lowcase', 'lperm', 'lpnorm', 'mad', 'margrclprc', 'margrptprc',
+        'max', 'md5', 'mdy', 'mean', 'median', 'min', 'minute', 'missing', 'mod', 'module',
+        'modulec', 'modulen', 'modz', 'month', 'mopen', 'mort', 'msplint', 'mvalid', 'n',
+        'netpv', 'nliteral', 'nmiss', 'nomrate', 'normal', 'notalnum', 'notalpha', 'notcntrl',
+        'notdigit', 'note', 'notfirst', 'notgraph', 'notlower', 'notname', 'notprint',
+        'notpunct', 'notspace', 'notupper', 'notxdigit', 'npv', 'nvalid', 'nwkdom', 'open',
+        'ordinal', 'pctl', 'pdf', 'peek', 'peekc', 'peekclong', 'peeklong', 'perm', 'pmt',
+        'point', 'poisson', 'ppmt', 'probbeta', 'probbnml', 'probbnrm', 'probchi', 'probf',
+        'probgam', 'probhypr', 'probit', 'probmc', 'probmed', 'probnegb', 'probnorm', 'probt',
+        'propcase', 'prxchange', 'prxmatch', 'prxparen', 'prxparse', 'prxposn', 'ptrlongadd',
+        'put', 'putc', 'putn', 'pvp', 'qtr', 'quantile', 'quote', 'ranbin', 'rancau', 'rand',
+        'ranexp', 'rangam', 'range', 'rank', 'rannor', 'ranpoi', 'rantbl', 'rantri', 'ranuni',
+        'repeat', 'resolve', 'reverse', 'rewind', 'right', 'rms', 'round', 'rounde', 'roundz',
+        'saving', 'savings', 'scan', 'sdf', 'sec', 'second', 'sha256', 'sha256hex',
+        'sha256hmachex', 'sign', 'sin', 'sinh', 'skewness', 'sleep', 'smallest', 'soapweb',
+        'soapwebmeta', 'soapwipservice', 'soapwipsrs', 'soapws', 'soapwsmeta', 'sort',
+        'soundex', 'spedis', 'sqrt', 'squantile', 'std', 'stderr', 'stfips', 'stname',
+        'stnamel', 'strip', 'subpad', 'substr', 'substrn', 'sum', 'sumabs', 'symexist',
+        'symget', 'symglobl', 'symlocal', 'sysget', 'sysparm', 'sysprocessid', 'sysprocessname',
+        'sysprod', 'system', 'tan', 'tanh', 'time', 'timepart', 'timevalue', 'tinv', 'tnonct',
+        'today', 'translate', 'transtrn', 'tranwrd', 'trigamma', 'trim', 'trimn', 'trunc',
+        'typeof', 'tzoneid', 'tzonename', 'tzoneoff', 'tzones2u', 'tzoneu2s', 'uniform',
+        'upcase', 'urldecode', 'urlencode', 'uss', 'uuidgen', 'var', 'varfmt', 'varinfmt',
+        'varlabel', 'varlen', 'varname', 'varnum', 'varray', 'varrayx', 'vartype', 'verify',
+        'vformat', 'vformatd', 'vformatdx', 'vformatn', 'vformatnx', 'vformatw', 'vformatwx',
+        'vformatx', 'vinarray', 'vinarrayx', 'vinformat', 'vinformatd', 'vinformatdx',
+        'vinformatn', 'vinformatnx', 'vinformatw', 'vinformatwx', 'vinformatx', 'vlabel',
+        'vlabelx', 'vlength', 'vlengthx', 'vname', 'vnamex', 'vtype', 'vtypex', 'vvalue',
+        'vvaluex', 'week', 'weekday', 'whichc', 'whichn', 'year', 'yieldp', 'yrdif', 'yyq',
+        'zipcity', 'zipcitydistance', 'zipfips', 'zipname', 'zipnamel', 'zipstate'
+    }
+)
+
+_SAS_CALL_ROUTINES = frozenset(
+    {
+        'allcomb', 'allcombi', 'allperm', 'cats', 'catt', 'catx', 'compcost', 'execute',
+        'graycode', 'is8601_convert', 'label', 'lexcomb', 'lexcombi', 'lexperk', 'lexperm',
+        'logistic', 'missing', 'module', 'poke', 'pokelong', 'prxchange', 'prxdebug', 'prxfree',
+        'prxnext', 'prxposn', 'prxsubstr', 'ranbin', 'rancau', 'rancomb', 'ranexp', 'rangam',
+        'ranperk', 'ranperm', 'ranpoi', 'rantbl', 'rantri', 'ranuni', 'scan', 'set', 'sleep',
+        'softmax', 'sort', 'sortc', 'sortn', 'stdize', 'stream', 'streaminit', 'streamrewind',
+        'symput', 'symputx', 'system', 'tanh', 'tso', 'vname', 'vnext'
+    }
+)
+
+# A function call is ``name(`` (optional whitespace before the paren); a CALL
+# routine is ``CALL name`` followed by a word boundary.  Both alternations are
+# built longest-name-first so a shorter name that prefixes a longer one can't
+# short-circuit the match, mirroring _RESERVED_WORDS_PATTERN's construction.
+_SAS_FUNCTIONS_PATTERN = "|".join(
+    re.escape(w) for w in sorted(_SAS_FUNCTIONS, key=len, reverse=True)
+)
+_SAS_CALL_ROUTINES_PATTERN = "|".join(
+    re.escape(w) for w in sorted(_SAS_CALL_ROUTINES, key=len, reverse=True)
+)
+_SAS_FUNCTION_CALL_RE = re.compile(
+    rf"\b({_SAS_FUNCTIONS_PATTERN})\b\s*\(",
+    re.IGNORECASE,
+)
+_SAS_CALL_ROUTINE_RE = re.compile(
+    rf"\bcall\s+({_SAS_CALL_ROUTINES_PATTERN})\b",
+    re.IGNORECASE,
+)
+
 _MACRO_CALL_RE = re.compile(
     rf"%(?!(?:{_RESERVED_WORDS_PATTERN})\b)([A-Za-z_]\w*)",
     re.IGNORECASE,
@@ -1022,6 +1147,28 @@ def _nid(value: str) -> str:
 # these four, so a leading match is always unambiguous.
 _MACRO_VAR_OP_RE = re.compile(r"%\s*(let|global|local|put)\b", re.IGNORECASE)
 
+# Leading statement keyword of a GLOBAL_STATEMENT chunk.  Matched against the
+# start of the chunk's sanitised text; by construction (see _classify) a
+# GLOBAL_STATEMENT always begins with one of these.  ``title``/``footnote``
+# capture without their optional occurrence digit (title2 -> title), which
+# the caller lower-cases.
+_GLOBAL_STMT_KW_RE = re.compile(
+    r"%?\s*(let|put|global|local|libname|filename|title|footnote|ods)\b",
+    re.IGNORECASE,
+)
+
+# ``%LET name`` target — the single macro variable a %LET declares.  The
+# optional leading ``&`` covers indirect (double-ampersand-resolved) targets
+# such as ``%let &&prefix&i = ...`` where the outer name is still literal.
+_LET_TARGET_RE = re.compile(r"%\s*let\s+&*([A-Za-z_]\w*)", re.IGNORECASE)
+
+# ``%GLOBAL``/``%LOCAL`` declaration list — captures everything up to the
+# terminating semicolon; the caller splits the list on whitespace/commas.
+_GLOBAL_LOCAL_DECL_RE = re.compile(
+    r"%\s*(?:global|local)\s+([^;]+?)\s*;",
+    re.IGNORECASE,
+)
+
 # Identifies which control-flow keyword begins a MACRO_CONTROL_FLOW chunk
 # (ROADMAP Phase 3).  Mirrors _MACRO_VAR_OP_RE exactly — matched against
 # the start of the chunk's sanitised text, which by construction (see
@@ -1350,10 +1497,14 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
 
     # ── macro-variable operation (%let / %global / %local / %put) ──────────
     var_op: str | None = None
+    global_stmt_kw: str | None = None
     if kind == SasChunkKind.GLOBAL_STATEMENT:
         op_m = _MACRO_VAR_OP_RE.match(mt.lstrip())
         if op_m:
             var_op = op_m.group(1).lower()
+        kw_m = _GLOBAL_STMT_KW_RE.match(mt.lstrip())
+        if kw_m:
+            global_stmt_kw = kw_m.group(1).lower()
 
     # ── control-flow operation (ROADMAP Phase 3) ────────────────────────────
     # Which specific keyword (%if/%else/%do/%end/%return/%goto/%abort) this
@@ -1438,6 +1589,40 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
         }
     )
 
+    # ── macro-language-level declarations and references ────────────────────
+    # declared_macro_vars: names introduced by %LET and by %GLOBAL/%LOCAL
+    # declaration lists.  Scanned on `cf` so %LET targets inside quoted text
+    # aren't a concern (these statements are never quoted).
+    declared: list[str] = [m.group(1).lower() for m in _LET_TARGET_RE.finditer(cf)]
+    for m in _GLOBAL_LOCAL_DECL_RE.finditer(cf):
+        for name in re.split(r"[,\s]+", m.group(1).strip()):
+            name = name.lstrip("&").rstrip(".")
+            if re.fullmatch(r"[A-Za-z_]\w*", name):
+                declared.append(name.lower())
+    declared_macro_vars = sorted(set(declared))
+
+    # referenced_macro_vars: the complete set of "&name" references (automatic
+    # variables included), the unfiltered counterpart to consumes_macrovars.
+    referenced_macro_vars = sorted(
+        {m.group(1).lower() for m in _VAR_REF_RE.finditer(cf)}
+    )
+
+    # ── recognised SAS functions and CALL routines ──────────────────────────
+    # Scanned on `mt` (string literals blanked) so a function-like token inside
+    # a quoted string isn't mistaken for a real call.
+    recognized_functions = sorted(
+        {m.group(1).lower() for m in _SAS_FUNCTION_CALL_RE.finditer(mt)}
+    )
+    recognized_call_routines = sorted(
+        {m.group(1).lower() for m in _SAS_CALL_ROUTINE_RE.finditer(mt)}
+    )
+    # A ``CALL name(...)`` invocation also textually matches the function-call
+    # pattern (``name(``); drop those so a routine isn't double-reported as a
+    # function of the same name.
+    recognized_functions = [
+        f for f in recognized_functions if f not in recognized_call_routines
+    ]
+
     return SasChunkMetadata(
         step_name=_nid(dm.group(1)) if dm else None,
         proc_name=_nid(pm.group(1)) if pm else None,
@@ -1451,7 +1636,12 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
         options=options,
         has_unclosed_block=(kind == SasChunkKind.UNKNOWN_BLOCK),
         macro_var_op=var_op,
+        global_statement_keyword=global_stmt_kw,
         referenced_automatic_vars=auto_vars,
+        declared_macro_vars=declared_macro_vars,
+        referenced_macro_vars=referenced_macro_vars,
+        recognized_functions=recognized_functions,
+        recognized_call_routines=recognized_call_routines,
         control_flow_op=control_flow_op,
         contains_abort=has_abort,
         contains_computed_goto=has_computed_goto,
@@ -1488,9 +1678,21 @@ def _merge_meta(parent: SasChunkMetadata, child: SasChunkMetadata) -> SasChunkMe
         options=ml(parent.options, child.options),
         has_unclosed_block=parent.has_unclosed_block or child.has_unclosed_block,
         macro_var_op=child.macro_var_op or parent.macro_var_op,
+        global_statement_keyword=child.global_statement_keyword
+        or parent.global_statement_keyword,
         referenced_automatic_vars=ml(
             parent.referenced_automatic_vars,
             child.referenced_automatic_vars,
+        ),
+        declared_macro_vars=ml(parent.declared_macro_vars, child.declared_macro_vars),
+        referenced_macro_vars=ml(
+            parent.referenced_macro_vars, child.referenced_macro_vars
+        ),
+        recognized_functions=ml(
+            parent.recognized_functions, child.recognized_functions
+        ),
+        recognized_call_routines=ml(
+            parent.recognized_call_routines, child.recognized_call_routines
         ),
         input_datasets=ml(parent.input_datasets, child.input_datasets),
         output_datasets=ml(parent.output_datasets, child.output_datasets),

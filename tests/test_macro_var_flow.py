@@ -15,7 +15,7 @@ Covers four constructs, all grounded in SAS Macro Language: Reference
 5. End-to-end macro_var_flow batching in batcher.py, including the new
    produces_macrovar index and SasBatch.produced_macrovars/required_macrovars.
 
-Run:  python -m pytest tests/test_macro_variable_flow.py -v
+Run:  python -m pytest tests/test_macro_var_flow.py -v
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ import pathlib
 import sys
 import unittest
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from chunker import (
     SasChunkBatcher,

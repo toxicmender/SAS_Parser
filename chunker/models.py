@@ -115,6 +115,16 @@ class SasChunkMetadata(BaseModel):
     # four — including the other GLOBAL_STATEMENT-classified statements.
     macro_var_op: str | None = None
 
+    # The leading statement keyword of a GLOBAL_STATEMENT chunk, normalised
+    # to lowercase with any trailing occurrence digits removed (``title2`` ->
+    # ``title``).  One of ``let``/``put``/``global``/``local`` (the four
+    # macro-variable statements, mirroring ``macro_var_op``) or one of the
+    # non-macro global statements the chunker folds into GLOBAL_STATEMENT:
+    # ``libname``/``filename``/``title``/``footnote``/``ods``.  ``None`` for
+    # every chunk whose kind is not GLOBAL_STATEMENT.  Gives a consumer the
+    # specific statement type without having to re-parse the chunk text.
+    global_statement_keyword: str | None = None
+
     # ── automatic (system) macro variable references ────────────────────────
     # Every automatic macro variable SAS itself provides (&sysdate, &syslast,
     # &sysparm, ...) begins with the reserved "SYS" prefix (SAS Macro
@@ -126,6 +136,39 @@ class SasChunkMetadata(BaseModel):
     # a future macro-variable dependency graph (see ROADMAP Phase 2) exclude
     # them from "unresolved external variable" treatment for free.
     referenced_automatic_vars: list[str] = Field(default_factory=list)
+
+    # ── macro-variable declarations and references (macro-language level) ────
+    #
+    # These two fields describe macro variables at the *source-text* level —
+    # what this chunk explicitly declares, and every ``&name`` it references —
+    # and are deliberately distinct from the Phase-2 producer/consumer edges
+    # below (``produces_macrovars`` / ``consumes_macrovars``), which track the
+    # narrower CALL SYMPUT/SYMPUTX and PROC SQL INTO data-flow used by the
+    # batcher.
+    #
+    # ``declared_macro_vars`` — names introduced by ``%LET name = ...`` and by
+    # ``%GLOBAL``/``%LOCAL`` declaration lists.  These are the macro variables
+    # this chunk brings into existence via the macro language itself (as
+    # opposed to the DATA-step side effects tracked in ``produces_macrovars``).
+    declared_macro_vars: list[str] = Field(default_factory=list)
+
+    # ``referenced_macro_vars`` — every ``&name`` reference in this chunk's
+    # text, including automatic (``&sys*``) variables.  This is the complete
+    # reference set; the filtered, dependency-oriented view lives in
+    # ``consumes_macrovars`` (automatics and own-parameters excluded).
+    referenced_macro_vars: list[str] = Field(default_factory=list)
+
+    # ── recognised SAS functions and CALL routines ──────────────────────────
+    #
+    # Names of DATA-step functions (called as ``name(...)``) and CALL routines
+    # (invoked as ``CALL name(...)``) recognised in this chunk against the
+    # published SAS 9.4 Functions and CALL Routines: Reference dictionary
+    # (see ``chunker._SAS_FUNCTIONS`` / ``_SAS_CALL_ROUTINES``).  These give an
+    # LLM translator an at-a-glance inventory of the built-ins a chunk relies
+    # on — several of which have no direct one-to-one target-language
+    # equivalent and need explicit handling.
+    recognized_functions: list[str] = Field(default_factory=list)
+    recognized_call_routines: list[str] = Field(default_factory=list)
 
     # ── directed I/O edges — used by the batcher ─────────────────────────────
     input_datasets: list[str] = Field(default_factory=list)

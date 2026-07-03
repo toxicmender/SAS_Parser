@@ -29,7 +29,7 @@ import pathlib
 import sys
 import unittest
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from chunker import SasChunkBatcher, SasCorpus, SasSemanticChunker
 from chunker.batcher import MultiFileBatcher, _parse_call_args

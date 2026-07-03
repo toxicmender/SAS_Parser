@@ -75,7 +75,7 @@ test_macro_body_resolution.py  (mixed literal/parameterised macro-body
                                          never silently mis-resolved
   TestNewFieldsSerialisable           - JSON round-trip of body-IO fields
 
-test_macro_variable_flow.py    (Phase 2 — CALL SYMPUT/SYMPUTX, CALL
+test_macro_var_flow.py         (Phase 2 — CALL SYMPUT/SYMPUTX, CALL
                                  EXECUTE, PROC SQL INTO, macro_var_flow)
   TestSplitTopLevel / TestCleanLiteral / TestEnumerateNumberedRange
                                       - low-level parser unit tests
@@ -128,7 +128,7 @@ Run only the four fully-dedicated files via pytest (each independently
 collected and run exactly once, no double-counting):
     pytest chunker/tests/test_macro_classification.py \\
            chunker/tests/test_macro_body_resolution.py \\
-           chunker/tests/test_macro_variable_flow.py -v
+           chunker/tests/test_macro_var_flow.py -v
 
 Run the dedicated suite as one process via this file's manifest:
     python chunker/tests/test_macro_suite.py
@@ -151,7 +151,7 @@ sys.path.insert(0, str(_THIS_DIR))  # makes sibling test modules importable
 # avoid the pytest double-collection problem described above.
 import test_macro_body_resolution as _body_resolution
 import test_macro_classification as _classification
-import test_macro_variable_flow as _variable_flow
+import test_macro_var_flow as _variable_flow
 
 _DEDICATED_MACRO_MODULES = (
     _classification,
