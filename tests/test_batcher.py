@@ -18,7 +18,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 from chunker import SasSemanticChunker
 from chunker.batcher import SasChunkBatcher
-from chunker.models import SasBatch, SasChunk, SasChunkKind
+from chunker.models import SasBatch, SasChunkKind
 
 # ── helpers ────────────────────────────────────────────────────────────────
 

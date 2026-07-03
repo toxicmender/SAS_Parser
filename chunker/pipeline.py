@@ -267,7 +267,6 @@ class SasLLMPipeline:
         delta_table: str | None = None,
         llm: Any | None = None,
     ) -> None:
-    ) -> None:
         logger.info(
             "SasLLMPipeline.__init__  model=%s  output_language=%s  window_k=%s",
             model,

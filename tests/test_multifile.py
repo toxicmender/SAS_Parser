@@ -34,7 +34,6 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 from chunker import (
     SasBatch,
-    SasChunk,
     SasCorpus,
     SasMultiBatchResult,
     SasSemanticChunker,
@@ -338,7 +337,6 @@ class TestCrossFileMacroInvocation(unittest.TestCase):
 
     def test_macro_redefinition_warning_cross_file(self):
         """Same macro name defined in two files — last definition wins; warning logged."""
-        import logging
 
         with self.assertLogs("chunker.batcher", level="WARNING") as cm:
             br = _batch(
