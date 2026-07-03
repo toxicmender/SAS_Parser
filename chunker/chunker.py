@@ -1,0 +1,1949 @@
+"""
+chunker.py — dependency-light semantic chunker for Base SAS source files.
+
+Recognised constructs (Base SAS Programming Reference)
+-------------------------------------------------------
+DATA step, PROC step, %MACRO/%MEND, %INCLUDE, LIBNAME/FILENAME/TITLE/FOOTNOTE,
+OPTIONS, ODS, FORMAT/INFORMAT standalone, %LET/%PUT/%GLOBAL/%LOCAL, %macro_call.
+
+All imports are stdlib + pydantic (via local models.py).
+
+Key design rule — block collection
+-----------------------------------
+FORMAT, LABEL, OPTIONS, LIBNAME, ODS, and other statement keywords that appear
+*inside* a DATA or PROC block body are legal SAS statements within that block
+and must NOT terminate the block early.  Only a new DATA, PROC, or %MACRO
+header, or an explicit RUN/QUIT, closes the current block.
+
+Logging
+-------
+Logger: ``sas_chunker.chunker``
+
+  Level    When emitted
+  -------  ---------------------------------------------------------------
+  DEBUG    Per-unit / per-region decisions (very verbose; off in prod)
+  INFO     File-level start/finish, oversized-split decisions, elapsed time
+  WARNING  Unclosed blocks, unterminated statements, unrecognised regions
+  ERROR    File-not-found (logged then re-raised)
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import time
+from bisect import bisect_right
+from dataclasses import dataclass
+from pathlib import Path
+
+from .models import (
+    SasChunk,
+    SasChunkKind,
+    SasChunkMetadata,
+    SasChunkResult,
+    SasDiagnostic,
+    SasDiagnosticSeverity,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Regex catalogue (mirrors the Reference Sheet grammar)
+# ---------------------------------------------------------------------------
+
+_DATASET_RE = re.compile(
+    r"\b(?:data|set|merge|update|modify)\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    re.IGNORECASE,
+)
+_DATA_OPT_RE = re.compile(
+    r"\bdata\s*=\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    re.IGNORECASE,
+)
+_LIBREF_RE = re.compile(r"\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b")
+_MACRO_DEF_RE = re.compile(r"%\s*macro\s+([A-Za-z_]\w*)", re.IGNORECASE)
+
+# ---------------------------------------------------------------------------
+# Reserved words — SAS Macro Language: Reference, Appendix 1
+# (Macro Facility Word Rules / Reserved Words, pp. 495-496)
+#
+# None of these words can validly be a user-defined macro name.  Any
+# "%word" appearing in source text where word is one of these is always a
+# macro-language keyword/statement/function, never an invocation of a
+# corpus-local macro — so every regex that detects "is this a macro call"
+# must exclude all of them, not just the small hand-picked subset that
+# earlier testing happened to surface.
+#
+# A handful of these (CMS, TSO — mainframe operating-environment words;
+# EDIT, SAVE, PAUSE, OPEN, CLOSE, CLEAR, ACT, ACTIVATE, DEACT, DEL, DELETE,
+# DMIDSPLY, DMISPLIT, COMANDR, METASYM, LIST, LISTM, WINDOW, DISPLAY,
+# INPUT, INC, INFILE, FILE, ON — interactive Display-Manager command
+# words) are essentially dead in modern batch/Compute-Server SAS, but are
+# kept in the set for correctness since excluding them costs nothing and
+# a SAS program could legally (if unusually) attempt to invoke one.
+# ---------------------------------------------------------------------------
+_RESERVED_WORDS = frozenset(
+    {
+        "abend",
+        "abort",
+        "act",
+        "activate",
+        "bquote",
+        "by",
+        "clear",
+        "close",
+        "cms",
+        "comandr",
+        "copy",
+        "deact",
+        "del",
+        "delete",
+        "display",
+        "dmidsply",
+        "dmisplit",
+        "do",
+        "edit",
+        "else",
+        "end",
+        "eval",
+        "file",
+        "global",
+        "go",
+        "goto",
+        "if",
+        "inc",
+        "include",
+        "index",
+        "infile",
+        "input",
+        "kcmpres",
+        "kindex",
+        "kleft",
+        "klength",
+        "kscan",
+        "ksubstr",
+        "ktrim",
+        "kupcase",
+        "length",
+        "let",
+        "list",
+        "listm",
+        "local",
+        "macro",
+        "mend",
+        "metasym",
+        "nrbquote",
+        "nrquote",
+        "nrstr",
+        "on",
+        "open",
+        "pause",
+        "put",
+        "qkcmpres",
+        "qkleft",
+        "qkscan",
+        "qksubstr",
+        "qktrim",
+        "qkupcase",
+        "qscan",
+        "qsubstr",
+        "qsysfunc",
+        "quote",
+        "qupcase",
+        "resolve",
+        "return",
+        "run",
+        "save",
+        "scan",
+        "stop",
+        "str",
+        "substr",
+        "superq",
+        "symdel",
+        "symexist",
+        "symglobl",
+        "symlocal",
+        "syscall",
+        "sysevalf",
+        "sysexec",
+        "sysfunc",
+        "sysget",
+        "sysrput",
+        "then",
+        "to",
+        "tso",
+        "unquote",
+        "unstr",
+        "until",
+        "upcase",
+        "while",
+        "window",
+    }
+)
+
+# ---------------------------------------------------------------------------
+# Additional macro functions — SAS Macro Language: Reference, Ch. 12
+# Table 12.3 ("Macro Functions"), pp. 189-210 — ROADMAP Phase 4 (E10).
+#
+# These five are genuine macro functions per Ch. 12's own function table,
+# but are *not* present in Appendix 1's reserved-word list (verified: all
+# other 22 of Table 12.3's 27 function names ARE already covered by
+# _RESERVED_WORDS above, purely as a side effect of Appendix 1 happening to
+# overlap heavily with the function list — confirmed by exhaustive testing,
+# not by assumption). Kept as a separate, clearly-sourced constant rather
+# than folded into _RESERVED_WORDS itself, so that constant's identity
+# ("Appendix 1, verbatim — 94 words") stays exact and independently
+# citable/verifiable, while the *exclusion mechanism* below still covers
+# the complete, real macro-function set Ch. 12 documents.
+# ---------------------------------------------------------------------------
+_ADDITIONAL_MACRO_FUNCTION_WORDS = frozenset(
+    {
+        "sysmacexec",
+        "sysmacexist",
+        "sysmexecdepth",
+        "sysmexecname",
+        "sysprod",
+    }
+)
+
+# Built once from the union of both reserved-word sources — longest words
+# first so the alternation doesn't short-circuit on a shorter word that is
+# itself a prefix of a longer one.
+_RESERVED_WORDS_PATTERN = "|".join(
+    re.escape(w)
+    for w in sorted(
+        _RESERVED_WORDS | _ADDITIONAL_MACRO_FUNCTION_WORDS,
+        key=len,
+        reverse=True,
+    )
+)
+
+# ---------------------------------------------------------------------------
+# Standard SAS-provided autocall macros — SAS Macro Language: Reference,
+# Ch. 12 Table 12.13 ("Selected Autocall Macros Provided with SAS
+# Software") — ROADMAP Phase 5 (F2b).
+#
+# Unlike the reserved-word sets above, these ARE genuine, callable macro
+# names — %left(&var), %trim(&var), etc. are real macro invocations, and
+# must still be detected as such by _MACRO_CALL_RE/_MACRO_INVOKE_RE (so
+# this set is deliberately NOT folded into _RESERVED_WORDS_PATTERN). The
+# distinction this set exists to make is narrower: these ten ship with
+# every SAS installation, so a call to one of them will *always* be
+# "unresolved" against any user-supplied corpus, even though it's
+# perfectly normal, ubiquitous SAS code — not a missing dependency the
+# user needs to go find. batcher.py uses this set to exclude these names
+# from a batch's `required_macros` (the "you're missing this macro's
+# definition" list) while still reporting them separately via
+# `SasBatch.standard_autocall_macros`, so the information isn't silently
+# dropped — mirrors the existing automatic-macro-variable pattern from
+# Phase 1 exactly (tracked separately, never treated as "missing").
+#
+# Full SASAUTOS directory scanning (F2, resolving *any* externally-defined
+# macro by probing `<dir>/<name>.sas` on a search path) and SASMSTORE
+# compiled-macro resolution (F3) remain explicitly deferred — see
+# MACRO_PARSING_ROADMAP.md Phase 5 for the reasoning.
+# ---------------------------------------------------------------------------
+_STANDARD_AUTOCALL_MACROS = frozenset(
+    {
+        "cmpres",
+        "qcmpres",
+        "left",
+        "qleft",
+        "trim",
+        "qtrim",
+        "verify",
+        "compstor",
+        "datatyp",
+        "sysrc",
+    }
+)
+
+_MACRO_CALL_RE = re.compile(
+    rf"%(?!(?:{_RESERVED_WORDS_PATTERN})\b)([A-Za-z_]\w*)",
+    re.IGNORECASE,
+)
+_INCLUDE_RE = re.compile(r"%\s*include\s+([^;]+)", re.IGNORECASE)
+_OPTIONS_RE = re.compile(r"\boptions\s+([^;]+)", re.IGNORECASE)
+_LABEL_RE = re.compile(r"\blabel\s+([A-Za-z_]\w*)\s*=", re.IGNORECASE)
+_PROC_RE = re.compile(r"\bproc\s+([A-Za-z_]\w*)", re.IGNORECASE)
+_DATA_RE = re.compile(
+    r"\bdata\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Internal parse primitives
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Unit:
+    start: int
+    end: int
+    text: str
+    is_comment: bool = False
+    terminated: bool = True
+    unclosed_comment: bool = False
+
+
+@dataclass(frozen=True)
+class _Region:
+    kind: SasChunkKind
+    start: int
+    end: int
+    units: list[_Unit]
+    unclosed: bool = False
+
+    @property
+    def text(self) -> str:
+        return "".join(u.text for u in self.units)
+
+
+# ---------------------------------------------------------------------------
+# Block-boundary classifier
+#
+# IMPORTANT: only these three kinds open a new top-level block and therefore
+# close whichever block is currently being collected.  Everything else
+# (FORMAT, OPTIONS, GLOBAL_STATEMENT, etc.) is a *statement inside* the
+# current block and must be collected, not treated as a boundary.
+# ---------------------------------------------------------------------------
+
+_BLOCK_OPENERS = frozenset(
+    {
+        SasChunkKind.DATA_STEP,
+        SasChunkKind.PROC_STEP,
+        SasChunkKind.MACRO_DEFINITION,
+    }
+)
+
+
+def _classify(stripped: str) -> SasChunkKind | None:
+    """
+    Map a single normalised SAS statement to its :class:`SasChunkKind`.
+
+    Returns ``None`` for unrecognised statements (they accumulate into
+    ``UNKNOWN_STATEMENT_GROUP`` / ``UNKNOWN_BLOCK``).
+
+    This function is called both at the top level (to decide *which* block
+    type to open) and inside ``_collect_block`` (only to detect the three
+    block-opener kinds that close the current block).  All other statement
+    types are transparently collected as block body statements.
+    """
+    n = _norm(stripped)
+    if not n:
+        return None
+    if re.match(r"data\b", n, re.IGNORECASE):
+        return SasChunkKind.DATA_STEP
+    if re.match(r"proc\b", n, re.IGNORECASE):
+        return SasChunkKind.PROC_STEP
+    if re.match(r"%\s*macro\b", n, re.IGNORECASE):
+        return SasChunkKind.MACRO_DEFINITION
+    if re.match(r"%\s*include\b", n, re.IGNORECASE):
+        return SasChunkKind.INCLUDE
+    if re.match(r"%\s*(?:let|put|global|local)\b", n, re.IGNORECASE):
+        return SasChunkKind.GLOBAL_STATEMENT
+    if re.match(r"%\s*(?:if|else|do|end|return|goto|abort)\b", n, re.IGNORECASE):
+        return SasChunkKind.MACRO_CONTROL_FLOW
+    if re.match(r"%[A-Za-z_]\w*\b", n):
+        return SasChunkKind.MACRO_CALL
+    if re.match(r"options\b", n, re.IGNORECASE):
+        return SasChunkKind.OPTIONS
+    if re.match(r"(?:libname|filename|title\d*|footnote\d*)\b", n, re.IGNORECASE):
+        return SasChunkKind.GLOBAL_STATEMENT
+    if re.match(r"ods\b", n, re.IGNORECASE):
+        return SasChunkKind.GLOBAL_STATEMENT
+    if re.match(r"(?:format|informat)\b", n, re.IGNORECASE):
+        return SasChunkKind.FORMAT_OR_INFORMAT
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Public chunker
+# ---------------------------------------------------------------------------
+
+
+class SasSemanticChunker:
+    """
+    Chunk Base SAS source into source-preserving semantic regions.
+
+    Parameters
+    ----------
+    min_words : int
+        Soft lower bound — chunks smaller than this are never split further.
+    max_words : int
+        Hard upper bound — regions larger than this are split at statement
+        boundaries with a small overlap window.
+    """
+
+    def __init__(self, *, min_words: int = 300, max_words: int = 700) -> None:
+        self.min_words = min_words
+        self.max_words = max_words
+        logger.debug(
+            f"SasSemanticChunker  min_words={min_words}  max_words={max_words}"
+        )
+
+    # ------------------------------------------------------------------
+    # Public entry points
+    # ------------------------------------------------------------------
+
+    def chunk_file(self, path: str) -> SasChunkResult:
+        """Read *path* from disk and return a :class:`SasChunkResult`."""
+        fp = Path(path)
+        logger.info(f"chunk_file: reading '{fp}'")
+        if not fp.exists():
+            logger.error(f"chunk_file: file not found '{fp}'")
+            raise FileNotFoundError(fp)
+        source = fp.read_text(encoding="utf-8")
+        line_count = source.count("\n") + 1
+        logger.debug(f"chunk_file: {len(source)} bytes / {line_count} lines  '{fp}'")
+        return self.chunk_text(source, source_id=str(fp))
+
+    def chunk_text(
+        self, source: str, *, source_id: str | None = None
+    ) -> SasChunkResult:
+        """Parse *source* string and return a :class:`SasChunkResult`."""
+        label = source_id or "<inline>"
+        line_count = source.count("\n") + 1
+        logger.info(
+            f"chunk_text: start  source='{label}'  chars={len(source)}  lines={line_count}"
+        )
+        t0 = time.perf_counter()
+
+        line_starts = _line_starts(source)
+        diagnostics: list[SasDiagnostic] = []
+
+        units = self._scan_units(source, line_starts, diagnostics)
+        logger.debug(f"chunk_text: scan → {len(units)} units")
+
+        regions = self._group_regions(units, line_starts, diagnostics)
+        logger.debug(f"chunk_text: group → {len(regions)} regions")
+
+        chunks: list[SasChunk] = []
+        for region in regions:
+            chunks.extend(
+                self._chunks_for_region(
+                    source,
+                    source_id,
+                    region,
+                    line_starts,
+                    len(chunks),
+                    diagnostics,
+                )
+            )
+
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            f"chunk_text: done  source='{label}'  chunks={len(chunks)}  diagnostics={len(diagnostics)}  elapsed={elapsed:.3f}s"
+        )
+        return SasChunkResult(
+            source_id=source_id, chunks=chunks, diagnostics=diagnostics
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 1 — scan source → _Unit list
+    # ------------------------------------------------------------------
+
+    def _scan_units(
+        self,
+        source: str,
+        line_starts: list[int],
+        diagnostics: list[SasDiagnostic],
+    ) -> list[_Unit]:
+        logger.debug(f"_scan_units: {len(source)} chars")
+        units: list[_Unit] = []
+        stmt_start: int | None = None
+        index = 0
+        quote: str | None = None
+
+        while index < len(source):
+            if stmt_start is None:
+                stmt_start = index
+
+            char = source[index]
+            nxt = source[index : index + 2]
+
+            # ── inside quoted string ────────────────────────────────────────
+            if quote:
+                if char == quote:
+                    if index + 1 < len(source) and source[index + 1] == quote:
+                        index += 2  # doubled-quote escape
+                        continue
+                    quote = None
+                index += 1
+                continue
+
+            if char in {"'", '"'}:
+                quote = char
+                index += 1
+                continue
+
+            # ── block comment /* … */ ───────────────────────────────────────
+            if nxt == "/*":
+                comment_start = index
+                comment_end = source.find("*/", index + 2)
+                before = source[stmt_start:comment_start]
+                if not before.strip():
+                    # standalone comment (no code before it on this statement)
+                    end = (
+                        len(source)
+                        if comment_end == -1
+                        else _ws_end(source, comment_end + 2)
+                    )
+                    unit = _Unit(
+                        start=stmt_start,
+                        end=end,
+                        text=source[stmt_start:end],
+                        is_comment=True,
+                        terminated=(comment_end != -1),
+                        unclosed_comment=(comment_end == -1),
+                    )
+                    units.append(unit)
+                    if comment_end == -1:
+                        logger.warning(
+                            f"_scan_units: unclosed block comment at line {_line_for(stmt_start, line_starts)}"
+                        )
+                        diagnostics.append(
+                            _diag(
+                                "UNCLOSED_BLOCK_COMMENT",
+                                "Unclosed block comment.",
+                                line_starts,
+                                unit,
+                            )
+                        )
+                    else:
+                        logger.debug(
+                            f"_scan_units: block comment  line={_line_for(stmt_start, line_starts)}"
+                        )
+                    stmt_start = None
+                    index = end
+                    continue
+                # inline comment — skip past it without ending the statement
+                index = len(source) if comment_end == -1 else comment_end + 2
+                continue
+
+            # ── statement terminator ────────────────────────────────────────
+            if char == ";":
+                end = _ws_end(source, index + 1)
+                text = source[stmt_start:end]
+                units.append(
+                    _Unit(
+                        start=stmt_start,
+                        end=end,
+                        text=text,
+                        is_comment=_is_stmt_comment(text),
+                    )
+                )
+                text_preview = text[:60].replace("\n", "↵")
+                logger.debug(
+                    f"_scan_units: stmt  line={_line_for(stmt_start, line_starts)}  "
+                    f"comment={_is_stmt_comment(text)}  text={text_preview!r}"
+                )
+                stmt_start = None
+                index = end
+                continue
+
+            index += 1
+
+        # trailing unterminated fragment
+        if stmt_start is not None and stmt_start < len(source):
+            text = source[stmt_start:]
+            if text.strip():
+                line = _line_for(stmt_start, line_starts)
+                logger.warning(f"_scan_units: unterminated statement at line {line}")
+                units.append(
+                    _Unit(
+                        start=stmt_start,
+                        end=len(source),
+                        text=text,
+                        is_comment=_is_stmt_comment(text),
+                        terminated=False,
+                    )
+                )
+
+        non_empty = [u for u in units if u.text]
+        logger.debug(
+            f"_scan_units: done  total={len(units)}  non_empty={len(non_empty)}"
+        )
+        return non_empty
+
+    # ------------------------------------------------------------------
+    # Phase 2 — _Unit list → _Region list
+    # ------------------------------------------------------------------
+
+    def _group_regions(
+        self,
+        units: list[_Unit],
+        line_starts: list[int],
+        diagnostics: list[SasDiagnostic],
+    ) -> list[_Region]:
+        logger.debug(f"_group_regions: {len(units)} units")
+        regions: list[_Region] = []
+        unknown: list[_Unit] = []
+        index = 0
+
+        def flush_unknown() -> None:
+            if not unknown:
+                return
+            kind = (
+                SasChunkKind.UNKNOWN_BLOCK
+                if any(not u.terminated for u in unknown)
+                else SasChunkKind.UNKNOWN_STATEMENT_GROUP
+            )
+            r = _Region(
+                kind,
+                unknown[0].start,
+                unknown[-1].end,
+                list(unknown),
+                unclosed=(kind == SasChunkKind.UNKNOWN_BLOCK),
+            )
+            regions.append(r)
+            sl = _line_for(r.start, line_starts)
+            el = _line_for(max(r.end - 1, r.start), line_starts)
+            logger.warning(
+                f"_group_regions: unrecognised  kind={kind.value}  lines={sl}-{el}"
+            )
+            diagnostics.append(
+                SasDiagnostic(
+                    code="UNRECOGNIZED_SOURCE_REGION",
+                    message="Source region did not match a known Base SAS semantic unit.",
+                    start_line=sl,
+                    end_line=el,
+                )
+            )
+            unknown.clear()
+
+        while index < len(units):
+            unit = units[index]
+            stripped = unit.text.strip()
+
+            if not stripped:
+                unknown.append(unit)
+                index += 1
+                continue
+
+            if unit.is_comment:
+                flush_unknown()
+                regions.append(
+                    _Region(
+                        SasChunkKind.COMMENT_BLOCK,
+                        unit.start,
+                        unit.end,
+                        [unit],
+                    )
+                )
+                logger.debug(
+                    f"_group_regions: COMMENT_BLOCK  line={_line_for(unit.start, line_starts)}"
+                )
+                index += 1
+                continue
+
+            cls = _classify(stripped)
+
+            # ── block-opener: collect the whole block ───────────────────────
+            if cls in _BLOCK_OPENERS:
+                flush_unknown()
+                block_units, index, unclosed = self._collect_block(units, index, cls)
+                r = _Region(
+                    cls,
+                    block_units[0].start,
+                    block_units[-1].end,
+                    block_units,
+                    unclosed=unclosed,
+                )
+                regions.append(r)
+                sl = _line_for(r.start, line_starts)
+                el = _line_for(max(r.end - 1, r.start), line_starts)
+                if unclosed:
+                    code = {
+                        SasChunkKind.DATA_STEP: "UNCLOSED_DATA_OR_PROC_STEP",
+                        SasChunkKind.PROC_STEP: "UNCLOSED_DATA_OR_PROC_STEP",
+                        SasChunkKind.MACRO_DEFINITION: "UNCLOSED_MACRO",
+                    }[cls]
+                    logger.warning(
+                        f"_group_regions: unclosed {cls.value}  lines={sl}-{el}  code={code}"
+                    )
+                    diagnostics.append(
+                        SasDiagnostic(
+                            code=code,
+                            message=f"{cls.value} was not closed before end of file.",
+                            start_line=sl,
+                            end_line=el,
+                        )
+                    )
+                else:
+                    logger.debug(
+                        f"_group_regions: {cls.value}  lines={sl}-{el}  units={len(block_units)}"
+                    )
+                continue
+
+            # ── single-statement kinds ──────────────────────────────────────
+            if cls is not None:
+                flush_unknown()
+                regions.append(
+                    _Region(
+                        cls,
+                        unit.start,
+                        unit.end,
+                        [unit],
+                        unclosed=(not unit.terminated),
+                    )
+                )
+                logger.debug(
+                    f"_group_regions: {cls.value}  line={_line_for(unit.start, line_starts)}"
+                )
+                index += 1
+                continue
+
+            unknown.append(unit)
+            index += 1
+
+        flush_unknown()
+        logger.debug(f"_group_regions: → {len(regions)} regions")
+        return regions
+
+    def _collect_block(
+        self,
+        units: list[_Unit],
+        start: int,
+        kind: SasChunkKind,
+    ) -> tuple[list[_Unit], int, bool]:
+        """
+        Collect all _Units belonging to a DATA / PROC / %MACRO block.
+
+        A block ends when one of the following is encountered:
+        - An explicit ``RUN;`` or ``QUIT;`` statement     (DATA / PROC)
+        - An explicit ``%MEND;`` statement                (%MACRO)
+        - A new DATA, PROC, or %MACRO header              (implicit close)
+        - End of file                                     (unclosed block)
+
+        Critically, FORMAT, LABEL, OPTIONS, LIBNAME, ODS, TITLE, and all
+        other statement types are treated as ordinary body statements and
+        collected without closing the block.
+        """
+        logger.debug(f"_collect_block: {kind.value}  start_unit={start}")
+        block: list[_Unit] = []
+        index = start
+
+        while index < len(units):
+            unit = units[index]
+
+            # Comments inside a block are just collected — they don't close it
+            if unit.is_comment:
+                block.append(unit)
+                index += 1
+                continue
+
+            stripped = unit.text.strip()
+            cls = _classify(stripped)
+
+            # ── only DATA/PROC openers close a DATA/PROC block (implicit).
+            # A %MACRO block is closed *only* by %MEND, so DATA and PROC
+            # steps that appear inside a macro body are collected, not
+            # treated as block boundaries.
+            implicit_close = (
+                cls in _BLOCK_OPENERS
+                and block
+                and kind in {SasChunkKind.DATA_STEP, SasChunkKind.PROC_STEP}
+            )
+            if implicit_close:
+                logger.debug(
+                    f"_collect_block: implicit close  {kind.value} at unit {index}  next_kind={cls.value}"
+                )
+                return block, index, True
+
+            block.append(unit)
+            lowered = _norm(unit.text)
+            index += 1
+
+            # ── explicit terminators ────────────────────────────────────────
+            if kind == SasChunkKind.MACRO_DEFINITION and re.match(
+                r"%\s*mend\b", lowered, re.IGNORECASE
+            ):
+                logger.debug(
+                    f"_collect_block: %MEND → closed MACRO_DEFINITION  units={len(block)}"
+                )
+                return block, index, False
+
+            if kind in {SasChunkKind.DATA_STEP, SasChunkKind.PROC_STEP} and lowered in {
+                "run",
+                "quit",
+            }:
+                logger.debug(
+                    f"_collect_block: RUN/QUIT → closed {kind.value}  units={len(block)}"
+                )
+                return block, index, False
+
+        logger.warning(
+            f"_collect_block: EOF without closing {kind.value}  units={len(block)}"
+        )
+        return block, index, True
+
+    # ------------------------------------------------------------------
+    # Phase 3 — _Region → SasChunk(s)
+    # ------------------------------------------------------------------
+
+    def _chunks_for_region(
+        self,
+        source: str,
+        source_id: str | None,
+        region: _Region,
+        line_starts: list[int],
+        next_index: int,
+        diagnostics: list[SasDiagnostic],
+    ) -> list[SasChunk]:
+        wc = _wc(region.text)
+        sl = _line_for(region.start, line_starts)
+        el = _line_for(max(region.end - 1, region.start), line_starts)
+
+        if wc <= self.max_words or len(region.units) <= 1:
+            logger.debug(
+                f"_chunks_for_region: single  kind={region.kind.value}  words={wc}  lines={sl}-{el}"
+            )
+            return [self._make_chunk(source_id, region, line_starts, next_index)]
+
+        # Oversized — split at statement boundaries with overlap
+        logger.info(
+            f"_chunks_for_region: oversized {region.kind.value}  words={wc} > max={self.max_words}  lines={sl}-{el}  splitting"
+        )
+        parent_meta = _metadata_for(region.text, region.kind)
+        parent_meta.has_unclosed_block = region.unclosed
+        parent_chunk = self._make_chunk(
+            source_id,
+            region,
+            line_starts,
+            next_index,
+            metadata=parent_meta,
+        )
+        chunks: list[SasChunk] = [parent_chunk]
+        parent_id = parent_chunk.chunk_id
+        current: list[_Unit] = []
+
+        for unit in region.units:
+            candidate = current + [unit]
+            cand_r = _Region(
+                region.kind,
+                candidate[0].start,
+                candidate[-1].end,
+                candidate,
+                unclosed=region.unclosed,
+            )
+            if current and _wc(cand_r.text) > self.max_words:
+                cr = _Region(
+                    region.kind,
+                    current[0].start,
+                    current[-1].end,
+                    list(current),
+                    unclosed=region.unclosed,
+                )
+                child_meta = _merge_meta(
+                    parent_meta,
+                    _metadata_for(cr.text, region.kind),
+                )
+                child_meta.has_unclosed_block = region.unclosed
+                child = self._make_chunk(
+                    source_id,
+                    cr,
+                    line_starts,
+                    next_index + len(chunks),
+                    parent_id=parent_id,
+                    metadata=child_meta,
+                )
+                logger.debug(
+                    f"_chunks_for_region: child {child.chunk_id}  parent={parent_id}  lines={child.start_line}-{child.end_line}"
+                )
+                chunks.append(child)
+                current = _overlap(current) + [unit]
+            else:
+                current = candidate
+
+        if current:
+            cr = _Region(
+                region.kind,
+                current[0].start,
+                current[-1].end,
+                list(current),
+                unclosed=region.unclosed,
+            )
+            child_meta = _merge_meta(
+                parent_meta,
+                _metadata_for(cr.text, region.kind),
+            )
+            child_meta.has_unclosed_block = region.unclosed
+            child = self._make_chunk(
+                source_id,
+                cr,
+                line_starts,
+                next_index + len(chunks),
+                parent_id=parent_id,
+                metadata=child_meta,
+            )
+            logger.debug(
+                f"_chunks_for_region: final child {child.chunk_id}  parent={parent_id}  lines={child.start_line}-{child.end_line}"
+            )
+            chunks.append(child)
+
+        still_big = [c for c in chunks if _wc(c.text) > self.max_words * 2]
+        if still_big:
+            logger.warning(
+                f"_chunks_for_region: {len(still_big)} chunk(s) remain oversized after split"
+            )
+            diagnostics.append(
+                SasDiagnostic(
+                    code="OVERSIZED_ATOMIC_CHUNK",
+                    message="A chunk remained oversized because it could not be split safely.",
+                    start_line=sl,
+                    end_line=el,
+                )
+            )
+
+        logger.info(
+            f"_chunks_for_region: {region.kind.value} → {len(chunks)} chunks (1 parent + {len(chunks) - 1} children)"
+        )
+        return chunks
+
+    def _make_chunk(
+        self,
+        source_id: str | None,
+        region: _Region,
+        line_starts: list[int],
+        index: int,
+        *,
+        parent_id: str | None = None,
+        metadata: SasChunkMetadata | None = None,
+    ) -> SasChunk:
+        meta = metadata or _metadata_for(region.text, region.kind)
+        meta.has_unclosed_block = region.unclosed
+        return SasChunk(
+            chunk_id=f"chunk-{index + 1:04d}",
+            source_id=source_id,
+            text=region.text,
+            kind=region.kind,
+            title=_title(region.kind, meta),
+            start_line=_line_for(region.start, line_starts),
+            end_line=_line_for(max(region.end - 1, region.start), line_starts),
+            start_char=region.start,
+            end_char=region.end,
+            parent_id=parent_id,
+            metadata=meta,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Pure helper functions  (no side-effects, no logging)
+# ---------------------------------------------------------------------------
+
+
+def _line_starts(source: str) -> list[int]:
+    starts = [0]
+    for i, ch in enumerate(source):
+        if ch == "\n":
+            starts.append(i + 1)
+    return starts
+
+
+def _line_for(char_index: int, line_starts: list[int]) -> int:
+    return bisect_right(line_starts, char_index)
+
+
+def _ws_end(source: str, index: int) -> int:
+    while index < len(source) and source[index].isspace():
+        index += 1
+    return index
+
+
+def _is_stmt_comment(text: str) -> bool:
+    s = text.lstrip()
+    return s.startswith("*") and not s.startswith("*/")
+
+
+def _norm(text: str) -> str:
+    s = text.strip()
+    s = re.sub(r"\s+", " ", s)
+    return s[:-1].strip().lower() if s.endswith(";") else s.lower()
+
+
+def _sanitise(text: str, *, blank_strings: bool = True) -> str:
+    """
+    Blank out block comments, preserving newlines so line numbers stay
+    aligned with the original source.
+
+    When ``blank_strings`` is True (the default), quoted string literals
+    are also blanked out — their delimiters are kept but their contents
+    become spaces, with the doubled-quote escape (``''`` / ``""``) handled
+    so it doesn't end the string early.  Pass ``blank_strings=False`` to
+    keep quoted text intact, e.g. when extracting a literal filename from
+    ``%include 'path.sas'``.
+    """
+    result: list[str] = []
+    index = 0
+    quote: str | None = None
+    while index < len(text):
+        if quote:
+            ch = text[index]
+            if ch == quote:
+                if index + 1 < len(text) and text[index + 1] == quote:
+                    result.extend("  ")
+                    index += 2
+                    continue
+                result.append(ch)
+                quote = None
+            else:
+                result.append("\n" if ch in "\r\n" else " ")
+            index += 1
+            continue
+        if text[index : index + 2] == "/*":
+            end = text.find("*/", index + 2)
+            if end == -1:
+                result.extend("\n" if ch in "\r\n" else " " for ch in text[index:])
+                break
+            result.extend("\n" if ch in "\r\n" else " " for ch in text[index : end + 2])
+            index = end + 2
+            continue
+        ch = text[index]
+        if blank_strings and ch in {"'", '"'}:
+            quote = ch
+        result.append(ch)
+        index += 1
+    return "".join(result)
+
+
+def _nid(value: str) -> str:
+    value = value.strip().strip(";")
+    if value.startswith(("'", '"')) and value.endswith(("'", '"')):
+        return value
+    return value.lower()
+
+
+# Identifies which of %let/%global/%local/%put begins a GLOBAL_STATEMENT
+# chunk.  Matched against the *start* of the chunk's sanitised text — by
+# construction (see _classify), any chunk already classified as
+# GLOBAL_STATEMENT via this same keyword set begins with exactly one of
+# these four, so a leading match is always unambiguous.
+_MACRO_VAR_OP_RE = re.compile(r"%\s*(let|global|local|put)\b", re.IGNORECASE)
+
+# Identifies which control-flow keyword begins a MACRO_CONTROL_FLOW chunk
+# (ROADMAP Phase 3).  Mirrors _MACRO_VAR_OP_RE exactly — matched against
+# the start of the chunk's sanitised text, which by construction (see
+# _classify) always begins with exactly one of these seven keywords for
+# any chunk already classified as MACRO_CONTROL_FLOW.
+_CONTROL_FLOW_OP_RE = re.compile(
+    r"%\s*(if|else|do|end|return|goto|abort)\b",
+    re.IGNORECASE,
+)
+
+# Any "&name" or "&name." reference, used to scan for automatic macro
+# variables.  Deliberately broad (matches every macro-variable reference,
+# not just &sys*) so it can be reused for other reference-tracking needs
+# without re-deriving the same pattern; the sys-prefix filter is applied
+# by the caller via _is_automatic_macro_var.
+_VAR_REF_RE = re.compile(r"&(\w+)\.?")
+
+
+def _is_automatic_macro_var(name: str) -> bool:
+    """
+    True if *name* (without the leading ``&`` or trailing ``.``) is one of
+    SAS's automatic macro variables.
+
+    Per *SAS Macro Language: Reference* (Ch. 12, "Automatic Macro
+    Variables"), every automatic macro variable's name begins with the
+    reserved ``SYS`` prefix — confirmed across all ~60 of them (SYSDATE,
+    SYSLAST, SYSPARM, …).  A simple prefix check is sufficient; no
+    enumerated lookup table is needed or maintained.
+    """
+    return name.lower().startswith("sys")
+
+
+# ---------------------------------------------------------------------------
+# Macro-variable producer/consumer extraction (ROADMAP Phase 2)
+#
+# Three SAS constructs create a macro variable as a side effect rather than
+# via %LET — CALL SYMPUT/SYMPUTX inside a DATA step, and PROC SQL's INTO
+# clause.  This section extracts statically-resolvable variable names from
+# each, and separately detects the CALL SYMPUT/SYMPUTX local-scope hazard
+# documented in SAS Macro Language: Reference, Ch. 5.
+# ---------------------------------------------------------------------------
+
+
+def _split_top_level(s: str, sep: str = ",") -> list[str]:
+    """
+    Split *s* on *sep* at paren-depth 0, respecting quoted strings.
+
+    Unlike a pure-regex comma splitter, this correctly handles arbitrarily
+    nested function calls in the argument list, e.g.
+    ``'holdate', trim(left(put(holiday, worddate.)))`` splits into exactly
+    two pieces, not four.
+    """
+    parts: list[str] = []
+    depth = 0
+    quote: str | None = None
+    start = 0
+    for i, ch in enumerate(s):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == sep and depth == 0:
+            parts.append(s[start:i])
+            start = i + 1
+    parts.append(s[start:])
+    return [p.strip() for p in parts]
+
+
+def _clean_literal(arg: str) -> str | None:
+    """
+    Return the contents of *arg* if it is a single, clean quoted-string
+    literal (no concatenation, no embedded quote of the same type) —
+    otherwise ``None``.
+
+    Deliberately conservative: anything that isn't a bare ``'text'`` or
+    ``"text"`` (a DATA step variable name, a concatenation expression, a
+    function call) returns ``None`` rather than a guessed value, matching
+    the "flag as unresolved, do not guess" principle used throughout this
+    module for parameterised/dynamic references.
+    """
+    arg = arg.strip()
+    if len(arg) < 2:
+        return None
+    if arg[0] not in ("'", '"') or arg[-1] != arg[0]:
+        return None
+    inner = arg[1:-1]
+    if arg[0] in inner:
+        return None
+    return inner
+
+
+# Matches CALL SYMPUT(...) / CALL SYMPUTX(...) and captures the full
+# argument-list text between the parens.
+_CALL_SYMPUT_RE = re.compile(
+    r"\bcall\s+symput(x?)\s*\(([^;]*?)\)\s*;",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Matches CALL EXECUTE(...) and captures its single argument.
+_CALL_EXECUTE_RE = re.compile(
+    r"\bcall\s+execute\s*\(([^;]*?)\)\s*;",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Detects %LOCAL anywhere in a macro body (used by the scope-hazard check;
+# a %LOCAL declaration makes the local symbol table non-empty exactly like
+# a declared parameter does).
+_LOCAL_STMT_RE = re.compile(r"%\s*local\b", re.IGNORECASE)
+
+# A %name or %name(...) pattern inside a CALL EXECUTE string argument's
+# contents — built from the same reserved-word exclusion as every other
+# macro-call detector in this module.
+_EXECUTE_MACRO_CALL_RE = re.compile(
+    rf"%(?!(?:{_RESERVED_WORDS_PATTERN})\b)([A-Za-z_]\w*)",
+    re.IGNORECASE,
+)
+
+
+def _extract_symput(
+    text: str,
+) -> tuple[list[str], bool, list[str]]:
+    """
+    Scan *text* for CALL SYMPUT/SYMPUTX statements.
+
+    Returns
+    -------
+    produced : list[str]
+        Statically-resolvable macro variable names created (deduplicated,
+        order-preserving).
+    any_unresolved : bool
+        True if at least one CALL SYMPUT/SYMPUTX had a non-literal
+        (dynamic) macro-variable-name argument.
+    explicit_global_vars : list[str]
+        Names (when resolvable) whose CALL SYMPUTX call passed an explicit
+        third argument forcing global scope (``'G'`` as the first
+        non-blank character) — these are exempt from the scope hazard.
+    """
+    produced: list[str] = []
+    seen: set[str] = set()
+    any_unresolved = False
+    explicit_global: list[str] = []
+
+    for m in _CALL_SYMPUT_RE.finditer(text):
+        is_x = bool(m.group(1))
+        args = _split_top_level(m.group(2))
+        if not args:
+            continue
+        name_arg = args[0]
+        name = _clean_literal(name_arg)
+        if name is None:
+            any_unresolved = True
+            continue
+        name = name.lower()
+        if name not in seen:
+            seen.add(name)
+            produced.append(name)
+
+        if is_x and len(args) >= 3:
+            scope_arg = _clean_literal(args[2])
+            if scope_arg and scope_arg.strip().lower().startswith("g"):
+                explicit_global.append(name)
+
+    return produced, any_unresolved, explicit_global
+
+
+# Captures a %GOTO statement's label.  Per Ch. 5, a *computed* %GOTO is one
+# whose label contains "&" or "%" (e.g. %goto &home;) -- this is one of the
+# three documented conditions that forces CALL SYMPUT/SYMPUTX into local
+# scope even when the symbol table would otherwise be empty.
+_GOTO_LABEL_RE = re.compile(r"%\s*goto\s+([^;]+?)\s*;", re.IGNORECASE)
+
+# Detects a bare %ABORT statement anywhere in a macro body.
+_ABORT_STMT_RE = re.compile(r"%\s*abort\b", re.IGNORECASE)
+
+
+def _macro_contains_computed_goto(text: str) -> bool:
+    """True if *text* contains a %GOTO whose label references a macro
+    variable or macro function (Ch. 5's "computed %GOTO")."""
+    for m in _GOTO_LABEL_RE.finditer(text):
+        label = m.group(1)
+        if "&" in label or "%" in label:
+            return True
+    return False
+
+
+def _macro_has_local_scope(text: str, param_names: list[str]) -> bool:
+    """
+    True if CALL SYMPUT/SYMPUTX inside the macro body *text* would store
+    its variable in the *local* symbol table rather than walking up to the
+    nearest non-empty (often global) one.
+
+    Per Ch. 5 "Special Cases of Scope", this happens when either:
+    - the local symbol table is non-empty — i.e. the macro has at least
+      one declared parameter, or contains an explicit ``%LOCAL`` statement
+      anywhere in its body; or
+    - the macro contains a *computed* ``%GOTO`` (a label referencing a
+      macro variable or function) — one of three documented conditions
+      that force local scope *even when the table would otherwise be
+      empty* (the other two — CALL SYMPUT used after a PROC SQL step, and
+      the rare SYSPBUFF case — are not detected; see ROADMAP Phase 2/3).
+    """
+    return (
+        bool(param_names)
+        or bool(_LOCAL_STMT_RE.search(text))
+        or _macro_contains_computed_goto(text)
+    )
+
+
+def _extract_call_execute_macros(text: str) -> list[str]:
+    """
+    Scan *text* for ``CALL EXECUTE(argument)`` statements and return the
+    macro name(s) invoked, when statically resolvable.
+
+    Resolvable cases (per Ch. 15's CALL EXECUTE dictionary entry):
+    - A clean quoted-string argument containing a literal ``%name`` —
+      e.g. ``call execute('%sales');``.
+    - A concatenation expression whose *first* piece (before the first
+      ``||``) is a clean quoted-string literal containing a complete
+      ``%name(`` — e.g. ``call execute('%sales('||month||')');`` resolves
+      to ``sales`` even though the full argument list isn't known.
+
+    Unresolvable cases (left alone, per "flag as unresolved, do not
+    guess"): an unquoted DATA step variable name, or any expression whose
+    first piece isn't itself a clean literal.
+    """
+    found: list[str] = []
+    for m in _CALL_EXECUTE_RE.finditer(text):
+        arg = m.group(1).strip()
+        first_piece = arg.split("||", 1)[0].strip()
+        literal = _clean_literal(first_piece)
+        if literal is None:
+            continue
+        call_m = _EXECUTE_MACRO_CALL_RE.search(literal)
+        if call_m:
+            found.append(call_m.group(1).lower())
+    return found
+
+
+# Captures the INTO clause of a PROC SQL step, up to the next FROM/; .
+_SQL_INTO_CLAUSE_RE = re.compile(
+    r"\binto\s+(.+?)(?=\bfrom\b|;)",
+    re.IGNORECASE | re.DOTALL,
+)
+# A single ":name" target inside an INTO clause.
+_SQL_INTO_VAR_RE = re.compile(r":\s*([A-Za-z_]\w*)")
+# THROUGH / THRU are exact synonyms for "-" in a numbered-range INTO target.
+_SQL_RANGE_SEP_RE = re.compile(r"-|\bthrough\b|\bthru\b", re.IGNORECASE)
+
+
+def _enumerate_numbered_range(name1: str, name2: str) -> list[str] | None:
+    """
+    Expand a ``:var1 - :varN`` / ``THROUGH`` / ``THRU`` numbered-range INTO
+    target into the full list of variable names, when both bounds share a
+    common alphabetic prefix and end in parseable integers (e.g.
+    ``type1``..``type4`` -> ``["type1","type2","type3","type4"]``).
+
+    Returns ``None`` when the bounds don't fit that shape — the two given
+    names are still tracked individually by the caller in that case.
+    """
+    m1 = re.match(r"^([A-Za-z_]+?)(\d+)$", name1)
+    m2 = re.match(r"^([A-Za-z_]+?)(\d+)$", name2)
+    if not m1 or not m2:
+        return None
+    prefix1, n1 = m1.group(1), int(m1.group(2))
+    prefix2, n2 = m2.group(1), int(m2.group(2))
+    if prefix1.lower() != prefix2.lower() or n2 < n1:
+        return None
+    return [f"{prefix1}{i}" for i in range(n1, n2 + 1)]
+
+
+def _extract_sql_into_vars(text: str) -> list[str]:
+    """
+    Scan *text* (a PROC SQL step's source) for every ``INTO`` clause and
+    return the macro variable names created, covering all three documented
+    forms (Ch. 18):
+
+    - ``into :var1, :var2, ...`` — each name tracked directly.
+    - ``into :var1 - :varN`` (or ``THROUGH``/``THRU``) — enumerated when
+      both bounds share a prefix and end in integers; otherwise both named
+      bounds are tracked individually.
+    - ``into :var separated by '...'`` — the single name is tracked.
+    """
+    produced: list[str] = []
+    seen: set[str] = set()
+
+    for clause_m in _SQL_INTO_CLAUSE_RE.finditer(text):
+        clause = clause_m.group(1)
+        targets = [t.strip() for t in clause.split(",")]
+        for target in targets:
+            if not target:
+                continue
+            names = _SQL_INTO_VAR_RE.findall(target)
+            if len(names) == 2 and _SQL_RANGE_SEP_RE.search(target):
+                expanded = _enumerate_numbered_range(names[0], names[1])
+                names = expanded if expanded is not None else names
+            for n in names:
+                n = n.lower()
+                if n not in seen:
+                    seen.add(n)
+                    produced.append(n)
+
+    return produced
+
+
+def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
+    cf = _sanitise(text, blank_strings=False)
+    mt = _sanitise(text)
+    datasets = sorted({_nid(m.group(1)) for m in _DATASET_RE.finditer(mt)})
+    datasets += [_nid(m.group(1)) for m in _DATA_OPT_RE.finditer(mt)]
+    librefs = sorted({_nid(m.group(1)) for m in _LIBREF_RE.finditer(mt)})
+    two_part = sorted({_nid(m.group(0)) for m in _LIBREF_RE.finditer(mt)})
+    mdefs = sorted({_nid(m.group(1)) for m in _MACRO_DEF_RE.finditer(mt)})
+    mcalls = sorted({_nid(m.group(1)) for m in _MACRO_CALL_RE.finditer(mt)})
+    includes = [_nid(m.group(1)).strip("'\"") for m in _INCLUDE_RE.finditer(cf)]
+    options = [_nid(p) for m in _OPTIONS_RE.finditer(mt) for p in m.group(1).split()]
+    labels = sorted({_nid(m.group(1)) for m in _LABEL_RE.finditer(mt)})
+    pm = _PROC_RE.search(mt)
+    dm = _DATA_RE.search(mt)
+    mm = _MACRO_DEF_RE.search(mt)
+    inp, out, defs, invk = _io_for(text, kind)
+
+    # ── macro-variable operation (%let / %global / %local / %put) ──────────
+    var_op: str | None = None
+    if kind == SasChunkKind.GLOBAL_STATEMENT:
+        op_m = _MACRO_VAR_OP_RE.match(mt.lstrip())
+        if op_m:
+            var_op = op_m.group(1).lower()
+
+    # ── control-flow operation (ROADMAP Phase 3) ────────────────────────────
+    # Which specific keyword (%if/%else/%do/%end/%return/%goto/%abort) this
+    # MACRO_CONTROL_FLOW chunk is.  Only ever set for that one kind — these
+    # same words appearing *inside* a macro body don't get their own chunk
+    # at all (they're part of the enclosing MACRO_DEFINITION's text).
+    control_flow_op: str | None = None
+    if kind == SasChunkKind.MACRO_CONTROL_FLOW:
+        cf_m = _CONTROL_FLOW_OP_RE.match(mt.lstrip())
+        if cf_m:
+            control_flow_op = cf_m.group(1).lower()
+
+    # ── automatic (system) macro variable references ───────────────────────
+    # Scanned on `cf` (quotes preserved, comments stripped) rather than `mt`
+    # so references inside double-quoted strings — e.g. title "Report run
+    # &sysday" — are still caught.  SAS only resolves macro variables inside
+    # double-quoted strings, never single-quoted ones; distinguishing that
+    # here would add real complexity for marginal benefit, so this also
+    # matches (harmlessly) inside single-quoted text.
+    auto_vars = sorted(
+        {
+            m.group(1).lower()
+            for m in _VAR_REF_RE.finditer(cf)
+            if _is_automatic_macro_var(m.group(1))
+        }
+    )
+
+    # ── macro body I/O classification (literal vs parameterised) ───────────
+    body_lit_in: list[str] = []
+    body_lit_out: list[str] = []
+    body_par_in: list[dict] = []
+    body_par_out: list[dict] = []
+    param_names: list[str] = []
+    if kind == SasChunkKind.MACRO_DEFINITION:
+        body_lit_in, body_lit_out, body_par_in, body_par_out, param_names = (
+            _macro_body_io(text)
+        )
+
+    # ── high-severity control-flow visibility (ROADMAP Phase 3) ─────────────
+    # %ABORT and a computed %GOTO are macro-definition-only constructs, so
+    # they never get their own MACRO_CONTROL_FLOW chunk — they're always
+    # part of the enclosing macro's own text.  Surfaced here regardless of
+    # how deeply nested inside %if/%do blocks they are.
+    has_abort = False
+    has_computed_goto = False
+    if kind == SasChunkKind.MACRO_DEFINITION:
+        has_abort = bool(_ABORT_STMT_RE.search(text))
+        has_computed_goto = _macro_contains_computed_goto(text)
+
+    # ── macro-variable producer/consumer edges (ROADMAP Phase 2) ────────────
+    produces_macrovars: list[str] = []
+    hazard: bool = False
+    hazard_vars: list[str] = []
+
+    if kind in {SasChunkKind.DATA_STEP, SasChunkKind.MACRO_DEFINITION}:
+        symput_names, _unresolved, explicit_global = _extract_symput(cf)
+        produces_macrovars.extend(symput_names)
+        invk.extend(_extract_call_execute_macros(cf))
+
+        if kind == SasChunkKind.MACRO_DEFINITION and symput_names:
+            has_local = _macro_has_local_scope(text, param_names)
+            if has_local:
+                at_risk = [n for n in symput_names if n not in explicit_global]
+                if at_risk:
+                    hazard = True
+                    hazard_vars = at_risk
+
+    elif kind == SasChunkKind.PROC_STEP and pm and _nid(pm.group(1)) == "sql":
+        produces_macrovars.extend(_extract_sql_into_vars(cf))
+
+    # consumes_macrovars: every "&name" reference in this chunk, excluding
+    # automatic variables (tracked separately above) and — for
+    # MACRO_DEFINITION chunks — the macro's own declared parameters (those
+    # are call-site-resolved, not a corpus-level dependency).
+    own_params = set(param_names)
+    consumes_macrovars = sorted(
+        {
+            m.group(1).lower()
+            for m in _VAR_REF_RE.finditer(cf)
+            if not _is_automatic_macro_var(m.group(1))
+            and m.group(1).lower() not in own_params
+        }
+    )
+
+    return SasChunkMetadata(
+        step_name=_nid(dm.group(1)) if dm else None,
+        proc_name=_nid(pm.group(1)) if pm else None,
+        macro_name=_nid(mm.group(1)) if mm else None,
+        labels=labels,
+        referenced_librefs=librefs,
+        referenced_datasets=sorted(set(datasets + two_part)),
+        defined_macros=mdefs,
+        called_macros=mcalls,
+        includes=includes,
+        options=options,
+        has_unclosed_block=(kind == SasChunkKind.UNKNOWN_BLOCK),
+        macro_var_op=var_op,
+        referenced_automatic_vars=auto_vars,
+        control_flow_op=control_flow_op,
+        contains_abort=has_abort,
+        contains_computed_goto=has_computed_goto,
+        input_datasets=inp,
+        output_datasets=out,
+        defines_macros=defs,
+        invokes_macros=sorted(set(invk)),
+        body_literal_inputs=body_lit_in,
+        body_literal_outputs=body_lit_out,
+        body_param_inputs=body_par_in,
+        body_param_outputs=body_par_out,
+        macro_param_names=param_names,
+        produces_macrovars=sorted(set(produces_macrovars)),
+        consumes_macrovars=consumes_macrovars,
+        symput_scope_hazard=hazard,
+        symput_hazard_vars=sorted(set(hazard_vars)),
+    )
+
+
+def _merge_meta(parent: SasChunkMetadata, child: SasChunkMetadata) -> SasChunkMetadata:
+    def ml(a: list[str], b: list[str]) -> list[str]:
+        return sorted(set(a + b))
+
+    return SasChunkMetadata(
+        step_name=child.step_name or parent.step_name,
+        proc_name=child.proc_name or parent.proc_name,
+        macro_name=child.macro_name or parent.macro_name,
+        labels=ml(parent.labels, child.labels),
+        referenced_librefs=ml(parent.referenced_librefs, child.referenced_librefs),
+        referenced_datasets=ml(parent.referenced_datasets, child.referenced_datasets),
+        defined_macros=ml(parent.defined_macros, child.defined_macros),
+        called_macros=ml(parent.called_macros, child.called_macros),
+        includes=ml(parent.includes, child.includes),
+        options=ml(parent.options, child.options),
+        has_unclosed_block=parent.has_unclosed_block or child.has_unclosed_block,
+        macro_var_op=child.macro_var_op or parent.macro_var_op,
+        referenced_automatic_vars=ml(
+            parent.referenced_automatic_vars,
+            child.referenced_automatic_vars,
+        ),
+        input_datasets=ml(parent.input_datasets, child.input_datasets),
+        output_datasets=ml(parent.output_datasets, child.output_datasets),
+        defines_macros=ml(parent.defines_macros, child.defines_macros),
+        invokes_macros=ml(parent.invokes_macros, child.invokes_macros),
+        body_literal_inputs=ml(parent.body_literal_inputs, child.body_literal_inputs),
+        body_literal_outputs=ml(
+            parent.body_literal_outputs, child.body_literal_outputs
+        ),
+        body_param_inputs=parent.body_param_inputs or child.body_param_inputs,
+        body_param_outputs=parent.body_param_outputs or child.body_param_outputs,
+        macro_param_names=parent.macro_param_names or child.macro_param_names,
+        produces_macrovars=ml(parent.produces_macrovars, child.produces_macrovars),
+        consumes_macrovars=ml(parent.consumes_macrovars, child.consumes_macrovars),
+        symput_scope_hazard=parent.symput_scope_hazard or child.symput_scope_hazard,
+        symput_hazard_vars=ml(parent.symput_hazard_vars, child.symput_hazard_vars),
+        control_flow_op=child.control_flow_op or parent.control_flow_op,
+        contains_abort=parent.contains_abort or child.contains_abort,
+        contains_computed_goto=parent.contains_computed_goto
+        or child.contains_computed_goto,
+    )
+
+
+def _title(kind: SasChunkKind, meta: SasChunkMetadata) -> str | None:
+    if kind == SasChunkKind.DATA_STEP and meta.step_name:
+        return f"DATA {meta.step_name}"
+    if kind == SasChunkKind.PROC_STEP and meta.proc_name:
+        return f"PROC {meta.proc_name}"
+    if kind == SasChunkKind.MACRO_DEFINITION and meta.macro_name:
+        return f"%MACRO {meta.macro_name}"
+    if kind == SasChunkKind.MACRO_CONTROL_FLOW and meta.control_flow_op:
+        return f"%{meta.control_flow_op.upper()}"
+    return kind.value.replace("_", " ").title()
+
+
+def _wc(text: str) -> int:
+    return len(re.findall(r"\S+", text))
+
+
+def _overlap(units: list[_Unit]) -> list[_Unit]:
+    overlap: list[_Unit] = []
+    words = 0
+    for unit in reversed(units[-3:]):
+        uw = _wc(unit.text)
+        if words + uw > 100 and overlap:
+            break
+        overlap.insert(0, unit)
+        words += uw
+    return overlap
+
+
+def _diag(
+    code: str,
+    msg: str,
+    line_starts: list[int],
+    target: _Unit | _Region,
+) -> SasDiagnostic:
+    return SasDiagnostic(
+        code=code,
+        message=msg,
+        severity=SasDiagnosticSeverity.WARNING,
+        start_line=_line_for(target.start, line_starts),
+        end_line=_line_for(max(target.end - 1, target.start), line_starts),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Directed I/O extraction  — called from _metadata_for
+# ---------------------------------------------------------------------------
+
+_SQL_CREATE_RE = re.compile(
+    r"\bcreate\s+(?:table|view)\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    re.IGNORECASE,
+)
+_SQL_FROM_RE = re.compile(
+    r"\bfrom\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    re.IGNORECASE,
+)
+_SQL_JOIN_RE = re.compile(
+    r"\bjoin\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    re.IGNORECASE,
+)
+_SQL_INTO_RE = re.compile(
+    r"\binsert\s+into\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    re.IGNORECASE,
+)
+_SET_RE = re.compile(
+    r"\bset\s+((?:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?(?:\s*\([^)]*\))?\s*)+?)"
+    r"(?=;|\bwhere\b|\bby\b|\bobs\b|\bnobs\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+_MERGE_RE = re.compile(
+    r"\bmerge\s+((?:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?(?:\s*\([^)]*\))?\s*)+?)"
+    r"(?=;|\bby\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+_UPDATE_RE = re.compile(
+    r"\bupdate\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    re.IGNORECASE,
+)
+_MODIFY_RE = re.compile(
+    r"\bmodify\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    re.IGNORECASE,
+)
+_OUTPUT_DS_RE = re.compile(
+    r"\boutput\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    re.IGNORECASE,
+)
+_PROC_OUT_RE = re.compile(
+    r"\bout\s*=\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)"
+    r"|\boutdata\s*=\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    re.IGNORECASE,
+)
+_PROC_IN_RE = re.compile(
+    r"\bdata\s*=\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    re.IGNORECASE,
+)
+_SAS_RESERVED = frozenset(
+    {
+        "work",
+        "_null_",
+        "_all_",
+        "_numeric_",
+        "_character_",
+        "sashelp",
+        "sasuser",
+        "maps",
+        "mapssas",
+    }
+)
+_MACRO_INVOKE_RE = re.compile(
+    rf"%(?!(?:{_RESERVED_WORDS_PATTERN})\b)([A-Za-z_]\w*)\s*(?:\(([^)]*)\))?",
+    re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Macro body dataset classification
+#
+# A %MACRO body may reference datasets two ways:
+#   Literal       — a hard-coded name, e.g. "data work.base;"
+#                   Resolvable purely from the macro source text.
+#   Parameterised — a macro variable reference, e.g. "data &ds.;"
+#                   Only resolvable at the call site where the argument
+#                   value is known.
+#
+# The functions below extract both kinds from a MACRO_DEFINITION chunk's
+# source text, used by the batcher to wire up cross-file dependencies that
+# pass through macro bodies.
+# ---------------------------------------------------------------------------
+
+# Detects a SAS macro variable reference: &name. or &name
+_MACRO_VAR_RE = re.compile(r"&(\w+)\.?")
+
+# DATA statement header inside a macro body (may contain &refs)
+_BODY_DATA_HDR_RE = re.compile(
+    r"(?<![\w=])data\s+((?:[A-Za-z_&][\w.&]*\s*)+?)(?=;)",
+    re.IGNORECASE,
+)
+_BODY_SET_RE = re.compile(
+    r"\bset\s+((?:[A-Za-z_&][\w.&]*(?:\s*\([^)]*\))?\s*)+?)(?=;|\bwhere\b|\bby\b|\bobs\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+_BODY_MERGE_RE = re.compile(
+    r"\bmerge\s+((?:[A-Za-z_&][\w.&]*(?:\s*\([^)]*\))?\s*)+?)(?=;|\bby\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+_BODY_UPDATE_RE = re.compile(r"\bupdate\s+([A-Za-z_&][\w.&]*)", re.IGNORECASE)
+_BODY_MODIFY_RE = re.compile(r"\bmodify\s+([A-Za-z_&][\w.&]*)", re.IGNORECASE)
+_BODY_OUTPUT_RE = re.compile(r"\boutput\s+([A-Za-z_&][\w.&]*)", re.IGNORECASE)
+_BODY_PROC_IN_RE = re.compile(r"\bdata\s*=\s*([A-Za-z_&][\w.&]*)", re.IGNORECASE)
+_BODY_PROC_OUT_RE = re.compile(
+    r"\bout\s*=\s*([A-Za-z_&][\w.&]*)"
+    r"|\boutdata\s*=\s*([A-Za-z_&][\w.&]*)",
+    re.IGNORECASE,
+)
+_BODY_SQL_CREATE_RE = re.compile(
+    r"\bcreate\s+(?:table|view)\s+([A-Za-z_&][\w.&]*)",
+    re.IGNORECASE,
+)
+_BODY_SQL_FROM_RE = re.compile(r"\bfrom\s+([A-Za-z_&][\w.&]*)", re.IGNORECASE)
+_BODY_SQL_JOIN_RE = re.compile(r"\bjoin\s+([A-Za-z_&][\w.&]*)", re.IGNORECASE)
+_BODY_SQL_INTO_RE = re.compile(
+    r"\binsert\s+into\s+([A-Za-z_&][\w.&]*)",
+    re.IGNORECASE,
+)
+
+# Splits a macro argument list on commas, respecting nested parens
+_ARG_SPLIT_RE = re.compile(r",(?![^(]*\))")
+
+# Extracts macro signature: %macro name(params)
+_MACRO_SIG_RE = re.compile(r"%\s*macro\s+\w+\s*\(([^)]*)\)", re.IGNORECASE)
+
+
+def _classify_ref(
+    raw: str,
+    param_pos: dict[str, int],
+) -> tuple[str, bool]:
+    """
+    Classify a raw dataset reference extracted from a macro body.
+
+    Returns (resolved_key, is_parameterised).
+    ``resolved_key`` is the literal lowercased dataset name if there is no
+    ``&`` reference, or the lowercased macro parameter name (without ``&``)
+    if the reference is a single, recognised macro variable.
+    """
+    raw = raw.strip()
+    if "&" not in raw:
+        return raw.lower(), False
+    refs = _MACRO_VAR_RE.findall(raw)
+    if len(refs) == 1 and refs[0].lower() in param_pos:
+        return refs[0].lower(), True
+    return raw.lower(), True
+
+
+def _parse_macro_params(sig_text: str) -> list[tuple[str, str | None]]:
+    """Parse a comma-separated macro parameter list into (name, default)."""
+    params: list[tuple[str, str | None]] = []
+    if not sig_text.strip():
+        return params
+    for part in _ARG_SPLIT_RE.split(sig_text):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" in part:
+            name, default = part.split("=", 1)
+            params.append((name.strip().lower(), default.strip()))
+        else:
+            params.append((part.lower(), None))
+    return params
+
+
+def _macro_body_io(
+    macro_text: str,
+) -> tuple[list[str], list[str], list[dict], list[dict], list[str]]:
+    """
+    Analyse a %MACRO block's body and classify every dataset reference
+    as literal (fixed value) or parameterised (depends on a call argument).
+
+    Returns
+    -------
+    literal_inputs, literal_outputs : list[str]
+    param_inputs, param_outputs     : list[dict]   {"param": name, "pos": idx}
+    param_names                     : list[str]    ordered signature names
+    """
+    mt = _sanitise(macro_text)
+
+    sig_m = _MACRO_SIG_RE.search(macro_text)
+    params = _parse_macro_params(sig_m.group(1) if sig_m else "")
+
+    param_pos: dict[str, int] = {}
+    pos_idx = 0
+    for pname, default in params:
+        if default is None:
+            param_pos[pname] = pos_idx
+            pos_idx += 1
+        else:
+            param_pos[pname] = -1
+
+    param_names = [p[0] for p in params]
+    logger.debug(f"_macro_body_io: params={param_names}  param_pos={param_pos}")
+
+    raw_outputs: list[str] = []
+    raw_inputs: list[str] = []
+
+    for m in _BODY_DATA_HDR_RE.finditer(mt):
+        for tok in re.findall(r"[A-Za-z_&][\w.&]*", m.group(1)):
+            if tok.lower() not in _SAS_RESERVED:
+                raw_outputs.append(tok)
+
+    for m in _BODY_OUTPUT_RE.finditer(mt):
+        raw_outputs.append(m.group(1))
+
+    for m in _BODY_PROC_OUT_RE.finditer(mt):
+        raw = m.group(1) or m.group(2) or ""
+        if raw:
+            raw_outputs.append(raw)
+
+    for m in _BODY_SQL_CREATE_RE.finditer(mt):
+        raw_outputs.append(m.group(1))
+    for m in _BODY_SQL_INTO_RE.finditer(mt):
+        raw_outputs.append(m.group(1))
+
+    for m in _BODY_SET_RE.finditer(mt):
+        cleaned = re.sub(r"\([^)]*\)", " ", m.group(1))
+        for tok in re.findall(r"[A-Za-z_&][\w.&]*", cleaned):
+            raw_inputs.append(tok)
+
+    for m in _BODY_MERGE_RE.finditer(mt):
+        cleaned = re.sub(r"\([^)]*\)", " ", m.group(1))
+        for tok in re.findall(r"[A-Za-z_&][\w.&]*", cleaned):
+            raw_inputs.append(tok)
+
+    for m in _BODY_UPDATE_RE.finditer(mt):
+        raw_inputs.append(m.group(1))
+        raw_outputs.append(m.group(1))
+    for m in _BODY_MODIFY_RE.finditer(mt):
+        raw_inputs.append(m.group(1))
+        raw_outputs.append(m.group(1))
+
+    for m in _BODY_PROC_IN_RE.finditer(mt):
+        raw_inputs.append(m.group(1))
+
+    for m in _BODY_SQL_FROM_RE.finditer(mt):
+        raw_inputs.append(m.group(1))
+    for m in _BODY_SQL_JOIN_RE.finditer(mt):
+        raw_inputs.append(m.group(1))
+
+    def _classify_list(raws: list[str], role: str) -> tuple[list[str], list[dict]]:
+        literals: list[str] = []
+        params_out: list[dict] = []
+        seen_lit: set[str] = set()
+        seen_par: set[str] = set()
+
+        for raw in raws:
+            raw = raw.strip()
+            if not raw or raw.lower() in _SAS_RESERVED:
+                continue
+            key, is_param = _classify_ref(raw, param_pos)
+            if is_param:
+                pname = key
+                if pname in param_pos and pname not in seen_par:
+                    seen_par.add(pname)
+                    params_out.append({"param": pname, "pos": param_pos[pname]})
+                    logger.debug(
+                        f"_macro_body_io: {role} PARAM  raw={raw!r}  param={pname}  pos={param_pos[pname]}"
+                    )
+                elif pname not in param_pos:
+                    logger.debug(
+                        f"_macro_body_io: {role} UNRESOLVABLE param ref {raw!r}"
+                    )
+            else:
+                if key not in seen_lit:
+                    seen_lit.add(key)
+                    literals.append(key)
+                    logger.debug(
+                        f"_macro_body_io: {role} LITERAL  raw={raw!r}  name={key}"
+                    )
+
+        return literals, params_out
+
+    lit_out, par_out = _classify_list(raw_outputs, "output")
+    lit_in, par_in = _classify_list(raw_inputs, "input")
+
+    logger.debug(
+        f"_macro_body_io: literal_outputs={lit_out}  literal_inputs={lit_in}  param_outputs={par_out}  param_inputs={par_in}"
+    )
+    return lit_in, lit_out, par_in, par_out, param_names
+
+
+def _ds_name(raw: str) -> str | None:
+    name = raw.strip().lower().split("(")[0].strip()
+    if not name or name in _SAS_RESERVED:
+        return None
+    return name
+
+
+def _multi_ds(match_group: str) -> list[str]:
+    cleaned = re.sub(r"\([^)]*\)", " ", match_group)
+    tokens = re.findall(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?", cleaned)
+    return [n for t in tokens if (n := _ds_name(t))]
+
+
+def _io_for(
+    text: str,
+    kind: SasChunkKind,
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    """
+    Extract directed data-flow edges from a single chunk's source text.
+
+    Returns
+    -------
+    (input_datasets, output_datasets, defines_macros, invokes_macros)
+    """
+    mt = _sanitise(text)
+
+    inputs: list[str] = []
+    outputs: list[str] = []
+    defines: list[str] = []
+    # Every chunk kind may invoke a macro inline (e.g. %clean inside a DATA
+    # step body, or a bare top-level call) — this scan is unconditional and
+    # identical across all kinds, so it runs once here rather than being
+    # repeated in each branch below.
+    invokes: list[str] = [m.group(1).lower() for m in _MACRO_INVOKE_RE.finditer(mt)]
+
+    if kind == SasChunkKind.MACRO_DEFINITION:
+        for m in _MACRO_DEF_RE.finditer(mt):
+            defines.append(m.group(1).lower())
+
+    elif kind == SasChunkKind.MACRO_CALL:
+        pass
+
+    elif kind == SasChunkKind.DATA_STEP:
+        first_semi = mt.find(";")
+        data_header = mt[:first_semi] if first_semi != -1 else mt
+        header_body = re.sub(r"^\s*data\s+", "", data_header, flags=re.IGNORECASE)
+        for tok in re.findall(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?", header_body):
+            if n := _ds_name(tok):
+                outputs.append(n)
+        for m in _OUTPUT_DS_RE.finditer(mt):
+            if n := _ds_name(m.group(1)):
+                outputs.append(n)
+        for m in _SET_RE.finditer(mt):
+            inputs.extend(_multi_ds(m.group(1)))
+        for m in _MERGE_RE.finditer(mt):
+            inputs.extend(_multi_ds(m.group(1)))
+        for m in _UPDATE_RE.finditer(mt):
+            if n := _ds_name(m.group(1)):
+                inputs.append(n)
+                outputs.append(n)
+        for m in _MODIFY_RE.finditer(mt):
+            if n := _ds_name(m.group(1)):
+                inputs.append(n)
+                outputs.append(n)
+
+    elif kind == SasChunkKind.PROC_STEP:
+        proc_m = _PROC_RE.search(mt)
+        proc_name = proc_m.group(1).lower() if proc_m else ""
+
+        if proc_name == "sql":
+            for m in _SQL_CREATE_RE.finditer(mt):
+                if n := _ds_name(m.group(1)):
+                    outputs.append(n)
+            for m in _SQL_INTO_RE.finditer(mt):
+                if n := _ds_name(m.group(1)):
+                    outputs.append(n)
+            for m in _SQL_FROM_RE.finditer(mt):
+                if n := _ds_name(m.group(1)):
+                    inputs.append(n)
+            for m in _SQL_JOIN_RE.finditer(mt):
+                if n := _ds_name(m.group(1)):
+                    inputs.append(n)
+        else:
+            for m in _PROC_IN_RE.finditer(mt):
+                if n := _ds_name(m.group(1)):
+                    inputs.append(n)
+            for m in _PROC_OUT_RE.finditer(mt):
+                raw = m.group(1) or m.group(2) or ""
+                if n := _ds_name(raw):
+                    outputs.append(n)
+            if proc_name == "sort" and not _PROC_OUT_RE.search(mt):
+                # in-place sort: DATA= is both input and output
+                for m in _PROC_IN_RE.finditer(mt):
+                    if (n := _ds_name(m.group(1))) and n not in outputs:
+                        outputs.append(n)
+
+    def _dedup(lst: list[str]) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for x in lst:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+
+    return _dedup(inputs), _dedup(outputs), _dedup(defines), _dedup(invokes)
