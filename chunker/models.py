@@ -49,6 +49,14 @@ class SasChunkKind(StrEnum):
     MACRO_CONTROL_FLOW = "MACRO_CONTROL_FLOW"
     INCLUDE = "INCLUDE"
     GLOBAL_STATEMENT = "GLOBAL_STATEMENT"
+    # A standalone RUN;/QUIT; that is *not* closing a DATA or PROC step —
+    # e.g. a stray RUN; written after a global LIBNAME/FILENAME/TITLE
+    # statement (a no-op in SAS, but common in hand-written code).  Inside a
+    # DATA/PROC block a RUN;/QUIT; still terminates that block and stays part
+    # of its chunk; this kind only applies to open-code occurrences that
+    # would otherwise fall through to UNKNOWN_STATEMENT_GROUP and raise a
+    # spurious UNRECOGNIZED_SOURCE_REGION diagnostic.
+    STEP_BOUNDARY = "STEP_BOUNDARY"
     COMMENT_BLOCK = "COMMENT_BLOCK"
     OPTIONS = "OPTIONS"
     FORMAT_OR_INFORMAT = "FORMAT_OR_INFORMAT"

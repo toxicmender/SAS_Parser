@@ -472,6 +472,16 @@ def _classify(stripped: str) -> SasChunkKind | None:
         return SasChunkKind.MACRO_CONTROL_FLOW
     if re.match(r"%[A-Za-z_]\w*\b", n):
         return SasChunkKind.MACRO_CALL
+    # A bare RUN;/QUIT; reached here (rather than inside _collect_block) is a
+    # standalone step boundary in open code — e.g. a stray RUN; after a
+    # global LIBNAME/TITLE statement.  Recognise it so it doesn't fall
+    # through to UNKNOWN_STATEMENT_GROUP and raise a spurious
+    # UNRECOGNIZED_SOURCE_REGION diagnostic.  RUN CANCEL; is included via the
+    # trailing \b (the optional CANCEL keyword follows).  Inside a DATA/PROC
+    # block this same statement still terminates the block (handled directly
+    # in _collect_block) and never reaches open code.
+    if re.match(r"(?:run|quit)\b", n, re.IGNORECASE):
+        return SasChunkKind.STEP_BOUNDARY
     if re.match(r"options\b", n, re.IGNORECASE):
         return SasChunkKind.OPTIONS
     if re.match(r"(?:libname|filename|title\d*|footnote\d*)\b", n, re.IGNORECASE):

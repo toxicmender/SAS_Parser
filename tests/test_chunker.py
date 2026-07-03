@@ -134,6 +134,45 @@ class TestSasSemanticChunker(unittest.TestCase):
         self.assertIn(SasChunkKind.GLOBAL_STATEMENT, kinds)
         self.assertIn(SasChunkKind.DATA_STEP, kinds)
 
+    def test_libname_with_stray_run_is_recognised(self):
+        # A multi-line LIBNAME (SAS/ACCESS engine, quoted &macro refs) followed
+        # by a stray, no-op RUN;.  The LIBNAME is its own GLOBAL_STATEMENT and
+        # the bare RUN; is recognised as a STEP_BOUNDARY — not swept into an
+        # UNKNOWN_STATEMENT_GROUP with a spurious UNRECOGNIZED_SOURCE_REGION.
+        source = (
+            'libname edwprod oracle path=EDWPRO_READ_ONLY schema=FR_DM_Pro '
+            'connection="global"\n'
+            'connection_group = "EDWPROD_READ_ONLY" user="&username." '
+            'pass="&user_pass.";\n'
+            "run;\n"
+        )
+        result = SasSemanticChunker().chunk_text(source)
+        self.assertEqual(len(result.chunks), 2)
+        self.assertEqual(result.chunks[0].kind, SasChunkKind.GLOBAL_STATEMENT)
+        self.assertEqual(
+            result.chunks[0].metadata.global_statement_keyword, "libname"
+        )
+        # The quoted &macro references still surface in metadata.
+        self.assertEqual(
+            result.chunks[0].metadata.referenced_macro_vars,
+            ["user_pass", "username"],
+        )
+        self.assertEqual(result.chunks[1].kind, SasChunkKind.STEP_BOUNDARY)
+        self.assertNotIn(
+            "UNRECOGNIZED_SOURCE_REGION",
+            {d.code for d in result.diagnostics},
+        )
+
+    def test_standalone_run_and_quit_are_step_boundaries(self):
+        # Bare RUN;/QUIT; in open code (no enclosing DATA/PROC step) are
+        # recognised rather than treated as unknown source.
+        result = SasSemanticChunker().chunk_text("run;\nquit;\n")
+        self.assertEqual(
+            [c.kind for c in result.chunks],
+            [SasChunkKind.STEP_BOUNDARY, SasChunkKind.STEP_BOUNDARY],
+        )
+        self.assertEqual(result.diagnostics, [])
+
     # ── comment / string edge cases ──────────────────────────────────────────
 
     def test_semicolons_inside_strings_and_comments_not_split(self):
