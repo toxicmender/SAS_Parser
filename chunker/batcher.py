@@ -308,8 +308,15 @@ def _discover_edges(
     produces_ds: dict[str, list[int]] = defaultdict(list)
     # macro name → global index of defining chunk (last definition wins)
     defines_macro: dict[str, int] = {}
-    # macro VARIABLE name → list of global indices of chunks that create it
-    # via CALL SYMPUT/SYMPUTX or PROC SQL INTO (ROADMAP Phase 2)
+    # macro VARIABLE name → list of global indices of chunks that create it.
+    # Two producer mechanisms feed this one index (ROADMAP Phase 2):
+    #   - DATA/PROC side effects: CALL SYMPUT/SYMPUTX or PROC SQL INTO
+    #     (``meta.produces_macrovars``).
+    #   - Macro-language declarations: ``%LET`` and ``%GLOBAL``/``%LOCAL``
+    #     lists (``meta.declared_macro_vars``).
+    # Both are treated identically here: any chunk that reads ``&name`` links
+    # back to whichever chunk brought that name into existence, regardless of
+    # how it was created.
     produces_macrovar: dict[str, list[int]] = defaultdict(list)
 
     # reverse-map: global_index → file_rank
@@ -340,6 +347,20 @@ def _discover_edges(
             logger.debug(
                 f"index[macrovar]: chunk {chunk.chunk_id} (g{gidx}) creates &{mvar}"
             )
+
+        # %LET / %GLOBAL / %LOCAL declarations also bring a macro variable
+        # into existence that downstream chunks may reference via &name.
+        # Register them in the same namespace as the SYMPUT/SQL-INTO
+        # producers above so that, e.g., "%let cutoff = 20240101;" links to a
+        # later "where dt >= &cutoff" step.  Guard against double-registering
+        # a name a chunk both declares and produces (which would emit a
+        # duplicate edge for the same producer/consumer pair).
+        for mvar in meta.declared_macro_vars:
+            if gidx not in produces_macrovar[mvar]:
+                produces_macrovar[mvar].append(gidx)
+                logger.debug(
+                    f"index[macrovar-decl]: chunk {chunk.chunk_id} (g{gidx}) declares &{mvar}"
+                )
 
         # ── Fix A: literal macro-body outputs ────────────────────────────
         # A %MACRO body may contain hard-coded dataset names, e.g.
@@ -676,6 +697,11 @@ def _make_batch(
         intra_outputs.update(c.metadata.output_datasets)
         intra_macros.update(c.metadata.defines_macros)
         intra_macrovars.update(c.metadata.produces_macrovars)
+        # %LET / %GLOBAL / %LOCAL declarations create macro variables too, so
+        # a name declared inside this batch is satisfied intra-batch and must
+        # not be reported as an external requirement (mirrors the producer
+        # index in _discover_edges).
+        intra_macrovars.update(c.metadata.declared_macro_vars)
         # A %MACRO definition's literal body outputs are produced whenever
         # the macro is invoked.  If any call site is also in this batch
         # (the usual case, since macro_invocation edges put them together),

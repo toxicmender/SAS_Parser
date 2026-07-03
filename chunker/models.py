@@ -424,8 +424,9 @@ class SasBatch(BaseModel):
     defined_macros
         Macro names whose full definitions live inside this batch.
     produced_macrovars
-        Macro variable names created inside this batch via CALL SYMPUT/
-        SYMPUTX or PROC SQL INTO (mirrors ``output_datasets`` for the
+        Macro variable names created inside this batch — via CALL SYMPUT/
+        SYMPUTX or PROC SQL INTO, or declared with ``%LET`` /
+        ``%GLOBAL`` / ``%LOCAL`` (mirrors ``output_datasets`` for the
         macro-variable namespace; ROADMAP Phase 2).
     required_macrovars
         Macro variable names referenced inside this batch (via ``&name``)

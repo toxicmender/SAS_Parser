@@ -504,6 +504,70 @@ class TestMacroVarFlowBatching(unittest.TestCase):
         self.assertEqual(len(br.batches), 0)
         self.assertEqual(len(br.singletons), 1)
 
+    def test_let_declaration_links_to_distant_consumer(self):
+        """A ``%LET``-declared macro variable is a producer in the
+        dependency graph: a later chunk referencing it must batch with the
+        declaring chunk even when an unrelated step sits between them (so
+        the link is a real macro_var_flow edge, not mere context
+        absorption of the adjacent %LET)."""
+        src = (
+            "%let cutoff = 20240101;\n"
+            "data work.other;\n  set lib.unrelated;\nrun;\n"
+            "data work.recent;\n"
+            "  set mylib.raw;\n"
+            "  where order_dt >= &cutoff;\n"
+            "run;\n"
+        )
+        cr = _C.chunk_text(src)
+        br = SasChunkBatcher().batch(cr)
+        self.assertEqual(len(br.batches), 1)
+        self.assertEqual(len(br.singletons), 0)
+        self.assertIn("cutoff", br.batches[0].produced_macrovars)
+        self.assertIn("macro_var_flow(&cutoff)", br.batches[0].reason)
+
+    def test_global_declaration_links_to_consumer(self):
+        """``%GLOBAL`` declaration names are producers too."""
+        src = (
+            "%global region;\n"
+            "data work.f;\n  set raw.s;\n  where region = \"&region\";\nrun;\n"
+        )
+        cr = _C.chunk_text(src)
+        br = SasChunkBatcher().batch(cr)
+        self.assertEqual(len(br.batches), 1)
+        self.assertIn("region", br.batches[0].produced_macrovars)
+
+    def test_cross_file_let_declaration_flow(self):
+        """A ``%LET`` in one file feeds a ``&var`` reference in another."""
+        cr1 = _C.chunk_text("%let region = APAC;", source_id="conf.sas")
+        cr2 = _C.chunk_text(
+            'data work.f;\n  set raw.s;\n  where region = "&region";\nrun;',
+            source_id="etl.sas",
+        )
+        br = MultiFileBatcher().batch(SasCorpus(file_results=[cr1, cr2]))
+        self.assertEqual(len(br.batches), 1)
+        self.assertTrue(br.batches[0].is_cross_file)
+        self.assertIn("region", br.batches[0].produced_macrovars)
+        self.assertEqual(
+            set(br.batches[0].source_files), {"conf.sas", "etl.sas"}
+        )
+
+    def test_unresolved_reference_stays_external_with_no_declaration(self):
+        """A ``&var`` never declared or produced anywhere in the corpus is
+        still reported as an external requirement, not spuriously linked."""
+        src = (
+            "data work.recent;\n"
+            "  set mylib.raw;\n"
+            "  where dt >= &external_cut;\n"
+            "run;\n"
+        )
+        cr = _C.chunk_text(src)
+        br = SasChunkBatcher().batch(cr)
+        self.assertEqual(len(br.batches), 0)
+        self.assertEqual(len(br.singletons), 1)
+        self.assertIn(
+            "external_cut", br.singletons[0].metadata.consumes_macrovars
+        )
+
     def test_does_not_interfere_with_dataset_flow_or_macro_invocation(self):
         """A complex program mixing dataset_flow, macro_invocation, and
         macro_var_flow edges must batch everything into one group."""
