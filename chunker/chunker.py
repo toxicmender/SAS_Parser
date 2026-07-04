@@ -15,6 +15,24 @@ FORMAT, LABEL, OPTIONS, LIBNAME, ODS, and other statement keywords that appear
 and must NOT terminate the block early.  Only a new DATA, PROC, or %MACRO
 header, or an explicit RUN/QUIT, closes the current block.
 
+Stuck-parser protection
+------------------------
+Two independent safeguards keep a pathological input from hanging the parser
+forever (see ``SasSemanticChunker(timeout=...)``):
+
+  * A wall-clock **deadline** is checked at statement/region boundaries in the
+    scan and grouping loops.  When it is exceeded the parser stops at the next
+    boundary, logs where it stopped, emits a ``PARSER_TIMEOUT`` diagnostic and
+    returns the *partial* result collected so far — a graceful exit rather than
+    an unbounded spin on, say, a multi-megabyte generated file.
+  * A background **watchdog** thread logs an escalating trail (WARNING → ERROR)
+    naming the phase and elapsed time whenever a parse overruns the timeout.
+    This is the only safeguard that fires when the parser is wedged inside a
+    single un-interruptible C-level regex call (catastrophic backtracking on
+    hostile source): pure-Python code cannot preempt that call, but the
+    watchdog still guarantees the stuck phase is named in the logs, so the hang
+    is diagnosable even if the process must ultimately be killed.
+
 Logging
 -------
 Logger: ``chunker.chunker``
@@ -23,14 +41,17 @@ Logger: ``chunker.chunker``
   -------  ---------------------------------------------------------------
   DEBUG    Per-unit / per-region decisions (very verbose; off in prod)
   INFO     File-level start/finish, oversized-split decisions, elapsed time
-  WARNING  Unclosed blocks, unterminated statements, unrecognised regions
-  ERROR    File-not-found (logged then re-raised)
+  WARNING  Unclosed blocks, unterminated statements, unrecognised regions;
+           watchdog "parse still running / appears stuck" notices
+  ERROR    File-not-found (logged then re-raised); parse-deadline exceeded
+           (partial result returned); repeated watchdog "appears stuck" notices
 """
 
 from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 from bisect import bisect_right
 from dataclasses import dataclass
@@ -436,6 +457,129 @@ class _Region:
 
 
 # ---------------------------------------------------------------------------
+# Stuck-parser protection — deadline + watchdog
+#
+# See the module docstring's "Stuck-parser protection" section for the split
+# of responsibilities: the deadline gives a *graceful partial exit* from the
+# Python-level scan/group loops, while the watchdog guarantees a *log trail*
+# for the one case the deadline cannot cover (a hang inside a single
+# un-interruptible C-level regex call).
+# ---------------------------------------------------------------------------
+
+
+class _Deadline:
+    """Monotonic wall-clock budget for a single parse.
+
+    A ``timeout`` of ``None`` means unbounded — :meth:`expired` then always
+    reports ``False`` and costs nothing.  :meth:`expired` reads the monotonic
+    clock, so call sites in the hot scan/group loops gate it behind a periodic
+    tick counter rather than hitting it on every character/unit.
+    """
+
+    __slots__ = ("_deadline",)
+
+    def __init__(self, timeout: float | None) -> None:
+        self._deadline = None if timeout is None else time.perf_counter() + timeout
+
+    def expired(self) -> bool:
+        return self._deadline is not None and time.perf_counter() >= self._deadline
+
+
+class _ParseWatchdog:
+    """Background timer that logs a trail when a parse appears stuck.
+
+    Used as a context manager around the whole parse.  When ``timeout`` is
+    ``None`` it is inert (no thread is started and :meth:`set_phase` is a
+    no-op).  Otherwise a daemon thread wakes every ``timeout`` seconds and,
+    while the parse is still running, logs which phase it was last in and how
+    long it has taken — escalating from WARNING to ERROR after repeated
+    strikes.  It never interrupts the parse (Python cannot preempt a C-level
+    regex call); its sole job is to make a wedged parse diagnosable from the
+    logs.  On a clean/graceful finish it is stopped and stays silent.
+    """
+
+    def __init__(self, timeout: float | None, label: str) -> None:
+        self._timeout = timeout
+        self._label = label
+        self._phase = "starting"
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        self._start = 0.0
+        self._thread: threading.Thread | None = None
+        if timeout is not None:
+            self._thread = threading.Thread(
+                target=self._run, name="chunker-watchdog", daemon=True
+            )
+
+    def __enter__(self) -> _ParseWatchdog:
+        if self._thread is not None:
+            self._start = time.perf_counter()
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._done.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.1)
+
+    def set_phase(self, phase: str) -> None:
+        if self._thread is None:
+            return
+        with self._lock:
+            self._phase = phase
+
+    def _run(self) -> None:
+        assert self._timeout is not None
+        strikes = 0
+        while not self._done.wait(self._timeout):
+            strikes += 1
+            elapsed = time.perf_counter() - self._start
+            with self._lock:
+                phase = self._phase
+            level = logging.ERROR if strikes >= 3 else logging.WARNING
+            logger.log(
+                level,
+                f"parse watchdog: '{self._label}' still running after "
+                f"{elapsed:.1f}s (timeout={self._timeout:.1f}s) — appears stuck "
+                f"in phase '{phase}'; graceful exit will occur at the next "
+                f"statement boundary if the parser is not wedged in a regex",
+            )
+
+
+def _record_parser_timeout(
+    diagnostics: list[SasDiagnostic],
+    line_starts: list[int],
+    phase: str,
+    stop_char: int,
+) -> None:
+    """Append a single ``PARSER_TIMEOUT`` diagnostic (idempotent across phases).
+
+    Once the deadline expires every subsequent phase sees it as expired and
+    bails immediately, so this guards against emitting one diagnostic per
+    phase — only the first (where the parser actually got stuck) is recorded.
+    """
+    if any(d.code == "PARSER_TIMEOUT" for d in diagnostics):
+        return
+    line = _line_for(stop_char, line_starts)
+    logger.error(
+        f"parse deadline exceeded during {phase} phase near line {line}; "
+        f"returning partial result"
+    )
+    diagnostics.append(
+        SasDiagnostic(
+            code="PARSER_TIMEOUT",
+            message=(
+                f"Parsing exceeded its time budget during the {phase} phase; "
+                f"output is partial (stopped near line {line})."
+            ),
+            severity=SasDiagnosticSeverity.ERROR,
+            start_line=line,
+            end_line=line,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
 # Block-boundary classifier
 #
 # IMPORTANT: only these three kinds open a new top-level block and therefore
@@ -540,13 +684,29 @@ class SasSemanticChunker:
     max_words : int
         Hard upper bound — regions larger than this are split at statement
         boundaries with a small overlap window.
+    timeout : float | None
+        Wall-clock budget, in seconds, for a single ``chunk_text`` /
+        ``chunk_file`` call.  When the parser overruns it, it stops at the next
+        statement/region boundary, logs where it stopped, emits a
+        ``PARSER_TIMEOUT`` diagnostic and returns the partial result gathered
+        so far (a background watchdog also logs the stuck phase throughout).
+        Pass ``None`` to disable both safeguards and parse unbounded.  Defaults
+        to 60s, comfortably above any healthy parse.
     """
 
-    def __init__(self, *, min_words: int = 300, max_words: int = 700) -> None:
+    def __init__(
+        self,
+        *,
+        min_words: int = 300,
+        max_words: int = 700,
+        timeout: float | None = 60.0,
+    ) -> None:
         self.min_words = min_words
         self.max_words = max_words
+        self.timeout = timeout
         logger.debug(
-            f"SasSemanticChunker  min_words={min_words}  max_words={max_words}"
+            f"SasSemanticChunker  min_words={min_words}  max_words={max_words}  "
+            f"timeout={timeout}"
         )
 
     # ------------------------------------------------------------------
@@ -578,25 +738,43 @@ class SasSemanticChunker:
 
         line_starts = _line_starts(source)
         diagnostics: list[SasDiagnostic] = []
+        deadline = _Deadline(self.timeout)
 
-        units = self._scan_units(source, line_starts, diagnostics)
-        logger.debug(f"chunk_text: scan → {len(units)} units")
+        with _ParseWatchdog(self.timeout, label) as watchdog:
+            watchdog.set_phase("scan")
+            units = self._scan_units(source, line_starts, diagnostics, deadline)
+            logger.debug(f"chunk_text: scan → {len(units)} units")
 
-        regions = self._group_regions(units, line_starts, diagnostics)
-        logger.debug(f"chunk_text: group → {len(regions)} regions")
+            watchdog.set_phase("region grouping")
+            regions = self._group_regions(units, line_starts, diagnostics, deadline)
+            logger.debug(f"chunk_text: group → {len(regions)} regions")
 
-        chunks: list[SasChunk] = []
-        for region in regions:
-            chunks.extend(
-                self._chunks_for_region(
-                    source,
-                    source_id,
-                    region,
-                    line_starts,
-                    len(chunks),
-                    diagnostics,
+            watchdog.set_phase("chunk building")
+            chunks: list[SasChunk] = []
+            for region in regions:
+                # Deadline check between regions: a graceful exit here keeps the
+                # chunks already built (each region is self-contained) and stops
+                # before spending more of the budget on the remaining regions.
+                if deadline.expired():
+                    _record_parser_timeout(
+                        diagnostics, line_starts, "chunk building", region.start
+                    )
+                    logger.warning(
+                        f"chunk_text: deadline exceeded before region at "
+                        f"line {_line_for(region.start, line_starts)}; "
+                        f"stopping with {len(chunks)} chunk(s) built"
+                    )
+                    break
+                chunks.extend(
+                    self._chunks_for_region(
+                        source,
+                        source_id,
+                        region,
+                        line_starts,
+                        len(chunks),
+                        diagnostics,
+                    )
                 )
-            )
 
         elapsed = time.perf_counter() - t0
         logger.info(
@@ -615,14 +793,30 @@ class SasSemanticChunker:
         source: str,
         line_starts: list[int],
         diagnostics: list[SasDiagnostic],
+        deadline: _Deadline,
     ) -> list[_Unit]:
         logger.debug(f"_scan_units: {len(source)} chars")
         units: list[_Unit] = []
         stmt_start: int | None = None
         index = 0
         quote: str | None = None
+        ticks = 0
 
         while index < len(source):
+            # Deadline check, gated behind a tick counter so perf_counter() is
+            # sampled ~once per 8192 iterations, not on every character (this is
+            # the module's hottest loop).  On expiry: keep the units gathered so
+            # far and return them for grouping — a graceful, partial exit.
+            ticks += 1
+            if (ticks & 0x1FFF) == 0 and deadline.expired():
+                _record_parser_timeout(diagnostics, line_starts, "scan", index)
+                logger.warning(
+                    f"_scan_units: deadline exceeded at char {index}/{len(source)} "
+                    f"(line {_line_for(index, line_starts)}); returning "
+                    f"{len(units)} partial unit(s)"
+                )
+                break
+
             if stmt_start is None:
                 stmt_start = index
 
@@ -742,11 +936,13 @@ class SasSemanticChunker:
         units: list[_Unit],
         line_starts: list[int],
         diagnostics: list[SasDiagnostic],
+        deadline: _Deadline,
     ) -> list[_Region]:
         logger.debug(f"_group_regions: {len(units)} units")
         regions: list[_Region] = []
         unknown: list[_Unit] = []
         index = 0
+        ticks = 0
 
         def flush_unknown() -> None:
             if not unknown:
@@ -780,6 +976,21 @@ class SasSemanticChunker:
             unknown.clear()
 
         while index < len(units):
+            # Deadline check (tick-gated, as in _scan_units).  On expiry, flush
+            # any pending unknown run and return the regions built so far so the
+            # chunk-building phase still gets a well-formed, if partial, list.
+            ticks += 1
+            if (ticks & 0x0FFF) == 0 and deadline.expired():
+                _record_parser_timeout(
+                    diagnostics, line_starts, "region grouping", units[index].start
+                )
+                logger.warning(
+                    f"_group_regions: deadline exceeded at unit {index}/{len(units)} "
+                    f"(line {_line_for(units[index].start, line_starts)}); "
+                    f"returning {len(regions)} partial region(s)"
+                )
+                break
+
             unit = units[index]
             stripped = unit.text.strip()
 
