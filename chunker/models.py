@@ -91,6 +91,15 @@ class SasDiagnostic(BaseModel):
             f"SasDiagnostic  code={self.code}  severity={self.severity}  line={self.start_line}  source={self.source_id or '<inline>'}"
         )
 
+    def __str__(self) -> str:
+        span = (
+            f"line {self.start_line}"
+            if self.end_line is None or self.end_line == self.start_line
+            else f"lines {self.start_line}-{self.end_line}"
+        )
+        source = f" [{self.source_id}]" if self.source_id else ""
+        return f"[{self.severity}] {self.code} ({span}){source}: {self.message}"
+
 
 # ---------------------------------------------------------------------------
 # Chunk metadata
@@ -292,6 +301,14 @@ class SasChunkMetadata(BaseModel):
     # and folded into `_macro_has_local_scope()`'s own check (see chunker.py).
     contains_computed_goto: bool = False
 
+    def __str__(self) -> str:
+        # Show only the fields that carry information, so the many empty
+        # defaults don't drown out the handful that are actually populated.
+        populated = ", ".join(
+            f"{name}={value!r}" for name, value in self.__dict__.items() if value
+        )
+        return f"SasChunkMetadata({populated or '<empty>'})"
+
 
 # ---------------------------------------------------------------------------
 # Chunk
@@ -323,6 +340,14 @@ class SasChunk(BaseModel):
             f"SasChunk  id={self.chunk_id}  kind={self.kind.value}  lines={self.start_line}-{self.end_line}  source={self.source_id or '<inline>'}  parent={self.parent_id or 'none'}"
         )
 
+    def __str__(self) -> str:
+        title = f" '{self.title}'" if self.title else ""
+        source = f" [{self.source_id}]" if self.source_id else ""
+        return (
+            f"SasChunk {self.chunk_id} [{self.kind.value}]{title} "
+            f"lines {self.start_line}-{self.end_line}{source}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Single-file chunker result
@@ -339,6 +364,12 @@ class SasChunkResult(BaseModel):
     def model_post_init(self, __context: object) -> None:  # noqa: ANN001
         logger.info(
             f"SasChunkResult  source='{self.source_id or '<inline>'}'  chunks={len(self.chunks)}  diagnostics={len(self.diagnostics)}"
+        )
+
+    def __str__(self) -> str:
+        return (
+            f"SasChunkResult(source='{self.source_id or '<inline>'}', "
+            f"chunks={len(self.chunks)}, diagnostics={len(self.diagnostics)})"
         )
 
 
@@ -384,6 +415,12 @@ class SasCorpus(BaseModel):
         total_chunks = sum(len(r.chunks) for r in self.file_results)
         logger.info(
             f"SasCorpus  files={len(self.file_results)}  total_chunks={total_chunks}  source_ids={self.source_ids}"
+        )
+
+    def __str__(self) -> str:
+        return (
+            f"SasCorpus(files={len(self.file_results)}, "
+            f"total_chunks={len(self.all_chunks)}, source_ids={self.source_ids})"
         )
 
 
@@ -476,6 +513,15 @@ class SasBatch(BaseModel):
             f"SasBatch  id={self.batch_id}  chunks={len(self.chunks)}  source_files={self.source_files}  cross_file={self.is_cross_file}  inputs={self.input_datasets}  outputs={self.output_datasets}"
         )
 
+    def __str__(self) -> str:
+        scope = "cross-file" if self.is_cross_file else "single-file"
+        return (
+            f"SasBatch {self.batch_id} ({scope}) chunks={len(self.chunks)} "
+            f"lines {self.start_line}-{self.end_line} "
+            f"source_files={self.source_files} "
+            f"inputs={self.input_datasets} outputs={self.output_datasets}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Single-file batcher result
@@ -505,6 +551,12 @@ class SasBatchResult(BaseModel):
     def model_post_init(self, __context: object) -> None:  # noqa: ANN001
         logger.info(
             f"SasBatchResult  source='{self.source_id or '<inline>'}'  batches={len(self.batches)}  singletons={len(self.singletons)}"
+        )
+
+    def __str__(self) -> str:
+        return (
+            f"SasBatchResult(source='{self.source_id or '<inline>'}', "
+            f"batches={len(self.batches)}, singletons={len(self.singletons)})"
         )
 
 
@@ -565,4 +617,12 @@ class SasMultiBatchResult(BaseModel):
         cf = sum(1 for b in self.batches if b.is_cross_file)
         logger.info(
             f"SasMultiBatchResult  source_ids={self.source_ids}  batches={len(self.batches)}  cross_file_batches={cf}  singletons={len(self.singletons)}"
+        )
+
+    def __str__(self) -> str:
+        return (
+            f"SasMultiBatchResult(source_ids={self.source_ids}, "
+            f"batches={len(self.batches)}, "
+            f"cross_file_batches={len(self.cross_file_batches)}, "
+            f"singletons={len(self.singletons)})"
         )

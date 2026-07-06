@@ -51,12 +51,15 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 import threading
 import time
 from bisect import bisect_right
+from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
+from typing import TextIO
 
 import regex
 
@@ -70,6 +73,51 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Pretty-printing helper
+# ---------------------------------------------------------------------------
+
+
+def print_iterable(
+    items: Iterable[object],
+    *,
+    label: str | None = None,
+    numbered: bool = True,
+    stream: TextIO | None = None,
+) -> None:
+    """Print an iterable of objects one-per-line via each item's ``str()``.
+
+    A convenience for eyeballing a chunker run at the REPL — e.g. the
+    ``chunks`` or ``diagnostics`` of a :class:`~chunker.models.SasChunkResult`,
+    or the internal ``_Region`` / ``_Unit`` lists while debugging.  Every
+    element is rendered with ``str()``; the models and the internal
+    dataclasses all provide concise readable forms.
+
+    Parameters
+    ----------
+    items
+        Any iterable.  Materialised to a list once so its length can be
+        reported (safe to pass a generator).
+    label
+        Header line printed before the items.  Defaults to ``"N item(s)"``.
+    numbered
+        Prefix each line with a right-aligned ``[i]`` index (default True).
+    stream
+        Destination text stream; defaults to ``sys.stdout``.
+    """
+    materialised = list(items)
+    out = stream if stream is not None else sys.stdout
+    header = label if label is not None else f"{len(materialised)} item(s)"
+    print(f"{header}:", file=out)
+    if not materialised:
+        print("  <empty>", file=out)
+        return
+    width = len(str(len(materialised)))
+    for i, item in enumerate(materialised, 1):
+        prefix = f"  [{i:>{width}}] " if numbered else "  "
+        print(f"{prefix}{item}", file=out)
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +491,24 @@ class _Unit:
     terminated: bool = True
     unclosed_comment: bool = False
 
+    def __str__(self) -> str:
+        # start/end are character offsets into the source; show a short
+        # single-line preview rather than the full (possibly long) text.
+        preview = " ".join(self.text.split())
+        if len(preview) > 60:
+            preview = preview[:57] + "..."
+        flags = [
+            name
+            for name, on in (
+                ("comment", self.is_comment),
+                ("unterminated", not self.terminated),
+                ("unclosed-comment", self.unclosed_comment),
+            )
+            if on
+        ]
+        tag = f" ({', '.join(flags)})" if flags else ""
+        return f"_Unit chars {self.start}-{self.end}{tag}: {preview!r}"
+
 
 @dataclass(frozen=True)
 class _Region:
@@ -451,6 +517,13 @@ class _Region:
     end: int
     units: list[_Unit]
     unclosed: bool = False
+
+    def __str__(self) -> str:
+        unclosed = " unclosed" if self.unclosed else ""
+        return (
+            f"_Region {self.kind.value} chars {self.start}-{self.end} "
+            f"units={len(self.units)}{unclosed}"
+        )
 
     @cached_property
     def text(self) -> str:

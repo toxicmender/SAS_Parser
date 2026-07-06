@@ -47,9 +47,12 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 import time
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import TextIO
 
 from .chunker import _STANDARD_AUTOCALL_MACROS
 from .models import (
@@ -63,6 +66,52 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Pretty-printing helper
+# ---------------------------------------------------------------------------
+
+
+def print_iterable(
+    items: Iterable[object],
+    *,
+    label: str | None = None,
+    numbered: bool = True,
+    stream: TextIO | None = None,
+) -> None:
+    """Print an iterable of objects one-per-line via each item's ``str()``.
+
+    A convenience for eyeballing a batcher run at the REPL — e.g. the
+    ``batches`` or ``singletons`` of a
+    :class:`~chunker.models.SasBatchResult`, or the internal ``_Edge`` list
+    while debugging dependency discovery.  Every element is rendered with
+    ``str()``; the models and the internal dataclasses all provide concise
+    readable forms.
+
+    Parameters
+    ----------
+    items
+        Any iterable.  Materialised to a list once so its length can be
+        reported (safe to pass a generator).
+    label
+        Header line printed before the items.  Defaults to ``"N item(s)"``.
+    numbered
+        Prefix each line with a right-aligned ``[i]`` index (default True).
+    stream
+        Destination text stream; defaults to ``sys.stdout``.
+    """
+    materialised = list(items)
+    out = stream if stream is not None else sys.stdout
+    header = label if label is not None else f"{len(materialised)} item(s)"
+    print(f"{header}:", file=out)
+    if not materialised:
+        print("  <empty>", file=out)
+        return
+    width = len(str(len(materialised)))
+    for i, item in enumerate(materialised, 1):
+        prefix = f"  [{i:>{width}}] " if numbered else "  "
+        print(f"{prefix}{item}", file=out)
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +166,10 @@ class _Edge:
     from_global_idx: int
     to_global_idx: int
     cross_file: bool = False
+
+    def __str__(self) -> str:
+        scope = " (cross-file)" if self.cross_file else ""
+        return f"_Edge {self.from_id} -> {self.to_id} [{self.kind} via {self.via}]{scope}"
 
 
 # Splits a call-site argument list on commas, respecting nested parens
