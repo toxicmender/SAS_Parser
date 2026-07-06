@@ -2408,7 +2408,7 @@ _MACRO_INVOKE_RE = re.compile(
 # with no reachable terminator must fail in O(n), not exponentially.  The outer
 # ``+?`` stays lazy to preserve the "stop at the first ; / keyword" capture.
 _BODY_DATA_HDR_RE = re.compile(
-    r"(?<![\w=])data\s++((?:[A-Za-z_&][\w.&]*+\s*+)+?)(?=;)",
+    r"(?<![\w=])data\s++((?:[A-Za-z_&][\w.&]*+(?:\s*+\([^)]*+\))?\s*+)+?)(?=;)",
     re.IGNORECASE,
 )
 _BODY_SET_RE = re.compile(
@@ -2525,7 +2525,8 @@ def _macro_body_io(
     raw_inputs: list[str] = []
 
     for m in _BODY_DATA_HDR_RE.finditer(mt):
-        for tok in _AMP_TOKEN_RE.findall(m.group(1)):
+        cleaned = _PAREN_RE.sub(" ", m.group(1))
+        for tok in _AMP_TOKEN_RE.findall(cleaned):
             if tok.lower() not in _SAS_RESERVED:
                 raw_outputs.append(tok)
 
@@ -2715,9 +2716,7 @@ def _io_for(
         first_semi = mt.find(";")
         data_header = mt[:first_semi] if first_semi != -1 else mt
         header_body = _DATA_HDR_STRIP_RE.sub("", data_header)
-        for tok in _DS_TOKEN_RE.findall(header_body):
-            if n := _ds_name(tok):
-                outputs.append(_canon_ds(n))
+        outputs.extend(_multi_ds(header_body))
         for m in _OUTPUT_DS_RE.finditer(mt):
             if n := _ds_name(m.group(1)):
                 outputs.append(_canon_ds(n))
