@@ -57,6 +57,39 @@ class TestSasSemanticChunker(unittest.TestCase):
         self.assertEqual(chunk.kind, SasChunkKind.DATA_STEP)
         self.assertIn("work.shopping", chunk.metadata.referenced_datasets)
 
+    def test_data_step_header_dataset_options_not_outputs(self):
+        # Dataset options in parens on the DATA statement header (keep=/drop=/
+        # where=) must be blanked before tokenising — the option keywords and
+        # variable names inside them are not produced datasets.
+        source = (
+            "data work.out(keep=x y drop=z where=(x > 0));\n"
+            " set work.src;\n"
+            "run;\n"
+        )
+        result = SasSemanticChunker().chunk_text(source)
+        chunk = result.chunks[0]
+        self.assertEqual(chunk.kind, SasChunkKind.DATA_STEP)
+        self.assertEqual(chunk.metadata.output_datasets, ["work.out"])
+        self.assertEqual(chunk.metadata.input_datasets, ["work.src"])
+
+    def test_macro_body_data_header_with_options(self):
+        # Same hazard inside a %MACRO body: a DATA header carrying dataset
+        # options must still yield its real output name, and none of the
+        # option tokens.
+        source = (
+            "%macro build;\n"
+            "  data work.out(keep=x y drop=z);\n"
+            "    set work.src;\n"
+            "  run;\n"
+            "%mend build;\n"
+        )
+        result = SasSemanticChunker().chunk_text(source)
+        chunk = result.chunks[0]
+        self.assertEqual(chunk.kind, SasChunkKind.MACRO_DEFINITION)
+        self.assertIn("work.out", chunk.metadata.body_literal_outputs)
+        for tok in ("keep", "drop", "x", "y", "z"):
+            self.assertNotIn(tok, chunk.metadata.body_literal_outputs)
+
     # ── PROC step ────────────────────────────────────────────────────────────
 
     def test_proc_step_quit_terminator(self):
