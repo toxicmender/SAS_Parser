@@ -252,6 +252,27 @@ class TestSasSemanticChunker(unittest.TestCase):
         self.assertIsNone(parent.parent_id)
         self.assertTrue(all(c.parent_id == parent.chunk_id for c in children))
 
+    def test_oversized_split_no_space_after_semicolon_boundaries(self):
+        # Statements have internal spaces but NO whitespace after each ';', so
+        # adjacent units join without a separator (e.g. "...0;x1 = ...") and the
+        # word count of a joined span is *less* than the sum of its parts.  This
+        # pins the exact split boundaries so the incremental word-count path in
+        # _chunks_for_region stays equivalent to re-splitting the joined text.
+        stmts = "".join(f"x{i} = {i};" for i in range(900))
+        source = f"data work.big;{stmts}run;"
+        result = SasSemanticChunker(max_words=120).chunk_text(source)
+        boundaries = [(c.start_char, c.end_char) for c in result.chunks]
+        self.assertEqual(
+            boundaries,
+            [
+                (0, 9698), (0, 525), (498, 1059), (1026, 1675), (1642, 2291),
+                (2258, 2907), (2874, 3523), (3490, 4139), (4106, 4755),
+                (4722, 5371), (5338, 5987), (5954, 6603), (6570, 7219),
+                (7186, 7835), (7802, 8451), (8418, 9067), (9034, 9683),
+                (9650, 9698),
+            ],
+        )
+
     # ── diagnostics ──────────────────────────────────────────────────────────
 
     def test_unclosed_data_step_diagnostic(self):
