@@ -106,6 +106,60 @@ class TestSasSemanticChunker(unittest.TestCase):
         codes = {d.code for d in result.diagnostics}
         self.assertIn("UNCLOSED_MACRO", codes)
 
+    def test_macro_with_data_steps_procs_and_nested_macros(self):
+        # A single %MACRO body holding, in order:
+        #   * 5 DATA steps (one of them a DATA _NULL_ step that outputs nothing)
+        #   * 3 PROC SUMMARY steps (NWAY + MISSING options)
+        #   * 2 nested %MACRO definitions, one directly after the other
+        # then closed by the outer `%mend main;`.
+        #
+        # Per _collect_block's contract, a %MACRO block is closed *only* by its
+        # own %MEND, so the whole thing is ONE MACRO_DEFINITION region spanning
+        # from `%macro main;` to `%mend main;`, and every %MACRO header inside
+        # (main, inner1, inner2) is reported in metadata.defined_macros.
+        source = (
+            "%macro main;\n"
+            "  data step1; set lib.a; total = 1; run;\n"
+            "  data step2; set lib.b; total = 2; run;\n"
+            "  data _null_; set lib.c; put total; run;\n"
+            "  data step4; set lib.d; total = 4; run;\n"
+            "  data step5; set lib.e; total = 5; run;\n"
+            "\n"
+            "  proc summary data=lib.f nway missing; class region; var sales;"
+            " output out=work.o1 sum=; run;\n"
+            "  proc summary data=lib.g nway missing; class region; var sales;"
+            " output out=work.o2 sum=; run;\n"
+            "  proc summary data=lib.h nway missing; class region; var sales;"
+            " output out=work.o3 sum=; run;\n"
+            "\n"
+            "  %macro inner1;\n"
+            "    data work.i1; set lib.i; run;\n"
+            "  %mend inner1;\n"
+            "\n"
+            "  %macro inner2;\n"
+            "    data work.i2; set lib.j; run;\n"
+            "  %mend inner2;\n"
+            "%mend main;\n"
+        )
+        result = SasSemanticChunker().chunk_text(source)
+
+        # The outer macro is one region, undivided by the inner definitions.
+        self.assertEqual(len(result.chunks), 1)
+        chunk = result.chunks[0]
+        self.assertEqual(chunk.kind, SasChunkKind.MACRO_DEFINITION)
+        self.assertEqual(chunk.metadata.macro_name, "main")
+        # It must span all the way to the outer `%mend main;` on the last line.
+        self.assertEqual(chunk.start_line, 1)
+        self.assertEqual(chunk.end_line, source.count("\n"))
+        # Both nested macros are captured inside the body, not spun off.
+        self.assertEqual(
+            chunk.metadata.defined_macros, ["inner1", "inner2", "main"]
+        )
+        # The DATA _NULL_ step is a well-known no-output step: `_null_` is a
+        # reserved automatic dataset name and must not surface as a real output.
+        self.assertNotIn("_null_", chunk.metadata.output_datasets)
+        self.assertNotIn("UNCLOSED_MACRO", {d.code for d in result.diagnostics})
+
     # ── GLOBAL statements ────────────────────────────────────────────────────
 
     def test_global_statements_libname_options_title(self):

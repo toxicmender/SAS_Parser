@@ -1182,9 +1182,14 @@ class SasSemanticChunker:
 
         A block ends when one of the following is encountered:
         - An explicit ``RUN;`` or ``QUIT;`` statement     (DATA / PROC)
-        - An explicit ``%MEND;`` statement                (%MACRO)
+        - The matching ``%MEND;`` statement                (%MACRO)
         - A new DATA, PROC, or %MACRO header              (implicit close)
         - End of file                                     (unclosed block)
+
+        Nested ``%MACRO`` definitions are balanced: a macro body may contain
+        inner ``%MACRO``/``%MEND`` pairs, so the block is closed only by the
+        ``%MEND`` that matches *this* macro's own header — inner ``%MEND``
+        statements pop the nesting depth without ending the outer block.
 
         Critically, FORMAT, LABEL, OPTIONS, LIBNAME, ODS, TITLE, and all
         other statement types are treated as ordinary body statements and
@@ -1193,6 +1198,12 @@ class SasSemanticChunker:
         logger.debug(f"_collect_block: {kind.value}  start_unit={start}")
         block: list[_Unit] = []
         index = start
+        # Nesting depth of *inner* %MACRO definitions currently open inside this
+        # macro body.  Only meaningful when kind is MACRO_DEFINITION; each inner
+        # %MACRO header increments it and each %MEND decrements it, so the block
+        # closes on the %MEND that brings the depth back below zero — i.e. the
+        # one matching this macro's own header.
+        macro_depth = 0
 
         while index < len(units):
             unit = units[index]
@@ -1223,11 +1234,31 @@ class SasSemanticChunker:
                 )
                 return block, index, True
 
+            # A nested %MACRO header inside our macro body opens an inner
+            # definition that must be balanced by its own %MEND before ours can
+            # close us.  The first unit (index == start) is *our* header, not a
+            # nested one, so it never bumps the depth.
+            if (
+                kind == SasChunkKind.MACRO_DEFINITION
+                and cls == SasChunkKind.MACRO_DEFINITION
+                and index != start
+            ):
+                macro_depth += 1
+                logger.debug(
+                    f"_collect_block: nested %MACRO at unit {index}  depth={macro_depth}"
+                )
+
             block.append(unit)
             index += 1
 
             # ── explicit terminators ────────────────────────────────────────
             if kind == SasChunkKind.MACRO_DEFINITION and _MEND_RE.match(lowered):
+                if macro_depth > 0:
+                    macro_depth -= 1
+                    logger.debug(
+                        f"_collect_block: %MEND closes nested macro  depth={macro_depth}"
+                    )
+                    continue
                 logger.debug(
                     f"_collect_block: %MEND → closed MACRO_DEFINITION  units={len(block)}"
                 )
@@ -2192,13 +2223,24 @@ _SQL_INTO_RE = re.compile(
     r"\binsert\s+into\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
     re.IGNORECASE,
 )
+# The inner token quantifiers below are *possessive* (``*+``): the dataset-list
+# group ``(?:token (opts)? ws)+?`` is a nested quantifier whose inner ``\w*`` /
+# ``\s*`` can re-partition the same text many ways.  With a plain greedy/lazy
+# star, a ``set``/``merge`` header that never reaches its terminating ``;`` (or
+# BY/WHERE/OBS keyword) — e.g. a source line with a dropped semicolon — makes
+# the engine explore those partitions exponentially (catastrophic backtracking,
+# which the parse deadline cannot interrupt since it is one un-interruptible
+# C-level regex call).  Possessive stars commit each token/whitespace run once
+# and never give it back, so a failing match degrades to O(n).  Only the outer
+# ``+?`` stays lazy — it must still stop at the first terminator so a trailing
+# BY/WHERE/OBS keyword isn't swallowed into the dataset list.
 _SET_RE = re.compile(
-    r"\bset\s+((?:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?(?:\s*\([^)]*\))?\s*)+?)"
+    r"\bset\s++((?:[A-Za-z_]\w*+(?:\.[A-Za-z_]\w*+)?(?:\s*+\([^)]*\))?\s*+)+?)"
     r"(?=;|\bwhere\b|\bby\b|\bobs\b|\bnobs\b)",
     re.IGNORECASE | re.DOTALL,
 )
 _MERGE_RE = re.compile(
-    r"\bmerge\s+((?:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?(?:\s*\([^)]*\))?\s*)+?)"
+    r"\bmerge\s++((?:[A-Za-z_]\w*+(?:\.[A-Za-z_]\w*+)?(?:\s*+\([^)]*\))?\s*+)+?)"
     r"(?=;|\bby\b)",
     re.IGNORECASE | re.DOTALL,
 )
@@ -2260,17 +2302,22 @@ _MACRO_INVOKE_RE = re.compile(
 # _VAR_REF_RE defined above — the pattern is identical, so it is reused here
 # rather than compiled a second time.
 
-# DATA statement header inside a macro body (may contain &refs)
+# DATA statement header inside a macro body (may contain &refs).
+# Inner token/whitespace stars are possessive (``*+``) for the same
+# catastrophic-backtracking reason documented at _SET_RE above: these run over
+# a whole (possibly malformed) macro body, so a ``data``/``set``/``merge`` header
+# with no reachable terminator must fail in O(n), not exponentially.  The outer
+# ``+?`` stays lazy to preserve the "stop at the first ; / keyword" capture.
 _BODY_DATA_HDR_RE = re.compile(
-    r"(?<![\w=])data\s+((?:[A-Za-z_&][\w.&]*\s*)+?)(?=;)",
+    r"(?<![\w=])data\s++((?:[A-Za-z_&][\w.&]*+\s*+)+?)(?=;)",
     re.IGNORECASE,
 )
 _BODY_SET_RE = re.compile(
-    r"\bset\s+((?:[A-Za-z_&][\w.&]*(?:\s*\([^)]*\))?\s*)+?)(?=;|\bwhere\b|\bby\b|\bobs\b)",
+    r"\bset\s++((?:[A-Za-z_&][\w.&]*+(?:\s*+\([^)]*\))?\s*+)+?)(?=;|\bwhere\b|\bby\b|\bobs\b)",
     re.IGNORECASE | re.DOTALL,
 )
 _BODY_MERGE_RE = re.compile(
-    r"\bmerge\s+((?:[A-Za-z_&][\w.&]*(?:\s*\([^)]*\))?\s*)+?)(?=;|\bby\b)",
+    r"\bmerge\s++((?:[A-Za-z_&][\w.&]*+(?:\s*+\([^)]*\))?\s*+)+?)(?=;|\bby\b)",
     re.IGNORECASE | re.DOTALL,
 )
 _BODY_UPDATE_RE = re.compile(r"\bupdate\s+([A-Za-z_&][\w.&]*)", re.IGNORECASE)
