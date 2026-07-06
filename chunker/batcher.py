@@ -125,6 +125,11 @@ _CALL_ARG_SPLIT_RE = re.compile(r",(?![^(]*\))")
 # Extracts the call's argument list: %macroname( ... )
 _CALL_ARGS_RE = re.compile(r"%\s*\w+\s*\(([^)]*)\)", re.DOTALL)
 
+# A libref.member (or bare member) dataset token, used to scan a MACRO_CALL
+# chunk's argument text for names that match a producer.  Compiled once here
+# rather than passed as a string literal to re.findall on every MACRO_CALL.
+_ARG_DS_TOKEN_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?")
+
 
 def _parse_call_args(call_text: str) -> tuple[list[str], dict[str, str]]:
     """
@@ -207,7 +212,7 @@ _CONTEXT_KINDS = _OPTION_KINDS | _COMMENT_KINDS
 
 def _build_flat_index(
     file_results: list[SasChunkResult],
-) -> tuple[list[SasChunk], list[tuple[int, int]], list[int]]:
+) -> tuple[list[SasChunk], list[int]]:
     """
     Flatten all files into a single ordered list and re-stamp chunk IDs
     so they are globally unique across files.
@@ -221,17 +226,14 @@ def _build_flat_index(
     -------
     flat_chunks : list[SasChunk]
         Every chunk across all files in corpus order, with global IDs.
-    file_chunk_ranges : list[(start, end)]
-        Inclusive global index range for each file.
     file_offsets : list[int]
         Global index of the first chunk of each file.
     """
     flat: list[SasChunk] = []
-    ranges: list[tuple[int, int]] = []
     offsets: list[int] = []
 
     for fi, fr in enumerate(file_results):
-        start = len(flat)
+        offsets.append(len(flat))
         for chunk in fr.chunks:
             # Build a globally-unique ID: f<file_rank>-<original_id>
             # e.g. "chunk-0003" in file 2 → "f2-chunk-0003"
@@ -244,11 +246,8 @@ def _build_flat_index(
                     update={"parent_id": f"f{fi + 1}-{chunk.parent_id}"}
                 )
             flat.append(stamped)
-        end = len(flat) - 1
-        ranges.append((start, end))
-        offsets.append(start)
 
-    return flat, ranges, offsets
+    return flat, offsets
 
 
 def _add_edge(
@@ -283,9 +282,10 @@ def _add_edge(
     )
     edges.append(e)
     merged = uf.union(from_idx, to_idx)
-    logger.debug(
-        f"edge[{kind}] {e.from_id}(g{from_idx}) → {e.to_id}(g{to_idx}) via={via!r} cross_file={cf} uf_merged={merged}"
-    )
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            f"edge[{kind}] {e.from_id}(g{from_idx}) → {e.to_id}(g{to_idx}) via={via!r} cross_file={cf} uf_merged={merged}"
+        )
     return merged
 
 
@@ -293,16 +293,15 @@ def _discover_edges(
     flat_chunks: list[SasChunk],
     uf: _UF,
     *,
-    file_offsets: list[int],
+    file_of: list[int],
 ) -> list[_Edge]:
     """
     Walk flat_chunks once, building producer indices and emitting edges.
 
-    file_offsets is used to determine when two chunks belong to different
-    files (for logging the cross_file flag on edges).
+    ``file_of`` (global_index → file_rank) is used to determine when two
+    chunks belong to different files (for the cross_file flag on edges).  It
+    is computed once by the caller and shared across all passes.
     """
-    n = len(flat_chunks)
-
     # ── build producer indices ─────────────────────────────────────────────
     # dataset → list of global indices of chunks that write it
     produces_ds: dict[str, list[int]] = defaultdict(list)
@@ -318,9 +317,6 @@ def _discover_edges(
     # back to whichever chunk brought that name into existence, regardless of
     # how it was created.
     produces_macrovar: dict[str, list[int]] = defaultdict(list)
-
-    # reverse-map: global_index → file_rank
-    file_of = _file_of_map(file_offsets, n)
 
     for gidx, chunk in enumerate(flat_chunks):
         meta = chunk.metadata
@@ -460,10 +456,7 @@ def _discover_edges(
 
         # — macro-argument dataset —
         if chunk.kind == SasChunkKind.MACRO_CALL:
-            arg_tokens = re.findall(
-                r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?",
-                chunk.text,
-            )
+            arg_tokens = _ARG_DS_TOKEN_RE.findall(chunk.text)
             for tok in arg_tokens:
                 ds_norm = tok.lower()
                 if ds_norm not in produces_ds:
@@ -610,15 +603,17 @@ def _absorb_context(
     *,
     include_options: bool,
     include_comments: bool,
-    file_offsets: list[int],
+    file_of: list[int],
 ) -> None:
     """
     Pull OPTIONS/GLOBAL_STATEMENT and/or COMMENT_BLOCK chunks into the
     component of the first substantive chunk that follows them,
     *within the same file only*.  We never absorb across a file boundary.
+
+    ``file_of`` (global_index → file_rank) is computed once by the caller and
+    shared across all passes.
     """
     n = len(flat_chunks)
-    file_of = _file_of_map(file_offsets, n)
 
     for idx, chunk in enumerate(flat_chunks):
         kind = chunk.kind
@@ -657,19 +652,22 @@ def _absorb_context(
 def _make_batch(
     global_indices: list[int],
     flat_chunks: list[SasChunk],
-    edges_by_pair: dict[tuple[int, int], list[_Edge]],
+    component_edges: list[_Edge],
     batch_number: int,
-    file_offsets: list[int],
+    file_of: list[int],
 ) -> SasBatch:
     """
     Build a SasBatch from a set of global chunk indices.
 
     Chunks are ordered by (file_rank, start_line) so producers always
     appear before consumers in the batch text.
-    """
-    n = len(flat_chunks)
-    file_of = _file_of_map(file_offsets, n)
 
+    ``component_edges`` are exactly the edges internal to this batch's
+    Union-Find component (every edge's endpoints share a component root,
+    since each edge unions them), pre-grouped by the caller so the reason
+    string is built without re-scanning the whole corpus edge list.
+    ``file_of`` (global_index → file_rank) is computed once by the caller.
+    """
     bid = f"batch-{batch_number:03d}"
 
     # Sort by (file_rank, start_line) — producers before consumers
@@ -757,9 +755,16 @@ def _make_batch(
                 logger.debug(f"_make_batch {bid}: ext macrovar '&{mvar}'")
 
     # ── reason string ──────────────────────────────────────────────────────
+    # Group this component's edges by (from, to) pair, preserving the global
+    # discovery order in which each pair is first seen — identical to the old
+    # global edges_by_pair iteration restricted to this component.
+    edges_by_pair: dict[tuple[int, int], list[_Edge]] = defaultdict(list)
+    for e in component_edges:
+        edges_by_pair[(e.from_global_idx, e.to_global_idx)].append(e)
+
     reason_parts: list[str] = []
     seen_r: set[str] = set()
-    for (fi, ti), edge_list in edges_by_pair.items():
+    for edge_list in edges_by_pair.values():
         fid = edge_list[0].from_id
         tid = edge_list[0].to_id
         if fid not in member_ids and tid not in member_ids:
@@ -793,15 +798,19 @@ def _extract_result(
     uf: _UF,
     flat_chunks: list[SasChunk],
     edges: list[_Edge],
-    file_offsets: list[int],
+    file_of: list[int],
 ) -> tuple[list[SasBatch], list[SasChunk]]:
     """Convert UF components → (batches, singletons)."""
     n = len(flat_chunks)
     components = uf.components(n)
 
-    edges_by_pair: dict[tuple[int, int], list[_Edge]] = defaultdict(list)
+    # Group edges by their component root.  Both endpoints of every edge share
+    # a root (each edge unions them in the UF), so keying on the from-endpoint's
+    # root buckets each edge with exactly the batch it belongs to — turning the
+    # old O(batches × total_edges) reason scan into O(total_edges) overall.
+    edges_by_component: dict[int, list[_Edge]] = defaultdict(list)
     for e in edges:
-        edges_by_pair[(e.from_global_idx, e.to_global_idx)].append(e)
+        edges_by_component[uf.find(e.from_global_idx)].append(e)
 
     batches: list[SasBatch] = []
     singletons: list[SasChunk] = []
@@ -821,9 +830,9 @@ def _extract_result(
         batch = _make_batch(
             global_indices=members,
             flat_chunks=flat_chunks,
-            edges_by_pair=edges_by_pair,
+            component_edges=edges_by_component.get(root, []),
             batch_number=len(batches) + 1,
-            file_offsets=file_offsets,
+            file_of=file_of,
         )
         batches.append(batch)
         logger.info(
@@ -1021,16 +1030,18 @@ class MultiFileBatcher:
             return SasMultiBatchResult(source_ids=source_ids)
 
         # ── flatten corpus ──────────────────────────────────────────────────
-        flat_chunks, _, file_offsets = _build_flat_index(corpus.file_results)
+        flat_chunks, file_offsets = _build_flat_index(corpus.file_results)
         n = len(flat_chunks)
         uf = _UF(n)
+        # global_index → file_rank, computed once and shared by every pass.
+        file_of = _file_of_map(file_offsets, n)
 
         logger.debug(
             f"MultiFileBatcher.batch: flat index  total={n}  file_offsets={file_offsets}"
         )
 
         # ── edge discovery ──────────────────────────────────────────────────
-        edges = _discover_edges(flat_chunks, uf, file_offsets=file_offsets)
+        edges = _discover_edges(flat_chunks, uf, file_of=file_of)
 
         # ── context absorption (same-file only) ─────────────────────────────
         if self.include_options_chunks or self.include_comment_chunks:
@@ -1040,11 +1051,11 @@ class MultiFileBatcher:
                 edges,
                 include_options=self.include_options_chunks,
                 include_comments=self.include_comment_chunks,
-                file_offsets=file_offsets,
+                file_of=file_of,
             )
 
         # ── extract batches + singletons ────────────────────────────────────
-        batches, singletons = _extract_result(uf, flat_chunks, edges, file_offsets)
+        batches, singletons = _extract_result(uf, flat_chunks, edges, file_of)
 
         cf_count = sum(1 for b in batches if b.is_cross_file)
         elapsed = time.perf_counter() - t0

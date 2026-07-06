@@ -106,6 +106,16 @@ def _jload(s: str) -> Any:
     return json.loads(s)
 
 
+def _sql_quote(s: str) -> str:
+    """Escape a value for safe inlining inside a single-quoted SQL literal.
+
+    Keys are internally generated today, but the DELETE statements in Delta
+    mode interpolate them into SQL text; doubling single quotes prevents a
+    stray quote from breaking (or injecting into) the statement.
+    """
+    return s.replace("'", "''")
+
+
 # Schema shared by every layer
 _KV_SCHEMA = None  # built lazily after PySpark import check
 
@@ -255,6 +265,27 @@ class SparkKVStore:
             "source": row.source,
         }
 
+    def _mem_row_to_dict(self, rec: Dict) -> Dict:
+        """In-memory-mode counterpart of :meth:`_row_to_dict`.
+
+        ``rec`` is a raw dict from ``self._mem`` (``value``/``tags`` still
+        JSON-encoded); this returns the same deserialised shape the DataFrame
+        path produces via :meth:`_row_to_dict`.
+        """
+        return {
+            "value": _jload(rec["value"]),
+            "tags": _jload(rec["tags"]) if rec["tags"] else [],
+            "created_at": rec["created_at"],
+            "updated_at": rec["updated_at"],
+            "source": rec["source"],
+        }
+
+    def _mem_items(self, prefix: str = ""):
+        """Yield ``(key, raw_rec)`` from the in-memory dict, prefix-filtered."""
+        for k, rec in self._mem.items():
+            if not prefix or k.startswith(prefix):
+                yield k, rec
+
     # ---- CRUD --------------------------------------------------------------
 
     def set(
@@ -319,7 +350,9 @@ class SparkKVStore:
             )
             if before == 0:
                 return False
-            self._spark.sql(f"DELETE FROM {self._table} WHERE kv_key = '{key}'")
+            self._spark.sql(
+                f"DELETE FROM {self._table} WHERE kv_key = '{_sql_quote(key)}'"
+            )
             return True
         if key in self._mem:
             del self._mem[key]
@@ -327,16 +360,24 @@ class SparkKVStore:
         return False
 
     def keys(self, prefix: str = "") -> List[str]:
+        if self._table is None:
+            return [k for k, _ in self._mem_items(prefix)]
         return [row.kv_key for row in self._df(prefix).select("kv_key").collect()]
 
     def all_records(self, prefix: str = "") -> List[Tuple[str, Dict]]:
+        if self._table is None:
+            return [
+                (k, self._mem_row_to_dict(rec)) for k, rec in self._mem_items(prefix)
+            ]
         rows = self._df(prefix).collect()
         return [(row.kv_key, self._row_to_dict(row)) for row in rows]
 
     def clear_prefix(self, prefix: str) -> int:
         if self._table:
             count = self._df(prefix).count()
-            self._spark.sql(f"DELETE FROM {self._table} WHERE kv_key LIKE '{prefix}%'")
+            self._spark.sql(
+                f"DELETE FROM {self._table} WHERE kv_key LIKE '{_sql_quote(prefix)}%'"
+            )
             return count
         targets = [k for k in self._mem if k.startswith(prefix)]
         for k in targets:
@@ -353,6 +394,13 @@ class SparkKVStore:
 
     def get_by_tag(self, tag: str, prefix: str = "") -> List[Tuple[str, Dict]]:
         """Return [(key, record_dict), ...] for all entries carrying `tag`."""
+        if self._table is None:
+            result = []
+            for k, raw in self._mem_items(prefix):
+                rec = self._mem_row_to_dict(raw)
+                if tag in rec["tags"]:
+                    result.append((k, rec))
+            return result
         rows = self._df(prefix).collect()
         result = []
         for row in rows:
@@ -362,8 +410,13 @@ class SparkKVStore:
         return result
 
     def all_tags(self, prefix: str = "") -> List[str]:
-        rows = self._df(prefix).select("tags").collect()
         tags: set = set()
+        if self._table is None:
+            for _, raw in self._mem_items(prefix):
+                if raw["tags"]:
+                    tags.update(_jload(raw["tags"]))
+            return sorted(tags)
+        rows = self._df(prefix).select("tags").collect()
         for row in rows:
             if row.tags:
                 tags.update(_jload(row.tags))
@@ -385,20 +438,32 @@ class SparkKVStore:
         which is optimised by Delta's data-skipping on string predicates.
         """
         q = query.lower()
-        rows = self._df(prefix).collect()
+        # Unify both backends into (key, value_str, tags_list) tuples so the
+        # scoring below is written once.  In-memory mode reads the dict
+        # directly; Delta mode collects the DataFrame.
+        if self._table is None:
+            scannable = (
+                (k, raw["value"], _jload(raw["tags"]) if raw["tags"] else [])
+                for k, raw in self._mem_items(prefix)
+            )
+        else:
+            scannable = (
+                (row.kv_key, row.value, _jload(row.tags) if row.tags else [])
+                for row in self._df(prefix).collect()
+            )
+
         hits: List[Tuple[str, float]] = []
-        for row in rows:
+        for key, value_str, tags in scannable:
             score = 0.0
-            if q in row.kv_key.lower():
+            if q in key.lower():
                 score += 2.0
-            if q in row.value.lower():
-                score += row.value.lower().count(q) * 1.0
-            tags = _jload(row.tags) if row.tags else []
+            if q in value_str.lower():
+                score += value_str.lower().count(q) * 1.0
             for tag in tags:
                 if q in tag.lower():
                     score += 1.5
             if score > 0:
-                hits.append((row.kv_key, score))
+                hits.append((key, score))
         hits.sort(key=lambda x: x[1], reverse=True)
         return hits[:top_k]
 
@@ -433,7 +498,7 @@ class SparkKVStore:
     # ---- Diagnostics -------------------------------------------------------
 
     def stats(self) -> Dict[str, Any]:
-        total = self._df().count()
+        total = len(self._mem) if self._table is None else self._df().count()
         return {
             "total_keys": total,
             "all_tags": self.all_tags(),
@@ -441,7 +506,8 @@ class SparkKVStore:
         }
 
     def __repr__(self) -> str:
-        return f"SparkKVStore(table={self._table!r}, keys={self._df().count()})"
+        count = len(self._mem) if self._table is None else self._df().count()
+        return f"SparkKVStore(table={self._table!r}, keys={count})"
 
 
 # ===========================================================================
@@ -516,6 +582,14 @@ class KVChatMessageHistory(BaseChatMessageHistory):
         self._store.clear_prefix(self._msg_prefix)
         self._store.delete(self._idx_key)
 
+    def has_messages(self) -> bool:
+        """True if this thread has at least one stored message.
+
+        Cheaper than ``bool(self.messages)``: it checks only for the presence
+        of a message key rather than loading and deserialising every message.
+        """
+        return bool(self._store.keys(prefix=self._msg_prefix))
+
     # ---- Helpers -----------------------------------------------------------
 
     def get_session_metadata(self) -> Dict[str, Any]:
@@ -562,7 +636,7 @@ class ThreadMemoryManager:
         return self._threads[thread_id]
 
     def list_threads(self) -> List[str]:
-        return [tid for tid, h in self._threads.items() if h.messages]
+        return [tid for tid, h in self._threads.items() if h.has_messages()]
 
     def delete_thread(self, thread_id: str) -> None:
         self.get_thread(thread_id).clear()

@@ -55,6 +55,7 @@ import threading
 import time
 from bisect import bisect_right
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 
 import regex
@@ -451,8 +452,12 @@ class _Region:
     units: list[_Unit]
     unclosed: bool = False
 
-    @property
+    @cached_property
     def text(self) -> str:
+        # Cached: a region's units are fixed at construction, and `.text` is
+        # read several times per region (word count, metadata, chunk build).
+        # cached_property writes through the instance __dict__, which a frozen
+        # (but unslotted) dataclass still allows.
         return "".join(u.text for u in self.units)
 
 
@@ -620,7 +625,7 @@ _MEND_RE = re.compile(r"%\s*mend\b")
 
 def _classify(stripped: str) -> SasChunkKind | None:
     """
-    Map a single normalised SAS statement to its :class:`SasChunkKind`.
+    Map a single SAS statement to its :class:`SasChunkKind`.
 
     Returns ``None`` for unrecognised statements (they accumulate into
     ``UNKNOWN_STATEMENT_GROUP`` / ``UNKNOWN_BLOCK``).
@@ -630,7 +635,17 @@ def _classify(stripped: str) -> SasChunkKind | None:
     block-opener kinds that close the current block).  All other statement
     types are transparently collected as block body statements.
     """
-    n = _norm(stripped)
+    return _classify_normed(_norm(stripped))
+
+
+def _classify_normed(n: str) -> SasChunkKind | None:
+    """Classify an already-``_norm``'d (stripped, lowercased) statement.
+
+    Split out from :func:`_classify` so callers that already hold the
+    normalised form — notably ``_collect_block``, which needs it for the
+    %MEND / RUN / QUIT terminator checks too — can classify without
+    re-normalising the same text.
+    """
     if not n:
         return None
     if _CLS_DATA_RE.match(n):
@@ -871,7 +886,7 @@ class SasSemanticChunker:
                                 unit,
                             )
                         )
-                    else:
+                    elif logger.isEnabledFor(logging.DEBUG):
                         logger.debug(
                             f"_scan_units: block comment  line={_line_for(stmt_start, line_starts)}"
                         )
@@ -886,19 +901,21 @@ class SasSemanticChunker:
             if char == ";":
                 end = _ws_end(source, index + 1)
                 text = source[stmt_start:end]
+                is_comment = _is_stmt_comment(text)
                 units.append(
                     _Unit(
                         start=stmt_start,
                         end=end,
                         text=text,
-                        is_comment=_is_stmt_comment(text),
+                        is_comment=is_comment,
                     )
                 )
-                text_preview = text[:60].replace("\n", "↵")
-                logger.debug(
-                    f"_scan_units: stmt  line={_line_for(stmt_start, line_starts)}  "
-                    f"comment={_is_stmt_comment(text)}  text={text_preview!r}"
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    text_preview = text[:60].replace("\n", "↵")
+                    logger.debug(
+                        f"_scan_units: stmt  line={_line_for(stmt_start, line_starts)}  "
+                        f"comment={is_comment}  text={text_preview!r}"
+                    )
                 stmt_start = None
                 index = end
                 continue
@@ -1009,9 +1026,10 @@ class SasSemanticChunker:
                         [unit],
                     )
                 )
-                logger.debug(
-                    f"_group_regions: COMMENT_BLOCK  line={_line_for(unit.start, line_starts)}"
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"_group_regions: COMMENT_BLOCK  line={_line_for(unit.start, line_starts)}"
+                    )
                 index += 1
                 continue
 
@@ -1066,9 +1084,10 @@ class SasSemanticChunker:
                         unclosed=(not unit.terminated),
                     )
                 )
-                logger.debug(
-                    f"_group_regions: {cls.value}  line={_line_for(unit.start, line_starts)}"
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"_group_regions: {cls.value}  line={_line_for(unit.start, line_starts)}"
+                    )
                 index += 1
                 continue
 
@@ -1111,8 +1130,10 @@ class SasSemanticChunker:
                 index += 1
                 continue
 
-            stripped = unit.text.strip()
-            cls = _classify(stripped)
+            # Normalise once and reuse for both classification and the
+            # %MEND / RUN / QUIT terminator checks below.
+            lowered = _norm(unit.text)
+            cls = _classify_normed(lowered)
 
             # ── only DATA/PROC openers close a DATA/PROC block (implicit).
             # A %MACRO block is closed *only* by %MEND, so DATA and PROC
@@ -1130,7 +1151,6 @@ class SasSemanticChunker:
                 return block, index, True
 
             block.append(unit)
-            lowered = _norm(unit.text)
             index += 1
 
             # ── explicit terminators ────────────────────────────────────────
@@ -1193,17 +1213,34 @@ class SasSemanticChunker:
         chunks: list[SasChunk] = [parent_chunk]
         parent_id = parent_chunk.chunk_id
         current: list[_Unit] = []
+        # Running word count of the joined `current` text, maintained
+        # incrementally so the split loop stays O(units) instead of re-joining
+        # and re-splitting the whole accumulated text on every unit.  When two
+        # units abut without whitespace (former ends non-space, latter starts
+        # non-space) their touching tokens merge into one, so joining adds
+        # `_wc(unit.text)` minus one for that merge — mirroring exactly what
+        # `_wc("".join(...))` would count.  `cur_tail_nonws` tracks whether the
+        # joined text currently ends in a non-space character.
+        cur_wc = 0
+        cur_tail_nonws = False
+
+        def _wc_and_tail(units_list: list[_Unit]) -> tuple[int, bool]:
+            joined = "".join(u.text for u in units_list)
+            return _wc(joined), bool(joined) and not joined[-1].isspace()
 
         for unit in region.units:
-            candidate = current + [unit]
-            cand_r = _Region(
-                region.kind,
-                candidate[0].start,
-                candidate[-1].end,
-                candidate,
-                unclosed=region.unclosed,
-            )
-            if current and _wc(cand_r.text) > self.max_words:
+            utext = unit.text
+            uw = _wc(utext)
+            uhead_nonws = bool(utext) and not utext[0].isspace()
+            utail_nonws = bool(utext) and not utext[-1].isspace()
+            if current:
+                merge = 1 if (cur_tail_nonws and uhead_nonws) else 0
+                cand_wc = cur_wc + uw - merge
+                cand_tail = utail_nonws if utext else cur_tail_nonws
+            else:
+                cand_wc = uw
+                cand_tail = utail_nonws
+            if current and cand_wc > self.max_words:
                 cr = _Region(
                     region.kind,
                     current[0].start,
@@ -1229,8 +1266,11 @@ class SasSemanticChunker:
                 )
                 chunks.append(child)
                 current = _overlap(current) + [unit]
+                cur_wc, cur_tail_nonws = _wc_and_tail(current)
             else:
-                current = candidate
+                current = current + [unit]
+                cur_wc = cand_wc
+                cur_tail_nonws = cand_tail
 
         if current:
             cr = _Region(
@@ -1310,10 +1350,13 @@ class SasSemanticChunker:
 
 
 def _line_starts(source: str) -> list[int]:
+    # Walk newline to newline with str.find (a C-level scan) rather than a
+    # per-character Python loop; each match yields the start of the next line.
     starts = [0]
-    for i, ch in enumerate(source):
-        if ch == "\n":
-            starts.append(i + 1)
+    pos = source.find("\n")
+    while pos != -1:
+        starts.append(pos + 1)
+        pos = source.find("\n", pos + 1)
     return starts
 
 
@@ -1571,13 +1614,10 @@ _CALL_EXECUTE_RE = re.compile(
 # a declared parameter does).
 _LOCAL_STMT_RE = re.compile(r"%\s*local\b", re.IGNORECASE)
 
-# A %name or %name(...) pattern inside a CALL EXECUTE string argument's
-# contents — built from the same reserved-word exclusion as every other
-# macro-call detector in this module.
-_EXECUTE_MACRO_CALL_RE = re.compile(
-    rf"%(?!(?:{_RESERVED_WORDS_PATTERN})\b)([A-Za-z_]\w*)",
-    re.IGNORECASE,
-)
+# A %name pattern inside a CALL EXECUTE string argument's contents is detected
+# with the same reserved-word-excluding matcher as every other macro-call site
+# (_MACRO_CALL_RE) — the pattern is identical, so it is reused directly rather
+# than compiled a second time.
 
 
 def _extract_symput(
@@ -1694,7 +1734,7 @@ def _extract_call_execute_macros(text: str) -> list[str]:
         literal = _clean_literal(first_piece)
         if literal is None:
             continue
-        call_m = _EXECUTE_MACRO_CALL_RE.search(literal)
+        call_m = _MACRO_CALL_RE.search(literal)
         if call_m:
             found.append(call_m.group(1).lower())
     return found
@@ -1769,10 +1809,19 @@ def _extract_sql_into_vars(text: str) -> list[str]:
 def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
     cf = _sanitise(text, blank_strings=False)
     mt = _sanitise(text)
-    datasets = sorted({_nid(m.group(1)) for m in _DATASET_RE.finditer(mt)})
+    # `datasets` is re-sorted later (via `sorted(set(datasets + two_part))`), so
+    # collect it unsorted here and skip the redundant intermediate sort.
+    datasets = [_nid(m.group(1)) for m in _DATASET_RE.finditer(mt)]
     datasets += [_nid(m.group(1)) for m in _DATA_OPT_RE.finditer(mt)]
-    librefs = sorted({_nid(m.group(1)) for m in _LIBREF_RE.finditer(mt)})
-    two_part = sorted({_nid(m.group(0)) for m in _LIBREF_RE.finditer(mt)})
+    # One _LIBREF_RE pass feeds both the bare-libref set and the two-part
+    # (libref.member) set instead of scanning the text twice.
+    libref_set: set[str] = set()
+    two_part_set: set[str] = set()
+    for m in _LIBREF_RE.finditer(mt):
+        libref_set.add(_nid(m.group(1)))
+        two_part_set.add(_nid(m.group(0)))
+    librefs = sorted(libref_set)
+    two_part = sorted(two_part_set)
     mdefs = sorted({_nid(m.group(1)) for m in _MACRO_DEF_RE.finditer(mt)})
     mcalls = sorted({_nid(m.group(1)) for m in _MACRO_CALL_RE.finditer(mt)})
     includes = [_nid(m.group(1)).strip("'\"") for m in _INCLUDE_RE.finditer(cf)]
@@ -1781,7 +1830,7 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
     pm = _PROC_RE.search(mt)
     dm = _DATA_RE.search(mt)
     mm = _MACRO_DEF_RE.search(mt)
-    inp, out, defs, invk = _io_for(text, kind)
+    inp, out, defs, invk = _io_for(text, kind, mt)
 
     # ── macro-variable operation (%let / %global / %local / %put) ──────────
     var_op: str | None = None
@@ -1828,7 +1877,7 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
     param_names: list[str] = []
     if kind == SasChunkKind.MACRO_DEFINITION:
         body_lit_in, body_lit_out, body_par_in, body_par_out, param_names = (
-            _macro_body_io(text)
+            _macro_body_io(text, mt)
         )
 
     # ── high-severity control-flow visibility (ROADMAP Phase 3) ─────────────
@@ -2097,10 +2146,9 @@ _PROC_OUT_RE = re.compile(
     r"|\boutdata\s*=\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
     re.IGNORECASE,
 )
-_PROC_IN_RE = re.compile(
-    r"\bdata\s*=\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
-    re.IGNORECASE,
-)
+# A PROC step's DATA= input is the same "data=<name>" option matched by
+# _DATA_OPT_RE (defined near the top of the module); it is reused here rather
+# than compiled a second time under a separate name.
 _SAS_RESERVED = frozenset(
     {
         "work",
@@ -2135,8 +2183,9 @@ _MACRO_INVOKE_RE = re.compile(
 # pass through macro bodies.
 # ---------------------------------------------------------------------------
 
-# Detects a SAS macro variable reference: &name. or &name
-_MACRO_VAR_RE = re.compile(r"&(\w+)\.?")
+# A SAS macro variable reference (&name. or &name) is detected with the shared
+# _VAR_REF_RE defined above — the pattern is identical, so it is reused here
+# rather than compiled a second time.
 
 # DATA statement header inside a macro body (may contain &refs)
 _BODY_DATA_HDR_RE = re.compile(
@@ -2193,7 +2242,7 @@ def _classify_ref(
     raw = raw.strip()
     if "&" not in raw:
         return raw.lower(), False
-    refs = _MACRO_VAR_RE.findall(raw)
+    refs = _VAR_REF_RE.findall(raw)
     if len(refs) == 1 and refs[0].lower() in param_pos:
         return refs[0].lower(), True
     return raw.lower(), True
@@ -2218,10 +2267,16 @@ def _parse_macro_params(sig_text: str) -> list[tuple[str, str | None]]:
 
 def _macro_body_io(
     macro_text: str,
+    mt: str | None = None,
 ) -> tuple[list[str], list[str], list[dict], list[dict], list[str]]:
     """
     Analyse a %MACRO block's body and classify every dataset reference
     as literal (fixed value) or parameterised (depends on a call argument).
+
+    ``mt`` is the sanitised (comments/strings blanked) form of ``macro_text``;
+    callers that already have it — e.g. :func:`_metadata_for` — pass it in to
+    avoid re-running the sanitiser over the same body.  When omitted it is
+    computed here, so direct callers can still pass just the raw text.
 
     Returns
     -------
@@ -2229,7 +2284,8 @@ def _macro_body_io(
     param_inputs, param_outputs     : list[dict]   {"param": name, "pos": idx}
     param_names                     : list[str]    ordered signature names
     """
-    mt = _sanitise(macro_text)
+    if mt is None:
+        mt = _sanitise(macro_text)
 
     sig_m = _MACRO_SIG_RE.search(macro_text)
     params = _parse_macro_params(sig_m.group(1) if sig_m else "")
@@ -2350,15 +2406,21 @@ def _multi_ds(match_group: str) -> list[str]:
 def _io_for(
     text: str,
     kind: SasChunkKind,
+    mt: str | None = None,
 ) -> tuple[list[str], list[str], list[str], list[str]]:
     """
     Extract directed data-flow edges from a single chunk's source text.
+
+    ``mt`` is the sanitised (comments/strings blanked) form of ``text``;
+    callers that already have it pass it in to avoid a redundant sanitise
+    pass.  When omitted it is computed here.
 
     Returns
     -------
     (input_datasets, output_datasets, defines_macros, invokes_macros)
     """
-    mt = _sanitise(text)
+    if mt is None:
+        mt = _sanitise(text)
 
     inputs: list[str] = []
     outputs: list[str] = []
@@ -2417,7 +2479,7 @@ def _io_for(
                 if n := _ds_name(m.group(1)):
                     inputs.append(n)
         else:
-            for m in _PROC_IN_RE.finditer(mt):
+            for m in _DATA_OPT_RE.finditer(mt):
                 if n := _ds_name(m.group(1)):
                     inputs.append(n)
             for m in _PROC_OUT_RE.finditer(mt):
@@ -2426,7 +2488,7 @@ def _io_for(
                     outputs.append(n)
             if proc_name == "sort" and not _PROC_OUT_RE.search(mt):
                 # in-place sort: DATA= is both input and output
-                for m in _PROC_IN_RE.finditer(mt):
+                for m in _DATA_OPT_RE.finditer(mt):
                     if (n := _ds_name(m.group(1))) and n not in outputs:
                         outputs.append(n)
 

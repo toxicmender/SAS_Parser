@@ -249,6 +249,11 @@ class SasLLMPipeline:
     delta_table : str | None
         Forwarded to :class:`DatabricksMemory` if ``memory`` is omitted.
         ``None`` keeps the store in-memory (no Delta table).
+    llm : Any | None
+        Pre-built LangChain chat model to use instead of constructing one
+        from ``model`` via ``init_chat_model``.  Useful for injecting a fake
+        or pre-configured client (e.g. in tests).  When ``None`` (default) a
+        model is built from ``model``.
     """
 
     def __init__(
@@ -289,7 +294,9 @@ class SasLLMPipeline:
 
         self._memory = memory or self._build_default_memory(spark, delta_table)
 
-        llm = init_chat_model(model)
+        # Use a caller-supplied chat model when given (e.g. a fake in tests, or
+        # a pre-configured client); otherwise construct one from ``model``.
+        llm = llm if llm is not None else init_chat_model(model)
         prompt = ChatPromptTemplate.from_messages(
             [
                 ("system", self._system_prompt),
