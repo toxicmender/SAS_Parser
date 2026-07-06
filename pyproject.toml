@@ -14,7 +14,7 @@ dependencies = [
 [project.optional-dependencies]
 anthropic = ["langchain-anthropic>=0.3"]
 openai    = ["langchain-openai>=0.2"]
-dev       = ["pytest>=8", "pytest-cov"]
+dev       = ["pytest>=8", "pytest-cov", "ruff"]
 
 [tool.setuptools.packages.find]
 where = ["."]
