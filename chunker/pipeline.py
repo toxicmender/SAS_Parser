@@ -192,6 +192,7 @@ def _format_batch_message(
         output_datasets=_fmt_list(batch.output_datasets),
         required_macros=_fmt_list(batch.required_macros),
         defined_macros=_fmt_list(batch.defined_macros),
+        required_librefs=_fmt_list(batch.required_librefs),
         standard_autocall_macros=_fmt_list(batch.standard_autocall_macros),
         required_macrovars=_fmt_list(batch.required_macrovars),
         produced_macrovars=_fmt_list(batch.produced_macrovars),

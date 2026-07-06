@@ -132,7 +132,12 @@ _DATA_OPT_RE = re.compile(
     r"\bdata\s*=\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
     re.IGNORECASE,
 )
-_LIBREF_RE = re.compile(r"\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b")
+# The libref a LIBNAME statement assigns: ``libname <ref> ...``.  Also matches
+# the deassignment form ``libname <ref> clear;`` — static extraction is
+# positional, not temporal, so a cleared libref is still reported as defined
+# (documented on SasChunkMetadata.defines_librefs).  ``libname _all_ clear|list``
+# targets every assigned libref rather than naming one; the caller drops it.
+_LIBNAME_REF_RE = re.compile(r"\blibname\s+([A-Za-z_]\w*)", re.IGNORECASE)
 _MACRO_DEF_RE = re.compile(r"%\s*macro\s+([A-Za-z_]\w*)", re.IGNORECASE)
 
 # ---------------------------------------------------------------------------
@@ -655,6 +660,52 @@ def _record_parser_timeout(
             end_line=line,
         )
     )
+
+
+def _record_user_library(
+    chunks: list[SasChunk],
+    diagnostics: list[SasDiagnostic],
+) -> None:
+    """Emit a single ``USER_LIBRARY_ASSIGNED`` diagnostic per parse.
+
+    Per the SAS Programmer's Guide: Essentials (pp. 236, 252-253), assigning
+    a USER library — via the ``USER=`` system option or a ``libname user``
+    statement — redirects one-level dataset names to that (permanent)
+    library instead of the temporary WORK library.  That invalidates the
+    ``work.``-canonicalisation :func:`_canon_ds` applies, so the condition
+    is surfaced as a diagnostic rather than silently mis-resolved.
+    Idempotent across regions, mirroring :func:`_record_parser_timeout`.
+    """
+    if any(d.code == "USER_LIBRARY_ASSIGNED" for d in diagnostics):
+        return
+    for chunk in chunks:
+        meta = chunk.metadata
+        assigns_user = "user" in meta.defines_librefs or (
+            chunk.kind == SasChunkKind.OPTIONS
+            and any(t == "user" or t.startswith("user=") for t in meta.options)
+        )
+        if not assigns_user:
+            continue
+        logger.warning(
+            f"_record_user_library: USER library assigned near line "
+            f"{chunk.start_line}; one-level dataset names resolve to USER, "
+            f"not WORK — canonicalised names may be inaccurate"
+        )
+        diagnostics.append(
+            SasDiagnostic(
+                code="USER_LIBRARY_ASSIGNED",
+                message=(
+                    "A USER library is assigned (USER= system option or "
+                    "LIBNAME USER), so one-level dataset names resolve to "
+                    "the USER library, not WORK; the work.-canonicalised "
+                    "dataset names in this result may be inaccurate."
+                ),
+                severity=SasDiagnosticSeverity.WARNING,
+                start_line=chunk.start_line,
+                end_line=chunk.end_line,
+            )
+        )
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -1299,7 +1350,9 @@ class SasSemanticChunker:
             logger.debug(
                 f"_chunks_for_region: single  kind={region.kind.value}  words={wc}  lines={sl}-{el}"
             )
-            return [self._make_chunk(source_id, region, line_starts, next_index)]
+            single = [self._make_chunk(source_id, region, line_starts, next_index)]
+            _record_user_library(single, diagnostics)
+            return single
 
         # Oversized — split at statement boundaries with overlap
         logger.info(
@@ -1419,6 +1472,7 @@ class SasSemanticChunker:
         logger.info(
             f"_chunks_for_region: {region.kind.value} → {len(chunks)} chunks (1 parent + {len(chunks) - 1} children)"
         )
+        _record_user_library(chunks, diagnostics)
         return chunks
 
     def _make_chunk(
@@ -1913,19 +1967,43 @@ def _extract_sql_into_vars(text: str) -> list[str]:
 def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
     cf = _sanitise(text, blank_strings=False)
     mt = _sanitise(text)
-    # `datasets` is re-sorted later (via `sorted(set(datasets + two_part))`), so
-    # collect it unsorted here and skip the redundant intermediate sort.
+    # Dataset names collected from *dataset positions only* — the DATA/SET/
+    # MERGE/UPDATE/MODIFY keywords, DATA=/OUT=/OUTDATA= options, and PROC SQL
+    # CREATE/FROM/JOIN/INSERT clauses.  An earlier blanket ``word.word`` scan
+    # also swept up PROC SQL table aliases (``l.id`` → libref ``l``) and
+    # BY-group temporaries (``first.grp`` → libref ``first``); restricting the
+    # scan to dataset context removes those false positives from both
+    # ``referenced_datasets`` and ``referenced_librefs``.
     datasets = [_nid(m.group(1)) for m in _DATASET_RE.finditer(mt)]
     datasets += [_nid(m.group(1)) for m in _DATA_OPT_RE.finditer(mt)]
-    # One _LIBREF_RE pass feeds both the bare-libref set and the two-part
-    # (libref.member) set instead of scanning the text twice.
-    libref_set: set[str] = set()
-    two_part_set: set[str] = set()
-    for m in _LIBREF_RE.finditer(mt):
-        libref_set.add(_nid(m.group(1)))
-        two_part_set.add(_nid(m.group(0)))
-    librefs = sorted(libref_set)
-    two_part = sorted(two_part_set)
+    datasets += [_nid(m.group(1)) for m in _SQL_CREATE_RE.finditer(mt)]
+    datasets += [_nid(m.group(1)) for m in _SQL_FROM_RE.finditer(mt)]
+    datasets += [_nid(m.group(1)) for m in _SQL_JOIN_RE.finditer(mt)]
+    datasets += [_nid(m.group(1)) for m in _SQL_INTO_RE.finditer(mt)]
+    datasets += [_nid(m.group(1) or m.group(2)) for m in _PROC_OUT_RE.finditer(mt)]
+    # The directed I/O extraction parses the *full* dataset lists (a DATA
+    # header or SET/MERGE statement may name several datasets; _DATASET_RE
+    # above captures only the first), so its canonical names complete
+    # ``referenced_datasets``.  One-level names therefore appear here in
+    # their canonical ``work.``-qualified spelling.
+    inp, out, defs, invk = _io_for(text, kind, mt, cf)
+    dataset_set = set(datasets) | set(inp) | set(out)
+    # Librefs this chunk assigns (``libname ref ...``); ``_all_`` targets every
+    # assigned libref (``libname _all_ clear|list;``) rather than naming one.
+    defines_librefs = sorted(
+        {_nid(m.group(1)) for m in _LIBNAME_REF_RE.finditer(mt)} - {"_all_"}
+    )
+    # Referenced librefs: the libref part of every two-level dataset-context
+    # name, plus any libref assigned here.  Quoted physical-path references
+    # address a file directly and carry no libref.
+    librefs = sorted(
+        {
+            d.split(".", 1)[0]
+            for d in dataset_set
+            if "." in d and not d.startswith("'")
+        }
+        | set(defines_librefs)
+    )
     mdefs = sorted({_nid(m.group(1)) for m in _MACRO_DEF_RE.finditer(mt)})
     mcalls = sorted({_nid(m.group(1)) for m in _MACRO_CALL_RE.finditer(mt)})
     includes = [_nid(m.group(1)).strip("'\"") for m in _INCLUDE_RE.finditer(cf)]
@@ -1934,7 +2012,6 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
     pm = _PROC_RE.search(mt)
     dm = _DATA_RE.search(mt)
     mm = _MACRO_DEF_RE.search(mt)
-    inp, out, defs, invk = _io_for(text, kind, mt)
 
     # ── macro-variable operation (%let / %global / %local / %put) ──────────
     var_op: str | None = None
@@ -2070,7 +2147,8 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
         macro_name=_nid(mm.group(1)) if mm else None,
         labels=labels,
         referenced_librefs=librefs,
-        referenced_datasets=sorted(set(datasets + two_part)),
+        referenced_datasets=sorted(dataset_set),
+        defines_librefs=defines_librefs,
         defined_macros=mdefs,
         called_macros=mcalls,
         includes=includes,
@@ -2113,6 +2191,7 @@ def _merge_meta(parent: SasChunkMetadata, child: SasChunkMetadata) -> SasChunkMe
         labels=ml(parent.labels, child.labels),
         referenced_librefs=ml(parent.referenced_librefs, child.referenced_librefs),
         referenced_datasets=ml(parent.referenced_datasets, child.referenced_datasets),
+        defines_librefs=ml(parent.defines_librefs, child.defines_librefs),
         defined_macros=ml(parent.defined_macros, child.defined_macros),
         called_macros=ml(parent.called_macros, child.called_macros),
         includes=ml(parent.includes, child.includes),
@@ -2264,6 +2343,26 @@ _PROC_OUT_RE = re.compile(
 # A PROC step's DATA= input is the same "data=<name>" option matched by
 # _DATA_OPT_RE (defined near the top of the module); it is reused here rather
 # than compiled a second time under a separate name.
+#
+# Quoted physical-path dataset references (SAS Programmer's Guide: Essentials,
+# Ch. 11 "Accessing Data without Using a Libref"): a data set may be addressed
+# by its quoted path instead of a libref, e.g. ``data 'c:/tmp/perm';`` or
+# ``proc print data='c:/tmp/perm';``.  String contents are blanked in ``mt``,
+# so these MUST be scanned on the quotes-preserved form (``cf``).  The header
+# form uses the same ``(?<![\w=])`` guard as _BODY_DATA_HDR_RE so ``data=``
+# options don't match as DATA statements.
+_QUOTED_DATA_HDR_RE = re.compile(
+    r"(?<![\w=])data\s+((['\"])[^'\";]+\2)", re.IGNORECASE
+)
+_QUOTED_SET_MERGE_RE = re.compile(
+    r"\b(?:set|merge)\s+((['\"])[^'\";]+\2)", re.IGNORECASE
+)
+_QUOTED_DATA_OPT_RE = re.compile(
+    r"\bdata\s*=\s*((['\"])[^'\";]+\2)", re.IGNORECASE
+)
+_QUOTED_OUT_OPT_RE = re.compile(
+    r"\bout\s*=\s*((['\"])[^'\";]+\2)", re.IGNORECASE
+)
 _SAS_RESERVED = frozenset(
     {
         "work",
@@ -2492,6 +2591,7 @@ def _macro_body_io(
                         f"_macro_body_io: {role} UNRESOLVABLE param ref {raw!r}"
                     )
             else:
+                key = _canon_ds(key)
                 if key not in seen_lit:
                     seen_lit.add(key)
                     literals.append(key)
@@ -2517,23 +2617,74 @@ def _ds_name(raw: str) -> str | None:
     return name
 
 
+def _canon_ds(name: str) -> str:
+    """Canonicalise a dataset name for producer/consumer matching.
+
+    A one-level name resolves to the temporary Work library — per the SAS
+    Programmer's Guide: Essentials (Ch. 11), ``data mytable;`` "behaves the
+    same if you specify work.mytable" — so it is rewritten to
+    ``work.<name>``, unifying both spellings in the batcher's exact-string
+    dataset namespace.  Everything that is not a plain one-level identifier
+    passes through unchanged:
+
+    - two-level ``libref.member`` names;
+    - special ``_name_`` tokens (``_data_`` / ``_last_``), which are not
+      Work members but placeholders the batcher's implicit-dataset pass
+      resolves in corpus order;
+    - quoted physical-path references (normalised by :func:`_quoted_path`
+      to a leading ``'``), which address a file directly, not a library
+      member.
+
+    The rewrite is inexact when a USER library is assigned (one-level names
+    then resolve to USER, not WORK — guide pp. 236, 252-253); the chunker
+    emits a ``USER_LIBRARY_ASSIGNED`` diagnostic in that case rather than
+    guessing.
+    """
+    if (
+        "." in name
+        or name.startswith("'")
+        or (name.startswith("_") and name.endswith("_"))
+    ):
+        return name
+    return f"work.{name}"
+
+
+def _quoted_path(raw: str) -> str:
+    """Normalise a quoted physical-path dataset reference to an exact-match
+    key: lowercased, backslashes → forward slashes, wrapped in single
+    quotes.  The quote wrapper is kept so a path key can never collide with
+    an identifier name (``data 'perm';`` addresses a file in the current
+    working directory, *not* work.perm) and so :func:`_canon_ds` passes it
+    through.  Per-OS path case-sensitivity is deliberately ignored,
+    consistent with the module's lowercase-everything policy."""
+    inner = raw.strip()[1:-1].strip().lower().replace("\\", "/")
+    return f"'{inner}'"
+
+
 def _multi_ds(match_group: str) -> list[str]:
     cleaned = _PAREN_RE.sub(" ", match_group)
     tokens = _DS_TOKEN_RE.findall(cleaned)
-    return [n for t in tokens if (n := _ds_name(t))]
+    return [_canon_ds(n) for t in tokens if (n := _ds_name(t))]
 
 
 def _io_for(
     text: str,
     kind: SasChunkKind,
     mt: str | None = None,
+    cf: str | None = None,
 ) -> tuple[list[str], list[str], list[str], list[str]]:
     """
     Extract directed data-flow edges from a single chunk's source text.
 
-    ``mt`` is the sanitised (comments/strings blanked) form of ``text``;
-    callers that already have it pass it in to avoid a redundant sanitise
-    pass.  When omitted it is computed here.
+    ``mt`` is the sanitised (comments/strings blanked) form of ``text`` and
+    ``cf`` the comments-only-blanked form (string literals intact — needed
+    for quoted physical-path dataset references, which live *inside* string
+    delimiters); callers that already have them pass them in to avoid
+    redundant sanitise passes.  When omitted they are computed here.
+
+    All extracted names are canonicalised via :func:`_canon_ds`, so a
+    one-level name and its ``work.``-qualified spelling land in the same
+    producer/consumer namespace.
 
     Returns
     -------
@@ -2541,6 +2692,8 @@ def _io_for(
     """
     if mt is None:
         mt = _sanitise(text)
+    if cf is None:
+        cf = _sanitise(text, blank_strings=False)
 
     inputs: list[str] = []
     outputs: list[str] = []
@@ -2564,22 +2717,28 @@ def _io_for(
         header_body = _DATA_HDR_STRIP_RE.sub("", data_header)
         for tok in _DS_TOKEN_RE.findall(header_body):
             if n := _ds_name(tok):
-                outputs.append(n)
+                outputs.append(_canon_ds(n))
         for m in _OUTPUT_DS_RE.finditer(mt):
             if n := _ds_name(m.group(1)):
-                outputs.append(n)
+                outputs.append(_canon_ds(n))
         for m in _SET_RE.finditer(mt):
             inputs.extend(_multi_ds(m.group(1)))
         for m in _MERGE_RE.finditer(mt):
             inputs.extend(_multi_ds(m.group(1)))
         for m in _UPDATE_RE.finditer(mt):
             if n := _ds_name(m.group(1)):
-                inputs.append(n)
-                outputs.append(n)
+                inputs.append(_canon_ds(n))
+                outputs.append(_canon_ds(n))
         for m in _MODIFY_RE.finditer(mt):
             if n := _ds_name(m.group(1)):
-                inputs.append(n)
-                outputs.append(n)
+                inputs.append(_canon_ds(n))
+                outputs.append(_canon_ds(n))
+        # Quoted physical-path forms: ``data '<path>';`` header (output) and
+        # ``set|merge '<path>'`` (input) — scanned on cf, not mt.
+        for m in _QUOTED_DATA_HDR_RE.finditer(cf):
+            outputs.append(_quoted_path(m.group(1)))
+        for m in _QUOTED_SET_MERGE_RE.finditer(cf):
+            inputs.append(_quoted_path(m.group(1)))
 
     elif kind == SasChunkKind.PROC_STEP:
         proc_m = _PROC_RE.search(mt)
@@ -2588,29 +2747,37 @@ def _io_for(
         if proc_name == "sql":
             for m in _SQL_CREATE_RE.finditer(mt):
                 if n := _ds_name(m.group(1)):
-                    outputs.append(n)
+                    outputs.append(_canon_ds(n))
             for m in _SQL_INTO_RE.finditer(mt):
                 if n := _ds_name(m.group(1)):
-                    outputs.append(n)
+                    outputs.append(_canon_ds(n))
             for m in _SQL_FROM_RE.finditer(mt):
                 if n := _ds_name(m.group(1)):
-                    inputs.append(n)
+                    inputs.append(_canon_ds(n))
             for m in _SQL_JOIN_RE.finditer(mt):
                 if n := _ds_name(m.group(1)):
-                    inputs.append(n)
+                    inputs.append(_canon_ds(n))
         else:
             for m in _DATA_OPT_RE.finditer(mt):
                 if n := _ds_name(m.group(1)):
-                    inputs.append(n)
+                    inputs.append(_canon_ds(n))
             for m in _PROC_OUT_RE.finditer(mt):
                 raw = m.group(1) or m.group(2) or ""
                 if n := _ds_name(raw):
-                    outputs.append(n)
+                    outputs.append(_canon_ds(n))
+            # Quoted physical-path options: DATA='<path>' (input) and
+            # OUT='<path>' (output) — scanned on cf, not mt.
+            for m in _QUOTED_DATA_OPT_RE.finditer(cf):
+                inputs.append(_quoted_path(m.group(1)))
+            for m in _QUOTED_OUT_OPT_RE.finditer(cf):
+                outputs.append(_quoted_path(m.group(1)))
             if proc_name == "sort" and not _PROC_OUT_RE.search(mt):
                 # in-place sort: DATA= is both input and output
                 for m in _DATA_OPT_RE.finditer(mt):
-                    if (n := _ds_name(m.group(1))) and n not in outputs:
-                        outputs.append(n)
+                    if (n := _ds_name(m.group(1))) and (
+                        cn := _canon_ds(n)
+                    ) not in outputs:
+                        outputs.append(cn)
 
     def _dedup(lst: list[str]) -> list[str]:
         seen: set[str] = set()

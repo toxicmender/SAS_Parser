@@ -116,6 +116,13 @@ class SasChunkMetadata(BaseModel):
     labels: list[str] = Field(default_factory=list)
     referenced_librefs: list[str] = Field(default_factory=list)
     referenced_datasets: list[str] = Field(default_factory=list)
+    # Librefs this chunk *assigns* via a LIBNAME statement (lowercased).
+    # A LIBNAME may legally appear inside a DATA/PROC body, so this is
+    # extracted for every chunk kind, not just GLOBAL_STATEMENT.  Caveat:
+    # ``libname x clear;`` (deassignment) still reports ``x`` here — the
+    # extraction is positional, not temporal.  The batcher subtracts these
+    # from a batch's used librefs to derive ``SasBatch.required_librefs``.
+    defines_librefs: list[str] = Field(default_factory=list)
     defined_macros: list[str] = Field(default_factory=list)
     called_macros: list[str] = Field(default_factory=list)
     includes: list[str] = Field(default_factory=list)
@@ -458,6 +465,13 @@ class SasBatch(BaseModel):
         Datasets produced by this batch (may feed later batches/singletons).
     required_macros
         Macro names invoked inside but not defined inside this batch.
+    required_librefs
+        Librefs referenced by this batch's dataset I/O but not assigned by
+        a LIBNAME statement inside the batch, excluding the SAS-supplied
+        default libraries (work, user, sashelp, sasuser, maps, mapssas).
+        A non-empty list means the batch is not self-contained: it relies
+        on LIBNAME assignments that live outside it (mirrors
+        ``required_macros`` for the library namespace).
     defined_macros
         Macro names whose full definitions live inside this batch.
     produced_macrovars
@@ -486,6 +500,7 @@ class SasBatch(BaseModel):
     input_datasets: list[str] = Field(default_factory=list)
     output_datasets: list[str] = Field(default_factory=list)
     required_macros: list[str] = Field(default_factory=list)
+    required_librefs: list[str] = Field(default_factory=list)
     defined_macros: list[str] = Field(default_factory=list)
     produced_macrovars: list[str] = Field(default_factory=list)
     required_macrovars: list[str] = Field(default_factory=list)
@@ -519,7 +534,8 @@ class SasBatch(BaseModel):
             f"SasBatch {self.batch_id} ({scope}) chunks={len(self.chunks)} "
             f"lines {self.start_line}-{self.end_line} "
             f"source_files={self.source_files} "
-            f"inputs={self.input_datasets} outputs={self.output_datasets}"
+            f"inputs={self.input_datasets} outputs={self.output_datasets} "
+            f"required_librefs={self.required_librefs}"
         )
 
 

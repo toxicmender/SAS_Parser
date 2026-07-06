@@ -54,7 +54,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TextIO
 
-from .chunker import _STANDARD_AUTOCALL_MACROS
+from .chunker import _STANDARD_AUTOCALL_MACROS, _canon_ds
 from .models import (
     SasBatch,
     SasBatchResult,
@@ -241,6 +241,144 @@ def _file_of_map(file_offsets: list[int], n: int) -> list[int]:
         nxt = file_offsets[fi + 1] if fi + 1 < len(file_offsets) else n
         file_of.extend([fi] * (nxt - off))
     return file_of
+
+
+# ---------------------------------------------------------------------------
+# Library handling
+# ---------------------------------------------------------------------------
+
+# Libraries SAS supplies without a LIBNAME statement (SAS Programmer's Guide:
+# Essentials, Ch. 11 "SAS Default Libraries" — Work/User/Sashelp/Sasuser; the
+# maps libraries ship with SAS/GRAPH installs).  Never a missing libref a
+# batch needs to locate, so excluded from SasBatch.required_librefs.
+_DEFAULT_LIBREFS = frozenset(
+    {"work", "user", "sashelp", "sasuser", "maps", "mapssas"}
+)
+
+# PROC steps that read the most recently created data set (_LAST_) when no
+# DATA= option is given (guide, Ch. 3 "Special Data Set Names").  Kept to
+# common, unambiguous data-consuming procedures — a PROC outside this set
+# with no DATA= simply gets no implicit input rather than a guessed edge.
+_LAST_CONSUMING_PROCS = frozenset(
+    {
+        "chart",
+        "contents",
+        "corr",
+        "freq",
+        "means",
+        "plot",
+        "print",
+        "rank",
+        "report",
+        "sgplot",
+        "sort",
+        "summary",
+        "tabulate",
+        "transpose",
+        "univariate",
+    }
+)
+
+# A bare ``set;`` statement (no dataset named) reads _LAST_.  Scanned on the
+# chunk's raw text — a "set;" inside a comment or string could in principle
+# false-positive, but the check only fires for DATA_STEP chunks that have no
+# recorded input at all, where a real SET statement would have been captured.
+_BARE_SET_RE = re.compile(r"\bset\s*;", re.IGNORECASE)
+
+
+def _resolve_implicit_datasets(flat_chunks: list[SasChunk]) -> None:
+    """Resolve implicit dataset references in corpus order (finding 3).
+
+    SAS maintains a session-wide "most recently created data set" (_LAST_)
+    that several constructs read implicitly, and the reserved name
+    ``_DATA_`` names its outputs via the DATAn convention (DATA1, DATA2, …
+    — guide Ch. 3 "Special Data Set Names").  This pass walks the flat
+    corpus once, replacing those placeholders with concrete canonical
+    names so the ordinary dataset_flow pass links them with no special
+    cases:
+
+    - ``_data_`` outputs become ``work.data<n>`` (corpus-wide counter,
+      mirroring the session-wide DATAn counter);
+    - ``_last_`` inputs become the tracked last-created dataset (dropped
+      with a debug log when nothing has been created yet);
+    - a whitelisted PROC step with no input at all, or a DATA step whose
+      only SET statement is a bare ``set;``, gains the last-created
+      dataset as input.
+
+    ``last_created`` deliberately persists across file boundaries —
+    consistent with the same-session assumption that already links
+    ``work.*`` datasets across files.  Known limitations: a MACRO_CALL
+    whose outputs are only resolved later (Fix B) does not advance
+    ``last_created``, and MACRO_DEFINITION chunks never do (defining a
+    macro executes nothing — their ``output_datasets`` are empty).
+    """
+    last_created: str | None = None
+    datan = 0
+
+    for idx, chunk in enumerate(flat_chunks):
+        meta = chunk.metadata
+        new_in = list(meta.input_datasets)
+        new_out = list(meta.output_datasets)
+        changed = False
+
+        if "_data_" in new_out:
+            resolved_out: list[str] = []
+            for ds in new_out:
+                if ds == "_data_":
+                    datan += 1
+                    ds = f"work.data{datan}"
+                    logger.debug(
+                        f"implicit[_data_]: chunk {chunk.chunk_id} output resolved to '{ds}'"
+                    )
+                resolved_out.append(ds)
+            new_out = resolved_out
+            changed = True
+
+        if "_last_" in new_in:
+            if last_created is not None:
+                logger.debug(
+                    f"implicit[_last_]: chunk {chunk.chunk_id} input resolved to '{last_created}'"
+                )
+                new_in = [last_created if ds == "_last_" else ds for ds in new_in]
+            else:
+                logger.debug(
+                    f"implicit[_last_]: chunk {chunk.chunk_id} references _LAST_ "
+                    f"before any dataset was created — dropped"
+                )
+                new_in = [ds for ds in new_in if ds != "_last_"]
+            changed = True
+
+        if (
+            not new_in
+            and last_created is not None
+            and (
+                (
+                    chunk.kind == SasChunkKind.PROC_STEP
+                    and (meta.proc_name or "") in _LAST_CONSUMING_PROCS
+                )
+                or (
+                    chunk.kind == SasChunkKind.DATA_STEP
+                    and _BARE_SET_RE.search(chunk.text)
+                )
+            )
+        ):
+            logger.debug(
+                f"implicit[no-data=]: chunk {chunk.chunk_id} ({chunk.kind.value}) "
+                f"gains implicit input '{last_created}'"
+            )
+            new_in = [last_created]
+            changed = True
+
+        if changed:
+            updated_meta = meta.model_copy(
+                update={"input_datasets": new_in, "output_datasets": new_out}
+            )
+            flat_chunks[idx] = chunk.model_copy(update={"metadata": updated_meta})
+
+        if new_out:
+            # SAS sets _LAST_ to the most recently created data set; for a
+            # multi-dataset DATA statement that is the last one named.
+            last_created = new_out[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -511,7 +649,10 @@ def _discover_edges(
         if chunk.kind == SasChunkKind.MACRO_CALL:
             arg_tokens = _ARG_DS_TOKEN_RE.findall(chunk.text)
             for tok in arg_tokens:
-                ds_norm = tok.lower()
+                # Canonicalise so a bare one-level argument matches its
+                # work.-qualified producer (and vice versa) — the producer
+                # index keys are canonical.
+                ds_norm = _canon_ds(tok.lower())
                 if ds_norm not in produces_ds:
                     continue
                 for pidx in produces_ds[ds_norm]:
@@ -563,10 +704,15 @@ def _discover_edges(
                     # keyword-only parameter
                     return kw_args.get(pname)
 
+                # Resolved values are canonicalised (one-level → work.) so
+                # they match the producer index; a value still containing an
+                # ``&`` reference is unresolvable at this site and is kept
+                # verbatim, matching nothing rather than a guessed name.
                 resolved_outputs: list[str] = []
                 for entry in def_meta.body_param_outputs:
                     val = _resolve(entry)
                     if val:
+                        val = val if "&" in val else _canon_ds(val)
                         resolved_outputs.append(val)
                         logger.debug(
                             f"macro_body_dataset: resolved param '{entry['param']}' → output '{val}'  (call {chunk.chunk_id})"
@@ -576,6 +722,7 @@ def _discover_edges(
                 for entry in def_meta.body_param_inputs:
                     val = _resolve(entry)
                     if val:
+                        val = val if "&" in val else _canon_ds(val)
                         resolved_inputs.append(val)
                         logger.debug(
                             f"macro_body_dataset: resolved param '{entry['param']}' → input '{val}'  (call {chunk.chunk_id})"
@@ -797,6 +944,31 @@ def _make_batch(
                 seen_em.add(mac)
                 logger.debug(f"_make_batch {bid}: ext macro '%{mac}'")
 
+    # ── external libref requirements ────────────────────────────────────────
+    # Librefs referenced by this batch's dataset I/O but not assigned by a
+    # LIBNAME statement inside it, excluding the SAS-supplied default
+    # libraries.  Dataset names are canonical (one-level → work.) by the time
+    # they reach here, so the libref part of every two-level name is exact.
+    defined_librefs: set[str] = set()
+    used_librefs: set[str] = set()
+    for c in member_chunks:
+        m = c.metadata
+        defined_librefs.update(m.defines_librefs)
+        for ds in (
+            *m.input_datasets,
+            *m.output_datasets,
+            *m.body_literal_inputs,
+            *m.body_literal_outputs,
+        ):
+            # Quoted physical paths ('c:/tmp/x') address a file directly, not
+            # a library member; special _name_ tokens have no libref either.
+            if ds.startswith("'") or "." not in ds:
+                continue
+            used_librefs.add(ds.split(".", 1)[0])
+    ext_librefs = sorted(used_librefs - defined_librefs - _DEFAULT_LIBREFS)
+    if ext_librefs:
+        logger.debug(f"_make_batch {bid}: ext librefs {ext_librefs}")
+
     # ── external macro-variable requirements (ROADMAP Phase 2) ──────────────
     ext_macrovars: list[str] = []
     seen_emv: set[str] = set()
@@ -840,6 +1012,7 @@ def _make_batch(
         input_datasets=ext_inputs,
         output_datasets=sorted(intra_outputs),
         required_macros=ext_macros,
+        required_librefs=ext_librefs,
         defined_macros=sorted(intra_macros),
         produced_macrovars=sorted(intra_macrovars),
         required_macrovars=ext_macrovars,
@@ -1092,6 +1265,9 @@ class MultiFileBatcher:
         logger.debug(
             f"MultiFileBatcher.batch: flat index  total={n}  file_offsets={file_offsets}"
         )
+
+        # ── implicit dataset resolution (_LAST_ / _DATA_ / no DATA=) ────────
+        _resolve_implicit_datasets(flat_chunks)
 
         # ── edge discovery ──────────────────────────────────────────────────
         edges = _discover_edges(flat_chunks, uf, file_of=file_of)
