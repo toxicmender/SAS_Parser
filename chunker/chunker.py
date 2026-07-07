@@ -2169,53 +2169,58 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
     )
 
 
-def _merge_meta(parent: SasChunkMetadata, child: SasChunkMetadata) -> SasChunkMetadata:
-    def ml(a: list[str], b: list[str]) -> list[str]:
-        return sorted(set(a + b))
+# Fields where the parent's (whole-region) value is authoritative and the
+# child's is only a fallback, instead of the two being unioned.  All three
+# derive from the %MACRO signature header, which only the split slice that
+# contains it can parse — for every other slice the extractor returns an
+# empty list, and unioning positional {"param", "pos"} dicts from partial
+# views could double-count or (for the unhashable dicts) not union at all.
+_MERGE_PARENT_WINS = frozenset(
+    {
+        "body_param_inputs",
+        "body_param_outputs",
+        "macro_param_names",
+    }
+)
 
-    return SasChunkMetadata(
-        step_name=child.step_name or parent.step_name,
-        proc_name=child.proc_name or parent.proc_name,
-        macro_name=child.macro_name or parent.macro_name,
-        labels=ml(parent.labels, child.labels),
-        referenced_librefs=ml(parent.referenced_librefs, child.referenced_librefs),
-        referenced_datasets=ml(parent.referenced_datasets, child.referenced_datasets),
-        defines_librefs=ml(parent.defines_librefs, child.defines_librefs),
-        includes=ml(parent.includes, child.includes),
-        options=ml(parent.options, child.options),
-        has_unclosed_block=parent.has_unclosed_block or child.has_unclosed_block,
-        macro_var_op=child.macro_var_op or parent.macro_var_op,
-        global_statement_keyword=child.global_statement_keyword
-        or parent.global_statement_keyword,
-        declared_macro_vars=ml(parent.declared_macro_vars, child.declared_macro_vars),
-        referenced_macro_vars=ml(
-            parent.referenced_macro_vars, child.referenced_macro_vars
-        ),
-        recognized_functions=ml(
-            parent.recognized_functions, child.recognized_functions
-        ),
-        recognized_call_routines=ml(
-            parent.recognized_call_routines, child.recognized_call_routines
-        ),
-        input_datasets=ml(parent.input_datasets, child.input_datasets),
-        output_datasets=ml(parent.output_datasets, child.output_datasets),
-        defines_macros=ml(parent.defines_macros, child.defines_macros),
-        invokes_macros=ml(parent.invokes_macros, child.invokes_macros),
-        body_literal_inputs=ml(parent.body_literal_inputs, child.body_literal_inputs),
-        body_literal_outputs=ml(
-            parent.body_literal_outputs, child.body_literal_outputs
-        ),
-        body_param_inputs=parent.body_param_inputs or child.body_param_inputs,
-        body_param_outputs=parent.body_param_outputs or child.body_param_outputs,
-        macro_param_names=parent.macro_param_names or child.macro_param_names,
-        produces_macrovars=ml(parent.produces_macrovars, child.produces_macrovars),
-        symput_scope_hazard=parent.symput_scope_hazard or child.symput_scope_hazard,
-        symput_hazard_vars=ml(parent.symput_hazard_vars, child.symput_hazard_vars),
-        control_flow_op=child.control_flow_op or parent.control_flow_op,
-        contains_abort=parent.contains_abort or child.contains_abort,
-        contains_computed_goto=parent.contains_computed_goto
-        or child.contains_computed_goto,
-    )
+
+def _merge_meta(parent: SasChunkMetadata, child: SasChunkMetadata) -> SasChunkMetadata:
+    """Merge a split child's metadata with its parent region's metadata.
+
+    Driven by ``SasChunkMetadata.model_fields`` so a newly added field is
+    merged by its type automatically instead of being silently dropped:
+
+    - ``list[str]``   → sorted union of both sides;
+    - ``bool``        → OR (a flag raised anywhere in the region stays raised);
+    - ``str | None``  → child's value, falling back to the parent's (the
+      child is the more specific view of its own slice);
+    - ``_MERGE_PARENT_WINS`` fields → parent's value, falling back to the
+      child's (signature-derived fields; see the constant above).
+
+    Any other annotation raises ``TypeError`` at merge time — every test
+    that exercises an oversized split trips it — forcing the author of a
+    new field shape to pick a rule rather than inherit a wrong default.
+    Computed fields derive from their stored inputs and are not merged.
+    """
+    merged: dict[str, object] = {}
+    for name, field in SasChunkMetadata.model_fields.items():
+        p = getattr(parent, name)
+        c = getattr(child, name)
+        if name in _MERGE_PARENT_WINS:
+            merged[name] = p or c
+        elif field.annotation == list[str]:
+            merged[name] = sorted({*p, *c})
+        elif field.annotation is bool:
+            merged[name] = p or c
+        elif field.annotation == (str | None):
+            merged[name] = c or p
+        else:
+            raise TypeError(
+                f"SasChunkMetadata.{name}: no merge rule for annotation "
+                f"{field.annotation!r} — add a branch to _merge_meta or an "
+                f"entry to _MERGE_PARENT_WINS"
+            )
+    return SasChunkMetadata(**merged)
 
 
 def _title(kind: SasChunkKind, meta: SasChunkMetadata) -> str | None:

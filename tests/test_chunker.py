@@ -422,5 +422,61 @@ class TestSasSemanticChunker(unittest.TestCase):
         self.assertEqual(result.chunks[0].kind, SasChunkKind.DATA_STEP)
 
 
+class TestMergeMeta(unittest.TestCase):
+    """Pin the introspective _merge_meta's per-type rules.
+
+    _merge_meta iterates every stored field of SasChunkMetadata and raises
+    TypeError for a field whose annotation has no merge rule, so the
+    default-instance merge below doubles as the guard that a newly added
+    field shape cannot ship without a conscious merge decision.
+    """
+
+    def test_every_field_has_a_merge_rule(self):
+        from chunker.chunker import _merge_meta
+        from chunker.models import SasChunkMetadata
+
+        # Raises TypeError if any stored field's annotation is unhandled.
+        merged = _merge_meta(SasChunkMetadata(), SasChunkMetadata())
+        self.assertIsInstance(merged, SasChunkMetadata)
+
+    def test_merge_rules_by_type(self):
+        from chunker.chunker import _merge_meta
+        from chunker.models import SasChunkMetadata
+
+        parent = SasChunkMetadata(
+            step_name="parent_step",
+            macro_name="outer",
+            output_datasets=["work.a", "work.b"],
+            contains_abort=True,
+            macro_param_names=["ds", "out"],
+            body_param_outputs=[{"param": "out", "pos": 1}],
+            referenced_macro_vars=["cutoff", "ds", "out"],
+        )
+        child = SasChunkMetadata(
+            step_name="child_step",
+            output_datasets=["work.b", "work.c"],
+            referenced_macro_vars=["region"],
+        )
+        merged = _merge_meta(parent, child)
+
+        # str | None → child wins, parent is the fallback
+        self.assertEqual(merged.step_name, "child_step")
+        self.assertEqual(merged.macro_name, "outer")
+        # list[str] → sorted union
+        self.assertEqual(merged.output_datasets, ["work.a", "work.b", "work.c"])
+        self.assertEqual(
+            merged.referenced_macro_vars, ["cutoff", "ds", "out", "region"]
+        )
+        # bool → OR
+        self.assertTrue(merged.contains_abort)
+        self.assertFalse(merged.symput_scope_hazard)
+        # parent-wins signature fields
+        self.assertEqual(merged.macro_param_names, ["ds", "out"])
+        self.assertEqual(merged.body_param_outputs, [{"param": "out", "pos": 1}])
+        # computed views derive from the merged stored fields: the macro's
+        # own parameters stay excluded even for the child-slice reference
+        self.assertEqual(merged.consumes_macrovars, ["cutoff", "region"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
