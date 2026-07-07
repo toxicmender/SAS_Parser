@@ -21,9 +21,27 @@ from __future__ import annotations
 import logging
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 logger = logging.getLogger(__name__)
+
+
+def _is_automatic_macro_var(name: str) -> bool:
+    """
+    True if *name* (without the leading ``&`` or trailing ``.``) is one of
+    SAS's automatic macro variables.
+
+    Per *SAS Macro Language: Reference* (Ch. 12, "Automatic Macro
+    Variables"), every automatic macro variable's name begins with the
+    reserved ``SYS`` prefix — confirmed across all ~60 of them (SYSDATE,
+    SYSLAST, SYSPARM, …).  A simple prefix check is sufficient; no
+    enumerated lookup table is needed or maintained.
+
+    Lives here (rather than in chunker.py, its original home) because
+    :class:`SasChunkMetadata` derives its automatic-variable and
+    consumer views from ``referenced_macro_vars`` using this predicate.
+    """
+    return name.lower().startswith("sys")
 
 
 # ---------------------------------------------------------------------------
@@ -123,8 +141,6 @@ class SasChunkMetadata(BaseModel):
     # extraction is positional, not temporal.  The batcher subtracts these
     # from a batch's used librefs to derive ``SasBatch.required_librefs``.
     defines_librefs: list[str] = Field(default_factory=list)
-    defined_macros: list[str] = Field(default_factory=list)
-    called_macros: list[str] = Field(default_factory=list)
     includes: list[str] = Field(default_factory=list)
     options: list[str] = Field(default_factory=list)
     has_unclosed_block: bool = False
@@ -149,18 +165,6 @@ class SasChunkMetadata(BaseModel):
     # specific statement type without having to re-parse the chunk text.
     global_statement_keyword: str | None = None
 
-    # ── automatic (system) macro variable references ────────────────────────
-    # Every automatic macro variable SAS itself provides (&sysdate, &syslast,
-    # &sysparm, ...) begins with the reserved "SYS" prefix (SAS Macro
-    # Language: Reference, Ch. 12 "Automatic Macro Variables" — confirmed
-    # across all ~60 of them).  Rather than maintaining an enumerated lookup
-    # table, a chunk's text is scanned for any "&sys..." reference and the
-    # matched names are recorded here.  These are read-mostly, system-
-    # provided values — never a corpus-local dependency — so this field lets
-    # a future macro-variable dependency graph (see ROADMAP Phase 2) exclude
-    # them from "unresolved external variable" treatment for free.
-    referenced_automatic_vars: list[str] = Field(default_factory=list)
-
     # ── macro-variable declarations and references (macro-language level) ────
     #
     # These two fields describe macro variables at the *source-text* level —
@@ -177,10 +181,27 @@ class SasChunkMetadata(BaseModel):
     declared_macro_vars: list[str] = Field(default_factory=list)
 
     # ``referenced_macro_vars`` — every ``&name`` reference in this chunk's
-    # text, including automatic (``&sys*``) variables.  This is the complete
-    # reference set; the filtered, dependency-oriented view lives in
-    # ``consumes_macrovars`` (automatics and own-parameters excluded).
+    # text, including automatic (``&sys*``) variables.  This is the single
+    # STORED reference scan; the two filtered views are derived from it:
+    #   - ``referenced_automatic_vars``  (computed) — the ``&sys*`` subset.
+    #   - ``consumes_macrovars``         (computed) — automatics and the
+    #     macro's own parameters excluded; the dependency-oriented view the
+    #     batcher consumes.
     referenced_macro_vars: list[str] = Field(default_factory=list)
+
+    # ── automatic (system) macro variable references ────────────────────────
+    # Every automatic macro variable SAS itself provides (&sysdate, &syslast,
+    # &sysparm, ...) begins with the reserved "SYS" prefix (SAS Macro
+    # Language: Reference, Ch. 12 "Automatic Macro Variables").  Derived from
+    # ``referenced_macro_vars`` via :func:`_is_automatic_macro_var` rather
+    # than stored separately.  These are read-mostly, system-provided values —
+    # never a corpus-local dependency — so this view lets the macro-variable
+    # dependency graph exclude them from "unresolved external variable"
+    # treatment for free.
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def referenced_automatic_vars(self) -> list[str]:
+        return [n for n in self.referenced_macro_vars if _is_automatic_macro_var(n)]
 
     # ── recognised SAS functions and CALL routines ──────────────────────────
     #
@@ -258,7 +279,18 @@ class SasChunkMetadata(BaseModel):
     # and, for MACRO_DEFINITION chunks, the macro's own declared parameters
     # (already tracked via ``macro_param_names`` / ``body_param_*`` — those
     # are call-site-resolved, not a corpus-level macro-variable dependency).
-    consumes_macrovars: list[str] = Field(default_factory=list)
+    # Derived from ``referenced_macro_vars`` + ``macro_param_names`` rather
+    # than stored (macro parameter names are lowercased at parse time, as are
+    # the stored references, so the exclusion is an exact match).
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def consumes_macrovars(self) -> list[str]:
+        own_params = set(self.macro_param_names)
+        return [
+            n
+            for n in self.referenced_macro_vars
+            if not _is_automatic_macro_var(n) and n not in own_params
+        ]
 
     # ── CALL SYMPUT/SYMPUTX local-scope hazard (ROADMAP Phase 2, C5c) ───────
     #

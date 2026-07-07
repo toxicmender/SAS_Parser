@@ -12,8 +12,8 @@ Phase 1 — reserved-word exclusion and two new metadata fields:
    hand-maintained partial list that predated this phase.  Confirmed bug:
    control-flow keywords (%do, %if, %then, %else, %end, %return, %abort,
    %goto, ...) and macro functions (%scan, %substr, %bquote, ...) were
-   leaking into invokes_macros/called_macros as if they were real
-   corpus-local macro invocations.
+   leaking into invokes_macros as if they were real corpus-local macro
+   invocations.
 
 2. macro_var_op metadata field — distinguishes %let/%global/%local/%put
    from each other and from the other statements that share the
@@ -91,10 +91,10 @@ from chunker.chunker import (
     _MACRO_INVOKE_RE,
     _RESERVED_WORDS,
     _STANDARD_AUTOCALL_MACROS,
-    _is_automatic_macro_var,
     _macro_contains_computed_goto,
     _macro_has_local_scope,
 )
+from chunker.models import _is_automatic_macro_var
 
 _C = SasSemanticChunker(min_words=1, max_words=9_999)
 
@@ -196,9 +196,7 @@ class TestReservedWordExclusion(unittest.TestCase):
         for src in cases:
             cr = _C.chunk_text(src)
             all_invokes = {m for c in cr.chunks for m in c.metadata.invokes_macros}
-            all_called = {m for c in cr.chunks for m in c.metadata.called_macros}
             self.assertEqual(all_invokes, set(), f"leak in invokes_macros for {src!r}")
-            self.assertEqual(all_called, set(), f"leak in called_macros for {src!r}")
 
     def test_macro_functions_not_in_invokes_macros(self):
         """%scan/%substr/%bquote/%eval/%sysfunc etc. must never leak either."""
@@ -218,7 +216,6 @@ class TestReservedWordExclusion(unittest.TestCase):
         """Widening the exclusion list must not swallow real macro names."""
         cr = _C.chunk_text("%clean(work.orders);")
         self.assertIn("clean", cr.chunks[0].metadata.invokes_macros)
-        self.assertIn("clean", cr.chunks[0].metadata.called_macros)
 
     def test_macro_name_resembling_reserved_substring_still_detected(self):
         """
@@ -231,9 +228,9 @@ class TestReservedWordExclusion(unittest.TestCase):
 
     def test_call_re_and_invoke_re_consistent(self):
         """
-        _MACRO_CALL_RE (legacy called_macros) and _MACRO_INVOKE_RE (modern
-        invokes_macros) must now agree on every reserved word, fixing the
-        documented inconsistency between the two regexes.
+        _MACRO_CALL_RE (used by CALL EXECUTE literal extraction) and
+        _MACRO_INVOKE_RE (invokes_macros) must agree on every reserved
+        word, fixing the documented inconsistency between the two regexes.
         """
         sample = " ".join(f"%{w}" for w in sorted(_RESERVED_WORDS))
         call_matches = {m.group(1).lower() for m in _MACRO_CALL_RE.finditer(sample)}

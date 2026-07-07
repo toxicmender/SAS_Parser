@@ -1694,26 +1694,12 @@ _SPLIT_WS_COMMA_RE = re.compile(r"[,\s]+")  # %global/%local list separator
 _DATA_HDR_STRIP_RE = re.compile(r"^\s*data\s+", re.IGNORECASE)  # drop DATA keyword
 _NUM_SUFFIX_RE = re.compile(r"^([A-Za-z_]+?)(\d+)$")  # split trailing integer
 
-# Any "&name" or "&name." reference, used to scan for automatic macro
-# variables.  Deliberately broad (matches every macro-variable reference,
-# not just &sys*) so it can be reused for other reference-tracking needs
-# without re-deriving the same pattern; the sys-prefix filter is applied
-# by the caller via _is_automatic_macro_var.
+# Any "&name" or "&name." reference — the single stored scan feeding
+# SasChunkMetadata.referenced_macro_vars.  Deliberately broad (matches every
+# macro-variable reference, not just &sys*): the automatic-variable and
+# consumer views are derived from the stored set by computed fields on the
+# model (see models._is_automatic_macro_var).
 _VAR_REF_RE = re.compile(r"&(\w+)\.?")
-
-
-def _is_automatic_macro_var(name: str) -> bool:
-    """
-    True if *name* (without the leading ``&`` or trailing ``.``) is one of
-    SAS's automatic macro variables.
-
-    Per *SAS Macro Language: Reference* (Ch. 12, "Automatic Macro
-    Variables"), every automatic macro variable's name begins with the
-    reserved ``SYS`` prefix — confirmed across all ~60 of them (SYSDATE,
-    SYSLAST, SYSPARM, …).  A simple prefix check is sufficient; no
-    enumerated lookup table is needed or maintained.
-    """
-    return name.lower().startswith("sys")
 
 
 # ---------------------------------------------------------------------------
@@ -2030,8 +2016,6 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
         }
         | set(defines_librefs)
     )
-    mdefs = sorted({_nid(m.group(1)) for m in _MACRO_DEF_RE.finditer(mt)})
-    mcalls = sorted({_nid(m.group(1)) for m in _MACRO_CALL_RE.finditer(mt)})
     includes = [_nid(m.group(1)).strip("'\"") for m in _INCLUDE_RE.finditer(cf)]
     options = [_nid(p) for m in _OPTIONS_RE.finditer(mt) for p in m.group(1).split()]
     labels = sorted({_nid(m.group(1)) for m in _LABEL_RE.finditer(mt)})
@@ -2061,19 +2045,19 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
         if cf_m:
             control_flow_op = cf_m.group(1).lower()
 
-    # ── automatic (system) macro variable references ───────────────────────
-    # Scanned on `cf` (quotes preserved, comments stripped) rather than `mt`
-    # so references inside double-quoted strings — e.g. title "Report run
-    # &sysday" — are still caught.  SAS only resolves macro variables inside
-    # double-quoted strings, never single-quoted ones; distinguishing that
-    # here would add real complexity for marginal benefit, so this also
-    # matches (harmlessly) inside single-quoted text.
-    auto_vars = sorted(
-        {
-            m.group(1).lower()
-            for m in _VAR_REF_RE.finditer(cf)
-            if _is_automatic_macro_var(m.group(1))
-        }
+    # ── macro-variable references (single stored scan) ─────────────────────
+    # Every "&name" reference in this chunk, automatic (&sys*) variables
+    # included.  Scanned on `cf` (quotes preserved, comments stripped) rather
+    # than `mt` so references inside double-quoted strings — e.g. title
+    # "Report run &sysday" — are still caught.  SAS only resolves macro
+    # variables inside double-quoted strings, never single-quoted ones;
+    # distinguishing that here would add real complexity for marginal
+    # benefit, so this also matches (harmlessly) inside single-quoted text.
+    # The automatic-variable subset and the dependency-oriented consumer view
+    # (automatics and own-parameters excluded) are computed fields on
+    # SasChunkMetadata, derived from this one scan.
+    referenced_macro_vars = sorted(
+        {m.group(1).lower() for m in _VAR_REF_RE.finditer(cf)}
     )
 
     # ── macro body I/O classification (literal vs parameterised) ───────────
@@ -2119,20 +2103,6 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
     elif kind == SasChunkKind.PROC_STEP and pm and _nid(pm.group(1)) == "sql":
         produces_macrovars.extend(_extract_sql_into_vars(cf))
 
-    # consumes_macrovars: every "&name" reference in this chunk, excluding
-    # automatic variables (tracked separately above) and — for
-    # MACRO_DEFINITION chunks — the macro's own declared parameters (those
-    # are call-site-resolved, not a corpus-level dependency).
-    own_params = set(param_names)
-    consumes_macrovars = sorted(
-        {
-            m.group(1).lower()
-            for m in _VAR_REF_RE.finditer(cf)
-            if not _is_automatic_macro_var(m.group(1))
-            and m.group(1).lower() not in own_params
-        }
-    )
-
     # ── macro-language-level declarations and references ────────────────────
     # declared_macro_vars: names introduced by %LET and by %GLOBAL/%LOCAL
     # declaration lists.  Scanned on `cf` so %LET targets inside quoted text
@@ -2144,12 +2114,6 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
             if _IDENT_RE.fullmatch(name):
                 declared.append(name.lower())
     declared_macro_vars = sorted(set(declared))
-
-    # referenced_macro_vars: the complete set of "&name" references (automatic
-    # variables included), the unfiltered counterpart to consumes_macrovars.
-    referenced_macro_vars = sorted(
-        {m.group(1).lower() for m in _VAR_REF_RE.finditer(cf)}
-    )
 
     # ── recognised SAS functions and CALL routines ──────────────────────────
     # Scanned on `mt` (string literals blanked) so a function-like token inside
@@ -2178,14 +2142,11 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
         referenced_librefs=librefs,
         referenced_datasets=sorted(dataset_set),
         defines_librefs=defines_librefs,
-        defined_macros=mdefs,
-        called_macros=mcalls,
         includes=includes,
         options=options,
         has_unclosed_block=(kind == SasChunkKind.UNKNOWN_BLOCK),
         macro_var_op=var_op,
         global_statement_keyword=global_stmt_kw,
-        referenced_automatic_vars=auto_vars,
         declared_macro_vars=declared_macro_vars,
         referenced_macro_vars=referenced_macro_vars,
         recognized_functions=recognized_functions,
@@ -2195,7 +2156,7 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
         contains_computed_goto=has_computed_goto,
         input_datasets=inp,
         output_datasets=out,
-        defines_macros=defs,
+        defines_macros=sorted(set(defs)),
         invokes_macros=sorted(set(invk)),
         body_literal_inputs=body_lit_in,
         body_literal_outputs=body_lit_out,
@@ -2203,7 +2164,6 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
         body_param_outputs=body_par_out,
         macro_param_names=param_names,
         produces_macrovars=sorted(set(produces_macrovars)),
-        consumes_macrovars=consumes_macrovars,
         symput_scope_hazard=hazard,
         symput_hazard_vars=sorted(set(hazard_vars)),
     )
@@ -2221,18 +2181,12 @@ def _merge_meta(parent: SasChunkMetadata, child: SasChunkMetadata) -> SasChunkMe
         referenced_librefs=ml(parent.referenced_librefs, child.referenced_librefs),
         referenced_datasets=ml(parent.referenced_datasets, child.referenced_datasets),
         defines_librefs=ml(parent.defines_librefs, child.defines_librefs),
-        defined_macros=ml(parent.defined_macros, child.defined_macros),
-        called_macros=ml(parent.called_macros, child.called_macros),
         includes=ml(parent.includes, child.includes),
         options=ml(parent.options, child.options),
         has_unclosed_block=parent.has_unclosed_block or child.has_unclosed_block,
         macro_var_op=child.macro_var_op or parent.macro_var_op,
         global_statement_keyword=child.global_statement_keyword
         or parent.global_statement_keyword,
-        referenced_automatic_vars=ml(
-            parent.referenced_automatic_vars,
-            child.referenced_automatic_vars,
-        ),
         declared_macro_vars=ml(parent.declared_macro_vars, child.declared_macro_vars),
         referenced_macro_vars=ml(
             parent.referenced_macro_vars, child.referenced_macro_vars
@@ -2255,7 +2209,6 @@ def _merge_meta(parent: SasChunkMetadata, child: SasChunkMetadata) -> SasChunkMe
         body_param_outputs=parent.body_param_outputs or child.body_param_outputs,
         macro_param_names=parent.macro_param_names or child.macro_param_names,
         produces_macrovars=ml(parent.produces_macrovars, child.produces_macrovars),
-        consumes_macrovars=ml(parent.consumes_macrovars, child.consumes_macrovars),
         symput_scope_hazard=parent.symput_scope_hazard or child.symput_scope_hazard,
         symput_hazard_vars=ml(parent.symput_hazard_vars, child.symput_hazard_vars),
         control_flow_op=child.control_flow_op or parent.control_flow_op,

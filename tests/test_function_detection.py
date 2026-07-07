@@ -103,8 +103,10 @@ class TestFunctionFalsePositives(unittest.TestCase):
         """
         code = "%compress(&ds);"
         self.assertEqual(_functions(code), set())
-        called = {m for c in _C.chunk_text(code).chunks for m in c.metadata.called_macros}
-        self.assertIn("compress", called)
+        invoked = {
+            m for c in _C.chunk_text(code).chunks for m in c.metadata.invokes_macros
+        }
+        self.assertIn("compress", invoked)
 
     def test_macro_definition_header_named_like_function(self):
         self.assertEqual(_functions("%macro compress(x); %mend compress;"), set())

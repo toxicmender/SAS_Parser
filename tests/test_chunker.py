@@ -129,9 +129,9 @@ class TestSasSemanticChunker(unittest.TestCase):
         result = SasSemanticChunker().chunk_text(source)
 
         self.assertEqual(result.chunks[0].kind, SasChunkKind.MACRO_DEFINITION)
-        self.assertIn("build", result.chunks[0].metadata.defined_macros)
+        self.assertIn("build", result.chunks[0].metadata.defines_macros)
         self.assertEqual(result.chunks[1].kind, SasChunkKind.MACRO_CALL)
-        self.assertIn("build", result.chunks[1].metadata.called_macros)
+        self.assertIn("build", result.chunks[1].metadata.invokes_macros)
         self.assertEqual(result.chunks[2].kind, SasChunkKind.GLOBAL_STATEMENT)
 
     def test_unclosed_macro_diagnostic(self):
@@ -149,7 +149,7 @@ class TestSasSemanticChunker(unittest.TestCase):
         # Per _collect_block's contract, a %MACRO block is closed *only* by its
         # own %MEND, so the whole thing is ONE MACRO_DEFINITION region spanning
         # from `%macro main;` to `%mend main;`, and every %MACRO header inside
-        # (main, inner1, inner2) is reported in metadata.defined_macros.
+        # (main, inner1, inner2) is reported in metadata.defines_macros.
         source = (
             "%macro main;\n"
             "  data step1; set lib.a; total = 1; run;\n"
@@ -186,7 +186,7 @@ class TestSasSemanticChunker(unittest.TestCase):
         self.assertEqual(chunk.end_line, source.count("\n"))
         # Both nested macros are captured inside the body, not spun off.
         self.assertEqual(
-            chunk.metadata.defined_macros, ["inner1", "inner2", "main"]
+            chunk.metadata.defines_macros, ["inner1", "inner2", "main"]
         )
         # The DATA _NULL_ step is a well-known no-output step: `_null_` is a
         # reserved automatic dataset name and must not surface as a real output.

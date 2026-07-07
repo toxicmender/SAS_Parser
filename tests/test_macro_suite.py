@@ -39,8 +39,7 @@ Dedicated macro test files (fully consolidated; covered by
 test_macro_classification.py   (Phase 1 + Phase 3 — "what is this
                                  statement, structurally")
   TestReservedWordExclusion          - the ~94-word Appendix-1 reserved
-                                        set excluded from invokes_macros/
-                                        called_macros
+                                        set excluded from invokes_macros
   TestMacroVarOp                     - %let/%global/%local/%put
                                         distinguished within GLOBAL_STATEMENT
   TestAutomaticMacroVariables        - &sys* prefix detection
