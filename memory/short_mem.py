@@ -1,18 +1,31 @@
 """
 (Databricks / PySpark backend)
 =====================================================
-LangChain Memory Module backed by a Spark DataFrame that maps 1-to-1
-onto a Databricks Delta table in production.
+LangChain chat-history and KV memory module.  Persists to a Databricks
+Delta table in production; runs on a plain Python dict locally, with no
+Spark (or JVM) required at all in that mode.
 
 Architecture
 ------------
-SparkKVStore                 ← core backend  (Spark DataFrame / Delta table)
+SparkKVStore                 ← façade over one of two interchangeable backends
+│   ├── _InMemoryBackend     ← plain dict  (local / CI; pyspark not required)
+│   └── _DeltaBackend        ← Spark DataFrame / Databricks Delta table
 │
 ├── KVChatMessageHistory     ← BaseChatMessageHistory for one thread/session
 ├── ThreadMemoryManager      ← manages many independent threads
-├── WindowChatMemory         ← rolling-window BaseMemory for LangChain chains
 ├── KVMemoryStore            ← tagged KV store with search + text ingestion
 └── DatabricksMemory         ← unified façade (recommended entry point)
+
+LangChain integration
+---------------------
+KVChatMessageHistory implements ``langchain_core.chat_history.
+BaseChatMessageHistory`` (overriding bulk ``add_messages``, as the base
+class recommends) and plugs into ``RunnableWithMessageHistory`` — both are
+current, supported APIs in LangChain v1.  The legacy ``BaseMemory`` /
+``ConversationChain`` layer was removed from LangChain in v1 (it lives on
+only in ``langchain_classic``), so this module no longer ships a
+``BaseMemory`` adapter; see ``chunker.pipeline`` for the
+RunnableWithMessageHistory wiring.
 
 Storage schema (one row per KV entry)
 --------------------------------------
@@ -29,9 +42,9 @@ suffix, so they are collision-free without any read-modify-write sequence
 counter and sort lexicographically in time order (legacy ``{seq:08d}``
 keys sort before them, i.e. before any new message).
 
-On Databricks the SparkKVStore writes to a Delta table and uses
-MERGE INTO for upserts (``set_many`` batches several entries into one
-MERGE).  In local / CI mode it keeps state in a plain Python dict.
+On Databricks the Delta backend uses MERGE INTO for upserts (``set_many``
+batches several entries into one MERGE).  In local / CI mode all state
+lives in a plain Python dict.
 
 Usage — Databricks notebook
 ----------------------------
@@ -46,19 +59,14 @@ Usage — Databricks notebook
     thread.add_user_message("Hello!")
     thread.add_ai_message("Hi! How can I help?")
 
-    chat = mem.chat_memory(session_id="session-1", k=8)
-    # plug straight into ConversationChain(llm=llm, memory=chat)
-
     mem.kv.set("project_goal", "RAG pipeline", tags=["project"])
     mem.kv.search("pipeline")
 
-Usage — local / CI (no Databricks)
------------------------------------
+Usage — local / CI (no Databricks, no Spark)
+---------------------------------------------
     from memory.short_mem import DatabricksMemory
-    from pyspark.sql import SparkSession
 
-    spark = SparkSession.builder.master("local").appName("mem").getOrCreate()
-    mem   = DatabricksMemory(spark=spark)   # table=None → pure in-memory DF
+    mem = DatabricksMemory()   # in-memory dict; pyspark not required
 """
 
 from __future__ import annotations
@@ -78,11 +86,10 @@ from langchain_core.messages import (
     HumanMessage,
     SystemMessage,
 )
-from pydantic import BaseModel, ConfigDict, Field
 
 # ---------------------------------------------------------------------------
-# Guards: PySpark is optional at import time so the module can be loaded
-# even when building docs or running unit tests without a Spark cluster.
+# Guards: PySpark is an optional dependency — required only for Delta mode.
+# The in-memory backend (table=None) must import and run without it.
 # ---------------------------------------------------------------------------
 try:
     from pyspark.sql import DataFrame, SparkSession
@@ -153,8 +160,8 @@ def _sql_like_prefix(prefix: str) -> str:
     )
 
 
-# Schema shared by every layer
-_KV_SCHEMA = None  # built lazily after PySpark import check
+# Schema for the Delta table (built lazily; Delta mode only)
+_KV_SCHEMA = None
 
 
 def _schema():
@@ -173,86 +180,110 @@ def _schema():
     return _KV_SCHEMA
 
 
-# ---------------------------------------------------------------------------
-# BaseMemory shim  (removed from langchain_core public API in v1)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Storage backends
+#
+# Both backends speak the same *raw* record shape — a tuple in Delta-schema
+# column order:
+#
+#     (key, value_json, tags_json | None, created_at, updated_at, source)
+#
+# with value/tags kept as their JSON-serialised strings.  All JSON
+# (de)serialisation, tag filtering, searching and snapshotting live once in
+# SparkKVStore; a backend only stores, retrieves and deletes raw rows.
+#
+# Upsert rows arrive with ``created_at=None`` when the caller did not supply
+# an explicit creation timestamp — each backend then applies its mode's
+# preservation semantics (keep the existing row's created_at on update,
+# default to "now" on insert).
+# ===========================================================================
+
+_RawRecord = Tuple[str, str, Optional[str], float, float, Optional[str]]
 
 
-class BaseMemory(BaseModel):
-    """Minimal abstract base for custom memory objects."""
+class _InMemoryBackend:
+    """Plain-dict backend for local / CI use.  No pyspark, no JVM."""
 
-    @property
-    def memory_variables(self) -> List[str]:
-        raise NotImplementedError
+    def __init__(self) -> None:
+        self._mem: Dict[str, Dict[str, Any]] = {}
 
-    def load_memory_variables(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        raise NotImplementedError
+    def upsert(self, rows: List[_RawRecord], now: float) -> None:
+        for key, value_json, tags_json, created_at, updated_at, source in rows:
+            existing = self._mem.get(key)
+            self._mem[key] = {
+                "value": value_json,
+                # tags=None / source=None on update preserve the existing
+                # values (mirrors the Delta MERGE's COALESCE below).
+                "tags": tags_json
+                if tags_json is not None
+                else (existing["tags"] if existing else _jdump([])),
+                "created_at": created_at
+                if created_at is not None
+                else (existing["created_at"] if existing else now),
+                "updated_at": updated_at,
+                "source": source or (existing["source"] if existing else None),
+            }
 
-    def save_context(self, inputs: Dict[str, Any], outputs: Dict[str, str]) -> None:
-        raise NotImplementedError
+    def get(self, key: str) -> Optional[str]:
+        rec = self._mem.get(key)
+        return rec["value"] if rec else None
+
+    def records(self, prefix: str = "") -> List[_RawRecord]:
+        return [
+            (k, r["value"], r["tags"], r["created_at"], r["updated_at"], r["source"])
+            for k, r in self._mem.items()
+            if not prefix or k.startswith(prefix)
+        ]
+
+    def keys(self, prefix: str = "") -> List[str]:
+        return [k for k in self._mem if not prefix or k.startswith(prefix)]
+
+    def has_prefix(self, prefix: str) -> bool:
+        return any(k.startswith(prefix) for k in self._mem)
+
+    def delete_many(self, keys: List[str]) -> int:
+        removed = 0
+        for k in keys:
+            if k in self._mem:
+                del self._mem[k]
+                removed += 1
+        return removed
+
+    def clear_prefix(self, prefix: str) -> int:
+        targets = [k for k in self._mem if k.startswith(prefix)]
+        for k in targets:
+            del self._mem[k]
+        return len(targets)
 
     def clear(self) -> None:
-        raise NotImplementedError
+        self._mem.clear()
+
+    def count(self) -> int:
+        return len(self._mem)
+
+    @property
+    def label(self) -> str:
+        return "in-memory"
 
 
-# ===========================================================================
-# CORE: SparkKVStore
-# ===========================================================================
+class _DeltaBackend:
+    """Spark DataFrame / Databricks Delta table backend (production).
 
-
-class SparkKVStore:
-    """
-    Key-value store backed by a Spark DataFrame / Databricks Delta table.
-
-    Two modes
-    ---------
-    - **Delta mode** (production):
-      Pass ``table="catalog.schema.table_name"``.
-      The table is created with Delta format if it does not already exist.
-      Upserts use ``MERGE INTO``, deletes use ``DELETE FROM``.
-
-    - **In-memory mode** (local / CI):
-      Pass ``table=None`` (default).
-      All state lives in a Python dict that is wrapped in a DataFrame only
-      for query operations.  No disk I/O — identical to the previous backend
-      but going through the same Spark SQL interface.
-
-    All values are JSON-serialised so any Python type (dict, list, str, …)
-    can be stored.  Tags are stored as a JSON array string.
-
-    Key layout
-    ----------
-    Keys follow a namespace::subkey convention so multiple logical stores
-    can share one physical table without collision:
-
-        msg::thread-42::00000003   → chat message seq 3 of thread-42
-        kv::project_goal           → a KVMemoryStore entry
-        idx::thread-42             → next sequence counter for a thread
-
-    Parameters
-    ----------
-    spark : SparkSession
-        Active Spark / Databricks session.
-    table : str | None
-        Fully-qualified Delta table name for persistence, or None for
-        pure in-memory operation.
+    Upserts use ``MERGE INTO``, deletes use ``DELETE FROM``.  Requires
+    pyspark and an active SparkSession; the table is created with Delta
+    format if it does not already exist.
     """
 
-    def __init__(
-        self,
-        spark: "SparkSession",
-        table: Optional[str] = None,
-    ) -> None:
+    def __init__(self, spark: "SparkSession", table: str) -> None:
         if not _PYSPARK_AVAILABLE:
             raise RuntimeError("pyspark is not installed. Run: pip install pyspark")
+        if spark is None:
+            raise ValueError(
+                f"Delta mode (table={table!r}) requires an active SparkSession"
+            )
         self._spark = spark
         self._table = table
-        self._mem: Dict[str, Dict] = {}  # used only when table is None
-
-        if table:
-            self._ensure_table()
-
-    # ---- Table bootstrap (Delta only) --------------------------------------
+        self._ensure_table()
 
     def _ensure_table(self) -> None:
         """Create the Delta table if it does not already exist."""
@@ -269,54 +300,145 @@ class SparkKVStore:
             TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')
         """)
 
-    # ---- Internal read helpers ---------------------------------------------
-
     def _df(self, prefix: str = "") -> "DataFrame":
-        """Return a DataFrame view of the Delta table (Delta mode only).
-
-        Every in-memory-mode caller has a dict fast path via
-        :meth:`_mem_items`; wrapping the dict in a DataFrame here was dead
-        code and would have required a live SparkSession the in-memory
-        tests deliberately run without.
-        """
-        if not self._table:
-            raise RuntimeError(
-                "_df() is Delta-mode only; in-memory mode reads _mem_items()"
-            )
         df = self._spark.table(self._table)
         if prefix:
             df = df.filter(F.col("kv_key").startswith(prefix))
         return df
 
-    def _row_to_dict(self, row) -> Dict:
-        return {
-            "value": _jload(row.value),
-            "tags": _jload(row.tags) if row.tags else [],
-            "created_at": row.created_at,
-            "updated_at": row.updated_at,
-            "source": row.source,
-        }
+    def upsert(self, rows: List[_RawRecord], now: float) -> None:
+        # created_at=None (not supplied) defaults to now; the MERGE's
+        # WHEN MATCHED branch never touches created_at, so an existing
+        # row's creation time is preserved on update.
+        staged_rows = [
+            (key, value_json, tags_json, created_at if created_at is not None else now, updated_at, source)
+            for key, value_json, tags_json, created_at, updated_at, source in rows
+        ]
+        # Unique per-call view name: a fixed name would let two concurrent
+        # writers on the same SparkSession clobber each other's staged rows
+        # between createOrReplaceTempView and MERGE.
+        view = f"_kv_upsert_{uuid.uuid4().hex}"
+        staged = self._spark.createDataFrame(staged_rows, schema=_schema())
+        staged.createOrReplaceTempView(view)
+        try:
+            self._spark.sql(f"""
+                MERGE INTO {self._table} AS target
+                USING {view} AS source
+                  ON target.kv_key = source.kv_key
+                WHEN MATCHED THEN UPDATE SET
+                    target.value      = source.value,
+                    target.tags       = COALESCE(source.tags, target.tags),
+                    target.updated_at = source.updated_at,
+                    target.source     = COALESCE(source.source, target.source)
+                WHEN NOT MATCHED THEN INSERT *
+            """)
+        finally:
+            self._spark.catalog.dropTempView(view)
 
-    def _mem_row_to_dict(self, rec: Dict) -> Dict:
-        """In-memory-mode counterpart of :meth:`_row_to_dict`.
+    def get(self, key: str) -> Optional[str]:
+        rows = (
+            self._df()
+            .filter(F.col("kv_key") == key)
+            .select("value")
+            .limit(1)
+            .collect()
+        )
+        return rows[0].value if rows else None
 
-        ``rec`` is a raw dict from ``self._mem`` (``value``/``tags`` still
-        JSON-encoded); this returns the same deserialised shape the DataFrame
-        path produces via :meth:`_row_to_dict`.
-        """
-        return {
-            "value": _jload(rec["value"]),
-            "tags": _jload(rec["tags"]) if rec["tags"] else [],
-            "created_at": rec["created_at"],
-            "updated_at": rec["updated_at"],
-            "source": rec["source"],
-        }
+    def records(self, prefix: str = "") -> List[_RawRecord]:
+        return [
+            (row.kv_key, row.value, row.tags, row.created_at, row.updated_at, row.source)
+            for row in self._df(prefix).collect()
+        ]
 
-    def _mem_items(self, prefix: str = ""):
-        """Yield ``(key, raw_rec)`` from the in-memory dict, prefix-filtered."""
-        for k, rec in self._mem.items():
-            if not prefix or k.startswith(prefix):
-                yield k, rec
+    def keys(self, prefix: str = "") -> List[str]:
+        return [row.kv_key for row in self._df(prefix).select("kv_key").collect()]
+
+    def has_prefix(self, prefix: str) -> bool:
+        # Stops at the first matching row instead of collecting every key.
+        return bool(self._df(prefix).limit(1).count())
+
+    def delete_many(self, keys: List[str]) -> int:
+        key_set = set(keys)
+        existing = self._df().filter(F.col("kv_key").isin(list(key_set))).count()
+        if existing:
+            quoted = ", ".join(f"'{_sql_quote(k)}'" for k in key_set)
+            self._spark.sql(f"DELETE FROM {self._table} WHERE kv_key IN ({quoted})")
+        return existing
+
+    def clear_prefix(self, prefix: str) -> int:
+        count = self._df(prefix).count()
+        # LIKE wildcards in the prefix must be escaped: '_' matches any
+        # character, so "msg::thread_1::" would otherwise also delete
+        # "msg::threadX1::…" — unlike every read path, which matches
+        # the prefix literally via startswith.
+        pattern = _sql_like_prefix(prefix)
+        self._spark.sql(
+            f"DELETE FROM {self._table} "
+            f"WHERE kv_key LIKE '{_sql_quote(pattern)}%' ESCAPE '{_LIKE_ESCAPE}'"
+        )
+        return count
+
+    def clear(self) -> None:
+        self._spark.sql(f"DELETE FROM {self._table}")
+
+    def count(self) -> int:
+        return self._df().count()
+
+    @property
+    def label(self) -> str:
+        return f"Delta:{self._table}"
+
+
+# ===========================================================================
+# CORE: SparkKVStore
+# ===========================================================================
+
+
+class SparkKVStore:
+    """
+    Key-value store, backed by one of two interchangeable backends.
+
+    Two modes
+    ---------
+    - **Delta mode** (production):
+      Pass ``spark`` and ``table="catalog.schema.table_name"``.
+      The table is created with Delta format if it does not already exist.
+      Upserts use ``MERGE INTO``, deletes use ``DELETE FROM``.
+
+    - **In-memory mode** (local / CI):
+      Pass ``table=None`` (default).  All state lives in a plain Python
+      dict — pyspark is not required, no Spark session is touched.
+
+    All values are JSON-serialised so any Python type (dict, list, str, …)
+    can be stored.  Tags are stored as a JSON array string.
+
+    Key layout
+    ----------
+    Keys follow a namespace::subkey convention so multiple logical stores
+    can share one physical table without collision:
+
+        msg::thread-42::00000003   → chat message seq 3 of thread-42
+        kv::project_goal           → a KVMemoryStore entry
+        idx::thread-42             → next sequence counter for a thread
+
+    Parameters
+    ----------
+    spark : SparkSession | None
+        Active Spark / Databricks session.  Required only when ``table``
+        is given; ignored in in-memory mode.
+    table : str | None
+        Fully-qualified Delta table name for persistence, or None for
+        pure in-memory operation.
+    """
+
+    def __init__(
+        self,
+        spark: "SparkSession | None" = None,
+        table: Optional[str] = None,
+    ) -> None:
+        self._table = table
+        self._backend = _DeltaBackend(spark, table) if table else _InMemoryBackend()
 
     # ---- CRUD --------------------------------------------------------------
 
@@ -336,8 +458,7 @@ class SparkKVStore:
 
         - ``key`` (required), ``value`` (required)
         - ``tags``: list of tag strings, or None to preserve existing tags
-          on update (both modes now agree on this — Delta previously
-          overwrote tags with ``[]`` when None was passed)
+          on update
         - ``source``: provenance label, or None to preserve existing
         - ``created_at`` / ``updated_at``: optional explicit timestamps
           (used by :meth:`restore` to keep snapshot history); default now.
@@ -345,86 +466,25 @@ class SparkKVStore:
         if not entries:
             return
         now = _now()
-
-        if self._table:
-            rows = [
-                (
-                    e["key"],
-                    _jdump(e["value"]),
-                    _jdump(e["tags"]) if e.get("tags") is not None else None,
-                    e.get("created_at", now),
-                    e.get("updated_at", now),
-                    e.get("source"),
-                )
-                for e in entries
-            ]
-            # Unique per-call view name: a fixed name would let two
-            # concurrent writers on the same SparkSession clobber each
-            # other's staged rows between createOrReplaceTempView and MERGE.
-            view = f"_kv_upsert_{uuid.uuid4().hex}"
-            staged = self._spark.createDataFrame(rows, schema=_schema())
-            staged.createOrReplaceTempView(view)
-            try:
-                self._spark.sql(f"""
-                    MERGE INTO {self._table} AS target
-                    USING {view} AS source
-                      ON target.kv_key = source.kv_key
-                    WHEN MATCHED THEN UPDATE SET
-                        target.value      = source.value,
-                        target.tags       = COALESCE(source.tags, target.tags),
-                        target.updated_at = source.updated_at,
-                        target.source     = COALESCE(source.source, target.source)
-                    WHEN NOT MATCHED THEN INSERT *
-                """)
-            finally:
-                self._spark.catalog.dropTempView(view)
-        else:
-            for e in entries:
-                key = e["key"]
-                tags = e.get("tags")
-                existing = self._mem.get(key)
-                self._mem[key] = {
-                    "value": _jdump(e["value"]),
-                    "tags": _jdump(tags)
-                    if tags is not None
-                    else (existing["tags"] if existing else _jdump([])),
-                    "created_at": e.get(
-                        "created_at",
-                        existing["created_at"] if existing else now,
-                    ),
-                    "updated_at": e.get("updated_at", now),
-                    "source": e.get("source")
-                    or (existing["source"] if existing else None),
-                }
+        rows: List[_RawRecord] = [
+            (
+                e["key"],
+                _jdump(e["value"]),
+                _jdump(e["tags"]) if e.get("tags") is not None else None,
+                e.get("created_at"),  # None → backend preserves/defaults
+                e.get("updated_at", now),
+                e.get("source"),
+            )
+            for e in entries
+        ]
+        self._backend.upsert(rows, now)
 
     def get(self, key: str, default: Any = None) -> Any:
-        if self._table:
-            rows = (
-                self._spark.table(self._table)
-                .filter(F.col("kv_key") == key)
-                .select("value")
-                .limit(1)
-                .collect()
-            )
-            return _jload(rows[0].value) if rows else default
-        rec = self._mem.get(key)
-        return _jload(rec["value"]) if rec else default
+        raw = self._backend.get(key)
+        return _jload(raw) if raw is not None else default
 
     def delete(self, key: str) -> bool:
-        if self._table:
-            before = (
-                self._spark.table(self._table).filter(F.col("kv_key") == key).count()
-            )
-            if before == 0:
-                return False
-            self._spark.sql(
-                f"DELETE FROM {self._table} WHERE kv_key = '{_sql_quote(key)}'"
-            )
-            return True
-        if key in self._mem:
-            del self._mem[key]
-            return True
-        return False
+        return self._backend.delete_many([key]) == 1
 
     def delete_many(self, keys: List[str]) -> int:
         """Delete several keys — a single DELETE … IN in Delta mode.
@@ -433,26 +493,10 @@ class SparkKVStore:
         """
         if not keys:
             return 0
-        if self._table:
-            key_set = set(keys)
-            existing = self._df().filter(F.col("kv_key").isin(list(key_set))).count()
-            if existing:
-                quoted = ", ".join(f"'{_sql_quote(k)}'" for k in key_set)
-                self._spark.sql(
-                    f"DELETE FROM {self._table} WHERE kv_key IN ({quoted})"
-                )
-            return existing
-        removed = 0
-        for k in keys:
-            if k in self._mem:
-                del self._mem[k]
-                removed += 1
-        return removed
+        return self._backend.delete_many(keys)
 
     def keys(self, prefix: str = "") -> List[str]:
-        if self._table is None:
-            return [k for k, _ in self._mem_items(prefix)]
-        return [row.kv_key for row in self._df(prefix).select("kv_key").collect()]
+        return self._backend.keys(prefix)
 
     def has_prefix(self, prefix: str) -> bool:
         """True if at least one key starts with *prefix*.
@@ -460,72 +504,42 @@ class SparkKVStore:
         Cheaper than ``bool(keys(prefix))`` in Delta mode: stops at the
         first matching row instead of collecting every key.
         """
-        if self._table is None:
-            return any(True for _ in self._mem_items(prefix))
-        return bool(self._df(prefix).limit(1).count())
+        return self._backend.has_prefix(prefix)
 
     def all_records(self, prefix: str = "") -> List[Tuple[str, Dict]]:
-        if self._table is None:
-            return [
-                (k, self._mem_row_to_dict(rec)) for k, rec in self._mem_items(prefix)
-            ]
-        rows = self._df(prefix).collect()
-        return [(row.kv_key, self._row_to_dict(row)) for row in rows]
+        return [
+            (
+                key,
+                {
+                    "value": _jload(value_json),
+                    "tags": _jload(tags_json) if tags_json else [],
+                    "created_at": created_at,
+                    "updated_at": updated_at,
+                    "source": source,
+                },
+            )
+            for key, value_json, tags_json, created_at, updated_at, source in (
+                self._backend.records(prefix)
+            )
+        ]
 
     def clear_prefix(self, prefix: str) -> int:
-        if self._table:
-            count = self._df(prefix).count()
-            # LIKE wildcards in the prefix must be escaped: '_' matches any
-            # character, so "msg::thread_1::" would otherwise also delete
-            # "msg::threadX1::…" — unlike every read path, which matches
-            # the prefix literally via startswith.
-            pattern = _sql_like_prefix(prefix)
-            self._spark.sql(
-                f"DELETE FROM {self._table} "
-                f"WHERE kv_key LIKE '{_sql_quote(pattern)}%' ESCAPE '{_LIKE_ESCAPE}'"
-            )
-            return count
-        targets = [k for k in self._mem if k.startswith(prefix)]
-        for k in targets:
-            del self._mem[k]
-        return len(targets)
+        return self._backend.clear_prefix(prefix)
 
     def clear(self) -> None:
-        if self._table:
-            self._spark.sql(f"DELETE FROM {self._table}")
-        else:
-            self._mem.clear()
+        self._backend.clear()
 
     # ---- Tag queries -------------------------------------------------------
 
     def get_by_tag(self, tag: str, prefix: str = "") -> List[Tuple[str, Dict]]:
         """Return [(key, record_dict), ...] for all entries carrying `tag`."""
-        if self._table is None:
-            result = []
-            for k, raw in self._mem_items(prefix):
-                rec = self._mem_row_to_dict(raw)
-                if tag in rec["tags"]:
-                    result.append((k, rec))
-            return result
-        rows = self._df(prefix).collect()
-        result = []
-        for row in rows:
-            rec = self._row_to_dict(row)
-            if tag in rec["tags"]:
-                result.append((row.kv_key, rec))
-        return result
+        return [(k, rec) for k, rec in self.all_records(prefix) if tag in rec["tags"]]
 
     def all_tags(self, prefix: str = "") -> List[str]:
         tags: set = set()
-        if self._table is None:
-            for _, raw in self._mem_items(prefix):
-                if raw["tags"]:
-                    tags.update(_jload(raw["tags"]))
-            return sorted(tags)
-        rows = self._df(prefix).select("tags").collect()
-        for row in rows:
-            if row.tags:
-                tags.update(_jload(row.tags))
+        for _, _, tags_json, _, _, _ in self._backend.records(prefix):
+            if tags_json:
+                tags.update(_jload(tags_json))
         return sorted(tags)
 
     # ---- Search ------------------------------------------------------------
@@ -540,32 +554,18 @@ class SparkKVStore:
         Keyword search over keys, JSON-serialised values, and tags.
 
         On Databricks this can be enhanced with Spark MLlib TF-IDF or
-        a Vector Search index; here we use a simple LIKE / contains scan
-        which is optimised by Delta's data-skipping on string predicates.
+        a Vector Search index; here we use a simple contains scan over
+        the raw records both backends expose in the same shape.
         """
         q = query.lower()
-        # Unify both backends into (key, value_str, tags_list) tuples so the
-        # scoring below is written once.  In-memory mode reads the dict
-        # directly; Delta mode collects the DataFrame.
-        if self._table is None:
-            scannable = (
-                (k, raw["value"], _jload(raw["tags"]) if raw["tags"] else [])
-                for k, raw in self._mem_items(prefix)
-            )
-        else:
-            scannable = (
-                (row.kv_key, row.value, _jload(row.tags) if row.tags else [])
-                for row in self._df(prefix).collect()
-            )
-
         hits: List[Tuple[str, float]] = []
-        for key, value_str, tags in scannable:
+        for key, value_json, tags_json, _, _, _ in self._backend.records(prefix):
             score = 0.0
             if q in key.lower():
                 score += 2.0
-            if q in value_str.lower():
-                score += value_str.lower().count(q) * 1.0
-            for tag in tags:
+            if q in value_json.lower():
+                score += value_json.lower().count(q) * 1.0
+            for tag in _jload(tags_json) if tags_json else []:
                 if q in tag.lower():
                     score += 1.5
             if score > 0:
@@ -615,16 +615,14 @@ class SparkKVStore:
     # ---- Diagnostics -------------------------------------------------------
 
     def stats(self) -> Dict[str, Any]:
-        total = len(self._mem) if self._table is None else self._df().count()
         return {
-            "total_keys": total,
+            "total_keys": self._backend.count(),
             "all_tags": self.all_tags(),
-            "backend": f"Delta:{self._table}" if self._table else "Spark in-memory",
+            "backend": self._backend.label,
         }
 
     def __repr__(self) -> str:
-        count = len(self._mem) if self._table is None else self._df().count()
-        return f"SparkKVStore(table={self._table!r}, keys={count})"
+        return f"SparkKVStore(table={self._table!r}, keys={self._backend.count()})"
 
 
 # ===========================================================================
@@ -650,7 +648,7 @@ class KVChatMessageHistory(BaseChatMessageHistory):
 
     Usage
     -----
-    store   = SparkKVStore(spark)
+    store   = SparkKVStore()          # in-memory; pass spark+table for Delta
     history = KVChatMessageHistory("thread-42", store=store)
     history.add_user_message("Hello!")
     history.add_ai_message("Hi there!")
@@ -686,7 +684,7 @@ class KVChatMessageHistory(BaseChatMessageHistory):
         pairs.sort(key=lambda kv: kv[0][len(self._msg_prefix) :])
         result: List[BaseMessage] = []
         for _, rec in pairs:
-            data = rec["value"]  # already deserialised by _row_to_dict
+            data = rec["value"]  # already deserialised by all_records
             role = data.get("role", "human")
             cls = self._TYPE_MAP.get(role)
             meta = data.get("meta", {})
@@ -740,9 +738,9 @@ class KVChatMessageHistory(BaseChatMessageHistory):
     def prune_before(self, cutoff_ts: float) -> int:
         """Delete messages whose stored ``ts`` is older than *cutoff_ts*.
 
-        The rolling window in WindowChatMemory only limits what is
-        *surfaced* to a chain; this is the complementary storage-side trim
-        (one DELETE in Delta mode).  Returns the number removed.
+        The pipeline's rolling window only limits what is *surfaced* to the
+        LLM; this is the complementary storage-side trim (one DELETE in
+        Delta mode).  Returns the number removed.
         """
         stale = [
             key
@@ -824,96 +822,7 @@ class ThreadMemoryManager:
 
 
 # ===========================================================================
-# 3. WindowChatMemory  (BaseMemory with rolling window)
-# ===========================================================================
-
-
-class WindowChatMemory(BaseMemory):
-    """
-    Rolling-window chat memory backed by SparkKVStore.
-
-    All turns are persisted; only the last ``k`` (human, AI) pairs are
-    surfaced in the chain context.  Plug directly into ConversationChain.
-
-    Usage
-    -----
-    mem   = WindowChatMemory(session_id="s1", k=10)
-    mem.bind_store(store)
-    chain = ConversationChain(llm=llm, memory=mem)
-    """
-
-    session_id: str = Field(default="default")
-    k: int = Field(default=10)
-    human_prefix: str = Field(default="Human")
-    ai_prefix: str = Field(default="AI")
-    memory_key: str = Field(default="history")
-
-    _history: Optional[KVChatMessageHistory] = None
-    _store: Optional[SparkKVStore] = None
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    def bind_store(self, store: SparkKVStore) -> "WindowChatMemory":
-        self._store = store
-        self._history = KVChatMessageHistory(self.session_id, store)
-        return self
-
-    def _get_history(self) -> KVChatMessageHistory:
-        if self._history is None:
-            raise RuntimeError(
-                "Call bind_store(spark_kv_store) before using WindowChatMemory."
-            )
-        return self._history
-
-    @property
-    def memory_variables(self) -> List[str]:
-        return [self.memory_key]
-
-    def load_memory_variables(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        msgs = self._get_history().messages
-        window = msgs[-(self.k * 2) :]
-        lines: List[str] = []
-        for msg in window:
-            if isinstance(msg, HumanMessage):
-                lines.append(f"{self.human_prefix}: {msg.content}")
-            elif isinstance(msg, AIMessage):
-                lines.append(f"{self.ai_prefix}: {msg.content}")
-        return {self.memory_key: "\n".join(lines)}
-
-    def save_context(self, inputs: Dict[str, Any], outputs: Dict[str, str]) -> None:
-        h = self._get_history()
-        inp = (
-            inputs.get("input")
-            or inputs.get("human_input")
-            or next(iter(inputs.values()), "")
-        )
-        out = (
-            outputs.get("output")
-            or outputs.get("response")
-            or next(iter(outputs.values()), "")
-        )
-        # One store write for the whole turn (a single MERGE in Delta mode)
-        h.add_messages(
-            [HumanMessage(content=str(inp)), AIMessage(content=str(out))]
-        )
-
-    def clear(self) -> None:
-        self._get_history().clear()
-
-    def get_stats(self) -> Dict[str, Any]:
-        h = self._get_history()
-        msgs = h.messages
-        return {
-            "session_id": self.session_id,
-            "total_messages": len(msgs),
-            "window_size": self.k,
-            "messages_in_context": min(len(msgs), self.k * 2),
-            **h.get_session_metadata(),
-        }
-
-
-# ===========================================================================
-# 4. KVMemoryStore  (tagged KV + text ingestion + search)
+# 3. KVMemoryStore  (tagged KV + text ingestion + search)
 # ===========================================================================
 
 
@@ -1034,7 +943,7 @@ class KVMemoryStore:
 
 
 # ===========================================================================
-# 5. DatabricksMemory  —  unified façade
+# 4. DatabricksMemory  —  unified façade
 # ===========================================================================
 
 
@@ -1044,8 +953,9 @@ class DatabricksMemory:
 
     Parameters
     ----------
-    spark : SparkSession
-        Active Databricks / local Spark session.
+    spark : SparkSession | None
+        Active Databricks / local Spark session.  Required only when
+        ``table`` is given; in-memory mode never touches Spark.
     table : str | None
         Fully-qualified Delta table name, e.g. ``"main.ml.langchain_memory"``.
         Pass ``None`` (default) for local in-memory operation.
@@ -1059,23 +969,20 @@ class DatabricksMemory:
         thread = mem.get_thread("user-42")
         thread.add_user_message("Hello!")
 
-        chain = ConversationChain(
-            llm=llm,
-            memory=mem.chat_memory(session_id="s1", k=10),
-        )
+        # Chat-history threads plug into LangChain v1 chains via
+        # RunnableWithMessageHistory (see chunker.pipeline):
+        #   RunnableWithMessageHistory(chain, get_session_history=mem.get_thread, ...)
 
         mem.kv.set("goal", "Build a RAG pipeline", tags=["project"])
 
-    Usage — local
-    -------------
-        from pyspark.sql import SparkSession
-        spark = SparkSession.builder.master("local").appName("mem").getOrCreate()
-        mem   = DatabricksMemory(spark=spark)
+    Usage — local (no Spark required)
+    ---------------------------------
+        mem = DatabricksMemory()
     """
 
     def __init__(
         self,
-        spark: "SparkSession",
+        spark: "SparkSession | None" = None,
         table: Optional[str] = None,
     ) -> None:
         self._store = SparkKVStore(spark=spark, table=table)
@@ -1084,11 +991,6 @@ class DatabricksMemory:
 
     def get_thread(self, thread_id: str) -> KVChatMessageHistory:
         return self.threads.get_thread(thread_id)
-
-    def chat_memory(self, session_id: str = "default", k: int = 10) -> WindowChatMemory:
-        mem = WindowChatMemory(session_id=session_id, k=k)
-        mem.bind_store(self._store)
-        return mem
 
     def snapshot(self) -> Dict[str, Any]:
         """Dump entire store to a plain dict (JSON-serialisable)."""

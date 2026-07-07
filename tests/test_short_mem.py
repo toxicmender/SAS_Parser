@@ -1,10 +1,11 @@
 """
-test_short_mem.py — unit tests for the in-memory (table=None) fast-paths of
+test_short_mem.py — unit tests for the in-memory (table=None) backend of
 memory.short_mem.SparkKVStore and the layers built on top of it.
 
-These deliberately construct the store with ``spark=None, table=None``: in
-in-memory mode none of the exercised methods touch Spark, so the suite runs
-without a JVM / SparkSession (the Delta-mode branches are not covered here).
+These deliberately construct the store with ``spark=None, table=None``:
+in-memory mode uses the pure-dict _InMemoryBackend, which never touches
+Spark — the suite runs without a JVM / SparkSession, and pyspark itself is
+not required (the _DeltaBackend is not covered here).
 """
 
 import pathlib
@@ -92,7 +93,7 @@ class TestSparkKVStoreInMemory(unittest.TestCase):
         s.set("kv::a", 1, tags=["x"])
         stats = s.stats()
         self.assertEqual(stats["total_keys"], 1)
-        self.assertEqual(stats["backend"], "Spark in-memory")
+        self.assertEqual(stats["backend"], "in-memory")
         self.assertEqual(stats["all_tags"], ["x"])
 
     def test_set_preserves_created_at_and_tags_on_update(self):
@@ -141,7 +142,7 @@ class TestFacadeInMemory(unittest.TestCase):
 
     def test_summary_reports_backend(self):
         mem = DatabricksMemory(spark=None, table=None)
-        self.assertEqual(mem.summary()["store"]["backend"], "Spark in-memory")
+        self.assertEqual(mem.summary()["store"]["backend"], "in-memory")
 
     def test_kvmemorystore_strips_namespace_in_keys(self):
         store = SparkKVStore(spark=None, table=None)

@@ -8,7 +8,10 @@ correctly and that conversation state round-trips through
 DatabricksMemory / KVChatMessageHistory — without needing API credentials
 or network access.
 
-Requires: pyspark, langchain-core (FakeListChatModel).
+The memory layer runs on its in-memory backend, so no Spark session (or
+JVM, or pyspark install) is needed anywhere in this module.
+
+Requires: langchain-core (FakeListChatModel).
 """
 
 from __future__ import annotations
@@ -16,16 +19,11 @@ from __future__ import annotations
 import pathlib
 import sys
 
-import pytest
-
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-
-pyspark = pytest.importorskip("pyspark")
 
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from memory.short_mem import DatabricksMemory
-from pyspark.sql import SparkSession
 
 from chunker.models import (
     SasBatch,
@@ -38,21 +36,6 @@ from chunker.pipeline import (
     _format_batch_message,
     _format_chunk_message,
 )
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="module")
-def spark():
-    s = (
-        SparkSession.builder.master("local[1]")
-        .appName("chunker_pipeline_tests")
-        .getOrCreate()
-    )
-    yield s
-    s.stop()
 
 
 def _mk_chunk(chunk_id: str, source_id: str, text: str, **meta_kwargs) -> SasChunk:
@@ -133,8 +116,8 @@ def test_format_batch_message_includes_all_members_and_cross_file_flag():
 # ---------------------------------------------------------------------------
 
 
-def test_memory_thread_round_trips_messages(spark):
-    mem = DatabricksMemory(spark=spark)  # in-memory, no Delta table
+def test_memory_thread_round_trips_messages():
+    mem = DatabricksMemory()  # in-memory backend, no Spark
     thread = mem.get_thread("run::etl.sas")
 
     thread.add_user_message("batch-001 content")
@@ -147,8 +130,8 @@ def test_memory_thread_round_trips_messages(spark):
     assert same_thread.messages[1].content == "translated PySpark for batch-001"
 
 
-def test_different_thread_ids_are_isolated(spark):
-    mem = DatabricksMemory(spark=spark)
+def test_different_thread_ids_are_isolated():
+    mem = DatabricksMemory()
     mem.get_thread("run::a.sas").add_user_message("hello a")
     mem.get_thread("run::b.sas").add_user_message("hello b")
 
@@ -161,11 +144,11 @@ def test_different_thread_ids_are_isolated(spark):
 # ---------------------------------------------------------------------------
 
 
-def test_pipeline_accumulates_history_across_batches(spark):
+def test_pipeline_accumulates_history_across_batches():
     fake_llm = FakeListChatModel(
         responses=["translation for item 1", "translation for item 2"]
     )
-    mem = DatabricksMemory(spark=spark)
+    mem = DatabricksMemory()
 
     pipeline = SasLLMPipeline(
         model="unused-because-llm-injected",
@@ -214,9 +197,9 @@ def test_pipeline_accumulates_history_across_batches(spark):
     assert history[3].content == "translation for item 2"
 
 
-def test_pipeline_window_trimming_limits_injected_history(spark):
+def test_pipeline_window_trimming_limits_injected_history():
     fake_llm = FakeListChatModel(responses=[f"resp {i}" for i in range(6)])
-    mem = DatabricksMemory(spark=spark)
+    mem = DatabricksMemory()
     pipeline = SasLLMPipeline(
         model="unused-because-llm-injected",
         memory=mem,
@@ -235,9 +218,9 @@ def test_pipeline_window_trimming_limits_injected_history(spark):
     assert len(full_history) == 6  # 3 human + 3 ai
 
 
-def test_snapshot_delegates_to_memory(spark):
+def test_snapshot_delegates_to_memory():
     fake_llm = FakeListChatModel(responses=["ok"])
-    mem = DatabricksMemory(spark=spark)
+    mem = DatabricksMemory()
     pipeline = SasLLMPipeline(model="unused", memory=mem, llm=fake_llm)
 
     c1 = _mk_chunk("f1-chunk-0001", "etl.sas", "data work.a; run;")

@@ -246,10 +246,14 @@ class SasLLMPipeline:
         ``spark``/``delta_table``.
     spark : SparkSession | None
         Forwarded to :class:`DatabricksMemory` if ``memory`` is omitted.
-        If also omitted, a local in-process Spark session is created.
+        Only needed when ``delta_table`` is set; if omitted then, a local
+        in-process Spark session is created.  The in-memory store never
+        touches Spark, so no session is started when ``delta_table`` is
+        ``None``.
     delta_table : str | None
         Forwarded to :class:`DatabricksMemory` if ``memory`` is omitted.
-        ``None`` keeps the store in-memory (no Delta table).
+        ``None`` (default) keeps the store in-memory — a plain dict, no
+        Delta table, no Spark/JVM.
     llm : Any | None
         Pre-built LangChain chat model to use instead of constructing one
         from ``model`` via ``init_chat_model``.  Useful for injecting a fake
@@ -333,6 +337,14 @@ class SasLLMPipeline:
         spark: "SparkSession | None",
         delta_table: str | None,
     ) -> DatabricksMemory:
+        if delta_table is None:
+            # In-memory store: never touches Spark, so don't boot a JVM-backed
+            # local session just to hold a Python dict.
+            logger.info(
+                "SasLLMPipeline: in-memory message store (no Delta table, no "
+                "Spark session needed)"
+            )
+            return DatabricksMemory(spark=spark, table=None)
         if spark is None:
             from pyspark.sql import SparkSession
 
