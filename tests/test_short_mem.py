@@ -19,6 +19,7 @@ from memory.short_mem import (
     KVMemoryStore,
     SparkKVStore,
     ThreadMemoryManager,
+    _sql_like_prefix,
     _sql_quote,
 )
 
@@ -154,6 +155,183 @@ class TestSqlQuote(unittest.TestCase):
     def test_doubles_single_quotes(self):
         self.assertEqual(_sql_quote("o'brien"), "o''brien")
         self.assertEqual(_sql_quote("plain"), "plain")
+
+
+class TestSqlLikePrefix(unittest.TestCase):
+    def test_underscore_and_percent_escaped(self):
+        self.assertEqual(_sql_like_prefix("msg::thread_1::"), "msg::thread~_1::")
+        self.assertEqual(_sql_like_prefix("a%b"), "a~%b")
+
+    def test_escape_char_doubled(self):
+        self.assertEqual(_sql_like_prefix("a~b"), "a~~b")
+
+    def test_plain_prefix_unchanged(self):
+        self.assertEqual(_sql_like_prefix("kv::plain"), "kv::plain")
+
+
+class TestSetMany(unittest.TestCase):
+    def test_batch_roundtrip(self):
+        s = SparkKVStore(spark=None, table=None)
+        s.set_many(
+            [
+                {"key": "kv::a", "value": 1, "tags": ["x"]},
+                {"key": "kv::b", "value": {"n": 2}},
+            ]
+        )
+        self.assertEqual(s.get("kv::a"), 1)
+        self.assertEqual(s.get("kv::b"), {"n": 2})
+        self.assertEqual(dict(s.all_records())["kv::a"]["tags"], ["x"])
+
+    def test_explicit_timestamps_honoured(self):
+        s = SparkKVStore(spark=None, table=None)
+        s.set_many(
+            [{"key": "kv::a", "value": 1, "created_at": 100.0, "updated_at": 200.0}]
+        )
+        rec = dict(s.all_records())["kv::a"]
+        self.assertEqual(rec["created_at"], 100.0)
+        self.assertEqual(rec["updated_at"], 200.0)
+
+    def test_empty_entries_noop(self):
+        s = SparkKVStore(spark=None, table=None)
+        s.set_many([])
+        self.assertEqual(s.keys(), [])
+
+    def test_delete_many_counts_existing_only(self):
+        s = SparkKVStore(spark=None, table=None)
+        s.set("kv::a", 1)
+        s.set("kv::b", 2)
+        self.assertEqual(s.delete_many(["kv::a", "kv::b", "kv::missing"]), 2)
+        self.assertEqual(s.keys(), [])
+
+
+class TestRestorePreservesTimestamps(unittest.TestCase):
+    def test_created_at_survives_snapshot_restore(self):
+        s = SparkKVStore(spark=None, table=None)
+        s.set("kv::a", 1, tags=["t"])
+        before = dict(s.all_records())["kv::a"]
+
+        snap = s.snapshot()
+        s2 = SparkKVStore(spark=None, table=None)
+        s2.restore(snap)
+
+        after = dict(s2.all_records())["kv::a"]
+        self.assertEqual(after["created_at"], before["created_at"])
+        self.assertEqual(after["updated_at"], before["updated_at"])
+        self.assertEqual(after["value"], 1)
+        self.assertEqual(after["tags"], ["t"])
+
+
+class TestTimestampMessageKeys(unittest.TestCase):
+    def test_message_order_preserved_within_batch(self):
+        """Messages written in one add_messages call (same wall-clock
+        microsecond is possible) must read back in insertion order."""
+        store = SparkKVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store)
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        h.add_messages(
+            [HumanMessage(content=f"q{i}") for i in range(5)]
+            + [AIMessage(content="a")]
+        )
+        contents = [m.content for m in h.messages]
+        self.assertEqual(contents, ["q0", "q1", "q2", "q3", "q4", "a"])
+
+    def test_legacy_sequence_keys_sort_before_new_keys(self):
+        """Pre-existing {seq:08d} keys must stay ahead of timestamp keys."""
+        store = SparkKVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store)
+        # Simulate a legacy message written by the old counter scheme
+        store.set(
+            "msg::t1::00000000",
+            {"role": "human", "content": "legacy", "meta": {}, "ts": 1.0},
+        )
+        h.add_user_message("new")
+        self.assertEqual([m.content for m in h.messages], ["legacy", "new"])
+
+    def test_no_idx_counter_key_written(self):
+        store = SparkKVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store)
+        h.add_user_message("q")
+        self.assertEqual(store.keys(prefix="idx::"), [])
+
+    def test_clear_removes_legacy_idx_key(self):
+        store = SparkKVStore(spark=None, table=None)
+        store.set("idx::t1", 3)  # left over from the old counter scheme
+        h = KVChatMessageHistory("t1", store)
+        h.add_user_message("q")
+        h.clear()
+        self.assertEqual(store.keys(), [])
+
+
+class TestRoleRoundTrip(unittest.TestCase):
+    def test_tool_style_message_not_rewritten_as_human(self):
+        from langchain_core.messages import ChatMessage
+
+        store = SparkKVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store)
+        h.add_message(ChatMessage(role="tool", content="result"))
+        msgs = h.messages
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0].role, "tool")
+        self.assertEqual(msgs[0].content, "result")
+
+    def test_system_message_roundtrip(self):
+        from langchain_core.messages import SystemMessage
+
+        store = SparkKVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store)
+        h.add_message(SystemMessage(content="be brief"))
+        self.assertIsInstance(h.messages[0], SystemMessage)
+
+
+class TestThreadListingFromStore(unittest.TestCase):
+    def test_threads_survive_manager_restart(self):
+        """A new manager over the same store must see persisted threads."""
+        store = SparkKVStore(spark=None, table=None)
+        ThreadMemoryManager(store).get_thread("t1").add_user_message("hi")
+
+        fresh_mgr = ThreadMemoryManager(store)  # simulates process restart
+        self.assertEqual(fresh_mgr.list_threads(), ["t1"])
+        summaries = fresh_mgr.all_summaries()
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["message_count"], 1)
+
+    def test_underscore_session_ids_isolated_on_clear(self):
+        """Clearing thread_1 must not delete threadX1 (the old LIKE-based
+        Delta delete treated '_' as a wildcard; in-memory mode was always
+        literal — this pins the shared contract)."""
+        store = SparkKVStore(spark=None, table=None)
+        mgr = ThreadMemoryManager(store)
+        mgr.get_thread("thread_1").add_user_message("a")
+        mgr.get_thread("threadX1").add_user_message("b")
+        mgr.delete_thread("thread_1")
+        self.assertEqual(mgr.list_threads(), ["threadX1"])
+
+
+class TestPruneBefore(unittest.TestCase):
+    def test_prune_removes_only_older_messages(self):
+        from unittest import mock
+
+        store = SparkKVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store)
+        # Pin the clock: consecutive real writes can share a time.time()
+        # float, which would make any cutoff between them ambiguous.
+        with mock.patch("memory.short_mem._now", return_value=100.0):
+            h.add_user_message("old")
+        with mock.patch("memory.short_mem._now", return_value=200.0):
+            h.add_ai_message("new")
+        removed = h.prune_before(150.0)
+        self.assertEqual(removed, 1)
+        self.assertEqual([m.content for m in h.messages], ["new"])
+
+    def test_prune_via_facade(self):
+        mem = DatabricksMemory(spark=None, table=None)
+        mem.get_thread("t1").add_user_message("only")
+        import time as _time
+
+        removed = mem.prune_thread("t1", _time.time() + 10)
+        self.assertEqual(removed, 1)
+        self.assertFalse(mem.get_thread("t1").has_messages())
 
 
 if __name__ == "__main__":

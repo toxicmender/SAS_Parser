@@ -11,17 +11,34 @@ cross-file edge discovery and globally-unique chunk indexing.
 
 Algorithm (shared)
 ------------------
-1. Build a producer index: dataset-name → [(file_rank, chunk_index)]
-                           macro-name   → (file_rank, chunk_index)
+1. Build a producer index: dataset-name → [global_chunk_indices]
+                           macro-name   → global_chunk_index
 2. Walk all chunks in corpus order (file_rank, chunk_index).  For each
-   chunk look up its input_datasets and invokes_macros.  Any hit → edge
-   + Union-Find union(producer_global_idx, consumer_global_idx).
-3. For MACRO_CALL chunks also scan argument tokens for dataset names
-   (macro_arg_dataset edges).
-4. Optionally absorb OPTIONS/GLOBAL_STATEMENT/COMMENT_BLOCK chunks into
-   the component of the nearest following substantive chunk.
-5. Extract UF components → SasBatch (size ≥ 2) or singleton (size 1).
-6. Each batch derives external I/O by set-difference.
+   chunk look up its input_datasets and invokes_macros.  Edges come in
+   two tiers:
+
+   - **strong** (dataset_flow, macro_body_dataset): union immediately.
+     A dataset consumer links only to the *nearest preceding* producer
+     of that name in corpus order — matching SAS sequential execution,
+     so two unrelated jobs that both reuse ``work.tmp`` stay separate.
+   - **weak** (macro_invocation, macro_var_flow, macro_arg_dataset):
+     recorded but not unioned during discovery.
+
+3. For MACRO_CALL chunks scan the parsed argument *values* for dataset
+   names (macro_arg_dataset edges, weak).
+4. Resolve weak edges at component granularity: a producer component
+   whose weak consumers all live in ONE other component is absorbed
+   into it; a producer whose weak consumers span TWO OR MORE components
+   is *globally affecting* — all such producers are collected into a
+   single global-context batch emitted FIRST (``is_global_context``).
+   This keeps one shared %LET or utility macro from fusing the whole
+   corpus into a single mega-batch.
+5. Optionally absorb OPTIONS/GLOBAL_STATEMENT/COMMENT_BLOCK chunks into
+   the component of the nearest following substantive chunk (skipping
+   members of the global-context component).
+6. Extract UF components → SasBatch (size ≥ 2) or singleton (size 1).
+   The global-context component becomes a batch even at size 1.
+7. Each batch derives external I/O by set-difference.
 
 Cross-file specifics
 ---------------------
@@ -49,6 +66,7 @@ import logging
 import re
 import sys
 import time
+from bisect import bisect_left, insort
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -159,7 +177,11 @@ class _UF:
 
 @dataclass
 class _Edge:
-    kind: str  # dataset_flow | macro_invocation | macro_arg_dataset | macro_body_dataset | *_context
+    # dataset_flow | macro_body_dataset          (strong — union at discovery)
+    # macro_invocation | macro_var_flow | macro_arg_dataset  (weak — resolved
+    #                                            per-component afterwards)
+    # options_context | comment_context          (context absorption)
+    kind: str
     from_id: str  # chunk_id of producer/predecessor
     to_id: str  # chunk_id of consumer/successor
     via: str  # dataset name, %macro, or [context_reason]
@@ -172,16 +194,75 @@ class _Edge:
         return f"_Edge {self.from_id} -> {self.to_id} [{self.kind} via {self.via}]{scope}"
 
 
-# Splits a call-site argument list on commas, respecting nested parens
-_CALL_ARG_SPLIT_RE = re.compile(r",(?![^(]*\))")
+# Locates the opening of a macro call's argument list: %macroname(
+# The balanced closing paren is found by _extract_call_arg_text below —
+# a regex cannot handle nesting like %clean(%str(a,b), out).
+_CALL_OPEN_RE = re.compile(r"%\s*[A-Za-z_]\w*\s*\(")
 
-# Extracts the call's argument list: %macroname( ... )
-_CALL_ARGS_RE = re.compile(r"%\s*\w+\s*\(([^)]*)\)", re.DOTALL)
+# A keyword argument is name= at the very start of the (stripped) argument,
+# so a positional value like f(x=1) is not mistaken for keyword 'f(x'.
+_KW_ARG_RE = re.compile(r"([A-Za-z_]\w*)\s*=(.*)$", re.DOTALL)
 
 # A libref.member (or bare member) dataset token, used to scan a MACRO_CALL
 # chunk's argument text for names that match a producer.  Compiled once here
 # rather than passed as a string literal to re.findall on every MACRO_CALL.
 _ARG_DS_TOKEN_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?")
+
+
+def _extract_call_arg_text(call_text: str) -> str | None:
+    """Return the text between the call's balanced outer parens, or None.
+
+    Walks characters with a paren-depth counter, treating single- and
+    double-quoted spans as opaque, so nested constructs like
+    ``%clean(%str(a,b), out=f(x))`` yield the full argument text instead
+    of stopping at the first ``)``.  An unbalanced call (truncated chunk)
+    falls back to everything after the opening paren.
+    """
+    m = _CALL_OPEN_RE.search(call_text)
+    if not m:
+        return None
+    start = m.end()
+    depth = 1
+    quote: str | None = None
+    for i in range(start, len(call_text)):
+        ch = call_text[i]
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return call_text[start:i]
+    return call_text[start:]
+
+
+def _split_call_args(raw_args: str) -> list[str]:
+    """Split an argument list on top-level commas (quote- and paren-aware)."""
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    quote: str | None = None
+    for ch in raw_args:
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    parts.append("".join(buf))
+    return [p.strip() for p in parts if p.strip()]
 
 
 def _parse_call_args(call_text: str) -> tuple[list[str], dict[str, str]]:
@@ -198,20 +279,17 @@ def _parse_call_args(call_text: str) -> tuple[list[str], dict[str, str]]:
     ``work.orders``, ``'work.orders'``, and ``work.orders.`` all normalise
     to the same lowercase dataset key.
     """
-    m = _CALL_ARGS_RE.search(call_text)
-    if not m:
+    raw_args = _extract_call_arg_text(call_text)
+    if raw_args is None:
         return [], {}
-
-    raw_args = m.group(1)
-    parts = [p.strip() for p in _CALL_ARG_SPLIT_RE.split(raw_args) if p.strip()]
 
     positional: list[str] = []
     keyword: dict[str, str] = {}
 
-    for part in parts:
-        if "=" in part:
-            k, v = part.split("=", 1)
-            keyword[k.strip().lower()] = _clean_arg_value(v)
+    for part in _split_call_args(raw_args):
+        kw = _KW_ARG_RE.match(part)
+        if kw:
+            keyword[kw.group(1).lower()] = _clean_arg_value(kw.group(2))
         else:
             positional.append(_clean_arg_value(part))
 
@@ -397,6 +475,29 @@ _CONTEXT_KINDS = _OPTION_KINDS | _COMMENT_KINDS
 
 
 # ---------------------------------------------------------------------------
+# Edge tiers
+# ---------------------------------------------------------------------------
+
+# Strong edges represent confirmed data flow between two specific chunks and
+# union their components immediately during discovery.
+_STRONG_EDGE_KINDS = frozenset({"dataset_flow", "macro_body_dataset"})
+
+# Weak edges represent shared context (a macro definition, a macro variable,
+# a dataset name spotted in a call's argument text).  They are recorded but
+# only resolved after discovery, at component granularity, by
+# _resolve_weak_edges — so one widely-used %LET or utility macro cannot fuse
+# the whole corpus into a single batch.
+_WEAK_EDGE_KINDS = frozenset({"macro_invocation", "macro_var_flow", "macro_arg_dataset"})
+
+# Soft safety net: warn when a batch grows past this many chunks (there is
+# deliberately no hard cap — a genuine long pipeline is one batch).
+_WARN_BATCH_CHUNKS = 50
+
+# Maximum edge descriptions included in SasBatch.reason before truncation.
+_MAX_REASON_PARTS = 30
+
+
+# ---------------------------------------------------------------------------
 # Shared core: build flat index, discover edges, extract batches
 # ---------------------------------------------------------------------------
 
@@ -413,6 +514,10 @@ def _build_flat_index(
     This is done on *copies* of the SasChunk objects so the original
     SasChunkResult objects are not mutated.
 
+    A single-file corpus skips the re-stamping entirely: per-file IDs are
+    already unique, and preserving them keeps SasChunkBatcher output IDs
+    identical to the input SasChunkResult IDs.
+
     Returns
     -------
     flat_chunks : list[SasChunk]
@@ -420,6 +525,9 @@ def _build_flat_index(
     file_offsets : list[int]
         Global index of the first chunk of each file.
     """
+    if len(file_results) == 1:
+        return list(file_results[0].chunks), [0]
+
     flat: list[SasChunk] = []
     offsets: list[int] = []
 
@@ -453,12 +561,14 @@ def _add_edge(
     via: str,
 ) -> bool:
     """
-    Create a dependency edge between two global chunk indices, union them
-    in the Union-Find structure, log the result, and return whether the
-    union actually merged two previously-distinct components.
+    Create a dependency edge between two global chunk indices, log it, and
+    — for strong edge kinds only — union the endpoints in the Union-Find
+    structure.  Weak edges are recorded but left to _resolve_weak_edges.
 
-    Shared by every edge-discovery pass (dataset_flow, macro_invocation,
-    macro_arg_dataset, macro_body_dataset) so the "build edge, append,
+    Returns whether a union actually merged two previously-distinct
+    components (always False for weak kinds).
+
+    Shared by every edge-discovery pass so the "build edge, append,
     union, log" sequence exists in exactly one place.
     """
     cf = file_of[from_idx] != file_of[to_idx]
@@ -472,10 +582,11 @@ def _add_edge(
         cross_file=cf,
     )
     edges.append(e)
-    merged = uf.union(from_idx, to_idx)
+    merged = uf.union(from_idx, to_idx) if kind in _STRONG_EDGE_KINDS else False
     if logger.isEnabledFor(logging.DEBUG):
+        tier = "strong" if kind in _STRONG_EDGE_KINDS else "weak"
         logger.debug(
-            f"edge[{kind}] {e.from_id}(g{from_idx}) → {e.to_id}(g{to_idx}) via={via!r} cross_file={cf} uf_merged={merged}"
+            f"edge[{kind}/{tier}] {e.from_id}(g{from_idx}) → {e.to_id}(g{to_idx}) via={via!r} cross_file={cf} uf_merged={merged}"
         )
     return merged
 
@@ -513,9 +624,10 @@ def _discover_edges(
         meta = chunk.metadata
         for ds in meta.output_datasets:
             produces_ds[ds].append(gidx)
-            logger.debug(
-                f"index[ds]:    chunk {chunk.chunk_id} (g{gidx}) writes '{ds}'"
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"index[ds]:    chunk {chunk.chunk_id} (g{gidx}) writes '{ds}'"
+                )
         for mac in meta.defines_macros:
             if mac in defines_macro:
                 prev = flat_chunks[defines_macro[mac]]
@@ -525,15 +637,17 @@ def _discover_edges(
                     f"index[macro]: macro '%{mac}' redefined — chunk {chunk.chunk_id} (file {cur_file}) overrides chunk {prev.chunk_id} (file {prev_file})"
                 )
             defines_macro[mac] = gidx
-            logger.debug(
-                f"index[macro]: chunk {chunk.chunk_id} (g{gidx}) defines %{mac}"
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"index[macro]: chunk {chunk.chunk_id} (g{gidx}) defines %{mac}"
+                )
 
         for mvar in meta.produces_macrovars:
             produces_macrovar[mvar].append(gidx)
-            logger.debug(
-                f"index[macrovar]: chunk {chunk.chunk_id} (g{gidx}) creates &{mvar}"
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"index[macrovar]: chunk {chunk.chunk_id} (g{gidx}) creates &{mvar}"
+                )
 
         # %LET / %GLOBAL / %LOCAL declarations also bring a macro variable
         # into existence that downstream chunks may reference via &name.
@@ -545,9 +659,10 @@ def _discover_edges(
         for mvar in meta.declared_macro_vars:
             if gidx not in produces_macrovar[mvar]:
                 produces_macrovar[mvar].append(gidx)
-                logger.debug(
-                    f"index[macrovar-decl]: chunk {chunk.chunk_id} (g{gidx}) declares &{mvar}"
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"index[macrovar-decl]: chunk {chunk.chunk_id} (g{gidx}) declares &{mvar}"
+                    )
 
         # ── Fix A: literal macro-body outputs ────────────────────────────
         # A %MACRO body may contain hard-coded dataset names, e.g.
@@ -561,9 +676,10 @@ def _discover_edges(
         if meta.body_literal_outputs:
             for ds in meta.body_literal_outputs:
                 produces_ds[ds].append(gidx)
-                logger.debug(
-                    f"index[ds-literal-body]: chunk {chunk.chunk_id} (g{gidx}) macro body writes '{ds}'"
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"index[ds-literal-body]: chunk {chunk.chunk_id} (g{gidx}) macro body writes '{ds}'"
+                    )
 
     logger.debug(
         f"index built  unique_output_datasets={len(produces_ds)}  unique_macro_definitions={len(defines_macro)}"
@@ -576,26 +692,37 @@ def _discover_edges(
         meta = chunk.metadata
 
         # — dataset-flow —
+        # A consumer links only to the NEAREST PRECEDING producer of the
+        # name in corpus order — the dataset state a sequential SAS session
+        # would actually read.  Producers appearing later in the corpus
+        # (including a chunk's own write of the dataset it reads) never
+        # link backwards, so independent jobs reusing a scratch name like
+        # work.tmp stay in separate components.
         for ds in meta.input_datasets:
-            if ds not in produces_ds:
-                logger.debug(
-                    f"edge-skip[ds]: '{ds}' read by {chunk.chunk_id} — no producer in corpus"
-                )
+            plist = produces_ds.get(ds)
+            if not plist:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"edge-skip[ds]: '{ds}' read by {chunk.chunk_id} — no producer in corpus"
+                    )
                 continue
-            for pidx in produces_ds[ds]:
-                if pidx == cidx:
-                    logger.debug(f"edge-skip[ds]: self-ref '{ds}' in {chunk.chunk_id}")
-                    continue
-                _add_edge(
-                    edges,
-                    uf,
-                    flat_chunks,
-                    file_of,
-                    kind="dataset_flow",
-                    from_idx=pidx,
-                    to_idx=cidx,
-                    via=ds,
-                )
+            pos = bisect_left(plist, cidx) - 1
+            if pos < 0:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"edge-skip[ds]: '{ds}' read by {chunk.chunk_id} — no preceding producer"
+                    )
+                continue
+            _add_edge(
+                edges,
+                uf,
+                flat_chunks,
+                file_of,
+                kind="dataset_flow",
+                from_idx=plist[pos],
+                to_idx=cidx,
+                via=ds,
+            )
 
         # — macro-variable flow (ROADMAP Phase 2) —
         # Mirrors dataset_flow exactly, but for the macro-variable
@@ -603,15 +730,17 @@ def _discover_edges(
         # or PROC SQL INTO links to any chunk that references &cutoff.
         for mvar in meta.consumes_macrovars:
             if mvar not in produces_macrovar:
-                logger.debug(
-                    f"edge-skip[macrovar]: '&{mvar}' read by {chunk.chunk_id} — no producer in corpus"
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"edge-skip[macrovar]: '&{mvar}' read by {chunk.chunk_id} — no producer in corpus"
+                    )
                 continue
             for pidx in produces_macrovar[mvar]:
                 if pidx == cidx:
-                    logger.debug(
-                        f"edge-skip[macrovar]: self-ref '&{mvar}' in {chunk.chunk_id}"
-                    )
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            f"edge-skip[macrovar]: self-ref '&{mvar}' in {chunk.chunk_id}"
+                        )
                     continue
                 _add_edge(
                     edges,
@@ -627,9 +756,10 @@ def _discover_edges(
         # — macro-invocation —
         for mac in meta.invokes_macros:
             if mac not in defines_macro:
-                logger.debug(
-                    f"edge-skip[macro]: '%{mac}' in {chunk.chunk_id} — no definition in corpus"
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"edge-skip[macro]: '%{mac}' in {chunk.chunk_id} — no definition in corpus"
+                    )
                 continue
             didx = defines_macro[mac]
             if didx == cidx:
@@ -646,17 +776,28 @@ def _discover_edges(
             )
 
         # — macro-argument dataset —
+        # Scan only the parsed argument VALUES of the call (not the macro's
+        # own name or keyword parameter names, which the old whole-text scan
+        # matched), deduped so one dataset name yields at most one edge.
+        # Like dataset_flow, the call links to the nearest preceding
+        # producer of the name.
         if chunk.kind == SasChunkKind.MACRO_CALL:
-            arg_tokens = _ARG_DS_TOKEN_RE.findall(chunk.text)
-            for tok in arg_tokens:
-                # Canonicalise so a bare one-level argument matches its
-                # work.-qualified producer (and vice versa) — the producer
-                # index keys are canonical.
-                ds_norm = _canon_ds(tok.lower())
-                if ds_norm not in produces_ds:
-                    continue
-                for pidx in produces_ds[ds_norm]:
-                    if pidx == cidx:
+            arg_pos, arg_kw = _parse_call_args(chunk.text)
+            seen_arg_ds: set[str] = set()
+            for val in (*arg_pos, *arg_kw.values()):
+                for tok in _ARG_DS_TOKEN_RE.findall(val):
+                    # Canonicalise so a bare one-level argument matches its
+                    # work.-qualified producer (and vice versa) — the
+                    # producer index keys are canonical.
+                    ds_norm = _canon_ds(tok.lower())
+                    if ds_norm in seen_arg_ds:
+                        continue
+                    seen_arg_ds.add(ds_norm)
+                    plist = produces_ds.get(ds_norm)
+                    if not plist:
+                        continue
+                    pos = bisect_left(plist, cidx) - 1
+                    if pos < 0:
                         continue
                     _add_edge(
                         edges,
@@ -664,7 +805,7 @@ def _discover_edges(
                         flat_chunks,
                         file_of,
                         kind="macro_arg_dataset",
-                        from_idx=pidx,
+                        from_idx=plist[pos],
                         to_idx=cidx,
                         via=ds_norm,
                     )
@@ -675,9 +816,12 @@ def _discover_edges(
         # We resolve &ds. using the actual argument supplied at this call
         # site, then treat the resolved name as if this call-site chunk
         # itself produced/consumed that dataset — letting normal
-        # dataset_flow edges (computed in the next pass-through of this
-        # same loop, since produces_ds is mutated in place) link it to
-        # whatever else reads/writes that name elsewhere in the corpus.
+        # dataset_flow edges (computed later in this same loop, since
+        # produces_ds is mutated in place) link it to whatever reads that
+        # name AFTER this call site.  Under nearest-preceding-producer
+        # semantics this mid-loop registration is exactly right: the
+        # macro's output only exists once the call has executed, so only
+        # later chunks may consume it.
         if chunk.kind == SasChunkKind.MACRO_CALL:
             for mac in meta.invokes_macros:
                 if mac not in defines_macro:
@@ -688,9 +832,10 @@ def _discover_edges(
                     continue
 
                 pos_args, kw_args = _parse_call_args(chunk.text)
-                logger.debug(
-                    f"macro_body_dataset: call {chunk.chunk_id} invokes %{mac}  pos_args={pos_args}  kw_args={kw_args}"
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"macro_body_dataset: call {chunk.chunk_id} invokes %{mac}  pos_args={pos_args}  kw_args={kw_args}"
+                    )
 
                 def _resolve(entry: dict) -> str | None:
                     pname = entry["param"]
@@ -714,9 +859,10 @@ def _discover_edges(
                     if val:
                         val = val if "&" in val else _canon_ds(val)
                         resolved_outputs.append(val)
-                        logger.debug(
-                            f"macro_body_dataset: resolved param '{entry['param']}' → output '{val}'  (call {chunk.chunk_id})"
-                        )
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                f"macro_body_dataset: resolved param '{entry['param']}' → output '{val}'  (call {chunk.chunk_id})"
+                            )
 
                 resolved_inputs: list[str] = []
                 for entry in def_meta.body_param_inputs:
@@ -724,19 +870,25 @@ def _discover_edges(
                     if val:
                         val = val if "&" in val else _canon_ds(val)
                         resolved_inputs.append(val)
-                        logger.debug(
-                            f"macro_body_dataset: resolved param '{entry['param']}' → input '{val}'  (call {chunk.chunk_id})"
-                        )
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                f"macro_body_dataset: resolved param '{entry['param']}' → input '{val}'  (call {chunk.chunk_id})"
+                            )
 
                 # Register this call site as a producer of its resolved
                 # outputs so later chunks (in any file) that read those
                 # names get linked via the normal dataset_flow pass.
+                # insort keeps the producer list sorted by global index —
+                # the invariant the nearest-preceding bisect lookups rely
+                # on (a plain append could land after a larger pass-1
+                # index and break bisection).
                 for ds in resolved_outputs:
                     if cidx not in produces_ds[ds]:
-                        produces_ds[ds].append(cidx)
-                        logger.debug(
-                            f"index[ds-call-resolved]: chunk {chunk.chunk_id} (g{cidx}) resolved-produces '{ds}' via %{mac}"
-                        )
+                        insort(produces_ds[ds], cidx)
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                f"index[ds-call-resolved]: chunk {chunk.chunk_id} (g{cidx}) resolved-produces '{ds}' via %{mac}"
+                            )
 
                 # Persist resolved outputs/inputs back onto the chunk's own
                 # metadata (output_datasets / input_datasets) so that
@@ -746,11 +898,19 @@ def _discover_edges(
                 # SasBatch.output_datasets correctly report 'work.first',
                 # 'work.second', etc. for resolved parameterised calls.
                 if resolved_outputs or resolved_inputs:
-                    new_out = sorted(
-                        set(chunk.metadata.output_datasets) | set(resolved_outputs)
+                    # Insertion-order dedupe, NOT sorted():
+                    # _resolve_implicit_datasets treats output_datasets[-1]
+                    # as "the last dataset named" when tracking _LAST_, and
+                    # sorting would silently break that convention.
+                    new_out = list(
+                        dict.fromkeys(
+                            [*chunk.metadata.output_datasets, *resolved_outputs]
+                        )
                     )
-                    new_in = sorted(
-                        set(chunk.metadata.input_datasets) | set(resolved_inputs)
+                    new_in = list(
+                        dict.fromkeys(
+                            [*chunk.metadata.input_datasets, *resolved_inputs]
+                        )
                     )
                     updated_meta = chunk.metadata.model_copy(
                         update={"output_datasets": new_out, "input_datasets": new_in},
@@ -762,28 +922,32 @@ def _discover_edges(
                         f"macro_body_dataset: chunk {chunk.chunk_id} metadata updated  output_datasets={new_out}  input_datasets={new_in}"
                     )
 
-                # Link this call site to whatever already produces its
-                # resolved inputs (covers the case where the macro reads
+                # Link this call site to the nearest preceding producer of
+                # each resolved input (covers the case where the macro reads
                 # a dataset whose actual name is only known at this site).
                 for ds in resolved_inputs:
-                    if ds not in produces_ds:
-                        logger.debug(
-                            f"macro_body_dataset: resolved input '{ds}' has no producer in corpus (call {chunk.chunk_id})"
-                        )
+                    plist = produces_ds.get(ds)
+                    preceding = None
+                    if plist:
+                        pos = bisect_left(plist, cidx) - 1
+                        if pos >= 0:
+                            preceding = plist[pos]
+                    if preceding is None:
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                f"macro_body_dataset: resolved input '{ds}' has no preceding producer in corpus (call {chunk.chunk_id})"
+                            )
                         continue
-                    for pidx in produces_ds[ds]:
-                        if pidx == cidx:
-                            continue
-                        _add_edge(
-                            edges,
-                            uf,
-                            flat_chunks,
-                            file_of,
-                            kind="macro_body_dataset",
-                            from_idx=pidx,
-                            to_idx=cidx,
-                            via=ds,
-                        )
+                    _add_edge(
+                        edges,
+                        uf,
+                        flat_chunks,
+                        file_of,
+                        kind="macro_body_dataset",
+                        from_idx=preceding,
+                        to_idx=cidx,
+                        via=ds,
+                    )
 
     cf_count = sum(1 for e in edges if e.cross_file)
     logger.info(
@@ -804,11 +968,19 @@ def _absorb_context(
     include_options: bool,
     include_comments: bool,
     file_of: list[int],
+    globals_root: int | None = None,
 ) -> None:
     """
     Pull OPTIONS/GLOBAL_STATEMENT and/or COMMENT_BLOCK chunks into the
     component of the first substantive chunk that follows them,
     *within the same file only*.  We never absorb across a file boundary.
+
+    Runs AFTER weak-edge resolution: a context chunk that was promoted to
+    the global-context component (e.g. a ``%let`` consumed by two
+    independent pipelines) is skipped here — absorbing it into the chunk
+    that happens to follow it would drag the entire globals component into
+    one pipeline's batch, recreating exactly the mega-batch the promotion
+    exists to prevent.
 
     ``file_of`` (global_index → file_rank) is computed once by the caller and
     shared across all passes.
@@ -820,6 +992,12 @@ def _absorb_context(
         is_option = kind in _OPTION_KINDS and include_options
         is_comment = kind in _COMMENT_KINDS and include_comments
         if not (is_option or is_comment):
+            continue
+        if globals_root is not None and uf.find(idx) == globals_root:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"absorb-skip[globals]: {chunk.chunk_id} is in the global-context component"
+                )
             continue
 
         my_file = file_of[idx]
@@ -849,12 +1027,88 @@ def _absorb_context(
             break
 
 
+def _resolve_weak_edges(
+    uf: _UF,
+    edges: list[_Edge],
+    flat_chunks: list[SasChunk],
+) -> int | None:
+    """
+    Resolve weak edges (macro_invocation, macro_var_flow, macro_arg_dataset)
+    at component granularity, after strong-edge discovery has shaped the
+    core components (context absorption runs after this pass, so that a
+    globally-consumed ``%let`` is promoted here before absorption could
+    merge it into whichever pipeline happens to follow it in the source).
+
+    For each producer component (the from-side of weak edges):
+
+    - exactly ONE distinct consumer component → the producer is absorbed
+      into it (a macro defined for a single caller batches with that
+      caller, exactly as before);
+    - TWO OR MORE distinct consumer components → the producer is globally
+      affecting.  All such producers are unioned together into one
+      global-context component, which the caller emits as the FIRST batch.
+
+    The producer→consumers map is a snapshot of component roots taken
+    before any weak union is applied, so the outcome does not depend on
+    iteration order beyond the deterministic ascending-root processing.
+    (A producer absorbed into its lone consumer can in principle leave
+    another producer with fewer distinct consumers than the snapshot saw;
+    this single-pass resolution accepts that slack rather than iterating
+    to a fixpoint, keeping the result deterministic and cheap.)
+
+    Returns the root of the global-context component, or None when no
+    producer spans multiple components.
+    """
+    consumers_by_producer: dict[int, set[int]] = defaultdict(set)
+    for e in edges:
+        if e.kind not in _WEAK_EDGE_KINDS:
+            continue
+        pr = uf.find(e.from_global_idx)
+        cr = uf.find(e.to_global_idx)
+        if pr != cr:
+            consumers_by_producer[pr].add(cr)
+
+    global_roots: list[int] = []
+    for pr in sorted(consumers_by_producer):
+        crs = consumers_by_producer[pr]
+        if len(crs) == 1:
+            cr = next(iter(crs))
+            uf.union(pr, cr)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"weak-resolve[absorb]: producer component of {flat_chunks[pr].chunk_id} "
+                    f"absorbed into its single consumer component ({flat_chunks[cr].chunk_id})"
+                )
+        else:
+            global_roots.append(pr)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"weak-resolve[global]: producer component of {flat_chunks[pr].chunk_id} "
+                    f"feeds {len(crs)} distinct components — promoted to global context"
+                )
+
+    if not global_roots:
+        return None
+
+    anchor = global_roots[0]
+    for r in global_roots[1:]:
+        uf.union(anchor, r)
+    root = uf.find(anchor)
+    logger.info(
+        f"weak-resolve: {len(global_roots)} globally-affecting producer component(s) "
+        f"collected into global-context component (root=g{root})"
+    )
+    return root
+
+
 def _make_batch(
     global_indices: list[int],
     flat_chunks: list[SasChunk],
     component_edges: list[_Edge],
     batch_number: int,
     file_of: list[int],
+    *,
+    is_global_context: bool = False,
 ) -> SasBatch:
     """
     Build a SasBatch from a set of global chunk indices.
@@ -919,7 +1173,8 @@ def _make_batch(
             if ds not in intra_outputs and ds not in seen_ei:
                 ext_inputs.append(ds)
                 seen_ei.add(ds)
-                logger.debug(f"_make_batch {bid}: ext input '{ds}'")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"_make_batch {bid}: ext input '{ds}'")
 
     # ── external macro requirements ────────────────────────────────────────
     ext_macros: list[str] = []
@@ -937,12 +1192,16 @@ def _make_batch(
                 if mac not in seen_sa:
                     standard_autocall.append(mac)
                     seen_sa.add(mac)
-                    logger.debug(f"_make_batch {bid}: standard autocall macro '%{mac}'")
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            f"_make_batch {bid}: standard autocall macro '%{mac}'"
+                        )
                 continue
             if mac not in seen_em:
                 ext_macros.append(mac)
                 seen_em.add(mac)
-                logger.debug(f"_make_batch {bid}: ext macro '%{mac}'")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"_make_batch {bid}: ext macro '%{mac}'")
 
     # ── external libref requirements ────────────────────────────────────────
     # Librefs referenced by this batch's dataset I/O but not assigned by a
@@ -977,7 +1236,8 @@ def _make_batch(
             if mvar not in intra_macrovars and mvar not in seen_emv:
                 ext_macrovars.append(mvar)
                 seen_emv.add(mvar)
-                logger.debug(f"_make_batch {bid}: ext macrovar '&{mvar}'")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"_make_batch {bid}: ext macrovar '&{mvar}'")
 
     # ── reason string ──────────────────────────────────────────────────────
     # Group this component's edges by (from, to) pair, preserving the global
@@ -1001,13 +1261,30 @@ def _make_batch(
                 reason_parts.append(desc)
                 seen_r.add(desc)
 
+    # Cap the reason string — a large component can carry hundreds of
+    # edges, and an unbounded reason bloats every serialised result.
+    if len(reason_parts) > _MAX_REASON_PARTS:
+        omitted = len(reason_parts) - _MAX_REASON_PARTS
+        reason_parts = reason_parts[:_MAX_REASON_PARTS]
+        reason_parts.append(f"… +{omitted} more edges")
+
     reason = "; ".join(reason_parts) or "[context absorption only]"
-    logger.debug(f"_make_batch {bid}: reason={reason!r}")
+    if is_global_context:
+        reason = f"[global context — consumed by multiple batches] {reason}"
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"_make_batch {bid}: reason={reason!r}")
+
+    if len(member_chunks) > _WARN_BATCH_CHUNKS:
+        logger.warning(
+            f"_make_batch {bid}: batch has {len(member_chunks)} chunks "
+            f"(> {_WARN_BATCH_CHUNKS}) — downstream consumers may want to split it"
+        )
 
     return SasBatch(
         batch_id=bid,
         chunks=member_chunks,
         reason=reason,
+        is_global_context=is_global_context,
         source_files=seen_files,
         input_datasets=ext_inputs,
         output_datasets=sorted(intra_outputs),
@@ -1025,15 +1302,23 @@ def _extract_result(
     flat_chunks: list[SasChunk],
     edges: list[_Edge],
     file_of: list[int],
+    globals_root: int | None = None,
 ) -> tuple[list[SasBatch], list[SasChunk]]:
-    """Convert UF components → (batches, singletons)."""
+    """Convert UF components → (batches, singletons).
+
+    When ``globals_root`` names a component (see :func:`_resolve_weak_edges`),
+    that component is emitted FIRST as ``batch-001`` with
+    ``is_global_context=True`` — even at size 1, since "process these
+    globally-consumed definitions before everything else" is meaningful for
+    a lone macro definition too.
+    """
     n = len(flat_chunks)
     components = uf.components(n)
 
-    # Group edges by their component root.  Both endpoints of every edge share
-    # a root (each edge unions them in the UF), so keying on the from-endpoint's
-    # root buckets each edge with exactly the batch it belongs to — turning the
-    # old O(batches × total_edges) reason scan into O(total_edges) overall.
+    # Group edges by their component root.  Strong edges union their
+    # endpoints, so both sides share a root; weak edges may span components,
+    # in which case keying on the from-endpoint buckets them with their
+    # producer (for a global producer: the global-context batch).
     edges_by_component: dict[int, list[_Edge]] = defaultdict(list)
     for e in edges:
         edges_by_component[uf.find(e.from_global_idx)].append(e)
@@ -1041,16 +1326,33 @@ def _extract_result(
     batches: list[SasBatch] = []
     singletons: list[SasChunk] = []
 
-    for root, members in sorted(components.items()):
-        logger.debug(
-            f"component root={root}  size={len(members)}  members={[flat_chunks[i].chunk_id for i in members]}"
+    if globals_root is not None:
+        members = components.pop(globals_root)
+        batch = _make_batch(
+            global_indices=members,
+            flat_chunks=flat_chunks,
+            component_edges=edges_by_component.get(globals_root, []),
+            batch_number=1,
+            file_of=file_of,
+            is_global_context=True,
         )
+        batches.append(batch)
+        logger.info(
+            f"batch {batch.batch_id} [GLOBAL CONTEXT]  chunks={len(batch.chunks)}  source_files={batch.source_files}  def_macros={batch.defined_macros}  produced_macrovars={batch.produced_macrovars}"
+        )
+
+    for root, members in sorted(components.items()):
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"component root={root}  size={len(members)}  members={[flat_chunks[i].chunk_id for i in members]}"
+            )
         if len(members) == 1:
             solo = flat_chunks[members[0]]
             singletons.append(solo)
-            logger.debug(
-                f"singleton: {solo.chunk_id}  kind={solo.kind.value}  source={solo.source_id}"
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"singleton: {solo.chunk_id}  kind={solo.kind.value}  source={solo.source_id}"
+                )
             continue
 
         batch = _make_batch(
@@ -1077,6 +1379,11 @@ class SasChunkBatcher:
     """
     Group the chunks of a *single* :class:`SasChunkResult` into
     dependency-aware :class:`SasBatch` objects.
+
+    Chunk IDs in the result match the input SasChunkResult IDs (single-file
+    corpora skip the multi-file ID re-stamping).  When globally-consumed
+    definitions exist (see :class:`MultiFileBatcher`), the first batch is a
+    global-context batch with ``is_global_context=True``.
 
     For multi-file batching use :class:`MultiFileBatcher`.
 
@@ -1152,6 +1459,15 @@ class MultiFileBatcher:
     In this case the DATA step chunk from File_A and the PROC step chunk
     from File_B are placed in the **same batch**, with ``source_files``
     listing both files and ``is_cross_file = True``.
+
+    Edges are tiered: confirmed dataset flow merges components directly,
+    while shared-context links (macro definitions, macro variables, call
+    arguments) merge only when unambiguous — a producer consumed by two or
+    more otherwise-independent components is instead promoted to a single
+    **global-context batch**, emitted first with ``is_global_context=True``.
+    Dataset consumers link to the *nearest preceding* producer in corpus
+    order, so unrelated jobs reusing a scratch name (``work.tmp``) no
+    longer fuse into one batch.
 
     Parameters
     ----------
@@ -1272,7 +1588,10 @@ class MultiFileBatcher:
         # ── edge discovery ──────────────────────────────────────────────────
         edges = _discover_edges(flat_chunks, uf, file_of=file_of)
 
-        # ── context absorption (same-file only) ─────────────────────────────
+        # ── weak-edge resolution (absorb or promote to global context) ──────
+        globals_root = _resolve_weak_edges(uf, edges, flat_chunks)
+
+        # ── context absorption (same-file only; skips globals members) ──────
         if self.include_options_chunks or self.include_comment_chunks:
             _absorb_context(
                 flat_chunks,
@@ -1281,10 +1600,13 @@ class MultiFileBatcher:
                 include_options=self.include_options_chunks,
                 include_comments=self.include_comment_chunks,
                 file_of=file_of,
+                globals_root=globals_root,
             )
 
         # ── extract batches + singletons ────────────────────────────────────
-        batches, singletons = _extract_result(uf, flat_chunks, edges, file_of)
+        batches, singletons = _extract_result(
+            uf, flat_chunks, edges, file_of, globals_root
+        )
 
         cf_count = sum(1 for b in batches if b.is_cross_file)
         elapsed = time.perf_counter() - t0

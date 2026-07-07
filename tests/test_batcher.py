@@ -253,8 +253,11 @@ class TestMacroInvocation(unittest.TestCase):
         self.assertIn("clean", batch.defined_macros)
         self.assertEqual(len(batch.chunks), 2)
 
-    def test_macro_def_two_callsites_one_batch(self):
-        """One macro definition + two call sites → all three in one batch."""
+    def test_macro_def_two_callsites_globals_batch(self):
+        """One macro definition + two independent call sites: the definition
+        is consumed by two separate components, so it is promoted to the
+        global-context batch (emitted first) instead of fusing the two
+        call sites into one mega-batch."""
         src = (
             "%macro report(ds);\n"
             "  proc print data=&ds.; run;\n"
@@ -265,7 +268,14 @@ class TestMacroInvocation(unittest.TestCase):
         _, br = _chunk_and_batch(src)
         self.assertEqual(len(br.batches), 1)
         batch = br.batches[0]
-        self.assertEqual(len(batch.chunks), 3)
+        self.assertTrue(batch.is_global_context)
+        self.assertEqual(batch.batch_id, "batch-001")
+        self.assertIn("report", batch.defined_macros)
+        self.assertEqual(len(batch.chunks), 1)
+        # The two call sites stay independent singletons
+        self.assertEqual(len(br.singletons), 2)
+        for solo in br.singletons:
+            self.assertIn("report", solo.metadata.invokes_macros)
 
     def test_macro_with_dataset_flow(self):
         """Macro def + DATA step that calls it + downstream PROC → one batch."""
@@ -710,6 +720,154 @@ class TestComplexPrograms(unittest.TestCase):
         batch = br.batches[0]
         self.assertEqual(len(batch.chunks), 3)
         self.assertIn("work.final", batch.output_datasets)
+
+
+# ── 10. Order-aware dataset flow (nearest preceding producer) ─────────────
+
+
+class TestOrderAwareDatasetFlow(unittest.TestCase):
+    def test_scratch_name_reuse_stays_separate(self):
+        """Two independent jobs both using work.tmp must NOT fuse: each
+        consumer links only to the nearest preceding producer."""
+        src = (
+            "data work.tmp; set mylib.a; run;\n"
+            "proc print data=work.tmp; run;\n"
+            "data work.tmp; set mylib.b; run;\n"
+            "proc means data=work.tmp; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 2)
+        sizes = sorted(len(b.chunks) for b in br.batches)
+        self.assertEqual(sizes, [2, 2])
+        # Each batch reads a different external source
+        ext_inputs = sorted(ds for b in br.batches for ds in b.input_datasets)
+        self.assertEqual(ext_inputs, ["mylib.a", "mylib.b"])
+
+    def test_consumer_before_producer_gets_no_edge(self):
+        """A read that precedes the only producer of that name cannot be
+        fed by it under sequential SAS execution → no edge."""
+        src = (
+            "proc print data=work.later; run;\n"
+            "data work.later; set mylib.raw; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 0)
+        self.assertEqual(len(br.singletons), 2)
+
+
+# ── 11. Global-context batch (tiered weak-edge resolution) ────────────────
+
+
+class TestGlobalContextBatch(unittest.TestCase):
+    def test_shared_let_promoted_to_globals(self):
+        """A %LET consumed by two independent pipelines becomes the first
+        batch (is_global_context) instead of fusing the pipelines."""
+        src = (
+            "%let cutoff = 20240101;\n"
+            "data work.a; set mylib.x; where dt >= &cutoff; run;\n"
+            "proc print data=work.a; run;\n"
+            "data work.b; set mylib.y; where dt >= &cutoff; run;\n"
+            "proc means data=work.b; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 3)
+        globals_batch = br.batches[0]
+        self.assertTrue(globals_batch.is_global_context)
+        self.assertEqual(globals_batch.batch_id, "batch-001")
+        self.assertIn("cutoff", globals_batch.produced_macrovars)
+        # The two pipelines stay separate and report the external need
+        for b in br.batches[1:]:
+            self.assertFalse(b.is_global_context)
+            self.assertEqual(len(b.chunks), 2)
+            self.assertIn("cutoff", b.required_macrovars)
+
+    def test_single_consumer_macro_still_absorbed(self):
+        """A macro with exactly one call site batches with it — no globals
+        batch is created."""
+        src = (
+            "%macro clean(ds); data &ds.; set &ds.; run; %mend;\n"
+            "data work.raw; set mylib.x; run;\n"
+            "%clean(work.raw);\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertFalse(br.batches[0].is_global_context)
+        self.assertIn("clean", br.batches[0].defined_macros)
+
+    def test_no_globals_batch_when_no_shared_producers(self):
+        """Ordinary corpora get no global-context batch and numbering
+        starts at batch-001 as before."""
+        src = (
+            "data work.a; set mylib.raw; run;\n"
+            "proc print data=work.a; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertFalse(br.batches[0].is_global_context)
+        self.assertEqual(br.batches[0].batch_id, "batch-001")
+
+
+# ── 12. Call-argument parsing with nested parens ──────────────────────────
+
+
+class TestNestedParenCallArgs(unittest.TestCase):
+    def test_str_quoted_arg_does_not_truncate_list(self):
+        """%str(...) inside the argument list must not stop parsing at its
+        inner ')': the dataset argument after it still resolves."""
+        from chunker.batcher import _parse_call_args
+
+        pos, kw = _parse_call_args("%clean(%str(a,b), out=work.x);")
+        self.assertEqual(pos, ["%str(a,b)"])
+        self.assertEqual(kw, {"out": "work.x"})
+
+    def test_comma_after_nested_parens_still_splits(self):
+        from chunker.batcher import _parse_call_args
+
+        pos, kw = _parse_call_args("%m(a, f(x,y), b);")
+        self.assertEqual(pos, ["a", "f(x,y)", "b"])
+        self.assertEqual(kw, {})
+
+    def test_positional_value_with_equals_inside_parens_not_keyword(self):
+        from chunker.batcher import _parse_call_args
+
+        pos, kw = _parse_call_args("%m(f(x=1), ds=work.a);")
+        self.assertEqual(pos, ["f(x=1)"])
+        self.assertEqual(kw, {"ds": "work.a"})
+
+    def test_macro_name_matching_dataset_creates_no_arg_edge(self):
+        """A macro NAMED like a produced dataset must not create a
+        macro_arg_dataset edge — only argument values are scanned."""
+        src = (
+            "data work.base; set mylib.raw; run;\n"
+            "%base(some_param);\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 0)
+        self.assertEqual(len(br.singletons), 2)
+
+    def test_keyword_name_matching_dataset_creates_no_arg_edge(self):
+        """A keyword parameter NAME that collides with a produced dataset
+        must not create an edge; only its value is scanned."""
+        src = (
+            "data work.title; set mylib.raw; run;\n"
+            "%report(title=nothing_relevant);\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 0)
+        self.assertEqual(len(br.singletons), 2)
+
+
+# ── 13. Single-file chunk IDs are not re-stamped ──────────────────────────
+
+
+class TestSingleFileChunkIds(unittest.TestCase):
+    def test_ids_match_input_chunk_result(self):
+        src = "data work.a; set mylib.raw; run;\nproc print data=work.a; run;\n"
+        cr, br = _chunk_and_batch(src)
+        original_ids = [c.chunk_id for c in cr.chunks]
+        batched_ids = _ordered_chunk_ids(br)
+        self.assertEqual(sorted(batched_ids), sorted(original_ids))
+        self.assertTrue(all(not cid.startswith("f1-") for cid in batched_ids))
 
 
 if __name__ == "__main__":

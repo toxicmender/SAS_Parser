@@ -16,20 +16,26 @@ SparkKVStore                 ← core backend  (Spark DataFrame / Delta table)
 
 Storage schema (one row per KV entry)
 --------------------------------------
-kv_key      STRING NOT NULL   — namespaced key  e.g. "msg::thread-1::00000003"
+kv_key      STRING NOT NULL   — namespaced key
+                                e.g. "msg::thread-1::0001783440000000-9f3a"
 value       STRING NOT NULL   — JSON-serialised payload
 tags        STRING            — JSON array of tag strings
 created_at  DOUBLE            — Unix timestamp (float)
 updated_at  DOUBLE            — Unix timestamp (float)
 source      STRING            — optional provenance label
 
+Message keys embed a zero-padded microsecond timestamp plus a short random
+suffix, so they are collision-free without any read-modify-write sequence
+counter and sort lexicographically in time order (legacy ``{seq:08d}``
+keys sort before them, i.e. before any new message).
+
 On Databricks the SparkKVStore writes to a Delta table and uses
-MERGE INTO for upserts.  In local / CI mode it keeps state in a
-plain in-memory DataFrame (no disk I/O).
+MERGE INTO for upserts (``set_many`` batches several entries into one
+MERGE).  In local / CI mode it keeps state in a plain Python dict.
 
 Usage — Databricks notebook
 ----------------------------
-    from persistent_memory import DatabricksMemory
+    from memory.short_mem import DatabricksMemory
 
     mem = DatabricksMemory(
         spark=spark,                          # existing Databricks SparkSession
@@ -48,7 +54,7 @@ Usage — Databricks notebook
 
 Usage — local / CI (no Databricks)
 -----------------------------------
-    from persistent_memory import DatabricksMemory
+    from memory.short_mem import DatabricksMemory
     from pyspark.sql import SparkSession
 
     spark = SparkSession.builder.master("local").appName("mem").getOrCreate()
@@ -59,12 +65,20 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from pydantic import BaseModel, Field
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    ChatMessage,
+    HumanMessage,
+    SystemMessage,
+)
+from pydantic import BaseModel, ConfigDict, Field
 
 # ---------------------------------------------------------------------------
 # Guards: PySpark is optional at import time so the module can be loaded
@@ -83,6 +97,9 @@ try:
     _PYSPARK_AVAILABLE = True
 except ImportError:
     _PYSPARK_AVAILABLE = False
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +131,26 @@ def _sql_quote(s: str) -> str:
     stray quote from breaking (or injecting into) the statement.
     """
     return s.replace("'", "''")
+
+
+# LIKE-pattern escape character.  '~' is used instead of the conventional
+# backslash so the escaped pattern survives Spark SQL string-literal
+# processing without a second layer of backslash doubling.
+_LIKE_ESCAPE = "~"
+
+
+def _sql_like_prefix(prefix: str) -> str:
+    """Escape LIKE wildcards in *prefix* for a literal prefix match.
+
+    ``_`` matches any single character in LIKE and ``%`` any run, so a key
+    prefix like ``msg::thread_1::`` would otherwise also match
+    ``msg::threadX1::…``.  The result must be used with ``ESCAPE '~'``.
+    """
+    return (
+        prefix.replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2)
+        .replace("%", _LIKE_ESCAPE + "%")
+        .replace("_", _LIKE_ESCAPE + "_")
+    )
 
 
 # Schema shared by every layer
@@ -235,23 +272,18 @@ class SparkKVStore:
     # ---- Internal read helpers ---------------------------------------------
 
     def _df(self, prefix: str = "") -> "DataFrame":
-        """Return a DataFrame view of current store contents."""
-        if self._table:
-            df = self._spark.table(self._table)
-        else:
-            rows = [
-                (
-                    k,
-                    r["value"],
-                    r["tags"],
-                    r["created_at"],
-                    r["updated_at"],
-                    r["source"],
-                )
-                for k, r in self._mem.items()
-            ]
-            df = self._spark.createDataFrame(rows or [], schema=_schema())
+        """Return a DataFrame view of the Delta table (Delta mode only).
 
+        Every in-memory-mode caller has a dict fast path via
+        :meth:`_mem_items`; wrapping the dict in a DataFrame here was dead
+        code and would have required a live SparkSession the in-memory
+        tests deliberately run without.
+        """
+        if not self._table:
+            raise RuntimeError(
+                "_df() is Delta-mode only; in-memory mode reads _mem_items()"
+            )
+        df = self._spark.table(self._table)
         if prefix:
             df = df.filter(F.col("kv_key").startswith(prefix))
         return df
@@ -295,40 +327,75 @@ class SparkKVStore:
         tags: Optional[List[str]] = None,
         source: Optional[str] = None,
     ) -> None:
+        self.set_many([{"key": key, "value": value, "tags": tags, "source": source}])
+
+    def set_many(self, entries: List[Dict[str, Any]]) -> None:
+        """Upsert several entries at once — a single MERGE in Delta mode.
+
+        Each entry is a dict with keys:
+
+        - ``key`` (required), ``value`` (required)
+        - ``tags``: list of tag strings, or None to preserve existing tags
+          on update (both modes now agree on this — Delta previously
+          overwrote tags with ``[]`` when None was passed)
+        - ``source``: provenance label, or None to preserve existing
+        - ``created_at`` / ``updated_at``: optional explicit timestamps
+          (used by :meth:`restore` to keep snapshot history); default now.
+        """
+        if not entries:
+            return
         now = _now()
-        val_json = _jdump(value)
-        tags_json = _jdump(tags or [])
 
         if self._table:
-            # MERGE INTO for upsert
-            # Stage the new row as a single-row temp view
-            new_row = self._spark.createDataFrame(
-                [(key, val_json, tags_json, now, now, source)],
-                schema=_schema(),
-            )
-            new_row.createOrReplaceTempView("_kv_upsert_staging")
-            self._spark.sql(f"""
-                MERGE INTO {self._table} AS target
-                USING _kv_upsert_staging AS source
-                  ON target.kv_key = source.kv_key
-                WHEN MATCHED THEN UPDATE SET
-                    target.value      = source.value,
-                    target.tags       = COALESCE(source.tags, target.tags),
-                    target.updated_at = source.updated_at,
-                    target.source     = COALESCE(source.source, target.source)
-                WHEN NOT MATCHED THEN INSERT *
-            """)
+            rows = [
+                (
+                    e["key"],
+                    _jdump(e["value"]),
+                    _jdump(e["tags"]) if e.get("tags") is not None else None,
+                    e.get("created_at", now),
+                    e.get("updated_at", now),
+                    e.get("source"),
+                )
+                for e in entries
+            ]
+            # Unique per-call view name: a fixed name would let two
+            # concurrent writers on the same SparkSession clobber each
+            # other's staged rows between createOrReplaceTempView and MERGE.
+            view = f"_kv_upsert_{uuid.uuid4().hex}"
+            staged = self._spark.createDataFrame(rows, schema=_schema())
+            staged.createOrReplaceTempView(view)
+            try:
+                self._spark.sql(f"""
+                    MERGE INTO {self._table} AS target
+                    USING {view} AS source
+                      ON target.kv_key = source.kv_key
+                    WHEN MATCHED THEN UPDATE SET
+                        target.value      = source.value,
+                        target.tags       = COALESCE(source.tags, target.tags),
+                        target.updated_at = source.updated_at,
+                        target.source     = COALESCE(source.source, target.source)
+                    WHEN NOT MATCHED THEN INSERT *
+                """)
+            finally:
+                self._spark.catalog.dropTempView(view)
         else:
-            existing = self._mem.get(key)
-            self._mem[key] = {
-                "value": val_json,
-                "tags": tags_json
-                if tags is not None
-                else (existing["tags"] if existing else _jdump([])),
-                "created_at": existing["created_at"] if existing else now,
-                "updated_at": now,
-                "source": source or (existing["source"] if existing else None),
-            }
+            for e in entries:
+                key = e["key"]
+                tags = e.get("tags")
+                existing = self._mem.get(key)
+                self._mem[key] = {
+                    "value": _jdump(e["value"]),
+                    "tags": _jdump(tags)
+                    if tags is not None
+                    else (existing["tags"] if existing else _jdump([])),
+                    "created_at": e.get(
+                        "created_at",
+                        existing["created_at"] if existing else now,
+                    ),
+                    "updated_at": e.get("updated_at", now),
+                    "source": e.get("source")
+                    or (existing["source"] if existing else None),
+                }
 
     def get(self, key: str, default: Any = None) -> Any:
         if self._table:
@@ -359,10 +426,43 @@ class SparkKVStore:
             return True
         return False
 
+    def delete_many(self, keys: List[str]) -> int:
+        """Delete several keys — a single DELETE … IN in Delta mode.
+
+        Returns the number of keys that existed and were removed.
+        """
+        if not keys:
+            return 0
+        if self._table:
+            key_set = set(keys)
+            existing = self._df().filter(F.col("kv_key").isin(list(key_set))).count()
+            if existing:
+                quoted = ", ".join(f"'{_sql_quote(k)}'" for k in key_set)
+                self._spark.sql(
+                    f"DELETE FROM {self._table} WHERE kv_key IN ({quoted})"
+                )
+            return existing
+        removed = 0
+        for k in keys:
+            if k in self._mem:
+                del self._mem[k]
+                removed += 1
+        return removed
+
     def keys(self, prefix: str = "") -> List[str]:
         if self._table is None:
             return [k for k, _ in self._mem_items(prefix)]
         return [row.kv_key for row in self._df(prefix).select("kv_key").collect()]
+
+    def has_prefix(self, prefix: str) -> bool:
+        """True if at least one key starts with *prefix*.
+
+        Cheaper than ``bool(keys(prefix))`` in Delta mode: stops at the
+        first matching row instead of collecting every key.
+        """
+        if self._table is None:
+            return any(True for _ in self._mem_items(prefix))
+        return bool(self._df(prefix).limit(1).count())
 
     def all_records(self, prefix: str = "") -> List[Tuple[str, Dict]]:
         if self._table is None:
@@ -375,8 +475,14 @@ class SparkKVStore:
     def clear_prefix(self, prefix: str) -> int:
         if self._table:
             count = self._df(prefix).count()
+            # LIKE wildcards in the prefix must be escaped: '_' matches any
+            # character, so "msg::thread_1::" would otherwise also delete
+            # "msg::threadX1::…" — unlike every read path, which matches
+            # the prefix literally via startswith.
+            pattern = _sql_like_prefix(prefix)
             self._spark.sql(
-                f"DELETE FROM {self._table} WHERE kv_key LIKE '{_sql_quote(prefix)}%'"
+                f"DELETE FROM {self._table} "
+                f"WHERE kv_key LIKE '{_sql_quote(pattern)}%' ESCAPE '{_LIKE_ESCAPE}'"
             )
             return count
         targets = [k for k in self._mem if k.startswith(prefix)]
@@ -471,12 +577,11 @@ class SparkKVStore:
 
     def snapshot(self) -> Dict[str, Any]:
         """Export full store as a plain dict (JSON-serialisable)."""
+        # all_records() already deserialises value and tags
         return {
             key: {
                 "value": rec["value"],
-                "tags": _jload(rec["tags"])
-                if isinstance(rec["tags"], str)
-                else rec["tags"],
+                "tags": rec["tags"],
                 "created_at": rec["created_at"],
                 "updated_at": rec["updated_at"],
                 "source": rec["source"],
@@ -485,15 +590,27 @@ class SparkKVStore:
         }
 
     def restore(self, snapshot: Dict[str, Any]) -> None:
-        """Overwrite store contents from a snapshot dict."""
+        """Overwrite store contents from a snapshot dict.
+
+        The snapshot's ``created_at``/``updated_at`` are preserved (a
+        restored store previously re-stamped every entry to restore time,
+        losing the history the snapshot carried).
+        """
         self.clear()
+        entries = []
         for key, data in snapshot.items():
-            self.set(
-                key,
-                data["value"],
-                tags=data.get("tags", []),
-                source=data.get("source"),
-            )
+            entry: Dict[str, Any] = {
+                "key": key,
+                "value": data["value"],
+                "tags": data.get("tags", []),
+                "source": data.get("source"),
+            }
+            if data.get("created_at") is not None:
+                entry["created_at"] = data["created_at"]
+            if data.get("updated_at") is not None:
+                entry["updated_at"] = data["updated_at"]
+            entries.append(entry)
+        self.set_many(entries)
 
     # ---- Diagnostics -------------------------------------------------------
 
@@ -521,8 +638,15 @@ class KVChatMessageHistory(BaseChatMessageHistory):
 
     Key layout
     ----------
-    msg::{session_id}::{seq:08d}  → {"role":..., "content":..., "ts":...}
-    idx::{session_id}             → next sequence int (as JSON number)
+    msg::{session_id}::{epoch_micros:016d}-{rand4}
+        → {"role":..., "content":..., "meta":..., "ts":...}
+
+    Keys embed a microsecond timestamp plus a random suffix, so they are
+    collision-free with no read-modify-write sequence counter (the old
+    ``idx::{session_id}`` get-then-set raced under concurrent writers and
+    silently overwrote messages) and sort lexicographically in time order.
+    Legacy ``{seq:08d}`` keys sort before every timestamp key, i.e. legacy
+    messages stay ahead of any new ones.
 
     Usage
     -----
@@ -533,62 +657,103 @@ class KVChatMessageHistory(BaseChatMessageHistory):
     print(history.messages)
     """
 
-    _ROLE_MAP = {HumanMessage: "human", AIMessage: "ai", SystemMessage: "system"}
     _TYPE_MAP = {"human": HumanMessage, "ai": AIMessage, "system": SystemMessage}
 
     def __init__(self, session_id: str, store: SparkKVStore) -> None:
         self.session_id = session_id
         self._store = store
-        self._idx_key = f"idx::{session_id}"
+        self._idx_key = f"idx::{session_id}"  # legacy counter key, cleanup only
         self._msg_prefix = f"msg::{session_id}::"
+        self._last_us = 0
 
-    def _next_seq(self) -> int:
-        seq = self._store.get(self._idx_key, 0)
-        self._store.set(self._idx_key, seq + 1)
-        return seq
+    def _msg_key(self, ts: float) -> str:
+        """Build a time-ordered, collision-free message key for *ts*."""
+        us = int(ts * 1_000_000)
+        if us <= self._last_us:
+            # Keep same-microsecond writes from this instance in insertion
+            # order (the random suffix alone would shuffle them).
+            us = self._last_us + 1
+        self._last_us = us
+        return f"{self._msg_prefix}{us:016d}-{uuid.uuid4().hex[:4]}"
 
     # ---- BaseChatMessageHistory --------------------------------------------
 
     @property
     def messages(self) -> List[BaseMessage]:
         pairs = self._store.all_records(prefix=self._msg_prefix)
-        # Sort by the zero-padded sequence suffix
-        pairs.sort(key=lambda kv: kv[0].split("::")[-1])
+        # Sort by the key suffix: zero-padded timestamps (and legacy
+        # zero-padded sequence numbers) order lexicographically by time.
+        pairs.sort(key=lambda kv: kv[0][len(self._msg_prefix) :])
         result: List[BaseMessage] = []
         for _, rec in pairs:
             data = rec["value"]  # already deserialised by _row_to_dict
-            cls = self._TYPE_MAP.get(data["role"], HumanMessage)
-            result.append(
-                cls(content=data["content"], additional_kwargs=data.get("meta", {}))
-            )
+            role = data.get("role", "human")
+            cls = self._TYPE_MAP.get(role)
+            meta = data.get("meta", {})
+            if cls is not None:
+                result.append(cls(content=data["content"], additional_kwargs=meta))
+            else:
+                # Tool/function/custom roles round-trip via ChatMessage
+                # instead of being silently rewritten as human messages.
+                result.append(
+                    ChatMessage(role=role, content=data["content"], additional_kwargs=meta)
+                )
         return result
 
     def add_message(self, message: BaseMessage) -> None:
-        seq = self._next_seq()
-        role = self._ROLE_MAP.get(type(message), "human")
-        key = f"{self._msg_prefix}{seq:08d}"
-        self._store.set(
-            key,
-            {
-                "role": role,
-                "content": message.content,
-                "meta": message.additional_kwargs,
-                "ts": _now(),
-            },
-            tags=["message", role, self.session_id],
-        )
+        self.add_messages([message])
+
+    def add_messages(self, messages: List[BaseMessage]) -> None:
+        """Persist several messages in ONE store write (one Delta MERGE)."""
+        ts = _now()
+        entries = []
+        for message in messages:
+            # ChatMessage carries the actual role in .role; every other
+            # BaseMessage subclass identifies itself via .type.
+            role = getattr(message, "role", None) or message.type
+            entries.append(
+                {
+                    "key": self._msg_key(ts),
+                    "value": {
+                        "role": role,
+                        "content": message.content,
+                        "meta": message.additional_kwargs,
+                        "ts": ts,
+                    },
+                    "tags": ["message", role, self.session_id],
+                }
+            )
+        self._store.set_many(entries)
 
     def clear(self) -> None:
         self._store.clear_prefix(self._msg_prefix)
-        self._store.delete(self._idx_key)
+        self._store.delete(self._idx_key)  # legacy counter, if present
 
     def has_messages(self) -> bool:
         """True if this thread has at least one stored message.
 
-        Cheaper than ``bool(self.messages)``: it checks only for the presence
-        of a message key rather than loading and deserialising every message.
+        Checks only for the presence of a message key — in Delta mode this
+        stops at the first matching row instead of collecting every key.
         """
-        return bool(self._store.keys(prefix=self._msg_prefix))
+        return self._store.has_prefix(self._msg_prefix)
+
+    def prune_before(self, cutoff_ts: float) -> int:
+        """Delete messages whose stored ``ts`` is older than *cutoff_ts*.
+
+        The rolling window in WindowChatMemory only limits what is
+        *surfaced* to a chain; this is the complementary storage-side trim
+        (one DELETE in Delta mode).  Returns the number removed.
+        """
+        stale = [
+            key
+            for key, rec in self._store.all_records(prefix=self._msg_prefix)
+            if rec["value"].get("ts", 0.0) < cutoff_ts
+        ]
+        removed = self._store.delete_many(stale)
+        logger.info(
+            f"prune_before: session '{self.session_id}' removed {removed} message(s)"
+        )
+        return removed
 
     # ---- Helpers -----------------------------------------------------------
 
@@ -636,7 +801,17 @@ class ThreadMemoryManager:
         return self._threads[thread_id]
 
     def list_threads(self) -> List[str]:
-        return [tid for tid, h in self._threads.items() if h.has_messages()]
+        """Thread ids with at least one stored message.
+
+        Derived from the store's keys — not from the threads this manager
+        instance happens to have touched — so with a persistent Delta
+        backend the list survives a process restart.
+        """
+        ids = {
+            key[len("msg::") :].rsplit("::", 1)[0]
+            for key in self._store.keys(prefix="msg::")
+        }
+        return sorted(ids)
 
     def delete_thread(self, thread_id: str) -> None:
         self.get_thread(thread_id).clear()
@@ -645,7 +820,7 @@ class ThreadMemoryManager:
         return self.get_thread(thread_id).get_session_metadata()
 
     def all_summaries(self) -> List[Dict[str, Any]]:
-        return [self.thread_summary(tid) for tid in self._threads]
+        return [self.thread_summary(tid) for tid in self.list_threads()]
 
 
 # ===========================================================================
@@ -676,8 +851,7 @@ class WindowChatMemory(BaseMemory):
     _history: Optional[KVChatMessageHistory] = None
     _store: Optional[SparkKVStore] = None
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def bind_store(self, store: SparkKVStore) -> "WindowChatMemory":
         self._store = store
@@ -718,8 +892,10 @@ class WindowChatMemory(BaseMemory):
             or outputs.get("response")
             or next(iter(outputs.values()), "")
         )
-        h.add_user_message(str(inp))
-        h.add_ai_message(str(out))
+        # One store write for the whole turn (a single MERGE in Delta mode)
+        h.add_messages(
+            [HumanMessage(content=str(inp)), AIMessage(content=str(out))]
+        )
 
     def clear(self) -> None:
         self._get_history().clear()
@@ -921,6 +1097,11 @@ class DatabricksMemory:
     def restore(self, snapshot: Dict[str, Any]) -> None:
         """Replace store contents from a snapshot dict."""
         self._store.restore(snapshot)
+
+    def prune_thread(self, thread_id: str, before_ts: float) -> int:
+        """Storage-side trim: delete *thread_id* messages older than
+        *before_ts* (Unix seconds).  Returns the number removed."""
+        return self.get_thread(thread_id).prune_before(before_ts)
 
     def summary(self) -> Dict[str, Any]:
         return {

@@ -330,7 +330,9 @@ class TestParameterisedMacroBodyBatching(unittest.TestCase):
         self.assertEqual(len(br.batches[0].chunks), 5)
 
     def test_multiple_call_sites_resolve_independently(self):
-        """Same macro called twice with different dataset args."""
+        """Same macro called twice with different dataset args.  The two
+        call-site pipelines stay independent; the shared definition is
+        promoted to the global-context batch instead of fusing them."""
         src = (
             "%macro load(out); data &out.; x=1; run; %mend;\n"
             "%load(work.first);\n"
@@ -340,12 +342,17 @@ class TestParameterisedMacroBodyBatching(unittest.TestCase):
         )
         cr = _C.chunk_text(src)
         br = SasChunkBatcher().batch(cr)
-        # All five chunks connect transitively through the shared macro
-        # definition (macro_invocation edges) into one batch.
-        self.assertEqual(len(br.batches), 1)
-        self.assertEqual(len(br.batches[0].chunks), 5)
-        self.assertIn("work.first", br.batches[0].output_datasets)
-        self.assertIn("work.second", br.batches[0].output_datasets)
+        self.assertEqual(len(br.batches), 3)
+        globals_batch = br.batches[0]
+        self.assertTrue(globals_batch.is_global_context)
+        self.assertIn("load", globals_batch.defined_macros)
+        # Each call site batches with its own downstream consumer
+        pipeline_outputs = [set(b.output_datasets) for b in br.batches[1:]]
+        self.assertIn({"work.first"}, pipeline_outputs)
+        self.assertIn({"work.second"}, pipeline_outputs)
+        for b in br.batches[1:]:
+            self.assertEqual(len(b.chunks), 2)
+            self.assertIn("load", b.required_macros)
 
 
 # ---------------------------------------------------------------------------
@@ -477,11 +484,13 @@ class TestNestedMacroInvocation(unittest.TestCase):
             {"abc.sas", "xyz.sas", "main.sas"},
         )
 
-    def test_xyz_called_multiple_times_still_one_batch(self):
+    def test_xyz_called_multiple_times_promotes_defs_to_globals(self):
         """
-        Multiple top-level calls to %xyz (which itself invokes %abc) must
-        all transitively join the same batch as abc's and xyz's
-        definitions, via the shared macro_invocation chain.
+        Multiple top-level calls to %xyz (which itself invokes %abc): the
+        definition chain (%abc absorbed into %xyz's component, since xyz is
+        its only consumer) is consumed by two independent call sites, so
+        both definitions land together in the global-context batch and the
+        call sites stay singletons.
         """
         src = (
             "%macro abc;\n  data work.base; set mylib.raw; run;\n%mend;\n"
@@ -492,8 +501,12 @@ class TestNestedMacroInvocation(unittest.TestCase):
         cr = _C.chunk_text(src)
         br = SasChunkBatcher().batch(cr)
         self.assertEqual(len(br.batches), 1)
-        # 2 definitions + 2 call sites = 4 chunks
-        self.assertEqual(len(br.batches[0].chunks), 4)
+        globals_batch = br.batches[0]
+        self.assertTrue(globals_batch.is_global_context)
+        self.assertEqual(len(globals_batch.chunks), 2)
+        self.assertIn("abc", globals_batch.defined_macros)
+        self.assertIn("xyz", globals_batch.defined_macros)
+        self.assertEqual(len(br.singletons), 2)
 
     def test_unrelated_third_macro_stays_separate(self):
         """

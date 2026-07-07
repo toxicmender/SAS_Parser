@@ -293,15 +293,22 @@ class TestCrossFileMacroInvocation(unittest.TestCase):
         self.assertEqual(len(batch.chunks), 2)
 
     def test_macro_def_multiple_files_calls(self):
-        """Macro defined in file 1; called in files 2 and 3 → all in one batch."""
+        """Macro defined in file 1; called in files 2 and 3.  The definition
+        feeds two independent components, so it becomes the global-context
+        batch and the two call sites stay separate singletons."""
         br = _batch(
             "%macro report(ds);\n  proc print data=&ds.; run;\n%mend;",
             "%report(work.a);",
             "%report(work.b);",
         )
         self.assertEqual(len(br.batches), 1)
-        self.assertTrue(br.batches[0].is_cross_file)
-        self.assertEqual(len(br.batches[0].chunks), 3)
+        batch = br.batches[0]
+        self.assertTrue(batch.is_global_context)
+        self.assertIn("report", batch.defined_macros)
+        self.assertEqual(batch.source_files, ["file_1.sas"])
+        self.assertEqual(len(br.singletons), 2)
+        singleton_sources = {c.source_id for c in br.singletons}
+        self.assertEqual(singleton_sources, {"file_2.sas", "file_3.sas"})
 
     def test_two_macro_libs_separate_batches(self):
         """Two unrelated macro def+call pairs → two separate cross-file batches."""

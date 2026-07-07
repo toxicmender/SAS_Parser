@@ -449,6 +449,13 @@ class SasBatch(BaseModel):
     ------
     batch_id
         Zero-padded sequential id, e.g. ``"batch-001"``.
+    is_global_context
+        True for the (at most one) global-context batch: chunks whose
+        outputs — macro definitions, %LET/%GLOBAL declarations, datasets —
+        are consumed by two or more otherwise-independent batches.  It is
+        always emitted first in the batch list so downstream consumers can
+        process the shared context before any batch that depends on it,
+        and it may legitimately contain a single chunk.
     chunks
         Member chunks in dependency-respecting, source-order sequence.
         Chunks from different files are interleaved so that producers always
@@ -496,6 +503,7 @@ class SasBatch(BaseModel):
     batch_id: str
     chunks: list[SasChunk] = Field(default_factory=list)
     reason: str = ""
+    is_global_context: bool = False
     source_files: list[str] = Field(default_factory=list)
     input_datasets: list[str] = Field(default_factory=list)
     output_datasets: list[str] = Field(default_factory=list)
@@ -530,6 +538,8 @@ class SasBatch(BaseModel):
 
     def __str__(self) -> str:
         scope = "cross-file" if self.is_cross_file else "single-file"
+        if self.is_global_context:
+            scope += ", global-context"
         return (
             f"SasBatch {self.batch_id} ({scope}) chunks={len(self.chunks)} "
             f"lines {self.start_line}-{self.end_line} "
