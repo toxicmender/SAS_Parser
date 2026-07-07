@@ -18,7 +18,7 @@ Test sections
 7.  Source ordering inside batches
 8.  Singleton / batch I/O fields
 9.  Context absorption (same-file only)
-10. SasMultiBatchResult model properties
+10. SasBatchResult model properties
 11. Complex realistic multi-file programs
 12. MultiFileBatcher.from_files factory (mocked paths)
 """
@@ -35,7 +35,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from chunker import (
     SasBatch,
     SasCorpus,
-    SasMultiBatchResult,
+    SasBatchResult,
     SasSemanticChunker,
 )
 from chunker.batcher import MultiFileBatcher
@@ -61,7 +61,7 @@ def _batch(
     ids: list[str] | None = None,
     include_options: bool = True,
     include_comments: bool = False,
-) -> SasMultiBatchResult:
+) -> SasBatchResult:
     corp = _corpus(*sources, ids=ids)
     return MultiFileBatcher(
         include_options_chunks=include_options,
@@ -69,7 +69,7 @@ def _batch(
     ).batch(corp)
 
 
-def _all_chunk_ids(result: SasMultiBatchResult) -> list[str]:
+def _all_chunk_ids(result: SasBatchResult) -> list[str]:
     ids = []
     for item in result.all_ordered_items:
         if isinstance(item, SasBatch):
@@ -628,7 +628,7 @@ class TestContextAbsorptionMultiFile(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 10. SasMultiBatchResult model properties
+# 10. SasBatchResult model properties
 # ---------------------------------------------------------------------------
 
 
@@ -824,7 +824,7 @@ class TestFromFilesFactory(unittest.TestCase):
             corpus, result = MultiFileBatcher.from_files([str(f1), str(f2)])
 
         self.assertIsInstance(corpus, SasCorpus)
-        self.assertIsInstance(result, SasMultiBatchResult)
+        self.assertIsInstance(result, SasBatchResult)
         self.assertEqual(len(result.batches), 1)
         self.assertTrue(result.batches[0].is_cross_file)
 

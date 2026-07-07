@@ -80,7 +80,6 @@ from .models import (
     SasChunkKind,
     SasChunkResult,
     SasCorpus,
-    SasMultiBatchResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -1378,14 +1377,15 @@ def _extract_result(
 class SasChunkBatcher:
     """
     Group the chunks of a *single* :class:`SasChunkResult` into
-    dependency-aware :class:`SasBatch` objects.
+    dependency-aware :class:`SasBatch` objects — a single-file convenience
+    over :class:`MultiFileBatcher`, which does all the work.
 
     Chunk IDs in the result match the input SasChunkResult IDs (single-file
     corpora skip the multi-file ID re-stamping).  When globally-consumed
     definitions exist (see :class:`MultiFileBatcher`), the first batch is a
     global-context batch with ``is_global_context=True``.
 
-    For multi-file batching use :class:`MultiFileBatcher`.
+    For multi-file batching use :class:`MultiFileBatcher` directly.
 
     Parameters
     ----------
@@ -1405,40 +1405,22 @@ class SasChunkBatcher:
     ) -> None:
         self.include_comment_chunks = include_comment_chunks
         self.include_options_chunks = include_options_chunks
+        self._delegate = MultiFileBatcher(
+            include_comment_chunks=include_comment_chunks,
+            include_options_chunks=include_options_chunks,
+        )
         logger.debug(
             f"SasChunkBatcher  include_comment={include_comment_chunks}  include_options={include_options_chunks}"
         )
 
     def batch(self, chunk_result: SasChunkResult) -> SasBatchResult:
-        """Compute dependency-driven batches for all chunks in *chunk_result*."""
-        label = chunk_result.source_id or "<inline>"
-        logger.info(
-            f"SasChunkBatcher.batch: start  source='{label}'  chunks={len(chunk_result.chunks)}"
-        )
-        t0 = time.perf_counter()
+        """Compute dependency-driven batches for all chunks in *chunk_result*.
 
-        if not chunk_result.chunks:
-            logger.warning(f"batch: no chunks for source='{label}'")
-            return SasBatchResult(source_id=chunk_result.source_id)
-
-        # Wrap as a single-file corpus and delegate to the shared core
-        corpus = SasCorpus(file_results=[chunk_result])
-        multi = MultiFileBatcher(
-            include_comment_chunks=self.include_comment_chunks,
-            include_options_chunks=self.include_options_chunks,
-        ).batch(corpus)
-
-        # Unwrap back to SasBatchResult
-        result = SasBatchResult(
-            source_id=chunk_result.source_id,
-            batches=multi.batches,
-            singletons=multi.singletons,
-        )
-        elapsed = time.perf_counter() - t0
-        logger.info(
-            f"SasChunkBatcher.batch: done  source='{label}'  batches={len(result.batches)}  singletons={len(result.singletons)}  elapsed={elapsed:.3f}s"
-        )
-        return result
+        Wraps the result as a one-file corpus and delegates to
+        :class:`MultiFileBatcher`; the returned :class:`SasBatchResult` has
+        exactly one entry in ``source_ids``.
+        """
+        return self._delegate.batch(SasCorpus(file_results=[chunk_result]))
 
 
 # ---------------------------------------------------------------------------
@@ -1521,7 +1503,7 @@ class MultiFileBatcher:
         *,
         chunker_kwargs: dict | None = None,
         **batcher_kwargs,
-    ) -> "tuple[SasCorpus, SasMultiBatchResult]":
+    ) -> "tuple[SasCorpus, SasBatchResult]":
         """
         Convenience: chunk each file in *paths* and batch the resulting corpus.
 
@@ -1554,11 +1536,11 @@ class MultiFileBatcher:
     # Main entry point
     # ------------------------------------------------------------------
 
-    def batch(self, corpus: SasCorpus) -> SasMultiBatchResult:
+    def batch(self, corpus: SasCorpus) -> SasBatchResult:
         """
         Compute cross-file dependency batches for all files in *corpus*.
 
-        Returns a :class:`SasMultiBatchResult` containing all batches
+        Returns a :class:`SasBatchResult` containing all batches
         (including cross-file ones) and standalone singletons.
         """
         source_ids = corpus.source_ids
@@ -1569,7 +1551,7 @@ class MultiFileBatcher:
 
         if not corpus.file_results or not corpus.all_chunks:
             logger.warning("MultiFileBatcher.batch: corpus is empty")
-            return SasMultiBatchResult(source_ids=source_ids)
+            return SasBatchResult(source_ids=source_ids)
 
         # ── flatten corpus ──────────────────────────────────────────────────
         flat_chunks, file_offsets = _build_flat_index(corpus.file_results)
@@ -1614,7 +1596,7 @@ class MultiFileBatcher:
             f"MultiFileBatcher.batch: done  files={len(corpus.file_results)}  batches={len(batches)}  cross_file_batches={cf_count}  singletons={len(singletons)}  elapsed={elapsed:.3f}s"
         )
 
-        return SasMultiBatchResult(
+        return SasBatchResult(
             source_ids=source_ids,
             batches=batches,
             singletons=singletons,

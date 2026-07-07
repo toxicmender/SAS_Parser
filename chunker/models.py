@@ -6,14 +6,15 @@ Single-file models
 SasChunkKind, SasDiagnosticSeverity, SasDiagnostic,
 SasChunkMetadata, SasChunk, SasChunkResult
 
-Single-file batcher models
---------------------------
-SasBatch, SasBatchResult
+Batcher models
+--------------
+SasBatch        — one dependency group of chunks
+SasBatchResult  — batcher output, single-file and multi-file alike
+                  (source_ids has one entry for a single-file run)
 
-Multi-file models
------------------
-SasCorpus            — collection of SasChunkResult objects (one per file)
-SasMultiBatchResult  — cross-file batcher output; superset of SasBatchResult
+Multi-file input
+----------------
+SasCorpus — collection of SasChunkResult objects (one per file)
 """
 
 from __future__ import annotations
@@ -582,53 +583,19 @@ class SasBatch(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Single-file batcher result
+# Batcher result (single-file and multi-file)
 # ---------------------------------------------------------------------------
 
 
 class SasBatchResult(BaseModel):
     """
-    Output of :class:`~chunker.batcher.SasChunkBatcher` (single file).
-    """
+    Output of :class:`~chunker.batcher.SasChunkBatcher` and
+    :class:`~chunker.batcher.MultiFileBatcher`.
 
-    source_id: str | None = None
-    batches: list[SasBatch] = Field(default_factory=list)
-    singletons: list[SasChunk] = Field(default_factory=list)
-
-    @property
-    def all_ordered_items(self) -> list[SasBatch | SasChunk]:
-        """
-        Batches and singletons merged back into original source order,
-        sorted by the start_line of the first chunk in each item.
-        """
-        tagged: list[tuple[int, SasBatch | SasChunk]] = [
-            (b.start_line, b) for b in self.batches
-        ] + [(c.start_line, c) for c in self.singletons]
-        return [item for _, item in sorted(tagged, key=lambda t: t[0])]
-
-    def model_post_init(self, __context: object) -> None:  # noqa: ANN001
-        logger.info(
-            f"SasBatchResult  source='{self.source_id or '<inline>'}'  batches={len(self.batches)}  singletons={len(self.singletons)}"
-        )
-
-    def __str__(self) -> str:
-        return (
-            f"SasBatchResult(source='{self.source_id or '<inline>'}', "
-            f"batches={len(self.batches)}, singletons={len(self.singletons)})"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Multi-file batcher result
-# ---------------------------------------------------------------------------
-
-
-class SasMultiBatchResult(BaseModel):
-    """
-    Output of :class:`~chunker.batcher.MultiFileBatcher`.
-
-    Structurally identical to :class:`SasBatchResult` but carries the full
-    set of source files and exposes cross-file batch statistics.
+    One model serves both workflows: ``source_ids`` lists every file in the
+    corpus (exactly one entry for a single-file run, ``"<inline>"`` for
+    string input), and ``cross_file_batches`` is empty when only one file
+    was batched.
 
     Attributes
     ----------
@@ -645,6 +612,12 @@ class SasMultiBatchResult(BaseModel):
     singletons: list[SasChunk] = Field(default_factory=list)
 
     @property
+    def source_id(self) -> str | None:
+        """The lone source id of a single-file result (``"<inline>"`` for
+        string input), or ``None`` when the corpus holds several files."""
+        return self.source_ids[0] if len(self.source_ids) == 1 else None
+
+    @property
     def cross_file_batches(self) -> list[SasBatch]:
         """Batches that span more than one source file."""
         return [b for b in self.batches if b.is_cross_file]
@@ -654,6 +627,7 @@ class SasMultiBatchResult(BaseModel):
         """
         All items ordered by (file_index, start_line) so that the sequence
         respects both inter-file corpus order and intra-file source order.
+        For a single-file result this reduces to plain start_line order.
 
         For cross-file batches the position is determined by the earliest
         chunk in the batch (i.e. the producing chunk).
@@ -674,12 +648,12 @@ class SasMultiBatchResult(BaseModel):
     def model_post_init(self, __context: object) -> None:  # noqa: ANN001
         cf = sum(1 for b in self.batches if b.is_cross_file)
         logger.info(
-            f"SasMultiBatchResult  source_ids={self.source_ids}  batches={len(self.batches)}  cross_file_batches={cf}  singletons={len(self.singletons)}"
+            f"SasBatchResult  source_ids={self.source_ids}  batches={len(self.batches)}  cross_file_batches={cf}  singletons={len(self.singletons)}"
         )
 
     def __str__(self) -> str:
         return (
-            f"SasMultiBatchResult(source_ids={self.source_ids}, "
+            f"SasBatchResult(source_ids={self.source_ids}, "
             f"batches={len(self.batches)}, "
             f"cross_file_batches={len(self.cross_file_batches)}, "
             f"singletons={len(self.singletons)})"

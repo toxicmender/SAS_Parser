@@ -10,8 +10,8 @@ Architecture
                           |
                           v
                  +----------------------+
-  SasCorpus ----->| SasChunkBatcher /   |--> SasBatchResult /
-                 | MultiFileBatcher    |    SasMultiBatchResult
+  SasCorpus ----->| SasChunkBatcher /   |--> SasBatchResult
+                 | MultiFileBatcher    |
                  +----------------------+
                           |  all_ordered_items (SasBatch | SasChunk)
                           v

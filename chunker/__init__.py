@@ -45,7 +45,6 @@ from .models import (
     SasCorpus,
     SasDiagnostic,
     SasDiagnosticSeverity,
-    SasMultiBatchResult,
 )
 
 __all__ = [
@@ -62,12 +61,11 @@ __all__ = [
     "SasChunkResult",
     "SasDiagnostic",
     "SasDiagnosticSeverity",
-    # models — batcher
+    # models — batcher (single- and multi-file)
     "SasBatch",
     "SasBatchResult",
-    # models — multi-file
+    # models — multi-file input
     "SasCorpus",
-    "SasMultiBatchResult",
 ]
 
 
