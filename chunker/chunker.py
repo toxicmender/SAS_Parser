@@ -441,10 +441,15 @@ _SAS_CALL_ROUTINES = frozenset(
     }
 )
 
-# A function call is ``name(`` (optional whitespace before the paren); a CALL
-# routine is ``CALL name`` followed by a word boundary.  Both alternations are
-# built longest-name-first so a shorter name that prefixes a longer one can't
-# short-circuit the match, mirroring _RESERVED_WORDS_PATTERN's construction.
+# A function call is ``name(`` (optional whitespace before the paren) where
+# the name is not glued to a preceding ``%`` (the macro-language counterpart —
+# ``%scan(...)``, ``%put (...)`` — or a user macro that happens to share a
+# function's name, ``%compress(&ds)``), ``&`` (a macro-variable reference),
+# or ``.`` (a hash-object method call ``h.find()`` or an ``&pfx.name``
+# concatenation).  A CALL routine is ``CALL name`` followed by a word
+# boundary.  Both alternations are built longest-name-first so a shorter name
+# that prefixes a longer one can't short-circuit the match, mirroring
+# _RESERVED_WORDS_PATTERN's construction.
 _SAS_FUNCTIONS_PATTERN = "|".join(
     re.escape(w) for w in sorted(_SAS_FUNCTIONS, key=len, reverse=True)
 )
@@ -460,13 +465,34 @@ _SAS_CALL_ROUTINES_PATTERN = "|".join(
 # stdlib ``re`` — for the small patterns and the reserved-word negative-lookahead
 # alternations, ``re`` is as fast or faster, so a blanket swap would be a net loss.
 _SAS_FUNCTION_CALL_RE = regex.compile(
-    rf"\b({_SAS_FUNCTIONS_PATTERN})\b\s*\(",
+    rf"(?<![%&.\w])({_SAS_FUNCTIONS_PATTERN})\b\s*\(",
     regex.IGNORECASE,
 )
 _SAS_CALL_ROUTINE_RE = regex.compile(
     rf"\bcall\s+({_SAS_CALL_ROUTINES_PATTERN})\b",
     regex.IGNORECASE,
 )
+
+# INPUT/PUT *statement* grouped-list form — ``input (var-list) (informat-list)``
+# / ``put (var-list) (format-list)``.  The keyword directly followed by two
+# back-to-back parenthesised groups is never valid function-call syntax (a
+# call's argument list is a single group), so the keyword can be blanked ahead
+# of the function scan without touching genuine INPUT()/PUT() calls — including
+# SQL's ``case when ... then put(x, fmt.)``, whose single group never matches.
+_GROUPED_INPUT_PUT_STMT_RE = re.compile(
+    r"\b(?:input|put)\b(?=\s*\([^()]*\)\s*\()",
+    re.IGNORECASE,
+)
+
+
+def _function_scan_text(mt: str) -> str:
+    """Blank the spans of sanitised text *mt* that textually look like
+    ``name(`` but are not function calls, so _SAS_FUNCTION_CALL_RE /
+    _SAS_CALL_ROUTINE_RE don't misreport them: ``%macro name(...)`` definition
+    headers (a macro *named* like a function) and grouped-list INPUT/PUT
+    statements (see _GROUPED_INPUT_PUT_STMT_RE)."""
+    mt = _MACRO_DEF_RE.sub(lambda m: _blank_span(m.group(0)), mt)
+    return _GROUPED_INPUT_PUT_STMT_RE.sub(lambda m: " " * len(m.group(0)), mt)
 
 _MACRO_CALL_RE = re.compile(
     rf"%(?!(?:{_RESERVED_WORDS_PATTERN})\b)([A-Za-z_]\w*)",
@@ -2127,12 +2153,15 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
 
     # ── recognised SAS functions and CALL routines ──────────────────────────
     # Scanned on `mt` (string literals blanked) so a function-like token inside
-    # a quoted string isn't mistaken for a real call.
+    # a quoted string isn't mistaken for a real call, with %MACRO definition
+    # headers and grouped-list INPUT/PUT statements blanked on top
+    # (_function_scan_text) so those non-call ``name(`` shapes don't register.
+    ft = _function_scan_text(mt)
     recognized_functions = sorted(
-        {m.group(1).lower() for m in _SAS_FUNCTION_CALL_RE.finditer(mt)}
+        {m.group(1).lower() for m in _SAS_FUNCTION_CALL_RE.finditer(ft)}
     )
     recognized_call_routines = sorted(
-        {m.group(1).lower() for m in _SAS_CALL_ROUTINE_RE.finditer(mt)}
+        {m.group(1).lower() for m in _SAS_CALL_ROUTINE_RE.finditer(ft)}
     )
     # A ``CALL name(...)`` invocation also textually matches the function-call
     # pattern (``name(``); drop those so a routine isn't double-reported as a
