@@ -19,7 +19,8 @@ Architecture
                  | pipeline.py (this module)                       |
                  |  - thread_id = run id (all batches/files for    |
                  |    one run share ONE KVChatMessageHistory)      |
-                 |  - RunnableWithMessageHistory(prompt | llm)     |
+                 |  - LangGraph StateGraph; model node runs        |
+                 |    _trim | prompt | llm over KV-stored history  |
                  |  - prompt text sourced from pipeline_constants  |
                  +------------------------------------------------+
                           |
@@ -51,10 +52,10 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableConfig, RunnableLambda
-from langchain_core.runnables.history import RunnableWithMessageHistory
+from langgraph.graph import START, MessagesState, StateGraph
 from memory.short_mem import DatabricksMemory
 
 from .batcher import MultiFileBatcher, SasChunkBatcher
@@ -323,13 +324,28 @@ class SasLLMPipeline:
 
         chain = RunnableLambda(_trim) | prompt | llm
 
-        logger.debug("SasLLMPipeline: wiring RunnableWithMessageHistory")
-        self._runnable = RunnableWithMessageHistory(
-            chain,
-            get_session_history=self._memory.get_thread,
-            input_messages_key="input",
-            history_messages_key="history",
-        )
+        def _call_model(
+            state: MessagesState, config: RunnableConfig
+        ) -> dict[str, list[BaseMessage]]:
+            thread_id = config["configurable"]["thread_id"]
+            history = self._memory.get_thread(thread_id)
+            input_messages = state["messages"]
+            response = chain.invoke(
+                {"input": input_messages[-1].content, "history": history.messages}
+            )
+            history.add_messages(list(input_messages) + [response])
+            return {"messages": [response]}
+
+        # The graph is compiled WITHOUT a checkpointer on purpose: durable
+        # per-thread persistence lives in the KV-backed chat history above,
+        # keeping the msg:: row schema (snapshot / prune_before /
+        # list_threads) canonical instead of duplicating state in
+        # checkpoint blobs.
+        logger.debug("SasLLMPipeline: compiling LangGraph state graph")
+        builder = StateGraph(MessagesState)
+        builder.add_node("model", _call_model)
+        builder.add_edge(START, "model")
+        self._graph = builder.compile()
         logger.debug("SasLLMPipeline: ready")
 
     @staticmethod
@@ -452,7 +468,7 @@ class SasLLMPipeline:
         )
         t_pipeline = time.perf_counter()
         outputs: list[dict[str, Any]] = []
-        cfg: RunnableConfig = {"configurable": {"session_id": thread_id}}
+        cfg: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
         for idx, item in enumerate(items, start=1):
             is_batch = isinstance(item, SasBatch)
@@ -474,7 +490,10 @@ class SasLLMPipeline:
 
             t_item = time.perf_counter()
             try:
-                response = self._runnable.invoke({"input": user_msg}, cfg)
+                state = self._graph.invoke(
+                    {"messages": [HumanMessage(user_msg)]}, cfg
+                )
+                response = state["messages"][-1]
             except Exception:
                 logger.error(
                     "_process: LLM call failed  item=%s  thread=%s",

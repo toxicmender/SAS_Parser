@@ -20,12 +20,14 @@ LangChain integration
 ---------------------
 KVChatMessageHistory implements ``langchain_core.chat_history.
 BaseChatMessageHistory`` (overriding bulk ``add_messages``, as the base
-class recommends) and plugs into ``RunnableWithMessageHistory`` — both are
-current, supported APIs in LangChain v1.  The legacy ``BaseMemory`` /
-``ConversationChain`` layer was removed from LangChain in v1 (it lives on
-only in ``langchain_classic``), so this module no longer ships a
-``BaseMemory`` adapter; see ``chunker.pipeline`` for the
-RunnableWithMessageHistory wiring.
+class recommends) — a current, supported API in LangChain v1.  It serves
+as the durable backing store behind a LangGraph ``StateGraph``: the
+graph's model node loads ``history.messages`` before each LLM call and
+persists the new turn with ``add_messages`` (see ``chunker.pipeline`` for
+the wiring).  The legacy ``BaseMemory`` / ``ConversationChain`` layer was
+removed from LangChain in v1 (it lives on only in ``langchain_classic``),
+and ``RunnableWithMessageHistory`` is deprecated in favour of LangGraph
+persistence, so this module ships neither adapter.
 
 Storage schema (one row per KV entry)
 --------------------------------------
@@ -969,9 +971,9 @@ class DatabricksMemory:
         thread = mem.get_thread("user-42")
         thread.add_user_message("Hello!")
 
-        # Chat-history threads plug into LangChain v1 chains via
-        # RunnableWithMessageHistory (see chunker.pipeline):
-        #   RunnableWithMessageHistory(chain, get_session_history=mem.get_thread, ...)
+        # Chat-history threads back a LangGraph model node (see
+        # chunker.pipeline): the node reads mem.get_thread(thread_id).messages
+        # before each LLM call and persists the new turn via add_messages.
 
         mem.kv.set("goal", "Build a RAG pipeline", tags=["project"])
 
