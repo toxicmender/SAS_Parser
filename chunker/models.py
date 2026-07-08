@@ -106,9 +106,12 @@ class SasDiagnostic(BaseModel):
     source_id: str | None = None
 
     def model_post_init(self, __context: object) -> None:  # noqa: ANN001
-        logger.debug(
-            f"SasDiagnostic  code={self.code}  severity={self.severity}  line={self.start_line}  source={self.source_id or '<inline>'}"
-        )
+        # Constructed once per diagnostic — guard so the f-string isn't
+        # built at all when DEBUG is off (this is a per-instance hot path).
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"SasDiagnostic  code={self.code}  severity={self.severity}  line={self.start_line}  source={self.source_id or '<inline>'}"
+            )
 
     def __str__(self) -> str:
         span = (
@@ -376,9 +379,12 @@ class SasChunk(BaseModel):
     metadata: SasChunkMetadata = Field(default_factory=SasChunkMetadata)
 
     def model_post_init(self, __context: object) -> None:  # noqa: ANN001
-        logger.debug(
-            f"SasChunk  id={self.chunk_id}  kind={self.kind.value}  lines={self.start_line}-{self.end_line}  source={self.source_id or '<inline>'}  parent={self.parent_id or 'none'}"
-        )
+        # Constructed once per chunk (thousands per parse) — guard so the
+        # f-string isn't built at all when DEBUG is off.
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"SasChunk  id={self.chunk_id}  kind={self.kind.value}  lines={self.start_line}-{self.end_line}  source={self.source_id or '<inline>'}  parent={self.parent_id or 'none'}"
+            )
 
     def __str__(self) -> str:
         title = f" '{self.title}'" if self.title else ""
@@ -565,9 +571,12 @@ class SasBatch(BaseModel):
         return len(self.source_files) > 1
 
     def model_post_init(self, __context: object) -> None:  # noqa: ANN001
-        logger.debug(
-            f"SasBatch  id={self.batch_id}  chunks={len(self.chunks)}  source_files={self.source_files}  cross_file={self.is_cross_file}  inputs={self.input_datasets}  outputs={self.output_datasets}"
-        )
+        # Constructed per batch (and re-validated per model_copy) — guard so
+        # the f-string isn't built at all when DEBUG is off.
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"SasBatch  id={self.batch_id}  chunks={len(self.chunks)}  source_files={self.source_files}  cross_file={self.is_cross_file}  inputs={self.input_datasets}  outputs={self.output_datasets}"
+            )
 
     def __str__(self) -> str:
         scope = "cross-file" if self.is_cross_file else "single-file"
