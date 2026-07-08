@@ -1,74 +1,9 @@
-"""
-(Databricks / PySpark backend)
-=====================================================
-LangChain chat-history and KV memory module.  Persists to a Databricks
-Delta table in production; runs on a plain Python dict locally, with no
-Spark (or JVM) required at all in that mode.
+"""LangChain chat-history and KV memory. See memory/README.md.
 
-Architecture
-------------
-SparkKVStore                 ← façade over one of two interchangeable backends
-│   ├── _InMemoryBackend     ← plain dict  (local / CI; pyspark not required)
-│   └── _DeltaBackend        ← Spark DataFrame / Databricks Delta table
-│
-├── KVChatMessageHistory     ← BaseChatMessageHistory for one thread/session
-├── ThreadMemoryManager      ← manages many independent threads
-├── KVMemoryStore            ← tagged KV store with search + text ingestion
-└── DatabricksMemory         ← unified façade (recommended entry point)
+Persists to a Databricks Delta table in production; runs on a plain Python dict
+locally, with no Spark (or JVM) required at all in that mode.
 
-LangChain integration
----------------------
-KVChatMessageHistory implements ``langchain_core.chat_history.
-BaseChatMessageHistory`` (overriding bulk ``add_messages``, as the base
-class recommends) — a current, supported API in LangChain v1.  It serves
-as the durable backing store behind a LangGraph ``StateGraph``: the
-graph's model node loads ``history.messages`` before each LLM call and
-persists the new turn with ``add_messages`` (see ``chunker.pipeline`` for
-the wiring).  The legacy ``BaseMemory`` / ``ConversationChain`` layer was
-removed from LangChain in v1 (it lives on only in ``langchain_classic``),
-and ``RunnableWithMessageHistory`` is deprecated in favour of LangGraph
-persistence, so this module ships neither adapter.
-
-Storage schema (one row per KV entry)
---------------------------------------
-kv_key      STRING NOT NULL   — namespaced key
-                                e.g. "msg::thread-1::0001783440000000-9f3a"
-value       STRING NOT NULL   — JSON-serialised payload
-tags        STRING            — JSON array of tag strings
-created_at  DOUBLE            — Unix timestamp (float)
-updated_at  DOUBLE            — Unix timestamp (float)
-source      STRING            — optional provenance label
-
-Message keys embed a zero-padded microsecond timestamp plus a short random
-suffix, so they are collision-free without any read-modify-write sequence
-counter and sort lexicographically in time order (legacy ``{seq:08d}``
-keys sort before them, i.e. before any new message).
-
-On Databricks the Delta backend uses MERGE INTO for upserts (``set_many``
-batches several entries into one MERGE).  In local / CI mode all state
-lives in a plain Python dict.
-
-Usage — Databricks notebook
-----------------------------
-    from memory.short_mem import DatabricksMemory
-
-    mem = DatabricksMemory(
-        spark=spark,                          # existing Databricks SparkSession
-        table="catalog.schema.langchain_mem", # Delta table (created if absent)
-    )
-
-    thread = mem.get_thread("user-42")
-    thread.add_user_message("Hello!")
-    thread.add_ai_message("Hi! How can I help?")
-
-    mem.kv.set("project_goal", "RAG pipeline", tags=["project"])
-    mem.kv.search("pipeline")
-
-Usage — local / CI (no Databricks, no Spark)
----------------------------------------------
-    from memory.short_mem import DatabricksMemory
-
-    mem = DatabricksMemory()   # in-memory dict; pyspark not required
+Logger name: ``memory.short_mem``.
 """
 
 from __future__ import annotations
@@ -89,10 +24,8 @@ from langchain_core.messages import (
     SystemMessage,
 )
 
-# ---------------------------------------------------------------------------
-# Guards: PySpark is an optional dependency — required only for Delta mode.
-# The in-memory backend (table=None) must import and run without it.
-# ---------------------------------------------------------------------------
+# PySpark is optional — required only for Delta mode; the in-memory backend
+# (table=None) must import and run without it.
 try:
     from pyspark.sql import DataFrame, SparkSession
     from pyspark.sql import functions as F
@@ -182,24 +115,10 @@ def _schema():
     return _KV_SCHEMA
 
 
-# ===========================================================================
-# Storage backends
-#
-# Both backends speak the same *raw* record shape — a tuple in Delta-schema
-# column order:
-#
-#     (key, value_json, tags_json | None, created_at, updated_at, source)
-#
-# with value/tags kept as their JSON-serialised strings.  All JSON
-# (de)serialisation, tag filtering, searching and snapshotting live once in
-# SparkKVStore; a backend only stores, retrieves and deletes raw rows.
-#
-# Upsert rows arrive with ``created_at=None`` when the caller did not supply
-# an explicit creation timestamp — each backend then applies its mode's
-# preservation semantics (keep the existing row's created_at on update,
-# default to "now" on insert).
-# ===========================================================================
-
+# Storage backends. Both speak the same raw record shape, a tuple in
+# Delta-schema column order (value/tags kept JSON-serialised). Upsert rows with
+# created_at=None get each backend's preservation semantics (keep existing on
+# update, default to now on insert).
 _RawRecord = Tuple[str, str, Optional[str], float, float, Optional[str]]
 
 

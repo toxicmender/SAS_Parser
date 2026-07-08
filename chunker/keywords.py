@@ -1,13 +1,6 @@
-"""
-keywords.py — SAS keyword catalogues and the patterns compiled from them.
+"""SAS keyword catalogues and the patterns compiled from them. See chunker/README.md.
 
-Frozen-set dictionaries transcribed from the SAS documentation — reserved
-macro words (Appendix 1), standard autocall macros, the DATA-step
-function and CALL-routine dictionaries, and the reserved dataset-name
-tokens — plus the regexes built from those alternations: the macro-call
-detectors (_MACRO_CALL_RE / _MACRO_INVOKE_RE) and the function /
-CALL-routine scanners.  Pure data: no logging, no imports from the rest
-of the package.  Every provenance note stays with its constant below.
+Pure data: no logging, no imports from the rest of the package.
 """
 
 from __future__ import annotations
@@ -17,25 +10,9 @@ import re
 import regex
 
 
-# ---------------------------------------------------------------------------
-# Reserved words — SAS Macro Language: Reference, Appendix 1
-# (Macro Facility Word Rules / Reserved Words, pp. 495-496)
-#
-# None of these words can validly be a user-defined macro name.  Any
-# "%word" appearing in source text where word is one of these is always a
-# macro-language keyword/statement/function, never an invocation of a
-# corpus-local macro — so every regex that detects "is this a macro call"
-# must exclude all of them, not just the small hand-picked subset that
-# earlier testing happened to surface.
-#
-# A handful of these (CMS, TSO — mainframe operating-environment words;
-# EDIT, SAVE, PAUSE, OPEN, CLOSE, CLEAR, ACT, ACTIVATE, DEACT, DEL, DELETE,
-# DMIDSPLY, DMISPLIT, COMANDR, METASYM, LIST, LISTM, WINDOW, DISPLAY,
-# INPUT, INC, INFILE, FILE, ON — interactive Display-Manager command
-# words) are essentially dead in modern batch/Compute-Server SAS, but are
-# kept in the set for correctness since excluding them costs nothing and
-# a SAS program could legally (if unusually) attempt to invoke one.
-# ---------------------------------------------------------------------------
+# Reserved words — SAS Macro Language: Reference, Appendix 1 (94 words, verbatim).
+# None can validly be a user-defined macro name, so every macro-call detector
+# must exclude all of them.
 _RESERVED_WORDS = frozenset(
     {
         "abend",
@@ -135,21 +112,9 @@ _RESERVED_WORDS = frozenset(
     }
 )
 
-# ---------------------------------------------------------------------------
-# Additional macro functions — SAS Macro Language: Reference, Ch. 12
-# Table 12.3 ("Macro Functions"), pp. 189-210 — ROADMAP Phase 4 (E10).
-#
-# These five are genuine macro functions per Ch. 12's own function table,
-# but are *not* present in Appendix 1's reserved-word list (verified: all
-# other 22 of Table 12.3's 27 function names ARE already covered by
-# _RESERVED_WORDS above, purely as a side effect of Appendix 1 happening to
-# overlap heavily with the function list — confirmed by exhaustive testing,
-# not by assumption). Kept as a separate, clearly-sourced constant rather
-# than folded into _RESERVED_WORDS itself, so that constant's identity
-# ("Appendix 1, verbatim — 94 words") stays exact and independently
-# citable/verifiable, while the *exclusion mechanism* below still covers
-# the complete, real macro-function set Ch. 12 documents.
-# ---------------------------------------------------------------------------
+# Genuine macro functions (SAS Macro Language: Reference, Ch. 12 Table 12.3)
+# that are absent from Appendix 1. Kept separate so _RESERVED_WORDS stays
+# "Appendix 1 verbatim", while the exclusion mechanism still covers the full set.
 _ADDITIONAL_MACRO_FUNCTION_WORDS = frozenset(
     {
         "sysmacexec",
@@ -160,9 +125,8 @@ _ADDITIONAL_MACRO_FUNCTION_WORDS = frozenset(
     }
 )
 
-# Built once from the union of both reserved-word sources — longest words
-# first so the alternation doesn't short-circuit on a shorter word that is
-# itself a prefix of a longer one.
+# Longest words first so the alternation doesn't short-circuit on a shorter
+# word that is a prefix of a longer one.
 _RESERVED_WORDS_PATTERN = "|".join(
     re.escape(w)
     for w in sorted(
@@ -172,31 +136,11 @@ _RESERVED_WORDS_PATTERN = "|".join(
     )
 )
 
-# ---------------------------------------------------------------------------
-# Standard SAS-provided autocall macros — SAS Macro Language: Reference,
-# Ch. 12 Table 12.13 ("Selected Autocall Macros Provided with SAS
-# Software") — ROADMAP Phase 5 (F2b).
-#
-# Unlike the reserved-word sets above, these ARE genuine, callable macro
-# names — %left(&var), %trim(&var), etc. are real macro invocations, and
-# must still be detected as such by _MACRO_CALL_RE/_MACRO_INVOKE_RE (so
-# this set is deliberately NOT folded into _RESERVED_WORDS_PATTERN). The
-# distinction this set exists to make is narrower: these ten ship with
-# every SAS installation, so a call to one of them will *always* be
-# "unresolved" against any user-supplied corpus, even though it's
-# perfectly normal, ubiquitous SAS code — not a missing dependency the
-# user needs to go find. batcher.py uses this set to exclude these names
-# from a batch's `required_macros` (the "you're missing this macro's
-# definition" list) while still reporting them separately via
-# `SasBatch.standard_autocall_macros`, so the information isn't silently
-# dropped — mirrors the existing automatic-macro-variable pattern from
-# Phase 1 exactly (tracked separately, never treated as "missing").
-#
-# Full SASAUTOS directory scanning (F2, resolving *any* externally-defined
-# macro by probing `<dir>/<name>.sas` on a search path) and SASMSTORE
-# compiled-macro resolution (F3) remain explicitly deferred — see
-# MACRO_PARSING_ROADMAP.md Phase 5 for the reasoning.
-# ---------------------------------------------------------------------------
+# Standard SAS-provided autocall macros (SAS Macro Language: Reference, Ch. 12
+# Table 12.13). These ARE genuine callable macro names, so this set is NOT
+# folded into _RESERVED_WORDS_PATTERN; batcher.py uses it to exclude them from a
+# batch's required_macros while still reporting them via
+# SasBatch.standard_autocall_macros.
 _STANDARD_AUTOCALL_MACROS = frozenset(
     {
         "cmpres",
@@ -213,21 +157,9 @@ _STANDARD_AUTOCALL_MACROS = frozenset(
 )
 
 
-# ---------------------------------------------------------------------------
 # SAS DATA-step functions and CALL routines — SAS 9.4 Functions and CALL
-# Routines: Reference, Fifth Edition (the "Dictionary of Functions and CALL
-# Routines" chapter, and the "Functions and CALL Routines by Category"
-# summary table).  Every name below is a documented dictionary entry title
-# in that manual, lower-cased and with the ``CALL`` prefix stripped from
-# routine names.
-#
-# Purpose: recognising which built-ins a chunk uses gives an LLM translator
-# an at-a-glance inventory of the functions/routines it must map to the
-# target language — many of which (INTNX/INTCK date arithmetic, PUT/INPUT
-# format application, the PRX* regex family, CALL SYMPUT/EXECUTE, ...) have
-# no one-to-one equivalent and need explicit handling.  These are advisory
-# metadata only; they never gate chunking or batching decisions.
-# ---------------------------------------------------------------------------
+# Routines: Reference (dictionary entry titles, lower-cased, CALL prefix
+# stripped). Advisory metadata only; never gate chunking or batching.
 _SAS_FUNCTIONS = frozenset(
     {
         'abs', 'addr', 'addrlong', 'airy', 'allcomb', 'allperm', 'anyalnum', 'anyalpha',
@@ -319,29 +251,18 @@ _SAS_CALL_ROUTINES = frozenset(
     }
 )
 
-# A function call is ``name(`` (optional whitespace before the paren) where
-# the name is not glued to a preceding ``%`` (the macro-language counterpart —
-# ``%scan(...)``, ``%put (...)`` — or a user macro that happens to share a
-# function's name, ``%compress(&ds)``), ``&`` (a macro-variable reference),
-# or ``.`` (a hash-object method call ``h.find()`` or an ``&pfx.name``
-# concatenation).  A CALL routine is ``CALL name`` followed by a word
-# boundary.  Both alternations are built longest-name-first so a shorter name
-# that prefixes a longer one can't short-circuit the match, mirroring
-# _RESERVED_WORDS_PATTERN's construction.
+# A function call is ``name(`` where the name is not glued to a preceding ``%``,
+# ``&``, or ``.``; a CALL routine is ``CALL name`` at a word boundary. Both
+# alternations are longest-name-first (as _RESERVED_WORDS_PATTERN).
 _SAS_FUNCTIONS_PATTERN = "|".join(
     re.escape(w) for w in sorted(_SAS_FUNCTIONS, key=len, reverse=True)
 )
 _SAS_CALL_ROUTINES_PATTERN = "|".join(
     re.escape(w) for w in sorted(_SAS_CALL_ROUTINES, key=len, reverse=True)
 )
-# These two are the only patterns in this module built from a *large* literal
-# alternation (~600 function names / ~65 CALL-routine names).  The third-party
-# ``regex`` engine compiles such big literal alternations into a far more
-# efficient matcher than stdlib ``re`` (measured ~1.75x faster per scan on
-# representative chunk text), and this scan runs once per chunk over the whole
-# chunk body, so it is a real hot path.  Every *other* pattern here stays on
-# stdlib ``re`` — for the small patterns and the reserved-word negative-lookahead
-# alternations, ``re`` is as fast or faster, so a blanket swap would be a net loss.
+# The third-party ``regex`` engine compiles these large literal alternations
+# (~600 / ~65 names) ~1.75x faster than stdlib ``re``, and this is a per-chunk
+# hot path. Every other pattern here stays on ``re``.
 _SAS_FUNCTION_CALL_RE = regex.compile(
     rf"(?<![%&.\w])({_SAS_FUNCTIONS_PATTERN})\b\s*\(",
     regex.IGNORECASE,

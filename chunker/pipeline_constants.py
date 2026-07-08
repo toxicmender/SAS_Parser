@@ -1,10 +1,7 @@
 """Shared prompt constants — importable without langchain installed."""
 
-# ---------------------------------------------------------------------------
-# System prompt (fills {output_language}; do not f-string this at import
-# time — SasLLMPipeline resolves it once at construction via .format()).
-# ---------------------------------------------------------------------------
-
+# System prompt — fills {output_language} via .format() at pipeline construction
+# (do not f-string at import time).
 _SYSTEM_PROMPT_TEMPLATE = """\
 You are an expert SAS-to-{output_language} migration assistant.
 You will be given either a single semantic chunk of Base SAS source code,
@@ -28,10 +25,7 @@ For each item you receive:
 Be concise. Respond in structured Markdown.
 """
 
-# ---------------------------------------------------------------------------
-# Singleton-chunk context (used for SasChunk items in all_ordered_items)
-# ---------------------------------------------------------------------------
-
+# Singleton-chunk context (SasChunk items in all_ordered_items).
 _CONTEXT_TEMPLATE = """\
 ## Program context
 - Source file       : {source_id}
@@ -65,10 +59,7 @@ _CONTEXT_TEMPLATE = """\
 ```
 """
 
-# ---------------------------------------------------------------------------
-# Batch context (used for SasBatch items in all_ordered_items)
-# ---------------------------------------------------------------------------
-
+# Batch context (SasBatch items in all_ordered_items).
 _BATCH_MEMBER_TEMPLATE = """\
 ### {chunk_id}  [{kind}]  ({source_id}, lines {start_line}-{end_line})
 Title: {title}

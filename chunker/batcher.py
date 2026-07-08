@@ -1,63 +1,10 @@
-"""
-batcher.py — dependency-graph-driven batching of SAS semantic chunks.
+"""Dependency-graph-driven batching of SAS semantic chunks. See chunker/README.md.
 
-Two public classes
-------------------
-SasChunkBatcher   — single-file batching (accepts one SasChunkResult)
-MultiFileBatcher  — multi-file batching  (accepts a SasCorpus)
+`SasChunkBatcher` batches one `SasChunkResult`; `MultiFileBatcher` batches a
+`SasCorpus`, extending the same core with cross-file edge discovery and
+globally-unique chunk indexing.
 
-Both share the same core algorithm; MultiFileBatcher extends it with
-cross-file edge discovery and globally-unique chunk indexing.
-
-Algorithm (shared)
-------------------
-1. Build a producer index: dataset-name → [global_chunk_indices]
-                           macro-name   → global_chunk_index
-2. Walk all chunks in corpus order (file_rank, chunk_index).  For each
-   chunk look up its input_datasets and invokes_macros.  Edges come in
-   two tiers:
-
-   - **strong** (dataset_flow, macro_body_dataset): union immediately.
-     A dataset consumer links only to the *nearest preceding* producer
-     of that name in corpus order — matching SAS sequential execution,
-     so two unrelated jobs that both reuse ``work.tmp`` stay separate.
-   - **weak** (macro_invocation, macro_var_flow, macro_arg_dataset):
-     recorded but not unioned during discovery.
-
-3. For MACRO_CALL chunks scan the parsed argument *values* for dataset
-   names (macro_arg_dataset edges, weak).
-4. Resolve weak edges at component granularity: a producer component
-   whose weak consumers all live in ONE other component is absorbed
-   into it; a producer whose weak consumers span TWO OR MORE components
-   is *globally affecting* — all such producers are collected into a
-   single global-context batch emitted FIRST (``is_global_context``).
-   This keeps one shared %LET or utility macro from fusing the whole
-   corpus into a single mega-batch.
-5. Optionally absorb OPTIONS/GLOBAL_STATEMENT/COMMENT_BLOCK chunks into
-   the component of the nearest following substantive chunk (skipping
-   members of the global-context component).
-6. Extract UF components → SasBatch (size ≥ 2) or singleton (size 1).
-   The global-context component becomes a batch even at size 1.
-7. Each batch derives external I/O by set-difference.
-
-Cross-file specifics
----------------------
-- Chunk indices are global: file 0 chunks are 0..n0-1, file 1 chunks are
-  n0..n0+n1-1, etc.  Union-Find runs over this flat index space.
-- Ordering inside a cross-file batch: chunks are sorted by
-  (file_rank, start_line) so producers always precede consumers.
-- SasBatch.source_files lists the distinct source_ids of member chunks.
-
-Logging
--------
-Logger: ``chunker.batcher``
-
-  Level    When emitted
-  -------  ---------------------------------------------------------------
-  DEBUG    Every edge (or skip); UF merges; component membership;
-           batch I/O derivation; context absorption
-  INFO     Start/finish; edge totals; per-batch summary; cross-file count
-  WARNING  Macro redefinition across files; unresolvable dependencies
+Logger name: ``chunker.batcher``.
 """
 
 from __future__ import annotations
@@ -129,11 +76,8 @@ class _UF:
 
 @dataclass
 class _Edge:
-    # dataset_flow | macro_body_dataset          (strong — union at discovery)
-    # macro_invocation | macro_var_flow | macro_arg_dataset  (weak — resolved
-    #                                            per-component afterwards)
-    # options_context | comment_context          (context absorption)
-    kind: str
+    kind: str  # strong: dataset_flow|macro_body_dataset; weak: macro_invocation|
+    # macro_var_flow|macro_arg_dataset; context: options_context|comment_context
     from_id: str  # chunk_id of producer/predecessor
     to_id: str  # chunk_id of consumer/successor
     via: str  # dataset name, %macro, or [context_reason]
@@ -146,18 +90,16 @@ class _Edge:
         return f"_Edge {self.from_id} -> {self.to_id} [{self.kind} via {self.via}]{scope}"
 
 
-# Locates the opening of a macro call's argument list: %macroname(
-# The balanced closing paren is found by _extract_call_arg_text below —
-# a regex cannot handle nesting like %clean(%str(a,b), out).
+# Locates the opening of a macro call's argument list: %macroname( . The
+# balanced closing paren is found by _extract_call_arg_text below.
 _CALL_OPEN_RE = re.compile(r"%\s*[A-Za-z_]\w*\s*\(")
 
-# A keyword argument is name= at the very start of the (stripped) argument,
-# so a positional value like f(x=1) is not mistaken for keyword 'f(x'.
+# A keyword argument is name= at the start of the (stripped) argument, so a
+# positional value like f(x=1) is not mistaken for keyword 'f(x'.
 _KW_ARG_RE = re.compile(r"([A-Za-z_]\w*)\s*=(.*)$", re.DOTALL)
 
-# A libref.member (or bare member) dataset token, used to scan a MACRO_CALL
-# chunk's argument text for names that match a producer.  Compiled once here
-# rather than passed as a string literal to re.findall on every MACRO_CALL.
+# A libref.member (or bare member) dataset token, for scanning a MACRO_CALL's
+# argument text against the producer index.
 _ARG_DS_TOKEN_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?")
 
 
@@ -277,18 +219,15 @@ def _file_of_map(file_offsets: list[int], n: int) -> list[int]:
 # Library handling
 # ---------------------------------------------------------------------------
 
-# Libraries SAS supplies without a LIBNAME statement (SAS Programmer's Guide:
-# Essentials, Ch. 11 "SAS Default Libraries" — Work/User/Sashelp/Sasuser; the
-# maps libraries ship with SAS/GRAPH installs).  Never a missing libref a
+# Libraries SAS supplies without a LIBNAME statement — never a missing libref a
 # batch needs to locate, so excluded from SasBatch.required_librefs.
 _DEFAULT_LIBREFS = frozenset(
     {"work", "user", "sashelp", "sasuser", "maps", "mapssas"}
 )
 
-# PROC steps that read the most recently created data set (_LAST_) when no
-# DATA= option is given (guide, Ch. 3 "Special Data Set Names").  Kept to
-# common, unambiguous data-consuming procedures — a PROC outside this set
-# with no DATA= simply gets no implicit input rather than a guessed edge.
+# PROC steps that read the most recently created dataset (_LAST_) when no DATA=
+# is given. Kept to common, unambiguous consumers; anything else gets no
+# implicit input rather than a guessed edge.
 _LAST_CONSUMING_PROCS = frozenset(
     {
         "chart",
@@ -309,10 +248,8 @@ _LAST_CONSUMING_PROCS = frozenset(
     }
 )
 
-# A bare ``set;`` statement (no dataset named) reads _LAST_.  Scanned on the
-# chunk's raw text — a "set;" inside a comment or string could in principle
-# false-positive, but the check only fires for DATA_STEP chunks that have no
-# recorded input at all, where a real SET statement would have been captured.
+# A bare ``set;`` statement (no dataset named) reads _LAST_. Only consulted for
+# DATA_STEP chunks that have no recorded input at all.
 _BARE_SET_RE = re.compile(r"\bset\s*;", re.IGNORECASE)
 
 
@@ -434,19 +371,16 @@ _CONTEXT_KINDS = _OPTION_KINDS | _COMMENT_KINDS
 # Edge tiers
 # ---------------------------------------------------------------------------
 
-# Strong edges represent confirmed data flow between two specific chunks and
-# union their components immediately during discovery.
+# Strong edges (confirmed data flow) union their components immediately.
 _STRONG_EDGE_KINDS = frozenset({"dataset_flow", "macro_body_dataset"})
 
-# Weak edges represent shared context (a macro definition, a macro variable,
-# a dataset name spotted in a call's argument text).  They are recorded but
-# only resolved after discovery, at component granularity, by
-# _resolve_weak_edges — so one widely-used %LET or utility macro cannot fuse
-# the whole corpus into a single batch.
+# Weak edges (shared context) are resolved after discovery at component
+# granularity by _resolve_weak_edges, so one widely-used %LET or utility macro
+# cannot fuse the whole corpus into a single batch.
 _WEAK_EDGE_KINDS = frozenset({"macro_invocation", "macro_var_flow", "macro_arg_dataset"})
 
-# Soft safety net: warn when a batch grows past this many chunks (there is
-# deliberately no hard cap — a genuine long pipeline is one batch).
+# Soft safety net: warn past this many chunks (no hard cap — a long pipeline is
+# legitimately one batch).
 _WARN_BATCH_CHUNKS = 50
 
 # Maximum edge descriptions included in SasBatch.reason before truncation.
@@ -490,12 +424,8 @@ def _build_flat_index(
     for fi, fr in enumerate(file_results):
         offsets.append(len(flat))
         for chunk in fr.chunks:
-            # Build a globally-unique ID: f<file_rank>-<original_id>
-            # e.g. "chunk-0003" in file 2 → "f2-chunk-0003"
             new_id = f"f{fi + 1}-{chunk.chunk_id}"
-            # model_copy avoids mutating the original chunk
             stamped = chunk.model_copy(update={"chunk_id": new_id})
-            # Also update parent_id if it references a sibling chunk
             if stamped.parent_id:
                 stamped = stamped.model_copy(
                     update={"parent_id": f"f{fi + 1}-{chunk.parent_id}"}
@@ -535,25 +465,17 @@ class _EdgeDiscovery:
     ) -> None:
         self.flat_chunks = flat_chunks
         self.uf = uf
-        # global_index → file_rank; used for the cross_file flag on edges.
-        # Computed once by the caller and shared across all passes.
-        self.file_of = file_of
+        self.file_of = file_of  # global_index → file_rank (cross_file edge flag)
         self.edges: list[_Edge] = []
 
         # ── producer indices (filled by _build_indices) ────────────────────
-        # dataset → list of global indices of chunks that write it
+        # dataset → global indices of chunks that write it
         self.produces_ds: dict[str, list[int]] = defaultdict(list)
         # macro name → global index of defining chunk (last definition wins)
         self.defines_macro: dict[str, int] = {}
-        # macro VARIABLE name → list of global indices of chunks that create
-        # it.  Two producer mechanisms feed this one index (ROADMAP Phase 2):
-        #   - DATA/PROC side effects: CALL SYMPUT/SYMPUTX or PROC SQL INTO
-        #     (``meta.produces_macrovars``).
-        #   - Macro-language declarations: ``%LET`` and ``%GLOBAL``/``%LOCAL``
-        #     lists (``meta.declared_macro_vars``).
-        # Both are treated identically: any chunk that reads ``&name`` links
-        # back to whichever chunk brought that name into existence,
-        # regardless of how it was created.
+        # macro variable name → global indices of chunks that create it, via
+        # SYMPUT/SQL-INTO side effects or %LET/%GLOBAL/%LOCAL declarations
+        # (both treated identically).
         self.produces_macrovar: dict[str, list[int]] = defaultdict(list)
 
     # ------------------------------------------------------------------
@@ -628,14 +550,9 @@ class _EdgeDiscovery:
                         f"index[macrovar]: chunk {chunk.chunk_id} (g{gidx}) creates &{mvar}"
                     )
 
-            # %LET / %GLOBAL / %LOCAL declarations also bring a macro variable
-            # into existence that downstream chunks may reference via &name.
-            # Register them in the same namespace as the SYMPUT/SQL-INTO
-            # producers above so that, e.g., "%let cutoff = 20240101;" links
-            # to a later "where dt >= &cutoff" step.  Guard against
-            # double-registering a name a chunk both declares and produces
-            # (which would emit a duplicate edge for the same
-            # producer/consumer pair).
+            # %LET / %GLOBAL / %LOCAL declarations register in the same
+            # namespace as the SYMPUT/SQL-INTO producers above. Guard against
+            # double-registering a name a chunk both declares and produces.
             for mvar in meta.declared_macro_vars:
                 if gidx not in self.produces_macrovar[mvar]:
                     self.produces_macrovar[mvar].append(gidx)
@@ -644,16 +561,9 @@ class _EdgeDiscovery:
                             f"index[macrovar-decl]: chunk {chunk.chunk_id} (g{gidx}) declares &{mvar}"
                         )
 
-            # ── Fix A: literal macro-body outputs ────────────────────────
-            # A %MACRO body may contain hard-coded dataset names, e.g.
-            #     %macro setup; data work.base; set mylib.raw; run; %mend;
-            # These datasets are produced whenever the macro is *invoked*,
-            # but for indexing purposes we register them as if the
-            # MACRO_DEFINITION chunk itself were the producer.  The
-            # macro_invocation edge (added in discover) already links every
-            # call site back to this chunk, so any consumer of 'work.base'
-            # transitively joins the same component as every call site of
-            # %setup.
+            # Literal macro-body outputs (hard-coded dataset names in a %MACRO
+            # body) are registered as if the MACRO_DEFINITION chunk itself were
+            # the producer; macro_invocation edges then link every call site in.
             if meta.body_literal_outputs:
                 for ds in meta.body_literal_outputs:
                     self.produces_ds[ds].append(gidx)
@@ -701,12 +611,9 @@ class _EdgeDiscovery:
     def _dataset_flow(
         self, cidx: int, chunk: SasChunk, meta: SasChunkMetadata
     ) -> None:
-        # A consumer links only to the NEAREST PRECEDING producer of the
-        # name in corpus order — the dataset state a sequential SAS session
-        # would actually read.  Producers appearing later in the corpus
-        # (including a chunk's own write of the dataset it reads) never
-        # link backwards, so independent jobs reusing a scratch name like
-        # work.tmp stay in separate components.
+        # A consumer links only to the nearest preceding producer in corpus
+        # order — the state a sequential SAS session would read — so independent
+        # jobs reusing a scratch name like work.tmp stay in separate components.
         for ds in meta.input_datasets:
             plist = self.produces_ds.get(ds)
             if not plist:
@@ -732,9 +639,8 @@ class _EdgeDiscovery:
     def _macrovar_flow(
         self, cidx: int, chunk: SasChunk, meta: SasChunkMetadata
     ) -> None:
-        # Mirrors dataset_flow exactly, but for the macro-variable
-        # namespace: a chunk that creates &cutoff via CALL SYMPUT/SYMPUTX
-        # or PROC SQL INTO links to any chunk that references &cutoff.
+        # Mirrors dataset_flow for the macro-variable namespace: a chunk that
+        # creates &cutoff links to any chunk that references &cutoff.
         for mvar in meta.consumes_macrovars:
             if mvar not in self.produces_macrovar:
                 if logger.isEnabledFor(logging.DEBUG):
@@ -777,18 +683,14 @@ class _EdgeDiscovery:
             )
 
     def _macro_arg_datasets(self, cidx: int, chunk: SasChunk) -> None:
-        # Scan only the parsed argument VALUES of the call (not the macro's
-        # own name or keyword parameter names, which the old whole-text scan
-        # matched), deduped so one dataset name yields at most one edge.
-        # Like dataset_flow, the call links to the nearest preceding
-        # producer of the name.
+        # Scan only the parsed argument values, deduped so one dataset name
+        # yields at most one edge; link to the nearest preceding producer.
         arg_pos, arg_kw = _parse_call_args(chunk.text)
         seen_arg_ds: set[str] = set()
         for val in (*arg_pos, *arg_kw.values()):
             for tok in _ARG_DS_TOKEN_RE.findall(val):
                 # Canonicalise so a bare one-level argument matches its
-                # work.-qualified producer (and vice versa) — the
-                # producer index keys are canonical.
+                # work.-qualified producer (index keys are canonical).
                 ds_norm = _canon_ds(tok.lower())
                 if ds_norm in seen_arg_ds:
                     continue
@@ -809,18 +711,12 @@ class _EdgeDiscovery:
     def _resolve_macro_body(
         self, cidx: int, chunk: SasChunk, meta: SasChunkMetadata
     ) -> None:
-        # (Fix B: parameterised resolution)
-        # The MACRO_CALL invokes a macro whose body references a dataset
-        # only through a parameter, e.g. "data &ds.;" inside %clean(ds).
-        # We resolve &ds. using the actual argument supplied at this call
-        # site, then treat the resolved name as if this call-site chunk
-        # itself produced/consumed that dataset — letting normal
-        # dataset_flow edges (computed for later chunks in the same walk,
-        # since produces_ds is mutated in place) link it to whatever reads
-        # that name AFTER this call site.  Under nearest-preceding-producer
-        # semantics this mid-walk registration is exactly right: the
-        # macro's output only exists once the call has executed, so only
-        # later chunks may consume it.
+        # Parameterised resolution: the call invokes a macro whose body
+        # references a dataset only through a parameter (e.g. "data &ds.;" in
+        # %clean(ds)). Resolve using the actual argument at this call site, then
+        # treat the resolved name as if this chunk produced/consumed it. Under
+        # nearest-preceding-producer semantics this mid-walk registration is
+        # correct: the output exists only once the call has executed.
         for mac in meta.invokes_macros:
             if mac not in self.defines_macro:
                 continue
@@ -847,10 +743,9 @@ class _EdgeDiscovery:
                 # keyword-only parameter
                 return kw_args.get(pname)
 
-            # Resolved values are canonicalised (one-level → work.) so
-            # they match the producer index; a value still containing an
-            # ``&`` reference is unresolvable at this site and is kept
-            # verbatim, matching nothing rather than a guessed name.
+            # Resolved values are canonicalised (one-level → work.) to match the
+            # producer index; a value still containing ``&`` is unresolvable and
+            # kept verbatim, matching nothing rather than a guessed name.
             resolved_outputs: list[str] = []
             for entry in def_meta.body_param_outputs:
                 val = _resolve(entry)
@@ -873,13 +768,10 @@ class _EdgeDiscovery:
                             f"macro_body_dataset: resolved param '{entry['param']}' → input '{val}'  (call {chunk.chunk_id})"
                         )
 
-            # Register this call site as a producer of its resolved
-            # outputs so later chunks (in any file) that read those
-            # names get linked via the normal dataset_flow pass.
-            # insort keeps the producer list sorted by global index —
-            # the invariant the nearest-preceding bisect lookups rely
-            # on (a plain append could land after a larger pass-1
-            # index and break bisection).
+            # Register this call site as a producer of its resolved outputs so
+            # later chunks get linked via the normal dataset_flow pass. insort
+            # (not append) keeps produces_ds sorted, the invariant the
+            # nearest-preceding bisect lookups rely on.
             for ds in resolved_outputs:
                 if cidx not in self.produces_ds[ds]:
                     insort(self.produces_ds[ds], cidx)
@@ -888,18 +780,11 @@ class _EdgeDiscovery:
                             f"index[ds-call-resolved]: chunk {chunk.chunk_id} (g{cidx}) resolved-produces '{ds}' via %{mac}"
                         )
 
-            # Persist resolved outputs/inputs back onto the chunk's own
-            # metadata (output_datasets / input_datasets) so that
-            # _make_batch — and any other downstream consumer — sees
-            # them through the normal metadata fields, with no special
-            # casing required.  This is what makes
-            # SasBatch.output_datasets correctly report 'work.first',
-            # 'work.second', etc. for resolved parameterised calls.
+            # Persist resolved outputs/inputs back onto the chunk's metadata so
+            # _make_batch and other consumers see them through the normal fields.
             if resolved_outputs or resolved_inputs:
-                # Insertion-order dedupe, NOT sorted():
-                # _resolve_implicit_datasets treats output_datasets[-1]
-                # as "the last dataset named" when tracking _LAST_, and
-                # sorting would silently break that convention.
+                # Insertion-order dedupe, NOT sorted(): _resolve_implicit_datasets
+                # treats output_datasets[-1] as "the last dataset named".
                 new_out = list(
                     dict.fromkeys(
                         [*chunk.metadata.output_datasets, *resolved_outputs]
@@ -921,9 +806,8 @@ class _EdgeDiscovery:
                         f"macro_body_dataset: chunk {chunk.chunk_id} metadata updated  output_datasets={new_out}  input_datasets={new_in}"
                     )
 
-            # Link this call site to the nearest preceding producer of
-            # each resolved input (covers the case where the macro reads
-            # a dataset whose actual name is only known at this site).
+            # Link this call site to the nearest preceding producer of each
+            # resolved input (whose actual name is only known at this site).
             for ds in resolved_inputs:
                 plist = self.produces_ds.get(ds)
                 preceding = None
@@ -1151,15 +1035,11 @@ def _make_batch(
         intra_outputs.update(c.metadata.output_datasets)
         intra_macros.update(c.metadata.defines_macros)
         intra_macrovars.update(c.metadata.produces_macrovars)
-        # %LET / %GLOBAL / %LOCAL declarations create macro variables too, so
-        # a name declared inside this batch is satisfied intra-batch and must
-        # not be reported as an external requirement (mirrors the producer
-        # index in _discover_edges).
+        # %LET / %GLOBAL / %LOCAL declarations also satisfy a name intra-batch
+        # (mirrors the producer index in _discover_edges).
         intra_macrovars.update(c.metadata.declared_macro_vars)
-        # A %MACRO definition's literal body outputs are produced whenever
-        # the macro is invoked.  If any call site is also in this batch
-        # (the usual case, since macro_invocation edges put them together),
-        # report the literal body output as a batch-level output too.
+        # A %MACRO definition's literal body outputs count as batch outputs when
+        # a call site is also in this batch (usually the case).
         if c.kind == SasChunkKind.MACRO_DEFINITION:
             intra_outputs.update(c.metadata.body_literal_outputs)
 
@@ -1181,9 +1061,8 @@ def _make_batch(
     # ── external macro requirements ────────────────────────────────────────
     ext_macros: list[str] = []
     seen_em: set[str] = set()
-    # Standard, SAS-provided autocall macros (ROADMAP Phase 5, F2b) — never
-    # a missing dependency the user needs to locate, so excluded from
-    # ext_macros, but still tracked separately rather than silently dropped.
+    # Standard SAS-provided autocall macros — never a missing dependency, so
+    # excluded from ext_macros but still tracked separately.
     standard_autocall: list[str] = []
     seen_sa: set[str] = set()
     for c in member_chunks:
@@ -1206,10 +1085,8 @@ def _make_batch(
                     logger.debug(f"_make_batch {bid}: ext macro '%{mac}'")
 
     # ── external libref requirements ────────────────────────────────────────
-    # Librefs referenced by this batch's dataset I/O but not assigned by a
-    # LIBNAME statement inside it, excluding the SAS-supplied default
-    # libraries.  Dataset names are canonical (one-level → work.) by the time
-    # they reach here, so the libref part of every two-level name is exact.
+    # Librefs used by this batch's dataset I/O but not assigned inside it,
+    # excluding the SAS-supplied default libraries.
     defined_librefs: set[str] = set()
     used_librefs: set[str] = set()
     for c in member_chunks:
@@ -1242,9 +1119,7 @@ def _make_batch(
                     logger.debug(f"_make_batch {bid}: ext macrovar '&{mvar}'")
 
     # ── reason string ──────────────────────────────────────────────────────
-    # Group this component's edges by (from, to) pair, preserving the global
-    # discovery order in which each pair is first seen — identical to the old
-    # global edges_by_pair iteration restricted to this component.
+    # Group this component's edges by (from, to) pair, in discovery order.
     edges_by_pair: dict[tuple[int, int], list[_Edge]] = defaultdict(list)
     for e in component_edges:
         edges_by_pair[(e.from_global_idx, e.to_global_idx)].append(e)
@@ -1317,10 +1192,8 @@ def _extract_result(
     n = len(flat_chunks)
     components = uf.components(n)
 
-    # Group edges by their component root.  Strong edges union their
-    # endpoints, so both sides share a root; weak edges may span components,
-    # in which case keying on the from-endpoint buckets them with their
-    # producer (for a global producer: the global-context batch).
+    # Group edges by component root, keyed on the from-endpoint so a weak edge
+    # that spans components buckets with its producer.
     edges_by_component: dict[int, list[_Edge]] = defaultdict(list)
     for e in edges:
         edges_by_component[uf.find(e.from_global_idx)].append(e)

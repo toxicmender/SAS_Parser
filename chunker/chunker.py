@@ -1,58 +1,7 @@
-"""
-chunker.py — dependency-light semantic chunker for Base SAS source files.
+"""Dependency-light semantic chunker for Base SAS source files (scan → group →
+build chunks). See chunker/README.md.
 
-Recognised constructs (Base SAS Programming Reference)
--------------------------------------------------------
-DATA step, PROC step, %MACRO/%MEND, %INCLUDE, LIBNAME/FILENAME/TITLE/FOOTNOTE,
-OPTIONS, ODS, FORMAT/INFORMAT standalone, %LET/%PUT/%GLOBAL/%LOCAL, %macro_call.
-
-All imports are stdlib + pydantic (via local models.py).  This module is the
-orchestrator; its supporting layers live beside it in the package:
-
-  keywords.py — SAS keyword catalogues + the patterns compiled from them
-  scanner.py  — _Unit/_Region parse primitives, statement classifier,
-                sanitiser, and the deadline/watchdog machinery
-  metadata.py — per-chunk SasChunkMetadata extraction (_metadata_for,
-                _io_for, _macro_body_io, _merge_meta, ...)
-
-Key design rule — block collection
------------------------------------
-FORMAT, LABEL, OPTIONS, LIBNAME, ODS, and other statement keywords that appear
-*inside* a DATA or PROC block body are legal SAS statements within that block
-and must NOT terminate the block early.  Only a new DATA, PROC, or %MACRO
-header, or an explicit RUN/QUIT, closes the current block.
-
-Stuck-parser protection
-------------------------
-Two independent safeguards keep a pathological input from hanging the parser
-forever (see ``SasSemanticChunker(timeout=...)``; both classes live in
-scanner.py):
-
-  * A wall-clock **deadline** is checked at statement/region boundaries in the
-    scan and grouping loops.  When it is exceeded the parser stops at the next
-    boundary, logs where it stopped, emits a ``PARSER_TIMEOUT`` diagnostic and
-    returns the *partial* result collected so far — a graceful exit rather than
-    an unbounded spin on, say, a multi-megabyte generated file.
-  * A background **watchdog** thread logs an escalating trail (WARNING → ERROR)
-    naming the phase and elapsed time whenever a parse overruns the timeout.
-    This is the only safeguard that fires when the parser is wedged inside a
-    single un-interruptible C-level regex call (catastrophic backtracking on
-    hostile source): pure-Python code cannot preempt that call, but the
-    watchdog still guarantees the stuck phase is named in the logs, so the hang
-    is diagnosable even if the process must ultimately be killed.
-
-Logging
--------
-Logger: ``chunker.chunker`` (the scanner and metadata layers log under
-``chunker.scanner`` / ``chunker.metadata``)
-
-  Level    When emitted
-  -------  ---------------------------------------------------------------
-  DEBUG    Per-unit / per-region decisions (very verbose; off in prod)
-  INFO     File-level start/finish, oversized-split decisions, elapsed time
-  WARNING  Unclosed blocks, unterminated statements, unrecognised regions
-  ERROR    File-not-found (logged then re-raised); parse-deadline exceeded
-           (partial result returned)
+Logger name: ``chunker.chunker``.
 """
 
 from __future__ import annotations
@@ -220,9 +169,8 @@ class SasSemanticChunker:
             watchdog.set_phase("chunk building")
             chunks: list[SasChunk] = []
             for region in regions:
-                # Deadline check between regions: a graceful exit here keeps the
-                # chunks already built (each region is self-contained) and stops
-                # before spending more of the budget on the remaining regions.
+                # Deadline check between regions: graceful exit keeps the chunks
+                # already built and stops before spending more of the budget.
                 if deadline.expired():
                     _record_parser_timeout(
                         diagnostics, line_starts, "chunk building", region.start
@@ -272,9 +220,7 @@ class SasSemanticChunker:
 
         while index < len(source):
             # Deadline check, gated behind a tick counter so perf_counter() is
-            # sampled ~once per 8192 iterations, not on every character (this is
-            # the module's hottest loop).  On expiry: keep the units gathered so
-            # far and return them for grouping — a graceful, partial exit.
+            # sampled ~once per 8192 iterations (this is the hottest loop).
             ticks += 1
             if (ticks & 0x1FFF) == 0 and deadline.expired():
                 _record_parser_timeout(diagnostics, line_starts, "scan", index)
@@ -446,9 +392,8 @@ class SasSemanticChunker:
             unknown.clear()
 
         while index < len(units):
-            # Deadline check (tick-gated, as in _scan_units).  On expiry, flush
-            # any pending unknown run and return the regions built so far so the
-            # chunk-building phase still gets a well-formed, if partial, list.
+            # Deadline check (tick-gated, as in _scan_units); on expiry flush any
+            # pending unknown run and return the regions built so far.
             ticks += 1
             if (ticks & 0x0FFF) == 0 and deadline.expired():
                 _record_parser_timeout(
@@ -580,31 +525,25 @@ class SasSemanticChunker:
             logger.debug(f"_collect_block: {kind.value}  start_unit={start}")
         block: list[_Unit] = []
         index = start
-        # Nesting depth of *inner* %MACRO definitions currently open inside this
-        # macro body.  Only meaningful when kind is MACRO_DEFINITION; each inner
-        # %MACRO header increments it and each %MEND decrements it, so the block
-        # closes on the %MEND that brings the depth back below zero — i.e. the
-        # one matching this macro's own header.
+        # Nesting depth of inner %MACRO definitions open inside this macro body
+        # (MACRO_DEFINITION only): the block closes on the %MEND matching this
+        # macro's own header.
         macro_depth = 0
 
         while index < len(units):
             unit = units[index]
 
-            # Comments inside a block are just collected — they don't close it
             if unit.is_comment:
                 block.append(unit)
                 index += 1
                 continue
 
-            # Normalise once and reuse for both classification and the
-            # %MEND / RUN / QUIT terminator checks below.
+            # Normalise once, reused for classification and the terminator checks.
             lowered = _norm(unit.text)
             cls = _classify_normed(lowered)
 
-            # ── only DATA/PROC openers close a DATA/PROC block (implicit).
-            # A %MACRO block is closed *only* by %MEND, so DATA and PROC
-            # steps that appear inside a macro body are collected, not
-            # treated as block boundaries.
+            # Only DATA/PROC openers implicitly close a DATA/PROC block; a %MACRO
+            # block is closed only by %MEND, so nested steps are collected.
             implicit_close = (
                 cls in _BLOCK_OPENERS
                 and block
@@ -617,10 +556,8 @@ class SasSemanticChunker:
                     )
                 return block, index, True
 
-            # A nested %MACRO header inside our macro body opens an inner
-            # definition that must be balanced by its own %MEND before ours can
-            # close us.  The first unit (index == start) is *our* header, not a
-            # nested one, so it never bumps the depth.
+            # A nested %MACRO header must be balanced by its own %MEND before
+            # ours can close. index == start is our own header, not a nested one.
             if (
                 kind == SasChunkKind.MACRO_DEFINITION
                 and cls == SasChunkKind.MACRO_DEFINITION
@@ -708,13 +645,10 @@ class SasSemanticChunker:
         parent_id = parent_chunk.chunk_id
         current: list[_Unit] = []
         # Running word count of the joined `current` text, maintained
-        # incrementally so the split loop stays O(units) instead of re-joining
-        # and re-splitting the whole accumulated text on every unit.  When two
-        # units abut without whitespace (former ends non-space, latter starts
-        # non-space) their touching tokens merge into one, so joining adds
-        # `_wc(unit.text)` minus one for that merge — mirroring exactly what
-        # `_wc("".join(...))` would count.  `cur_tail_nonws` tracks whether the
-        # joined text currently ends in a non-space character.
+        # incrementally so the split loop stays O(units). When two units abut
+        # without whitespace their touching tokens merge into one, so joining
+        # adds `_wc(unit.text)` minus one; `cur_tail_nonws` tracks whether the
+        # joined text ends in a non-space character.
         cur_wc = 0
         cur_tail_nonws = False
 
@@ -842,9 +776,6 @@ class SasSemanticChunker:
 
 
 def _wc(text: str) -> int:
-    # str.split() with no argument splits on runs of whitespace and drops empty
-    # fields, so its length equals the number of ``\S+`` runs — identical to the
-    # previous ``len(re.findall(r"\S+", text))`` but without the regex overhead.
     return len(text.split())
 
 

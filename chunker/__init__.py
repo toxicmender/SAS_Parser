@@ -1,37 +1,4 @@
-"""
-chunker — SAS semantic chunker, dependency batcher, and LangChain pipeline.
-
-Single-file workflow
---------------------
-    from chunker import SasSemanticChunker, SasChunkBatcher
-
-    chunker = SasSemanticChunker()
-    result  = chunker.chunk_file("program.sas")
-
-    batcher = SasChunkBatcher()
-    batches = batcher.batch(result)
-
-Multi-file workflow
--------------------
-    from chunker import SasSemanticChunker, SasCorpus
-    from chunker.batcher import MultiFileBatcher
-
-    chunker = SasSemanticChunker()
-    corpus  = SasCorpus(file_results=[
-        chunker.chunk_file("macros.sas"),
-        chunker.chunk_file("etl.sas"),
-        chunker.chunk_file("reports.sas"),
-    ])
-    result = MultiFileBatcher().batch(corpus)
-
-    # Or use the convenience factory:
-    corpus, result = MultiFileBatcher.from_files([
-        "macros.sas", "etl.sas", "reports.sas",
-    ])
-
-    for item in result.all_ordered_items:
-        ...  # SasBatch or SasChunk, cross-file batches included
-"""
+"""SAS semantic chunker, dependency batcher, and LangChain pipeline. See chunker/README.md."""
 
 from .batcher import MultiFileBatcher, SasChunkBatcher
 from .chunker import SasSemanticChunker

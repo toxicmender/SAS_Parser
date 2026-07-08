@@ -1,19 +1,7 @@
-"""
-scanner.py — lexical layer of the SAS chunker.
+"""Lexical layer of the SAS chunker: parse primitives, statement classifier,
+sanitiser, and the deadline/watchdog machinery. See chunker/README.md.
 
-Statement-level parse primitives shared by SasSemanticChunker
-(chunker.py) and the metadata extractors (metadata.py):
-
-- _Unit / _Region — the scanner's intermediate representations
-- _Deadline / _ParseWatchdog / _record_parser_timeout — stuck-parser
-  protection (the design rationale lives in chunker.py's docstring)
-- _classify / _classify_normed and the _CLS_* statement classifiers
-- _norm / _sanitise / _blank_span and the line-offset helpers
-
-Logging
--------
-Logger: ``chunker.scanner`` — WARNING/ERROR for the watchdog's
-"parse appears stuck" trail and the recorded parse-deadline timeout.
+Logger name: ``chunker.scanner``.
 """
 
 from __future__ import annotations
@@ -46,8 +34,6 @@ class _Unit:
     unclosed_comment: bool = False
 
     def __str__(self) -> str:
-        # start/end are character offsets into the source; show a short
-        # single-line preview rather than the full (possibly long) text.
         preview = " ".join(self.text.split())
         if len(preview) > 60:
             preview = preview[:57] + "..."
@@ -81,22 +67,12 @@ class _Region:
 
     @cached_property
     def text(self) -> str:
-        # Cached: a region's units are fixed at construction, and `.text` is
-        # read several times per region (word count, metadata, chunk build).
         # cached_property writes through the instance __dict__, which a frozen
         # (but unslotted) dataclass still allows.
         return "".join(u.text for u in self.units)
 
 
-# ---------------------------------------------------------------------------
-# Stuck-parser protection — deadline + watchdog
-#
-# See the module docstring's "Stuck-parser protection" section for the split
-# of responsibilities: the deadline gives a *graceful partial exit* from the
-# Python-level scan/group loops, while the watchdog guarantees a *log trail*
-# for the one case the deadline cannot cover (a hang inside a single
-# un-interruptible C-level regex call).
-# ---------------------------------------------------------------------------
+# Stuck-parser protection — deadline + watchdog (see chunker/README.md).
 
 
 class _Deadline:
@@ -211,15 +187,9 @@ def _record_parser_timeout(
     )
 
 
-# ---------------------------------------------------------------------------
-# Block-boundary classifier
-#
-# IMPORTANT: only these three kinds open a new top-level block and therefore
-# close whichever block is currently being collected.  Everything else
-# (FORMAT, OPTIONS, GLOBAL_STATEMENT, etc.) is a *statement inside* the
-# current block and must be collected, not treated as a boundary.
-# ---------------------------------------------------------------------------
-
+# Block-boundary classifier. Only these three kinds open a new top-level block
+# and close the block currently being collected; everything else is a statement
+# inside the current block.
 _BLOCK_OPENERS = frozenset(
     {
         SasChunkKind.DATA_STEP,
@@ -228,12 +198,8 @@ _BLOCK_OPENERS = frozenset(
     }
 )
 
-# Precompiled statement-classifier patterns.  ``_classify`` runs once per unit
-# (tens of thousands of times on a large file), so these are compiled once here
-# rather than re-parsed from string literals on every call — which otherwise
-# dominates via ``re``'s per-call pattern-cache lookup.  ``_norm`` lower-cases
-# its result, so the classifier input is always lowercase and no IGNORECASE flag
-# is needed (matching a lowercase literal without the flag is faster still).
+# Precompiled statement-classifier patterns (``_classify`` runs once per unit).
+# Input is always ``_norm``'d (lowercase), so no IGNORECASE flag is needed.
 _CLS_DATA_RE = re.compile(r"data\b")
 _CLS_PROC_RE = re.compile(r"proc\b")
 _CLS_MACRO_RE = re.compile(r"%\s*macro\b")
@@ -289,14 +255,8 @@ def _classify_normed(n: str) -> SasChunkKind | None:
         return SasChunkKind.MACRO_CONTROL_FLOW
     if _CLS_MACROCALL_RE.match(n):
         return SasChunkKind.MACRO_CALL
-    # A bare RUN;/QUIT; reached here (rather than inside _collect_block) is a
-    # standalone step boundary in open code — e.g. a stray RUN; after a
-    # global LIBNAME/TITLE statement.  Recognise it so it doesn't fall
-    # through to UNKNOWN_STATEMENT_GROUP and raise a spurious
-    # UNRECOGNIZED_SOURCE_REGION diagnostic.  RUN CANCEL; is included via the
-    # trailing \b (the optional CANCEL keyword follows).  Inside a DATA/PROC
-    # block this same statement still terminates the block (handled directly
-    # in _collect_block) and never reaches open code.
+    # A bare RUN;/QUIT; here is a standalone open-code step boundary (inside a
+    # DATA/PROC block it is handled by _collect_block and never reaches here).
     if _CLS_STEP_RE.match(n):
         return SasChunkKind.STEP_BOUNDARY
     if _CLS_OPTIONS_RE.match(n):
@@ -316,8 +276,6 @@ def _classify_normed(n: str) -> SasChunkKind | None:
 
 
 def _line_starts(source: str) -> list[int]:
-    # Walk newline to newline with str.find (a C-level scan) rather than a
-    # per-character Python loop; each match yields the start of the next line.
     starts = [0]
     pos = source.find("\n")
     while pos != -1:
@@ -350,26 +308,19 @@ def _norm(text: str) -> str:
     return s[:-1].strip().lower() if s.endswith(";") else s.lower()
 
 
-# A block comment (terminated ``/* … */`` or unterminated ``/* …`` to EOF) or a
-# quoted string literal (single/double, with the doubled-quote ``''``/``""``
-# escape and a possibly-unterminated tail).  The three alternatives start with
-# distinct characters, so at any position at most one can match, and ``re``'s
-# left-to-right scan reproduces the original hand-written scanner's "first
-# delimiter encountered wins" precedence (a quote inside a comment, or ``/*``
-# inside a string, is swallowed by whichever region opened first).
+# A block comment or a quoted string literal (single/double, doubled-quote
+# escape, possibly-unterminated tail). The three alternatives start with
+# distinct characters, so ``re``'s left-to-right scan gives "first delimiter
+# encountered wins" precedence.
 _COMMENT_OR_STRING_RE = re.compile(
     r"/\*.*?(?:\*/|\Z)"
     r"|'(?:''|[^'])*(?:'|\Z)"
     r'|"(?:""|[^"])*(?:"|\Z)',
     re.DOTALL,
 )
-# Comment-only variant used when blank_strings=False: string literals are left
-# completely intact and a ``/*`` is a comment even inside apparent quotes,
-# matching the original loop's behaviour in that mode.
+# Comment-only variant (blank_strings=False): string literals stay intact.
 _COMMENT_ONLY_RE = re.compile(r"/\*.*?(?:\*/|\Z)", re.DOTALL)
-# Every non-newline character; used to blank a span to spaces while preserving
-# line breaks.  CR is normalised to LF afterwards, exactly as the original loop
-# mapped both ``\r`` and ``\n`` to ``\n``.
+# Every non-newline character; blanks a span to spaces while preserving breaks.
 _NON_NEWLINE_RE = re.compile(r"[^\r\n]")
 
 
@@ -385,12 +336,9 @@ def _sanitise_repl(m: re.Match[str]) -> str:
     if q == "/":
         # block comment — delimiters included, blanked wholesale
         return _blank_span(s)
-    # Quoted string — keep the delimiters, blank only the interior.  The span
-    # is terminated (a real closing delimiter is present) iff it holds an even
-    # number of the quote char: opener (1) + doubled-quote escapes (2 each) +
-    # closer (1).  An odd count means the trailing quote is the second half of
-    # a ``''`` escape and the literal actually runs to EOF unterminated — in
-    # which case only the opening delimiter is kept.
+    # Quoted string — keep the delimiters, blank the interior. An even count of
+    # the quote char means it is terminated (opener + 2/escape + closer); an odd
+    # count means it runs unterminated to EOF, so keep only the opener.
     if s.count(q) % 2 == 0:
         return q + _blank_span(s[1:-1]) + q
     return q + _blank_span(s[1:])

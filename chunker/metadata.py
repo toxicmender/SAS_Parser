@@ -1,23 +1,9 @@
-"""
-metadata.py — per-chunk semantic metadata extraction for the SAS chunker.
+"""Per-chunk semantic metadata extraction for the SAS chunker. See chunker/README.md.
 
-Everything that turns a chunk's raw text into SasChunkMetadata:
+All scans run on sanitised text from scanner._sanitise; keyword-derived patterns
+come from keywords.py.
 
-- _metadata_for / _merge_meta / _title — called by chunker.py per region
-  (and per oversized-split child)
-- _io_for — directed dataset I/O and macro define/invoke edges
-- _macro_body_io — literal vs parameterised macro-body dataset refs
-- _extract_symput / _extract_sql_into_vars / _extract_call_execute_macros
-  — macro-variable producers and CALL EXECUTE invocations
-- the extraction regex catalogue (dataset positions, SQL clauses, quoted
-  physical paths, %LET/%GLOBAL/%LOCAL forms, ...)
-
-All scans run on sanitised text from scanner._sanitise; keyword-derived
-patterns come from keywords.py.
-
-Logging
--------
-Logger: ``chunker.metadata`` — DEBUG only (per-macro body-IO decisions).
+Logger name: ``chunker.metadata``.
 """
 
 from __future__ import annotations
@@ -50,21 +36,16 @@ _DATA_OPT_RE = re.compile(
     r"\bdata\s*=\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
     re.IGNORECASE,
 )
-# The libref a LIBNAME statement assigns: ``libname <ref> ...``.  Also matches
-# the deassignment form ``libname <ref> clear;`` — static extraction is
-# positional, not temporal, so a cleared libref is still reported as defined
-# (documented on SasChunkMetadata.defines_librefs).  ``libname _all_ clear|list``
+# The libref a LIBNAME statement assigns (``libname <ref> ...``). Extraction is
+# positional, not temporal, so ``libname x clear;`` still reports x. ``_all_``
 # targets every assigned libref rather than naming one; the caller drops it.
 _LIBNAME_REF_RE = re.compile(r"\blibname\s+([A-Za-z_]\w*)", re.IGNORECASE)
 _MACRO_DEF_RE = re.compile(r"%\s*macro\s+([A-Za-z_]\w*)", re.IGNORECASE)
 
 
-# INPUT/PUT *statement* grouped-list form — ``input (var-list) (informat-list)``
-# / ``put (var-list) (format-list)``.  The keyword directly followed by two
-# back-to-back parenthesised groups is never valid function-call syntax (a
-# call's argument list is a single group), so the keyword can be blanked ahead
-# of the function scan without touching genuine INPUT()/PUT() calls — including
-# SQL's ``case when ... then put(x, fmt.)``, whose single group never matches.
+# INPUT/PUT *statement* grouped-list form — the keyword followed by two
+# back-to-back parenthesised groups, never valid function-call syntax, so it can
+# be blanked ahead of the function scan without touching real INPUT()/PUT() calls.
 _GROUPED_INPUT_PUT_STMT_RE = re.compile(
     r"\b(?:input|put)\b(?=\s*\([^()]*\)\s*\()",
     re.IGNORECASE,
@@ -98,49 +79,36 @@ def _nid(value: str) -> str:
     return value.lower()
 
 
-# Identifies which of %let/%global/%local/%put begins a GLOBAL_STATEMENT
-# chunk.  Matched against the *start* of the chunk's sanitised text — by
-# construction (see _classify), any chunk already classified as
-# GLOBAL_STATEMENT via this same keyword set begins with exactly one of
-# these four, so a leading match is always unambiguous.
+# Which of %let/%global/%local/%put begins a GLOBAL_STATEMENT chunk, matched
+# against the start of its sanitised text.
 _MACRO_VAR_OP_RE = re.compile(r"%\s*(let|global|local|put)\b", re.IGNORECASE)
 
-# Leading statement keyword of a GLOBAL_STATEMENT chunk.  Matched against the
-# start of the chunk's sanitised text; by construction (see _classify) a
-# GLOBAL_STATEMENT always begins with one of these.  ``title``/``footnote``
-# capture without their optional occurrence digit (title2 -> title), which
-# the caller lower-cases.
+# Leading statement keyword of a GLOBAL_STATEMENT chunk. ``title``/``footnote``
+# capture without their optional occurrence digit (title2 -> title).
 _GLOBAL_STMT_KW_RE = re.compile(
     r"%?\s*(let|put|global|local|libname|filename|title|footnote|ods)\b",
     re.IGNORECASE,
 )
 
-# ``%LET name`` target — the single macro variable a %LET declares.  The
-# optional leading ``&`` covers indirect (double-ampersand-resolved) targets
-# such as ``%let &&prefix&i = ...`` where the outer name is still literal.
+# ``%LET name`` target. The optional leading ``&`` covers indirect
+# (double-ampersand-resolved) targets whose outer name is still literal.
 _LET_TARGET_RE = re.compile(r"%\s*let\s+&*([A-Za-z_]\w*)", re.IGNORECASE)
 
-# ``%GLOBAL``/``%LOCAL`` declaration list — captures everything up to the
-# terminating semicolon; the caller splits the list on whitespace/commas.
+# ``%GLOBAL``/``%LOCAL`` declaration list up to the terminating semicolon; the
+# caller splits on whitespace/commas.
 _GLOBAL_LOCAL_DECL_RE = re.compile(
     r"%\s*(?:global|local)\s+([^;]+?)\s*;",
     re.IGNORECASE,
 )
 
-# Identifies which control-flow keyword begins a MACRO_CONTROL_FLOW chunk
-# (ROADMAP Phase 3).  Mirrors _MACRO_VAR_OP_RE exactly — matched against
-# the start of the chunk's sanitised text, which by construction (see
-# _classify) always begins with exactly one of these seven keywords for
-# any chunk already classified as MACRO_CONTROL_FLOW.
+# Which control-flow keyword begins a MACRO_CONTROL_FLOW chunk, matched against
+# the start of its sanitised text (mirrors _MACRO_VAR_OP_RE).
 _CONTROL_FLOW_OP_RE = re.compile(
     r"%\s*(if|else|do|end|return|goto|abort)\b",
     re.IGNORECASE,
 )
 
-# Shared, precompiled token/paren helpers reused across the metadata extractors
-# below.  Compiling them once here (rather than passing string literals to
-# re.sub / re.findall on every call) removes the dominant per-call pattern-cache
-# lookup from these hot loops.
+# Shared precompiled token/paren helpers reused across the extractors below.
 _PAREN_RE = re.compile(r"\([^)]*\)")  # a balanced-free "(...)" span to blank out
 _DS_TOKEN_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?")  # libref.member token
 _AMP_TOKEN_RE = re.compile(r"[A-Za-z_&][\w.&]*")  # dataset token that may hold &refs
@@ -150,22 +118,13 @@ _DATA_HDR_STRIP_RE = re.compile(r"^\s*data\s+", re.IGNORECASE)  # drop DATA keyw
 _NUM_SUFFIX_RE = re.compile(r"^([A-Za-z_]+?)(\d+)$")  # split trailing integer
 
 # Any "&name" or "&name." reference — the single stored scan feeding
-# SasChunkMetadata.referenced_macro_vars.  Deliberately broad (matches every
-# macro-variable reference, not just &sys*): the automatic-variable and
-# consumer views are derived from the stored set by computed fields on the
-# model (see models._is_automatic_macro_var).
+# SasChunkMetadata.referenced_macro_vars (the automatic-variable and consumer
+# views are computed from it).
 _VAR_REF_RE = re.compile(r"&(\w+)\.?")
 
 
-# ---------------------------------------------------------------------------
-# Macro-variable producer/consumer extraction (ROADMAP Phase 2)
-#
-# Three SAS constructs create a macro variable as a side effect rather than
-# via %LET — CALL SYMPUT/SYMPUTX inside a DATA step, and PROC SQL's INTO
-# clause.  This section extracts statically-resolvable variable names from
-# each, and separately detects the CALL SYMPUT/SYMPUTX local-scope hazard
-# documented in SAS Macro Language: Reference, Ch. 5.
-# ---------------------------------------------------------------------------
+# Macro-variable producer/consumer extraction: CALL SYMPUT/SYMPUTX and PROC SQL
+# INTO create a macro variable as a side effect rather than via %LET.
 
 
 def _split_top_level(s: str, sep: str = ",") -> list[str]:
@@ -234,15 +193,9 @@ _CALL_EXECUTE_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-# Detects %LOCAL anywhere in a macro body (used by the scope-hazard check;
-# a %LOCAL declaration makes the local symbol table non-empty exactly like
-# a declared parameter does).
+# Detects %LOCAL anywhere in a macro body (scope-hazard check: a %LOCAL makes
+# the local symbol table non-empty, like a declared parameter).
 _LOCAL_STMT_RE = re.compile(r"%\s*local\b", re.IGNORECASE)
-
-# A %name pattern inside a CALL EXECUTE string argument's contents is detected
-# with the same reserved-word-excluding matcher as every other macro-call site
-# (_MACRO_CALL_RE) — the pattern is identical, so it is reused directly rather
-# than compiled a second time.
 
 
 def _extract_symput(
@@ -292,10 +245,8 @@ def _extract_symput(
     return produced, any_unresolved, explicit_global
 
 
-# Captures a %GOTO statement's label.  Per Ch. 5, a *computed* %GOTO is one
-# whose label contains "&" or "%" (e.g. %goto &home;) -- this is one of the
-# three documented conditions that forces CALL SYMPUT/SYMPUTX into local
-# scope even when the symbol table would otherwise be empty.
+# Captures a %GOTO statement's label. A *computed* %GOTO (label contains "&" or
+# "%") forces CALL SYMPUT/SYMPUTX into local scope (Ch. 5).
 _GOTO_LABEL_RE = re.compile(r"%\s*goto\s+([^;]+?)\s*;", re.IGNORECASE)
 
 # Detects a bare %ABORT statement anywhere in a macro body.
@@ -434,13 +385,9 @@ def _extract_sql_into_vars(text: str) -> list[str]:
 def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
     cf = _sanitise(text, blank_strings=False)
     mt = _sanitise(text)
-    # Dataset names collected from *dataset positions only* — the DATA/SET/
-    # MERGE/UPDATE/MODIFY keywords, DATA=/OUT=/OUTDATA= options, and PROC SQL
-    # CREATE/FROM/JOIN/INSERT clauses.  An earlier blanket ``word.word`` scan
-    # also swept up PROC SQL table aliases (``l.id`` → libref ``l``) and
-    # BY-group temporaries (``first.grp`` → libref ``first``); restricting the
-    # scan to dataset context removes those false positives from both
-    # ``referenced_datasets`` and ``referenced_librefs``.
+    # Dataset names collected from dataset positions only (DATA/SET/MERGE/UPDATE/
+    # MODIFY keywords, DATA=/OUT=/OUTDATA= options, PROC SQL clauses) so table
+    # aliases and BY-group temporaries aren't mistaken for datasets/librefs.
     datasets = [_nid(m.group(1)) for m in _DATASET_RE.finditer(mt)]
     datasets += [_nid(m.group(1)) for m in _DATA_OPT_RE.finditer(mt)]
     datasets += [_nid(m.group(1)) for m in _SQL_CREATE_RE.finditer(mt)]
@@ -448,21 +395,17 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
     datasets += [_nid(m.group(1)) for m in _SQL_JOIN_RE.finditer(mt)]
     datasets += [_nid(m.group(1)) for m in _SQL_INTO_RE.finditer(mt)]
     datasets += [_nid(m.group(1) or m.group(2)) for m in _PROC_OUT_RE.finditer(mt)]
-    # The directed I/O extraction parses the *full* dataset lists (a DATA
-    # header or SET/MERGE statement may name several datasets; _DATASET_RE
-    # above captures only the first), so its canonical names complete
-    # ``referenced_datasets``.  One-level names therefore appear here in
-    # their canonical ``work.``-qualified spelling.
+    # Directed I/O parses the full dataset lists (_DATASET_RE above captures only
+    # the first of a multi-dataset statement), so its canonical names complete
+    # referenced_datasets in their work.-qualified spelling.
     inp, out, defs, invk = _io_for(text, kind, mt, cf)
     dataset_set = set(datasets) | set(inp) | set(out)
-    # Librefs this chunk assigns (``libname ref ...``); ``_all_`` targets every
-    # assigned libref (``libname _all_ clear|list;``) rather than naming one.
+    # Librefs this chunk assigns; ``_all_`` targets every assigned libref.
     defines_librefs = sorted(
         {_nid(m.group(1)) for m in _LIBNAME_REF_RE.finditer(mt)} - {"_all_"}
     )
-    # Referenced librefs: the libref part of every two-level dataset-context
-    # name, plus any libref assigned here.  Quoted physical-path references
-    # address a file directly and carry no libref.
+    # Referenced librefs: the libref part of every two-level name, plus any
+    # assigned here. Quoted physical paths carry no libref.
     librefs = sorted(
         {
             d.split(".", 1)[0]
@@ -489,11 +432,7 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
         if kw_m:
             global_stmt_kw = kw_m.group(1).lower()
 
-    # ── control-flow operation (ROADMAP Phase 3) ────────────────────────────
-    # Which specific keyword (%if/%else/%do/%end/%return/%goto/%abort) this
-    # MACRO_CONTROL_FLOW chunk is.  Only ever set for that one kind — these
-    # same words appearing *inside* a macro body don't get their own chunk
-    # at all (they're part of the enclosing MACRO_DEFINITION's text).
+    # ── control-flow operation (only set for MACRO_CONTROL_FLOW chunks) ─────
     control_flow_op: str | None = None
     if kind == SasChunkKind.MACRO_CONTROL_FLOW:
         cf_m = _CONTROL_FLOW_OP_RE.match(mt.lstrip())
@@ -501,16 +440,8 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
             control_flow_op = cf_m.group(1).lower()
 
     # ── macro-variable references (single stored scan) ─────────────────────
-    # Every "&name" reference in this chunk, automatic (&sys*) variables
-    # included.  Scanned on `cf` (quotes preserved, comments stripped) rather
-    # than `mt` so references inside double-quoted strings — e.g. title
-    # "Report run &sysday" — are still caught.  SAS only resolves macro
-    # variables inside double-quoted strings, never single-quoted ones;
-    # distinguishing that here would add real complexity for marginal
-    # benefit, so this also matches (harmlessly) inside single-quoted text.
-    # The automatic-variable subset and the dependency-oriented consumer view
-    # (automatics and own-parameters excluded) are computed fields on
-    # SasChunkMetadata, derived from this one scan.
+    # Scanned on `cf` (quotes preserved) so &refs inside quoted strings are
+    # caught. The automatic-variable and consumer views are computed from this.
     referenced_macro_vars = sorted(
         {m.group(1).lower() for m in _VAR_REF_RE.finditer(cf)}
     )
@@ -526,11 +457,7 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
             _macro_body_io(text, mt)
         )
 
-    # ── high-severity control-flow visibility (ROADMAP Phase 3) ─────────────
-    # %ABORT and a computed %GOTO are macro-definition-only constructs, so
-    # they never get their own MACRO_CONTROL_FLOW chunk — they're always
-    # part of the enclosing macro's own text.  Surfaced here regardless of
-    # how deeply nested inside %if/%do blocks they are.
+    # ── high-severity control-flow visibility (MACRO_DEFINITION bodies) ─────
     has_abort = False
     has_computed_goto = False
     if kind == SasChunkKind.MACRO_DEFINITION:
@@ -558,10 +485,7 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
     elif kind == SasChunkKind.PROC_STEP and pm and _nid(pm.group(1)) == "sql":
         produces_macrovars.extend(_extract_sql_into_vars(cf))
 
-    # ── macro-language-level declarations and references ────────────────────
-    # declared_macro_vars: names introduced by %LET and by %GLOBAL/%LOCAL
-    # declaration lists.  Scanned on `cf` so %LET targets inside quoted text
-    # aren't a concern (these statements are never quoted).
+    # ── macro-language-level declarations (%LET and %GLOBAL/%LOCAL lists) ───
     declared: list[str] = [m.group(1).lower() for m in _LET_TARGET_RE.finditer(cf)]
     for m in _GLOBAL_LOCAL_DECL_RE.finditer(cf):
         for name in _SPLIT_WS_COMMA_RE.split(m.group(1).strip()):
@@ -571,10 +495,8 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
     declared_macro_vars = sorted(set(declared))
 
     # ── recognised SAS functions and CALL routines ──────────────────────────
-    # Scanned on `mt` (string literals blanked) so a function-like token inside
-    # a quoted string isn't mistaken for a real call, with %MACRO definition
-    # headers and grouped-list INPUT/PUT statements blanked on top
-    # (_function_scan_text) so those non-call ``name(`` shapes don't register.
+    # Scanned on `mt` (string literals blanked), with %MACRO headers and
+    # grouped-list INPUT/PUT blanked on top so non-call ``name(`` don't register.
     ft = _function_scan_text(mt)
     recognized_functions = sorted(
         {m.group(1).lower() for m in _SAS_FUNCTION_CALL_RE.finditer(ft)}
@@ -624,12 +546,9 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
     )
 
 
-# Fields where the parent's (whole-region) value is authoritative and the
-# child's is only a fallback, instead of the two being unioned.  All three
-# derive from the %MACRO signature header, which only the split slice that
-# contains it can parse — for every other slice the extractor returns an
-# empty list, and unioning positional {"param", "pos"} dicts from partial
-# views could double-count or (for the unhashable dicts) not union at all.
+# Fields where the parent's whole-region value wins over the child's (a fallback)
+# rather than being unioned. All derive from the %MACRO signature header, which
+# only the split slice containing it can parse.
 _MERGE_PARENT_WINS = frozenset(
     {
         "body_param_inputs",
@@ -710,17 +629,10 @@ _SQL_INTO_RE = re.compile(
     r"\binsert\s+into\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
     re.IGNORECASE,
 )
-# The inner token quantifiers below are *possessive* (``*+``): the dataset-list
-# group ``(?:token (opts)? ws)+?`` is a nested quantifier whose inner ``\w*`` /
-# ``\s*`` can re-partition the same text many ways.  With a plain greedy/lazy
-# star, a ``set``/``merge`` header that never reaches its terminating ``;`` (or
-# BY/WHERE/OBS keyword) — e.g. a source line with a dropped semicolon — makes
-# the engine explore those partitions exponentially (catastrophic backtracking,
-# which the parse deadline cannot interrupt since it is one un-interruptible
-# C-level regex call).  Possessive stars commit each token/whitespace run once
-# and never give it back, so a failing match degrades to O(n).  Only the outer
-# ``+?`` stays lazy — it must still stop at the first terminator so a trailing
-# BY/WHERE/OBS keyword isn't swallowed into the dataset list.
+# The inner token/whitespace quantifiers are *possessive* (``*+``) so a
+# ``set``/``merge`` header with no reachable terminator fails in O(n) instead of
+# backtracking exponentially (which the parse deadline cannot interrupt). Only
+# the outer ``+?`` stays lazy, to stop at the first terminator.
 _SET_RE = re.compile(
     r"\bset\s++((?:[A-Za-z_]\w*+(?:\.[A-Za-z_]\w*+)?(?:\s*+\([^)]*\))?\s*+)+?)"
     r"(?=;|\bwhere\b|\bby\b|\bobs\b|\bnobs\b)",
@@ -748,17 +660,10 @@ _PROC_OUT_RE = re.compile(
     r"|\boutdata\s*=\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
     re.IGNORECASE,
 )
-# A PROC step's DATA= input is the same "data=<name>" option matched by
-# _DATA_OPT_RE (defined near the top of the module); it is reused here rather
-# than compiled a second time under a separate name.
-#
-# Quoted physical-path dataset references (SAS Programmer's Guide: Essentials,
-# Ch. 11 "Accessing Data without Using a Libref"): a data set may be addressed
-# by its quoted path instead of a libref, e.g. ``data 'c:/tmp/perm';`` or
-# ``proc print data='c:/tmp/perm';``.  String contents are blanked in ``mt``,
-# so these MUST be scanned on the quotes-preserved form (``cf``).  The header
-# form uses the same ``(?<![\w=])`` guard as _BODY_DATA_HDR_RE so ``data=``
-# options don't match as DATA statements.
+# Quoted physical-path dataset references (e.g. ``data 'c:/tmp/perm';``). String
+# contents are blanked in ``mt``, so these MUST be scanned on the
+# quotes-preserved form (``cf``). The header form uses the same ``(?<![\w=])``
+# guard as _BODY_DATA_HDR_RE so ``data=`` options don't match as DATA statements.
 _QUOTED_DATA_HDR_RE = re.compile(
     r"(?<![\w=])data\s+((['\"])[^'\";]+\2)", re.IGNORECASE
 )
@@ -773,31 +678,14 @@ _QUOTED_OUT_OPT_RE = re.compile(
 )
 
 
-# ---------------------------------------------------------------------------
-# Macro body dataset classification
-#
-# A %MACRO body may reference datasets two ways:
-#   Literal       — a hard-coded name, e.g. "data work.base;"
-#                   Resolvable purely from the macro source text.
-#   Parameterised — a macro variable reference, e.g. "data &ds.;"
-#                   Only resolvable at the call site where the argument
-#                   value is known.
-#
-# The functions below extract both kinds from a MACRO_DEFINITION chunk's
-# source text, used by the batcher to wire up cross-file dependencies that
-# pass through macro bodies.
-# ---------------------------------------------------------------------------
+# Macro body dataset classification. A %MACRO body references datasets either
+# literally (``data work.base;``, resolvable from source) or parameterised
+# (``data &ds.;``, resolvable only at the call site). The functions below
+# extract both kinds for the batcher.
 
-# A SAS macro variable reference (&name. or &name) is detected with the shared
-# _VAR_REF_RE defined above — the pattern is identical, so it is reused here
-# rather than compiled a second time.
-
-# DATA statement header inside a macro body (may contain &refs).
-# Inner token/whitespace stars are possessive (``*+``) for the same
-# catastrophic-backtracking reason documented at _SET_RE above: these run over
-# a whole (possibly malformed) macro body, so a ``data``/``set``/``merge`` header
-# with no reachable terminator must fail in O(n), not exponentially.  The outer
-# ``+?`` stays lazy to preserve the "stop at the first ; / keyword" capture.
+# DATA statement header inside a macro body (may contain &refs). Inner stars are
+# possessive (``*+``) for the same reason as _SET_RE above; the outer ``+?``
+# stays lazy.
 _BODY_DATA_HDR_RE = re.compile(
     r"(?<![\w=])data\s++((?:[A-Za-z_&][\w.&]*+(?:\s*+\([^)]*+\))?\s*+)+?)(?=;)",
     re.IGNORECASE,
@@ -1095,10 +983,7 @@ def _io_for(
     inputs: list[str] = []
     outputs: list[str] = []
     defines: list[str] = []
-    # Every chunk kind may invoke a macro inline (e.g. %clean inside a DATA
-    # step body, or a bare top-level call) — this scan is unconditional and
-    # identical across all kinds, so it runs once here rather than being
-    # repeated in each branch below.
+    # Every chunk kind may invoke a macro inline, so this scan is unconditional.
     invokes: list[str] = [m.group(1).lower() for m in _MACRO_INVOKE_RE.finditer(mt)]
 
     if kind == SasChunkKind.MACRO_DEFINITION:

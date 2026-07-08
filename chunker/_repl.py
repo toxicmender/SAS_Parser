@@ -1,11 +1,4 @@
-"""
-_repl.py — REPL conveniences for eyeballing chunker/batcher runs.
-
-Nothing in the package imports this module; it exists for interactive
-sessions:
-
-    from chunker._repl import print_iterable
-"""
+"""REPL conveniences for eyeballing chunker/batcher runs (imported by nothing)."""
 
 from __future__ import annotations
 
