@@ -65,7 +65,21 @@ chunker/
   pipeline_constants.py Prompt templates.
   _repl.py              print_iterable REPL helper (imported by nothing).
 
+llm_client/
+  client.py             LLMClient / LLMClientConfig: chat-model construction
+                        via init_chat_model (temperature, max output tokens,
+                        proactive InMemoryRateLimiter) and invocation
+                        (input-token budget -> InputTokenLimitError, 429
+                        retry with exponential backoff). Imports nothing
+                        from chunker or memory.
+
 memory/
+  relevance.py          RelevantHistorySelector: relevance-based selection of
+                        prompted history turn pairs — BM25 (bm25s) + optional
+                        dense retrieval (LangChain Embeddings + FAISS
+                        IndexFlatIP), RRF fusion, optional reranker hook,
+                        always-keep-last tail, per-pair embedding cache.
+                        Imports nothing from chunker or memory.short_mem.
   short_mem.py          SparkKVStore façade over two backends
                         (_InMemoryBackend dict / _DeltaBackend Spark+Delta),
                         KVChatMessageHistory (BaseChatMessageHistory),
@@ -77,7 +91,8 @@ Import direction is strictly downward: `keywords` and `models` import
 nothing from the package; `scanner` and `metadata` import from them;
 `chunker.py` imports from all four; `batcher` imports from `keywords`,
 `metadata`, `models`; `pipeline` sits on top and is the **only** module that
-imports `memory.short_mem`. `memory` never imports `chunker`.
+imports `memory.short_mem`, `memory.relevance`, and `llm_client`. `memory` and
+`llm_client` never import `chunker` (or each other).
 
 ## Chunking model
 
@@ -152,9 +167,23 @@ actually read — so unrelated jobs reusing `work.tmp` stay separate.
 
 `SasLLMPipeline` compiles a one-node LangGraph `StateGraph(MessagesState)`.
 The model node loads the thread's history from `KVChatMessageHistory`, runs
-`_trim | prompt | llm` (trimming only limits what is *prompted*; storage
-keeps every turn), and persists exactly the prompted message plus the
-response in one bulk `add_messages` write. All items of one
+`_trim | prompt | LLMClient` (trimming only limits what is *prompted*;
+storage keeps every turn), and persists exactly the prompted message plus
+the response in one bulk `add_messages` write. `llm_client.LLMClient` owns
+model construction (temperature, output-token cap, proactive rate limiter)
+and invocation (input-token budget, 429 retry with backoff); an injected
+`llm` still gets the retry/budget layers.
+
+Prompted-history trimming has two modes: the default `window_k` recency
+window, or — when a `memory.relevance.RelevantHistorySelector` is passed as
+`history_selector` — relevance-based selection: each call keeps the
+`top_k` turn pairs most relevant to the current batch/chunk message (BM25
+lexical retrieval, optional FAISS dense retrieval over embeddings, RRF
+fusion, optional reranker), always including the most recent
+`always_keep_last` pairs and preserving chronological order. Scorers with
+no signal (all scores tied) are excluded from fusion; with no signal at
+all, selection degrades to recency. Either way, trimming affects only the
+prompt — storage keeps every turn. All items of one
 `run_file`/`run_text`/`run_files` call share one thread
 (`thread_id = "run::<source ids>"`), so the LLM sees the run's accumulated
 context batch by batch.
@@ -232,7 +261,7 @@ any of these silently changes behavior.
   when DEBUG is off; per-call entry/exit and LLM-paced logs are unguarded.
   Logger names follow modules: `chunker.chunker`, `chunker.scanner`,
   `chunker.metadata`, `chunker.batcher`, `chunker.pipeline`,
-  `memory.short_mem`.
+  `memory.short_mem`, `memory.relevance`, `llm_client.client`.
 - **Names:** dataset/macro/libref names are lowercased at extraction;
   quoted physical paths keep a leading `'` so they can never collide with
   identifiers.

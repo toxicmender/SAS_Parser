@@ -1,48 +1,10 @@
-"""
-pipeline.py — glue layer: SAS chunker/batcher -> LangChain chat-memory
-threads (memory.short_mem.py / persistent_memory.py) -> LLM.
+"""Glue layer: SAS chunker/batcher -> LangChain chat-memory threads -> LLM.
+See chunker/README.md.
 
-Architecture
-------------
-                 +----------------------+
-  SAS source(s) ->| SasSemanticChunker  |--> SasChunkResult(s)
-                 +----------------------+
-                          |
-                          v
-                 +----------------------+
-  SasCorpus ----->| SasChunkBatcher /   |--> SasBatchResult
-                 | MultiFileBatcher    |
-                 +----------------------+
-                          |  all_ordered_items (SasBatch | SasChunk)
-                          v
-                 +------------------------------------------------+
-                 | pipeline.py (this module)                       |
-                 |  - thread_id = run id (all batches/files for    |
-                 |    one run share ONE KVChatMessageHistory)      |
-                 |  - LangGraph StateGraph; model node runs        |
-                 |    _trim | prompt | llm over KV-stored history  |
-                 |  - prompt text sourced from pipeline_constants  |
-                 +------------------------------------------------+
-                          |
-                          v
-                     LLM responses, one per batch/singleton
+This module is the sole integration point between the chunker/batcher stack and
+the ``memory`` / ``llm_client`` packages, so those stay independently usable.
 
-memory.short_mem.py (persistent_memory.py) is never imported by chunker.py,
-models.py, or batcher.py, and this module never reaches into its
-internals beyond the public DatabricksMemory facade — pipeline.py is
-the sole integration point between the chunker/batcher stack and the
-memory backend, so memory.short_mem.py stays independently usable/testable.
-
-Logging
--------
-Logger name: ``chunker.pipeline``
-
-  Level    When emitted
-  -------  ---------------------------------------------------------------
-  DEBUG    Message formatting details, trim decisions
-  INFO     Pipeline start/finish, per-item LLM call start/finish
-  WARNING  No items to process
-  ERROR    LLM invocation failure (exception re-raised after logging)
+Logger name: ``chunker.pipeline``.
 """
 
 from __future__ import annotations
@@ -51,11 +13,12 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
-from langchain.chat_models import init_chat_model
 from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableConfig, RunnableLambda
 from langgraph.graph import START, MessagesState, StateGraph
+from llm_client import LLMClient, LLMClientConfig
+from memory.relevance import RelevantHistorySelector
 from memory.short_mem import DatabricksMemory
 
 from .batcher import MultiFileBatcher, SasChunkBatcher
@@ -228,6 +191,20 @@ class SasLLMPipeline:
     ----------
     model : str
         LangChain chat-model string, e.g. ``"claude-haiku-4-5-20251001"``.
+    temperature : float | None
+        Sampling temperature for the LLM. ``None`` (default) keeps the
+        provider default. Forwarded to :class:`llm_client.LLMClientConfig`.
+    max_input_tokens : int | None
+        Input-token budget per LLM call; an over-budget prompt raises
+        :class:`llm_client.InputTokenLimitError` instead of being sent.
+        ``None`` (default) disables counting.
+    requests_per_second : float | None
+        Proactive client-side request throttle (``InMemoryRateLimiter``).
+        ``None`` (default) disables it. Ignored when ``llm`` is injected —
+        rate limiters attach at model construction time.
+    max_retries : int
+        Retries with exponential backoff for rate-limit (429-shaped)
+        errors; other errors are never retried.
     min_words, max_words : int
         Forwarded to :class:`SasSemanticChunker`.
     output_language : str
@@ -237,6 +214,12 @@ class SasLLMPipeline:
     window_k : int | None
         Rolling-window size in (human, AI) turn-pairs kept in context per
         LLM call. ``None`` disables trimming (full history every call).
+        Ignored when ``history_selector`` is set.
+    history_selector : RelevantHistorySelector | None
+        Relevance-based history selection: per LLM call, prompt only the
+        turn pairs most relevant to the current batch/chunk message
+        (BM25 + optional FAISS dense retrieval, RRF-fused) instead of the
+        recency window. ``None`` (default) keeps ``window_k`` behaviour.
     include_options_chunks, include_comment_chunks : bool
         Forwarded to the batchers.
     memory : DatabricksMemory | None
@@ -254,20 +237,26 @@ class SasLLMPipeline:
         Delta table, no Spark/JVM.
     llm : Any | None
         Pre-built LangChain chat model to use instead of constructing one
-        from ``model`` via ``init_chat_model``.  Useful for injecting a fake
-        or pre-configured client (e.g. in tests).  When ``None`` (default) a
-        model is built from ``model``.
+        from ``model`` via :class:`llm_client.LLMClient`.  Useful for
+        injecting a fake or pre-configured client (e.g. in tests).  The
+        retry and input-token-budget layers still wrap an injected model;
+        ``temperature`` / ``requests_per_second`` do not apply to it.
     """
 
     def __init__(
         self,
         model: str = "claude-haiku-4-5-20251001",
         *,
+        temperature: float | None = None,
+        max_input_tokens: int | None = None,
+        requests_per_second: float | None = None,
+        max_retries: int = 3,
         min_words: int = 300,
         max_words: int = 700,
         output_language: str = "PySpark",
         system_prompt: str | None = None,
         window_k: int | None = 6,
+        history_selector: RelevantHistorySelector | None = None,
         include_options_chunks: bool = True,
         include_comment_chunks: bool = False,
         memory: DatabricksMemory | None = None,
@@ -280,6 +269,7 @@ class SasLLMPipeline:
         )
         self.model = model
         self.window_k = window_k
+        self._history_selector = history_selector
 
         self.chunker = SasSemanticChunker(min_words=min_words, max_words=max_words)
         self.batcher = SasChunkBatcher(include_options_chunks=include_options_chunks)
@@ -294,9 +284,19 @@ class SasLLMPipeline:
 
         self._memory = memory or self._build_default_memory(spark, delta_table)
 
-        # Use a caller-supplied chat model when given (e.g. a fake in tests, or
-        # a pre-configured client); otherwise construct one from ``model``.
-        llm = llm if llm is not None else init_chat_model(model)
+        # llm_client owns construction (temperature, output cap, rate limiter)
+        # and invocation (429 retry, input-token budget). An injected chat model
+        # replaces only the construction half; retry and budget still apply.
+        self._llm_client = LLMClient(
+            LLMClientConfig(
+                model=model,
+                temperature=temperature,
+                max_input_tokens=max_input_tokens,
+                requests_per_second=requests_per_second,
+                max_retries=max_retries,
+            ),
+            llm=llm,
+        )
         prompt = ChatPromptTemplate.from_messages(
             [
                 ("system", self._system_prompt),
@@ -307,6 +307,12 @@ class SasLLMPipeline:
 
         def _trim(inputs: dict[str, Any]) -> dict[str, Any]:
             history: list[BaseMessage] = inputs.get("history", [])
+            if self._history_selector is not None:
+                selected = self._history_selector.select(history, inputs["input"])
+                logger.debug(
+                    f"_trim: relevance selector kept {len(selected)}/{len(history)} message(s)"
+                )
+                return {"input": inputs["input"], "history": selected}
             k = self.window_k
             if k is not None and len(history) > k * 2:
                 dropped = len(history) - k * 2
@@ -316,18 +322,14 @@ class SasLLMPipeline:
                 history = history[-(k * 2) :]
             return {"input": inputs["input"], "history": history}
 
-        chain = RunnableLambda(_trim) | prompt | llm
+        chain = RunnableLambda(_trim) | prompt | self._llm_client.as_runnable()
 
         def _call_model(
             state: MessagesState, config: RunnableConfig
         ) -> dict[str, list[BaseMessage]]:
-            # One graph invocation == one conversational turn: the prompt
-            # template has a single {input} slot, so only the LAST state
-            # message is prompted, and exactly that message (plus the
-            # response) is persisted — the store never records a message
-            # the LLM was not shown.  _process always seeds exactly one
-            # HumanMessage; earlier seed messages from a direct
-            # self._graph.invoke would be dropped by design.
+            # One graph invocation == one conversational turn: only the LAST
+            # state message is prompted, and exactly that message plus the
+            # response is persisted (the store never records an unshown message).
             thread_id = config["configurable"]["thread_id"]
             history = self._memory.get_thread(thread_id)
             input_message = state["messages"][-1]
@@ -337,11 +339,9 @@ class SasLLMPipeline:
             history.add_messages([input_message, response])
             return {"messages": [response]}
 
-        # The graph is compiled WITHOUT a checkpointer on purpose: durable
-        # per-thread persistence lives in the KV-backed chat history above,
-        # keeping the msg:: row schema (snapshot / prune_before /
-        # list_threads) canonical instead of duplicating state in
-        # checkpoint blobs.
+        # Compiled WITHOUT a checkpointer on purpose: durable per-thread
+        # persistence lives in the KV-backed chat history above, keeping the
+        # msg:: row schema canonical instead of duplicating state in blobs.
         logger.debug("SasLLMPipeline: compiling LangGraph state graph")
         builder = StateGraph(MessagesState)
         builder.add_node("model", _call_model)
@@ -355,8 +355,7 @@ class SasLLMPipeline:
         delta_table: str | None,
     ) -> DatabricksMemory:
         if delta_table is None:
-            # In-memory store: never touches Spark, so don't boot a JVM-backed
-            # local session just to hold a Python dict.
+            # In-memory store never touches Spark, so don't boot a JVM session.
             logger.info(
                 "SasLLMPipeline: in-memory message store (no Delta table, no "
                 "Spark session needed)"
