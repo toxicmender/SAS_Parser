@@ -327,13 +327,20 @@ class SasLLMPipeline:
         def _call_model(
             state: MessagesState, config: RunnableConfig
         ) -> dict[str, list[BaseMessage]]:
+            # One graph invocation == one conversational turn: the prompt
+            # template has a single {input} slot, so only the LAST state
+            # message is prompted, and exactly that message (plus the
+            # response) is persisted — the store never records a message
+            # the LLM was not shown.  _process always seeds exactly one
+            # HumanMessage; earlier seed messages from a direct
+            # self._graph.invoke would be dropped by design.
             thread_id = config["configurable"]["thread_id"]
             history = self._memory.get_thread(thread_id)
-            input_messages = state["messages"]
+            input_message = state["messages"][-1]
             response = chain.invoke(
-                {"input": input_messages[-1].content, "history": history.messages}
+                {"input": input_message.content, "history": history.messages}
             )
-            history.add_messages(list(input_messages) + [response])
+            history.add_messages([input_message, response])
             return {"messages": [response]}
 
         # The graph is compiled WITHOUT a checkpointer on purpose: durable
