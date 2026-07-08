@@ -19,4 +19,6 @@ dev       = ["pytest>=8", "pytest-cov", "ruff"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["chunker*"]
+# chunker/pipeline.py imports memory.short_mem, so both packages must ship —
+# a wheel with chunker alone breaks `from chunker import SasLLMPipeline`.
+include = ["chunker*", "memory*"]
