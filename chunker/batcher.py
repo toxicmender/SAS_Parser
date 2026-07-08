@@ -357,24 +357,27 @@ def _resolve_implicit_datasets(flat_chunks: list[SasChunk]) -> None:
                 if ds == "_data_":
                     datan += 1
                     ds = f"work.data{datan}"
-                    logger.debug(
-                        f"implicit[_data_]: chunk {chunk.chunk_id} output resolved to '{ds}'"
-                    )
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            f"implicit[_data_]: chunk {chunk.chunk_id} output resolved to '{ds}'"
+                        )
                 resolved_out.append(ds)
             new_out = resolved_out
             changed = True
 
         if "_last_" in new_in:
             if last_created is not None:
-                logger.debug(
-                    f"implicit[_last_]: chunk {chunk.chunk_id} input resolved to '{last_created}'"
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"implicit[_last_]: chunk {chunk.chunk_id} input resolved to '{last_created}'"
+                    )
                 new_in = [last_created if ds == "_last_" else ds for ds in new_in]
             else:
-                logger.debug(
-                    f"implicit[_last_]: chunk {chunk.chunk_id} references _LAST_ "
-                    f"before any dataset was created — dropped"
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"implicit[_last_]: chunk {chunk.chunk_id} references _LAST_ "
+                        f"before any dataset was created — dropped"
+                    )
                 new_in = [ds for ds in new_in if ds != "_last_"]
             changed = True
 
@@ -392,10 +395,11 @@ def _resolve_implicit_datasets(flat_chunks: list[SasChunk]) -> None:
                 )
             )
         ):
-            logger.debug(
-                f"implicit[no-data=]: chunk {chunk.chunk_id} ({chunk.kind.value}) "
-                f"gains implicit input '{last_created}'"
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"implicit[no-data=]: chunk {chunk.chunk_id} ({chunk.kind.value}) "
+                    f"gains implicit input '{last_created}'"
+                )
             new_in = [last_created]
             changed = True
 
@@ -912,9 +916,10 @@ class _EdgeDiscovery:
                 chunk = chunk.model_copy(update={"metadata": updated_meta})
                 self.flat_chunks[cidx] = chunk
                 meta = updated_meta
-                logger.debug(
-                    f"macro_body_dataset: chunk {chunk.chunk_id} metadata updated  output_datasets={new_out}  input_datasets={new_in}"
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"macro_body_dataset: chunk {chunk.chunk_id} metadata updated  output_datasets={new_out}  input_datasets={new_in}"
+                    )
 
             # Link this call site to the nearest preceding producer of
             # each resolved input (covers the case where the macro reads
@@ -1005,9 +1010,10 @@ def _absorb_context(
                 continue  # skip consecutive context chunks
             reason = "options_context" if is_option else "comment_context"
             merged = uf.union(idx, nxt_idx)
-            logger.debug(
-                f"absorb[{reason}]: {chunk.chunk_id} ← {nxt_chunk.chunk_id}  merged={merged}"
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"absorb[{reason}]: {chunk.chunk_id} ← {nxt_chunk.chunk_id}  merged={merged}"
+                )
             if merged:
                 edges.append(
                     _Edge(

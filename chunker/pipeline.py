@@ -155,7 +155,7 @@ def _format_chunk_message(
         text=chunk.text,
     )
     logger.debug(
-        "_format_chunk_message: chunk=%s  prompt_chars=%d", chunk.chunk_id, len(msg)
+        f"_format_chunk_message: chunk={chunk.chunk_id}  prompt_chars={len(msg)}"
     )
     return msg
 
@@ -201,10 +201,7 @@ def _format_batch_message(
         members=members,
     )
     logger.debug(
-        "_format_batch_message: batch=%s  members=%d  prompt_chars=%d",
-        batch.batch_id,
-        len(batch.chunks),
-        len(msg),
+        f"_format_batch_message: batch={batch.batch_id}  members={len(batch.chunks)}  prompt_chars={len(msg)}"
     )
     return msg
 
@@ -279,10 +276,7 @@ class SasLLMPipeline:
         llm: Any | None = None,
     ) -> None:
         logger.info(
-            "SasLLMPipeline.__init__  model=%s  output_language=%s  window_k=%s",
-            model,
-            output_language,
-            window_k,
+            f"SasLLMPipeline.__init__  model={model}  output_language={output_language}  window_k={window_k}"
         )
         self.model = model
         self.window_k = window_k
@@ -317,7 +311,7 @@ class SasLLMPipeline:
             if k is not None and len(history) > k * 2:
                 dropped = len(history) - k * 2
                 logger.debug(
-                    "_trim: dropping %d old message(s), window_k=%d", dropped, k
+                    f"_trim: dropping {dropped} old message(s), window_k={k}"
                 )
                 history = history[-(k * 2) :]
             return {"input": inputs["input"], "history": history}
@@ -387,7 +381,7 @@ class SasLLMPipeline:
         self, path: str, *, thread_id: str | None = None
     ) -> list[dict[str, Any]]:
         """Chunk + batch the SAS file at *path*, run every item through the LLM."""
-        logger.info("run_file: '%s'", path)
+        logger.info(f"run_file: '{path}'")
         result = self.chunker.chunk_file(path)
         batch_result = self.batcher.batch(result)
         tid = thread_id or self._default_thread_id([result.source_id or path])
@@ -404,7 +398,7 @@ class SasLLMPipeline:
     ) -> list[dict[str, Any]]:
         """Chunk + batch the SAS *source* string, run every item through the LLM."""
         label = source_id or "<inline>"
-        logger.info("run_text: source_id='%s'  chars=%d", label, len(source))
+        logger.info(f"run_text: source_id='{label}'  chars={len(source)}")
         result = self.chunker.chunk_text(source, source_id=source_id)
         batch_result = self.batcher.batch(result)
         tid = thread_id or self._default_thread_id([result.source_id or label])
@@ -420,7 +414,7 @@ class SasLLMPipeline:
         via :class:`MultiFileBatcher`, and run every batch/singleton
         through the LLM on **one shared thread** for the whole corpus.
         """
-        logger.info("run_files: %d file(s)", len(paths))
+        logger.info(f"run_files: {len(paths)} file(s)")
         file_results = [self.chunker.chunk_file(p) for p in paths]
         corpus = SasCorpus(file_results=file_results)
         multi_result = self.multi_batcher.batch(corpus)
@@ -431,10 +425,10 @@ class SasLLMPipeline:
 
     def get_thread_messages(self, thread_id: str) -> list[BaseMessage]:
         """Return the raw message history stored for *thread_id*."""
-        logger.debug("get_thread_messages: thread_id='%s'", thread_id)
+        logger.debug(f"get_thread_messages: thread_id='{thread_id}'")
         msgs = self._memory.get_thread(thread_id).messages
         logger.debug(
-            "get_thread_messages: thread_id='%s'  messages=%d", thread_id, len(msgs)
+            f"get_thread_messages: thread_id='{thread_id}'  messages={len(msgs)}"
         )
         return msgs
 
@@ -464,14 +458,11 @@ class SasLLMPipeline:
     ) -> list[dict[str, Any]]:
         total = len(items)
         if not items:
-            logger.warning("_process: nothing to process  thread='%s'", thread_id)
+            logger.warning(f"_process: nothing to process  thread='{thread_id}'")
             return []
 
         logger.info(
-            "_process: invoking LLM for %d item(s)  thread='%s'  model=%s",
-            total,
-            thread_id,
-            self.model,
+            f"_process: invoking LLM for {total} item(s)  thread='{thread_id}'  model={self.model}"
         )
         t_pipeline = time.perf_counter()
         outputs: list[dict[str, Any]] = []
@@ -481,12 +472,7 @@ class SasLLMPipeline:
             is_batch = isinstance(item, SasBatch)
             item_id = item.batch_id if is_batch else item.chunk_id
             logger.info(
-                "_process: item %d/%d  id=%s  is_batch=%s  thread=%s",
-                idx,
-                total,
-                item_id,
-                is_batch,
-                thread_id,
+                f"_process: item {idx}/{total}  id={item_id}  is_batch={is_batch}  thread={thread_id}"
             )
 
             user_msg = (
@@ -503,9 +489,7 @@ class SasLLMPipeline:
                 response = state["messages"][-1]
             except Exception:
                 logger.error(
-                    "_process: LLM call failed  item=%s  thread=%s",
-                    item_id,
-                    thread_id,
+                    f"_process: LLM call failed  item={item_id}  thread={thread_id}",
                     exc_info=True,
                 )
                 raise
@@ -513,15 +497,11 @@ class SasLLMPipeline:
             elapsed = time.perf_counter() - t_item
             ai_text = response.content
             logger.info(
-                "_process: item %s done  elapsed=%.3fs  response_chars=%d",
-                item_id,
-                elapsed,
-                len(ai_text),
+                f"_process: item {item_id} done  elapsed={elapsed:.3f}s  response_chars={len(ai_text)}"
             )
             logger.debug(
-                "_process: item %s response preview: %r",
-                item_id,
-                ai_text[:120].replace("\n", "\u21b5"),
+                f"_process: item {item_id} response preview: "
+                f"{ai_text[:120].replace(chr(10), chr(0x21B5))!r}"
             )
 
             outputs.append(
@@ -540,9 +520,6 @@ class SasLLMPipeline:
 
         elapsed_total = time.perf_counter() - t_pipeline
         logger.info(
-            "_process: all %d item(s) processed  total_elapsed=%.3fs  thread='%s'",
-            total,
-            elapsed_total,
-            thread_id,
+            f"_process: all {total} item(s) processed  total_elapsed={elapsed_total:.3f}s  thread='{thread_id}'"
         )
         return outputs

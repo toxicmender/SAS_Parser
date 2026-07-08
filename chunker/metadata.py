@@ -910,7 +910,8 @@ def _macro_body_io(
             param_pos[pname] = -1
 
     param_names = [p[0] for p in params]
-    logger.debug(f"_macro_body_io: params={param_names}  param_pos={param_pos}")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"_macro_body_io: params={param_names}  param_pos={param_pos}")
 
     raw_outputs: list[str] = []
     raw_inputs: list[str] = []
@@ -975,30 +976,34 @@ def _macro_body_io(
                 if pname in param_pos and pname not in seen_par:
                     seen_par.add(pname)
                     params_out.append({"param": pname, "pos": param_pos[pname]})
-                    logger.debug(
-                        f"_macro_body_io: {role} PARAM  raw={raw!r}  param={pname}  pos={param_pos[pname]}"
-                    )
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            f"_macro_body_io: {role} PARAM  raw={raw!r}  param={pname}  pos={param_pos[pname]}"
+                        )
                 elif pname not in param_pos:
-                    logger.debug(
-                        f"_macro_body_io: {role} UNRESOLVABLE param ref {raw!r}"
-                    )
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            f"_macro_body_io: {role} UNRESOLVABLE param ref {raw!r}"
+                        )
             else:
                 key = _canon_ds(key)
                 if key not in seen_lit:
                     seen_lit.add(key)
                     literals.append(key)
-                    logger.debug(
-                        f"_macro_body_io: {role} LITERAL  raw={raw!r}  name={key}"
-                    )
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            f"_macro_body_io: {role} LITERAL  raw={raw!r}  name={key}"
+                        )
 
         return literals, params_out
 
     lit_out, par_out = _classify_list(raw_outputs, "output")
     lit_in, par_in = _classify_list(raw_inputs, "input")
 
-    logger.debug(
-        f"_macro_body_io: literal_outputs={lit_out}  literal_inputs={lit_in}  param_outputs={par_out}  param_inputs={par_in}"
-    )
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            f"_macro_body_io: literal_outputs={lit_out}  literal_inputs={lit_in}  param_outputs={par_out}  param_inputs={par_in}"
+        )
     return lit_in, lit_out, par_in, par_out, param_names
 
 

@@ -520,9 +520,10 @@ class SasSemanticChunker:
                         )
                     )
                 else:
-                    logger.debug(
-                        f"_group_regions: {cls.value}  lines={sl}-{el}  units={len(block_units)}"
-                    )
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            f"_group_regions: {cls.value}  lines={sl}-{el}  units={len(block_units)}"
+                        )
                 continue
 
             # ── single-statement kinds ──────────────────────────────────────
@@ -575,7 +576,8 @@ class SasSemanticChunker:
         other statement types are treated as ordinary body statements and
         collected without closing the block.
         """
-        logger.debug(f"_collect_block: {kind.value}  start_unit={start}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"_collect_block: {kind.value}  start_unit={start}")
         block: list[_Unit] = []
         index = start
         # Nesting depth of *inner* %MACRO definitions currently open inside this
@@ -609,9 +611,10 @@ class SasSemanticChunker:
                 and kind in {SasChunkKind.DATA_STEP, SasChunkKind.PROC_STEP}
             )
             if implicit_close:
-                logger.debug(
-                    f"_collect_block: implicit close  {kind.value} at unit {index}  next_kind={cls.value}"
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"_collect_block: implicit close  {kind.value} at unit {index}  next_kind={cls.value}"
+                    )
                 return block, index, True
 
             # A nested %MACRO header inside our macro body opens an inner
@@ -624,9 +627,10 @@ class SasSemanticChunker:
                 and index != start
             ):
                 macro_depth += 1
-                logger.debug(
-                    f"_collect_block: nested %MACRO at unit {index}  depth={macro_depth}"
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"_collect_block: nested %MACRO at unit {index}  depth={macro_depth}"
+                    )
 
             block.append(unit)
             index += 1
@@ -635,22 +639,25 @@ class SasSemanticChunker:
             if kind == SasChunkKind.MACRO_DEFINITION and _MEND_RE.match(lowered):
                 if macro_depth > 0:
                     macro_depth -= 1
-                    logger.debug(
-                        f"_collect_block: %MEND closes nested macro  depth={macro_depth}"
-                    )
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            f"_collect_block: %MEND closes nested macro  depth={macro_depth}"
+                        )
                     continue
-                logger.debug(
-                    f"_collect_block: %MEND → closed MACRO_DEFINITION  units={len(block)}"
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"_collect_block: %MEND → closed MACRO_DEFINITION  units={len(block)}"
+                    )
                 return block, index, False
 
             if kind in {SasChunkKind.DATA_STEP, SasChunkKind.PROC_STEP} and lowered in {
                 "run",
                 "quit",
             }:
-                logger.debug(
-                    f"_collect_block: RUN/QUIT → closed {kind.value}  units={len(block)}"
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"_collect_block: RUN/QUIT → closed {kind.value}  units={len(block)}"
+                    )
                 return block, index, False
 
         logger.warning(
@@ -676,9 +683,10 @@ class SasSemanticChunker:
         el = _line_for(max(region.end - 1, region.start), line_starts)
 
         if wc <= self.max_words or len(region.units) <= 1:
-            logger.debug(
-                f"_chunks_for_region: single  kind={region.kind.value}  words={wc}  lines={sl}-{el}"
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"_chunks_for_region: single  kind={region.kind.value}  words={wc}  lines={sl}-{el}"
+                )
             single = [self._make_chunk(source_id, region, line_starts, next_index)]
             _record_user_library(single, diagnostics)
             return single
@@ -747,9 +755,10 @@ class SasSemanticChunker:
                     parent_id=parent_id,
                     metadata=child_meta,
                 )
-                logger.debug(
-                    f"_chunks_for_region: child {child.chunk_id}  parent={parent_id}  lines={child.start_line}-{child.end_line}"
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"_chunks_for_region: child {child.chunk_id}  parent={parent_id}  lines={child.start_line}-{child.end_line}"
+                    )
                 chunks.append(child)
                 current = _overlap(current) + [unit]
                 cur_wc, cur_tail_nonws = _wc_and_tail(current)
@@ -779,9 +788,10 @@ class SasSemanticChunker:
                 parent_id=parent_id,
                 metadata=child_meta,
             )
-            logger.debug(
-                f"_chunks_for_region: final child {child.chunk_id}  parent={parent_id}  lines={child.start_line}-{child.end_line}"
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"_chunks_for_region: final child {child.chunk_id}  parent={parent_id}  lines={child.start_line}-{child.end_line}"
+                )
             chunks.append(child)
 
         still_big = [c for c in chunks if _wc(c.text) > self.max_words * 2]
