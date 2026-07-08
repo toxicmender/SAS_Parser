@@ -33,7 +33,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from chunker import SasChunkBatcher, SasCorpus, SasSemanticChunker
 from chunker.batcher import MultiFileBatcher, _parse_call_args
-from chunker.chunker import _macro_body_io
+from chunker.metadata import _macro_body_io
 
 _C = SasSemanticChunker(min_words=1, max_words=9_999)
 

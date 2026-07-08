@@ -432,7 +432,7 @@ class TestMergeMeta(unittest.TestCase):
     """
 
     def test_every_field_has_a_merge_rule(self):
-        from chunker.chunker import _merge_meta
+        from chunker.metadata import _merge_meta
         from chunker.models import SasChunkMetadata
 
         # Raises TypeError if any stored field's annotation is unhandled.
@@ -440,7 +440,7 @@ class TestMergeMeta(unittest.TestCase):
         self.assertIsInstance(merged, SasChunkMetadata)
 
     def test_merge_rules_by_type(self):
-        from chunker.chunker import _merge_meta
+        from chunker.metadata import _merge_meta
         from chunker.models import SasChunkMetadata
 
         parent = SasChunkMetadata(

@@ -85,12 +85,14 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from chunker import SasChunkBatcher, SasChunkKind, SasSemanticChunker
-from chunker.chunker import (
+from chunker.keywords import (
     _ADDITIONAL_MACRO_FUNCTION_WORDS,
     _MACRO_CALL_RE,
     _MACRO_INVOKE_RE,
     _RESERVED_WORDS,
     _STANDARD_AUTOCALL_MACROS,
+)
+from chunker.metadata import (
     _macro_contains_computed_goto,
     _macro_has_local_scope,
 )
@@ -349,7 +351,7 @@ class TestMacroVarOp(unittest.TestCase):
     def test_oversized_split_preserves_var_op(self):
         """A %let chunk is single-statement and never splits, but verify
         _merge_meta's macro_var_op precedence rule directly."""
-        from chunker.chunker import _merge_meta
+        from chunker.metadata import _merge_meta
         from chunker.models import SasChunkMetadata
 
         parent = SasChunkMetadata(macro_var_op="let")

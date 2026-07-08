@@ -33,7 +33,7 @@ from chunker import (
     SasSemanticChunker,
 )
 from chunker.batcher import MultiFileBatcher
-from chunker.chunker import (
+from chunker.metadata import (
     _clean_literal,
     _enumerate_numbered_range,
     _extract_call_execute_macros,

@@ -72,7 +72,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TextIO
 
-from .chunker import _STANDARD_AUTOCALL_MACROS, _canon_ds
+from .keywords import _STANDARD_AUTOCALL_MACROS
+from .metadata import _canon_ds
 from .models import (
     SasBatch,
     SasBatchResult,
