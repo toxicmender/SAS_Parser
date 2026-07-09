@@ -74,11 +74,14 @@ llm_client/
                         from chunker or memory.
 
 memory/
-  relevance.py          RelevantHistorySelector: relevance-based selection of
-                        prompted history turn pairs — BM25 (bm25s) + optional
-                        dense retrieval (LangChain Embeddings + FAISS
-                        IndexFlatIP), RRF fusion, optional reranker hook,
-                        always-keep-last tail, per-pair embedding cache.
+  relevance.py          HybridRanker: shared BM25 (bm25s) + optional dense
+                        retrieval (LangChain Embeddings + FAISS IndexFlatIP),
+                        RRF fusion, optional reranker hook, content-hashed
+                        embedding cache — with a stateless per-call mode and an
+                        index-once/query-many static-corpus mode.
+                        RelevantHistorySelector layers history policy on top:
+                        relevance-based selection of prompted history turn
+                        pairs, always-keep-last tail, recency fallback.
                         Imports nothing from chunker or memory.short_mem.
   short_mem.py          SparkKVStore façade over two backends
                         (_InMemoryBackend dict / _DeltaBackend Spark+Delta),

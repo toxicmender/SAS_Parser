@@ -19,7 +19,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
-from memory.relevance import RelevantHistorySelector, _group_turns
+from memory.relevance import HybridRanker, RelevantHistorySelector, _group_turns
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +228,80 @@ def test_embedding_cache_embeds_each_pair_once():
 
     assert first_pass == 3  # candidates only (tail pair is never embedded)
     assert len(embeddings.documents_embedded) == first_pass  # all cached
+
+
+# ---------------------------------------------------------------------------
+# HybridRanker — static-corpus mode (index once, query many)
+# ---------------------------------------------------------------------------
+
+
+def test_hybrid_ranker_query_ranks_lexical_match_first():
+    ranker = HybridRanker()
+    ranker.index(
+        [
+            "proc means computes descriptive statistics",  # 0
+            "the intnx function advances a sas date",  # 1 <- match
+            "libname assigns a library reference",  # 2
+        ]
+    )
+    ranking = ranker.query("how does intnx advance a date")
+    assert ranking[0] == 1
+
+
+def test_hybrid_ranker_query_no_signal_returns_empty():
+    ranker = HybridRanker()
+    ranker.index(["alpha one", "beta two", "gamma three"])
+    assert ranker.query("zzz completely unrelated qqq") == []
+
+
+def test_hybrid_ranker_empty_query_returns_empty():
+    ranker = HybridRanker()
+    ranker.index(["alpha one", "beta two"])
+    assert ranker.query("!!! ???") == []  # tokenizes to nothing, no dense stage
+
+
+def test_hybrid_ranker_top_k_truncates():
+    ranker = HybridRanker()
+    ranker.index(["sas macro %let statement", "macro variable resolution", "macro"])
+    ranking = ranker.query("macro", top_k=2)
+    assert len(ranking) == 2
+
+
+def test_hybrid_ranker_empty_corpus_queries_empty():
+    ranker = HybridRanker()
+    ranker.index([])
+    assert ranker.query("anything") == []
+
+
+def test_hybrid_ranker_query_before_index_raises():
+    ranker = HybridRanker()
+    ranker._corpus = ["never indexed"]  # simulate corpus set without index()
+    with pytest.raises(RuntimeError):
+        ranker.query("anything")
+
+
+def test_hybrid_ranker_dense_recovers_synonym():
+    ranker = HybridRanker(embeddings=_VocabEmbeddings())
+    ranker.index(
+        [
+            "warehouse shelving layout notes",  # 0
+            "quarterly revenue tables by region",  # 1 <- synonym of 'sales'
+            "employee onboarding checklist",  # 2
+        ]
+    )
+    ranking = ranker.query("sales figures please")
+    assert ranking[0] == 1
+
+
+def test_hybrid_ranker_index_reuses_embedding_cache():
+    embeddings = _VocabEmbeddings()
+    ranker = HybridRanker(embeddings=embeddings)
+    docs = ["sales report", "stock levels", "client emails"]
+    ranker.index(docs)
+    embedded_after_index = len(embeddings.documents_embedded)
+    ranker.query("revenue query")  # query embeds only the query, not docs
+    assert embedded_after_index == 3
+    assert len(embeddings.documents_embedded) == 3
 
 
 # ---------------------------------------------------------------------------

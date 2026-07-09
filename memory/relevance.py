@@ -45,9 +45,233 @@ def _turn_text(turn: list[BaseMessage]) -> str:
     return "\n".join(str(m.content) for m in turn)
 
 
+class HybridRanker:
+    """
+    Hybrid lexical + dense retrieval with RRF fusion and an optional reranker.
+
+    Bundles the scoring primitives shared by two callers with opposite corpus
+    lifetimes:
+
+    * :class:`RelevantHistorySelector`, whose corpus (one chat thread's turns)
+      changes every call, ranks an arbitrary doc list afresh each time via the
+      stateless :meth:`bm25_ranking` / :meth:`dense_ranking` / :meth:`rrf_fuse`
+      / :meth:`rerank` primitives.
+    * A fixed instruction corpus calls :meth:`index` once and then
+      :meth:`query` many times, reusing one BM25 index and one FAISS index
+      rather than rebuilding them per query — the corpus is thousands of
+      chunks, so a per-query rebuild would dominate runtime.
+
+    Both paths share the RRF fusion, reranker hook, and content-hashed
+    embedding cache, so lexical/dense/fusion behaviour is identical whichever
+    entry point is used.
+
+    Parameters
+    ----------
+    embeddings : Any | None
+        LangChain ``Embeddings`` instance, or a provider string forwarded to
+        ``langchain.embeddings.init_embeddings`` (e.g.
+        ``"openai:text-embedding-3-small"``). ``None`` (default) disables the
+        dense stage — ranking is BM25-only and fully offline.
+    rrf_k : int
+        Reciprocal Rank Fusion constant; 60 is the standard choice. Larger
+        values flatten the difference between rank positions.
+    reranker : Callable[[str, list[str]], list[float]] | None
+        Optional second-stage reranker: given ``(query, docs)`` returns one
+        relevance score per doc (higher = better). Applied to the RRF-fused
+        shortlist; use for a cross-encoder or LLM judge.
+    """
+
+    def __init__(
+        self,
+        *,
+        embeddings: Any | None = None,
+        rrf_k: int = 60,
+        reranker: Callable[[str, list[str]], list[float]] | None = None,
+    ) -> None:
+        if isinstance(embeddings, str):
+            from langchain.embeddings import init_embeddings
+
+            embeddings = init_embeddings(embeddings)
+        self.rrf_k = rrf_k
+        self._embeddings = embeddings
+        self._reranker = reranker
+        self._embedding_cache: dict[str, np.ndarray] = {}
+        # Static-corpus state, populated by index(); unused in per-call mode.
+        self._corpus: list[str] = []
+        self._bm25: Any | None = None
+        self._faiss: Any | None = None
+
+    @property
+    def has_dense(self) -> bool:
+        return self._embeddings is not None
+
+    @property
+    def has_reranker(self) -> bool:
+        return self._reranker is not None
+
+    # ------------------------------------------------------------------
+    # Stateless per-call ranking (corpus differs every call)
+    # ------------------------------------------------------------------
+
+    def bm25_ranking(
+        self, docs: list[str], candidates: list[int], query: str
+    ) -> list[int] | None:
+        """Best-first candidate ranking, or ``None`` when BM25 has no signal."""
+        query_tokens = _tokenize(query)
+        if not query_tokens:
+            logger.warning("bm25_ranking: query produced no tokens; no signal")
+            return None
+        # "_" placeholder keeps a pathological empty doc from breaking the
+        # index; it can never match a real query token.
+        corpus = [_tokenize(docs[i]) or ["_"] for i in candidates]
+        retriever = bm25s.BM25()
+        retriever.index(corpus, show_progress=False)
+        scores = retriever.get_scores(query_tokens)
+        if float(scores.max()) - float(scores.min()) < 1e-12:
+            return None  # every doc tied — ordering would be arbitrary
+        # Remaining ties break toward recency.
+        order = sorted(
+            range(len(candidates)), key=lambda j: (-scores[j], -candidates[j])
+        )
+        return [candidates[j] for j in order]
+
+    def dense_ranking(
+        self, docs: list[str], candidates: list[int], query: str
+    ) -> list[int] | None:
+        """Best-first candidate ranking, or ``None`` when cosine has no signal."""
+        vectors = self.embed_cached([docs[i] for i in candidates])
+        query_vec = self._normalize(
+            np.asarray(self._embeddings.embed_query(query), dtype=np.float32)
+        )
+        index = faiss.IndexFlatIP(vectors.shape[1])
+        index.add(vectors)
+        similarities, order = index.search(query_vec[None, :], len(candidates))
+        if float(similarities.max()) - float(similarities.min()) < 1e-9:
+            return None  # every doc tied — ordering would be arbitrary
+        return [candidates[j] for j in order[0] if j != -1]
+
+    def rrf_fuse(self, rankings: list[list[int]]) -> list[int]:
+        scores: dict[int, float] = defaultdict(float)
+        for ranking in rankings:
+            for position, idx in enumerate(ranking):
+                scores[idx] += 1.0 / (self.rrf_k + position + 1)
+        # Ties break toward recency (higher turn index first).
+        return sorted(scores, key=lambda i: (-scores[i], -i))
+
+    def rerank(
+        self, fused: list[int], docs: list[str], query: str, *, window_size: int
+    ) -> list[int]:
+        """Re-order the top ``window_size`` of *fused* with the reranker hook."""
+        window = fused[:window_size]
+        scores = self._reranker(query, [docs[i] for i in window])
+        order = sorted(range(len(window)), key=lambda j: (-scores[j], -window[j]))
+        return [window[j] for j in order] + fused[len(window) :]
+
+    # ------------------------------------------------------------------
+    # Static-corpus ranking (index once, query many)
+    # ------------------------------------------------------------------
+
+    def index(self, docs: list[str]) -> None:
+        """
+        Build reusable BM25 (and dense, if enabled) indexes over a fixed
+        corpus so repeated :meth:`query` calls do not rebuild them.
+        """
+        self._corpus = list(docs)
+        logger.info(
+            f"HybridRanker.index: {len(self._corpus)} document(s)  "
+            f"dense={'on' if self.has_dense else 'off'}"
+        )
+        if not self._corpus:
+            self._bm25 = None
+            self._faiss = None
+            return
+        tokenized = [_tokenize(d) or ["_"] for d in self._corpus]
+        self._bm25 = bm25s.BM25()
+        self._bm25.index(tokenized, show_progress=False)
+        if self._embeddings is not None:
+            vectors = self.embed_cached(self._corpus)
+            self._faiss = faiss.IndexFlatIP(vectors.shape[1])
+            self._faiss.add(vectors)
+        else:
+            self._faiss = None
+
+    def query(self, text: str, *, top_k: int | None = None) -> list[int]:
+        """
+        Best-first corpus indices for *text*, reusing the indexes built by
+        :meth:`index`. Returns an empty list when no scorer has signal —
+        a fixed instruction corpus has no recency to fall back to, so
+        irrelevant matches are simply dropped. Truncated to ``top_k`` when
+        given.
+        """
+        if not self._corpus:
+            return []
+        if self._bm25 is None:
+            raise RuntimeError("HybridRanker.index() must be called before query()")
+        n = len(self._corpus)
+        candidates = list(range(n))
+        rankings: list[list[int]] = []
+
+        query_tokens = _tokenize(text)
+        if not query_tokens:
+            logger.warning("HybridRanker.query: query produced no tokens; BM25 skipped")
+        else:
+            scores = self._bm25.get_scores(query_tokens)
+            if float(scores.max()) - float(scores.min()) >= 1e-12:
+                # No recency to prefer in a static corpus: break ties toward the
+                # lower (earlier) index for a stable, deterministic order.
+                rankings.append(sorted(candidates, key=lambda i: (-scores[i], i)))
+
+        if self._faiss is not None:
+            query_vec = self._normalize(
+                np.asarray(self._embeddings.embed_query(text), dtype=np.float32)
+            )
+            similarities, order = self._faiss.search(query_vec[None, :], n)
+            if float(similarities.max()) - float(similarities.min()) >= 1e-9:
+                rankings.append([int(j) for j in order[0] if j != -1])
+
+        if not rankings:
+            logger.debug("HybridRanker.query: no scorer has signal; empty result")
+            return []
+        fused = self.rrf_fuse(rankings)
+        if self._reranker is not None:
+            window = max(4 * top_k, top_k) if top_k else len(fused)
+            fused = self.rerank(fused, self._corpus, text, window_size=window)
+        return fused[:top_k] if top_k is not None else fused
+
+    # ------------------------------------------------------------------
+    # Embedding cache
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize(vec: np.ndarray) -> np.ndarray:
+        return vec / max(float(np.linalg.norm(vec)), 1e-12)
+
+    def embed_cached(self, texts: list[str]) -> np.ndarray:
+        keys = [hashlib.sha1(t.encode("utf-8")).hexdigest() for t in texts]
+        missing = [
+            (k, t) for k, t in zip(keys, texts) if k not in self._embedding_cache
+        ]
+        if missing:
+            logger.debug(
+                f"embed_cached: embedding {len(missing)} new text(s) "
+                f"({len(texts) - len(missing)} cached)"
+            )
+            new_vectors = self._embeddings.embed_documents([t for _, t in missing])
+            for (key, _), vec in zip(missing, new_vectors):
+                self._embedding_cache[key] = self._normalize(
+                    np.asarray(vec, dtype=np.float32)
+                )
+        return np.stack([self._embedding_cache[k] for k in keys])
+
+
 class RelevantHistorySelector:
     """
     Select the history turn pairs most relevant to the current request.
+
+    Thin orchestration over a :class:`HybridRanker`: it groups the thread into
+    turns, ranks the candidate turns with the shared BM25/dense/RRF stack, and
+    layers the history-specific policy on top — an always-kept recency tail, a
+    recency fallback when no scorer has signal, and chronological-order output.
 
     Parameters
     ----------
@@ -82,21 +306,17 @@ class RelevantHistorySelector:
             raise ValueError(f"top_k must be >= 1, got {top_k}")
         if always_keep_last < 0:
             raise ValueError(f"always_keep_last must be >= 0, got {always_keep_last}")
-        if isinstance(embeddings, str):
-            from langchain.embeddings import init_embeddings
-
-            embeddings = init_embeddings(embeddings)
         self.top_k = top_k
         self.always_keep_last = always_keep_last
         self.rrf_k = rrf_k
-        self._embeddings = embeddings
-        self._reranker = reranker
-        self._embedding_cache: dict[str, np.ndarray] = {}
+        self._ranker = HybridRanker(
+            embeddings=embeddings, rrf_k=rrf_k, reranker=reranker
+        )
         logger.info(
             f"RelevantHistorySelector: top_k={top_k}  "
             f"always_keep_last={always_keep_last}  "
-            f"dense={'on' if embeddings is not None else 'off'}  "
-            f"reranker={'on' if reranker is not None else 'off'}  rrf_k={rrf_k}"
+            f"dense={'on' if self._ranker.has_dense else 'off'}  "
+            f"reranker={'on' if self._ranker.has_reranker else 'off'}  rrf_k={rrf_k}"
         )
 
     # ------------------------------------------------------------------
@@ -124,17 +344,17 @@ class RelevantHistorySelector:
         chosen: list[int] = []
         if slots > 0:
             docs = [_turn_text(t) for t in turns]
-            maybe_rankings = [self._bm25_ranking(docs, candidates, query)]
-            if self._embeddings is not None:
-                maybe_rankings.append(self._dense_ranking(docs, candidates, query))
-            rankings = [r for r in maybe_rankings if r is not None]
-            if rankings:
-                fused = self._rrf_fuse(rankings)
-            else:
+            fused = self._fuse(docs, candidates, query)
+            if fused is None:
                 logger.debug("select: no scorer has signal; recency fallback")
                 fused = sorted(candidates, reverse=True)
-            if self._reranker is not None:
-                fused = self._rerank(fused, docs, query)
+            if self._ranker.has_reranker:
+                fused = self._ranker.rerank(
+                    fused,
+                    docs,
+                    query,
+                    window_size=max(4 * self.top_k, self.top_k),
+                )
             chosen = fused[:slots]
 
         selected = sorted(set(chosen) | set(tail))
@@ -145,85 +365,31 @@ class RelevantHistorySelector:
         return [m for i in selected for m in turns[i]]
 
     # ------------------------------------------------------------------
-    # Stage 1 — retrieval rankings (best-first candidate index lists)
+    # Internals — delegate scoring to the shared HybridRanker
     # ------------------------------------------------------------------
 
+    def _fuse(
+        self, docs: list[str], candidates: list[int], query: str
+    ) -> list[int] | None:
+        """RRF-fused candidate ranking, or ``None`` when no scorer has signal."""
+        maybe_rankings = [self._ranker.bm25_ranking(docs, candidates, query)]
+        if self._ranker.has_dense:
+            maybe_rankings.append(self._ranker.dense_ranking(docs, candidates, query))
+        rankings = [r for r in maybe_rankings if r is not None]
+        if not rankings:
+            return None
+        return self._ranker.rrf_fuse(rankings)
+
+    # Kept for direct unit-test access; each forwards to the shared ranker.
     def _bm25_ranking(
         self, docs: list[str], candidates: list[int], query: str
     ) -> list[int] | None:
-        """Best-first candidate ranking, or ``None`` when BM25 has no signal."""
-        query_tokens = _tokenize(query)
-        if not query_tokens:
-            logger.warning("_bm25_ranking: query produced no tokens; no signal")
-            return None
-        # "_" placeholder keeps a pathological empty doc from breaking the
-        # index; it can never match a real query token.
-        corpus = [_tokenize(docs[i]) or ["_"] for i in candidates]
-        retriever = bm25s.BM25()
-        retriever.index(corpus, show_progress=False)
-        scores = retriever.get_scores(query_tokens)
-        if float(scores.max()) - float(scores.min()) < 1e-12:
-            return None  # every doc tied — ordering would be arbitrary
-        # Remaining ties break toward recency.
-        order = sorted(
-            range(len(candidates)), key=lambda j: (-scores[j], -candidates[j])
-        )
-        return [candidates[j] for j in order]
+        return self._ranker.bm25_ranking(docs, candidates, query)
 
     def _dense_ranking(
         self, docs: list[str], candidates: list[int], query: str
     ) -> list[int] | None:
-        """Best-first candidate ranking, or ``None`` when cosine has no signal."""
-        vectors = self._embed_cached([docs[i] for i in candidates])
-        query_vec = self._normalize(
-            np.asarray(self._embeddings.embed_query(query), dtype=np.float32)
-        )
-        index = faiss.IndexFlatIP(vectors.shape[1])
-        index.add(vectors)
-        similarities, order = index.search(query_vec[None, :], len(candidates))
-        if float(similarities.max()) - float(similarities.min()) < 1e-9:
-            return None  # every doc tied — ordering would be arbitrary
-        return [candidates[j] for j in order[0] if j != -1]
-
-    # ------------------------------------------------------------------
-    # Stage 2 — rerank
-    # ------------------------------------------------------------------
+        return self._ranker.dense_ranking(docs, candidates, query)
 
     def _rrf_fuse(self, rankings: list[list[int]]) -> list[int]:
-        scores: dict[int, float] = defaultdict(float)
-        for ranking in rankings:
-            for position, idx in enumerate(ranking):
-                scores[idx] += 1.0 / (self.rrf_k + position + 1)
-        # Ties break toward recency (higher turn index first).
-        return sorted(scores, key=lambda i: (-scores[i], -i))
-
-    def _rerank(self, fused: list[int], docs: list[str], query: str) -> list[int]:
-        window = fused[: max(4 * self.top_k, self.top_k)]
-        scores = self._reranker(query, [docs[i] for i in window])
-        order = sorted(range(len(window)), key=lambda j: (-scores[j], -window[j]))
-        return [window[j] for j in order] + fused[len(window) :]
-
-    # ------------------------------------------------------------------
-    # Embedding cache
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _normalize(vec: np.ndarray) -> np.ndarray:
-        return vec / max(float(np.linalg.norm(vec)), 1e-12)
-
-    def _embed_cached(self, texts: list[str]) -> np.ndarray:
-        keys = [hashlib.sha1(t.encode("utf-8")).hexdigest() for t in texts]
-        missing = [
-            (k, t) for k, t in zip(keys, texts) if k not in self._embedding_cache
-        ]
-        if missing:
-            logger.debug(
-                f"_embed_cached: embedding {len(missing)} new turn pair(s) "
-                f"({len(texts) - len(missing)} cached)"
-            )
-            new_vectors = self._embeddings.embed_documents([t for _, t in missing])
-            for (key, _), vec in zip(missing, new_vectors):
-                self._embedding_cache[key] = self._normalize(
-                    np.asarray(vec, dtype=np.float32)
-                )
-        return np.stack([self._embedding_cache[k] for k in keys])
+        return self._ranker.rrf_fuse(rankings)

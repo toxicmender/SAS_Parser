@@ -113,6 +113,22 @@ window may have already dropped.
 
 Wire it into the pipeline via `SasLLMPipeline(history_selector=...)`.
 
+### HybridRanker — the shared retrieval core
+
+The BM25 + dense + RRF + reranker stack lives in `HybridRanker`, independent of
+chat history. It has two modes:
+
+- **Stateless per-call** (`bm25_ranking` / `dense_ranking` / `rrf_fuse` /
+  `rerank`): ranks an arbitrary doc list afresh each call, for a corpus that
+  changes every time — which is exactly a chat thread, so
+  `RelevantHistorySelector` uses this mode.
+- **Static corpus** (`index` once, then `query` many): builds one BM25 index
+  and one FAISS index and reuses them across queries, for a fixed corpus where
+  a per-query rebuild would dominate runtime. `query` returns an empty list on
+  no signal — a fixed corpus has no recency to fall back to.
+
+`RelevantHistorySelector` is a thin policy layer over the per-call mode.
+
 ### Two-stage retrieve-then-rerank
 
 Over the thread's `(human, AI)` turn pairs:
