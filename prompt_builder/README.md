@@ -9,9 +9,9 @@ The package imports nothing from `chunker` or `llm_client`; it reuses
 `memory.relevance.HybridRanker` for retrieval. `chunker.pipeline` remains the
 sole integration point.
 
-> **Status:** built incrementally. **Phases 2–4** ship the data models, the PDF
-> reader, the word-budget chunker, and the reference catalog + extraction cache.
-> Indexing/selection and pipeline wiring land in later phases.
+> **Status:** built incrementally. **Phases 2–5** ship the data models, the PDF
+> reader, the word-budget chunker, the reference catalog + extraction cache, and
+> the two-stage instruction selector. Pipeline wiring lands in Phase 6.
 
 ## Package layout
 
@@ -21,7 +21,7 @@ models.py       InstructionDiagnostic, ConstructKey, DocSection,
 pdf_reader.py   PdfReader — PDF -> list[DocSection], two strategies
 doc_chunker.py  InstructionChunker — DocSection -> word-budgeted InstructionChunk
 catalog.py      DocumentSpec + default_catalog + CorpusLoader (on-disk cache)
-selector.py     (Phase 5) construct lookup + HybridRanker retrieval
+selector.py     InstructionSelector — construct lookup + HybridRanker retrieval
 builder.py      (Phase 6) PromptBuilder facade: read -> chunk -> index -> build
 ```
 
@@ -155,8 +155,46 @@ chunks = CorpusLoader().load(specs)          # cold: reads PDFs; warm: from cach
   `EXTRACTOR_VERSION` when the reader or chunker changes shape. Pass
   `use_cache=False` to bypass it.
 
-> The dense-embedding disk cache the plan pairs with this one lands in Phase 5,
-> alongside the selector that turns embeddings on.
+## InstructionSelector
+
+Retrieves the chunks most relevant to one pipeline item, in two stages:
+
+```python
+from prompt_builder.selector import InstructionSelector
+
+sel = InstructionSelector(chunks, pinned_sections=["Output Format"])
+picks = sel.select(
+    query="advance a date to the next month interval",
+    constructs=[ConstructKey(kind="function", name="intnx")],
+    max_words=1500,
+    top_k=6,
+)
+```
+
+1. **Construct lookup (deterministic).** The item's constructs map straight to
+   the reference section documenting each — an exact hit no ranker can beat.
+   Hazard-linked constructs (SYMPUT/SYMGET, %GOTO, %ABORT, CALL EXECUTE,
+   %SYSFUNC) are fetched first and never stop-listed; a stop-list drops trivial
+   ubiquitous functions (PUT, INPUT, SUM, …) so they don't flood the budget.
+2. **Hybrid ranking (topical).** `HybridRanker` (BM25 always, dense optional)
+   over the whole chunk corpus surfaces guidance no title lookup can find —
+   target-platform sections keyed off the free-text query.
+
+Results fill `max_words` in priority order — **pinned → hazard constructs →
+other constructs → topical** (at most `top_k` topical chunks) — dropping whole
+chunks at the tail, never truncating. Nothing relevant yields an empty list, so
+the caller emits no guidance block (irrelevant reference pages are worse than
+none). The metadata→`ConstructKey`/query mapping lives in the pipeline (Phase 6)
+to keep `prompt_builder` free of any `chunker` import.
+
+### Dense retrieval and the embedding cache
+
+Pass `embeddings=` (a LangChain `Embeddings` or provider string) to add the
+dense stage; `DiskCachedEmbeddings` then memoises document vectors to an `.npz`
+keyed by content SHA-1 (`embedding_cache_path=`), so embedding the 6–9k-chunk
+corpus — the one genuinely expensive step — happens once across runs. It sits
+under `HybridRanker`'s in-process cache, so a warm disk cache means no model
+call at all. Queries, which vary every call, are never cached.
 
 ### Logging — pdf_reader
 
