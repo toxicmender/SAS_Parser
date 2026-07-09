@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# prompt_builder on-disk extraction cache
+.prompt_builder_cache/

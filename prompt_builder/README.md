@@ -9,9 +9,9 @@ The package imports nothing from `chunker` or `llm_client`; it reuses
 `memory.relevance.HybridRanker` for retrieval. `chunker.pipeline` remains the
 sole integration point.
 
-> **Status:** built incrementally. **Phases 2–3** ship the data models, the PDF
-> reader, and the word-budget chunker. Indexing/selection and pipeline wiring
-> land in later phases.
+> **Status:** built incrementally. **Phases 2–4** ship the data models, the PDF
+> reader, the word-budget chunker, and the reference catalog + extraction cache.
+> Indexing/selection and pipeline wiring land in later phases.
 
 ## Package layout
 
@@ -20,6 +20,7 @@ models.py       InstructionDiagnostic, ConstructKey, DocSection,
                 InstructionDoc, InstructionChunk (+ DocRole / ExtractionStrategy)
 pdf_reader.py   PdfReader — PDF -> list[DocSection], two strategies
 doc_chunker.py  InstructionChunker — DocSection -> word-budgeted InstructionChunk
+catalog.py      DocumentSpec + default_catalog + CorpusLoader (on-disk cache)
 selector.py     (Phase 5) construct lookup + HybridRanker retrieval
 builder.py      (Phase 6) PromptBuilder facade: read -> chunk -> index -> build
 ```
@@ -126,6 +127,36 @@ chunks = InstructionChunker(min_words=120, max_words=900, overlap_words=60).chun
 
 Logger name: `prompt_builder.doc_chunker` (INFO on section→chunk counts and each
 oversized split).
+
+## Catalog and extraction cache
+
+`CorpusLoader` reads and chunks a list of `DocumentSpec`s into instruction
+chunks, memoised on disk:
+
+```python
+from prompt_builder.catalog import default_catalog, CorpusLoader
+
+specs = default_catalog("reference_docs")   # only the files actually present
+chunks = CorpusLoader().load(specs)          # cold: reads PDFs; warm: from cache
+```
+
+- **`DocumentSpec`** says how to read one document — `path`, `doc_id`, `role`,
+  `strategy` (`"auto"`/`"toc"`/`"font"`), `section_level`, and `pinned_sections`
+  (used in Phase 6). `default_catalog` ships specs for the bundled
+  `reference_docs/` set with per-document TOC depths pinned from each manual's
+  structure, and returns only the specs whose file is present (the directory is
+  user-provided and untracked).
+- **Extraction cache.** Reading + chunking the ~7,400-page corpus costs tens of
+  seconds per document and never changes between runs, so each document's chunks
+  are cached as JSON under `.prompt_builder_cache/` (gitignored). The cache key
+  is the file's SHA-256 plus everything else that affects output — extractor
+  version, spec, and reader/chunker parameters — so any change re-extracts; a
+  hit skips PyMuPDF entirely (measured ~50× faster than a cold read). Bump
+  `EXTRACTOR_VERSION` when the reader or chunker changes shape. Pass
+  `use_cache=False` to bypass it.
+
+> The dense-embedding disk cache the plan pairs with this one lands in Phase 5,
+> alongside the selector that turns embeddings on.
 
 ### Logging — pdf_reader
 

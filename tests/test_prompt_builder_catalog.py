@@ -1,0 +1,205 @@
+"""
+Tests for prompt_builder.catalog — DocumentSpec, default_catalog, and the
+CorpusLoader on-disk extraction cache (hit, invalidation, round-trip).
+
+Fully offline: fixture PDFs are generated in-process with pymupdf.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+import pymupdf
+
+from prompt_builder.catalog import (
+    CorpusLoader,
+    DocumentSpec,
+    default_catalog,
+)
+from prompt_builder.doc_chunker import InstructionChunker
+from prompt_builder.models import ConstructKey, DocRole
+from prompt_builder.pdf_reader import PdfReader
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _write_funcs_pdf(path: pathlib.Path) -> str:
+    pages = [
+        [
+            ("Dictionary of Functions", 16),
+            ("This section documents SAS functions.", 11),
+            ("INTNX Function", 16),
+            ("Advances a SAS date by a number of intervals. " * 8, 11),
+        ],
+        [
+            ("SUBSTR Function", 16),
+            ("Extracts a substring from a character value. " * 8, 11),
+        ],
+    ]
+    toc = [
+        [1, "Dictionary of Functions", 1],
+        [2, "INTNX Function", 1],
+        [2, "SUBSTR Function", 2],
+    ]
+    doc = pymupdf.open()
+    for lines in pages:
+        page = doc.new_page(width=612, height=792)
+        y = 72.0
+        for text, size in lines:
+            page.insert_text((72, y), text, fontsize=size, fontname="helv")
+            y += size * 1.6 + 6
+    doc.set_toc(toc)
+    doc.save(str(path))
+    doc.close()
+    return str(path)
+
+
+class _CountingReader(PdfReader):
+    """PdfReader that records how many times read() runs (to detect cache hits)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.read_calls = 0
+
+    def read(self, *args, **kwargs):
+        self.read_calls += 1
+        return super().read(*args, **kwargs)
+
+
+def _spec(path: str) -> DocumentSpec:
+    return DocumentSpec(
+        path=path, doc_id="funcs", role=DocRole.SAS_REFERENCE, section_level=2
+    )
+
+
+# ---------------------------------------------------------------------------
+# DocumentSpec / default_catalog
+# ---------------------------------------------------------------------------
+
+
+def test_document_spec_defaults():
+    spec = DocumentSpec(path="x.pdf", doc_id="x")
+    assert spec.role is DocRole.SAS_REFERENCE
+    assert spec.strategy == "auto"
+    assert spec.section_level is None
+    assert spec.pinned_sections == []
+
+
+def test_default_catalog_only_lists_present_files(tmp_path):
+    # An empty reference dir yields no specs.
+    assert default_catalog(str(tmp_path)) == []
+
+    # Drop in one known filename; only that spec comes back, with its pinned level.
+    _write_funcs_pdf(tmp_path / "SAS_Functions_and_Call_Routines.pdf")
+    specs = default_catalog(str(tmp_path))
+    assert [s.doc_id for s in specs] == ["functions"]
+    assert specs[0].section_level == 4
+    assert specs[0].role is DocRole.SAS_REFERENCE
+
+
+# ---------------------------------------------------------------------------
+# CorpusLoader extraction + cache
+# ---------------------------------------------------------------------------
+
+
+def test_load_one_extracts_and_writes_cache(tmp_path):
+    path = _write_funcs_pdf(tmp_path / "funcs.pdf")
+    cache_dir = tmp_path / "cache"
+    loader = CorpusLoader(cache_dir=str(cache_dir))
+    chunks = loader.load_one(_spec(path))
+
+    assert chunks
+    assert all(c.doc_id == "funcs" for c in chunks)
+    assert (cache_dir / "funcs.json").exists()
+    # INTNX construct key survived reader -> chunker.
+    intnx = ConstructKey(kind="function", name="intnx")
+    assert any(intnx in c.construct_keys for c in chunks)
+
+
+def test_second_load_hits_cache_without_reading_pdf(tmp_path):
+    path = _write_funcs_pdf(tmp_path / "funcs.pdf")
+    reader = _CountingReader()
+    loader = CorpusLoader(reader=reader, cache_dir=str(tmp_path / "cache"))
+
+    first = loader.load_one(_spec(path))
+    assert reader.read_calls == 1
+
+    second = loader.load_one(_spec(path))
+    assert reader.read_calls == 1  # served from cache, PDF not re-read
+    assert [c.chunk_id for c in first] == [c.chunk_id for c in second]
+    assert [c.text for c in first] == [c.text for c in second]
+
+
+def test_cache_round_trips_construct_keys_and_pages(tmp_path):
+    path = _write_funcs_pdf(tmp_path / "funcs.pdf")
+    loader = CorpusLoader(cache_dir=str(tmp_path / "cache"))
+    fresh = loader.load_one(_spec(path))
+    # Force a second, cache-served load and compare full fidelity.
+    cached = CorpusLoader(cache_dir=str(tmp_path / "cache")).load_one(_spec(path))
+    assert [c.model_dump() for c in fresh] == [c.model_dump() for c in cached]
+
+
+def test_changed_chunker_params_invalidate_cache(tmp_path):
+    path = _write_funcs_pdf(tmp_path / "funcs.pdf")
+    cache_dir = str(tmp_path / "cache")
+
+    reader_a = _CountingReader()
+    CorpusLoader(reader=reader_a, cache_dir=cache_dir).load_one(_spec(path))
+    assert reader_a.read_calls == 1
+
+    # Different chunker budget -> different signature -> cache miss -> re-read.
+    reader_b = _CountingReader()
+    CorpusLoader(
+        reader=reader_b,
+        chunker=InstructionChunker(min_words=999, max_words=1000),
+        cache_dir=cache_dir,
+    ).load_one(_spec(path))
+    assert reader_b.read_calls == 1
+
+
+def test_changed_source_bytes_invalidate_cache(tmp_path):
+    pdf = tmp_path / "funcs.pdf"
+    _write_funcs_pdf(pdf)
+    cache_dir = str(tmp_path / "cache")
+
+    reader_a = _CountingReader()
+    CorpusLoader(reader=reader_a, cache_dir=cache_dir).load_one(_spec(str(pdf)))
+    assert reader_a.read_calls == 1
+
+    # Rewrite the file with different content: SHA changes -> cache miss.
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "COMPLETELY DIFFERENT CONTENT", fontsize=14)
+    doc.set_toc([[1, "COMPLETELY DIFFERENT CONTENT", 1]])
+    doc.save(str(pdf))
+    doc.close()
+
+    reader_b = _CountingReader()
+    CorpusLoader(reader=reader_b, cache_dir=cache_dir).load_one(_spec(str(pdf)))
+    assert reader_b.read_calls == 1
+
+
+def test_use_cache_false_never_writes(tmp_path):
+    path = _write_funcs_pdf(tmp_path / "funcs.pdf")
+    cache_dir = tmp_path / "cache"
+    loader = CorpusLoader(cache_dir=str(cache_dir), use_cache=False)
+    loader.load_one(_spec(path))
+    assert not cache_dir.exists()
+
+
+def test_load_concatenates_specs_and_skips_missing(tmp_path):
+    path = _write_funcs_pdf(tmp_path / "funcs.pdf")
+    loader = CorpusLoader(cache_dir=str(tmp_path / "cache"))
+    specs = [
+        _spec(path),
+        DocumentSpec(path=str(tmp_path / "absent.pdf"), doc_id="absent"),
+    ]
+    chunks = loader.load(specs)
+    assert chunks  # the present spec's chunks
+    assert all(c.doc_id == "funcs" for c in chunks)  # missing spec contributed none
