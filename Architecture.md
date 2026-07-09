@@ -171,8 +171,11 @@ actually read — so unrelated jobs reusing `work.tmp` stay separate.
 `SasLLMPipeline` compiles a one-node LangGraph `StateGraph(MessagesState)`.
 The model node loads the thread's history from `KVChatMessageHistory`, runs
 `_trim | prompt | LLMClient` (trimming only limits what is *prompted*;
-storage keeps every turn), and persists exactly the prompted message plus
-the response in one bulk `add_messages` write. `llm_client.LLMClient` owns
+storage keeps every turn), and persists exactly the item message plus the
+response in one bulk `add_messages` write. When a `prompt_builder` is set the
+prompt additionally carries a block of reference guidance (see
+`prompt_builder/`), injected via an ephemeral `instructions` placeholder that
+is **prompted but never persisted**. `llm_client.LLMClient` owns
 model construction (temperature, output-token cap, proactive rate limiter)
 and invocation (input-token budget, 429 retry with backoff); an injected
 `llm` still gets the retry/budget layers.
@@ -239,7 +242,13 @@ any of these silently changes behavior.
    on. A `BaseCheckpointSaver` would store full state blobs per turn
    (O(n²) growth in the Delta table) and duplicate the canonical store.
    Corollary: one graph invocation is one conversational turn — the node
-   prompts with, and persists, exactly the last state message.
+   persists exactly the last state message plus the response. **Ephemeral
+   reference guidance is the one thing prompted but not persisted:** when a
+   `prompt_builder` is set, per-item instruction chunks are injected through
+   an `instructions` placeholder carried in the run config, never added to
+   the graph state or the store. This keeps re-derivable guidance out of the
+   O(n) history and out of `RelevantHistorySelector`'s scoring — *stored = the
+   item message; prompted = item message + ephemeral guidance*.
 
 6. **In-memory mode must stay Spark-free.** `_InMemoryBackend` (and
    therefore `DatabricksMemory()` with no arguments) must import and run

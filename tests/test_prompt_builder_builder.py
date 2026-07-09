@@ -1,0 +1,132 @@
+"""
+Tests for prompt_builder.builder — PromptBuilder guidance-block formatting,
+the None-when-empty contract, pinned sections, and from_specs loading.
+
+Fully offline: chunks are built directly; from_specs uses a pymupdf fixture PDF.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+import pymupdf
+
+from prompt_builder.builder import PromptBuilder
+from prompt_builder.catalog import DocumentSpec
+from prompt_builder.models import ConstructKey, DocRole, InstructionChunk
+
+
+def _chunk(chunk_id, section_path, body, *, keys=None, page_start=1, page_end=1):
+    return InstructionChunk(
+        chunk_id=chunk_id,
+        doc_id="functions",
+        section_path=section_path,
+        text=f"{section_path}\n\n{body}",
+        page_start=page_start,
+        page_end=page_end,
+        role=DocRole.SAS_REFERENCE,
+        construct_keys=keys or [],
+    )
+
+
+INTNX = ConstructKey(kind="function", name="intnx")
+
+
+def _corpus():
+    return [
+        _chunk(
+            "c0",
+            "Funcs > INTNX Function",
+            "advances a sas date by a number of intervals",
+            keys=[INTNX],
+            page_start=41,
+            page_end=43,
+        ),
+        _chunk("c1", "Guidelines > Output Format", "always return structured markdown"),
+    ]
+
+
+def test_build_formats_markdown_block():
+    pb = PromptBuilder(_corpus())
+    block = pb.build("advance a date interval", [INTNX])
+    assert block is not None
+    assert block.startswith("## Relevant migration guidance")
+    assert "### [functions · Funcs > INTNX Function · pp. 41-43]" in block
+    assert "advances a sas date" in block
+    # The retrieval-only breadcrumb prefix is stripped from the body.
+    assert "Funcs > INTNX Function\n\nadvances" not in block
+
+
+def test_build_returns_none_when_nothing_relevant():
+    pb = PromptBuilder(_corpus())
+    assert pb.build("zzz totally unrelated gibberish", []) is None
+
+
+def test_single_page_citation_format():
+    key = ConstructKey(kind="function", name="a")
+    pb = PromptBuilder(
+        [_chunk("c0", "Funcs > A", "body text here", keys=[key], page_start=7, page_end=7)]
+    )
+    block = pb.build("anything", [key])  # deterministic construct hit
+    assert "· p. 7]" in block
+
+
+def test_pinned_section_appears_in_block():
+    pb = PromptBuilder(_corpus(), pinned_sections=["Output Format"])
+    block = pb.build("zzz nothing", [])
+    assert block is not None
+    assert "Output Format" in block
+
+
+def test_max_instruction_words_caps_block():
+    big = [
+        _chunk("c0", "Funcs > A", " ".join(f"w{i}" for i in range(400)), keys=[INTNX]),
+        _chunk(
+            "c1",
+            "Funcs > B",
+            " ".join(f"x{i}" for i in range(400)),
+            keys=[ConstructKey(kind="function", name="b")],
+        ),
+    ]
+    pb = PromptBuilder(big, max_instruction_words=420)
+    block = pb.build("w1 w2", [INTNX, ConstructKey(kind="function", name="b")])
+    # Only the first ~400-word chunk fits the 420 budget.
+    assert "Funcs > A" in block
+    assert "Funcs > B" not in block
+
+
+# ---------------------------------------------------------------------------
+# from_specs (load + cache path)
+# ---------------------------------------------------------------------------
+
+
+def _write_funcs_pdf(path: pathlib.Path) -> str:
+    doc = pymupdf.open()
+    for lines in [
+        [
+            ("Dictionary of Functions", 16),
+            ("INTNX Function", 16),
+            ("Advances a SAS date by a number of intervals. " * 6, 11),
+        ],
+    ]:
+        page = doc.new_page(width=612, height=792)
+        y = 72.0
+        for text, size in lines:
+            page.insert_text((72, y), text, fontsize=size, fontname="helv")
+            y += size * 1.6 + 6
+    doc.set_toc([[1, "Dictionary of Functions", 1], [2, "INTNX Function", 1]])
+    doc.save(str(path))
+    doc.close()
+    return str(path)
+
+
+def test_from_specs_loads_and_builds(tmp_path):
+    pdf = _write_funcs_pdf(tmp_path / "funcs.pdf")
+    spec = DocumentSpec(path=pdf, doc_id="functions", section_level=2)
+    pb = PromptBuilder.from_specs([spec], cache_dir=str(tmp_path / "cache"))
+    block = pb.build("advance a date", [INTNX])
+    assert block is not None
+    assert "INTNX Function" in block

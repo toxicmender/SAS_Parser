@@ -13,19 +13,21 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableConfig, RunnableLambda
 from langgraph.graph import START, MessagesState, StateGraph
 from llm_client import LLMClient, LLMClientConfig
 from memory.relevance import RelevantHistorySelector
 from memory.short_mem import DatabricksMemory
+from prompt_builder import ConstructKey, PromptBuilder
 
 from .batcher import MultiFileBatcher, SasChunkBatcher
 from .chunker import SasSemanticChunker
 from .models import (
     SasBatch,
     SasChunk,
+    SasChunkKind,
     SasCorpus,
     SasDiagnostic,
 )
@@ -49,6 +51,76 @@ logger = logging.getLogger(__name__)
 
 def _fmt_list(xs: list[str] | None) -> str:
     return ", ".join(xs) if xs else "none"
+
+
+# ---------------------------------------------------------------------------
+# Item -> instruction-retrieval query / constructs
+#
+# This is the sole metadata -> prompt_builder mapping; keeping it here (not in
+# prompt_builder) is what lets that package stay free of any chunker import.
+# ---------------------------------------------------------------------------
+
+
+def _query_for_chunk(chunk: SasChunk) -> str:
+    """Free-text retrieval query from a chunk's *constructs*, not its source.
+
+    Dataset names and literal source text are retrieval noise for reference
+    guidance, which is organised by construct; kind, title, and the recognised
+    functions / routines / statements are the signal.
+    """
+    m = chunk.metadata
+    tokens = [chunk.kind.value.replace("_", " "), chunk.title or ""]
+    if m.proc_name:
+        tokens.append(m.proc_name)
+    tokens.extend(m.recognized_functions)
+    tokens.extend(m.recognized_call_routines)
+    if m.global_statement_keyword:
+        tokens.append(m.global_statement_keyword)
+    if m.control_flow_op:
+        tokens.append(m.control_flow_op)
+    tokens.extend(m.invokes_macros)
+    return " ".join(t for t in tokens if t)
+
+
+def _query_for_item(item: SasBatch | SasChunk) -> str:
+    chunks = item.chunks if isinstance(item, SasBatch) else [item]
+    return " ".join(_query_for_chunk(c) for c in chunks)
+
+
+def _constructs_for_item(item: SasBatch | SasChunk) -> list[ConstructKey]:
+    """The SAS constructs an item uses, as reference-lookup keys.
+
+    Hazard flags add their canonical construct even when the name extractor
+    missed it, so the selector still pulls the SYMPUT / %GOTO / %ABORT section.
+    """
+    chunks = item.chunks if isinstance(item, SasBatch) else [item]
+    keys: list[ConstructKey] = []
+    seen: set[ConstructKey] = set()
+
+    def add(kind: str, name: str | None) -> None:
+        if not name:
+            return
+        key = ConstructKey(kind=kind, name=name.lower())
+        if key not in seen:
+            seen.add(key)
+            keys.append(key)
+
+    for chunk in chunks:
+        m = chunk.metadata
+        if chunk.kind is SasChunkKind.PROC_STEP:
+            add("proc", m.proc_name)
+        for fn in m.recognized_functions:
+            add("function", fn)
+        for routine in m.recognized_call_routines:
+            add("call_routine", routine)
+        add("global_statement", m.global_statement_keyword)
+        if m.symput_scope_hazard:
+            add("call_routine", "symput")
+        if m.contains_computed_goto:
+            add("macro_statement", "goto")
+        if m.contains_abort:
+            add("macro_statement", "abort")
+    return keys
 
 
 def _diagnostics_for_chunk(
@@ -241,6 +313,13 @@ class SasLLMPipeline:
         injecting a fake or pre-configured client (e.g. in tests).  The
         retry and input-token-budget layers still wrap an injected model;
         ``temperature`` / ``requests_per_second`` do not apply to it.
+    prompt_builder : PromptBuilder | None
+        Reference-PDF guidance source. When set, each item's prompt gains a
+        block of instruction chunks relevant to that item's constructs
+        (retrieved from the reference corpus). The guidance is **ephemeral**:
+        it is prompted but never stored in the thread's history — see the
+        load-bearing invariant on this in Architecture.md. ``None`` (default)
+        disables guidance injection entirely.
     """
 
     def __init__(
@@ -263,13 +342,16 @@ class SasLLMPipeline:
         spark: "SparkSession | None" = None,
         delta_table: str | None = None,
         llm: Any | None = None,
+        prompt_builder: PromptBuilder | None = None,
     ) -> None:
         logger.info(
-            f"SasLLMPipeline.__init__  model={model}  output_language={output_language}  window_k={window_k}"
+            f"SasLLMPipeline.__init__  model={model}  output_language={output_language}  "
+            f"window_k={window_k}  guidance={'on' if prompt_builder else 'off'}"
         )
         self.model = model
         self.window_k = window_k
         self._history_selector = history_selector
+        self._prompt_builder = prompt_builder
 
         self.chunker = SasSemanticChunker(min_words=min_words, max_words=max_words)
         self.batcher = SasChunkBatcher(include_options_chunks=include_options_chunks)
@@ -301,18 +383,26 @@ class SasLLMPipeline:
             [
                 ("system", self._system_prompt),
                 MessagesPlaceholder("history"),
+                # Ephemeral per-item reference guidance: 0 or 1 SystemMessage,
+                # prompted but never persisted (see _call_model).
+                MessagesPlaceholder("instructions"),
                 ("human", "{input}"),
             ]
         )
 
         def _trim(inputs: dict[str, Any]) -> dict[str, Any]:
             history: list[BaseMessage] = inputs.get("history", [])
+            instructions = inputs.get("instructions", [])
             if self._history_selector is not None:
                 selected = self._history_selector.select(history, inputs["input"])
                 logger.debug(
                     f"_trim: relevance selector kept {len(selected)}/{len(history)} message(s)"
                 )
-                return {"input": inputs["input"], "history": selected}
+                return {
+                    "input": inputs["input"],
+                    "history": selected,
+                    "instructions": instructions,
+                }
             k = self.window_k
             if k is not None and len(history) > k * 2:
                 dropped = len(history) - k * 2
@@ -320,7 +410,11 @@ class SasLLMPipeline:
                     f"_trim: dropping {dropped} old message(s), window_k={k}"
                 )
                 history = history[-(k * 2) :]
-            return {"input": inputs["input"], "history": history}
+            return {
+                "input": inputs["input"],
+                "history": history,
+                "instructions": instructions,
+            }
 
         chain = RunnableLambda(_trim) | prompt | self._llm_client.as_runnable()
 
@@ -330,11 +424,19 @@ class SasLLMPipeline:
             # One graph invocation == one conversational turn: only the LAST
             # state message is prompted, and exactly that message plus the
             # response is persisted (the store never records an unshown message).
+            # Reference guidance is prompted via `instructions` but is NOT part
+            # of the persisted turn — it is re-derivable, would bloat the store,
+            # and would pollute relevance-based history selection.
             thread_id = config["configurable"]["thread_id"]
+            instructions = config["configurable"].get("instructions", [])
             history = self._memory.get_thread(thread_id)
             input_message = state["messages"][-1]
             response = chain.invoke(
-                {"input": input_message.content, "history": history.messages}
+                {
+                    "input": input_message.content,
+                    "history": history.messages,
+                    "instructions": instructions,
+                }
             )
             history.add_messages([input_message, response])
             return {"messages": [response]}
@@ -448,6 +550,23 @@ class SasLLMPipeline:
     def _default_thread_id(source_ids: list[str]) -> str:
         return "run::" + "+".join(source_ids)
 
+    def _instruction_messages(
+        self, item: SasBatch | SasChunk
+    ) -> list[BaseMessage]:
+        """Ephemeral reference-guidance message(s) for *item* — [] when none."""
+        if self._prompt_builder is None:
+            return []
+        query = _query_for_item(item)
+        constructs = _constructs_for_item(item)
+        guidance = self._prompt_builder.build(query, constructs)
+        if not guidance:
+            return []
+        item_id = item.batch_id if isinstance(item, SasBatch) else item.chunk_id
+        logger.debug(
+            f"_instruction_messages: item={item_id}  guidance_chars={len(guidance)}"
+        )
+        return [SystemMessage(guidance)]
+
     def _process(
         self,
         items: list[SasBatch | SasChunk],
@@ -465,7 +584,6 @@ class SasLLMPipeline:
         )
         t_pipeline = time.perf_counter()
         outputs: list[dict[str, Any]] = []
-        cfg: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
         for idx, item in enumerate(items, start=1):
             is_batch = isinstance(item, SasBatch)
@@ -479,6 +597,14 @@ class SasLLMPipeline:
                 if is_batch
                 else _format_chunk_message(item, idx, total, diagnostics)
             )
+            # Per-item guidance rides in the config, not the state, so it is
+            # prompted without ever entering the persisted message history.
+            cfg: RunnableConfig = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "instructions": self._instruction_messages(item),
+                }
+            }
 
             t_item = time.perf_counter()
             try:

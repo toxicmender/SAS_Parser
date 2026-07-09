@@ -11,3 +11,19 @@ import machinery treat it uniformly. Imports nothing from ``chunker`` or
 
 See prompt_builder/README.md.
 """
+
+from .builder import PromptBuilder
+from .catalog import CorpusLoader, DocumentSpec, default_catalog
+from .models import ConstructKey, DocRole, InstructionChunk
+from .selector import InstructionSelector
+
+__all__ = [
+    "PromptBuilder",
+    "InstructionSelector",
+    "CorpusLoader",
+    "DocumentSpec",
+    "default_catalog",
+    "ConstructKey",
+    "DocRole",
+    "InstructionChunk",
+]

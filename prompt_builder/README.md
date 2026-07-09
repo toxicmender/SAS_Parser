@@ -9,9 +9,8 @@ The package imports nothing from `chunker` or `llm_client`; it reuses
 `memory.relevance.HybridRanker` for retrieval. `chunker.pipeline` remains the
 sole integration point.
 
-> **Status:** built incrementally. **Phases 2–5** ship the data models, the PDF
-> reader, the word-budget chunker, the reference catalog + extraction cache, and
-> the two-stage instruction selector. Pipeline wiring lands in Phase 6.
+> **Status:** complete. The pipeline injects per-item reference guidance when a
+> `PromptBuilder` is passed to `SasLLMPipeline(prompt_builder=...)`.
 
 ## Package layout
 
@@ -22,8 +21,27 @@ pdf_reader.py   PdfReader — PDF -> list[DocSection], two strategies
 doc_chunker.py  InstructionChunker — DocSection -> word-budgeted InstructionChunk
 catalog.py      DocumentSpec + default_catalog + CorpusLoader (on-disk cache)
 selector.py     InstructionSelector — construct lookup + HybridRanker retrieval
-builder.py      (Phase 6) PromptBuilder facade: read -> chunk -> index -> build
+builder.py      PromptBuilder facade: read -> chunk -> index -> build(query)
 ```
+
+## Quick start
+
+```python
+from chunker.pipeline import SasLLMPipeline
+from prompt_builder import PromptBuilder
+
+# Load + chunk + index the reference corpus once (cached on disk after run 1).
+builder = PromptBuilder.from_reference_dir("reference_docs")
+
+pipeline = SasLLMPipeline(model="claude-haiku-4-5-20251001", prompt_builder=builder)
+pipeline.run_file("etl.sas")   # each item's prompt now carries relevant guidance
+```
+
+Every batch/singleton the pipeline sends the LLM gains a `## Relevant migration
+guidance` block: the reference sections for that item's exact constructs, plus
+topically retrieved target-platform chunks. The guidance is **ephemeral** — it
+is prompted but never written to the conversation history (it is re-derivable,
+would bloat the store, and would skew relevance-based history selection).
 
 ## PdfReader
 
@@ -195,6 +213,30 @@ keyed by content SHA-1 (`embedding_cache_path=`), so embedding the 6–9k-chunk
 corpus — the one genuinely expensive step — happens once across runs. It sits
 under `HybridRanker`'s in-process cache, so a warm disk cache means no model
 call at all. Queries, which vary every call, are never cached.
+
+## PromptBuilder
+
+The facade over the whole package. Load + chunk + index the corpus once
+(`PromptBuilder(chunks)`, `PromptBuilder.from_specs(specs)`, or
+`PromptBuilder.from_reference_dir(dir)`), then `build(query, constructs)`
+returns a Markdown block or `None`:
+
+```
+## Relevant migration guidance
+
+### [functions · … > INTNX Function · pp. 1109-1118]
+INTNX Function  Increments a date, time, or datetime value …
+
+### [spark_guide · … > DataFrames and SQL · p. 15]
+…
+```
+
+Keep `max_instruction_words` ≥ the chunker's `max_words` (default 1500 ≥ 900)
+so any single reference section always fits — the budget then limits only the
+*number* of chunks, dropping whole chunks at the tail, never a lone construct
+hit. The pipeline builds the `(query, constructs)` for each item from its SAS
+metadata (`chunker.pipeline._query_for_item` / `_constructs_for_item`) — that
+mapping lives in the pipeline, not here, so this package imports no `chunker`.
 
 ### Logging — pdf_reader
 
