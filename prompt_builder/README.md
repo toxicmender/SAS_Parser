@@ -9,8 +9,8 @@ The package imports nothing from `chunker` or `llm_client`; it reuses
 `memory.relevance.HybridRanker` for retrieval. `chunker.pipeline` remains the
 sole integration point.
 
-> **Status:** built incrementally. **Phase 2** (this commit) ships the data
-> models and the PDF reader. Chunking, indexing/selection, and pipeline wiring
+> **Status:** built incrementally. **Phases 2–3** ship the data models, the PDF
+> reader, and the word-budget chunker. Indexing/selection and pipeline wiring
 > land in later phases.
 
 ## Package layout
@@ -19,7 +19,7 @@ sole integration point.
 models.py       InstructionDiagnostic, ConstructKey, DocSection,
                 InstructionDoc, InstructionChunk (+ DocRole / ExtractionStrategy)
 pdf_reader.py   PdfReader — PDF -> list[DocSection], two strategies
-doc_chunker.py  (Phase 3) DocSection -> word-budgeted InstructionChunk
+doc_chunker.py  InstructionChunker — DocSection -> word-budgeted InstructionChunk
 selector.py     (Phase 5) construct lookup + HybridRanker retrieval
 builder.py      (Phase 6) PromptBuilder facade: read -> chunk -> index -> build
 ```
@@ -96,7 +96,38 @@ Like the SAS chunker, the reader never raises on a malformed document; it emits
 No OCR and no table-structure extraction in v1 — every bundled reference PDF has
 a clean text layer.
 
-### Logging
+## InstructionChunker
+
+Turns reader sections into retrieval-ready `InstructionChunk`s under a word
+budget:
+
+```python
+from prompt_builder.doc_chunker import InstructionChunker
+
+chunks = InstructionChunker(min_words=120, max_words=900, overlap_words=60).chunk(
+    sections, role=summary.role
+)
+```
+
+- **Merge.** Consecutive sections under the *same parent heading* whose combined
+  text is below `min_words` merge into one chunk (SAS function dictionaries have
+  the odd one-line entry). The merged chunk collapses to the shared parent
+  breadcrumb and aggregates every member's construct key; a section that already
+  meets `min_words` stands alone.
+- **Split.** A chunk over `max_words` splits into overlapping windows at
+  paragraph boundaries (a single over-long paragraph is hard-split on word
+  count). Unlike the SAS chunker there is no parent/child pair — the LLM only
+  ever sees the retrieved window, so plain windows suffice.
+- **Breadcrumb prefix.** Every chunk's stored text is prefixed with its section
+  breadcrumb, so heading terms ("MERGE", "INTNX") weigh on retrieval even when
+  the prose below never repeats them. The word budget governs the section
+  *body*; the small breadcrumb prefix sits on top of it (the hard token cap is
+  `llm_client`'s job at prompt time).
+
+Logger name: `prompt_builder.doc_chunker` (INFO on section→chunk counts and each
+oversized split).
+
+### Logging — pdf_reader
 
 Logger name: `prompt_builder.pdf_reader`
 
