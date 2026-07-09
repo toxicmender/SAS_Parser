@@ -10,6 +10,7 @@ dependencies = [
     "langchain>=1.3.11",
     "langgraph>=1.0",
     "pydantic>=2.13.4",
+    "pymupdf>=1.28.0",
     "pyspark>=4.1.2",
     "regex>=2026.6.28",
 ]
@@ -21,7 +22,12 @@ dev       = ["pytest>=8", "pytest-cov", "ruff"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-# chunker/pipeline.py imports memory.short_mem and llm_client, so all three
-# packages must ship — a wheel with chunker alone breaks
+# chunker/pipeline.py imports memory.short_mem, llm_client, and prompt_builder,
+# so all four packages must ship — a wheel with chunker alone breaks
 # `from chunker import SasLLMPipeline`.
-include = ["chunker*", "memory*", "llm_client*"]
+include = ["chunker*", "memory*", "llm_client*", "prompt_builder*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: end-to-end tests over the real reference_docs corpus; skipped when the PDFs are absent",
+]

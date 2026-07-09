@@ -13,6 +13,11 @@ layers, each usable on its own:
    memory persisted to a KV store (in-memory dict locally, Databricks Delta
    in production).
 
+An optional fourth component, **prompt_builder**, reads reference PDFs (SAS
+manuals, target-platform guides) into retrieval-ready instruction chunks and,
+when passed to the pipeline, injects per-item guidance relevant to each work
+item's constructs — prompted to the LLM but never persisted (see invariant 5).
+
 ```
                  +----------------------+
   SAS source(s) ─▶ SasSemanticChunker   │──▶ SasChunkResult (per file)
@@ -30,8 +35,12 @@ layers, each usable on its own:
                  │ (LangGraph graph,    │ turns │ (KV chat history)  │
                  │  one thread per run) │       +--------------------+
                  +----------------------+
-                          ▼
-                LLM responses, one per batch/singleton
+                    ▲ ephemeral   │
+                    │ guidance    ▼
+   +----------------------+   LLM responses, one per batch/singleton
+   │ prompt_builder       │◀── reference PDFs (SAS + target manuals)
+   │ (PromptBuilder, opt) │
+   +----------------------+
 ```
 
 ## Package layout
@@ -88,14 +97,39 @@ memory/
                         KVChatMessageHistory (BaseChatMessageHistory),
                         ThreadMemoryManager, KVMemoryStore, and the
                         DatabricksMemory entry-point façade.
+
+prompt_builder/
+  models.py             Pydantic models: InstructionChunk, DocSection,
+                        InstructionDoc, InstructionDiagnostic, ConstructKey
+                        (frozen), DocRole / ExtractionStrategy.
+  pdf_reader.py         PdfReader: reference PDF -> DocSections via a TOC or a
+                        font-heuristic strategy, with shared text cleanup,
+                        SAS-title -> ConstructKey parsing, and chunker-style
+                        diagnostics (never raises).
+  doc_chunker.py        InstructionChunker: DocSections -> word-budgeted
+                        InstructionChunks (same-parent merge, oversized
+                        paragraph-window split, breadcrumb prefix).
+  catalog.py            DocumentSpec, default_catalog (the bundled
+                        reference_docs set), and CorpusLoader with a per-doc
+                        on-disk extraction cache keyed by file SHA-256.
+  selector.py           InstructionSelector: construct-key lookup (hazard-
+                        first, stop-listed) + HybridRanker topical ranking
+                        under a word budget; DiskCachedEmbeddings for the
+                        dense stage. Imports memory.relevance only.
+  builder.py            PromptBuilder façade: read -> chunk -> index at
+                        construction, then build(query, constructs) -> a
+                        Markdown guidance block or None.
 ```
 
 Import direction is strictly downward: `keywords` and `models` import
 nothing from the package; `scanner` and `metadata` import from them;
 `chunker.py` imports from all four; `batcher` imports from `keywords`,
 `metadata`, `models`; `pipeline` sits on top and is the **only** module that
-imports `memory.short_mem`, `memory.relevance`, and `llm_client`. `memory` and
-`llm_client` never import `chunker` (or each other).
+imports `memory.short_mem`, `memory.relevance`, `llm_client`, and
+`prompt_builder`. `memory`, `llm_client`, and `prompt_builder` never import
+`chunker` (or each other) — `prompt_builder` reuses `memory.relevance` for
+retrieval, and the SAS-metadata → `(query, constructs)` mapping that feeds it
+lives in `pipeline`, precisely so `prompt_builder` needs no `chunker` import.
 
 ## Chunking model
 

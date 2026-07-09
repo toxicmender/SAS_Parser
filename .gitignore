@@ -11,3 +11,6 @@ wheels/
 
 # prompt_builder on-disk extraction cache
 .prompt_builder_cache/
+
+# Reference PDFs — user-provided, copyrighted SAS/O'Reilly manuals; never commit
+reference_docs/

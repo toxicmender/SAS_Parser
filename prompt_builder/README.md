@@ -43,6 +43,17 @@ topically retrieved target-platform chunks. The guidance is **ephemeral** — it
 is prompted but never written to the conversation history (it is re-derivable,
 would bloat the store, and would skew relevance-based history selection).
 
+### The `reference_docs/` directory
+
+Drop your reference PDFs into `reference_docs/` at the repo root. The directory
+is **gitignored** — these are user-provided, copyrighted SAS/O'Reilly manuals
+that must never be committed. `default_catalog` recognises the bundled filenames
+(the SAS language manuals, the Base ref sheet, and the Spark excerpt) and reads
+only the ones actually present, so a partial set works. First load extracts and
+caches to `.prompt_builder_cache/` (also gitignored); later loads are ~50×
+faster. To index a document not in the default set, build a `DocumentSpec` for
+it and pass it via `PromptBuilder.from_specs`.
+
 ## PdfReader
 
 ```python
