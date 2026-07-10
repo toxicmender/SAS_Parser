@@ -72,6 +72,74 @@ class TestSasSemanticChunker(unittest.TestCase):
         self.assertEqual(chunk.metadata.output_datasets, ["work.out"])
         self.assertEqual(chunk.metadata.input_datasets, ["work.src"])
 
+    def test_hash_dataset_argument_is_input(self):
+        # A hash constructor's dataset: argument loads that dataset at
+        # instantiation — an input like SET/MERGE, with any dataset options
+        # in the quoted value stripped.
+        source = (
+            "data work.flagged;\n"
+            "  set work.claims;\n"
+            "  declare hash h1(dataset:\"monthly_notes(rename=(cf_total_auth_cnt"
+            " = cf_monthly_notes))\");\n"
+            "  h1.definekey('admit_type');\n"
+            "  h1.definedata('cf_monthly_notes');\n"
+            "  h1.definedone();\n"
+            "run;\n"
+        )
+        result = SasSemanticChunker().chunk_text(source)
+        chunk = result.chunks[0]
+        self.assertEqual(chunk.kind, SasChunkKind.DATA_STEP)
+        self.assertIn("work.monthly_notes", chunk.metadata.input_datasets)
+        self.assertIn("work.monthly_notes", chunk.metadata.referenced_datasets)
+        self.assertEqual(chunk.metadata.component_objects, ["hash"])
+
+    def test_hash_dataset_argument_two_level_name(self):
+        source = (
+            "data work.merged;\n"
+            "  declare hash hm(dataset:'sashelp.class', hashexp:6);\n"
+            "  hm.definekey('Name');\n"
+            "  hm.definedone();\n"
+            "run;\n"
+        )
+        result = SasSemanticChunker().chunk_text(source)
+        chunk = result.chunks[0]
+        self.assertIn("sashelp.class", chunk.metadata.input_datasets)
+
+    def test_hash_dataset_argument_macro_ref_not_guessed(self):
+        # A dataset: value holding a macro reference is unresolvable at the
+        # DATA-step level — it must not be reported as a literal input.
+        source = (
+            "data work.a;\n"
+            "  declare hash h(dataset:\"&lookup_ds\");\n"
+            "  h.definedone();\n"
+            "run;\n"
+        )
+        result = SasSemanticChunker().chunk_text(source)
+        chunk = result.chunks[0]
+        self.assertEqual(chunk.metadata.input_datasets, [])
+
+    def test_macro_body_hash_dataset_literal_and_param(self):
+        # Inside a %MACRO body the same argument classifies like any other
+        # dataset reference: literal name -> body_literal_inputs, &param ->
+        # body_param_inputs against the signature.
+        source = (
+            "%macro lookup(ds);\n"
+            "  data work.out;\n"
+            "    declare hash a(dataset:'work.base_lu');\n"
+            "    a.definedone();\n"
+            "    declare hash b(dataset:\"&ds\");\n"
+            "    b.definedone();\n"
+            "  run;\n"
+            "%mend lookup;\n"
+        )
+        result = SasSemanticChunker().chunk_text(source)
+        chunk = result.chunks[0]
+        self.assertEqual(chunk.kind, SasChunkKind.MACRO_DEFINITION)
+        self.assertIn("work.base_lu", chunk.metadata.body_literal_inputs)
+        self.assertIn(
+            {"param": "ds", "pos": 0}, chunk.metadata.body_param_inputs
+        )
+
     def test_macro_body_data_header_with_options(self):
         # Same hazard inside a %MACRO body: a DATA header carrying dataset
         # options must still yield its real output name, and none of the

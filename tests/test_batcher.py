@@ -108,6 +108,22 @@ class TestDatasetFlow(unittest.TestCase):
         self.assertEqual(len(batch.chunks), 3)
         self.assertIn("work.combined", batch.output_datasets)
 
+    def test_hash_dataset_argument_feeds_consumer(self):
+        """DATA writes work.lu → a hash constructor loads dataset:'lu' in a
+        later step → the dataset: argument is a consume edge → one batch."""
+        src = (
+            "data work.lu;\n set mylib.raw;\n run;\n"
+            "data work.flagged;\n"
+            "  set work.claims;\n"
+            "  declare hash h1(dataset:\"lu(rename=(cnt = monthly_cnt))\");\n"
+            "  h1.definekey('id');\n"
+            "  h1.definedone();\n"
+            "run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertEqual(len(br.batches[0].chunks), 2)
+
     def test_chain_a_b_c_one_batch(self):
         """A→B→C chain (transitive) collapses to one batch."""
         src = (

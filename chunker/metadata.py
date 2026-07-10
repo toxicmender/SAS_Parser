@@ -455,7 +455,7 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
     param_names: list[str] = []
     if kind == SasChunkKind.MACRO_DEFINITION:
         body_lit_in, body_lit_out, body_par_in, body_par_out, param_names = (
-            _macro_body_io(text, mt)
+            _macro_body_io(text, mt, cf)
         )
 
     # ── high-severity control-flow visibility (MACRO_DEFINITION bodies) ─────
@@ -685,6 +685,29 @@ _QUOTED_DATA_OPT_RE = re.compile(
 _QUOTED_OUT_OPT_RE = re.compile(
     r"\bout\s*=\s*((['\"])[^'\";]+\2)", re.IGNORECASE
 )
+# A hash object constructor's DATASET: argument — the dataset loaded into the
+# hash table at instantiation (Programmer's Guide Ch. 21, "Hash Table
+# Merging") — is a data input of the step, like SET/MERGE. The name lives
+# inside a quoted string literal, so it MUST be scanned on the
+# quotes-preserved form (``cf``), never on ``mt``.
+_HASH_DATASET_ARG_RE = re.compile(
+    r"\bdataset\s*:\s*(['\"])\s*([^'\"]+?)\s*\1",
+    re.IGNORECASE,
+)
+
+
+def _hash_dataset_refs(cf: str) -> list[str]:
+    """Raw dataset references from hash constructors' ``dataset:`` arguments
+    in *cf*, with any parenthesised dataset options stripped. References may
+    still hold macro variables (``dataset: "&ds"``) — callers classify or
+    skip those; an unquoted argument (a character variable or expression) is
+    never matched, per "flag as unresolved, do not guess"."""
+    refs: list[str] = []
+    for m in _HASH_DATASET_ARG_RE.finditer(cf):
+        name = m.group(2).split("(", 1)[0].strip()
+        if name:
+            refs.append(name)
+    return refs
 
 
 # Macro body dataset classification. A %MACRO body references datasets either
@@ -775,14 +798,17 @@ def _parse_macro_params(sig_text: str) -> list[tuple[str, str | None]]:
 def _macro_body_io(
     macro_text: str,
     mt: str | None = None,
+    cf: str | None = None,
 ) -> tuple[list[str], list[str], list[dict], list[dict], list[str]]:
     """
     Analyse a %MACRO block's body and classify every dataset reference
     as literal (fixed value) or parameterised (depends on a call argument).
 
-    ``mt`` is the sanitised (comments/strings blanked) form of ``macro_text``;
-    callers that already have it — e.g. :func:`_metadata_for` — pass it in to
-    avoid re-running the sanitiser over the same body.  When omitted it is
+    ``mt`` is the sanitised (comments/strings blanked) form of ``macro_text``
+    and ``cf`` the comments-only-blanked form (string literals intact —
+    needed for hash constructors' quoted ``dataset:`` arguments); callers
+    that already have them — e.g. :func:`_metadata_for` — pass them in to
+    avoid re-running the sanitiser over the same body.  When omitted they are
     computed here, so direct callers can still pass just the raw text.
 
     Returns
@@ -793,6 +819,8 @@ def _macro_body_io(
     """
     if mt is None:
         mt = _sanitise(macro_text)
+    if cf is None:
+        cf = _sanitise(macro_text, blank_strings=False)
 
     sig_m = _MACRO_SIG_RE.search(macro_text)
     params = _parse_macro_params(sig_m.group(1) if sig_m else "")
@@ -856,6 +884,13 @@ def _macro_body_io(
         raw_inputs.append(m.group(1))
     for m in _BODY_SQL_JOIN_RE.finditer(mt):
         raw_inputs.append(m.group(1))
+
+    # Hash constructors' dataset: arguments — scanned on cf because the name
+    # sits inside a quoted literal. May hold &refs (``dataset:"&ds"``), which
+    # _classify_ref resolves against the signature like any other reference.
+    for raw in _hash_dataset_refs(cf):
+        if _AMP_TOKEN_RE.fullmatch(raw):
+            raw_inputs.append(raw)
 
     def _classify_list(raws: list[str], role: str) -> tuple[list[str], list[dict]]:
         literals: list[str] = []
@@ -1028,6 +1063,14 @@ def _io_for(
             outputs.append(_quoted_path(m.group(1)))
         for m in _QUOTED_SET_MERGE_RE.finditer(cf):
             inputs.append(_quoted_path(m.group(1)))
+        # Hash object constructors load their DATASET: argument at
+        # instantiation — an input like SET/MERGE. A value holding a macro
+        # reference is left unresolved rather than guessed.
+        for raw in _hash_dataset_refs(cf):
+            if "&" in raw:
+                continue
+            if (n := _ds_name(raw)) and _DS_TOKEN_RE.fullmatch(n):
+                inputs.append(_canon_ds(n))
 
     elif kind == SasChunkKind.PROC_STEP:
         proc_m = _PROC_RE.search(mt)
