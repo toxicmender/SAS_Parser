@@ -185,6 +185,14 @@ class CorpusLoader:
         )
         return chunks
 
+    def load_documents(self, specs: list[DocumentSpec]) -> list:
+        """
+        The corpus as LangChain ``Document``s (see
+        :meth:`InstructionChunk.to_document`), for feeding a LangChain vector
+        store / retriever / index instead of the built-in selector.
+        """
+        return [chunk.to_document() for chunk in self.load(specs)]
+
     def load_one(self, spec: DocumentSpec) -> list[InstructionChunk]:
         """Chunks for one *spec*, from cache when valid, else freshly extracted."""
         source = Path(spec.path)

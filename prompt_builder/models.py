@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import logging
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field
+
+if TYPE_CHECKING:
+    from langchain_core.documents import Document
 
 logger = logging.getLogger(__name__)
 
@@ -121,3 +125,50 @@ class InstructionChunk(BaseModel):
 
     def __str__(self) -> str:
         return f"InstructionChunk({self.chunk_id}: {self.section_path})"
+
+    # ------------------------------------------------------------------
+    # LangChain Document interop — so the corpus can feed any LangChain
+    # indexing pipeline (vector stores, retrievers, LangChain's index API)
+    # without a custom adapter. Metadata values are kept to str/int so
+    # every vector-store backend accepts them; construct keys flatten to
+    # their "kind:name" string form.
+    # ------------------------------------------------------------------
+
+    def to_document(self) -> "Document":
+        """This chunk as a ``langchain_core.documents.Document``."""
+        from langchain_core.documents import Document
+
+        return Document(
+            id=self.chunk_id,
+            page_content=self.text,
+            metadata={
+                "chunk_id": self.chunk_id,
+                "doc_id": self.doc_id,
+                "section_path": self.section_path,
+                "page_start": self.page_start,
+                "page_end": self.page_end,
+                "role": self.role.value,
+                "construct_keys": [str(k) for k in self.construct_keys],
+                "tags": list(self.tags),
+            },
+        )
+
+    @classmethod
+    def from_document(cls, document: "Document") -> "InstructionChunk":
+        """Rebuild a chunk from a :meth:`to_document` round-trip."""
+        meta = document.metadata
+        keys = []
+        for raw in meta.get("construct_keys", []):
+            kind, _, name = raw.partition(":")
+            keys.append(ConstructKey(kind=kind, name=name))
+        return cls(
+            chunk_id=meta.get("chunk_id") or document.id or "",
+            doc_id=meta["doc_id"],
+            section_path=meta["section_path"],
+            text=document.page_content,
+            page_start=meta["page_start"],
+            page_end=meta["page_end"],
+            role=DocRole(meta.get("role", DocRole.SAS_REFERENCE.value)),
+            construct_keys=keys,
+            tags=list(meta.get("tags", [])),
+        )
