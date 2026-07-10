@@ -31,11 +31,33 @@ from .pdf_reader import PdfReader
 
 logger = logging.getLogger(__name__)
 
-# Bump when the reader or chunker changes in a way that alters output, so old
-# cache entries miss and re-extract even if the source file is unchanged.
+# Manual escape hatch: bump to force a full re-extract even when nothing the
+# automatic signature tracks has changed. Routine reader/chunker edits are
+# picked up automatically via _code_fingerprint().
 EXTRACTOR_VERSION = 1
 
 _DEFAULT_CACHE_DIR = ".prompt_builder_cache"
+
+_CODE_HASH: str | None = None
+
+
+def _code_fingerprint() -> str:
+    """
+    Hash of the extractor source files (pdf_reader.py + doc_chunker.py),
+    folded into every cache signature so a code change re-extracts
+    automatically — no manual EXTRACTOR_VERSION bump needed for the common
+    case. Computed once per process.
+    """
+    global _CODE_HASH
+    if _CODE_HASH is None:
+        from . import doc_chunker as _dc
+        from . import pdf_reader as _pr
+
+        digest = hashlib.sha256()
+        for module in (_pr, _dc):
+            digest.update(Path(module.__file__).read_bytes())
+        _CODE_HASH = digest.hexdigest()[:12]
+    return _CODE_HASH
 
 
 class DocumentSpec(BaseModel):
@@ -170,11 +192,17 @@ class CorpusLoader:
             logger.warning(f"CorpusLoader: file not found, skipping '{spec.path}'")
             return []
 
-        signature = self._signature(spec, source) if self.use_cache else None
-        cache_path = self._cache_path(spec.doc_id)
+        payload: dict | None = None
+        signature: str | None = None
+        file_sha = ""
         if self.use_cache:
-            cached = self._read_cache(cache_path, signature)
-            if cached is not None:
+            payload = self._read_payload(self._cache_path(spec.doc_id))
+            file_sha = self._file_sha_fast(source, payload)
+            signature = self._signature(spec, file_sha)
+            if payload is not None and payload.get("signature") == signature:
+                cached = [
+                    InstructionChunk.model_validate(c) for c in payload["chunks"]
+                ]
                 logger.info(
                     f"CorpusLoader: cache hit doc_id='{spec.doc_id}' "
                     f"({len(cached)} chunk(s))"
@@ -198,8 +226,54 @@ class CorpusLoader:
                 f"diagnostics={[d.code for d in summary.diagnostics]}"
             )
         if self.use_cache:
-            self._write_cache(cache_path, signature, chunks)
+            self._write_cache(spec.doc_id, signature, source, file_sha, chunks)
         return chunks
+
+    # ------------------------------------------------------------------
+    # Freshness API
+    # ------------------------------------------------------------------
+
+    def check_freshness(self, spec: DocumentSpec) -> str:
+        """
+        Cache status for one *spec* without extracting:
+        ``"fresh"`` (cache valid), ``"stale"`` (source bytes, extractor code,
+        or parameters changed), ``"uncached"`` (no readable cache entry), or
+        ``"missing"`` (source file absent).
+        """
+        source = Path(spec.path)
+        if not source.exists():
+            return "missing"
+        payload = self._read_payload(self._cache_path(spec.doc_id))
+        if payload is None:
+            return "uncached"
+        file_sha = self._file_sha_fast(source, payload)
+        return "fresh" if payload.get("signature") == self._signature(spec, file_sha) else "stale"
+
+    def freshness_report(self, specs: list[DocumentSpec]) -> dict[str, str]:
+        """Per-``doc_id`` freshness status (see :meth:`check_freshness`)."""
+        report = {spec.doc_id: self.check_freshness(spec) for spec in specs}
+        logger.info(f"freshness_report: {report}")
+        return report
+
+    def prune_stale(self, specs: list[DocumentSpec]) -> list[str]:
+        """
+        Delete cache entries that no longer serve *specs*: stale entries,
+        entries for specs whose source file is gone, and orphaned entries no
+        spec refers to. Returns the deleted file names.
+        """
+        keep: set[Path] = set()
+        for spec in specs:
+            if self.check_freshness(spec) == "fresh":
+                keep.add(self._cache_path(spec.doc_id))
+        removed: list[str] = []
+        if self.cache_dir.is_dir():
+            for entry in sorted(self.cache_dir.glob("*.json")):
+                if entry not in keep:
+                    entry.unlink()
+                    removed.append(entry.name)
+        if removed:
+            logger.info(f"prune_stale: removed {removed}")
+        return removed
 
     # ------------------------------------------------------------------
     # Cache internals
@@ -209,11 +283,29 @@ class CorpusLoader:
         safe = re.sub(r"[^A-Za-z0-9._-]", "_", doc_id)
         return self.cache_dir / f"{safe}.json"
 
-    def _signature(self, spec: DocumentSpec, source: Path) -> str:
+    @staticmethod
+    def _file_sha_fast(source: Path, payload: dict | None) -> str:
+        """
+        The source file's SHA-256, trusting the cached value when size and
+        mtime both match (the stat fast-path — no rehash of a multi-MB PDF on
+        every load); any stat difference forces a real rehash.
+        """
+        stat = source.stat()
+        if (
+            payload is not None
+            and payload.get("file_size") == stat.st_size
+            and payload.get("file_mtime_ns") == stat.st_mtime_ns
+            and payload.get("file_sha")
+        ):
+            return payload["file_sha"]
+        return _file_sha256(source)
+
+    def _signature(self, spec: DocumentSpec, file_sha: str) -> str:
         """Hash of everything that determines a document's chunks."""
         parts = [
             f"v={EXTRACTOR_VERSION}",
-            f"sha={_file_sha256(source)}",
+            f"code={_code_fingerprint()}",
+            f"sha={file_sha}",
             f"doc={spec.doc_id}",
             f"role={spec.role}",
             f"strategy={spec.strategy}",
@@ -226,29 +318,34 @@ class CorpusLoader:
         ]
         return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
-    def _read_cache(
-        self, cache_path: Path, signature: str | None
-    ) -> list[InstructionChunk] | None:
+    @staticmethod
+    def _read_payload(cache_path: Path) -> dict | None:
         if not cache_path.exists():
             return None
         try:
-            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            return json.loads(cache_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning(f"CorpusLoader: unreadable cache '{cache_path}': {exc}")
             return None
-        if payload.get("signature") != signature:
-            logger.debug(f"CorpusLoader: stale cache '{cache_path}', re-extracting")
-            return None
-        return [InstructionChunk.model_validate(c) for c in payload["chunks"]]
 
     def _write_cache(
-        self, cache_path: Path, signature: str | None, chunks: list[InstructionChunk]
+        self,
+        doc_id: str,
+        signature: str | None,
+        source: Path,
+        file_sha: str,
+        chunks: list[InstructionChunk],
     ) -> None:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        stat = source.stat()
         payload = {
             "signature": signature,
+            "file_sha": file_sha,
+            "file_size": stat.st_size,
+            "file_mtime_ns": stat.st_mtime_ns,
             "chunks": [c.model_dump(mode="json") for c in chunks],
         }
+        cache_path = self._cache_path(doc_id)
         cache_path.write_text(json.dumps(payload), encoding="utf-8")
         logger.debug(
             f"CorpusLoader: wrote cache '{cache_path}' ({len(chunks)} chunk(s))"

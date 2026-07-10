@@ -193,6 +193,112 @@ def test_use_cache_false_never_writes(tmp_path):
     assert not cache_dir.exists()
 
 
+# ---------------------------------------------------------------------------
+# Freshness API — check_freshness / freshness_report / prune_stale
+# ---------------------------------------------------------------------------
+
+
+def test_freshness_lifecycle(tmp_path):
+    pdf = tmp_path / "funcs.pdf"
+    _write_funcs_pdf(pdf)
+    loader = CorpusLoader(cache_dir=str(tmp_path / "cache"))
+    spec = _spec(str(pdf))
+
+    assert loader.check_freshness(spec) == "uncached"
+    loader.load_one(spec)
+    assert loader.check_freshness(spec) == "fresh"
+
+    # Rewriting the source with different bytes makes the entry stale.
+    doc = pymupdf.open()
+    doc.new_page().insert_text((72, 72), "changed content", fontsize=14)
+    doc.set_toc([[1, "changed content", 1]])
+    doc.save(str(pdf))
+    doc.close()
+    assert loader.check_freshness(spec) == "stale"
+
+    pdf.unlink()
+    assert loader.check_freshness(spec) == "missing"
+
+
+def test_freshness_report_covers_all_specs(tmp_path):
+    pdf = tmp_path / "funcs.pdf"
+    _write_funcs_pdf(pdf)
+    loader = CorpusLoader(cache_dir=str(tmp_path / "cache"))
+    present = _spec(str(pdf))
+    absent = DocumentSpec(path=str(tmp_path / "absent.pdf"), doc_id="absent")
+    loader.load_one(present)
+
+    report = loader.freshness_report([present, absent])
+    assert report == {"funcs": "fresh", "absent": "missing"}
+
+
+def test_stat_fast_path_skips_rehash(tmp_path, monkeypatch):
+    import prompt_builder.catalog as catalog_mod
+
+    pdf = tmp_path / "funcs.pdf"
+    _write_funcs_pdf(pdf)
+    loader = CorpusLoader(cache_dir=str(tmp_path / "cache"))
+    spec = _spec(str(pdf))
+    loader.load_one(spec)  # populates cache incl. size/mtime/sha
+
+    calls = {"n": 0}
+    real = catalog_mod._file_sha256
+
+    def counting_sha(path):
+        calls["n"] += 1
+        return real(path)
+
+    monkeypatch.setattr(catalog_mod, "_file_sha256", counting_sha)
+    loader.load_one(spec)  # warm load: stat matches, no rehash
+    assert calls["n"] == 0
+
+    # Touch the mtime without changing bytes: rehash happens, entry stays fresh.
+    stat = pdf.stat()
+    import os
+
+    os.utime(pdf, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+    assert loader.check_freshness(spec) == "fresh"
+    assert calls["n"] == 1
+
+
+def test_extractor_code_change_invalidates_cache(tmp_path, monkeypatch):
+    import prompt_builder.catalog as catalog_mod
+
+    pdf = tmp_path / "funcs.pdf"
+    _write_funcs_pdf(pdf)
+    loader = CorpusLoader(cache_dir=str(tmp_path / "cache"))
+    spec = _spec(str(pdf))
+    loader.load_one(spec)
+    assert loader.check_freshness(spec) == "fresh"
+
+    # Simulate an edit to pdf_reader.py / doc_chunker.py: the fingerprint
+    # changes, so the signature no longer matches.
+    monkeypatch.setattr(catalog_mod, "_CODE_HASH", "deadbeefdead")
+    assert loader.check_freshness(spec) == "stale"
+
+
+def test_prune_stale_removes_orphans_and_stale_keeps_fresh(tmp_path):
+    pdf = tmp_path / "funcs.pdf"
+    _write_funcs_pdf(pdf)
+    cache_dir = tmp_path / "cache"
+    loader = CorpusLoader(cache_dir=str(cache_dir))
+    spec = _spec(str(pdf))
+    loader.load_one(spec)
+
+    # An orphaned entry no spec refers to, and a stale one for a removed file.
+    (cache_dir / "orphan.json").write_text('{"signature": "x", "chunks": []}')
+    gone_pdf = tmp_path / "gone.pdf"
+    _write_funcs_pdf(gone_pdf)
+    gone_spec = DocumentSpec(path=str(gone_pdf), doc_id="gone", section_level=2)
+    loader.load_one(gone_spec)
+    gone_pdf.unlink()
+
+    removed = loader.prune_stale([spec, gone_spec])
+    assert sorted(removed) == ["gone.json", "orphan.json"]
+    assert (cache_dir / "funcs.json").exists()  # fresh entry kept
+    assert loader.check_freshness(spec) == "fresh"
+
+
 def test_load_concatenates_specs_and_skips_missing(tmp_path):
     path = _write_funcs_pdf(tmp_path / "funcs.pdf")
     loader = CorpusLoader(cache_dir=str(tmp_path / "cache"))
