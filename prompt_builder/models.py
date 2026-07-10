@@ -57,7 +57,8 @@ class ConstructKey(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     kind: str  # function | call_routine | macro_function | macro_statement |
-    #            global_statement | proc | format | informat | option | system_option
+    #            global_statement | proc | format | informat | option |
+    #            system_option | component_object
     name: str  # lowercased identifier, e.g. "intnx", "symput", "let", "sql"
 
     def __str__(self) -> str:

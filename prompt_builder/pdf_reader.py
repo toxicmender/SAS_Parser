@@ -95,6 +95,8 @@ def parse_construct_key(title: str) -> ConstructKey | None:
         return ConstructKey(kind="option", name=m.group(1))
     if m := re.match(r"^\$?([a-z_]\w*?)w?\.?\s+(in)?format$", low):
         return ConstructKey(kind="informat" if m.group(2) else "format", name=m.group(1))
+    if m := re.match(r"^([a-z_]\w*)\s+(?:component\s+)?object$", low):
+        return ConstructKey(kind="component_object", name=m.group(1))
     return None
 
 

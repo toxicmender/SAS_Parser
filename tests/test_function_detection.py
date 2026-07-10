@@ -62,6 +62,13 @@ def _call_routines(code: str) -> set[str]:
     }
 
 
+def _component_objects(code: str) -> set[str]:
+    """Union of component_objects across every chunk of *code*."""
+    return {
+        o for c in _C.chunk_text(code).chunks for o in c.metadata.component_objects
+    }
+
+
 # ---------------------------------------------------------------------------
 # False positives — none of these are DATA-step function calls
 # ---------------------------------------------------------------------------
@@ -178,6 +185,53 @@ class TestFunctionTruePositives(unittest.TestCase):
     def test_multiple_functions_in_expression(self):
         code = 'data a; d = intnx("month", today(), -1); s = strip(nm); run;'
         self.assertEqual(_functions(code), {"intnx", "strip", "today"})
+
+    def test_hashing_function_call(self):
+        """A genuine HASHING() call (crypto checksum) is a function usage."""
+        code = "data a; set b; digest = hashing('sha256', payload); run;"
+        self.assertEqual(_functions(code), {"hashing"})
+
+
+# ---------------------------------------------------------------------------
+# DATA step component objects (hash, hiter, ...) — declaration-keyed detection
+# ---------------------------------------------------------------------------
+
+
+class TestComponentObjectDetection(unittest.TestCase):
+    def test_declare_hash_with_dataset_argument(self):
+        """Hash object declared with a quoted dataset: argument (the shape
+        originally reported missing) registers as a component object, and its
+        dot-method calls still register nothing as functions."""
+        code = (
+            "data a;\n"
+            "declare\n"
+            '  hash h1(dataset:"monthly_notes(rename=(cf_total_auth_cnt = '
+            'cf_monthly_notes lag_month_notes = lag_month_max))");\n'
+            "  h1.definekey('admit_type', 'reg_cf', 'lag_month_max');\n"
+            "  h1.definedata('cf_monthly_notes');\n"
+            "  h1.definedone();\n"
+            "run;\n"
+        )
+        self.assertEqual(_component_objects(code), {"hash"})
+        self.assertEqual(_functions(code), set())
+        self.assertEqual(_call_routines(code), set())
+
+    def test_dcl_abbreviation(self):
+        code = "data a; dcl hash h(); h.definedone(); run;"
+        self.assertEqual(_component_objects(code), {"hash"})
+
+    def test_new_operator(self):
+        code = "data a; declare hash h; h = _new_ hash(); run;"
+        self.assertEqual(_component_objects(code), {"hash"})
+
+    def test_hash_iterator(self):
+        code = "data a; declare hiter hi('h1'); rc = hi.first(); run;"
+        self.assertEqual(_component_objects(code), {"hiter"})
+
+    def test_variable_named_hash_not_reported(self):
+        """`hash` as an ordinary variable name is not a declaration."""
+        code = "data a; set b; hash = md5(s); run;"
+        self.assertEqual(_component_objects(code), set())
 
 
 if __name__ == "__main__":

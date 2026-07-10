@@ -70,6 +70,8 @@ def _write_pdf(path: pathlib.Path, pages_lines, toc=None) -> str:
         ("LIBNAME Statement", ("global_statement", "libname")),
         ("The SQL Procedure", ("proc", "sql")),
         ("MEANS Procedure", ("proc", "means")),
+        ("Hash Object", ("component_object", "hash")),
+        ("HITER Component Object", ("component_object", "hiter")),
         ("Introduction", None),
         ("Dictionary of SAS Functions", None),
     ],

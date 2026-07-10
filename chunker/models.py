@@ -101,6 +101,9 @@ class SasChunkMetadata(BaseModel):
 
     recognized_functions: list[str] = Field(default_factory=list)
     recognized_call_routines: list[str] = Field(default_factory=list)
+    # DATA step component objects the chunk declares (hash, hiter, javaobj,
+    # logger, appender) — via DECLARE/DCL or the _NEW_ operator.
+    component_objects: list[str] = Field(default_factory=list)
 
     input_datasets: list[str] = Field(default_factory=list)
     output_datasets: list[str] = Field(default_factory=list)

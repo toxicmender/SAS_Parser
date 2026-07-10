@@ -74,6 +74,9 @@ def _query_for_chunk(chunk: SasChunk) -> str:
         tokens.append(m.proc_name)
     tokens.extend(m.recognized_functions)
     tokens.extend(m.recognized_call_routines)
+    # "hash object", "hiter object", ... — the reference guides discuss
+    # component objects by that phrasing ("hash object", "hash table").
+    tokens.extend(f"{obj} object" for obj in m.component_objects)
     if m.global_statement_keyword:
         tokens.append(m.global_statement_keyword)
     if m.control_flow_op:
@@ -113,6 +116,8 @@ def _constructs_for_item(item: SasBatch | SasChunk) -> list[ConstructKey]:
             add("function", fn)
         for routine in m.recognized_call_routines:
             add("call_routine", routine)
+        for obj in m.component_objects:
+            add("component_object", obj)
         add("global_statement", m.global_statement_keyword)
         if m.symput_scope_hazard:
             add("call_routine", "symput")

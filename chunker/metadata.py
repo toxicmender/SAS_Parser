@@ -15,6 +15,7 @@ from .keywords import (
     _MACRO_CALL_RE,
     _MACRO_INVOKE_RE,
     _SAS_CALL_ROUTINE_RE,
+    _SAS_COMPONENT_OBJECT_RE,
     _SAS_FUNCTION_CALL_RE,
     _SAS_RESERVED,
 )
@@ -511,6 +512,13 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
         f for f in recognized_functions if f not in recognized_call_routines
     ]
 
+    # ── DATA step component objects (hash, hiter, javaobj, logger, appender) ─
+    # Keyed on the DECLARE/DCL/_NEW_ declaration; the objects' dot-method calls
+    # are member access and invisible to the function scan by design.
+    component_objects = sorted(
+        {m.group(1).lower() for m in _SAS_COMPONENT_OBJECT_RE.finditer(mt)}
+    )
+
     return SasChunkMetadata(
         step_name=_nid(dm.group(1)) if dm else None,
         proc_name=_nid(pm.group(1)) if pm else None,
@@ -528,6 +536,7 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
         referenced_macro_vars=referenced_macro_vars,
         recognized_functions=recognized_functions,
         recognized_call_routines=recognized_call_routines,
+        component_objects=component_objects,
         control_flow_op=control_flow_op,
         contains_abort=has_abort,
         contains_computed_goto=has_computed_goto,

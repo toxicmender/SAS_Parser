@@ -101,6 +101,26 @@ def test_query_for_item_uses_constructs_not_dataset_names():
     assert "out" not in query.split()  # dataset name is not a query token
 
 
+def test_component_objects_map_to_constructs_and_query():
+    text = "data a; declare hash h1(dataset:'work.notes'); h1.definedone(); run;"
+    chunk = SasChunk(
+        chunk_id="c2",
+        source_id="etl.sas",
+        text=text,
+        kind=SasChunkKind.DATA_STEP,
+        title="hash lookup",
+        start_line=1,
+        end_line=1,
+        start_char=0,
+        end_char=len(text),
+        metadata=SasChunkMetadata(component_objects=["hash"]),
+    )
+    assert ConstructKey(kind="component_object", name="hash") in _constructs_for_item(
+        chunk
+    )
+    assert "hash object" in _query_for_item(chunk)
+
+
 # ---------------------------------------------------------------------------
 # Injection contract: prompted, never persisted
 # ---------------------------------------------------------------------------

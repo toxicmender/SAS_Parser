@@ -251,6 +251,23 @@ _SAS_CALL_ROUTINES = frozenset(
     }
 )
 
+# DATA step component objects — SAS Programmer's Guide: Essentials, Ch. 9
+# ("DATA Step Component Objects"): hash, hash iterator (HITER), Java, logger,
+# and appender objects. Usage is keyed on the declaration syntax
+# (``DECLARE``/``DCL`` statement or the ``_NEW_`` operator) because the
+# objects' dot-method calls (``h1.definekey(...)``, ``h1.find()``) are member
+# access, which the function scan deliberately ignores.
+_SAS_COMPONENT_OBJECTS = frozenset(
+    {"hash", "hiter", "javaobj", "logger", "appender"}
+)
+_SAS_COMPONENT_OBJECTS_PATTERN = "|".join(
+    re.escape(w) for w in sorted(_SAS_COMPONENT_OBJECTS, key=len, reverse=True)
+)
+_SAS_COMPONENT_OBJECT_RE = re.compile(
+    rf"\b(?:declare|dcl|_new_)\s+({_SAS_COMPONENT_OBJECTS_PATTERN})\b",
+    re.IGNORECASE,
+)
+
 # A function call is ``name(`` where the name is not glued to a preceding ``%``,
 # ``&``, or ``.``; a CALL routine is ``CALL name`` at a word boundary. Both
 # alternations are longest-name-first (as _RESERVED_WORDS_PATTERN).
