@@ -18,6 +18,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Iterable
 
+import app_config
+
 from .catalog import CorpusLoader, DocumentSpec, default_catalog
 from .models import ConstructKey, InstructionChunk
 from .selector import InstructionSelector
@@ -36,10 +38,15 @@ class PromptBuilder:
     ----------
     chunks : Iterable[InstructionChunk]
         The instruction corpus to retrieve over.
-    top_k : int
-        Maximum topical (ranked) chunks per item.
-    max_instruction_words : int
-        Word budget for the whole guidance block.
+    top_k : int | None
+        Maximum topical (ranked) chunks per item. ``None`` (default) reads
+        ``prompt_builder.top_k`` from config.json, falling back to 6 (see
+        the ``app_config`` package).
+    max_instruction_words : int | None
+        Word budget for the whole guidance block. ``None`` reads
+        ``prompt_builder.max_instruction_words``, falling back to 1500.
+        Keep this >= the instruction chunker's ``max_words`` so any single
+        reference section always fits.
     pinned_sections : Iterable[str]
         Section-path substrings always injected first.
     embeddings, embedding_cache_path, rrf_k, reranker :
@@ -53,8 +60,8 @@ class PromptBuilder:
         self,
         chunks: Iterable[InstructionChunk],
         *,
-        top_k: int = 6,
-        max_instruction_words: int = 1500,
+        top_k: int | None = None,
+        max_instruction_words: int | None = None,
         pinned_sections: Iterable[str] = (),
         embeddings: Any | None = None,
         embedding_cache_path: str | None = None,
@@ -62,8 +69,10 @@ class PromptBuilder:
         reranker: Callable[[str, list[str]], list[float]] | None = None,
         heading: str = "Relevant migration guidance",
     ) -> None:
-        self.top_k = top_k
-        self.max_instruction_words = max_instruction_words
+        self.top_k = app_config.resolve(top_k, "prompt_builder", "top_k", 6)
+        self.max_instruction_words = app_config.resolve(
+            max_instruction_words, "prompt_builder", "max_instruction_words", 1500
+        )
         self.heading = heading
         self._selector = InstructionSelector(
             chunks,
@@ -92,7 +101,17 @@ class PromptBuilder:
         pins = list(pinned_sections)
         for spec in specs:
             pins.extend(spec.pinned_sections)
-        return cls(chunks, pinned_sections=pins, **kwargs)
+        builder = cls(chunks, pinned_sections=pins, **kwargs)
+        # A budget below the chunker's window size silently drops whole
+        # construct hits — the known misconfiguration; warn loudly.
+        if builder.max_instruction_words < loader.chunker.max_words:
+            logger.warning(
+                f"from_specs: max_instruction_words="
+                f"{builder.max_instruction_words} is below the chunker's "
+                f"max_words={loader.chunker.max_words}; single reference "
+                f"sections may not fit the budget and will be dropped whole"
+            )
+        return builder
 
     @classmethod
     def from_reference_dir(

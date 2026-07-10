@@ -1,0 +1,20 @@
+{
+  "_comment": "Runtime limits for SAS_Parser. null means 'unset' (the code default applies). Precedence: explicit constructor argument > this file > code default. Loaded via the app_config package; point SAS_PARSER_CONFIG at an alternative file to override.",
+  "sas_chunker": {
+    "min_words": 300,
+    "max_words": 700
+  },
+  "instruction_chunker": {
+    "min_words": 120,
+    "max_words": 900,
+    "overlap_words": 60
+  },
+  "prompt_builder": {
+    "top_k": 6,
+    "max_instruction_words": 1500
+  },
+  "llm_client": {
+    "max_input_tokens": null,
+    "max_output_tokens": null
+  }
+}

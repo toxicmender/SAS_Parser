@@ -10,6 +10,8 @@ import logging
 import time
 from pathlib import Path
 
+import app_config
+
 from .metadata import _merge_meta, _metadata_for, _title
 from .models import (
     SasChunk,
@@ -96,11 +98,14 @@ class SasSemanticChunker:
 
     Parameters
     ----------
-    min_words : int
+    min_words : int | None
         Soft lower bound — chunks smaller than this are never split further.
-    max_words : int
+        ``None`` (default) reads ``sas_chunker.min_words`` from config.json,
+        falling back to 300 (see the ``app_config`` package).
+    max_words : int | None
         Hard upper bound — regions larger than this are split at statement
-        boundaries with a small overlap window.
+        boundaries with a small overlap window. ``None`` (default) reads
+        ``sas_chunker.max_words`` from config.json, falling back to 700.
     timeout : float | None
         Wall-clock budget, in seconds, for a single ``chunk_text`` /
         ``chunk_file`` call.  When the parser overruns it, it stops at the next
@@ -114,12 +119,12 @@ class SasSemanticChunker:
     def __init__(
         self,
         *,
-        min_words: int = 300,
-        max_words: int = 700,
+        min_words: int | None = None,
+        max_words: int | None = None,
         timeout: float | None = 60.0,
     ) -> None:
-        self.min_words = min_words
-        self.max_words = max_words
+        self.min_words = app_config.resolve(min_words, "sas_chunker", "min_words", 300)
+        self.max_words = app_config.resolve(max_words, "sas_chunker", "max_words", 700)
         self.timeout = timeout
         logger.debug(
             f"SasSemanticChunker  min_words={min_words}  max_words={max_words}  "

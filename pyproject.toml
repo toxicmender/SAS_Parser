@@ -24,8 +24,9 @@ dev       = ["pytest>=8", "pytest-cov", "ruff"]
 where = ["."]
 # chunker/pipeline.py imports memory.short_mem, llm_client, and prompt_builder,
 # so all four packages must ship — a wheel with chunker alone breaks
-# `from chunker import SasLLMPipeline`.
-include = ["chunker*", "memory*", "llm_client*", "prompt_builder*"]
+# `from chunker import SasLLMPipeline`. app_config is the dependency-free
+# config loader they all read defaults through.
+include = ["chunker*", "memory*", "llm_client*", "prompt_builder*", "app_config*"]
 
 [tool.pytest.ini_options]
 markers = [

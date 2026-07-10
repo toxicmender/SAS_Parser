@@ -277,8 +277,10 @@ class SasLLMPipeline:
     max_retries : int
         Retries with exponential backoff for rate-limit (429-shaped)
         errors; other errors are never retried.
-    min_words, max_words : int
-        Forwarded to :class:`SasSemanticChunker`.
+    min_words, max_words : int | None
+        Forwarded to :class:`SasSemanticChunker`. ``None`` (default) lets
+        the chunker read ``sas_chunker.*`` from config.json (see the
+        ``app_config`` package), falling back to 300/700.
     output_language : str
         Target language named in the system prompt (default ``"PySpark"``).
     system_prompt : str | None
@@ -330,8 +332,8 @@ class SasLLMPipeline:
         max_input_tokens: int | None = None,
         requests_per_second: float | None = None,
         max_retries: int = 3,
-        min_words: int = 300,
-        max_words: int = 700,
+        min_words: int | None = None,
+        max_words: int | None = None,
         output_language: str = "PySpark",
         system_prompt: str | None = None,
         window_k: int | None = 6,

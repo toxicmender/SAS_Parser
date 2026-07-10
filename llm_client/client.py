@@ -10,6 +10,7 @@ import random
 import time
 from typing import Any, Callable
 
+import app_config
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import LanguageModelInput
 from langchain_core.messages import BaseMessage, HumanMessage, convert_to_messages
@@ -47,12 +48,16 @@ class LLMClientConfig(BaseModel):
         default untouched.
     max_output_tokens : int | None
         Cap on generated tokens (provider ``max_tokens``). ``None`` keeps
-        the provider default.
+        the provider default. When the argument is *omitted*, the default
+        comes from ``llm_client.max_output_tokens`` in config.json (see the
+        ``app_config`` package); passing ``None`` explicitly still means
+        "provider default".
     max_input_tokens : int | None
         Input-token budget per call. When set, the prompt is counted
         before invocation and :class:`InputTokenLimitError` is raised if
-        it exceeds the budget. ``None`` (default) disables counting
-        entirely — no token-counter is ever called.
+        it exceeds the budget. ``None`` disables counting entirely — no
+        token-counter is ever called. When the argument is *omitted*, the
+        default comes from ``llm_client.max_input_tokens`` in config.json.
     requests_per_second : float | None
         Proactive client-side throttle: at most this many request starts
         per second via ``InMemoryRateLimiter``. ``None`` disables it.
@@ -75,8 +80,14 @@ class LLMClientConfig(BaseModel):
 
     model: str = "claude-haiku-4-5-20251001"
     temperature: float | None = Field(default=None, ge=0.0)
-    max_output_tokens: int | None = Field(default=None, gt=0)
-    max_input_tokens: int | None = Field(default=None, gt=0)
+    max_output_tokens: int | None = Field(
+        default_factory=lambda: app_config.get_value("llm_client", "max_output_tokens"),
+        gt=0,
+    )
+    max_input_tokens: int | None = Field(
+        default_factory=lambda: app_config.get_value("llm_client", "max_input_tokens"),
+        gt=0,
+    )
     requests_per_second: float | None = Field(default=None, gt=0.0)
     max_bucket_size: int = Field(default=1, gt=0)
     max_retries: int = Field(default=3, ge=0)

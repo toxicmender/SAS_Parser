@@ -22,6 +22,8 @@ from __future__ import annotations
 import logging
 import re
 
+import app_config
+
 from .models import DocRole, DocSection, InstructionChunk
 
 logger = logging.getLogger(__name__)
@@ -91,27 +93,38 @@ class InstructionChunker:
 
     Parameters
     ----------
-    min_words : int
+    min_words : int | None
         Soft lower bound: consecutive sections under the same parent heading
         are merged until their combined text reaches this size. A section that
-        already meets it stands alone.
-    max_words : int
+        already meets it stands alone. ``None`` (default) reads
+        ``instruction_chunker.min_words`` from config.json, falling back
+        to 120 (see the ``app_config`` package).
+    max_words : int | None
         Hard upper bound: a chunk larger than this is split into overlapping
-        paragraph windows.
-    overlap_words : int
+        paragraph windows. ``None`` reads ``instruction_chunker.max_words``,
+        falling back to 900.
+    overlap_words : int | None
         Target size of the trailing overlap carried into each next window.
+        ``None`` reads ``instruction_chunker.overlap_words``, falling back
+        to 60.
     """
 
     def __init__(
         self,
         *,
-        min_words: int = 120,
-        max_words: int = 900,
-        overlap_words: int = 60,
+        min_words: int | None = None,
+        max_words: int | None = None,
+        overlap_words: int | None = None,
     ) -> None:
-        self.min_words = min_words
-        self.max_words = max_words
-        self.overlap_words = overlap_words
+        self.min_words = app_config.resolve(
+            min_words, "instruction_chunker", "min_words", 120
+        )
+        self.max_words = app_config.resolve(
+            max_words, "instruction_chunker", "max_words", 900
+        )
+        self.overlap_words = app_config.resolve(
+            overlap_words, "instruction_chunker", "overlap_words", 60
+        )
         logger.debug(
             f"InstructionChunker  min_words={min_words}  max_words={max_words}  "
             f"overlap_words={overlap_words}"

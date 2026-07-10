@@ -119,6 +119,13 @@ prompt_builder/
   builder.py            PromptBuilder façade: read -> chunk -> index at
                         construction, then build(query, constructs) -> a
                         Markdown guidance block or None.
+
+app_config/
+  __init__.py           Dependency-free loader for the repo-root config.json
+                        (word/token limits). Precedence: explicit constructor
+                        argument > config.json > hard default; JSON null means
+                        "unset". Searched via SAS_PARSER_CONFIG env var, cwd,
+                        then repo root. A leaf package — imports nothing.
 ```
 
 Import direction is strictly downward: `keywords` and `models` import
@@ -130,6 +137,9 @@ imports `memory.short_mem`, `memory.relevance`, `llm_client`, and
 `chunker` (or each other) — `prompt_builder` reuses `memory.relevance` for
 retrieval, and the SAS-metadata → `(query, constructs)` mapping that feeds it
 lives in `pipeline`, precisely so `prompt_builder` needs no `chunker` import.
+`app_config` is a leaf every package may import (like `chunker.keywords`, it
+imports nothing): `chunker`, `llm_client`, and `prompt_builder` read their
+word/token-limit defaults through it.
 
 ## Chunking model
 
