@@ -273,6 +273,20 @@ def test_hybrid_ranker_empty_corpus_queries_empty():
     assert ranker.query("anything") == []
 
 
+def test_hybrid_ranker_single_doc_corpus_matches():
+    # max == min always holds with one doc; a positive score is still signal.
+    ranker = HybridRanker()
+    ranker.index(["the intnx function advances a sas date"])
+    assert ranker.query("advance a date with intnx") == [0]
+    assert ranker.query("zzz unrelated") == []  # zero score stays no-signal
+
+
+def test_hybrid_ranker_tied_positive_scores_rank_stably():
+    ranker = HybridRanker()
+    ranker.index(["macro alpha", "macro beta"])  # identical BM25 for "macro"
+    assert ranker.query("macro") == [0, 1]  # tie broken toward earlier index
+
+
 def test_hybrid_ranker_query_before_index_raises():
     ranker = HybridRanker()
     ranker._corpus = ["never indexed"]  # simulate corpus set without index()

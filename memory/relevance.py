@@ -216,7 +216,13 @@ class HybridRanker:
             logger.warning("HybridRanker.query: query produced no tokens; BM25 skipped")
         else:
             scores = self._bm25.get_scores(query_tokens)
-            if float(scores.max()) - float(scores.min()) >= 1e-12:
+            # Signal = any positive score. BM25 (Lucene idf) scores are >= 0
+            # with 0 meaning "no term matched", so a max of 0 is genuinely no
+            # signal — but tied *positive* scores (or a single-doc corpus,
+            # where max always equals min) are real matches and must rank.
+            # This differs from the per-call spread check in bm25_ranking,
+            # where a history selector can fall back to recency instead.
+            if float(scores.max()) > 1e-12:
                 # No recency to prefer in a static corpus: break ties toward the
                 # lower (earlier) index for a stable, deterministic order.
                 rankings.append(sorted(candidates, key=lambda i: (-scores[i], i)))

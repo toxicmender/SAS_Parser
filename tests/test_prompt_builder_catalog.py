@@ -103,6 +103,22 @@ def test_default_catalog_only_lists_present_files(tmp_path):
     assert specs[0].role is DocRole.SAS_REFERENCE
 
 
+def test_default_catalog_include_unknown_indexes_extra_pdfs(tmp_path):
+    _write_funcs_pdf(tmp_path / "SAS_Functions_and_Call_Routines.pdf")
+    _write_funcs_pdf(tmp_path / "My Custom Style-Guide (v2).pdf")
+
+    # Off by default: the unknown PDF is ignored.
+    assert [s.doc_id for s in default_catalog(str(tmp_path))] == ["functions"]
+
+    specs = default_catalog(str(tmp_path), include_unknown=True)
+    by_id = {s.doc_id: s for s in specs}
+    assert set(by_id) == {"functions", "my_custom_style_guide_v2"}
+    unknown = by_id["my_custom_style_guide_v2"]
+    assert unknown.strategy == "auto"
+    assert unknown.section_level is None
+    assert unknown.role is DocRole.SAS_REFERENCE
+
+
 # ---------------------------------------------------------------------------
 # CorpusLoader extraction + cache
 # ---------------------------------------------------------------------------

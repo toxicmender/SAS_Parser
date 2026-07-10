@@ -108,15 +108,27 @@ _DEFAULT_SPECS: tuple[tuple[str, str, DocRole, str, int | None], ...] = (
 )
 
 
-def default_catalog(reference_dir: str = "reference_docs") -> list[DocumentSpec]:
+def default_catalog(
+    reference_dir: str = "reference_docs",
+    *,
+    include_unknown: bool = False,
+) -> list[DocumentSpec]:
     """
     Specs for the bundled reference set that are actually present under
     *reference_dir* — the directory is user-provided and may hold only a
     subset, so missing files are skipped rather than erroring.
+
+    With ``include_unknown=True``, every other ``*.pdf`` in the directory also
+    gets a generic spec (``strategy="auto"``, ``sas_reference`` role, doc_id
+    slugged from the file stem), so dropping a new manual in the directory is
+    enough to index it. Pinned TOC levels and roles still require a hand-built
+    :class:`DocumentSpec` via ``PromptBuilder.from_specs``.
     """
     base = Path(reference_dir)
     specs: list[DocumentSpec] = []
+    known: set[str] = set()
     for filename, doc_id, role, strategy, level in _DEFAULT_SPECS:
+        known.add(filename)
         path = base / filename
         if path.exists():
             specs.append(
@@ -130,9 +142,18 @@ def default_catalog(reference_dir: str = "reference_docs") -> list[DocumentSpec]
             )
         else:
             logger.debug(f"default_catalog: not present, skipping '{path}'")
+    if include_unknown and base.is_dir():
+        for path in sorted(base.glob("*.pdf")):
+            if path.name in known:
+                continue
+            doc_id = re.sub(r"[^a-z0-9]+", "_", path.stem.lower()).strip("_")
+            logger.info(
+                f"default_catalog: unknown reference '{path.name}' included "
+                f"as doc_id='{doc_id}' (auto strategy)"
+            )
+            specs.append(DocumentSpec(path=str(path), doc_id=doc_id))
     logger.info(
-        f"default_catalog: {len(specs)}/{len(_DEFAULT_SPECS)} reference doc(s) "
-        f"present under '{reference_dir}'"
+        f"default_catalog: {len(specs)} reference doc(s) under '{reference_dir}'"
     )
     return specs
 

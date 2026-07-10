@@ -75,6 +75,16 @@ def _sha(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 
+def _interleave(lists: list[list[int]]) -> list[int]:
+    """Round-robin merge: firsts of every list, then seconds, and so on."""
+    out: list[int] = []
+    for position in range(max((len(xs) for xs in lists), default=0)):
+        for xs in lists:
+            if position < len(xs):
+                out.append(xs[position])
+    return out
+
+
 class DiskCachedEmbeddings:
     """
     Wrap a LangChain ``Embeddings`` with an on-disk document-embedding cache.
@@ -246,9 +256,15 @@ class InstructionSelector:
     def _construct_hits(
         self, constructs: Iterable[ConstructKey]
     ) -> tuple[list[int], list[int]]:
-        """Primary-chunk indices for the item's constructs, hazard set apart."""
-        hazard: list[int] = []
-        normal: list[int] = []
+        """
+        Chunk indices for the item's constructs, hazard set apart. A construct
+        whose section split into several windows contributes *all* of them,
+        interleaved breadth-first (every construct's first window before any
+        second window), so one long section cannot crowd another construct's
+        primary hit out of the budget.
+        """
+        hazard: list[list[int]] = []
+        normal: list[list[int]] = []
         seen: set[ConstructKey] = set()
         for key in constructs:
             if key in seen:
@@ -258,9 +274,9 @@ class InstructionSelector:
             if not idxs:
                 continue
             if key in self._hazard:
-                hazard.append(idxs[0])
+                hazard.append(idxs)
             elif key in self._stop:
                 continue
             else:
-                normal.append(idxs[0])
-        return hazard, normal
+                normal.append(idxs)
+        return _interleave(hazard), _interleave(normal)

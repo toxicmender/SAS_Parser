@@ -118,13 +118,18 @@ class PromptBuilder:
         cls,
         reference_dir: str = "reference_docs",
         *,
+        include_unknown: bool = False,
         loader: CorpusLoader | None = None,
         cache_dir: str | None = None,
         **kwargs: Any,
     ) -> "PromptBuilder":
-        """Build from the default catalog of PDFs present under *reference_dir*."""
+        """
+        Build from the default catalog of PDFs present under *reference_dir*.
+        ``include_unknown=True`` also indexes PDFs the catalog doesn't
+        recognise, with a generic auto-strategy spec.
+        """
         return cls.from_specs(
-            default_catalog(reference_dir),
+            default_catalog(reference_dir, include_unknown=include_unknown),
             loader=loader,
             cache_dir=cache_dir,
             **kwargs,

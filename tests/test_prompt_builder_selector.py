@@ -96,6 +96,21 @@ def test_hazard_construct_wins_tight_budget():
     assert [c.chunk_id for c in out] == ["c2"]
 
 
+def test_multi_window_construct_returns_all_windows_breadth_first():
+    big = ConstructKey(kind="function", name="bigfn")
+    corpus = _corpus() + [
+        _chunk("w0", "Funcs > BIGFN Function", "window one " + _words(30), keys=[big]),
+        _chunk("w1", "Funcs > BIGFN Function", "window two " + _words(30), keys=[big]),
+    ]
+    sel = InstructionSelector(corpus)
+    out = sel.select("zzz", [big, INTNX], max_words=10_000, top_k=0)
+    ids = [c.chunk_id for c in out]
+    # All windows of BIGFN present, but INTNX's primary section comes before
+    # BIGFN's second window (breadth-first interleave).
+    assert set(ids) == {"w0", "w1", "c0"}
+    assert ids.index("c0") < ids.index("w1")
+
+
 # ---------------------------------------------------------------------------
 # Topical ranking
 # ---------------------------------------------------------------------------
