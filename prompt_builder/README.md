@@ -178,11 +178,27 @@ chunks = CorpusLoader().load(specs)          # cold: reads PDFs; warm: from cach
 - **Extraction cache.** Reading + chunking the ~7,400-page corpus costs tens of
   seconds per document and never changes between runs, so each document's chunks
   are cached as JSON under `.prompt_builder_cache/` (gitignored). The cache key
-  is the file's SHA-256 plus everything else that affects output — extractor
-  version, spec, and reader/chunker parameters — so any change re-extracts; a
-  hit skips PyMuPDF entirely (measured ~50× faster than a cold read). Bump
-  `EXTRACTOR_VERSION` when the reader or chunker changes shape. Pass
-  `use_cache=False` to bypass it.
+  is the file's SHA-256 plus everything else that affects output — a fingerprint
+  of the extractor source itself (`pdf_reader.py` + `doc_chunker.py`, so editing
+  the code re-extracts automatically; `EXTRACTOR_VERSION` remains only as a
+  manual escape hatch), the spec, and the reader/chunker parameters. A stat
+  fast-path trusts the cached SHA when the file's size and mtime are unchanged,
+  so a warm load never rehashes a multi-MB PDF. A hit skips PyMuPDF entirely
+  (measured ~50× faster than a cold read). Pass `use_cache=False` to bypass.
+- **Freshness API.** `check_freshness(spec)` returns
+  `fresh | stale | uncached | missing` without extracting;
+  `freshness_report(specs)` maps every `doc_id` to its status; and
+  `prune_stale(specs)` deletes stale entries, entries whose source PDF is gone,
+  and orphaned entries no spec refers to (fresh entries are kept).
+- **Unknown PDFs.** `default_catalog(dir, include_unknown=True)` (also exposed
+  via `PromptBuilder.from_reference_dir`) gives every unrecognised `*.pdf` a
+  generic auto-strategy spec with a slugged `doc_id`, so dropping a new manual
+  into the directory is enough to index it.
+- **LangChain interop.** `loader.load_documents(specs)` returns the corpus as
+  `langchain_core.documents.Document`s (`InstructionChunk.to_document()` /
+  `from_document()` round-trip losslessly; construct keys flatten to
+  `"kind:name"` strings), for feeding a LangChain vector store / retriever /
+  index instead of the built-in selector.
 
 ## InstructionSelector
 
@@ -245,9 +261,15 @@ INTNX Function  Increments a date, time, or datetime value …
 Keep `max_instruction_words` ≥ the chunker's `max_words` (default 1500 ≥ 900)
 so any single reference section always fits — the budget then limits only the
 *number* of chunks, dropping whole chunks at the tail, never a lone construct
-hit. The pipeline builds the `(query, constructs)` for each item from its SAS
-metadata (`chunker.pipeline._query_for_item` / `_constructs_for_item`) — that
-mapping lives in the pipeline, not here, so this package imports no `chunker`.
+hit; `from_specs` logs a WARNING when the budget is misconfigured below the
+window size. The pipeline builds the `(query, constructs)` for each item from
+its SAS metadata (`chunker.pipeline._query_for_item` / `_constructs_for_item`)
+— that mapping lives in the pipeline, not here, so this package imports no
+`chunker`.
+
+`top_k` and `max_instruction_words` default from `config.json`
+(`prompt_builder.*`), as do the chunkers' word budgets — see the `app_config`
+package: explicit argument > config.json > hard default.
 
 ### Logging — pdf_reader
 
