@@ -7,13 +7,17 @@ Logger name: ``chunker.chunker``.
 from __future__ import annotations
 
 import logging
+import sys
 import time
+from collections.abc import Iterable
 from pathlib import Path
+from typing import TextIO
 
 import app_config
 
 from .metadata import _merge_meta, _metadata_for, _title
 from .models import (
+    SasBatchResult,
     SasChunk,
     SasChunkKind,
     SasChunkMetadata,
@@ -809,3 +813,58 @@ def _diag(
         start_line=_line_for(target.start, line_starts),
         end_line=_line_for(max(target.end - 1, target.start), line_starts),
     )
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+
+
+def print_singletons(
+    result: SasBatchResult | Iterable[SasChunk],
+    *,
+    stream: TextIO | None = None,
+) -> None:
+    """Print a readable report of the singleton chunks a batcher run found.
+
+    Singletons are chunks the batcher left unbatched because they share no
+    dependency edge with any other chunk (see
+    :attr:`~chunker.models.SasBatchResult.singletons`).  Each is printed
+    one-per-line with its id, kind, source and line span, followed by the
+    populated dependency-relevant metadata (datasets, macros, macro
+    variables) — useful for spotting a chunk that *should* have joined a
+    batch but didn't, e.g. because a dataset name failed to canonicalise.
+
+    Parameters
+    ----------
+    result
+        A :class:`~chunker.models.SasBatchResult` (its ``singletons`` are
+        printed) or any iterable of :class:`~chunker.models.SasChunk`.
+    stream
+        Destination text stream; defaults to ``sys.stdout``.
+    """
+    singletons = (
+        list(result.singletons)
+        if isinstance(result, SasBatchResult)
+        else list(result)
+    )
+    out = stream if stream is not None else sys.stdout
+    print(f"{len(singletons)} singleton(s):", file=out)
+    if not singletons:
+        print("  <none>", file=out)
+        return
+    width = len(str(len(singletons)))
+    for i, chunk in enumerate(singletons, 1):
+        print(f"  [{i:>{width}}] {chunk}", file=out)
+        meta = chunk.metadata
+        signals = {
+            "inputs": meta.input_datasets,
+            "outputs": meta.output_datasets,
+            "defines_macros": meta.defines_macros,
+            "invokes_macros": meta.invokes_macros,
+            "produces_macrovars": meta.produces_macrovars,
+            "consumes_macrovars": meta.consumes_macrovars,
+        }
+        populated = "  ".join(f"{k}={v}" for k, v in signals.items() if v)
+        if populated:
+            print(f"  {' ' * (width + 3)}{populated}", file=out)
