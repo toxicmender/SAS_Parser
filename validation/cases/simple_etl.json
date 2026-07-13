@@ -1,0 +1,6 @@
+{
+  "case_id": "simple_etl",
+  "description": "Two dependent steps (dataset_flow edge): a DATA step feeding PROC SQL. Exercises single-batch translation and dataset fidelity.",
+  "sas_source": "data work.sales_clean;\n  set work.sales_raw;\n  where amount > 0;\n  margin = amount - cost;\nrun;\n\nproc sql;\n  create table work.sales_summary as\n  select region, sum(margin) as total_margin\n  from work.sales_clean\n  group by region;\nquit;\n",
+  "required_terms": ["groupBy", "filter"]
+}

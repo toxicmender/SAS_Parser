@@ -16,5 +16,15 @@
   "llm_client": {
     "max_input_tokens": null,
     "max_output_tokens": null
+  },
+  "validation": {
+    "response_coverage_threshold": null,
+    "dataset_fidelity_threshold": null,
+    "python_syntax_threshold": null,
+    "required_terms_threshold": null,
+    "reference_similarity_threshold": null,
+    "llm_judge_threshold": null,
+    "table": null,
+    "path": null
   }
 }

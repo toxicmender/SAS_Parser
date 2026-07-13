@@ -126,6 +126,31 @@ app_config/
                         argument > config.json > hard default; JSON null means
                         "unset". Searched via SAS_PARSER_CONFIG env var, cwd,
                         then repo root. A leaf package — imports nothing.
+
+validation/
+  models.py             Pydantic models: ValidationCase, CaseRun,
+                        MetricResult, CaseResult, ValidationReport
+                        (score/passed are computed fields; to_markdown()).
+  metrics.py            Deterministic metrics + default_metrics():
+                        response_coverage, dataset_fidelity, python_syntax,
+                        required_terms, reference_similarity. Thresholds
+                        resolve via app_config (validation.<name>_threshold).
+  judge.py              LLMJudgeMetric — opt-in LLM-as-judge (any
+                        LangChain-style model / llm_client.LLMClient);
+                        never part of default_metrics().
+  runner.py             ValidationRunner: cases -> SasLLMPipeline -> metrics
+                        -> ValidationReport; fresh thread_id per case run.
+  dataset.py            load_cases(): *.json case files (inline sas_source
+                        or a sibling sas_path).
+  tracking.py           log_report() / load_runs(): Spark-backed run history,
+                        one row per (run, case, metric) — local parquet dir
+                        (./validation_runs) by default, saveAsTable (Delta)
+                        via `table` on Databricks. Spark boots lazily inside
+                        these two functions only.
+  __main__.py           CLI: python -m validation <cases_dir> [--judge-model
+                        ...] [--track]; exit code gates CI.
+  cases/                Sample cases. Like tests/, the package does not ship
+                        in the wheel.
 ```
 
 Import direction is strictly downward: `keywords` and `models` import
@@ -139,7 +164,9 @@ retrieval, and the SAS-metadata → `(query, constructs)` mapping that feeds it
 lives in `pipeline`, precisely so `prompt_builder` needs no `chunker` import.
 `app_config` is a leaf every package may import (like `chunker.keywords`, it
 imports nothing): `chunker`, `llm_client`, and `prompt_builder` read their
-word/token-limit defaults through it.
+word/token-limit defaults through it. `validation` sits *above* the whole
+stack, beside the CLI entry points: it drives `chunker.pipeline` and may
+import anything, and nothing imports it back.
 
 ## Chunking model
 
@@ -326,8 +353,8 @@ any of these silently changes behavior.
 
 ## Testing
 
-`tests/` (403 tests) runs without a JVM, network, or API keys: the memory
-tests use the in-memory backend, and the pipeline tests inject
+`tests/` runs without a JVM, network, or API keys: the memory
+tests use the in-memory backend, and the pipeline and validation tests inject
 `FakeListChatModel`. The Delta backend (`_DeltaBackend`) has **no automated
 coverage** in this suite — it requires a live Spark session — so changes to
 it need manual verification against Databricks. Behavior-preserving
@@ -336,3 +363,12 @@ snapshotting full batcher output (batch membership, I/O fields, reason
 strings, ordering) on a synthetic multi-file corpus and diffing against the
 pre-change code; prefer that over trusting the suite alone for pure
 code-motion changes.
+
+The unit suite asserts *code behavior*; the *output quality* of a real model
+run is the `validation` package's job — declarative cases scored by
+deterministic metrics (coverage, dataset fidelity, Python syntax, required
+terms, reference similarity) plus an opt-in LLM judge, with per-run history
+appended via Spark (`python -m validation validation/cases --track`): local
+parquet by default, a Delta table on Databricks. Like the Delta memory
+backend, the Spark write path needs a JVM, so its test skips itself where no
+local Spark session can start.

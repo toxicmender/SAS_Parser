@@ -1,0 +1,5 @@
+{
+  "case_id": "macro_flow",
+  "description": "A %LET-driven macro variable consumed by a later DATA step (macro_var_flow edge) plus an independent PROC MEANS. Exercises multi-item runs and macro-variable handling.",
+  "sas_source": "%let cutoff = 100;\n\ndata work.big_orders;\n  set work.orders;\n  if amount >= &cutoff;\nrun;\n\nproc means data=work.inventory sum mean;\n  var stock;\nrun;\n"
+}
