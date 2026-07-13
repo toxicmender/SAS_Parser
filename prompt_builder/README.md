@@ -15,13 +15,14 @@ sole integration point.
 ## Package layout
 
 ```
-models.py       InstructionDiagnostic, ConstructKey, DocSection,
-                InstructionDoc, InstructionChunk (+ DocRole / ExtractionStrategy)
-pdf_reader.py   PdfReader — PDF -> list[DocSection], two strategies
-doc_chunker.py  InstructionChunker — DocSection -> word-budgeted InstructionChunk
-catalog.py      DocumentSpec + default_catalog + CorpusLoader (on-disk cache)
-selector.py     InstructionSelector — construct lookup + HybridRanker retrieval
-builder.py      PromptBuilder facade: read -> chunk -> index -> build(query)
+models.py            InstructionDiagnostic, ConstructKey, DocSection,
+                     InstructionDoc, InstructionChunk (+ DocRole / ExtractionStrategy)
+pdf_reader.py        PdfReader — PDF -> list[DocSection], two strategies
+doc_chunker.py       InstructionChunker — DocSection -> word-budgeted InstructionChunk
+catalog.py           DocumentSpec + default_catalog + CorpusLoader (on-disk cache)
+selector.py          InstructionSelector — construct lookup + HybridRanker retrieval
+builder.py           PromptBuilder facade: read -> chunk -> index -> build(query)
+user_instructions.py UserInstructionSet — operator rules (str) -> scoped chunks
 ```
 
 ## Quick start
@@ -270,6 +271,55 @@ its SAS metadata (`chunker.pipeline._query_for_item` / `_constructs_for_item`)
 `top_k` and `max_instruction_words` default from `config.json`
 (`prompt_builder.*`), as do the chunkers' word budgets — see the `app_config`
 package: explicit argument > config.json > hard default.
+
+## User instructions
+
+Operators supply project rules as a plain string (or file) of markdown-ish
+sections; each `## heading` opens one instruction and an optional directive
+sets its scope:
+
+```markdown
+Always target Delta Lake tables, never pandas.        <- preamble: always-on
+
+## Output format                                       <- always-on
+One fenced PySpark block per SAS step, then a risk table.
+
+## [when: proc:sql, component_object:hash] Lookup rules  <- construct-scoped
+Prefer broadcast joins when the lookup side is small.
+
+## [topic] Partitioning guidance                       <- retrieved by ranking
+Wide fact tables are partitioned by load_date.
+```
+
+Wire them in at any level: `PromptBuilder(chunks, user_instructions=...)`,
+`builder.with_user_instructions(...)` (rebuilds over the same reference
+corpus), or `SasLLMPipeline(user_instructions=...)` — which, with no
+`prompt_builder`, constructs a corpus-less builder so rules work without any
+reference PDFs. When no explicit set is passed, the pipeline auto-loads the
+standing file named by `config.json` `user_instructions.path` (missing file =
+WARNING and continue).
+
+Selection priority per item: **user always → user construct-matched →
+reference pinned → hazard constructs → other constructs → user `[topic]` →
+reference topical** — the topical ranking is partitioned so every relevant
+user `[topic]` chunk precedes any reference hit, and `top_k` caps the tier as
+a whole. Operator rules have first claim on the budget; a rule that doesn't
+fit logs a WARNING naming it. `user_instructions.max_words` (config or the
+`user_max_words` argument) additionally caps the user block inside the
+overall budget. Selected rules render in a `## Project instructions` block
+above the reference guidance, with the operator's own headings and no page
+citations.
+
+Parsing never raises: unknown directives, malformed construct keys, and
+empty-bodied sections emit `InstructionDiagnostic`s and degrade toward
+*over*-inclusion (always-on) — an operator rule silently vanishing is the
+failure mode this module refuses. Like all guidance, rules are **ephemeral**:
+prompted, never persisted to history.
+
+Each set carries a 16-hex content `fingerprint`, exposed as
+`SasLLMPipeline.instructions_fingerprint` and recorded into the validation
+run history (`instructions_fingerprint` column) — eval runs under different
+instructions are never compared as equals.
 
 ### Logging — pdf_reader
 

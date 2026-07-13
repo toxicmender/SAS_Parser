@@ -330,7 +330,9 @@ class SasLLMPipeline:
     user_instructions : str | UserInstructionSet | None
         Operator-supplied project rules (see
         ``prompt_builder/user_instructions.py`` for the heading/directive
-        syntax). With a ``prompt_builder``, the rules are folded into it
+        syntax). ``None`` (default) falls back to the standing instructions
+        file named by config.json ``user_instructions.path``, when set and
+        present. With a ``prompt_builder``, the rules are folded into it
         (replacing any set it already carries — the pipeline-level argument
         wins, with a WARNING); without one, a corpus-less
         :class:`PromptBuilder` is built so instruction injection works with
@@ -362,6 +364,10 @@ class SasLLMPipeline:
         prompt_builder: PromptBuilder | None = None,
         user_instructions: "str | UserInstructionSet | None" = None,
     ) -> None:
+        if user_instructions is None:
+            # A standing instructions file (config.json user_instructions.path)
+            # applies whenever no explicit set is passed.
+            user_instructions = UserInstructionSet.from_config()
         if user_instructions is not None:
             if prompt_builder is None:
                 logger.info(
@@ -582,6 +588,18 @@ class SasLLMPipeline:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    @property
+    def instructions_fingerprint(self) -> str | None:
+        """
+        Content fingerprint of the active user-instruction set, or ``None``
+        when no instructions are active. Recorded into validation run history
+        so eval runs with different instructions are never compared as equals.
+        """
+        builder = self._prompt_builder
+        if builder is None or builder.user_instructions is None:
+            return None
+        return builder.user_instructions.fingerprint
 
     @staticmethod
     def _default_thread_id(source_ids: list[str]) -> str:

@@ -119,6 +119,13 @@ prompt_builder/
   builder.py            PromptBuilder façade: read -> chunk -> index at
                         construction, then build(query, constructs) -> a
                         Markdown guidance block or None.
+  user_instructions.py  UserInstructionSet: operator-supplied rules (plain
+                        str / file) -> scoped InstructionChunks (always /
+                        when:constructs / topic). Selected ahead of all
+                        reference tiers, rendered as a separate "Project
+                        instructions" block, fingerprinted for validation
+                        run history. Degrades toward over-inclusion, never
+                        raises.
 
 app_config/
   __init__.py           Dependency-free loader for the repo-root config.json

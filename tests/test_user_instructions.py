@@ -171,6 +171,72 @@ def test_from_file_reads_and_records_source(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# from_config — the standing instructions file
+# ---------------------------------------------------------------------------
+
+
+def _isolated_config(monkeypatch, tmp_path, mapping) -> None:
+    """Point app_config at a tmp file; each caller clear_cache()s in finally."""
+    import json
+
+    import app_config
+
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps(mapping), encoding="utf-8")
+    monkeypatch.setenv(app_config.ENV_VAR, str(cfg))
+    app_config.clear_cache()
+
+
+def test_from_config_unset_returns_none(monkeypatch, tmp_path):
+    import app_config
+
+    _isolated_config(monkeypatch, tmp_path, {})
+    try:
+        assert UserInstructionSet.from_config() is None
+    finally:
+        app_config.clear_cache()
+
+
+def test_from_config_loads_configured_file(monkeypatch, tmp_path):
+    import app_config
+
+    rules_path = tmp_path / "instructions.md"
+    rules_path.write_text(RULES, encoding="utf-8")
+    _isolated_config(
+        monkeypatch, tmp_path, {"user_instructions": {"path": str(rules_path)}}
+    )
+    try:
+        ins = UserInstructionSet.from_config()
+        assert ins is not None
+        assert ins.source == str(rules_path)
+        assert ins.fingerprint == UserInstructionSet.from_text(RULES).fingerprint
+    finally:
+        app_config.clear_cache()
+
+
+def test_from_config_missing_file_warns_and_returns_none(
+    monkeypatch, tmp_path, caplog
+):
+    import logging
+
+    import app_config
+
+    _isolated_config(
+        monkeypatch,
+        tmp_path,
+        {"user_instructions": {"path": str(tmp_path / "gone.md")}},
+    )
+    try:
+        with caplog.at_level(
+            logging.WARNING, logger="prompt_builder.user_instructions"
+        ):
+            assert UserInstructionSet.from_config() is None
+        assert "not found" in caplog.text
+    finally:
+        app_config.clear_cache()
+
+
+# ---------------------------------------------------------------------------
 # Interop — scope survives the LangChain Document round-trip
 # ---------------------------------------------------------------------------
 

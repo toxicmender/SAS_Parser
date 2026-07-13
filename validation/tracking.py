@@ -45,7 +45,8 @@ DEFAULT_PATH = "validation_runs"
 # One row per (run, case, metric); run- and case-level values are repeated on
 # each row so any slice of the table is self-describing.
 _SCHEMA_DDL = (
-    "run_id string, logged_at timestamp, model string, run_score double, "
+    "run_id string, logged_at timestamp, model string, "
+    "instructions_fingerprint string, run_score double, "
     "run_passed boolean, case_count int, case_id string, case_score double, "
     "case_passed boolean, item_count int, metric string, score double, "
     "threshold double, passed boolean, skipped boolean, details string"
@@ -84,6 +85,7 @@ def _report_rows(
                     "run_id": run_id,
                     "logged_at": logged_at,
                     "model": report.model,
+                    "instructions_fingerprint": report.instructions_fingerprint,
                     "run_score": report.score,
                     "run_passed": report.passed,
                     "case_count": len(report.results),

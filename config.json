@@ -17,6 +17,10 @@
     "max_input_tokens": null,
     "max_output_tokens": null
   },
+  "user_instructions": {
+    "path": null,
+    "max_words": null
+  },
   "validation": {
     "response_coverage_threshold": null,
     "dataset_fidelity_threshold": null,

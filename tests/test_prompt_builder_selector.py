@@ -246,6 +246,27 @@ def test_top_k_caps_user_and_reference_topical_together():
     assert "c4" not in ids
 
 
+def test_user_max_words_caps_user_block_only(caplog):
+    import logging
+
+    two_rules = (
+        "## Rule one\nalpha beta gamma delta epsilon.\n\n"
+        "## Rule two\nzeta eta theta iota kappa.\n"
+    )
+    sel = InstructionSelector(
+        _corpus(),
+        user_instructions=UserInstructionSet.from_text(two_rules),
+        user_max_words=9,  # each rule chunk is ~7 words; only one fits
+    )
+    with caplog.at_level(logging.WARNING, logger="prompt_builder.selector"):
+        out = sel.select("zzz", [INTNX], max_words=10_000)
+    ids = [c.chunk_id for c in out]
+    assert "user::c0000" in ids  # first rule within the user cap
+    assert "user::c0001" not in ids  # second rule over the user cap
+    assert "c0" in ids  # reference chunks unaffected by the user cap
+    assert "user_max_words=9" in caplog.text
+
+
 def test_user_always_overflow_warns(caplog):
     import logging
 
@@ -253,7 +274,7 @@ def test_user_always_overflow_warns(caplog):
     with caplog.at_level(logging.WARNING, logger="prompt_builder.selector"):
         out = sel.select("zzz", [], max_words=5)
     assert out == []
-    assert "does not fit the remaining budget" in caplog.text
+    assert "does not fit budget" in caplog.text
 
 
 # ---------------------------------------------------------------------------

@@ -104,6 +104,7 @@ class ValidationRunner:
         logger.info(f"run: {len(cases)} case(s)  model={self.pipeline.model}")
         report = ValidationReport(
             model=self.pipeline.model,
+            instructions_fingerprint=self.pipeline.instructions_fingerprint,
             results=[self.run_case(case) for case in cases],
         )
         logger.info(

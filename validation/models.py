@@ -106,6 +106,9 @@ class ValidationReport(BaseModel):
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+    # Fingerprint of the user-instruction set active during the run (None
+    # when none) — runs under different instructions are not comparable.
+    instructions_fingerprint: str | None = None
     results: list[CaseResult] = Field(default_factory=list)
 
     @computed_field  # type: ignore[prop-decorator]

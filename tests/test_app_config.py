@@ -92,6 +92,7 @@ def test_repo_config_json_matches_code_defaults():
         "max_input_tokens": None,
         "max_output_tokens": None,
     }
+    assert repo_cfg["user_instructions"] == {"path": None, "max_words": None}
 
 
 # ---------------------------------------------------------------------------

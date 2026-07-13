@@ -260,6 +260,52 @@ def test_conditional_rule_scoped_end_to_end():
     assert USER_MARKER not in "\n".join(str(m.content) for m in llm.prompts[1])
 
 
+def test_standing_instructions_file_from_config(monkeypatch, tmp_path):
+    import json
+
+    import app_config
+
+    rules_path = tmp_path / "instructions.md"
+    rules_path.write_text(f"## Output rules\n{USER_MARKER}.", encoding="utf-8")
+    cfg = tmp_path / "config.json"
+    cfg.write_text(
+        json.dumps({"user_instructions": {"path": str(rules_path)}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(app_config.ENV_VAR, str(cfg))
+    app_config.clear_cache()
+    try:
+        llm = _RecordingChatModel()
+        # No user_instructions argument: the configured standing file applies.
+        pipeline = SasLLMPipeline(
+            model="unused-because-llm-injected",
+            memory=DatabricksMemory(),
+            llm=llm,
+        )
+        pipeline._process(
+            items=[_intnx_chunk()], diagnostics=[], thread_id="run::etl.sas"
+        )
+        prompted = "\n".join(str(m.content) for m in llm.prompts[0])
+        assert USER_MARKER in prompted
+        assert pipeline.instructions_fingerprint is not None
+        assert len(pipeline.instructions_fingerprint) == 16
+    finally:
+        app_config.clear_cache()
+
+
+def test_instructions_fingerprint_property():
+    llm = _RecordingChatModel()
+    with_rules = SasLLMPipeline(
+        model="unused-because-llm-injected",
+        memory=DatabricksMemory(),
+        llm=llm,
+        user_instructions="## A\nrule body.",
+    )
+    without = _pipeline(_RecordingChatModel(), None)
+    assert with_rules.instructions_fingerprint is not None
+    assert without.instructions_fingerprint is None
+
+
 def test_irrelevant_item_injects_no_guidance():
     llm = _RecordingChatModel()
     pipeline = _pipeline(llm, PromptBuilder(_guidance_corpus()))

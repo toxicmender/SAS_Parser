@@ -382,6 +382,30 @@ def test_report_rows_flatten_run_case_and_metric_levels():
         assert row["run_score"] == pytest.approx(report.score)
 
 
+def test_instructions_fingerprint_flows_into_report_and_rows():
+    from datetime import datetime, timezone
+
+    from validation.tracking import _report_rows
+
+    case = ValidationCase(case_id="fp", sas_source="data work.a; run;")
+
+    with_rules = SasLLMPipeline(
+        llm=FakeListChatModel(responses=[GOOD_RESPONSE]),
+        user_instructions="## Rules\nAlways emit a risk table.",
+    )
+    report = ValidationRunner(with_rules).run([case])
+    assert report.instructions_fingerprint == with_rules.instructions_fingerprint
+    rows = _report_rows(report, "run-1", datetime.now(timezone.utc))
+    assert all(
+        r["instructions_fingerprint"] == report.instructions_fingerprint
+        for r in rows
+    )
+
+    # No instructions active -> None recorded, so runs stay distinguishable.
+    bare = ValidationRunner(_pipeline([GOOD_RESPONSE])).run([case])
+    assert bare.instructions_fingerprint is None
+
+
 def test_resolve_target_prefers_table_over_path():
     from validation.tracking import DEFAULT_PATH, _resolve_target
 

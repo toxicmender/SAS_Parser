@@ -165,6 +165,10 @@ class InstructionSelector:
         Where to persist document embeddings when dense retrieval is on.
     rrf_k, reranker :
         Forwarded to :class:`~memory.relevance.HybridRanker`.
+    user_max_words : int | None
+        Cap on the total words of *user-instruction* chunks per selection,
+        within the overall ``max_words`` budget. ``None`` (default) leaves
+        user chunks limited only by the overall budget.
     pinned_sections : Iterable[str]
         Section-path substrings (case-insensitive) whose reference chunks are
         always injected, within budget (after user instructions).
@@ -177,6 +181,7 @@ class InstructionSelector:
         chunks: Iterable[InstructionChunk],
         *,
         user_instructions: UserInstructionSet | None = None,
+        user_max_words: int | None = None,
         embeddings: Any | None = None,
         embedding_cache_path: str | None = None,
         rrf_k: int = 60,
@@ -185,6 +190,7 @@ class InstructionSelector:
         stop_constructs: Iterable[ConstructKey] = DEFAULT_STOP_CONSTRUCTS,
         hazard_constructs: Iterable[ConstructKey] = DEFAULT_HAZARD_CONSTRUCTS,
     ) -> None:
+        self._user_max_words = user_max_words
         self._chunks = list(chunks)
         self._reference_count = len(self._chunks)
         reference_count = self._reference_count
@@ -267,25 +273,38 @@ class InstructionSelector:
         chosen: list[int] = []
         chosen_set: set[int] = set()
         used = 0
+        user_used = 0
 
         def add(idx: int, *, warn_overflow: bool = False) -> bool:
-            nonlocal used
+            nonlocal used, user_used
             if idx in chosen_set:
                 return False
-            if used + self._wc[idx] > max_words:
+            is_user = idx >= self._reference_count
+            over_user_cap = (
+                is_user
+                and self._user_max_words is not None
+                and user_used + self._wc[idx] > self._user_max_words
+            )
+            if over_user_cap or used + self._wc[idx] > max_words:
                 if warn_overflow:
                     # Operator rules have first claim on the budget; even they
                     # did not fit. That's a misconfiguration, not tail-drop.
+                    limit = (
+                        f"user_max_words={self._user_max_words}"
+                        if over_user_cap
+                        else f"budget ({max_words - used}/{max_words})"
+                    )
                     logger.warning(
                         f"select: user instruction "
                         f"'{self._chunks[idx].section_path}' "
-                        f"({self._wc[idx]} words) does not fit the remaining "
-                        f"budget ({max_words - used}/{max_words}); dropped"
+                        f"({self._wc[idx]} words) does not fit {limit}; dropped"
                     )
                 return False
             chosen.append(idx)
             chosen_set.add(idx)
             used += self._wc[idx]
+            if is_user:
+                user_used += self._wc[idx]
             return True
 
         # Tiers 1-2 — operator rules, first claim on the budget.

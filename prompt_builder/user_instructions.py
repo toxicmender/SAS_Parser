@@ -36,6 +36,7 @@ import logging
 import re
 from pathlib import Path
 
+import app_config
 from pydantic import BaseModel, Field
 
 from .models import ConstructKey, DocRole, InstructionChunk, InstructionDiagnostic
@@ -138,6 +139,26 @@ class UserInstructionSet(BaseModel):
         """Read *path* (UTF-8) and parse it via :meth:`from_text`."""
         text = Path(path).read_text(encoding="utf-8")
         return cls.from_text(text, doc_id=doc_id, source=str(path))
+
+    @classmethod
+    def from_config(cls) -> "UserInstructionSet | None":
+        """
+        The standing instruction file named by config.json
+        (``user_instructions.path``), or ``None`` when the key is unset. A
+        configured-but-missing file warns and returns ``None`` rather than
+        raising — a deleted instructions file should not stop a run.
+        """
+        path = app_config.get_value("user_instructions", "path")
+        if path is None:
+            return None
+        if not Path(path).is_file():
+            logger.warning(
+                f"UserInstructionSet.from_config: configured instructions "
+                f"file '{path}' not found; continuing without user instructions"
+            )
+            return None
+        logger.info(f"UserInstructionSet.from_config: loading '{path}'")
+        return cls.from_file(str(path))
 
     # ------------------------------------------------------------------
     # Scope views

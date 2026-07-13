@@ -70,6 +70,7 @@ class PromptBuilder:
         chunks: Iterable[InstructionChunk],
         *,
         user_instructions: "str | UserInstructionSet | None" = None,
+        user_max_words: int | None = None,
         top_k: int | None = None,
         max_instruction_words: int | None = None,
         pinned_sections: Iterable[str] = (),
@@ -83,6 +84,10 @@ class PromptBuilder:
         self.top_k = app_config.resolve(top_k, "prompt_builder", "top_k", 6)
         self.max_instruction_words = app_config.resolve(
             max_instruction_words, "prompt_builder", "max_instruction_words", 1500
+        )
+        # None default keeps user chunks limited only by the overall budget.
+        self.user_max_words = app_config.resolve(
+            user_max_words, "user_instructions", "max_words", None
         )
         self.heading = heading
         self.project_heading = project_heading
@@ -99,6 +104,7 @@ class PromptBuilder:
         self._selector = InstructionSelector(
             chunks,
             user_instructions=user_instructions,
+            user_max_words=self.user_max_words,
             embeddings=embeddings,
             embedding_cache_path=embedding_cache_path,
             rrf_k=rrf_k,
@@ -117,6 +123,7 @@ class PromptBuilder:
         return PromptBuilder(
             self._selector.reference_chunks,
             user_instructions=user_instructions,
+            user_max_words=self.user_max_words,
             top_k=self.top_k,
             max_instruction_words=self.max_instruction_words,
             pinned_sections=self._pinned_sections,
