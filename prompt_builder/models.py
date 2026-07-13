@@ -20,6 +20,7 @@ class DocRole(StrEnum):
     SAS_REFERENCE = "sas_reference"  # SAS language manuals (source-side guidance)
     TARGET_GUIDE = "target_guide"  # target-platform guide, e.g. Spark (target-side)
     CHEAT_SHEET = "cheat_sheet"  # short quick-reference, optionally pinned
+    USER_INSTRUCTION = "user_instruction"  # operator-supplied project rules
 
 
 class ExtractionStrategy(StrEnum):

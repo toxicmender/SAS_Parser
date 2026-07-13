@@ -16,6 +16,7 @@ from .builder import PromptBuilder
 from .catalog import CorpusLoader, DocumentSpec, default_catalog
 from .models import ConstructKey, DocRole, InstructionChunk
 from .selector import InstructionSelector
+from .user_instructions import UserInstructionSet
 
 __all__ = [
     "PromptBuilder",
@@ -26,4 +27,5 @@ __all__ = [
     "ConstructKey",
     "DocRole",
     "InstructionChunk",
+    "UserInstructionSet",
 ]
