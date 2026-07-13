@@ -7,6 +7,7 @@ Logger name: ``chunker.chunker``.
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import time
 from collections.abc import Iterable
@@ -43,6 +44,11 @@ from .scanner import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The characters _scan_units cares about outside a quoted string: a statement
+# terminator, a quote opener, or a block-comment opener ("/" alone is ordinary
+# statement text and deliberately not an event).
+_SCAN_EVENT_RE = re.compile(r"[;'\"]|/\*")
 
 
 def _record_user_library(
@@ -227,11 +233,17 @@ class SasSemanticChunker:
         quote: str | None = None
         ticks = 0
 
+        # The scan jumps between "event" characters — statement terminators,
+        # quote openers, and block-comment openers — via a compiled search
+        # instead of visiting every character in Python; everything between
+        # events is ordinary statement text that needs no inspection. One
+        # iteration of this loop handles one event (or one quote-close /
+        # doubled-quote escape while inside a string).
         while index < len(source):
             # Deadline check, gated behind a tick counter so perf_counter() is
-            # sampled ~once per 8192 iterations (this is the hottest loop).
+            # sampled ~once per 256 events (this is the hottest loop).
             ticks += 1
-            if (ticks & 0x1FFF) == 0 and deadline.expired():
+            if (ticks & 0xFF) == 0 and deadline.expired():
                 _record_parser_timeout(diagnostics, line_starts, "scan", index)
                 logger.warning(
                     f"_scan_units: deadline exceeded at char {index}/{len(source)} "
@@ -240,29 +252,36 @@ class SasSemanticChunker:
                 )
                 break
 
+            # ── inside quoted string: jump to the closing quote ─────────────
+            if quote:
+                pos = source.find(quote, index)
+                if pos == -1:
+                    index = len(source)  # unterminated string runs to EOF
+                    continue
+                if pos + 1 < len(source) and source[pos + 1] == quote:
+                    index = pos + 2  # doubled-quote escape
+                    continue
+                quote = None
+                index = pos + 1
+                continue
+
             if stmt_start is None:
                 stmt_start = index
 
-            char = source[index]
-            nxt = source[index : index + 2]
-
-            # ── inside quoted string ────────────────────────────────────────
-            if quote:
-                if char == quote:
-                    if index + 1 < len(source) and source[index + 1] == quote:
-                        index += 2  # doubled-quote escape
-                        continue
-                    quote = None
-                index += 1
+            m = _SCAN_EVENT_RE.search(source, index)
+            if m is None:
+                index = len(source)  # no more events; trailing text handled below
                 continue
+            index = m.start()
+            char = source[index]
 
-            if char in {"'", '"'}:
+            if char in "'\"":
                 quote = char
                 index += 1
                 continue
 
             # ── block comment /* … */ ───────────────────────────────────────
-            if nxt == "/*":
+            if char == "/":
                 comment_start = index
                 comment_end = source.find("*/", index + 2)
                 before = source[stmt_start:comment_start]
@@ -305,30 +324,26 @@ class SasSemanticChunker:
                 index = len(source) if comment_end == -1 else comment_end + 2
                 continue
 
-            # ── statement terminator ────────────────────────────────────────
-            if char == ";":
-                end = _ws_end(source, index + 1)
-                text = source[stmt_start:end]
-                is_comment = _is_stmt_comment(text)
-                units.append(
-                    _Unit(
-                        start=stmt_start,
-                        end=end,
-                        text=text,
-                        is_comment=is_comment,
-                    )
+            # ── statement terminator (the only remaining event kind: ";") ───
+            end = _ws_end(source, index + 1)
+            text = source[stmt_start:end]
+            is_comment = _is_stmt_comment(text)
+            units.append(
+                _Unit(
+                    start=stmt_start,
+                    end=end,
+                    text=text,
+                    is_comment=is_comment,
                 )
-                if logger.isEnabledFor(logging.DEBUG):
-                    text_preview = text[:60].replace("\n", "↵")
-                    logger.debug(
-                        f"_scan_units: stmt  line={_line_for(stmt_start, line_starts)}  "
-                        f"comment={is_comment}  text={text_preview!r}"
-                    )
-                stmt_start = None
-                index = end
-                continue
-
-            index += 1
+            )
+            if logger.isEnabledFor(logging.DEBUG):
+                text_preview = text[:60].replace("\n", "↵")
+                logger.debug(
+                    f"_scan_units: stmt  line={_line_for(stmt_start, line_starts)}  "
+                    f"comment={is_comment}  text={text_preview!r}"
+                )
+            stmt_start = None
+            index = end
 
         # trailing unterminated fragment
         if stmt_start is not None and stmt_start < len(source):
