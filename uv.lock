@@ -1260,7 +1260,6 @@ dependencies = [
     { name = "pydantic" },
     { name = "pymupdf" },
     { name = "pyspark" },
-    { name = "regex" },
 ]
 
 [package.optional-dependencies]
@@ -1289,7 +1288,6 @@ requires-dist = [
     { name = "pyspark", specifier = ">=4.1.2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest-cov", marker = "extra == 'dev'" },
-    { name = "regex", specifier = ">=2026.6.28" },
     { name = "ruff", marker = "extra == 'dev'" },
 ]
 provides-extras = ["anthropic", "openai", "dev"]

@@ -12,7 +12,6 @@ dependencies = [
     "pydantic>=2.13.4",
     "pymupdf>=1.28.0",
     "pyspark>=4.1.2",
-    "regex>=2026.6.28",
 ]
 
 [project.optional-dependencies]

@@ -15,8 +15,10 @@ from .keywords import (
     _MACRO_CALL_RE,
     _MACRO_INVOKE_RE,
     _SAS_CALL_ROUTINE_RE,
+    _SAS_CALL_ROUTINES,
     _SAS_COMPONENT_OBJECT_RE,
     _SAS_FUNCTION_CALL_RE,
+    _SAS_FUNCTIONS,
     _SAS_RESERVED,
 )
 from .models import SasChunkKind, SasChunkMetadata
@@ -386,16 +388,31 @@ def _extract_sql_into_vars(text: str) -> list[str]:
 def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
     cf = _sanitise(text, blank_strings=False)
     mt = _sanitise(text)
+    # Lowercased copies used only to gate keyword scans: every gated pattern
+    # contains its keyword as a contiguous case-insensitive literal, so
+    # ``keyword in low`` is a necessary condition for any match and skipping
+    # the scan when it fails cannot change the result. The substring test is a
+    # single memchr-style pass — far cheaper than a regex scan that starts
+    # with \b or a lookbehind (which the engine cannot literal-prefix skip).
+    low = mt.lower()
+    lowcf = cf.lower()
     # Dataset names collected from dataset positions only (DATA/SET/MERGE/UPDATE/
     # MODIFY keywords, DATA=/OUT=/OUTDATA= options, PROC SQL clauses) so table
     # aliases and BY-group temporaries aren't mistaken for datasets/librefs.
     datasets = [_nid(m.group(1)) for m in _DATASET_RE.finditer(mt)]
     datasets += [_nid(m.group(1)) for m in _DATA_OPT_RE.finditer(mt)]
-    datasets += [_nid(m.group(1)) for m in _SQL_CREATE_RE.finditer(mt)]
-    datasets += [_nid(m.group(1)) for m in _SQL_FROM_RE.finditer(mt)]
-    datasets += [_nid(m.group(1)) for m in _SQL_JOIN_RE.finditer(mt)]
-    datasets += [_nid(m.group(1)) for m in _SQL_INTO_RE.finditer(mt)]
-    datasets += [_nid(m.group(1) or m.group(2)) for m in _PROC_OUT_RE.finditer(mt)]
+    if "create" in low:
+        datasets += [_nid(m.group(1)) for m in _SQL_CREATE_RE.finditer(mt)]
+    if "from" in low:
+        datasets += [_nid(m.group(1)) for m in _SQL_FROM_RE.finditer(mt)]
+    if "join" in low:
+        datasets += [_nid(m.group(1)) for m in _SQL_JOIN_RE.finditer(mt)]
+    if "insert" in low:
+        datasets += [_nid(m.group(1)) for m in _SQL_INTO_RE.finditer(mt)]
+    if "out" in low:
+        datasets += [
+            _nid(m.group(1) or m.group(2)) for m in _PROC_OUT_RE.finditer(mt)
+        ]
     # Directed I/O parses the full dataset lists (_DATASET_RE above captures only
     # the first of a multi-dataset statement), so its canonical names complete
     # referenced_datasets in their work.-qualified spelling.
@@ -404,6 +421,8 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
     # Librefs this chunk assigns; ``_all_`` targets every assigned libref.
     defines_librefs = sorted(
         {_nid(m.group(1)) for m in _LIBNAME_REF_RE.finditer(mt)} - {"_all_"}
+        if "libname" in low
+        else set()
     )
     # Referenced librefs: the libref part of every two-level name, plus any
     # assigned here. Quoted physical paths carry no libref.
@@ -415,9 +434,21 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
         }
         | set(defines_librefs)
     )
-    includes = [_nid(m.group(1)).strip("'\"") for m in _INCLUDE_RE.finditer(cf)]
-    options = [_nid(p) for m in _OPTIONS_RE.finditer(mt) for p in m.group(1).split()]
-    labels = sorted({_nid(m.group(1)) for m in _LABEL_RE.finditer(mt)})
+    includes = (
+        [_nid(m.group(1)).strip("'\"") for m in _INCLUDE_RE.finditer(cf)]
+        if "include" in lowcf
+        else []
+    )
+    options = (
+        [_nid(p) for m in _OPTIONS_RE.finditer(mt) for p in m.group(1).split()]
+        if "options" in low
+        else []
+    )
+    labels = (
+        sorted({_nid(m.group(1)) for m in _LABEL_RE.finditer(mt)})
+        if "label" in low
+        else []
+    )
     pm = _PROC_RE.search(mt)
     dm = _DATA_RE.search(mt)
     mm = _MACRO_DEF_RE.search(mt)
@@ -462,8 +493,12 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
     has_abort = False
     has_computed_goto = False
     if kind == SasChunkKind.MACRO_DEFINITION:
-        has_abort = bool(_ABORT_STMT_RE.search(text))
-        has_computed_goto = _macro_contains_computed_goto(text)
+        # Scanned on the raw text (comments included), so gate on its lowering.
+        lowtext = text.lower()
+        has_abort = "abort" in lowtext and bool(_ABORT_STMT_RE.search(text))
+        has_computed_goto = "goto" in lowtext and _macro_contains_computed_goto(
+            text
+        )
 
     # ── macro-variable producer/consumer edges (ROADMAP Phase 2) ────────────
     produces_macrovars: list[str] = []
@@ -471,9 +506,12 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
     hazard_vars: list[str] = []
 
     if kind in {SasChunkKind.DATA_STEP, SasChunkKind.MACRO_DEFINITION}:
-        symput_names, _unresolved, explicit_global = _extract_symput(cf)
+        symput_names, _unresolved, explicit_global = (
+            _extract_symput(cf) if "symput" in lowcf else ([], False, [])
+        )
         produces_macrovars.extend(symput_names)
-        invk.extend(_extract_call_execute_macros(cf))
+        if "execute" in lowcf:
+            invk.extend(_extract_call_execute_macros(cf))
 
         if kind == SasChunkKind.MACRO_DEFINITION and symput_names:
             has_local = _macro_has_local_scope(text, param_names)
@@ -483,7 +521,12 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
                     hazard = True
                     hazard_vars = at_risk
 
-    elif kind == SasChunkKind.PROC_STEP and pm and _nid(pm.group(1)) == "sql":
+    elif (
+        kind == SasChunkKind.PROC_STEP
+        and pm
+        and _nid(pm.group(1)) == "sql"
+        and "into" in lowcf
+    ):
         produces_macrovars.extend(_extract_sql_into_vars(cf))
 
     # ── macro-language-level declarations (%LET and %GLOBAL/%LOCAL lists) ───
@@ -499,11 +542,21 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
     # Scanned on `mt` (string literals blanked), with %MACRO headers and
     # grouped-list INPUT/PUT blanked on top so non-call ``name(`` don't register.
     ft = _function_scan_text(mt)
+    # The patterns capture any identifier token in call position; membership in
+    # the keyword catalogues decides what is *recognized* (see keywords.py).
     recognized_functions = sorted(
-        {m.group(1).lower() for m in _SAS_FUNCTION_CALL_RE.finditer(ft)}
+        {
+            name
+            for m in _SAS_FUNCTION_CALL_RE.finditer(ft)
+            if (name := m.group(1).lower()) in _SAS_FUNCTIONS
+        }
     )
     recognized_call_routines = sorted(
-        {m.group(1).lower() for m in _SAS_CALL_ROUTINE_RE.finditer(ft)}
+        {
+            name
+            for m in _SAS_CALL_ROUTINE_RE.finditer(ft)
+            if (name := m.group(1).lower()) in _SAS_CALL_ROUTINES
+        }
     )
     # A ``CALL name(...)`` invocation also textually matches the function-call
     # pattern (``name(``); drop those so a routine isn't double-reported as a
@@ -841,56 +894,74 @@ def _macro_body_io(
     raw_outputs: list[str] = []
     raw_inputs: list[str] = []
 
-    for m in _BODY_DATA_HDR_RE.finditer(mt):
-        cleaned = _PAREN_RE.sub(" ", m.group(1))
-        for tok in _AMP_TOKEN_RE.findall(cleaned):
-            if tok.lower() not in _SAS_RESERVED:
-                raw_outputs.append(tok)
+    # Keyword gates on lowercased copies, as in _metadata_for: each gated
+    # pattern contains its keyword as a contiguous case-insensitive literal,
+    # so a failed substring test proves the scan would find nothing.
+    low = mt.lower()
 
-    for m in _BODY_OUTPUT_RE.finditer(mt):
-        raw_outputs.append(m.group(1))
+    if "data" in low:
+        for m in _BODY_DATA_HDR_RE.finditer(mt):
+            cleaned = _PAREN_RE.sub(" ", m.group(1))
+            for tok in _AMP_TOKEN_RE.findall(cleaned):
+                if tok.lower() not in _SAS_RESERVED:
+                    raw_outputs.append(tok)
 
-    for m in _BODY_PROC_OUT_RE.finditer(mt):
-        raw = m.group(1) or m.group(2) or ""
-        if raw:
-            raw_outputs.append(raw)
+    if "output" in low:
+        for m in _BODY_OUTPUT_RE.finditer(mt):
+            raw_outputs.append(m.group(1))
 
-    for m in _BODY_SQL_CREATE_RE.finditer(mt):
-        raw_outputs.append(m.group(1))
-    for m in _BODY_SQL_INTO_RE.finditer(mt):
-        raw_outputs.append(m.group(1))
+    if "out" in low:
+        for m in _BODY_PROC_OUT_RE.finditer(mt):
+            raw = m.group(1) or m.group(2) or ""
+            if raw:
+                raw_outputs.append(raw)
 
-    for m in _BODY_SET_RE.finditer(mt):
-        cleaned = _PAREN_RE.sub(" ", m.group(1))
-        for tok in _AMP_TOKEN_RE.findall(cleaned):
-            raw_inputs.append(tok)
+    if "create" in low:
+        for m in _BODY_SQL_CREATE_RE.finditer(mt):
+            raw_outputs.append(m.group(1))
+    if "insert" in low:
+        for m in _BODY_SQL_INTO_RE.finditer(mt):
+            raw_outputs.append(m.group(1))
 
-    for m in _BODY_MERGE_RE.finditer(mt):
-        cleaned = _PAREN_RE.sub(" ", m.group(1))
-        for tok in _AMP_TOKEN_RE.findall(cleaned):
-            raw_inputs.append(tok)
+    if "set" in low:
+        for m in _BODY_SET_RE.finditer(mt):
+            cleaned = _PAREN_RE.sub(" ", m.group(1))
+            for tok in _AMP_TOKEN_RE.findall(cleaned):
+                raw_inputs.append(tok)
 
-    for m in _BODY_UPDATE_RE.finditer(mt):
-        raw_inputs.append(m.group(1))
-        raw_outputs.append(m.group(1))
-    for m in _BODY_MODIFY_RE.finditer(mt):
-        raw_inputs.append(m.group(1))
-        raw_outputs.append(m.group(1))
+    if "merge" in low:
+        for m in _BODY_MERGE_RE.finditer(mt):
+            cleaned = _PAREN_RE.sub(" ", m.group(1))
+            for tok in _AMP_TOKEN_RE.findall(cleaned):
+                raw_inputs.append(tok)
 
-    for m in _BODY_PROC_IN_RE.finditer(mt):
-        raw_inputs.append(m.group(1))
+    if "update" in low:
+        for m in _BODY_UPDATE_RE.finditer(mt):
+            raw_inputs.append(m.group(1))
+            raw_outputs.append(m.group(1))
+    if "modify" in low:
+        for m in _BODY_MODIFY_RE.finditer(mt):
+            raw_inputs.append(m.group(1))
+            raw_outputs.append(m.group(1))
 
-    for m in _BODY_SQL_FROM_RE.finditer(mt):
-        raw_inputs.append(m.group(1))
-    for m in _BODY_SQL_JOIN_RE.finditer(mt):
-        raw_inputs.append(m.group(1))
+    if "data" in low:
+        for m in _BODY_PROC_IN_RE.finditer(mt):
+            raw_inputs.append(m.group(1))
+
+    if "from" in low:
+        for m in _BODY_SQL_FROM_RE.finditer(mt):
+            raw_inputs.append(m.group(1))
+    if "join" in low:
+        for m in _BODY_SQL_JOIN_RE.finditer(mt):
+            raw_inputs.append(m.group(1))
 
     # Hash constructors' dataset: arguments — scanned on cf because the name
     # sits inside a quoted literal. May hold &refs (``dataset:"&ds"``), which
     # _classify_ref resolves against the signature like any other reference.
-    for raw in _hash_dataset_refs(cf):
-        if _AMP_TOKEN_RE.fullmatch(raw):
-            raw_inputs.append(raw)
+    if "dataset" in cf.lower():
+        for raw in _hash_dataset_refs(cf):
+            if _AMP_TOKEN_RE.fullmatch(raw):
+                raw_inputs.append(raw)
 
     def _classify_list(raws: list[str], role: str) -> tuple[list[str], list[dict]]:
         literals: list[str] = []
@@ -1038,72 +1109,98 @@ def _io_for(
         pass
 
     elif kind == SasChunkKind.DATA_STEP:
+        # Keyword gates on lowercased copies, as in _metadata_for: each gated
+        # pattern contains its keyword as a contiguous case-insensitive
+        # literal, so a failed substring test proves the scan would find
+        # nothing. Quoted-path patterns additionally require a quote char.
+        low = mt.lower()
+        lowcf = cf.lower()
+        has_quote = "'" in cf or '"' in cf
         first_semi = mt.find(";")
         data_header = mt[:first_semi] if first_semi != -1 else mt
         header_body = _DATA_HDR_STRIP_RE.sub("", data_header)
         outputs.extend(_multi_ds(header_body))
-        for m in _OUTPUT_DS_RE.finditer(mt):
-            if n := _ds_name(m.group(1)):
-                outputs.append(_canon_ds(n))
-        for m in _SET_RE.finditer(mt):
-            inputs.extend(_multi_ds(m.group(1)))
-        for m in _MERGE_RE.finditer(mt):
-            inputs.extend(_multi_ds(m.group(1)))
-        for m in _UPDATE_RE.finditer(mt):
-            if n := _ds_name(m.group(1)):
-                inputs.append(_canon_ds(n))
-                outputs.append(_canon_ds(n))
-        for m in _MODIFY_RE.finditer(mt):
-            if n := _ds_name(m.group(1)):
-                inputs.append(_canon_ds(n))
-                outputs.append(_canon_ds(n))
+        if "output" in low:
+            for m in _OUTPUT_DS_RE.finditer(mt):
+                if n := _ds_name(m.group(1)):
+                    outputs.append(_canon_ds(n))
+        if "set" in low:
+            for m in _SET_RE.finditer(mt):
+                inputs.extend(_multi_ds(m.group(1)))
+        if "merge" in low:
+            for m in _MERGE_RE.finditer(mt):
+                inputs.extend(_multi_ds(m.group(1)))
+        if "update" in low:
+            for m in _UPDATE_RE.finditer(mt):
+                if n := _ds_name(m.group(1)):
+                    inputs.append(_canon_ds(n))
+                    outputs.append(_canon_ds(n))
+        if "modify" in low:
+            for m in _MODIFY_RE.finditer(mt):
+                if n := _ds_name(m.group(1)):
+                    inputs.append(_canon_ds(n))
+                    outputs.append(_canon_ds(n))
         # Quoted physical-path forms: ``data '<path>';`` header (output) and
         # ``set|merge '<path>'`` (input) — scanned on cf, not mt.
-        for m in _QUOTED_DATA_HDR_RE.finditer(cf):
-            outputs.append(_quoted_path(m.group(1)))
-        for m in _QUOTED_SET_MERGE_RE.finditer(cf):
-            inputs.append(_quoted_path(m.group(1)))
+        if has_quote and "data" in lowcf:
+            for m in _QUOTED_DATA_HDR_RE.finditer(cf):
+                outputs.append(_quoted_path(m.group(1)))
+        if has_quote and ("set" in lowcf or "merge" in lowcf):
+            for m in _QUOTED_SET_MERGE_RE.finditer(cf):
+                inputs.append(_quoted_path(m.group(1)))
         # Hash object constructors load their DATASET: argument at
         # instantiation — an input like SET/MERGE. A value holding a macro
         # reference is left unresolved rather than guessed.
-        for raw in _hash_dataset_refs(cf):
-            if "&" in raw:
-                continue
-            if (n := _ds_name(raw)) and _DS_TOKEN_RE.fullmatch(n):
-                inputs.append(_canon_ds(n))
+        if "dataset" in lowcf:
+            for raw in _hash_dataset_refs(cf):
+                if "&" in raw:
+                    continue
+                if (n := _ds_name(raw)) and _DS_TOKEN_RE.fullmatch(n):
+                    inputs.append(_canon_ds(n))
 
     elif kind == SasChunkKind.PROC_STEP:
+        low = mt.lower()
         proc_m = _PROC_RE.search(mt)
         proc_name = proc_m.group(1).lower() if proc_m else ""
 
         if proc_name == "sql":
-            for m in _SQL_CREATE_RE.finditer(mt):
-                if n := _ds_name(m.group(1)):
-                    outputs.append(_canon_ds(n))
-            for m in _SQL_INTO_RE.finditer(mt):
-                if n := _ds_name(m.group(1)):
-                    outputs.append(_canon_ds(n))
-            for m in _SQL_FROM_RE.finditer(mt):
-                if n := _ds_name(m.group(1)):
-                    inputs.append(_canon_ds(n))
-            for m in _SQL_JOIN_RE.finditer(mt):
-                if n := _ds_name(m.group(1)):
-                    inputs.append(_canon_ds(n))
+            if "create" in low:
+                for m in _SQL_CREATE_RE.finditer(mt):
+                    if n := _ds_name(m.group(1)):
+                        outputs.append(_canon_ds(n))
+            if "insert" in low:
+                for m in _SQL_INTO_RE.finditer(mt):
+                    if n := _ds_name(m.group(1)):
+                        outputs.append(_canon_ds(n))
+            if "from" in low:
+                for m in _SQL_FROM_RE.finditer(mt):
+                    if n := _ds_name(m.group(1)):
+                        inputs.append(_canon_ds(n))
+            if "join" in low:
+                for m in _SQL_JOIN_RE.finditer(mt):
+                    if n := _ds_name(m.group(1)):
+                        inputs.append(_canon_ds(n))
         else:
+            lowcf = cf.lower()
+            has_quote = "'" in cf or '"' in cf
             for m in _DATA_OPT_RE.finditer(mt):
                 if n := _ds_name(m.group(1)):
                     inputs.append(_canon_ds(n))
-            for m in _PROC_OUT_RE.finditer(mt):
-                raw = m.group(1) or m.group(2) or ""
-                if n := _ds_name(raw):
-                    outputs.append(_canon_ds(n))
+            has_proc_out = "out" in low and _PROC_OUT_RE.search(mt)
+            if has_proc_out:
+                for m in _PROC_OUT_RE.finditer(mt):
+                    raw = m.group(1) or m.group(2) or ""
+                    if n := _ds_name(raw):
+                        outputs.append(_canon_ds(n))
             # Quoted physical-path options: DATA='<path>' (input) and
             # OUT='<path>' (output) — scanned on cf, not mt.
-            for m in _QUOTED_DATA_OPT_RE.finditer(cf):
-                inputs.append(_quoted_path(m.group(1)))
-            for m in _QUOTED_OUT_OPT_RE.finditer(cf):
-                outputs.append(_quoted_path(m.group(1)))
-            if proc_name == "sort" and not _PROC_OUT_RE.search(mt):
+            if has_quote and "data" in lowcf:
+                for m in _QUOTED_DATA_OPT_RE.finditer(cf):
+                    inputs.append(_quoted_path(m.group(1)))
+            if has_quote and "out" in lowcf:
+                for m in _QUOTED_OUT_OPT_RE.finditer(cf):
+                    outputs.append(_quoted_path(m.group(1)))
+            if proc_name == "sort" and not has_proc_out:
                 # in-place sort: DATA= is both input and output
                 for m in _DATA_OPT_RE.finditer(mt):
                     if (n := _ds_name(m.group(1))) and (

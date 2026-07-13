@@ -7,8 +7,6 @@ from __future__ import annotations
 
 import re
 
-import regex
-
 
 # Reserved words — SAS Macro Language: Reference, Appendix 1 (94 words, verbatim).
 # None can validly be a user-defined macro name, so every macro-call detector
@@ -270,23 +268,20 @@ _SAS_COMPONENT_OBJECT_RE = re.compile(
 
 # A function call is ``name(`` where the name is not glued to a preceding ``%``,
 # ``&``, or ``.``; a CALL routine is ``CALL name`` at a word boundary. Both
-# alternations are longest-name-first (as _RESERVED_WORDS_PATTERN).
-_SAS_FUNCTIONS_PATTERN = "|".join(
-    re.escape(w) for w in sorted(_SAS_FUNCTIONS, key=len, reverse=True)
-)
-_SAS_CALL_ROUTINES_PATTERN = "|".join(
-    re.escape(w) for w in sorted(_SAS_CALL_ROUTINES, key=len, reverse=True)
-)
-# The third-party ``regex`` engine compiles these large literal alternations
-# (~600 / ~65 names) ~1.75x faster than stdlib ``re``, and this is a per-chunk
-# hot path. Every other pattern here stays on ``re``.
-_SAS_FUNCTION_CALL_RE = regex.compile(
-    rf"(?<![%&.\w])({_SAS_FUNCTIONS_PATTERN})\b\s*\(",
-    regex.IGNORECASE,
-)
-_SAS_CALL_ROUTINE_RE = regex.compile(
-    rf"\bcall\s+({_SAS_CALL_ROUTINES_PATTERN})\b",
-    regex.IGNORECASE,
+# scans capture the *generic* identifier token and leave the "is it a known
+# SAS function/routine?" test to a frozenset lookup in the consumer
+# (metadata.py filters against _SAS_FUNCTIONS / _SAS_CALL_ROUTINES). A literal
+# alternation of the ~600 names costs O(names × text) per scan and dominated
+# the per-chunk metadata profile; the generic-token + set-filter form is
+# match-for-match identical because the alternation's longest-first order and
+# trailing ``\b`` already restricted matches to whole identifier tokens.
+_SAS_FUNCTION_CALL_RE = re.compile(r"(?<![%&.\w])([A-Za-z_]\w*)\s*\(")
+# The routine name is captured in a zero-width lookahead so a rejected token is
+# not consumed: in ``call call scan(...)`` the scan resumes right after the
+# first ``call`` and still finds the genuine ``call scan``.
+_SAS_CALL_ROUTINE_RE = re.compile(
+    r"\bcall\s+(?=([A-Za-z_]\w*))",
+    re.IGNORECASE,
 )
 
 
