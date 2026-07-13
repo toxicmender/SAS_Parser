@@ -36,6 +36,12 @@ import numpy as np
 from memory.relevance import HybridRanker
 
 from .models import ConstructKey, InstructionChunk
+from .user_instructions import (
+    SCOPE_TOPIC,
+    SCOPE_WHEN,
+    UserInstructionSet,
+    scope_of,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +150,14 @@ class InstructionSelector:
     Parameters
     ----------
     chunks : Iterable[InstructionChunk]
-        The full instruction corpus (from :class:`CorpusLoader`).
+        The reference instruction corpus (from :class:`CorpusLoader`).
+    user_instructions : UserInstructionSet | None
+        Operator-supplied rules (see ``user_instructions.py``). Always-scoped
+        chunks are injected into every item with first claim on the budget;
+        ``when:``-scoped chunks are injected when the item's constructs
+        intersect their keys; ``[topic]`` chunks join the topical ranking,
+        partitioned ahead of reference hits. Rule-scoped (always/when) chunks
+        never surface topically and never join the reference construct lookup.
     embeddings : Any | None
         LangChain ``Embeddings`` (or provider string) to enable dense topical
         retrieval; ``None`` (default) is BM25-only and fully offline.
@@ -153,8 +166,8 @@ class InstructionSelector:
     rrf_k, reranker :
         Forwarded to :class:`~memory.relevance.HybridRanker`.
     pinned_sections : Iterable[str]
-        Section-path substrings (case-insensitive) whose chunks are always
-        injected first, within budget.
+        Section-path substrings (case-insensitive) whose reference chunks are
+        always injected, within budget (after user instructions).
     stop_constructs, hazard_constructs : Iterable[ConstructKey]
         Override the default stop-list / hazard set.
     """
@@ -163,6 +176,7 @@ class InstructionSelector:
         self,
         chunks: Iterable[InstructionChunk],
         *,
+        user_instructions: UserInstructionSet | None = None,
         embeddings: Any | None = None,
         embedding_cache_path: str | None = None,
         rrf_k: int = 60,
@@ -172,19 +186,44 @@ class InstructionSelector:
         hazard_constructs: Iterable[ConstructKey] = DEFAULT_HAZARD_CONSTRUCTS,
     ) -> None:
         self._chunks = list(chunks)
-        self._wc = [len(c.text.split()) for c in self._chunks]
+        reference_count = len(self._chunks)
         self._stop = frozenset(stop_constructs)
         self._hazard = frozenset(hazard_constructs)
 
+        # User-instruction tiers: chunks join the shared list (so indices,
+        # word counts, and the ranker index stay uniform) but are tracked by
+        # scope and excluded from the reference-only structures below.
+        self._user_always: list[int] = []
+        self._user_conditional: list[tuple[frozenset[ConstructKey], int]] = []
+        self._user_topical: set[int] = set()
+        if user_instructions is not None:
+            for chunk in user_instructions.chunks:
+                idx = len(self._chunks)
+                self._chunks.append(chunk)
+                scope = scope_of(chunk)
+                if scope == SCOPE_WHEN:
+                    self._user_conditional.append(
+                        (frozenset(chunk.construct_keys), idx)
+                    )
+                elif scope == SCOPE_TOPIC:
+                    self._user_topical.add(idx)
+                else:
+                    self._user_always.append(idx)
+        self._user_rule_indices = set(self._user_always) | {
+            idx for _, idx in self._user_conditional
+        }
+
+        self._wc = [len(c.text.split()) for c in self._chunks]
+
         self._by_construct: dict[ConstructKey, list[int]] = defaultdict(list)
-        for i, chunk in enumerate(self._chunks):
+        for i, chunk in enumerate(self._chunks[:reference_count]):
             for key in chunk.construct_keys:
                 self._by_construct[key].append(i)
 
         pins = [p.lower() for p in pinned_sections]
         self._pinned = [
             i
-            for i, c in enumerate(self._chunks)
+            for i, c in enumerate(self._chunks[:reference_count])
             if any(p in c.section_path.lower() for p in pins)
         ]
 
@@ -195,7 +234,10 @@ class InstructionSelector:
         )
         self._ranker.index([c.text for c in self._chunks])
         logger.info(
-            f"InstructionSelector: {len(self._chunks)} chunk(s)  "
+            f"InstructionSelector: {reference_count} reference chunk(s)  "
+            f"user always/when/topic="
+            f"{len(self._user_always)}/{len(self._user_conditional)}/"
+            f"{len(self._user_topical)}  "
             f"{len(self._by_construct)} construct key(s)  "
             f"{len(self._pinned)} pinned  "
             f"dense={'on' if embeddings is not None else 'off'}"
@@ -210,41 +252,72 @@ class InstructionSelector:
         top_k: int = 6,
     ) -> list[InstructionChunk]:
         """
-        Chunks to inject for one item, in priority order (pinned -> hazard
-        constructs -> other constructs -> topical), filling ``max_words`` and
-        taking at most ``top_k`` topical chunks. Empty when nothing is relevant.
+        Chunks to inject for one item, in priority order — user always ->
+        user construct-matched -> reference pinned -> hazard constructs ->
+        other constructs -> user topical -> reference topical — filling
+        ``max_words`` and taking at most ``top_k`` topical chunks in total.
+        Empty when nothing is relevant.
         """
         chosen: list[int] = []
         chosen_set: set[int] = set()
         used = 0
 
-        def add(idx: int) -> bool:
+        def add(idx: int, *, warn_overflow: bool = False) -> bool:
             nonlocal used
             if idx in chosen_set:
                 return False
             if used + self._wc[idx] > max_words:
+                if warn_overflow:
+                    # Operator rules have first claim on the budget; even they
+                    # did not fit. That's a misconfiguration, not tail-drop.
+                    logger.warning(
+                        f"select: user instruction "
+                        f"'{self._chunks[idx].section_path}' "
+                        f"({self._wc[idx]} words) does not fit the remaining "
+                        f"budget ({max_words - used}/{max_words}); dropped"
+                    )
                 return False
             chosen.append(idx)
             chosen_set.add(idx)
             used += self._wc[idx]
             return True
 
+        # Tiers 1-2 — operator rules, first claim on the budget.
+        for idx in self._user_always:
+            add(idx, warn_overflow=True)
+        construct_set = set(constructs)
+        for keys, idx in self._user_conditional:
+            if keys & construct_set:
+                add(idx, warn_overflow=True)
+
+        # Tiers 3-5 — reference pins and construct hits.
         for idx in self._pinned:
             add(idx)
 
-        hazard, normal = self._construct_hits(constructs)
+        hazard, normal = self._construct_hits(construct_set)
         for idx in hazard:
             add(idx)
         for idx in normal:
             add(idx)
 
+        # Tiers 6-7 — topical, one shared ranking partitioned user-first (an
+        # operator [topic] note outranks any reference hit; no score contest).
+        # Rule-scoped user chunks are in the index but never surface here.
         topical_added = 0
         if top_k > 0 and query.strip():
-            for idx in self._ranker.query(query):
-                if topical_added >= top_k:
-                    break
-                if add(idx):
-                    topical_added += 1
+            ranked = [
+                idx
+                for idx in self._ranker.query(query)
+                if idx not in self._user_rule_indices
+            ]
+            for user_pass in (True, False):
+                for idx in ranked:
+                    if topical_added >= top_k:
+                        break
+                    if (idx in self._user_topical) is not user_pass:
+                        continue
+                    if add(idx):
+                        topical_added += 1
 
         logger.debug(
             f"select: {len(chosen)} chunk(s)  words={used}/{max_words}  "

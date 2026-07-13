@@ -16,6 +16,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from prompt_builder.models import ConstructKey, DocRole, InstructionChunk
 from prompt_builder.selector import DiskCachedEmbeddings, InstructionSelector
+from prompt_builder.user_instructions import UserInstructionSet
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +165,95 @@ def test_budget_drops_whole_chunks_without_truncating():
     assert len(out) == 1  # only one ~43-word chunk fits
     # returned chunk is intact (not truncated)
     assert len(out[0].text.split()) > 40
+
+
+# ---------------------------------------------------------------------------
+# User-instruction tiers
+# ---------------------------------------------------------------------------
+
+USER_RULES = """\
+## Output rules
+Return fenced pyspark blocks with a risk table.
+
+## [when: proc:sql] SQL rules
+Prefer broadcast joins qqxyzzy.
+
+## [topic] Partitioning guidance
+Repartition dataframe join merge partitions guidance.
+"""
+
+
+def _user_selector(**kwargs) -> InstructionSelector:
+    return InstructionSelector(
+        _corpus(),
+        user_instructions=UserInstructionSet.from_text(USER_RULES),
+        **kwargs,
+    )
+
+
+def test_user_always_injected_even_with_no_signal():
+    sel = _user_selector()
+    out = sel.select("zzz nothing matches", [])
+    assert [c.chunk_id for c in out] == ["user::c0000"]
+
+
+def test_user_conditional_included_iff_constructs_match():
+    sel = _user_selector()
+    with_sql = [c.chunk_id for c in sel.select("zzz", [SQL])]
+    without = [c.chunk_id for c in sel.select("zzz", [INTNX])]
+    assert "user::c0001" in with_sql
+    assert "user::c0001" not in without
+
+
+def test_unmatched_conditional_never_surfaces_topically():
+    sel = _user_selector()
+    # The query lexically nails the conditional chunk's body ("qqxyzzy"),
+    # but its scope is when:proc:sql and the item has no matching construct.
+    out = sel.select("broadcast joins qqxyzzy", [])
+    assert "user::c0001" not in [c.chunk_id for c in out]
+
+
+def test_full_tier_ordering():
+    sel = _user_selector(pinned_sections=["Output Format"])
+    out = sel.select(
+        "dataframe join merge partitions", [SQL, SYMPUT], top_k=2
+    )
+    assert [c.chunk_id for c in out] == [
+        "user::c0000",  # 1. user always
+        "user::c0001",  # 2. user conditional (proc:sql matched)
+        "c5",  # 3. reference pinned (Guidelines > Output Format)
+        "c2",  # 4. hazard construct (SYMPUT)
+        "c1",  # 5. other construct (SQL Procedure)
+        "user::c0002",  # 6. user topical
+        "c4",  # 7. reference topical (Spark > DataFrames and SQL)
+    ]
+
+
+def test_user_topic_partition_beats_higher_scoring_reference():
+    sel = _user_selector()
+    # "across w0 w1" pushes the reference chunk's BM25 score above the user
+    # topic chunk's; the partition must still order the user chunk first.
+    out = sel.select("dataframe join merge across partitions w0 w1", [], top_k=2)
+    ids = [c.chunk_id for c in out]
+    assert ids.index("user::c0002") < ids.index("c4")
+
+
+def test_top_k_caps_user_and_reference_topical_together():
+    sel = _user_selector()
+    out = sel.select("dataframe join merge partitions", [], top_k=1)
+    ids = [c.chunk_id for c in out]
+    assert "user::c0002" in ids  # the one topical slot goes to the user chunk
+    assert "c4" not in ids
+
+
+def test_user_always_overflow_warns(caplog):
+    import logging
+
+    sel = _user_selector()
+    with caplog.at_level(logging.WARNING, logger="prompt_builder.selector"):
+        out = sel.select("zzz", [], max_words=5)
+    assert out == []
+    assert "does not fit the remaining budget" in caplog.text
 
 
 # ---------------------------------------------------------------------------

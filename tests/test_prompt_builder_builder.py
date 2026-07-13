@@ -99,6 +99,52 @@ def test_max_instruction_words_caps_block():
 
 
 # ---------------------------------------------------------------------------
+# User instructions — two-block output
+# ---------------------------------------------------------------------------
+
+
+def test_user_instructions_render_in_project_block_above_guidance():
+    pb = PromptBuilder(
+        _corpus(),
+        user_instructions="## Output rules\nAlways emit a risk table.",
+    )
+    block = pb.build("zzz", [INTNX])
+    assert block is not None
+    assert block.startswith("## Project instructions")
+    assert "### Output rules" in block
+    assert "Always emit a risk table." in block
+    guidance_at = block.index("## Relevant migration guidance")
+    assert block.index("### Output rules") < guidance_at  # project block first
+    assert "INTNX Function" in block[guidance_at:]
+    # Operator rules cite no doc/pages; reference chunks still do.
+    project_block = block[:guidance_at]
+    assert "· p" not in project_block
+
+
+def test_user_instructions_only_no_reference_corpus():
+    pb = PromptBuilder([], user_instructions="Always target Delta Lake tables.")
+    block = pb.build("anything at all", [])
+    assert block is not None
+    assert block.startswith("## Project instructions")
+    assert "Always target Delta Lake tables." in block
+    assert "## Relevant migration guidance" not in block
+
+
+def test_user_instructions_str_is_parsed_and_fingerprinted():
+    pb = PromptBuilder([], user_instructions="## A\nrule body")
+    assert pb.user_instructions is not None
+    assert len(pb.user_instructions) == 1
+    assert len(pb.user_instructions.fingerprint) == 16
+
+
+def test_no_user_instructions_output_unchanged():
+    pb = PromptBuilder(_corpus())
+    block = pb.build("advance a date interval", [INTNX])
+    assert block.startswith("## Relevant migration guidance")
+    assert "## Project instructions" not in block
+
+
+# ---------------------------------------------------------------------------
 # from_specs (load + cache path)
 # ---------------------------------------------------------------------------
 
