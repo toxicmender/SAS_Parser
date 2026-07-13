@@ -89,6 +89,13 @@ class PromptBuilder:
         if isinstance(user_instructions, str):
             user_instructions = UserInstructionSet.from_text(user_instructions)
         self.user_instructions = user_instructions
+        # Retained so with_user_instructions can rebuild an equivalent
+        # selector over the same reference corpus.
+        self._pinned_sections = list(pinned_sections)
+        self._embeddings = embeddings
+        self._embedding_cache_path = embedding_cache_path
+        self._rrf_k = rrf_k
+        self._reranker = reranker
         self._selector = InstructionSelector(
             chunks,
             user_instructions=user_instructions,
@@ -97,6 +104,28 @@ class PromptBuilder:
             rrf_k=rrf_k,
             reranker=reranker,
             pinned_sections=pinned_sections,
+        )
+
+    def with_user_instructions(
+        self, user_instructions: "str | UserInstructionSet | None"
+    ) -> "PromptBuilder":
+        """
+        A new builder over the same reference corpus and settings, with
+        *user_instructions* replacing any current set. The selector index is
+        rebuilt once; the original builder is untouched.
+        """
+        return PromptBuilder(
+            self._selector.reference_chunks,
+            user_instructions=user_instructions,
+            top_k=self.top_k,
+            max_instruction_words=self.max_instruction_words,
+            pinned_sections=self._pinned_sections,
+            embeddings=self._embeddings,
+            embedding_cache_path=self._embedding_cache_path,
+            rrf_k=self._rrf_k,
+            reranker=self._reranker,
+            heading=self.heading,
+            project_heading=self.project_heading,
         )
 
     @classmethod

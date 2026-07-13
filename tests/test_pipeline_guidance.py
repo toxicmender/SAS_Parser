@@ -155,6 +155,111 @@ def test_no_prompt_builder_means_no_guidance_message():
     assert len(llm.prompts[0]) == 2
 
 
+# ---------------------------------------------------------------------------
+# User instructions through the pipeline (step 3 wiring)
+# ---------------------------------------------------------------------------
+
+# Like GUIDANCE_MARKER: phrases that exist only in operator rules, so their
+# presence in a prompt or the store is unambiguous.
+USER_MARKER = "ZZUSERRULE emit one risk table per step"
+OLD_MARKER = "ZZOLDRULE previous project law"
+
+
+def test_user_instructions_without_builder_prompted_not_persisted():
+    llm = _RecordingChatModel()
+    pipeline = SasLLMPipeline(
+        model="unused-because-llm-injected",
+        memory=DatabricksMemory(),
+        llm=llm,
+        user_instructions=f"## Output rules\n{USER_MARKER}.",
+    )
+    pipeline._process(items=[_intnx_chunk()], diagnostics=[], thread_id="run::etl.sas")
+
+    # Prompted: system + instructions + human.
+    assert len(llm.prompts[0]) == 3
+    prompted = "\n".join(str(m.content) for m in llm.prompts[0])
+    assert USER_MARKER in prompted
+    assert "## Project instructions" in prompted
+
+    stored = pipeline.get_thread_messages("run::etl.sas")
+    assert len(stored) == 2  # item + response only
+    assert USER_MARKER not in "\n".join(str(m.content) for m in stored)
+
+
+def test_user_instructions_fold_into_given_builder():
+    llm = _RecordingChatModel()
+    pipeline = SasLLMPipeline(
+        model="unused-because-llm-injected",
+        memory=DatabricksMemory(),
+        llm=llm,
+        prompt_builder=PromptBuilder(_guidance_corpus()),
+        user_instructions=f"## Output rules\n{USER_MARKER}.",
+    )
+    pipeline._process(items=[_intnx_chunk()], diagnostics=[], thread_id="run::etl.sas")
+
+    instructions_msg = str(llm.prompts[0][1].content)
+    assert USER_MARKER in instructions_msg  # operator rules present...
+    assert GUIDANCE_MARKER in instructions_msg  # ...alongside reference guidance
+    # Project block renders above the reference-guidance block.
+    assert instructions_msg.index("## Project instructions") < instructions_msg.index(
+        "## Relevant migration guidance"
+    )
+
+
+def test_pipeline_level_instructions_replace_builders_own():
+    llm = _RecordingChatModel()
+    builder = PromptBuilder(
+        _guidance_corpus(), user_instructions=f"## Old\n{OLD_MARKER}."
+    )
+    pipeline = SasLLMPipeline(
+        model="unused-because-llm-injected",
+        memory=DatabricksMemory(),
+        llm=llm,
+        prompt_builder=builder,
+        user_instructions=f"## New\n{USER_MARKER}.",
+    )
+    pipeline._process(items=[_intnx_chunk()], diagnostics=[], thread_id="run::etl.sas")
+
+    prompted = "\n".join(str(m.content) for m in llm.prompts[0])
+    assert USER_MARKER in prompted
+    assert OLD_MARKER not in prompted
+    # The original builder object is untouched.
+    assert OLD_MARKER in builder.build("zzz", [])
+
+
+def test_conditional_rule_scoped_end_to_end():
+    llm = _RecordingChatModel()
+    pipeline = SasLLMPipeline(
+        model="unused-because-llm-injected",
+        memory=DatabricksMemory(),
+        llm=llm,
+        user_instructions=f"## [when: function:intnx] Date rules\n{USER_MARKER}.",
+    )
+    intnx = _intnx_chunk()
+    print_text = "proc print data=work.x; run;"
+    print_chunk = SasChunk(
+        chunk_id="c9",
+        source_id="etl.sas",
+        text=print_text,
+        kind=SasChunkKind.PROC_STEP,
+        title="print",
+        start_line=1,
+        end_line=1,
+        start_char=0,
+        end_char=len(print_text),
+        metadata=SasChunkMetadata(proc_name="print"),
+    )
+    pipeline._process(
+        items=[intnx, print_chunk], diagnostics=[], thread_id="run::etl.sas"
+    )
+
+    assert USER_MARKER in "\n".join(str(m.content) for m in llm.prompts[0])
+    # The PROC PRINT item has no intnx construct, and turn 1's guidance was
+    # ephemeral — so the marker is absent from turn 2's ENTIRE prompt,
+    # history included.
+    assert USER_MARKER not in "\n".join(str(m.content) for m in llm.prompts[1])
+
+
 def test_irrelevant_item_injects_no_guidance():
     llm = _RecordingChatModel()
     pipeline = _pipeline(llm, PromptBuilder(_guidance_corpus()))

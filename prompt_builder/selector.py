@@ -186,7 +186,8 @@ class InstructionSelector:
         hazard_constructs: Iterable[ConstructKey] = DEFAULT_HAZARD_CONSTRUCTS,
     ) -> None:
         self._chunks = list(chunks)
-        reference_count = len(self._chunks)
+        self._reference_count = len(self._chunks)
+        reference_count = self._reference_count
         self._stop = frozenset(stop_constructs)
         self._hazard = frozenset(hazard_constructs)
 
@@ -243,6 +244,11 @@ class InstructionSelector:
             f"dense={'on' if embeddings is not None else 'off'}"
         )
 
+    @property
+    def reference_chunks(self) -> list[InstructionChunk]:
+        """The reference corpus as constructed (user-instruction chunks excluded)."""
+        return list(self._chunks[: self._reference_count])
+
     def select(
         self,
         query: str,
@@ -283,18 +289,20 @@ class InstructionSelector:
             return True
 
         # Tiers 1-2 — operator rules, first claim on the budget.
+        constructs = list(constructs)
+        construct_set = set(constructs)
         for idx in self._user_always:
             add(idx, warn_overflow=True)
-        construct_set = set(constructs)
         for keys, idx in self._user_conditional:
             if keys & construct_set:
                 add(idx, warn_overflow=True)
 
-        # Tiers 3-5 — reference pins and construct hits.
+        # Tiers 3-5 — reference pins and construct hits (the caller's
+        # construct order is meaningful; the set is membership-only).
         for idx in self._pinned:
             add(idx)
 
-        hazard, normal = self._construct_hits(construct_set)
+        hazard, normal = self._construct_hits(constructs)
         for idx in hazard:
             add(idx)
         for idx in normal:

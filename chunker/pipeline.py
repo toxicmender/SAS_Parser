@@ -20,7 +20,7 @@ from langgraph.graph import START, MessagesState, StateGraph
 from llm_client import LLMClient, LLMClientConfig
 from memory.relevance import RelevantHistorySelector
 from memory.short_mem import DatabricksMemory
-from prompt_builder import ConstructKey, PromptBuilder
+from prompt_builder import ConstructKey, PromptBuilder, UserInstructionSet
 
 from .batcher import MultiFileBatcher, SasChunkBatcher
 from .chunker import SasSemanticChunker
@@ -327,6 +327,16 @@ class SasLLMPipeline:
         it is prompted but never stored in the thread's history — see the
         load-bearing invariant on this in Architecture.md. ``None`` (default)
         disables guidance injection entirely.
+    user_instructions : str | UserInstructionSet | None
+        Operator-supplied project rules (see
+        ``prompt_builder/user_instructions.py`` for the heading/directive
+        syntax). With a ``prompt_builder``, the rules are folded into it
+        (replacing any set it already carries — the pipeline-level argument
+        wins, with a WARNING); without one, a corpus-less
+        :class:`PromptBuilder` is built so instruction injection works with
+        no reference PDFs at all. Selected rules render in a
+        ``## Project instructions`` block and are ephemeral like all
+        guidance: prompted, never persisted.
     """
 
     def __init__(
@@ -350,7 +360,27 @@ class SasLLMPipeline:
         delta_table: str | None = None,
         llm: Any | None = None,
         prompt_builder: PromptBuilder | None = None,
+        user_instructions: "str | UserInstructionSet | None" = None,
     ) -> None:
+        if user_instructions is not None:
+            if prompt_builder is None:
+                logger.info(
+                    "SasLLMPipeline: no prompt_builder given; building a "
+                    "corpus-less PromptBuilder for the user instructions"
+                )
+                prompt_builder = PromptBuilder(
+                    [], user_instructions=user_instructions
+                )
+            else:
+                if prompt_builder.user_instructions is not None:
+                    logger.warning(
+                        "SasLLMPipeline: replacing the PromptBuilder's "
+                        "existing user instructions with the pipeline-level "
+                        "set (the user_instructions argument wins)"
+                    )
+                prompt_builder = prompt_builder.with_user_instructions(
+                    user_instructions
+                )
         logger.info(
             f"SasLLMPipeline.__init__  model={model}  output_language={output_language}  "
             f"window_k={window_k}  guidance={'on' if prompt_builder else 'off'}"

@@ -137,6 +137,18 @@ def test_user_instructions_str_is_parsed_and_fingerprinted():
     assert len(pb.user_instructions.fingerprint) == 16
 
 
+def test_with_user_instructions_rebuilds_over_same_corpus():
+    original = PromptBuilder(_corpus(), user_instructions="## Old\nOLDMARK body.")
+    rebuilt = original.with_user_instructions("## New\nNEWMARK body.")
+
+    block = rebuilt.build("zzz", [INTNX])
+    assert "NEWMARK" in block
+    assert "OLDMARK" not in block
+    assert "INTNX Function" in block  # reference corpus carried over
+    # The original builder is untouched.
+    assert "OLDMARK" in original.build("zzz", [])
+
+
 def test_no_user_instructions_output_unchanged():
     pb = PromptBuilder(_corpus())
     block = pb.build("advance a date interval", [INTNX])
