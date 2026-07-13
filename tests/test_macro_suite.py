@@ -148,9 +148,9 @@ sys.path.insert(0, str(_THIS_DIR))  # makes sibling test modules importable
 
 # Imported only as modules (never their TestCase classes), specifically to
 # avoid the pytest double-collection problem described above.
-import test_macro_body_resolution as _body_resolution
-import test_macro_classification as _classification
-import test_macro_var_flow as _variable_flow
+import test_macro_body_resolution as _body_resolution  # noqa: E402
+import test_macro_classification as _classification  # noqa: E402
+import test_macro_var_flow as _variable_flow  # noqa: E402
 
 _DEDICATED_MACRO_MODULES = (
     _classification,

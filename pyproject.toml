@@ -27,6 +27,18 @@ where = ["."]
 # config loader they all read defaults through.
 include = ["chunker*", "memory*", "llm_client*", "prompt_builder*", "app_config*"]
 
+[tool.coverage.run]
+# Bare `--cov` (as CI passes it) measures exactly these packages; without this
+# it would measure everything imported, tests included, inflating the total.
+source = [
+    "chunker",
+    "memory",
+    "llm_client",
+    "prompt_builder",
+    "app_config",
+    "validation",
+]
+
 [tool.pytest.ini_options]
 markers = [
     "slow: end-to-end tests over the real reference_docs corpus; skipped when the PDFs are absent",

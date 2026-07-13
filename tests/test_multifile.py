@@ -346,7 +346,7 @@ class TestCrossFileMacroInvocation(unittest.TestCase):
         """Same macro name defined in two files — last definition wins; warning logged."""
 
         with self.assertLogs("chunker.batcher", level="WARNING") as cm:
-            br = _batch(
+            _batch(
                 "%macro helper; data work.v1; run; %mend;",
                 "%macro helper; data work.v2; run; %mend;",  # redefines
                 "%helper;",

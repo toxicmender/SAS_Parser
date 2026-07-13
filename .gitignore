@@ -9,6 +9,12 @@ wheels/
 # Virtual environments
 .venv
 
+# Test & coverage reports (CI uploads these as artifacts)
+.coverage
+coverage.xml
+junit.xml
+htmlcov/
+
 # prompt_builder on-disk extraction cache
 .prompt_builder_cache/
 
