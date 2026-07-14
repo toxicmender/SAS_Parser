@@ -91,6 +91,7 @@ def test_repo_config_json_matches_code_defaults():
         "top_k": 6,
         "max_instruction_words": 1500,
         "focus_hints": None,  # null = unset -> code default (True)
+        "reasoning_directives": None,  # null = unset -> code default (True)
     }
     assert repo_cfg["llm_client"] == {
         "max_input_tokens": None,

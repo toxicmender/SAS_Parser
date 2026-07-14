@@ -98,6 +98,53 @@ _MAX_HINT_CONSTRUCTS = 8
 _MAX_HINT_TOPICS = 4
 
 
+# ---------------------------------------------------------------------------
+# Reasoning directives (conditional chain-of-thought): one imperative
+# reasoning instruction per hazard construct, emitted only when the item
+# carries that hazard — so the extra reasoning tokens are spent exactly on
+# the items whose failure modes need them, not on every trivial chunk.
+# ---------------------------------------------------------------------------
+
+_HAZARD_DIRECTIVES: dict[ConstructKey, str] = {
+    ConstructKey(kind="call_routine", name="symput"): (
+        "Trace step by step when each macro variable is written versus "
+        "read — a CALL SYMPUT value is not available until the step "
+        "boundary — and verify the translation preserves that ordering."
+    ),
+    ConstructKey(kind="call_routine", name="symputx"): (
+        "Trace step by step when each macro variable is written versus "
+        "read — a CALL SYMPUTX value is not available until the step "
+        "boundary — and verify the translation preserves that ordering."
+    ),
+    ConstructKey(kind="call_routine", name="symget"): (
+        "Trace step by step which value each CALL SYMGET read observes "
+        "given the surrounding execution order, and verify the translation "
+        "reads the same value."
+    ),
+    ConstructKey(kind="call_routine", name="execute"): (
+        "Walk through exactly what code CALL EXECUTE generates and when it "
+        "runs (after the current step, with macro references resolved at "
+        "generation time), and confirm the translation preserves that "
+        "deferred execution."
+    ),
+    ConstructKey(kind="macro_statement", name="goto"): (
+        "Enumerate every possible %GOTO target and reason through each "
+        "resulting control-flow path before translating; make each path "
+        "explicit in the target code."
+    ),
+    ConstructKey(kind="macro_statement", name="abort"): (
+        "Decide explicitly how %ABORT's job/step-halt semantics map to "
+        "error handling in the target before translating, and state the "
+        "chosen behaviour."
+    ),
+    ConstructKey(kind="macro_function", name="sysfunc"): (
+        "Reason through when each %SYSFUNC call evaluates (at macro "
+        "resolution, before the step runs) and verify the translation "
+        "computes the value at an equivalent point."
+    ),
+}
+
+
 class PromptBuilder:
     """
     Build a per-item instruction block from a reference corpus.
@@ -135,12 +182,21 @@ class PromptBuilder:
         explicit keywords) above the reference guidance. ``None`` (default)
         reads ``prompt_builder.focus_hints`` from config.json, falling back
         to ``True``.
+    reasoning_directives : bool | None
+        Render a ``## {directives_heading}`` block with one step-by-step
+        reasoning instruction per hazard construct the item carries
+        (conditional chain-of-thought: reasoning tokens are spent only on
+        hazard items). ``None`` (default) reads
+        ``prompt_builder.reasoning_directives`` from config.json, falling
+        back to ``True``.
     heading : str
         Markdown H2 heading for the reference-guidance block.
     project_heading : str
         Markdown H2 heading for the user-instruction block.
     hints_heading : str
         Markdown H2 heading for the focus-hints block.
+    directives_heading : str
+        Markdown H2 heading for the reasoning-directives block.
     """
 
     def __init__(
@@ -157,9 +213,11 @@ class PromptBuilder:
         rrf_k: int = 60,
         reranker: Callable[[str, list[str]], list[float]] | None = None,
         focus_hints: bool | None = None,
+        reasoning_directives: bool | None = None,
         heading: str = "Relevant migration guidance",
         project_heading: str = "Project instructions",
         hints_heading: str = "Focus hints",
+        directives_heading: str = "Reasoning directives",
     ) -> None:
         self.top_k = app_config.resolve(top_k, "prompt_builder", "top_k", 6)
         self.max_instruction_words = app_config.resolve(
@@ -172,9 +230,13 @@ class PromptBuilder:
         self.focus_hints = app_config.resolve(
             focus_hints, "prompt_builder", "focus_hints", True
         )
+        self.reasoning_directives = app_config.resolve(
+            reasoning_directives, "prompt_builder", "reasoning_directives", True
+        )
         self.heading = heading
         self.project_heading = project_heading
         self.hints_heading = hints_heading
+        self.directives_heading = directives_heading
         if isinstance(user_instructions, str):
             user_instructions = UserInstructionSet.from_text(user_instructions)
         self.user_instructions = user_instructions
@@ -216,9 +278,11 @@ class PromptBuilder:
             rrf_k=self._rrf_k,
             reranker=self._reranker,
             focus_hints=self.focus_hints,
+            reasoning_directives=self.reasoning_directives,
             heading=self.heading,
             project_heading=self.project_heading,
             hints_heading=self.hints_heading,
+            directives_heading=self.directives_heading,
         )
 
     @classmethod
@@ -279,9 +343,10 @@ class PromptBuilder:
         """
         The Markdown block(s) for one item — a ``## Project instructions``
         block for selected user rules, then a compact ``## {hints_heading}``
-        stimulus block, then a ``## {heading}`` block for reference guidance,
-        each omitted when empty — or ``None`` when nothing at all is relevant
-        (so the caller injects no block).
+        stimulus block, then a ``## {directives_heading}`` block of per-hazard
+        reasoning instructions, then a ``## {heading}`` block for reference
+        guidance, each omitted when empty — or ``None`` when nothing at all
+        is relevant (so the caller injects no block).
         """
         constructs = list(constructs)
         picks = self._selector.select_detailed(
@@ -307,9 +372,38 @@ class PromptBuilder:
             hints = self._format_hints(picks, constructs)
             if hints:
                 blocks.append(hints)
+        if self.reasoning_directives:
+            directives = self._format_directives(constructs)
+            if directives:
+                blocks.append(directives)
         if reference:
             blocks.append(self._format_reference(reference))
         return "\n\n".join(blocks)
+
+    def _format_directives(self, constructs: list[ConstructKey]) -> str | None:
+        """
+        The conditional chain-of-thought block for one item: one imperative
+        reasoning instruction per hazard construct the item carries, or
+        ``None`` when the item has no hazard with a directive. Keyed on the
+        *item's* constructs (like the hazard hint line), not on the
+        selection, so the directive survives even when no reference section
+        matched.
+        """
+        directives: list[str] = []
+        for key in constructs:
+            directive = _HAZARD_DIRECTIVES.get(key)
+            if directive and directive not in directives:
+                directives.append(directive)
+        if not directives:
+            return None
+        return "\n".join(
+            [
+                f"## {self.directives_heading}",
+                "",
+                "Before writing the translation, in your Analysis:",
+                *(f"- {d}" for d in directives),
+            ]
+        )
 
     def _format_hints(
         self,

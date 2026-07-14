@@ -12,7 +12,8 @@
   "prompt_builder": {
     "top_k": 6,
     "max_instruction_words": 1500,
-    "focus_hints": null
+    "focus_hints": null,
+    "reasoning_directives": null
   },
   "llm_client": {
     "max_input_tokens": null,

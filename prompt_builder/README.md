@@ -265,6 +265,11 @@ returns a Markdown block or `None`:
 - Constructs to map: INTNX function, PROC SQL
 - Related reference topics: DataFrames and SQL
 
+## Reasoning directives
+
+Before writing the translation, in your Analysis:
+- Trace step by step when each macro variable is written versus read …
+
 ## Relevant migration guidance
 
 ### [functions · … > INTNX Function · pp. 1109-1118 · construct: intnx]
@@ -292,6 +297,21 @@ stop-list-filtered and budget-bounded. The block is skipped when there is
 nothing to hint at (e.g. a pinned-only selection), and `focus_hints=False`
 (or config.json `prompt_builder.focus_hints`) disables it entirely. Hint
 lines are small and sit outside the word budget, like breadcrumb prefixes.
+
+### Reasoning directives (conditional chain-of-thought)
+
+The `## Reasoning directives` block carries one imperative step-by-step
+reasoning instruction per hazard construct the item uses (SYMPUT/SYMPUTX/
+SYMGET, CALL EXECUTE, %GOTO, %ABORT, %SYSFUNC) — e.g. SYMPUT → *"Trace step
+by step when each macro variable is written versus read …"*. Chain-of-thought
+costs tokens, so it is triggered per item, only where the known silent-error
+failure modes live; hazard-free items get no block. Like the hazard hint
+line, directives key off the *item's* constructs, so they survive even when
+no reference section matched. Disable with `reasoning_directives=False` or
+config.json `prompt_builder.reasoning_directives`. The directives complement
+the pipeline's system prompt, which scaffolds every response as
+**Analysis → Mapping → Translation → Risks** and scopes conciseness to the
+final sections so reasoning isn't suppressed.
 
 Keep `max_instruction_words` ≥ the chunker's `max_words` (default 1500 ≥ 900)
 so any single reference section always fits — the budget then limits only the

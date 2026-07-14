@@ -267,6 +267,59 @@ def test_hints_construct_labels_by_kind():
 
 
 # ---------------------------------------------------------------------------
+# Reasoning directives (conditional chain-of-thought block)
+# ---------------------------------------------------------------------------
+
+
+def test_directives_rendered_for_hazard_item():
+    pb = PromptBuilder(_hazard_corpus())
+    block = pb.build("zzz", [SYMPUT])
+    assert "## Reasoning directives" in block
+    assert "Before writing the translation, in your Analysis:" in block
+    assert "a CALL SYMPUT value is not available until the step" in block
+    # Directives sit between the hints and the reference guidance.
+    assert (
+        block.index("## Focus hints")
+        < block.index("## Reasoning directives")
+        < block.index("## Relevant migration guidance")
+    )
+
+
+def test_directives_survive_missing_reference_section():
+    # No SYMPUT section in this corpus; the item still gets the directive.
+    pb = PromptBuilder(_corpus())
+    block = pb.build("advance a date interval", [INTNX, SYMPUT])
+    assert "## Reasoning directives" in block
+
+
+def test_no_directives_for_hazard_free_item():
+    pb = PromptBuilder(_corpus())
+    block = pb.build("advance a date interval", [INTNX])
+    assert "## Reasoning directives" not in block
+
+
+def test_duplicate_hazards_yield_one_directive():
+    goto = ConstructKey(kind="macro_statement", name="goto")
+    pb = PromptBuilder(_hazard_corpus())
+    block = pb.build("zzz", [SYMPUT, SYMPUT, goto])
+    assert block.count("a CALL SYMPUT value is not available") == 1
+    assert "%GOTO target" in block
+
+
+def test_reasoning_directives_flag_disables_block():
+    pb = PromptBuilder(_hazard_corpus(), reasoning_directives=False)
+    block = pb.build("zzz", [SYMPUT])
+    assert "## Reasoning directives" not in block
+    assert "## Focus hints" in block  # independent of the hints flag
+
+
+def test_with_user_instructions_preserves_directives_flag():
+    pb = PromptBuilder(_hazard_corpus(), reasoning_directives=False)
+    rebuilt = pb.with_user_instructions("## A\nrule body")
+    assert "## Reasoning directives" not in rebuilt.build("zzz", [SYMPUT])
+
+
+# ---------------------------------------------------------------------------
 # Selection-reason annotations on reference chunk headers
 # ---------------------------------------------------------------------------
 
