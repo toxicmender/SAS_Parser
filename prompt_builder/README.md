@@ -16,7 +16,8 @@ sole integration point.
 
 ```
 models.py            InstructionDiagnostic, ConstructKey, DocSection,
-                     InstructionDoc, InstructionChunk (+ DocRole / ExtractionStrategy)
+                     InstructionDoc, InstructionChunk, SelectedInstruction
+                     (+ DocRole / ExtractionStrategy / SelectionTier)
 pdf_reader.py        PdfReader — PDF -> list[DocSection], two strategies
 doc_chunker.py       InstructionChunker — DocSection -> word-budgeted InstructionChunk
 catalog.py           DocumentSpec + default_catalog + CorpusLoader (on-disk cache)
@@ -233,6 +234,13 @@ the caller emits no guidance block (irrelevant reference pages are worse than
 none). The metadata→`ConstructKey`/query mapping lives in the pipeline (Phase 6)
 to keep `prompt_builder` free of any `chunker` import.
 
+`select_detailed(...)` returns the same picks with provenance — each
+`SelectedInstruction` carries the `SelectionTier` that claimed it
+(`user_always | user_when | pinned | hazard | construct | user_topic |
+topical`) and, for construct-lookup tiers, the matched `ConstructKey` — so
+formatting can treat picks differently by tier (the builder's focus hints are
+built on this). `select()` is `select_detailed()` minus the provenance.
+
 ### Dense retrieval and the embedding cache
 
 Pass `embeddings=` (a LangChain `Embeddings` or provider string) to add the
@@ -250,6 +258,13 @@ The facade over the whole package. Load + chunk + index the corpus once
 returns a Markdown block or `None`:
 
 ```
+## Focus hints
+
+- ⚠️ Hazards to address explicitly: CALL SYMPUT routine — run-time
+  macro-variable write; scope/timing differs from %LET
+- Constructs to map: INTNX function, PROC SQL
+- Related reference topics: DataFrames and SQL
+
 ## Relevant migration guidance
 
 ### [functions · … > INTNX Function · pp. 1109-1118]
@@ -258,6 +273,20 @@ INTNX Function  Increments a date, time, or datetime value …
 ### [spark_guide · … > DataFrames and SQL · p. 15]
 …
 ```
+
+### Focus hints (directional stimulus)
+
+The `## Focus hints` block is a compact per-item stimulus — the item's
+hazards (with a one-line caution each), matched constructs (as readable
+labels: `PROC SQL`, `CALL SYMPUT routine`, `hash object`), and the leaf
+titles of topically retrieved sections — rendered as explicit keywords the
+response should address, above the reference guidance. Hazards are listed
+from the *item's* constructs even when no reference section matched;
+construct and topic lines come from the selection, so they are already
+stop-list-filtered and budget-bounded. The block is skipped when there is
+nothing to hint at (e.g. a pinned-only selection), and `focus_hints=False`
+(or config.json `prompt_builder.focus_hints`) disables it entirely. Hint
+lines are small and sit outside the word budget, like breadcrumb prefixes.
 
 Keep `max_instruction_words` ≥ the chunker's `max_words` (default 1500 ≥ 900)
 so any single reference section always fits — the budget then limits only the

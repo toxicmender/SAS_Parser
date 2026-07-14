@@ -87,7 +87,11 @@ def test_repo_config_json_matches_code_defaults():
         "max_words": 900,
         "overlap_words": 60,
     }
-    assert repo_cfg["prompt_builder"] == {"top_k": 6, "max_instruction_words": 1500}
+    assert repo_cfg["prompt_builder"] == {
+        "top_k": 6,
+        "max_instruction_words": 1500,
+        "focus_hints": None,  # null = unset -> code default (True)
+    }
     assert repo_cfg["llm_client"] == {
         "max_input_tokens": None,
         "max_output_tokens": None,

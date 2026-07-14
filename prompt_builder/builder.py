@@ -21,11 +21,81 @@ from typing import Any, Callable, Iterable
 import app_config
 
 from .catalog import CorpusLoader, DocumentSpec, default_catalog
-from .models import ConstructKey, DocRole, InstructionChunk
+from .models import (
+    ConstructKey,
+    DocRole,
+    InstructionChunk,
+    SelectedInstruction,
+    SelectionTier,
+)
 from .selector import InstructionSelector
 from .user_instructions import UserInstructionSet
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Focus hints (directional stimulus): a compact per-item hint block naming the
+# constructs, hazards, and retrieved topics the response should address —
+# instance-specific keywords rendered above the reference guidance, so the
+# model treats them as salient rather than inferring salience from pages of
+# verbatim manual text.
+# ---------------------------------------------------------------------------
+
+# Human-readable label per construct kind ({name} is upper-cased on format,
+# except component objects, which the guides write in lowercase prose).
+_KIND_LABELS = {
+    "function": "{name} function",
+    "call_routine": "CALL {name} routine",
+    "macro_function": "%{name} macro function",
+    "macro_statement": "%{name} macro statement",
+    "global_statement": "{name} statement",
+    "proc": "PROC {name}",
+    "component_object": "{lower} object",
+    "format": "{name} format",
+    "informat": "{name} informat",
+    "option": "{name} option",
+    "system_option": "{name} system option",
+}
+
+
+def _describe_construct(key: ConstructKey) -> str:
+    template = _KIND_LABELS.get(key.kind, "{name} ({kind})")
+    return template.format(
+        name=key.name.upper(), lower=key.name.lower(), kind=key.kind
+    )
+
+
+# One-line caution per known hazard construct — the stimulus phrase reminding
+# the model *why* the construct is dangerous, not just that it is present.
+_HAZARD_CAUTIONS: dict[ConstructKey, str] = {
+    ConstructKey(kind="call_routine", name="symput"): (
+        "run-time macro-variable write; scope/timing differs from %LET"
+    ),
+    ConstructKey(kind="call_routine", name="symputx"): (
+        "run-time macro-variable write; scope/timing differs from %LET"
+    ),
+    ConstructKey(kind="call_routine", name="symget"): (
+        "run-time macro-variable read; value depends on execution order"
+    ),
+    ConstructKey(kind="call_routine", name="execute"): (
+        "generates code at run time; macro timing is easy to get wrong"
+    ),
+    ConstructKey(kind="macro_statement", name="goto"): (
+        "computed jump; control flow resolved at macro execution"
+    ),
+    ConstructKey(kind="macro_statement", name="abort"): (
+        "halts the job/step; needs explicit error handling in the target"
+    ),
+    ConstructKey(kind="macro_function", name="sysfunc"): (
+        "calls a DATA-step function at macro time"
+    ),
+}
+_DEFAULT_CAUTION = "silent-error risk"
+
+# Caps keeping the hint block a compact stimulus, not another guidance dump.
+_MAX_HINT_CONSTRUCTS = 8
+_MAX_HINT_TOPICS = 4
 
 
 class PromptBuilder:
@@ -59,10 +129,18 @@ class PromptBuilder:
     embeddings, embedding_cache_path, rrf_k, reranker :
         Forwarded to :class:`InstructionSelector` (dense retrieval is off unless
         ``embeddings`` is given).
+    focus_hints : bool | None
+        Render a compact ``## {hints_heading}`` block (directional stimulus:
+        the item's hazards, matched constructs, and retrieved topics as
+        explicit keywords) above the reference guidance. ``None`` (default)
+        reads ``prompt_builder.focus_hints`` from config.json, falling back
+        to ``True``.
     heading : str
         Markdown H2 heading for the reference-guidance block.
     project_heading : str
         Markdown H2 heading for the user-instruction block.
+    hints_heading : str
+        Markdown H2 heading for the focus-hints block.
     """
 
     def __init__(
@@ -78,8 +156,10 @@ class PromptBuilder:
         embedding_cache_path: str | None = None,
         rrf_k: int = 60,
         reranker: Callable[[str, list[str]], list[float]] | None = None,
+        focus_hints: bool | None = None,
         heading: str = "Relevant migration guidance",
         project_heading: str = "Project instructions",
+        hints_heading: str = "Focus hints",
     ) -> None:
         self.top_k = app_config.resolve(top_k, "prompt_builder", "top_k", 6)
         self.max_instruction_words = app_config.resolve(
@@ -89,8 +169,12 @@ class PromptBuilder:
         self.user_max_words = app_config.resolve(
             user_max_words, "user_instructions", "max_words", None
         )
+        self.focus_hints = app_config.resolve(
+            focus_hints, "prompt_builder", "focus_hints", True
+        )
         self.heading = heading
         self.project_heading = project_heading
+        self.hints_heading = hints_heading
         if isinstance(user_instructions, str):
             user_instructions = UserInstructionSet.from_text(user_instructions)
         self.user_instructions = user_instructions
@@ -131,8 +215,10 @@ class PromptBuilder:
             embedding_cache_path=self._embedding_cache_path,
             rrf_k=self._rrf_k,
             reranker=self._reranker,
+            focus_hints=self.focus_hints,
             heading=self.heading,
             project_heading=self.project_heading,
+            hints_heading=self.hints_heading,
         )
 
     @classmethod
@@ -192,11 +278,13 @@ class PromptBuilder:
     ) -> str | None:
         """
         The Markdown block(s) for one item — a ``## Project instructions``
-        block for selected user rules above a ``## {heading}`` block for
-        reference guidance, either omitted when empty — or ``None`` when
-        nothing at all is relevant (so the caller injects no block).
+        block for selected user rules, then a compact ``## {hints_heading}``
+        stimulus block, then a ``## {heading}`` block for reference guidance,
+        each omitted when empty — or ``None`` when nothing at all is relevant
+        (so the caller injects no block).
         """
-        picks = self._selector.select(
+        constructs = list(constructs)
+        picks = self._selector.select_detailed(
             query,
             constructs,
             max_words=self.max_instruction_words,
@@ -205,17 +293,74 @@ class PromptBuilder:
         if not picks:
             logger.debug("build: no relevant instruction chunks; no block")
             return None
-        user = [c for c in picks if c.role is DocRole.USER_INSTRUCTION]
-        reference = [c for c in picks if c.role is not DocRole.USER_INSTRUCTION]
+        user = [p.chunk for p in picks if p.chunk.role is DocRole.USER_INSTRUCTION]
+        reference = [
+            p.chunk for p in picks if p.chunk.role is not DocRole.USER_INSTRUCTION
+        ]
         logger.debug(
             f"build: {len(user)} user + {len(reference)} reference chunk(s) injected"
         )
         blocks: list[str] = []
         if user:
             blocks.append(self._format_user(user))
+        if self.focus_hints:
+            hints = self._format_hints(picks, constructs)
+            if hints:
+                blocks.append(hints)
         if reference:
             blocks.append(self._format_reference(reference))
         return "\n\n".join(blocks)
+
+    def _format_hints(
+        self,
+        picks: list[SelectedInstruction],
+        constructs: list[ConstructKey],
+    ) -> str | None:
+        """
+        The directional-stimulus block for one item, or ``None`` when there
+        is nothing to hint at. Hazards come from the *item's* constructs (a
+        hazard deserves the caution even when no reference section matched);
+        construct and topic lines come from the selection, so they are
+        stop-list-filtered and budget-bounded already.
+        """
+        hazards: list[ConstructKey] = []
+        for key in constructs:
+            if key in self._selector.hazard_constructs and key not in hazards:
+                hazards.append(key)
+        matched: list[ConstructKey] = []
+        topics: list[str] = []
+        for pick in picks:
+            if (
+                pick.tier is SelectionTier.CONSTRUCT
+                and pick.construct_key is not None
+                and pick.construct_key not in matched
+            ):
+                matched.append(pick.construct_key)
+            elif pick.tier is SelectionTier.TOPICAL:
+                title = pick.chunk.section_path.rsplit(">", 1)[-1].strip()
+                if title and title not in topics:
+                    topics.append(title)
+
+        lines: list[str] = []
+        if hazards:
+            cautions = ", ".join(
+                f"{_describe_construct(k)} — "
+                f"{_HAZARD_CAUTIONS.get(k, _DEFAULT_CAUTION)}"
+                for k in hazards
+            )
+            lines.append(f"- ⚠️ Hazards to address explicitly: {cautions}")
+        if matched:
+            names = ", ".join(
+                _describe_construct(k) for k in matched[:_MAX_HINT_CONSTRUCTS]
+            )
+            lines.append(f"- Constructs to map: {names}")
+        if topics:
+            lines.append(
+                f"- Related reference topics: {'; '.join(topics[:_MAX_HINT_TOPICS])}"
+            )
+        if not lines:
+            return None
+        return "\n".join([f"## {self.hints_heading}", "", *lines])
 
     @staticmethod
     def _body_of(chunk: InstructionChunk) -> str:

@@ -53,7 +53,12 @@ def test_build_formats_markdown_block():
     pb = PromptBuilder(_corpus())
     block = pb.build("advance a date interval", [INTNX])
     assert block is not None
-    assert block.startswith("## Relevant migration guidance")
+    # Focus hints (directional stimulus) render above the reference guidance.
+    assert block.startswith("## Focus hints")
+    assert "- Constructs to map: INTNX function" in block
+    assert block.index("## Focus hints") < block.index(
+        "## Relevant migration guidance"
+    )
     assert "### [functions · Funcs > INTNX Function · pp. 41-43]" in block
     assert "advances a sas date" in block
     # The retrieval-only breadcrumb prefix is stripped from the body.
@@ -152,8 +157,110 @@ def test_with_user_instructions_rebuilds_over_same_corpus():
 def test_no_user_instructions_output_unchanged():
     pb = PromptBuilder(_corpus())
     block = pb.build("advance a date interval", [INTNX])
-    assert block.startswith("## Relevant migration guidance")
+    assert block.startswith("## Focus hints")
+    assert "## Relevant migration guidance" in block
     assert "## Project instructions" not in block
+
+
+# ---------------------------------------------------------------------------
+# Focus hints (directional stimulus block)
+# ---------------------------------------------------------------------------
+
+SYMPUT = ConstructKey(kind="call_routine", name="symput")
+
+
+def _hazard_corpus():
+    return _corpus() + [
+        _chunk(
+            "c2",
+            "CALL Routines > SYMPUT Routine",
+            "assigns a data step value to a macro variable",
+            keys=[SYMPUT],
+        ),
+        _chunk(
+            "c3",
+            "Spark > DataFrames and SQL",
+            "advance a date interval with dataframe expressions",
+        ),
+    ]
+
+
+def test_hints_hazard_line_carries_caution():
+    pb = PromptBuilder(_hazard_corpus())
+    block = pb.build("zzz", [SYMPUT])
+    assert "## Focus hints" in block
+    assert (
+        "- ⚠️ Hazards to address explicitly: CALL SYMPUT routine — "
+        "run-time macro-variable write; scope/timing differs from %LET" in block
+    )
+    # A hazard construct is not repeated on the ordinary constructs line.
+    assert "- Constructs to map:" not in block
+
+
+def test_hints_hazard_listed_even_without_reference_match():
+    # No SYMPUT section in the corpus: the construct lookup finds nothing,
+    # but the item still deserves the hazard caution.
+    pb = PromptBuilder(_corpus())
+    block = pb.build("advance a date interval", [INTNX, SYMPUT])
+    assert "⚠️ Hazards to address explicitly: CALL SYMPUT routine" in block
+
+
+def test_hints_topics_line_from_topical_picks():
+    pb = PromptBuilder(_hazard_corpus())
+    block = pb.build("advance a date interval with dataframe", [])
+    assert "- Related reference topics:" in block
+    assert "DataFrames and SQL" in block.split("## Relevant migration guidance")[0]
+
+
+def test_hints_render_between_project_and_reference_blocks():
+    pb = PromptBuilder(
+        _corpus(), user_instructions="## Output rules\nAlways emit a risk table."
+    )
+    block = pb.build("zzz", [INTNX])
+    assert (
+        block.index("## Project instructions")
+        < block.index("## Focus hints")
+        < block.index("## Relevant migration guidance")
+    )
+
+
+def test_hints_absent_when_nothing_to_hint():
+    # Pinned-only selection: no hazards, no construct hits, no topical picks.
+    pb = PromptBuilder(_corpus(), pinned_sections=["Output Format"])
+    block = pb.build("zzz nothing", [])
+    assert block is not None
+    assert "## Focus hints" not in block
+
+
+def test_focus_hints_flag_disables_block():
+    pb = PromptBuilder(_corpus(), focus_hints=False)
+    block = pb.build("advance a date interval", [INTNX])
+    assert block.startswith("## Relevant migration guidance")
+    assert "## Focus hints" not in block
+
+
+def test_with_user_instructions_preserves_focus_hints_flag():
+    pb = PromptBuilder(_corpus(), focus_hints=False)
+    rebuilt = pb.with_user_instructions("## A\nrule body")
+    block = rebuilt.build("zzz", [INTNX])
+    assert "## Focus hints" not in block
+
+
+def test_hints_construct_labels_by_kind():
+    keys = [
+        ConstructKey(kind="proc", name="sql"),
+        ConstructKey(kind="component_object", name="hash"),
+        ConstructKey(kind="macro_statement", name="let"),
+    ]
+    corpus = [
+        _chunk("p0", "Procs > SQL Procedure", "ansi sql queries", keys=[keys[0]]),
+        _chunk("p1", "Objects > Hash Object", "in-memory lookup", keys=[keys[1]]),
+        _chunk("p2", "Macro > %LET Statement", "assigns macro vars", keys=[keys[2]]),
+    ]
+    block = PromptBuilder(corpus).build("zzz", keys)
+    assert (
+        "- Constructs to map: PROC SQL, hash object, %LET macro statement" in block
+    )
 
 
 # ---------------------------------------------------------------------------
