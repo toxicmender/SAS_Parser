@@ -284,6 +284,70 @@ def test_user_always_overflow_warns(caplog):
 
 
 # ---------------------------------------------------------------------------
+# User example tier ([example: ...] few-shot chunks)
+# ---------------------------------------------------------------------------
+
+EXAMPLE_RULES = """\
+## Output rules
+Return fenced pyspark blocks.
+
+## [example: proc:sql] SQL join example
+qqexample sas and pyspark worked pair zzunique.
+
+## [example] Canonical shape
+Always-on example body.
+"""
+
+
+def _example_selector(**kwargs) -> InstructionSelector:
+    return InstructionSelector(
+        _corpus(),
+        user_instructions=UserInstructionSet.from_text(EXAMPLE_RULES),
+        **kwargs,
+    )
+
+
+def test_example_included_iff_constructs_match():
+    sel = _example_selector()
+    with_sql = [c.chunk_id for c in sel.select("zzz", [SQL])]
+    without = [c.chunk_id for c in sel.select("zzz", [INTNX])]
+    assert "user::c0001" in with_sql
+    assert "user::c0001" not in without
+
+
+def test_bare_example_included_for_every_item():
+    sel = _example_selector()
+    assert "user::c0002" in [c.chunk_id for c in sel.select("zzz", [])]
+
+
+def test_example_tier_sits_between_user_rules_and_reference():
+    sel = _example_selector()
+    picks = sel.select_detailed("zzz", [SQL, SYMPUT])
+    ids = [p.chunk.chunk_id for p in picks]
+    tiers = {p.chunk.chunk_id: p.tier for p in picks}
+    assert tiers["user::c0001"] is SelectionTier.USER_EXAMPLE
+    assert tiers["user::c0002"] is SelectionTier.USER_EXAMPLE
+    # After the always rule, before any reference hit.
+    assert ids.index("user::c0000") < ids.index("user::c0001")
+    assert ids.index("user::c0002") < ids.index("c2")
+
+
+def test_matched_example_carries_construct_key():
+    sel = _example_selector()
+    picks = sel.select_detailed("zzz", [SQL])
+    by_id = {p.chunk.chunk_id: p for p in picks}
+    assert by_id["user::c0001"].construct_key == SQL
+    assert by_id["user::c0002"].construct_key is None
+
+
+def test_unmatched_example_never_surfaces_topically():
+    sel = _example_selector()
+    # The query lexically nails the example body; no matching construct.
+    out = sel.select("qqexample worked pair zzunique", [])
+    assert "user::c0001" not in [c.chunk_id for c in out]
+
+
+# ---------------------------------------------------------------------------
 # select_detailed — tier/construct provenance
 # ---------------------------------------------------------------------------
 

@@ -75,6 +75,7 @@ class SelectionTier(StrEnum):
 
     USER_ALWAYS = "user_always"  # operator rule, always-on
     USER_WHEN = "user_when"  # operator rule matched via [when: ...] constructs
+    USER_EXAMPLE = "user_example"  # operator few-shot example ([example: ...])
     PINNED = "pinned"  # reference section pinned by section-path substring
     HAZARD = "hazard"  # construct lookup hit on a hazard construct
     CONSTRUCT = "construct"  # construct lookup hit (non-hazard)

@@ -352,6 +352,53 @@ def test_reason_annotations_distinguish_construct_from_topical():
 
 
 # ---------------------------------------------------------------------------
+# Few-shot worked examples ([example: ...] sections)
+# ---------------------------------------------------------------------------
+
+EXAMPLE_INSTRUCTIONS = """\
+## Output rules
+Always emit a risk table.
+
+## [example: function:intnx] Date advance
+```sas
+data out; d = intnx('month', d, 1); run;
+```
+```python
+out = df.withColumn("d", F.add_months("d", 1))
+```
+"""
+
+
+def test_matched_example_renders_in_worked_examples_block():
+    pb = PromptBuilder(_corpus(), user_instructions=EXAMPLE_INSTRUCTIONS)
+    block = pb.build("zzz", [INTNX])
+    assert "## Worked examples" in block
+    assert "### Date advance" in block
+    assert "F.add_months" in block
+    # Examples come last — after the reference guidance, next to the item.
+    assert block.index("## Relevant migration guidance") < block.index(
+        "## Worked examples"
+    )
+    # The example is not duplicated into the project-instructions block.
+    project = block[: block.index("## Focus hints")]
+    assert "Date advance" not in project
+    assert "### Output rules" in project
+
+
+def test_unmatched_example_not_rendered():
+    pb = PromptBuilder(_corpus(), user_instructions=EXAMPLE_INSTRUCTIONS)
+    block = pb.build("zzz", [])
+    assert "## Worked examples" not in block
+
+
+def test_examples_work_without_reference_corpus():
+    pb = PromptBuilder([], user_instructions=EXAMPLE_INSTRUCTIONS)
+    block = pb.build("zzz", [INTNX])
+    assert "## Worked examples" in block
+    assert "## Relevant migration guidance" not in block
+
+
+# ---------------------------------------------------------------------------
 # from_specs (load + cache path)
 # ---------------------------------------------------------------------------
 

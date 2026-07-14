@@ -12,6 +12,10 @@ scope:
   ``kind:name`` syntax is exactly ``str(ConstructKey)``.
 * ``## [topic] Partitioning guidance`` — **topical**: indexed for retrieval
   and surfaced by ranking, like a reference chunk.
+* ``## [example: proc:sql] SQL join`` — **example** (few-shot): a worked
+  SAS -> target pair, injected when the item's constructs intersect the
+  listed keys and rendered in its own ``## Worked examples`` block. A bare
+  ``[example]`` (no keys) is unconditional — shown to every item.
 
 A heading-less string is a single always-on instruction; non-empty text
 before the first heading becomes an always-on "General" instruction. Parsing
@@ -46,6 +50,7 @@ logger = logging.getLogger(__name__)
 SCOPE_ALWAYS = "always"
 SCOPE_WHEN = "when"
 SCOPE_TOPIC = "topic"
+SCOPE_EXAMPLE = "example"
 
 _HEADING_RE = re.compile(r"^\s{0,3}##+\s*(?P<heading>.*\S)\s*$", re.MULTILINE)
 _DIRECTIVE_RE = re.compile(r"^\[(?P<directive>[^\]]*)\]\s*(?P<title>.*)$")
@@ -125,6 +130,7 @@ class UserInstructionSet(BaseModel):
             f"always={sum(1 for c in chunks if scope_of(c) == SCOPE_ALWAYS)}  "
             f"when={sum(1 for c in chunks if scope_of(c) == SCOPE_WHEN)}  "
             f"topic={sum(1 for c in chunks if scope_of(c) == SCOPE_TOPIC)}  "
+            f"example={sum(1 for c in chunks if scope_of(c) == SCOPE_EXAMPLE)}  "
             f"diagnostics={len(diagnostics)}  fingerprint={fingerprint}"
         )
         return cls(
@@ -175,6 +181,10 @@ class UserInstructionSet(BaseModel):
     @property
     def topical_chunks(self) -> list[InstructionChunk]:
         return [c for c in self.chunks if scope_of(c) == SCOPE_TOPIC]
+
+    @property
+    def example_chunks(self) -> list[InstructionChunk]:
+        return [c for c in self.chunks if scope_of(c) == SCOPE_EXAMPLE]
 
     def __len__(self) -> int:
         return len(self.chunks)
@@ -227,6 +237,28 @@ def _parse_heading(
 
     if lowered == SCOPE_TOPIC:
         return SCOPE_TOPIC, title, []
+
+    if lowered == SCOPE_EXAMPLE:
+        # Bare [example]: an unconditional few-shot example, shown to every item.
+        return SCOPE_EXAMPLE, title, []
+
+    if lowered.startswith("example:"):
+        keys = _parse_when_keys(directive[8:], heading, doc_id, diagnostics)
+        if keys:
+            return SCOPE_EXAMPLE, title, keys
+        # No usable key: keep it an example (not an always-on rule, which
+        # would pollute the rules block) but drop the condition — shown to
+        # every item rather than silently vanishing.
+        diagnostics.append(
+            InstructionDiagnostic(
+                code="INVALID_CONSTRUCT_KEY",
+                message=f"example-directive in heading '{heading.strip()}' "
+                f"lists no valid construct keys; treating the example as "
+                f"unconditional",
+                doc_id=doc_id,
+            )
+        )
+        return SCOPE_EXAMPLE, title, []
 
     if lowered.startswith("when:"):
         keys = _parse_when_keys(directive[5:], heading, doc_id, diagnostics)

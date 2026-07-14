@@ -16,6 +16,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from prompt_builder.models import ConstructKey, DocRole, InstructionChunk
 from prompt_builder.user_instructions import (
     SCOPE_ALWAYS,
+    SCOPE_EXAMPLE,
     SCOPE_TOPIC,
     SCOPE_WHEN,
     UserInstructionSet,
@@ -76,6 +77,47 @@ def test_scope_views_partition_the_chunks():
     assert [c.section_path for c in ins.always_chunks] == ["General", "Output format"]
     assert [c.section_path for c in ins.conditional_chunks] == ["Lookup rules"]
     assert [c.section_path for c in ins.topical_chunks] == ["Partitioning guidance"]
+
+
+# ---------------------------------------------------------------------------
+# [example] directive (few-shot worked pairs)
+# ---------------------------------------------------------------------------
+
+
+def test_example_directive_with_keys():
+    ins = UserInstructionSet.from_text(
+        "## [example: proc:sql, function:intnx] SQL join\n"
+        "```sas\nproc sql; ...\n```\n```python\nspark.sql(...)\n```"
+    )
+    chunk = ins.chunks[0]
+    assert scope_of(chunk) == SCOPE_EXAMPLE
+    assert chunk.section_path == "SQL join"
+    assert chunk.construct_keys == [
+        ConstructKey(kind="proc", name="sql"),
+        ConstructKey(kind="function", name="intnx"),
+    ]
+    assert ins.example_chunks == [chunk]
+    assert ins.diagnostics == []
+
+
+def test_bare_example_directive_is_unconditional():
+    ins = UserInstructionSet.from_text("## [example] Canonical shape\nbody")
+    chunk = ins.chunks[0]
+    assert scope_of(chunk) == SCOPE_EXAMPLE
+    assert chunk.construct_keys == []
+    assert ins.diagnostics == []
+
+
+def test_example_directive_with_no_valid_keys_degrades_to_unconditional():
+    ins = UserInstructionSet.from_text("## [example: not a key] E\nbody")
+    chunk = ins.chunks[0]
+    # Stays an example (not an always-on rule) but loses the condition.
+    assert scope_of(chunk) == SCOPE_EXAMPLE
+    assert chunk.construct_keys == []
+    assert [d.code for d in ins.diagnostics] == [
+        "INVALID_CONSTRUCT_KEY",
+        "INVALID_CONSTRUCT_KEY",
+    ]  # one for the bad token, one for the empty result
 
 
 def test_when_keys_parse_to_construct_keys():

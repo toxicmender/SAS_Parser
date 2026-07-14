@@ -40,6 +40,7 @@ from .models import (
     SelectionTier,
 )
 from .user_instructions import (
+    SCOPE_EXAMPLE,
     SCOPE_TOPIC,
     SCOPE_WHEN,
     UserInstructionSet,
@@ -105,9 +106,12 @@ class InstructionSelector:
         Operator-supplied rules (see ``user_instructions.py``). Always-scoped
         chunks are injected into every item with first claim on the budget;
         ``when:``-scoped chunks are injected when the item's constructs
-        intersect their keys; ``[topic]`` chunks join the topical ranking,
-        partitioned ahead of reference hits. Rule-scoped (always/when) chunks
-        never surface topically and never join the reference construct lookup.
+        intersect their keys; ``example:``-scoped chunks (few-shot worked
+        pairs) follow the same construct matching in their own tier after the
+        rules (a bare ``[example]`` is unconditional); ``[topic]`` chunks
+        join the topical ranking, partitioned ahead of reference hits.
+        Rule-scoped (always/when/example) chunks never surface topically and
+        never join the reference construct lookup.
     embeddings : Any | None
         LangChain ``Embeddings`` (or provider string) to enable dense topical
         retrieval; ``None`` (default) is BM25-only and fully offline.
@@ -152,6 +156,7 @@ class InstructionSelector:
         # scope and excluded from the reference-only structures below.
         self._user_always: list[int] = []
         self._user_conditional: list[tuple[frozenset[ConstructKey], int]] = []
+        self._user_examples: list[tuple[frozenset[ConstructKey], int]] = []
         self._user_topical: set[int] = set()
         if user_instructions is not None:
             for chunk in user_instructions.chunks:
@@ -162,13 +167,20 @@ class InstructionSelector:
                     self._user_conditional.append(
                         (frozenset(chunk.construct_keys), idx)
                     )
+                elif scope == SCOPE_EXAMPLE:
+                    # An empty key set means an unconditional example.
+                    self._user_examples.append(
+                        (frozenset(chunk.construct_keys), idx)
+                    )
                 elif scope == SCOPE_TOPIC:
                     self._user_topical.add(idx)
                 else:
                     self._user_always.append(idx)
-        self._user_rule_indices = set(self._user_always) | {
-            idx for _, idx in self._user_conditional
-        }
+        self._user_rule_indices = (
+            set(self._user_always)
+            | {idx for _, idx in self._user_conditional}
+            | {idx for _, idx in self._user_examples}
+        )
 
         self._wc = [len(c.text.split()) for c in self._chunks]
 
@@ -192,9 +204,9 @@ class InstructionSelector:
         self._ranker.index([c.text for c in self._chunks])
         logger.info(
             f"InstructionSelector: {reference_count} reference chunk(s)  "
-            f"user always/when/topic="
+            f"user always/when/example/topic="
             f"{len(self._user_always)}/{len(self._user_conditional)}/"
-            f"{len(self._user_topical)}  "
+            f"{len(self._user_examples)}/{len(self._user_topical)}  "
             f"{len(self._by_construct)} construct key(s)  "
             f"{len(self._pinned)} pinned  "
             f"dense={'on' if embeddings is not None else 'off'}"
@@ -220,10 +232,10 @@ class InstructionSelector:
     ) -> list[InstructionChunk]:
         """
         Chunks to inject for one item, in priority order — user always ->
-        user construct-matched -> reference pinned -> hazard constructs ->
-        other constructs -> user topical -> reference topical — filling
-        ``max_words`` and taking at most ``top_k`` topical chunks in total.
-        Empty when nothing is relevant.
+        user construct-matched -> user examples -> reference pinned ->
+        hazard constructs -> other constructs -> user topical -> reference
+        topical — filling ``max_words`` and taking at most ``top_k`` topical
+        chunks in total. Empty when nothing is relevant.
         """
         return [
             pick.chunk
@@ -293,7 +305,7 @@ class InstructionSelector:
                 user_used += self._wc[idx]
             return True
 
-        # Tiers 1-2 — operator rules, first claim on the budget.
+        # Tiers 1-3 — operator rules and examples, first claim on the budget.
         constructs = list(constructs)
         construct_set = set(constructs)
         for idx in self._user_always:
@@ -303,8 +315,16 @@ class InstructionSelector:
                 # The matched key, in the caller's (meaningful) order.
                 matched = next(k for k in constructs if k in keys)
                 add(idx, SelectionTier.USER_WHEN, matched, warn_overflow=True)
+        for keys, idx in self._user_examples:
+            if not keys:  # unconditional example
+                add(idx, SelectionTier.USER_EXAMPLE, warn_overflow=True)
+            elif keys & construct_set:
+                matched = next(k for k in constructs if k in keys)
+                add(
+                    idx, SelectionTier.USER_EXAMPLE, matched, warn_overflow=True
+                )
 
-        # Tiers 3-5 — reference pins and construct hits (the caller's
+        # Tiers 4-6 — reference pins and construct hits (the caller's
         # construct order is meaningful; the set is membership-only).
         for idx in self._pinned:
             add(idx, SelectionTier.PINNED)
@@ -315,7 +335,7 @@ class InstructionSelector:
         for idx, key in normal:
             add(idx, SelectionTier.CONSTRUCT, key)
 
-        # Tiers 6-7 — topical, one shared ranking partitioned user-first (an
+        # Tiers 7-8 — topical, one shared ranking partitioned user-first (an
         # operator [topic] note outranks any reference hit; no score contest).
         # Rule-scoped user chunks are in the index but never surface here.
         topical_added = 0

@@ -343,7 +343,18 @@ Prefer broadcast joins when the lookup side is small.
 
 ## [topic] Partitioning guidance                       <- retrieved by ranking
 Wide fact tables are partitioned by load_date.
+
+## [example: proc:sql] SQL join                        <- few-shot example
+One worked SAS -> PySpark pair demonstrating the response shape.
 ```
+
+`[example: <keys>]` sections hold **few-shot worked pairs** — curated
+SAS → target translations demonstrating the full desired response shape
+(reasoning, fenced code, ⚠️ risk markers). They are selected by construct
+match like `[when:]` rules (a bare `[example]` is unconditional) but render
+in their own `## Worked examples` block placed *last*, adjacent to the item
+they demonstrate for; 5–10 canonical examples (PROC SQL, MERGE, SYMPUT, a
+macro loop) anchor output format better than instruction prose.
 
 Wire them in at any level: `PromptBuilder(chunks, user_instructions=...)`,
 `builder.with_user_instructions(...)` (rebuilds over the same reference
@@ -354,15 +365,17 @@ standing file named by `config.json` `user_instructions.path` (missing file =
 WARNING and continue).
 
 Selection priority per item: **user always → user construct-matched →
-reference pinned → hazard constructs → other constructs → user `[topic]` →
-reference topical** — the topical ranking is partitioned so every relevant
-user `[topic]` chunk precedes any reference hit, and `top_k` caps the tier as
-a whole. Operator rules have first claim on the budget; a rule that doesn't
-fit logs a WARNING naming it. `user_instructions.max_words` (config or the
-`user_max_words` argument) additionally caps the user block inside the
+user examples → reference pinned → hazard constructs → other constructs →
+user `[topic]` → reference topical** — the topical ranking is partitioned so
+every relevant user `[topic]` chunk precedes any reference hit, and `top_k`
+caps the tier as a whole. Operator rules and examples have first claim on
+the budget; one that doesn't fit logs a WARNING naming it.
+`user_instructions.max_words` (config or the `user_max_words` argument)
+additionally caps the user chunks (rules and examples together) inside the
 overall budget. Selected rules render in a `## Project instructions` block
 above the reference guidance, with the operator's own headings and no page
-citations.
+citations; selected examples render in a `## Worked examples` block placed
+last.
 
 Parsing never raises: unknown directives, malformed construct keys, and
 empty-bodied sections emit `InstructionDiagnostic`s and degrade toward

@@ -162,6 +162,9 @@ class PromptBuilder:
         for the heading/directive syntax). Selected user chunks render in
         their own ``## Project instructions`` block above the reference
         guidance and take priority over every reference tier.
+        ``[example: ...]``-scoped sections (few-shot worked pairs) instead
+        render in a ``## {examples_heading}`` block placed last, adjacent
+        to the item they demonstrate for.
     top_k : int | None
         Maximum topical (ranked) chunks per item. ``None`` (default) reads
         ``prompt_builder.top_k`` from config.json, falling back to 6 (see
@@ -197,6 +200,8 @@ class PromptBuilder:
         Markdown H2 heading for the focus-hints block.
     directives_heading : str
         Markdown H2 heading for the reasoning-directives block.
+    examples_heading : str
+        Markdown H2 heading for the few-shot worked-examples block.
     """
 
     def __init__(
@@ -218,6 +223,7 @@ class PromptBuilder:
         project_heading: str = "Project instructions",
         hints_heading: str = "Focus hints",
         directives_heading: str = "Reasoning directives",
+        examples_heading: str = "Worked examples",
     ) -> None:
         self.top_k = app_config.resolve(top_k, "prompt_builder", "top_k", 6)
         self.max_instruction_words = app_config.resolve(
@@ -237,6 +243,7 @@ class PromptBuilder:
         self.project_heading = project_heading
         self.hints_heading = hints_heading
         self.directives_heading = directives_heading
+        self.examples_heading = examples_heading
         if isinstance(user_instructions, str):
             user_instructions = UserInstructionSet.from_text(user_instructions)
         self.user_instructions = user_instructions
@@ -283,6 +290,7 @@ class PromptBuilder:
             project_heading=self.project_heading,
             hints_heading=self.hints_heading,
             directives_heading=self.directives_heading,
+            examples_heading=self.examples_heading,
         )
 
     @classmethod
@@ -345,8 +353,10 @@ class PromptBuilder:
         block for selected user rules, then a compact ``## {hints_heading}``
         stimulus block, then a ``## {directives_heading}`` block of per-hazard
         reasoning instructions, then a ``## {heading}`` block for reference
-        guidance, each omitted when empty — or ``None`` when nothing at all
-        is relevant (so the caller injects no block).
+        guidance, then a ``## {examples_heading}`` block of few-shot worked
+        examples (last, adjacent to the item it demonstrates for), each
+        omitted when empty — or ``None`` when nothing at all is relevant (so
+        the caller injects no block).
         """
         constructs = list(constructs)
         picks = self._selector.select_detailed(
@@ -358,12 +368,21 @@ class PromptBuilder:
         if not picks:
             logger.debug("build: no relevant instruction chunks; no block")
             return None
-        user = [p.chunk for p in picks if p.chunk.role is DocRole.USER_INSTRUCTION]
+        examples = [
+            p.chunk for p in picks if p.tier is SelectionTier.USER_EXAMPLE
+        ]
+        user = [
+            p.chunk
+            for p in picks
+            if p.chunk.role is DocRole.USER_INSTRUCTION
+            and p.tier is not SelectionTier.USER_EXAMPLE
+        ]
         reference = [
             p for p in picks if p.chunk.role is not DocRole.USER_INSTRUCTION
         ]
         logger.debug(
-            f"build: {len(user)} user + {len(reference)} reference chunk(s) injected"
+            f"build: {len(user)} user + {len(examples)} example + "
+            f"{len(reference)} reference chunk(s) injected"
         )
         blocks: list[str] = []
         if user:
@@ -378,6 +397,8 @@ class PromptBuilder:
                 blocks.append(directives)
         if reference:
             blocks.append(self._format_reference(reference))
+        if examples:
+            blocks.append(self._format_examples(examples))
         return "\n\n".join(blocks)
 
     def _format_directives(self, constructs: list[ConstructKey]) -> str | None:
@@ -467,6 +488,21 @@ class PromptBuilder:
         lines = [f"## {self.project_heading}", ""]
         for chunk in picks:
             # Operator rules cite no document or pages — just their heading.
+            lines.append(f"### {chunk.section_path}")
+            lines.append(self._body_of(chunk))
+            lines.append("")
+        return "\n".join(lines).rstrip()
+
+    def _format_examples(self, picks: list[InstructionChunk]) -> str:
+        lines = [
+            f"## {self.examples_heading}",
+            "",
+            "Follow the structure and conventions these worked examples "
+            "demonstrate:",
+            "",
+        ]
+        for chunk in picks:
+            # Like operator rules: the operator's own heading, no citations.
             lines.append(f"### {chunk.section_path}")
             lines.append(self._body_of(chunk))
             lines.append("")
