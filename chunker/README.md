@@ -77,7 +77,7 @@ outputs  = pipeline.run_files(["macros.sas", "etl.sas", "reports.sas"])
 **Import direction is strictly downward:** `keywords` and `models` import
 nothing from the package; `scanner` and `metadata` import from them; `chunker.py`
 imports from all four; `batcher` imports from `keywords`, `metadata`, `models`;
-`pipeline` sits on top and is the **only** module that imports `memory.short_mem`,
+`pipeline` sits on top and is the **only** module that imports `memory.store`,
 `memory.relevance`, and `llm_client`.
 
 ## Chunking model

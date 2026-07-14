@@ -18,7 +18,7 @@ Databricks.
 - **pyspark** is already a core dependency of this repo, and production runs
   on Databricks: locally `log_report` appends parquet rows to a directory,
   in production the same call appends to a managed Delta table — identical
-  to how `memory.short_mem` splits its in-memory and Delta backends.
+  to how `memory.store` splits its in-memory and Delta backends.
 
 The scoring layer itself is storage-free: metrics are plain functions of the
 pipeline's inputs/outputs, and Spark is only booted inside

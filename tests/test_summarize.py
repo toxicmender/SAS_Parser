@@ -13,7 +13,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from memory.short_mem import DatabricksMemory
+from memory.store import MemoryHub
 from memory.summarize import RollingSummarizer
 
 
@@ -73,7 +73,7 @@ def test_incremental_folding_never_resummarizes_covered_turns():
 
 
 def test_state_persists_through_external_store():
-    kv = DatabricksMemory().kv
+    kv = MemoryHub().kv
     model1 = RecordingModel()
     s1 = RollingSummarizer(model1, store=kv, trigger_tokens=1, keep_last_turns=0)
     history = _mk_history("alpha turn", "beta turn")
@@ -90,7 +90,7 @@ def test_state_persists_through_external_store():
 
 
 def test_shrunken_thread_resets_stale_summary():
-    kv = DatabricksMemory().kv
+    kv = MemoryHub().kv
     model = RecordingModel()
     # Trigger sized so the full 3-turn thread folds but a single leftover
     # turn stays under threshold after the reset.
@@ -104,7 +104,7 @@ def test_shrunken_thread_resets_stale_summary():
 
 
 def test_reset_discards_summary():
-    kv = DatabricksMemory().kv
+    kv = MemoryHub().kv
     s = RollingSummarizer(RecordingModel(), store=kv, trigger_tokens=1, keep_last_turns=0)
     history = _mk_history("a", "b")
     s.refresh("t1", history)

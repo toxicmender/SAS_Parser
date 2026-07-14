@@ -3,7 +3,7 @@
 Persists to a Databricks Delta table in production; runs on a plain Python dict
 locally, with no Spark (or JVM) required at all in that mode.
 
-Logger name: ``memory.short_mem``.
+Logger name: ``memory.store``.
 """
 
 from __future__ import annotations
@@ -156,10 +156,13 @@ class _InMemoryBackend:
         return rec["value"] if rec else None
 
     def records(self, prefix: str = "") -> List[_RawRecord]:
+        return self.records_after(prefix, "")
+
+    def records_after(self, prefix: str, after_key: str) -> List[_RawRecord]:
         return [
             (k, r["value"], r["tags"], r["created_at"], r["updated_at"], r["source"])
             for k, r in self._mem.items()
-            if not prefix or k.startswith(prefix)
+            if (not prefix or k.startswith(prefix)) and k > after_key
         ]
 
     def keys(self, prefix: str = "") -> List[str]:
@@ -289,9 +292,15 @@ class _DeltaBackend:
         return rows[0].value if rows else None
 
     def records(self, prefix: str = "") -> List[_RawRecord]:
+        return self.records_after(prefix, "")
+
+    def records_after(self, prefix: str, after_key: str) -> List[_RawRecord]:
+        df = self._df(prefix)
+        if after_key:
+            df = df.filter(F.col("kv_key") > after_key)
         return [
             (row.kv_key, row.value, row.tags, row.created_at, row.updated_at, row.source)
-            for row in self._df(prefix).collect()
+            for row in df.collect()
         ]
 
     def keys(self, prefix: str = "") -> List[str]:
@@ -341,11 +350,11 @@ class _DeltaBackend:
 
 
 # ===========================================================================
-# CORE: SparkKVStore
+# CORE: KVStore
 # ===========================================================================
 
 
-class SparkKVStore:
+class KVStore:
     """
     Key-value store, backed by one of two interchangeable backends.
 
@@ -456,21 +465,33 @@ class SparkKVStore:
         """
         return self._backend.has_prefix(prefix)
 
+    @staticmethod
+    def _decode_record(raw: _RawRecord) -> Tuple[str, Dict]:
+        key, value_json, tags_json, created_at, updated_at, source = raw
+        return (
+            key,
+            {
+                "value": _jload(value_json),
+                "tags": _jload(tags_json) if tags_json else [],
+                "created_at": created_at,
+                "updated_at": updated_at,
+                "source": source,
+            },
+        )
+
     def all_records(self, prefix: str = "") -> List[Tuple[str, Dict]]:
+        return [self._decode_record(r) for r in self._backend.records(prefix)]
+
+    def records_after(self, prefix: str, after_key: str) -> List[Tuple[str, Dict]]:
+        """Records under *prefix* whose key sorts strictly after *after_key*.
+
+        The append-only tail read: message keys are time-ordered, so a
+        caller that remembers the last key it saw fetches only what is new
+        instead of rescanning the prefix.
+        """
         return [
-            (
-                key,
-                {
-                    "value": _jload(value_json),
-                    "tags": _jload(tags_json) if tags_json else [],
-                    "created_at": created_at,
-                    "updated_at": updated_at,
-                    "source": source,
-                },
-            )
-            for key, value_json, tags_json, created_at, updated_at, source in (
-                self._backend.records(prefix)
-            )
+            self._decode_record(r)
+            for r in self._backend.records_after(prefix, after_key)
         ]
 
     def clear_prefix(self, prefix: str) -> int:
@@ -575,17 +596,17 @@ class SparkKVStore:
         }
 
     def __repr__(self) -> str:
-        return f"SparkKVStore(table={self._table!r}, keys={self._backend.count()})"
+        return f"KVStore(table={self._table!r}, keys={self._backend.count()})"
 
 
 # ===========================================================================
-# 1. KVChatMessageHistory  (BaseChatMessageHistory → SparkKVStore)
+# 1. KVChatMessageHistory  (BaseChatMessageHistory → KVStore)
 # ===========================================================================
 
 
 class KVChatMessageHistory(BaseChatMessageHistory):
     """
-    Chat message history for one session, stored in SparkKVStore.
+    Chat message history for one session, stored in KVStore.
 
     Key layout
     ----------
@@ -615,7 +636,7 @@ class KVChatMessageHistory(BaseChatMessageHistory):
 
     Usage
     -----
-    store   = SparkKVStore()          # in-memory; pass spark+table for Delta
+    store   = KVStore()          # in-memory; pass spark+table for Delta
     history = KVChatMessageHistory("thread-42", store=store)
     history.add_user_message("Hello!")
     history.add_ai_message("Hi there!")
@@ -627,7 +648,7 @@ class KVChatMessageHistory(BaseChatMessageHistory):
     def __init__(
         self,
         session_id: str,
-        store: SparkKVStore,
+        store: KVStore,
         *,
         max_age_s: float | None = None,
         max_messages: int | None = None,
@@ -643,6 +664,16 @@ class KVChatMessageHistory(BaseChatMessageHistory):
         self._idx_key = f"idx::{session_id}"  # legacy counter key, cleanup only
         self._msg_prefix = f"msg::{session_id}::"
         self._last_us = 0
+        # Read cache: after the first full load, .messages only fetches
+        # rows whose key sorts after the last one seen (records_after) —
+        # an append-only tail read instead of a per-call prefix rescan.
+        # Message keys are time-ordered, so appends from any writer sort
+        # after the cache frontier; the cache is invalidated whenever this
+        # instance deletes messages (clear / prune / retention). A writer
+        # bypassing this instance to *delete or backdate* rows is not
+        # detected until then.
+        self._msg_cache: Optional[List[BaseMessage]] = None
+        self._cache_last_key = ""
 
     def _msg_key(self, ts: float) -> str:
         """Build a time-ordered, collision-free message key for *ts*."""
@@ -656,32 +687,41 @@ class KVChatMessageHistory(BaseChatMessageHistory):
 
     # ---- BaseChatMessageHistory --------------------------------------------
 
+    @classmethod
+    def _decode_message(cls, data: Dict[str, Any]) -> BaseMessage:
+        if "message" in data:
+            return messages_from_dict([data["message"]])[0]
+        # Legacy rows from the pre-lossless schema: {"role", "content",
+        # "meta"}. Kept readable so existing Delta tables keep working.
+        role = data.get("role", "human")
+        msg_cls = cls._TYPE_MAP.get(role)
+        meta = data.get("meta", {})
+        if msg_cls is not None:
+            return msg_cls(content=data["content"], additional_kwargs=meta)
+        # Tool/function/custom roles round-trip via ChatMessage instead of
+        # being silently rewritten as human messages.
+        return ChatMessage(role=role, content=data["content"], additional_kwargs=meta)
+
     @property
     def messages(self) -> List[BaseMessage]:
-        pairs = self._store.all_records(prefix=self._msg_prefix)
+        if self._msg_cache is None:
+            pairs = self._store.all_records(prefix=self._msg_prefix)
+            self._msg_cache = []
+        else:
+            pairs = self._store.records_after(self._msg_prefix, self._cache_last_key)
+            if not pairs:
+                return list(self._msg_cache)
         # Sort by the key suffix: zero-padded timestamps (and legacy
         # zero-padded sequence numbers) order lexicographically by time.
         pairs.sort(key=lambda kv: kv[0][len(self._msg_prefix) :])
-        result: List[BaseMessage] = []
-        for _, rec in pairs:
-            data = rec["value"]  # already deserialised by all_records
-            if "message" in data:
-                result.append(messages_from_dict([data["message"]])[0])
-                continue
-            # Legacy rows from the pre-lossless schema: {"role", "content",
-            # "meta"}. Kept readable so existing Delta tables keep working.
-            role = data.get("role", "human")
-            cls = self._TYPE_MAP.get(role)
-            meta = data.get("meta", {})
-            if cls is not None:
-                result.append(cls(content=data["content"], additional_kwargs=meta))
-            else:
-                # Tool/function/custom roles round-trip via ChatMessage
-                # instead of being silently rewritten as human messages.
-                result.append(
-                    ChatMessage(role=role, content=data["content"], additional_kwargs=meta)
-                )
-        return result
+        self._msg_cache.extend(self._decode_message(rec["value"]) for _, rec in pairs)
+        if pairs:
+            self._cache_last_key = pairs[-1][0]
+        return list(self._msg_cache)
+
+    def _invalidate_cache(self) -> None:
+        self._msg_cache = None
+        self._cache_last_key = ""
 
     def add_message(self, message: BaseMessage) -> None:
         self.add_messages([message])
@@ -713,6 +753,7 @@ class KVChatMessageHistory(BaseChatMessageHistory):
     def clear(self) -> None:
         self._store.clear_prefix(self._msg_prefix)
         self._store.delete(self._idx_key)  # legacy counter, if present
+        self._invalidate_cache()
 
     def has_messages(self) -> bool:
         """True if this thread has at least one stored message.
@@ -735,6 +776,8 @@ class KVChatMessageHistory(BaseChatMessageHistory):
             if rec["value"].get("ts", 0.0) < cutoff_ts
         ]
         removed = self._store.delete_many(stale)
+        if removed:
+            self._invalidate_cache()
         # DEBUG when nothing was pruned: age-based retention calls this
         # after every write, and a no-op should not spam INFO.
         logger.log(
@@ -754,6 +797,8 @@ class KVChatMessageHistory(BaseChatMessageHistory):
             return 0
         pairs.sort(key=lambda kv: kv[0][len(self._msg_prefix) :])
         removed = self._store.delete_many([key for key, _ in pairs[:excess]])
+        if removed:
+            self._invalidate_cache()
         logger.info(
             f"prune_to_count: session '{self.session_id}' removed {removed} "
             f"message(s) beyond the newest {max_messages}"
@@ -803,7 +848,7 @@ class KVChatMessageHistory(BaseChatMessageHistory):
 
 class ThreadMemoryManager:
     """
-    Manages independent conversation threads, all sharing one SparkKVStore.
+    Manages independent conversation threads, all sharing one KVStore.
 
     Usage
     -----
@@ -818,7 +863,7 @@ class ThreadMemoryManager:
 
     def __init__(
         self,
-        store: SparkKVStore,
+        store: KVStore,
         *,
         max_age_s: float | None = None,
         max_messages: int | None = None,
@@ -915,6 +960,12 @@ class ThreadMemoryManager:
     def delete_thread(self, thread_id: str) -> None:
         self.get_thread(thread_id).clear()
 
+    def invalidate_caches(self) -> None:
+        """Drop every managed thread's read cache — required after an
+        out-of-band store rewrite such as :meth:`KVStore.restore`."""
+        for thread in self._threads.values():
+            thread._invalidate_cache()
+
     def thread_summary(self, thread_id: str) -> Dict[str, Any]:
         return self.get_thread(thread_id).get_session_metadata()
 
@@ -930,7 +981,7 @@ class ThreadMemoryManager:
 class KVMemoryStore:
     """
     High-level namespaced store for config, summaries, file chunks, etc.,
-    backed by SparkKVStore.
+    backed by KVStore.
 
     Usage
     -----
@@ -951,7 +1002,7 @@ class KVMemoryStore:
 
     def __init__(
         self,
-        store: SparkKVStore,
+        store: KVStore,
         namespace: str = "kv",
         ranker: Any | None = None,
     ) -> None:
@@ -1097,13 +1148,13 @@ class KVMemoryStore:
 
 
 # ===========================================================================
-# 4. DatabricksMemory  —  unified façade
+# 4. MemoryHub  —  unified façade
 # ===========================================================================
 
 
-class DatabricksMemory:
+class MemoryHub:
     """
-    Unified façade over all memory layers, all sharing one SparkKVStore.
+    Unified façade over all memory layers, all sharing one KVStore.
 
     Parameters
     ----------
@@ -1125,7 +1176,7 @@ class DatabricksMemory:
 
     Usage — Databricks
     ------------------
-        mem = DatabricksMemory(
+        mem = MemoryHub(
             spark=spark,
             table="main.langchain.memory",
         )
@@ -1140,7 +1191,7 @@ class DatabricksMemory:
 
     Usage — local (no Spark required)
     ---------------------------------
-        mem = DatabricksMemory()
+        mem = MemoryHub()
     """
 
     def __init__(
@@ -1151,7 +1202,7 @@ class DatabricksMemory:
         retention_max_age_s: float | None = None,
         retention_max_messages: int | None = None,
     ) -> None:
-        self._store = SparkKVStore(spark=spark, table=table)
+        self._store = KVStore(spark=spark, table=table)
         self.threads = ThreadMemoryManager(
             store=self._store,
             max_age_s=retention_max_age_s,
@@ -1186,6 +1237,9 @@ class DatabricksMemory:
     def restore(self, snapshot: Dict[str, Any]) -> None:
         """Replace store contents from a snapshot dict."""
         self._store.restore(snapshot)
+        # The rewrite happened underneath any threads already handed out;
+        # their append-only read caches no longer describe the store.
+        self.threads.invalidate_caches()
 
     def prune_thread(self, thread_id: str, before_ts: float) -> int:
         """Storage-side trim: delete *thread_id* messages older than

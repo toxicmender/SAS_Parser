@@ -22,7 +22,7 @@ from chunker.pipeline import (
     _constructs_for_item,
     _query_for_item,
 )
-from memory.short_mem import DatabricksMemory
+from memory.store import MemoryHub
 from prompt_builder.builder import PromptBuilder
 from prompt_builder.models import ConstructKey, DocRole, InstructionChunk
 
@@ -76,7 +76,7 @@ def _intnx_chunk() -> SasChunk:
 def _pipeline(llm, prompt_builder):
     return SasLLMPipeline(
         model="unused-because-llm-injected",
-        memory=DatabricksMemory(),
+        memory=MemoryHub(),
         llm=llm,
         prompt_builder=prompt_builder,
     )
@@ -169,7 +169,7 @@ def test_user_instructions_without_builder_prompted_not_persisted():
     llm = _RecordingChatModel()
     pipeline = SasLLMPipeline(
         model="unused-because-llm-injected",
-        memory=DatabricksMemory(),
+        memory=MemoryHub(),
         llm=llm,
         user_instructions=f"## Output rules\n{USER_MARKER}.",
     )
@@ -190,7 +190,7 @@ def test_user_instructions_fold_into_given_builder():
     llm = _RecordingChatModel()
     pipeline = SasLLMPipeline(
         model="unused-because-llm-injected",
-        memory=DatabricksMemory(),
+        memory=MemoryHub(),
         llm=llm,
         prompt_builder=PromptBuilder(_guidance_corpus()),
         user_instructions=f"## Output rules\n{USER_MARKER}.",
@@ -213,7 +213,7 @@ def test_pipeline_level_instructions_replace_builders_own():
     )
     pipeline = SasLLMPipeline(
         model="unused-because-llm-injected",
-        memory=DatabricksMemory(),
+        memory=MemoryHub(),
         llm=llm,
         prompt_builder=builder,
         user_instructions=f"## New\n{USER_MARKER}.",
@@ -231,7 +231,7 @@ def test_conditional_rule_scoped_end_to_end():
     llm = _RecordingChatModel()
     pipeline = SasLLMPipeline(
         model="unused-because-llm-injected",
-        memory=DatabricksMemory(),
+        memory=MemoryHub(),
         llm=llm,
         user_instructions=f"## [when: function:intnx] Date rules\n{USER_MARKER}.",
     )
@@ -279,7 +279,7 @@ def test_standing_instructions_file_from_config(monkeypatch, tmp_path):
         # No user_instructions argument: the configured standing file applies.
         pipeline = SasLLMPipeline(
             model="unused-because-llm-injected",
-            memory=DatabricksMemory(),
+            memory=MemoryHub(),
             llm=llm,
         )
         pipeline._process(
@@ -297,7 +297,7 @@ def test_instructions_fingerprint_property():
     llm = _RecordingChatModel()
     with_rules = SasLLMPipeline(
         model="unused-because-llm-injected",
-        memory=DatabricksMemory(),
+        memory=MemoryHub(),
         llm=llm,
         user_instructions="## A\nrule body.",
     )

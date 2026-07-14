@@ -1,11 +1,11 @@
 """
-Smoke tests for pipeline.py's integration with memory.short_mem.py.
+Smoke tests for pipeline.py's integration with memory.store.
 
 These tests deliberately avoid any live LLM call: SasLLMPipeline is
 constructed with a FakeListChatModel so we can verify the actual thing
 this integration is responsible for — that batches/chunks get formatted
 correctly and that conversation state round-trips through
-DatabricksMemory / KVChatMessageHistory — without needing API credentials
+MemoryHub / KVChatMessageHistory — without needing API credentials
 or network access.
 
 The memory layer runs on its in-memory backend, so no Spark session (or
@@ -23,7 +23,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, HumanMessage
-from memory.short_mem import DatabricksMemory
+from memory.store import MemoryHub
 
 from chunker.models import (
     SasBatch,
@@ -112,12 +112,12 @@ def test_format_batch_message_includes_all_members_and_cross_file_flag():
 
 
 # ---------------------------------------------------------------------------
-# Persistence wiring — KVChatMessageHistory round-trip via DatabricksMemory
+# Persistence wiring — KVChatMessageHistory round-trip via MemoryHub
 # ---------------------------------------------------------------------------
 
 
 def test_memory_thread_round_trips_messages():
-    mem = DatabricksMemory()  # in-memory backend, no Spark
+    mem = MemoryHub()  # in-memory backend, no Spark
     thread = mem.get_thread("run::etl.sas")
 
     thread.add_user_message("batch-001 content")
@@ -131,7 +131,7 @@ def test_memory_thread_round_trips_messages():
 
 
 def test_different_thread_ids_are_isolated():
-    mem = DatabricksMemory()
+    mem = MemoryHub()
     mem.get_thread("run::a.sas").add_user_message("hello a")
     mem.get_thread("run::b.sas").add_user_message("hello b")
 
@@ -148,7 +148,7 @@ def test_pipeline_accumulates_history_across_batches():
     fake_llm = FakeListChatModel(
         responses=["translation for item 1", "translation for item 2"]
     )
-    mem = DatabricksMemory()
+    mem = MemoryHub()
 
     pipeline = SasLLMPipeline(
         model="unused-because-llm-injected",
@@ -199,7 +199,7 @@ def test_pipeline_accumulates_history_across_batches():
 
 def test_pipeline_window_trimming_limits_injected_history():
     fake_llm = FakeListChatModel(responses=[f"resp {i}" for i in range(6)])
-    mem = DatabricksMemory()
+    mem = MemoryHub()
     pipeline = SasLLMPipeline(
         model="unused-because-llm-injected",
         memory=mem,
@@ -220,7 +220,7 @@ def test_pipeline_window_trimming_limits_injected_history():
 
 def test_snapshot_delegates_to_memory():
     fake_llm = FakeListChatModel(responses=["ok"])
-    mem = DatabricksMemory()
+    mem = MemoryHub()
     pipeline = SasLLMPipeline(model="unused", memory=mem, llm=fake_llm)
 
     c1 = _mk_chunk("f1-chunk-0001", "etl.sas", "data work.a; run;")
@@ -238,7 +238,7 @@ def test_snapshot_delegates_to_memory():
 
 def test_run_facts_recorded_per_item():
     fake_llm = FakeListChatModel(responses=["resp 1", "resp 2"])
-    mem = DatabricksMemory()
+    mem = MemoryHub()
     pipeline = SasLLMPipeline(model="unused", memory=mem, llm=fake_llm)
 
     chunks = [
@@ -258,7 +258,7 @@ def test_run_facts_recorded_per_item():
 
 def test_run_facts_isolated_per_thread():
     fake_llm = FakeListChatModel(responses=["a", "b"])
-    pipeline = SasLLMPipeline(model="unused", memory=DatabricksMemory(), llm=fake_llm)
+    pipeline = SasLLMPipeline(model="unused", memory=MemoryHub(), llm=fake_llm)
     pipeline._process(
         items=[_mk_chunk("c1", "a.sas", "data work.a; run;")],
         diagnostics=[],
@@ -279,7 +279,7 @@ def test_run_facts_isolated_per_thread():
 
 
 def test_resume_skips_completed_items_and_recovers_responses():
-    mem = DatabricksMemory()
+    mem = MemoryHub()
     fake_llm = FakeListChatModel(responses=["resp 1", "resp 2"])
     pipeline = SasLLMPipeline(model="unused", memory=mem, llm=fake_llm)
 
@@ -302,7 +302,7 @@ def test_resume_skips_completed_items_and_recovers_responses():
 
 
 def test_resume_reprocesses_items_with_error_facts():
-    mem = DatabricksMemory()
+    mem = MemoryHub()
     fake_llm = FakeListChatModel(responses=["resp 1", "resp 2"])
     pipeline = SasLLMPipeline(model="unused", memory=mem, llm=fake_llm)
 
@@ -326,7 +326,7 @@ def test_resume_reprocesses_items_with_error_facts():
 
 
 def test_fork_run_then_resume_continues_from_the_fork():
-    mem = DatabricksMemory()
+    mem = MemoryHub()
     fake_llm = FakeListChatModel(responses=["resp 1", "resp 2", "resp 2 redone"])
     pipeline = SasLLMPipeline(model="unused", memory=mem, llm=fake_llm)
 
@@ -361,7 +361,7 @@ def test_summarizer_gets_pipeline_store_and_summary_never_persisted():
     from memory.summarize import RollingSummarizer
 
     fake_llm = FakeListChatModel(responses=["resp 1", "resp 2", "resp 3"])
-    mem = DatabricksMemory()
+    mem = MemoryHub()
     summarizer = RollingSummarizer(
         lambda prompt: "condensed history",
         trigger_tokens=1,

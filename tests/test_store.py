@@ -1,6 +1,6 @@
 """
-test_short_mem.py — unit tests for the in-memory (table=None) backend of
-memory.short_mem.SparkKVStore and the layers built on top of it.
+test_store.py — unit tests for the in-memory (table=None) backend of
+memory.store.KVStore and the layers built on top of it.
 
 These deliberately construct the store with ``spark=None, table=None``:
 in-memory mode uses the pure-dict _InMemoryBackend, which never touches
@@ -14,19 +14,19 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from memory.short_mem import (
-    DatabricksMemory,
+from memory.store import (
+    MemoryHub,
     KVChatMessageHistory,
     KVMemoryStore,
-    SparkKVStore,
+    KVStore,
     ThreadMemoryManager,
     _sql_like_prefix,
 )
 
 
-class TestSparkKVStoreInMemory(unittest.TestCase):
-    def _store(self) -> SparkKVStore:
-        return SparkKVStore(spark=None, table=None)
+class TestKVStoreInMemory(unittest.TestCase):
+    def _store(self) -> KVStore:
+        return KVStore(spark=None, table=None)
 
     def test_set_get_roundtrip(self):
         s = self._store()
@@ -108,7 +108,7 @@ class TestSparkKVStoreInMemory(unittest.TestCase):
 
 class TestChatHistoryInMemory(unittest.TestCase):
     def test_add_and_read_messages(self):
-        store = SparkKVStore(spark=None, table=None)
+        store = KVStore(spark=None, table=None)
         h = KVChatMessageHistory("t1", store)
         self.assertFalse(h.has_messages())
         h.add_user_message("q1")
@@ -117,7 +117,7 @@ class TestChatHistoryInMemory(unittest.TestCase):
         self.assertEqual([m.content for m in h.messages], ["q1", "a1"])
 
     def test_clear_removes_messages(self):
-        store = SparkKVStore(spark=None, table=None)
+        store = KVStore(spark=None, table=None)
         h = KVChatMessageHistory("t1", store)
         h.add_user_message("q1")
         h.clear()
@@ -125,7 +125,7 @@ class TestChatHistoryInMemory(unittest.TestCase):
         self.assertEqual(h.messages, [])
 
     def test_list_threads_only_nonempty(self):
-        store = SparkKVStore(spark=None, table=None)
+        store = KVStore(spark=None, table=None)
         mgr = ThreadMemoryManager(store)
         mgr.get_thread("t1").add_user_message("hi")
         mgr.get_thread("empty")  # instantiated but no messages
@@ -134,17 +134,17 @@ class TestChatHistoryInMemory(unittest.TestCase):
 
 class TestFacadeInMemory(unittest.TestCase):
     def test_kv_store_namespacing_and_search(self):
-        mem = DatabricksMemory(spark=None, table=None)
+        mem = MemoryHub(spark=None, table=None)
         mem.kv.set("goal", "RAG pipeline", tags=["project"])
         self.assertEqual(mem.kv.get("goal"), "RAG pipeline")
         self.assertEqual(mem.kv.search("pipeline")[0][0], "goal")
 
     def test_summary_reports_backend(self):
-        mem = DatabricksMemory(spark=None, table=None)
+        mem = MemoryHub(spark=None, table=None)
         self.assertEqual(mem.summary()["store"]["backend"], "in-memory")
 
     def test_kvmemorystore_strips_namespace_in_keys(self):
-        store = SparkKVStore(spark=None, table=None)
+        store = KVStore(spark=None, table=None)
         kv = KVMemoryStore(store, namespace="kv")
         kv.set("a", 1)
         kv.set("b", 2)
@@ -157,7 +157,7 @@ class TestHybridKVSearch(unittest.TestCase):
     def _mem(self):
         from memory.relevance import HybridRanker
 
-        return DatabricksMemory(ranker=HybridRanker())
+        return MemoryHub(ranker=HybridRanker())
 
     def test_ranks_lexical_match_first(self):
         mem = self._mem()
@@ -190,7 +190,7 @@ class TestHybridKVSearch(unittest.TestCase):
         self.assertGreater(hits[0][1], hits[1][1])
 
     def test_without_ranker_substring_scan_still_works(self):
-        mem = DatabricksMemory()
+        mem = MemoryHub()
         mem.kv.set("goal", "RAG pipeline")
         self.assertEqual(mem.kv.search("pipeline")[0][0], "goal")
 
@@ -209,7 +209,7 @@ class TestSqlLikePrefix(unittest.TestCase):
 
 class TestSetMany(unittest.TestCase):
     def test_batch_roundtrip(self):
-        s = SparkKVStore(spark=None, table=None)
+        s = KVStore(spark=None, table=None)
         s.set_many(
             [
                 {"key": "kv::a", "value": 1, "tags": ["x"]},
@@ -221,7 +221,7 @@ class TestSetMany(unittest.TestCase):
         self.assertEqual(dict(s.all_records())["kv::a"]["tags"], ["x"])
 
     def test_explicit_timestamps_honoured(self):
-        s = SparkKVStore(spark=None, table=None)
+        s = KVStore(spark=None, table=None)
         s.set_many(
             [{"key": "kv::a", "value": 1, "created_at": 100.0, "updated_at": 200.0}]
         )
@@ -230,12 +230,12 @@ class TestSetMany(unittest.TestCase):
         self.assertEqual(rec["updated_at"], 200.0)
 
     def test_empty_entries_noop(self):
-        s = SparkKVStore(spark=None, table=None)
+        s = KVStore(spark=None, table=None)
         s.set_many([])
         self.assertEqual(s.keys(), [])
 
     def test_delete_many_counts_existing_only(self):
-        s = SparkKVStore(spark=None, table=None)
+        s = KVStore(spark=None, table=None)
         s.set("kv::a", 1)
         s.set("kv::b", 2)
         self.assertEqual(s.delete_many(["kv::a", "kv::b", "kv::missing"]), 2)
@@ -244,12 +244,12 @@ class TestSetMany(unittest.TestCase):
 
 class TestRestorePreservesTimestamps(unittest.TestCase):
     def test_created_at_survives_snapshot_restore(self):
-        s = SparkKVStore(spark=None, table=None)
+        s = KVStore(spark=None, table=None)
         s.set("kv::a", 1, tags=["t"])
         before = dict(s.all_records())["kv::a"]
 
         snap = s.snapshot()
-        s2 = SparkKVStore(spark=None, table=None)
+        s2 = KVStore(spark=None, table=None)
         s2.restore(snap)
 
         after = dict(s2.all_records())["kv::a"]
@@ -263,7 +263,7 @@ class TestTimestampMessageKeys(unittest.TestCase):
     def test_message_order_preserved_within_batch(self):
         """Messages written in one add_messages call (same wall-clock
         microsecond is possible) must read back in insertion order."""
-        store = SparkKVStore(spark=None, table=None)
+        store = KVStore(spark=None, table=None)
         h = KVChatMessageHistory("t1", store)
         from langchain_core.messages import AIMessage, HumanMessage
 
@@ -276,7 +276,7 @@ class TestTimestampMessageKeys(unittest.TestCase):
 
     def test_legacy_sequence_keys_sort_before_new_keys(self):
         """Pre-existing {seq:08d} keys must stay ahead of timestamp keys."""
-        store = SparkKVStore(spark=None, table=None)
+        store = KVStore(spark=None, table=None)
         h = KVChatMessageHistory("t1", store)
         # Simulate a legacy message written by the old counter scheme
         store.set(
@@ -287,13 +287,13 @@ class TestTimestampMessageKeys(unittest.TestCase):
         self.assertEqual([m.content for m in h.messages], ["legacy", "new"])
 
     def test_no_idx_counter_key_written(self):
-        store = SparkKVStore(spark=None, table=None)
+        store = KVStore(spark=None, table=None)
         h = KVChatMessageHistory("t1", store)
         h.add_user_message("q")
         self.assertEqual(store.keys(prefix="idx::"), [])
 
     def test_clear_removes_legacy_idx_key(self):
-        store = SparkKVStore(spark=None, table=None)
+        store = KVStore(spark=None, table=None)
         store.set("idx::t1", 3)  # left over from the old counter scheme
         h = KVChatMessageHistory("t1", store)
         h.add_user_message("q")
@@ -305,7 +305,7 @@ class TestRoleRoundTrip(unittest.TestCase):
     def test_tool_style_message_not_rewritten_as_human(self):
         from langchain_core.messages import ChatMessage
 
-        store = SparkKVStore(spark=None, table=None)
+        store = KVStore(spark=None, table=None)
         h = KVChatMessageHistory("t1", store)
         h.add_message(ChatMessage(role="tool", content="result"))
         msgs = h.messages
@@ -316,7 +316,7 @@ class TestRoleRoundTrip(unittest.TestCase):
     def test_system_message_roundtrip(self):
         from langchain_core.messages import SystemMessage
 
-        store = SparkKVStore(spark=None, table=None)
+        store = KVStore(spark=None, table=None)
         h = KVChatMessageHistory("t1", store)
         h.add_message(SystemMessage(content="be brief"))
         self.assertIsInstance(h.messages[0], SystemMessage)
@@ -326,7 +326,7 @@ class TestLosslessSerialisation(unittest.TestCase):
     """The stored payload is message_to_dict, so nothing is dropped."""
 
     def _history(self) -> KVChatMessageHistory:
-        return KVChatMessageHistory("t1", SparkKVStore(spark=None, table=None))
+        return KVChatMessageHistory("t1", KVStore(spark=None, table=None))
 
     def test_tool_calls_round_trip(self):
         from langchain_core.messages import AIMessage
@@ -409,7 +409,7 @@ class TestLosslessSerialisation(unittest.TestCase):
     def test_legacy_row_shape_still_readable(self):
         from langchain_core.messages import HumanMessage
 
-        store = SparkKVStore(spark=None, table=None)
+        store = KVStore(spark=None, table=None)
         h = KVChatMessageHistory("t1", store)
         # Row written by the pre-lossless schema.
         store.set(
@@ -427,7 +427,7 @@ class TestLosslessSerialisation(unittest.TestCase):
 class TestThreadListingFromStore(unittest.TestCase):
     def test_threads_survive_manager_restart(self):
         """A new manager over the same store must see persisted threads."""
-        store = SparkKVStore(spark=None, table=None)
+        store = KVStore(spark=None, table=None)
         ThreadMemoryManager(store).get_thread("t1").add_user_message("hi")
 
         fresh_mgr = ThreadMemoryManager(store)  # simulates process restart
@@ -440,7 +440,7 @@ class TestThreadListingFromStore(unittest.TestCase):
         """Clearing thread_1 must not delete threadX1 (the old LIKE-based
         Delta delete treated '_' as a wildcard; in-memory mode was always
         literal — this pins the shared contract)."""
-        store = SparkKVStore(spark=None, table=None)
+        store = KVStore(spark=None, table=None)
         mgr = ThreadMemoryManager(store)
         mgr.get_thread("thread_1").add_user_message("a")
         mgr.get_thread("threadX1").add_user_message("b")
@@ -448,9 +448,80 @@ class TestThreadListingFromStore(unittest.TestCase):
         self.assertEqual(mgr.list_threads(), ["threadX1"])
 
 
+class TestMessageReadCache(unittest.TestCase):
+    """After the first load, .messages fetches only the appended tail."""
+
+    def test_second_read_uses_records_after_not_a_full_rescan(self):
+        from unittest import mock
+
+        store = KVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store)
+        h.add_user_message("q1")
+        self.assertEqual([m.content for m in h.messages], ["q1"])
+
+        # Any further full-prefix scan through the history is a regression.
+        with mock.patch.object(
+            store, "all_records", side_effect=AssertionError("full rescan")
+        ):
+            h.add_ai_message("a1")
+            self.assertEqual([m.content for m in h.messages], ["q1", "a1"])
+            self.assertEqual([m.content for m in h.messages], ["q1", "a1"])
+
+    def test_cache_invalidated_by_clear(self):
+        store = KVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store)
+        h.add_user_message("q1")
+        _ = h.messages
+        h.clear()
+        self.assertEqual(h.messages, [])
+
+    def test_cache_invalidated_by_prune(self):
+        store = KVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store)
+        h.add_user_message("q1")
+        _ = h.messages
+        h.prune_before(float("inf"))
+        self.assertEqual(h.messages, [])
+
+    def test_retention_prune_after_write_is_reflected(self):
+        store = KVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store, max_messages=2)
+        h.add_user_message("m1")
+        _ = h.messages  # warm the cache before retention prunes m1
+        h.add_ai_message("m2")
+        h.add_user_message("m3")
+        self.assertEqual([m.content for m in h.messages], ["m2", "m3"])
+
+    def test_returned_list_is_a_copy(self):
+        store = KVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store)
+        h.add_user_message("q1")
+        first = h.messages
+        first.append("garbage")
+        self.assertEqual(len(h.messages), 1)
+
+    def test_appends_from_another_instance_are_picked_up(self):
+        store = KVStore(spark=None, table=None)
+        h1 = KVChatMessageHistory("t1", store)
+        h1.add_user_message("q1")
+        _ = h1.messages
+        # A second writer over the same store appends; keys are
+        # time-ordered so h1's tail read sees them.
+        KVChatMessageHistory("t1", store).add_user_message("q2")
+        self.assertEqual([m.content for m in h1.messages], ["q1", "q2"])
+
+    def test_facade_restore_invalidates_thread_caches(self):
+        mem = MemoryHub()
+        thread = mem.get_thread("t1")
+        thread.add_user_message("q1")
+        _ = thread.messages
+        mem.restore(MemoryHub().snapshot())  # restore an empty snapshot
+        self.assertEqual(thread.messages, [])
+
+
 class TestForkThread(unittest.TestCase):
     def test_fork_copies_messages_in_order_and_leaves_source_intact(self):
-        mem = DatabricksMemory()
+        mem = MemoryHub()
         src = mem.get_thread("t1")
         src.add_user_message("q1")
         src.add_ai_message("a1")
@@ -468,7 +539,7 @@ class TestForkThread(unittest.TestCase):
         self.assertEqual(mem.threads.list_threads(), ["t1", "t2"])
 
     def test_fork_upto_messages_takes_oldest_prefix(self):
-        mem = DatabricksMemory()
+        mem = MemoryHub()
         src = mem.get_thread("t1")
         for i in range(3):
             src.add_user_message(f"q{i}")
@@ -484,11 +555,11 @@ class TestForkThread(unittest.TestCase):
     def test_fork_upto_ts_cuts_strictly_before(self):
         from unittest import mock
 
-        mem = DatabricksMemory()
+        mem = MemoryHub()
         src = mem.get_thread("t1")
-        with mock.patch("memory.short_mem._now", return_value=100.0):
+        with mock.patch("memory.store._now", return_value=100.0):
             src.add_user_message("old")
-        with mock.patch("memory.short_mem._now", return_value=200.0):
+        with mock.patch("memory.store._now", return_value=200.0):
             src.add_user_message("new")
 
         copied = mem.fork_thread("t1", "t2", upto_ts=150.0)
@@ -499,7 +570,7 @@ class TestForkThread(unittest.TestCase):
         )
 
     def test_fork_preserves_key_suffixes_and_rewrites_session_tag(self):
-        store = SparkKVStore(spark=None, table=None)
+        store = KVStore(spark=None, table=None)
         mgr = ThreadMemoryManager(store)
         mgr.get_thread("t1").add_user_message("q1")
         mgr.fork_thread("t1", "t2")
@@ -513,7 +584,7 @@ class TestForkThread(unittest.TestCase):
         self.assertNotIn("t1", rec["tags"])
 
     def test_fork_rejects_nonempty_destination_and_self(self):
-        mem = DatabricksMemory()
+        mem = MemoryHub()
         mem.get_thread("t1").add_user_message("q")
         mem.get_thread("t2").add_user_message("occupied")
         with self.assertRaises(ValueError):
@@ -524,7 +595,7 @@ class TestForkThread(unittest.TestCase):
 
 class TestRetention(unittest.TestCase):
     def test_max_messages_prunes_oldest_after_write(self):
-        store = SparkKVStore(spark=None, table=None)
+        store = KVStore(spark=None, table=None)
         h = KVChatMessageHistory("t1", store, max_messages=2)
         h.add_user_message("m1")
         h.add_ai_message("m2")
@@ -534,30 +605,30 @@ class TestRetention(unittest.TestCase):
     def test_max_age_prunes_expired_messages(self):
         from unittest import mock
 
-        store = SparkKVStore(spark=None, table=None)
+        store = KVStore(spark=None, table=None)
         h = KVChatMessageHistory("t1", store, max_age_s=50.0)
-        with mock.patch("memory.short_mem._now", return_value=100.0):
+        with mock.patch("memory.store._now", return_value=100.0):
             h.add_user_message("old")
-        with mock.patch("memory.short_mem._now", return_value=200.0):
+        with mock.patch("memory.store._now", return_value=200.0):
             h.add_user_message("new")
         self.assertEqual([m.content for m in h.messages], ["new"])
 
     def test_facade_forwards_retention_to_threads(self):
-        mem = DatabricksMemory(retention_max_messages=2)
+        mem = MemoryHub(retention_max_messages=2)
         t = mem.get_thread("t1")
         for i in range(3):
             t.add_user_message(f"m{i}")
         self.assertEqual([m.content for m in t.messages], ["m1", "m2"])
 
     def test_no_retention_keeps_everything(self):
-        mem = DatabricksMemory()
+        mem = MemoryHub()
         t = mem.get_thread("t1")
         for i in range(5):
             t.add_user_message(f"m{i}")
         self.assertEqual(len(t.messages), 5)
 
     def test_invalid_retention_params_raise(self):
-        store = SparkKVStore(spark=None, table=None)
+        store = KVStore(spark=None, table=None)
         with self.assertRaises(ValueError):
             KVChatMessageHistory("t1", store, max_age_s=0)
         with self.assertRaises(ValueError):
@@ -568,20 +639,20 @@ class TestPruneBefore(unittest.TestCase):
     def test_prune_removes_only_older_messages(self):
         from unittest import mock
 
-        store = SparkKVStore(spark=None, table=None)
+        store = KVStore(spark=None, table=None)
         h = KVChatMessageHistory("t1", store)
         # Pin the clock: consecutive real writes can share a time.time()
         # float, which would make any cutoff between them ambiguous.
-        with mock.patch("memory.short_mem._now", return_value=100.0):
+        with mock.patch("memory.store._now", return_value=100.0):
             h.add_user_message("old")
-        with mock.patch("memory.short_mem._now", return_value=200.0):
+        with mock.patch("memory.store._now", return_value=200.0):
             h.add_ai_message("new")
         removed = h.prune_before(150.0)
         self.assertEqual(removed, 1)
         self.assertEqual([m.content for m in h.messages], ["new"])
 
     def test_prune_via_facade(self):
-        mem = DatabricksMemory(spark=None, table=None)
+        mem = MemoryHub(spark=None, table=None)
         mem.get_thread("t1").add_user_message("only")
         import time as _time
 

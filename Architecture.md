@@ -31,7 +31,7 @@ item's constructs — prompted to the LLM but never persisted (see invariant 5).
                           │  all_ordered_items
                           ▼
                  +----------------------+       +--------------------+
-                 │ SasLLMPipeline       │──────▶│ memory.short_mem   │
+                 │ SasLLMPipeline       │──────▶│ memory.store   │
                  │ (LangGraph graph,    │ turns │ (KV chat history)  │
                  │  one thread per run) │       +--------------------+
                  +----------------------+
@@ -96,18 +96,18 @@ memory/
                         on top: relevance-based selection of prompted history
                         turn pairs, always-keep-last tail, recency fallback,
                         optional max_tokens packing.
-                        Imports nothing from chunker or memory.short_mem.
+                        Imports nothing from chunker or memory.store.
   summarize.py          RollingSummarizer: one rolling summary per thread —
                         turns older than a recency tail fold monotonically
                         into a KV-stored summary (prompted, never persisted).
                         Store is duck-typed; imports only memory.turns.
-  short_mem.py          SparkKVStore façade over two backends
+  store.py              KVStore façade over two backends
                         (_InMemoryBackend dict / _DeltaBackend Spark+Delta),
                         KVChatMessageHistory (BaseChatMessageHistory, with
                         optional after-write retention), ThreadMemoryManager
                         (incl. fork_thread), KVMemoryStore (optional injected
                         HybridRanker upgrades kv.search to hybrid retrieval),
-                        and the DatabricksMemory entry-point façade.
+                        and the MemoryHub entry-point façade.
 
 prompt_builder/
   models.py             Pydantic models: InstructionChunk, DocSection,
@@ -176,7 +176,7 @@ Import direction is strictly downward: `keywords` and `models` import
 nothing from the package; `scanner` and `metadata` import from them;
 `chunker.py` imports from all four; `batcher` imports from `keywords`,
 `metadata`, `models`; `pipeline` sits on top and is the **only** module that
-imports `memory.short_mem`, `memory.relevance`, `memory.summarize`,
+imports `memory.store`, `memory.relevance`, `memory.summarize`,
 `llm_client`, and `prompt_builder`. `memory`, `llm_client`, and `prompt_builder` never import
 `chunker` (or each other) — `prompt_builder` reuses `memory.relevance` for
 retrieval, and the SAS-metadata → `(query, constructs)` mapping that feeds it
@@ -302,17 +302,22 @@ turn pairs, `skipped: True` in the output; error facts are reprocessed and
 overwritten), so a crashed run continues instead of replaying completed
 turns. **Fork**: `fork_run(src, dst, upto_items=k)` copies the first *k*
 turn pairs plus their `ok` facts onto an empty thread
-(`DatabricksMemory.fork_thread` underneath, preserving keys/timestamps);
+(`MemoryHub.fork_thread` underneath, preserving keys/timestamps);
 rerunning with `thread_id=dst, resume=True` redoes everything after item
 *k* on the branched history — KV-native time travel, no checkpointer.
 Storage growth is bounded, when wanted, by
-`DatabricksMemory(retention_max_age_s=..., retention_max_messages=...)`,
+`MemoryHub(retention_max_age_s=..., retention_max_messages=...)`,
 applied after each write.
 
-`memory.short_mem` stores everything as namespaced KV rows
+`memory.store` stores everything as namespaced KV rows
 (`msg::<thread>::<μs-timestamp>-<rand>` for messages). The
-`SparkKVStore` façade owns all JSON (de)serialisation, tag queries, search,
+`KVStore` façade owns all JSON (de)serialisation, tag queries, search,
 and snapshot/restore; a backend only stores/retrieves/deletes raw rows.
+Message reads are incremental: after one full load per
+`KVChatMessageHistory` instance, `.messages` fetches only rows past the
+last seen key (`records_after` — keys are time-ordered), invalidating on
+clear/prune/retention/restore, so an n-item run reads O(n) message rows
+instead of O(n²).
 `_InMemoryBackend` (default) is a plain dict and requires neither pyspark
 nor a JVM; `_DeltaBackend` requires both and uses MERGE INTO / DELETE FROM
 against a Delta table.
@@ -369,7 +374,7 @@ any of these silently changes behavior.
    prompted = summary + selected history + guidance + item message*.
 
 6. **In-memory mode must stay Spark-free.** `_InMemoryBackend` (and
-   therefore `DatabricksMemory()` with no arguments) must import and run
+   therefore `MemoryHub()` with no arguments) must import and run
    without pyspark installed; the pyspark requirement lives inside
    `_DeltaBackend.__init__` only. The pipeline never boots a SparkSession
    unless `delta_table` is set.
@@ -391,7 +396,7 @@ any of these silently changes behavior.
   when DEBUG is off; per-call entry/exit and LLM-paced logs are unguarded.
   Logger names follow modules: `chunker.chunker`, `chunker.scanner`,
   `chunker.metadata`, `chunker.batcher`, `chunker.pipeline`,
-  `memory.short_mem`, `memory.relevance`, `memory.summarize`,
+  `memory.store`, `memory.relevance`, `memory.summarize`,
   `llm_client.client`.
 - **Names:** dataset/macro/libref names are lowercased at extraction;
   quoted physical paths keep a leading `'` so they can never collide with

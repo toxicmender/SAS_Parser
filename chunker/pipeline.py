@@ -24,7 +24,7 @@ from langchain_core.runnables import RunnableConfig, RunnableLambda
 from langgraph.graph import START, MessagesState, StateGraph
 from llm_client import LLMClient, LLMClientConfig
 from memory.relevance import RelevantHistorySelector
-from memory.short_mem import DatabricksMemory
+from memory.store import MemoryHub
 from memory.summarize import RollingSummarizer
 from prompt_builder import ConstructKey, PromptBuilder, UserInstructionSet
 
@@ -260,7 +260,7 @@ def _format_batch_message(
 class SasLLMPipeline:
     """
     End-to-end pipeline: SAS source(s) -> semantic chunks -> dependency
-    batches -> LLM responses, with a memory.short_mem.py-backed chat-memory
+    batches -> LLM responses, with a memory.store-backed chat-memory
     thread per run.
 
     All batches and singleton chunks produced for a single ``run_file`` /
@@ -316,17 +316,17 @@ class SasLLMPipeline:
         pipeline's ``memory.kv``. ``None`` (default) disables compression.
     include_options_chunks, include_comment_chunks : bool
         Forwarded to the batchers.
-    memory : DatabricksMemory | None
-        Pre-built memory.short_mem facade. If omitted, one is constructed from
+    memory : MemoryHub | None
+        Pre-built memory.store facade. If omitted, one is constructed from
         ``spark``/``delta_table``.
     spark : SparkSession | None
-        Forwarded to :class:`DatabricksMemory` if ``memory`` is omitted.
+        Forwarded to :class:`MemoryHub` if ``memory`` is omitted.
         Only needed when ``delta_table`` is set; if omitted then, a local
         in-process Spark session is created.  The in-memory store never
         touches Spark, so no session is started when ``delta_table`` is
         ``None``.
     delta_table : str | None
-        Forwarded to :class:`DatabricksMemory` if ``memory`` is omitted.
+        Forwarded to :class:`MemoryHub` if ``memory`` is omitted.
         ``None`` (default) keeps the store in-memory — a plain dict, no
         Delta table, no Spark/JVM.
     llm : Any | None
@@ -373,7 +373,7 @@ class SasLLMPipeline:
         summarizer: RollingSummarizer | None = None,
         include_options_chunks: bool = True,
         include_comment_chunks: bool = False,
-        memory: DatabricksMemory | None = None,
+        memory: MemoryHub | None = None,
         spark: "SparkSession | None" = None,
         delta_table: str | None = None,
         llm: Any | None = None,
@@ -534,14 +534,14 @@ class SasLLMPipeline:
     def _build_default_memory(
         spark: "SparkSession | None",
         delta_table: str | None,
-    ) -> DatabricksMemory:
+    ) -> MemoryHub:
         if delta_table is None:
             # In-memory store never touches Spark, so don't boot a JVM session.
             logger.info(
                 "SasLLMPipeline: in-memory message store (no Delta table, no "
                 "Spark session needed)"
             )
-            return DatabricksMemory(spark=spark, table=None)
+            return MemoryHub(spark=spark, table=None)
         if spark is None:
             from pyspark.sql import SparkSession
 
@@ -551,7 +551,7 @@ class SasLLMPipeline:
                 .appName("chunker_pipeline")
                 .getOrCreate()
             )
-        return DatabricksMemory(spark=spark, table=delta_table)
+        return MemoryHub(spark=spark, table=delta_table)
 
     # ------------------------------------------------------------------
     # Public API
@@ -676,10 +676,10 @@ class SasLLMPipeline:
     def snapshot(self) -> dict[str, Any]:
         """
         Export the entire persistence-layer store (all threads + kv).
-        Delegates straight to :meth:`DatabricksMemory.snapshot` — pipeline
-        does not re-implement export logic that memory.short_mem.py already owns.
+        Delegates straight to :meth:`MemoryHub.snapshot` — pipeline
+        does not re-implement export logic that memory.store already owns.
         """
-        logger.info("snapshot: delegating to DatabricksMemory")
+        logger.info("snapshot: delegating to MemoryHub")
         return self._memory.snapshot()
 
     def get_run_facts(self, thread_id: str) -> list[dict[str, Any]]:

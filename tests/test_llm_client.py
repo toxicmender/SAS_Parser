@@ -250,11 +250,11 @@ def test_pipeline_enforces_input_token_budget():
     # under any counter, so the call must fail before reaching the fake LLM.
     from chunker.models import SasChunk, SasChunkKind, SasChunkMetadata
     from chunker.pipeline import SasLLMPipeline
-    from memory.short_mem import DatabricksMemory
+    from memory.store import MemoryHub
 
     pipeline = SasLLMPipeline(
         model="unused-because-llm-injected",
-        memory=DatabricksMemory(),
+        memory=MemoryHub(),
         llm=FakeListChatModel(responses=["never reached"]),
         max_input_tokens=1,
     )

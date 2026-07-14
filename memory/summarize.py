@@ -59,8 +59,8 @@ class RollingSummarizer:
     store : Any | None
         Where summaries persist: anything with ``get(key, default)`` /
         ``set(key, value, tags=...)`` / ``delete(key)`` —
-        :class:`memory.short_mem.KVMemoryStore` fits (duck-typed on
-        purpose: this module imports neither short_mem nor relevance).
+        :class:`memory.store.KVMemoryStore` fits (duck-typed on
+        purpose: this module imports neither store nor relevance).
         ``None`` (default) keeps summaries in a process-local dict;
         ``SasLLMPipeline`` injects its own KV store into a store-less
         summarizer at construction.

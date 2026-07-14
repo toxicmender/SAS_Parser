@@ -3,7 +3,7 @@
 One :func:`log_report` call appends one row per (case, metric) to a Spark
 target, so run history accumulates queryably over time — trend a metric
 across runs with a plain ``GROUP BY``. Two targets, mirroring
-``memory.short_mem``'s local/Databricks split:
+``memory.store``'s local/Databricks split:
 
 - **path** (local default): a parquet directory, ``./validation_runs`` unless
   overridden — no server, no service, nothing but pyspark (already a core

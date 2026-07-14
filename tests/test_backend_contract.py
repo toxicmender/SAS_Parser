@@ -1,6 +1,6 @@
 """
 test_backend_contract.py — one behavioral contract, run against every
-SparkKVStore backend.
+KVStore backend.
 
 ``KVStoreContract`` defines the store-level behaviors both backends must
 share (upsert/COALESCE semantics, literal prefix matching, delete counting,
@@ -22,13 +22,13 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from memory.short_mem import SparkKVStore
+from memory.store import KVStore
 
 
 class KVStoreContract:
-    """Every SparkKVStore backend must pass exactly these tests."""
+    """Every KVStore backend must pass exactly these tests."""
 
-    def make_store(self) -> SparkKVStore:
+    def make_store(self) -> KVStore:
         raise NotImplementedError
 
     # ---- CRUD ------------------------------------------------------------
@@ -125,6 +125,19 @@ class KVStoreContract:
         assert s.delete_many([key]) == 1
         assert s.keys() == []
 
+    def test_records_after_returns_only_strictly_later_keys(self):
+        s = self.make_store()
+        s.set("msg::t::0001", "a")
+        s.set("msg::t::0002", "b")
+        s.set("msg::t::0003", "c")
+        s.set("kv::other", "d")  # different prefix, never returned
+
+        later = sorted(k for k, _ in s.records_after("msg::t::", "msg::t::0001"))
+        assert later == ["msg::t::0002", "msg::t::0003"]
+        everything = sorted(k for k, _ in s.records_after("msg::t::", ""))
+        assert everything == ["msg::t::0001", "msg::t::0002", "msg::t::0003"]
+        assert s.records_after("msg::t::", "msg::t::0003") == []
+
     def test_clear_removes_everything(self):
         s = self.make_store()
         s.set("kv::a", 1)
@@ -165,8 +178,8 @@ class KVStoreContract:
 
 
 class TestInMemoryContract(KVStoreContract):
-    def make_store(self) -> SparkKVStore:
-        return SparkKVStore(spark=None, table=None)
+    def make_store(self) -> KVStore:
+        return KVStore(spark=None, table=None)
 
 
 @pytest.fixture(scope="session")
@@ -208,7 +221,7 @@ class TestDeltaContract(KVStoreContract):
         for table in self._tables:
             delta_spark.sql(f"DROP TABLE IF EXISTS {table}")
 
-    def make_store(self) -> SparkKVStore:
+    def make_store(self) -> KVStore:
         table = f"default.kv_contract_{uuid.uuid4().hex[:10]}"
         self._tables.append(table)
-        return SparkKVStore(spark=self._spark, table=table)
+        return KVStore(spark=self._spark, table=table)

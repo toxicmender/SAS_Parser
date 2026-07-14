@@ -3,10 +3,10 @@
 Chat-history and KV persistence layer for the pipeline, plus relevance-based
 history selection and rolling summarization. No module here imports
 `chunker`, and the three feature modules never import each other — in
-LangChain context-engineering terms they cover **write** (`short_mem`),
+LangChain context-engineering terms they cover **write** (`store`),
 **select** (`relevance`), and **compress** (`summarize`) independently.
 
-- `short_mem.py` — durable chat history and a tagged KV store, backed by a
+- `store.py` — durable chat history and a tagged KV store, backed by a
   plain Python dict locally or a Databricks Delta table in production.
 - `relevance.py` — `RelevantHistorySelector`, an alternative to recency-window
   trimming that prompts the history turns most *relevant* to the current
@@ -25,19 +25,19 @@ tools and import machinery treat it uniformly.
 
 ---
 
-## short_mem — chat history + KV persistence
+## store — chat history + KV persistence
 
 Persists to a Databricks Delta table in production; runs on a plain Python dict
 locally, with no Spark (or JVM) required at all in that mode.
 
 ```python
-from memory.short_mem import DatabricksMemory
+from memory.store import MemoryHub
 
 # local / CI — in-memory dict, pyspark not required
-mem = DatabricksMemory()
+mem = MemoryHub()
 
 # Databricks — Delta-backed
-mem = DatabricksMemory(
+mem = MemoryHub(
     spark=spark,                          # existing Databricks SparkSession
     table="catalog.schema.langchain_mem", # Delta table (created if absent)
 )
@@ -51,14 +51,14 @@ mem.kv.search("pipeline")
 
 # Optional: hybrid search over the KV store (BM25 + optional dense + RRF)
 from memory.relevance import HybridRanker
-mem = DatabricksMemory(ranker=HybridRanker())
+mem = MemoryHub(ranker=HybridRanker())
 ```
 
-`DatabricksMemory(ranker=...)` / `KVMemoryStore(ranker=...)` upgrade
+`MemoryHub(ranker=...)` / `KVMemoryStore(ranker=...)` upgrade
 `kv.search` from the naive substring scan to the same
 BM25 + optional dense + RRF stack the history selector uses (scores are the
 1/rank of the fused order; no-signal queries return `[]`). The ranker is
-duck-typed — `short_mem` never imports `relevance`, so plain KV usage stays
+duck-typed — `store` never imports `relevance`, so plain KV usage stays
 free of the bm25s/faiss dependencies.
 
 ### Thread forking
@@ -74,7 +74,7 @@ top of it.
 
 ### Retention
 
-`DatabricksMemory(retention_max_age_s=..., retention_max_messages=...)`
+`MemoryHub(retention_max_age_s=..., retention_max_messages=...)`
 bounds the *stored* thread, applied opportunistically after every write:
 messages older than the age limit are pruned, then the oldest beyond the
 count limit. Both default to off (keep everything). This automates the
@@ -84,17 +84,17 @@ a separate concern.
 ### Architecture
 
 ```
-SparkKVStore                 ← façade over one of two interchangeable backends
+KVStore                      ← façade over one of two interchangeable backends
 │   ├── _InMemoryBackend     ← plain dict  (local / CI; pyspark not required)
 │   └── _DeltaBackend        ← Spark DataFrame / Databricks Delta table
 │
 ├── KVChatMessageHistory     ← BaseChatMessageHistory for one thread/session
 ├── ThreadMemoryManager      ← manages many independent threads
 ├── KVMemoryStore            ← tagged KV store with search + text ingestion
-└── DatabricksMemory         ← unified façade (recommended entry point)
+└── MemoryHub                ← unified façade (recommended entry point)
 ```
 
-The `SparkKVStore` façade owns all JSON (de)serialisation, tag queries, search,
+The `KVStore` façade owns all JSON (de)serialisation, tag queries, search,
 and snapshot/restore. A backend only stores, retrieves, and deletes raw rows,
 which both speak in the same Delta-schema column order:
 
@@ -144,9 +144,22 @@ Message values carry the full LangChain `message_to_dict` payload
 `total_usage` token counts. Rows written by the pre-lossless schema
 (`{"role", "content", "meta", "ts"}`) are still readable.
 
+### Incremental reads
+
+Message keys are time-ordered, so `KVChatMessageHistory.messages` performs
+a full prefix scan only once per instance; every later call fetches just
+the rows whose key sorts after the last one seen
+(`KVStore.records_after`) and appends them to an in-instance cache — an
+n-item pipeline run reads O(n) rows instead of O(n²). The cache is
+invalidated by anything that deletes messages through the instance
+(`clear`, `prune_*`, retention) and by `MemoryHub.restore()`; appends from
+*other* writers are still picked up (their keys sort after the cache
+frontier), but out-of-band deletes or backdated keys are not seen until
+the next invalidation.
+
 ### Invariant — in-memory mode stays Spark-free
 
-`_InMemoryBackend` (and therefore `DatabricksMemory()` with no arguments) must
+`_InMemoryBackend` (and therefore `MemoryHub()` with no arguments) must
 import and run without pyspark installed; the pyspark requirement lives inside
 `_DeltaBackend.__init__` only. Both backends are held to one behavioral
 contract by `tests/test_backend_contract.py`: the in-memory half always runs,
