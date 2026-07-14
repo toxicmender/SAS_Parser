@@ -10,6 +10,7 @@ injecting fakes (FakeListChatModel or small stubs). Retry tests set
 
 from __future__ import annotations
 
+import asyncio
 import pathlib
 import sys
 
@@ -48,6 +49,9 @@ class _FlakyModel:
         if self.calls <= self.failures:
             raise self.exc
         return AIMessage("ok")
+
+    async def ainvoke(self, messages, config=None):
+        return self.invoke(messages, config)
 
 
 def _fast_retry_config(**overrides) -> LLMClientConfig:
@@ -103,6 +107,51 @@ def test_requests_per_second_builds_rate_limiter(monkeypatch):
     assert isinstance(limiter, client_mod.InMemoryRateLimiter)
     assert limiter.requests_per_second == 2.0
     assert limiter.max_bucket_size == 4
+
+
+def test_model_name_alias_accepted():
+    assert LLMClientConfig(model_name="alias-model").model == "alias-model"
+    assert LLMClientConfig(model="plain-model").model == "plain-model"
+
+
+def test_endpoint_overrides_forwarded(monkeypatch):
+    captured = _capture_init(monkeypatch)
+    LLMClient(
+        LLMClientConfig(
+            model="some-model",
+            base_url="https://gateway.example/v1",
+            api_key="sk-secret",
+            url_headers={"X-Team": "sas"},
+            timeout=42.5,
+            model_kwargs={"top_k": 40},
+        )
+    )
+
+    assert captured["base_url"] == "https://gateway.example/v1"
+    assert captured["api_key"] == "sk-secret"
+    assert captured["default_headers"] == {"X-Team": "sas"}
+    assert captured["timeout"] == 42.5
+    assert captured["model_kwargs"] == {"top_k": 40}
+
+
+def test_api_key_masked_in_repr():
+    cfg = LLMClientConfig(api_key="sk-secret")
+    assert "sk-secret" not in repr(cfg)
+    assert "sk-secret" not in str(cfg)
+
+
+def test_kwargs_escape_hatch_wins_over_named_knobs(monkeypatch):
+    captured = _capture_init(monkeypatch)
+    LLMClient(
+        LLMClientConfig(
+            model="some-model",
+            temperature=0.1,
+            kwargs={"temperature": 0.9, "stop": ["END"]},
+        )
+    )
+
+    assert captured["temperature"] == 0.9
+    assert captured["stop"] == ["END"]
 
 
 def test_injected_llm_skips_construction(monkeypatch):
@@ -225,6 +274,99 @@ def test_non_rate_limit_error_is_not_retried():
 )
 def test_is_rate_limit_error_shapes(exc, expected):
     assert client_mod._is_rate_limit_error(exc) is expected
+
+
+class _FakeOverloadedError(Exception):
+    """Mimics Anthropic's overloaded_error via its status_code attribute."""
+
+    status_code = 529
+
+
+@pytest.mark.parametrize(
+    "exc, expected",
+    [
+        (_FakeRateLimitError("throttled"), True),
+        (_FakeOverloadedError("overloaded"), True),
+        (type("ServerError", (Exception,), {"status_code": 503})("unavailable"), True),
+        (TimeoutError("read timed out"), True),
+        (ConnectionError("peer closed"), True),
+        (type("APIConnectionError", (Exception,), {})("no route"), True),
+        (type("ReadTimeout", (Exception,), {})("slow"), True),
+        # Message-only mentions of transport words must NOT trigger a retry.
+        (RuntimeError("connection reset"), False),
+        (ValueError("bad prompt"), False),
+        (type("BadRequestError", (Exception,), {"status_code": 400})("nope"), False),
+    ],
+)
+def test_is_transient_error_shapes(exc, expected):
+    assert client_mod._is_transient_error(exc) is expected
+
+
+def test_overloaded_5xx_errors_are_retried():
+    model = _FlakyModel(failures=1, exc=_FakeOverloadedError("overloaded"))
+    client = LLMClient(_fast_retry_config(max_retries=2), llm=model)
+
+    assert client.invoke("hi").content == "ok"
+    assert model.calls == 2
+
+
+def test_timeout_errors_are_retried():
+    model = _FlakyModel(failures=1, exc=TimeoutError("read timed out"))
+    client = LLMClient(_fast_retry_config(max_retries=2), llm=model)
+
+    assert client.invoke("hi").content == "ok"
+    assert model.calls == 2
+
+
+# ---------------------------------------------------------------------------
+# Async — ainvoke mirrors invoke (budget, retry, LCEL)
+# ---------------------------------------------------------------------------
+
+
+def test_ainvoke_returns_response():
+    client = LLMClient(llm=FakeListChatModel(responses=["hi"]))
+    assert asyncio.run(client.ainvoke("hello")).content == "hi"
+
+
+def test_ainvoke_retries_transient_errors():
+    model = _FlakyModel(failures=2)
+    client = LLMClient(_fast_retry_config(max_retries=3), llm=model)
+
+    assert asyncio.run(client.ainvoke("hi")).content == "ok"
+    assert model.calls == 3  # 2 failures + 1 success
+
+
+def test_ainvoke_does_not_retry_non_transient_errors():
+    model = _FlakyModel(failures=99, exc=ValueError("bad prompt"))
+    client = LLMClient(_fast_retry_config(max_retries=5), llm=model)
+
+    with pytest.raises(ValueError):
+        asyncio.run(client.ainvoke("hi"))
+    assert model.calls == 1
+
+
+def test_ainvoke_enforces_input_token_budget():
+    model = _FlakyModel(failures=0)
+    client = LLMClient(
+        LLMClientConfig(max_input_tokens=5, token_counter=lambda msgs: 100),
+        llm=model,
+    )
+
+    with pytest.raises(InputTokenLimitError):
+        asyncio.run(client.ainvoke("way too long"))
+    assert model.calls == 0  # nothing was sent
+
+
+def test_as_runnable_async_path_composes_with_prompt():
+    client = LLMClient(llm=FakeListChatModel(responses=["translated"]))
+    prompt = ChatPromptTemplate.from_messages(
+        [("system", "You translate SAS."), ("human", "{input}")]
+    )
+    chain = prompt | client.as_runnable()
+
+    result = asyncio.run(chain.ainvoke({"input": "data work.a; run;"}))
+    assert isinstance(result, AIMessage)
+    assert result.content == "translated"
 
 
 # ---------------------------------------------------------------------------

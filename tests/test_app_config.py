@@ -11,6 +11,7 @@ never leaks in or out.
 from __future__ import annotations
 
 import json
+import logging
 import pathlib
 import sys
 
@@ -94,6 +95,13 @@ def test_repo_config_json_matches_code_defaults():
         "reasoning_directives": None,  # null = unset -> code default (True)
     }
     assert repo_cfg["llm_client"] == {
+        "model": None,
+        "base_url": None,
+        "url_headers": None,
+        "timeout": None,
+        "temperature": None,
+        "max_retries": None,
+        "model_kwargs": None,
         "max_input_tokens": None,
         "max_output_tokens": None,
     }
@@ -153,6 +161,89 @@ def test_llm_client_config_reads_config(_isolated_config):
     assert LLMClientConfig(max_input_tokens=None).max_input_tokens is None
 
 
+def test_get_typed_value_wrong_type_falls_back_with_warning(
+    _isolated_config, caplog
+):
+    _set(_isolated_config, {"llm_client": {"timeout": "sixty"}})
+    with caplog.at_level(logging.WARNING, logger="app_config"):
+        assert app_config.get_typed_value("llm_client", "timeout", (int, float)) is None
+    assert "timeout" in caplog.text
+    assert "sixty" in caplog.text
+
+
+def test_get_typed_value_bool_is_not_a_number(_isolated_config):
+    # JSON true/false must not satisfy an int/float expectation.
+    _set(_isolated_config, {"llm_client": {"max_retries": True}})
+    assert app_config.get_typed_value("llm_client", "max_retries", int, 3) == 3
+
+
+def test_llm_client_value_checks_url_header_values(_isolated_config):
+    _set(_isolated_config, {"llm_client": {"url_headers": {"X-Team": 1}}})
+    assert app_config.llm_client_value("url_headers") is None
+    _set(_isolated_config, {"llm_client": {"url_headers": {"X-Team": "sas"}}})
+    assert app_config.llm_client_value("url_headers") == {"X-Team": "sas"}
+
+
+def test_llm_client_value_rejects_unknown_key():
+    # api_key is deliberately outside the schema: secrets never come from
+    # config.json, and any other unknown key is a programming error.
+    with pytest.raises(KeyError):
+        app_config.llm_client_value("api_key")
+
+
+def test_malformed_llm_client_section_degrades_gracefully(_isolated_config):
+    from llm_client import LLMClientConfig
+
+    _set(
+        _isolated_config,
+        {
+            "llm_client": {
+                "model": 123,
+                "timeout": "sixty",
+                "temperature": "warm",
+                "url_headers": ["not", "a", "mapping"],
+                "max_input_tokens": "lots",
+            }
+        },
+    )
+    cfg = LLMClientConfig()  # must not raise: bad entries -> hard defaults
+    assert cfg.model == "claude-haiku-4-5-20251001"
+    assert cfg.timeout is None
+    assert cfg.temperature is None
+    assert cfg.url_headers is None
+    assert cfg.max_input_tokens is None
+
+
+def test_llm_client_endpoint_knobs_read_config(_isolated_config):
+    from llm_client import LLMClientConfig
+
+    _set(
+        _isolated_config,
+        {
+            "llm_client": {
+                "model": "cfg-model",
+                "base_url": "https://gateway.example/v1",
+                "url_headers": {"X-Team": "sas"},
+                "timeout": 30,
+                "temperature": 0.4,
+                "max_retries": 7,
+                "model_kwargs": {"top_k": 40},
+            }
+        },
+    )
+    cfg = LLMClientConfig()
+    assert cfg.model == "cfg-model"
+    assert cfg.base_url == "https://gateway.example/v1"
+    assert cfg.url_headers == {"X-Team": "sas"}
+    assert cfg.timeout == 30
+    assert cfg.temperature == 0.4
+    assert cfg.max_retries == 7
+    assert cfg.model_kwargs == {"top_k": 40}
+    # Explicit argument still beats the config value.
+    assert LLMClientConfig(model="explicit").model == "explicit"
+    assert LLMClientConfig(timeout=5.0).timeout == 5.0
+
+
 def test_defaults_without_config(_isolated_config):
     from chunker.chunker import SasSemanticChunker
     from llm_client import LLMClientConfig
@@ -163,3 +254,5 @@ def test_defaults_without_config(_isolated_config):
     assert InstructionChunker().max_words == 900
     assert PromptBuilder([]).max_instruction_words == 1500
     assert LLMClientConfig().max_input_tokens is None
+    assert LLMClientConfig().model == "claude-haiku-4-5-20251001"
+    assert LLMClientConfig().max_retries == 3

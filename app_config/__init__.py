@@ -10,6 +10,12 @@ each consumer via :func:`get_value`:
 A JSON ``null`` (or absent key/section/file) means "unset" and falls through
 to the default, so a sparse or missing file is always valid.
 
+Two access levels: :func:`get_value` returns raw JSON values, while
+:func:`get_typed_value` also checks the JSON type and degrades a wrong-typed
+entry to the default with a WARNING. The ``llm_client`` section is parsed
+through a schema (:func:`llm_client_value`) so every LLM knob read from the
+file is type-checked in one place.
+
 The file is searched in order: the ``SAS_PARSER_CONFIG`` environment variable
 (explicit path), ``config.json`` in the current working directory, then
 ``config.json`` at the repo root (next to this package — present in a source
@@ -88,6 +94,82 @@ def resolve(explicit: Any, section: str, key: str, default: Any) -> Any:
     if explicit is not None:
         return explicit
     return get_value(section, key, default)
+
+
+def get_typed_value(
+    section: str,
+    key: str,
+    expected: type | tuple[type, ...],
+    default: Any = None,
+) -> Any:
+    """
+    :func:`get_value` with a JSON-type check: a present value of the wrong
+    type is ignored with a WARNING and *default* applies, so one bad entry
+    in config.json degrades that key instead of crashing the consumer.
+
+    ``bool`` is rejected where ``int``/``float`` is expected unless ``bool``
+    itself is listed (JSON ``true`` is not a number).
+    """
+    value = get_value(section, key, _MISSING)
+    if value is _MISSING:
+        return default
+    types = expected if isinstance(expected, tuple) else (expected,)
+    ok = isinstance(value, types) and not (
+        isinstance(value, bool) and bool not in types
+    )
+    if not ok:
+        expected_names = "/".join(t.__name__ for t in types)
+        logger.warning(
+            f"get_typed_value: config.json {section}.{key} is "
+            f"{type(value).__name__} ({value!r}), expected {expected_names}; "
+            f"ignoring it (default {default!r} applies)"
+        )
+        return default
+    return value
+
+
+# JSON types accepted per llm_client key. The section's parse rules live
+# here beside the loader — one schema — instead of scattered through the
+# LLMClientConfig default factories. api_key is deliberately absent:
+# secrets are not read from config.json.
+_LLM_CLIENT_TYPES: dict[str, type | tuple[type, ...]] = {
+    "model": str,
+    "base_url": str,
+    "url_headers": dict,
+    "timeout": (int, float),
+    "temperature": (int, float),
+    "max_retries": int,
+    "model_kwargs": dict,
+    "max_input_tokens": int,
+    "max_output_tokens": int,
+}
+
+
+def llm_client_value(key: str, default: Any = None) -> Any:
+    """
+    Type-checked value from the ``llm_client`` section of config.json.
+
+    *key* must appear in the section's schema (:data:`_LLM_CLIENT_TYPES`);
+    an unknown key raises ``KeyError`` — that is a programming error, not a
+    config error. Wrong-typed file values are ignored with a WARNING and
+    *default* applies. ``url_headers`` must additionally map to string
+    values (JSON object keys are always strings) or the whole mapping is
+    ignored.
+    """
+    expected = _LLM_CLIENT_TYPES[key]
+    value = get_typed_value("llm_client", key, expected, default)
+    if (
+        key == "url_headers"
+        and isinstance(value, dict)
+        and not all(isinstance(v, str) for v in value.values())
+    ):
+        logger.warning(
+            f"llm_client_value: config.json llm_client.url_headers must map "
+            f"header names to string values; ignoring it "
+            f"(default {default!r} applies)"
+        )
+        return default
+    return value
 
 
 def clear_cache() -> None:

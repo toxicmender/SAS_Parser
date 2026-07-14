@@ -77,10 +77,12 @@ chunker/
 llm_client/
   client.py             LLMClient / LLMClientConfig: chat-model construction
                         via init_chat_model (temperature, max output tokens,
-                        proactive InMemoryRateLimiter) and invocation
-                        (input-token budget -> InputTokenLimitError, 429
-                        retry with exponential backoff). Imports nothing
-                        from chunker or memory.
+                        endpoint overrides — base_url / api_key / headers /
+                        timeout / model_kwargs, proactive InMemoryRateLimiter)
+                        and sync + async invocation (input-token budget ->
+                        InputTokenLimitError, transient-error retry with
+                        exponential backoff). Imports nothing from chunker
+                        or memory.
 
 memory/
   turns.py              Dependency-light turn grouping + approx token count,
@@ -266,9 +268,10 @@ response in one bulk `add_messages` write. When a `prompt_builder` is set the
 prompt additionally carries a block of reference guidance (see
 `prompt_builder/`), injected via an ephemeral `instructions` placeholder that
 is **prompted but never persisted**. `llm_client.LLMClient` owns
-model construction (temperature, output-token cap, proactive rate limiter)
-and invocation (input-token budget, 429 retry with backoff); an injected
-`llm` still gets the retry/budget layers.
+model construction (temperature, output-token cap, endpoint overrides,
+proactive rate limiter) and sync + async invocation (input-token budget,
+transient-error retry with backoff); an injected `llm` still gets the
+retry/budget layers.
 
 Prompted-history trimming has two modes: the default `window_k` recency
 window, or — when a `memory.relevance.RelevantHistorySelector` is passed as

@@ -286,8 +286,36 @@ class SasLLMPipeline:
         ``None`` (default) disables it. Ignored when ``llm`` is injected —
         rate limiters attach at model construction time.
     max_retries : int
-        Retries with exponential backoff for rate-limit (429-shaped)
-        errors; other errors are never retried.
+        Retries with exponential backoff for transient errors (rate
+        limits, overload / 5xx, timeouts, connection drops); other
+        errors are never retried.
+    base_url : str | None
+        Provider endpoint override (proxy / gateway URL). ``None``
+        (default) defers to config.json ``llm_client.base_url``, then
+        the provider default. Ignored when ``llm`` is injected.
+    api_key : str | None
+        Explicit API key; held as a masked ``SecretStr`` inside
+        :class:`llm_client.LLMClientConfig`, never logged. ``None``
+        (default) defers to the provider's environment variable (e.g.
+        ``ANTHROPIC_API_KEY``). Ignored when ``llm`` is injected.
+    url_headers : dict[str, str] | None
+        Extra HTTP headers sent with every LLM request (forwarded as
+        ``default_headers`` — gateway auth, tracing, ...). ``None``
+        (default) defers to config.json ``llm_client.url_headers``.
+        Ignored when ``llm`` is injected.
+    timeout : float | None
+        Per-request LLM timeout in seconds. ``None`` (default) defers to
+        config.json ``llm_client.timeout``, then the provider default.
+        Ignored when ``llm`` is injected.
+    model_kwargs : dict | None
+        Provider-specific request-body extras (e.g. ``{"top_k": 40}``).
+        ``None`` (default) defers to config.json
+        ``llm_client.model_kwargs``. Ignored when ``llm`` is injected.
+    llm_kwargs : dict | None
+        Escape hatch: arbitrary keyword arguments merged last into the
+        ``init_chat_model`` call (the :class:`llm_client.LLMClientConfig`
+        field ``kwargs``), overriding anything the named knobs produced.
+        Ignored when ``llm`` is injected.
     min_words, max_words : int | None
         Forwarded to :class:`SasSemanticChunker`. ``None`` (default) lets
         the chunker read ``sas_chunker.*`` from config.json (see the
@@ -334,7 +362,9 @@ class SasLLMPipeline:
         from ``model`` via :class:`llm_client.LLMClient`.  Useful for
         injecting a fake or pre-configured client (e.g. in tests).  The
         retry and input-token-budget layers still wrap an injected model;
-        ``temperature`` / ``requests_per_second`` do not apply to it.
+        the construction-time knobs (``temperature``, ``base_url``,
+        ``api_key``, ``url_headers``, ``timeout``, ``model_kwargs``,
+        ``llm_kwargs``, ``requests_per_second``) do not apply to it.
     prompt_builder : PromptBuilder | None
         Reference-PDF guidance source. When set, each item's prompt gains a
         block of instruction chunks relevant to that item's constructs
@@ -364,6 +394,12 @@ class SasLLMPipeline:
         max_input_tokens: int | None = None,
         requests_per_second: float | None = None,
         max_retries: int = 3,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        url_headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+        model_kwargs: dict[str, Any] | None = None,
+        llm_kwargs: dict[str, Any] | None = None,
         min_words: int | None = None,
         max_words: int | None = None,
         output_language: str = "PySpark",
@@ -431,19 +467,31 @@ class SasLLMPipeline:
             # snapshot()/restore() carry them along with the history.
             summarizer.store = self._memory.kv
 
-        # llm_client owns construction (temperature, output cap, rate limiter)
-        # and invocation (429 retry, input-token budget). An injected chat model
-        # replaces only the construction half; retry and budget still apply.
-        self._llm_client = LLMClient(
-            LLMClientConfig(
-                model=model,
-                temperature=temperature,
-                max_input_tokens=max_input_tokens,
-                requests_per_second=requests_per_second,
-                max_retries=max_retries,
-            ),
-            llm=llm,
-        )
+        # llm_client owns construction (temperature, endpoint overrides,
+        # output cap, rate limiter) and invocation (transient-error retry,
+        # input-token budget). An injected chat model replaces only the
+        # construction half; retry and budget still apply.
+        llm_config_kwargs: dict[str, Any] = {
+            "model": model,
+            "temperature": temperature,
+            "max_input_tokens": max_input_tokens,
+            "requests_per_second": requests_per_second,
+            "max_retries": max_retries,
+        }
+        # Endpoint knobs are forwarded only when set, so an omitted argument
+        # still defers to the config.json llm_client defaults (an explicit
+        # None here would override them).
+        for key, value in (
+            ("base_url", base_url),
+            ("api_key", api_key),
+            ("url_headers", url_headers),
+            ("timeout", timeout),
+            ("model_kwargs", model_kwargs),
+            ("kwargs", llm_kwargs),
+        ):
+            if value is not None:
+                llm_config_kwargs[key] = value
+        self._llm_client = LLMClient(LLMClientConfig(**llm_config_kwargs), llm=llm)
         prompt = ChatPromptTemplate.from_messages(
             [
                 ("system", self._system_prompt),

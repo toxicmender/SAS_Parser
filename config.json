@@ -16,6 +16,13 @@
     "reasoning_directives": null
   },
   "llm_client": {
+    "model": null,
+    "base_url": null,
+    "url_headers": null,
+    "timeout": null,
+    "temperature": null,
+    "max_retries": null,
+    "model_kwargs": null,
     "max_input_tokens": null,
     "max_output_tokens": null
   },

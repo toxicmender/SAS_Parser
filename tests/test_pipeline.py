@@ -393,3 +393,42 @@ def test_summarizer_gets_pipeline_store_and_summary_never_persisted():
     history = pipeline.get_thread_messages("run::etl.sas")
     assert len(history) == 6
     assert not any(isinstance(m, SystemMessage) for m in history)
+
+
+# ---------------------------------------------------------------------------
+# LLM endpoint overrides — pipeline arguments reach init_chat_model
+# ---------------------------------------------------------------------------
+
+
+def test_endpoint_overrides_reach_init_chat_model(monkeypatch):
+    import llm_client.client as client_mod
+
+    captured: dict = {}
+
+    def fake_init(model, **kwargs):
+        captured["model"] = model
+        captured.update(kwargs)
+        return FakeListChatModel(responses=["built"])
+
+    monkeypatch.setattr(client_mod, "init_chat_model", fake_init)
+
+    SasLLMPipeline(
+        model="some-model",
+        temperature=0.2,
+        base_url="https://gateway.example/v1",
+        api_key="sk-secret",
+        url_headers={"X-Team": "sas"},
+        timeout=42.5,
+        model_kwargs={"top_k": 40},
+        llm_kwargs={"stop": ["END"]},
+        memory=MemoryHub(),
+    )
+
+    assert captured["model"] == "some-model"
+    assert captured["temperature"] == 0.2
+    assert captured["base_url"] == "https://gateway.example/v1"
+    assert captured["api_key"] == "sk-secret"
+    assert captured["default_headers"] == {"X-Team": "sas"}
+    assert captured["timeout"] == 42.5
+    assert captured["model_kwargs"] == {"top_k": 40}
+    assert captured["stop"] == ["END"]  # llm_kwargs escape hatch, merged last
