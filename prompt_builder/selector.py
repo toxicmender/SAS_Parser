@@ -27,13 +27,18 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, TypeVar
 
 # DiskCachedEmbeddings moved to memory.relevance so any HybridRanker consumer
 # (this selector, the KV store's hybrid search) can share the on-disk cache.
 from memory.relevance import DiskCachedEmbeddings, HybridRanker
 
-from .models import ConstructKey, InstructionChunk
+from .models import (
+    ConstructKey,
+    InstructionChunk,
+    SelectedInstruction,
+    SelectionTier,
+)
 from .user_instructions import (
     SCOPE_TOPIC,
     SCOPE_WHEN,
@@ -75,9 +80,12 @@ DEFAULT_HAZARD_CONSTRUCTS: frozenset[ConstructKey] = frozenset(
 )
 
 
-def _interleave(lists: list[list[int]]) -> list[int]:
+_T = TypeVar("_T")
+
+
+def _interleave(lists: list[list[_T]]) -> list[_T]:
     """Round-robin merge: firsts of every list, then seconds, and so on."""
-    out: list[int] = []
+    out: list[_T] = []
     for position in range(max((len(xs) for xs in lists), default=0)):
         for xs in lists:
             if position < len(xs):
@@ -197,6 +205,11 @@ class InstructionSelector:
         """The reference corpus as constructed (user-instruction chunks excluded)."""
         return list(self._chunks[: self._reference_count])
 
+    @property
+    def hazard_constructs(self) -> frozenset[ConstructKey]:
+        """The hazard construct set in effect (default or override)."""
+        return self._hazard
+
     def select(
         self,
         query: str,
@@ -212,12 +225,39 @@ class InstructionSelector:
         ``max_words`` and taking at most ``top_k`` topical chunks in total.
         Empty when nothing is relevant.
         """
-        chosen: list[int] = []
+        return [
+            pick.chunk
+            for pick in self.select_detailed(
+                query, constructs, max_words=max_words, top_k=top_k
+            )
+        ]
+
+    def select_detailed(
+        self,
+        query: str,
+        constructs: Iterable[ConstructKey] = (),
+        *,
+        max_words: int = 1500,
+        top_k: int = 6,
+    ) -> list[SelectedInstruction]:
+        """
+        :meth:`select`, but each pick carries its provenance — the
+        :class:`SelectionTier` that claimed it and, for construct-lookup
+        tiers, the construct key that matched — so formatting can treat
+        picks differently by tier (e.g. render hazard hits as focus hints).
+        """
+        chosen: list[SelectedInstruction] = []
         chosen_set: set[int] = set()
         used = 0
         user_used = 0
 
-        def add(idx: int, *, warn_overflow: bool = False) -> bool:
+        def add(
+            idx: int,
+            tier: SelectionTier,
+            construct: ConstructKey | None = None,
+            *,
+            warn_overflow: bool = False,
+        ) -> bool:
             nonlocal used, user_used
             if idx in chosen_set:
                 return False
@@ -242,7 +282,11 @@ class InstructionSelector:
                         f"({self._wc[idx]} words) does not fit {limit}; dropped"
                     )
                 return False
-            chosen.append(idx)
+            chosen.append(
+                SelectedInstruction(
+                    chunk=self._chunks[idx], tier=tier, construct_key=construct
+                )
+            )
             chosen_set.add(idx)
             used += self._wc[idx]
             if is_user:
@@ -253,21 +297,23 @@ class InstructionSelector:
         constructs = list(constructs)
         construct_set = set(constructs)
         for idx in self._user_always:
-            add(idx, warn_overflow=True)
+            add(idx, SelectionTier.USER_ALWAYS, warn_overflow=True)
         for keys, idx in self._user_conditional:
             if keys & construct_set:
-                add(idx, warn_overflow=True)
+                # The matched key, in the caller's (meaningful) order.
+                matched = next(k for k in constructs if k in keys)
+                add(idx, SelectionTier.USER_WHEN, matched, warn_overflow=True)
 
         # Tiers 3-5 — reference pins and construct hits (the caller's
         # construct order is meaningful; the set is membership-only).
         for idx in self._pinned:
-            add(idx)
+            add(idx, SelectionTier.PINNED)
 
         hazard, normal = self._construct_hits(constructs)
-        for idx in hazard:
-            add(idx)
-        for idx in normal:
-            add(idx)
+        for idx, key in hazard:
+            add(idx, SelectionTier.HAZARD, key)
+        for idx, key in normal:
+            add(idx, SelectionTier.CONSTRUCT, key)
 
         # Tiers 6-7 — topical, one shared ranking partitioned user-first (an
         # operator [topic] note outranks any reference hit; no score contest).
@@ -285,7 +331,12 @@ class InstructionSelector:
                         break
                     if (idx in self._user_topical) is not user_pass:
                         continue
-                    if add(idx):
+                    tier = (
+                        SelectionTier.USER_TOPIC
+                        if idx in self._user_topical
+                        else SelectionTier.TOPICAL
+                    )
+                    if add(idx, tier):
                         topical_added += 1
 
         logger.debug(
@@ -293,20 +344,23 @@ class InstructionSelector:
             f"pinned={len(self._pinned)}  hazard={len(hazard)}  "
             f"construct={len(normal)}  topical={topical_added}"
         )
-        return [self._chunks[i] for i in chosen]
+        return chosen
 
     def _construct_hits(
         self, constructs: Iterable[ConstructKey]
-    ) -> tuple[list[int], list[int]]:
+    ) -> tuple[
+        list[tuple[int, ConstructKey]], list[tuple[int, ConstructKey]]
+    ]:
         """
-        Chunk indices for the item's constructs, hazard set apart. A construct
-        whose section split into several windows contributes *all* of them,
-        interleaved breadth-first (every construct's first window before any
-        second window), so one long section cannot crowd another construct's
-        primary hit out of the budget.
+        ``(chunk index, matched key)`` pairs for the item's constructs, hazard
+        set apart. A construct whose section split into several windows
+        contributes *all* of them, interleaved breadth-first (every
+        construct's first window before any second window), so one long
+        section cannot crowd another construct's primary hit out of the
+        budget.
         """
-        hazard: list[list[int]] = []
-        normal: list[list[int]] = []
+        hazard: list[list[tuple[int, ConstructKey]]] = []
+        normal: list[list[tuple[int, ConstructKey]]] = []
         seen: set[ConstructKey] = set()
         for key in constructs:
             if key in seen:
@@ -316,9 +370,9 @@ class InstructionSelector:
             if not idxs:
                 continue
             if key in self._hazard:
-                hazard.append(idxs)
+                hazard.append([(i, key) for i in idxs])
             elif key in self._stop:
                 continue
             else:
-                normal.append(idxs)
+                normal.append([(i, key) for i in idxs])
         return _interleave(hazard), _interleave(normal)

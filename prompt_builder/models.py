@@ -66,6 +66,22 @@ class ConstructKey(BaseModel):
         return f"{self.kind}:{self.name}"
 
 
+class SelectionTier(StrEnum):
+    """
+    Why the selector picked a chunk — its priority tier, in selection order.
+    Carried on :class:`SelectedInstruction` so downstream formatting can treat
+    picks by provenance (e.g. render hazard hits as explicit focus hints).
+    """
+
+    USER_ALWAYS = "user_always"  # operator rule, always-on
+    USER_WHEN = "user_when"  # operator rule matched via [when: ...] constructs
+    PINNED = "pinned"  # reference section pinned by section-path substring
+    HAZARD = "hazard"  # construct lookup hit on a hazard construct
+    CONSTRUCT = "construct"  # construct lookup hit (non-hazard)
+    USER_TOPIC = "user_topic"  # operator [topic] chunk surfaced by ranking
+    TOPICAL = "topical"  # reference chunk surfaced by hybrid ranking
+
+
 class DocSection(BaseModel):
     """
     One section extracted from a reference PDF: the raw retrieval-preserving
@@ -174,3 +190,18 @@ class InstructionChunk(BaseModel):
             construct_keys=keys,
             tags=list(meta.get("tags", [])),
         )
+
+
+class SelectedInstruction(BaseModel):
+    """
+    One selector pick with its provenance: the chunk, the tier that claimed
+    it, and — for construct-lookup tiers — the construct key that matched.
+    """
+
+    chunk: InstructionChunk
+    tier: SelectionTier
+    construct_key: ConstructKey | None = None
+
+    def __str__(self) -> str:
+        via = f" via {self.construct_key}" if self.construct_key else ""
+        return f"SelectedInstruction({self.chunk.chunk_id}: {self.tier}{via})"

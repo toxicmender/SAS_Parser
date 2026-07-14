@@ -15,7 +15,12 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from memory.relevance import DiskCachedEmbeddings
-from prompt_builder.models import ConstructKey, DocRole, InstructionChunk
+from prompt_builder.models import (
+    ConstructKey,
+    DocRole,
+    InstructionChunk,
+    SelectionTier,
+)
 from prompt_builder.selector import InstructionSelector
 from prompt_builder.user_instructions import UserInstructionSet
 
@@ -276,6 +281,52 @@ def test_user_always_overflow_warns(caplog):
         out = sel.select("zzz", [], max_words=5)
     assert out == []
     assert "does not fit budget" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# select_detailed — tier/construct provenance
+# ---------------------------------------------------------------------------
+
+
+def test_select_detailed_tags_every_tier():
+    sel = _user_selector(pinned_sections=["Output Format"])
+    picks = sel.select_detailed(
+        "dataframe join merge partitions", [SQL, SYMPUT], top_k=2
+    )
+    tiers = {p.chunk.chunk_id: p.tier for p in picks}
+    assert tiers == {
+        "user::c0000": SelectionTier.USER_ALWAYS,
+        "user::c0001": SelectionTier.USER_WHEN,
+        "c5": SelectionTier.PINNED,
+        "c2": SelectionTier.HAZARD,
+        "c1": SelectionTier.CONSTRUCT,
+        "user::c0002": SelectionTier.USER_TOPIC,
+        "c4": SelectionTier.TOPICAL,
+    }
+
+
+def test_select_detailed_carries_matched_construct():
+    sel = InstructionSelector(_corpus())
+    picks = sel.select_detailed("zzz", [INTNX, SYMPUT])
+    by_id = {p.chunk.chunk_id: p for p in picks}
+    assert by_id["c0"].construct_key == INTNX
+    assert by_id["c2"].construct_key == SYMPUT
+
+
+def test_select_detailed_topical_has_no_construct():
+    sel = InstructionSelector(_corpus())
+    picks = sel.select_detailed("dataframe join merge partitions", [])
+    topical = [p for p in picks if p.chunk.chunk_id == "c4"]
+    assert topical and topical[0].tier is SelectionTier.TOPICAL
+    assert topical[0].construct_key is None
+
+
+def test_select_matches_select_detailed_chunks():
+    sel = _user_selector(pinned_sections=["Output Format"])
+    args = ("dataframe join merge partitions", [SQL, SYMPUT])
+    assert [c.chunk_id for c in sel.select(*args)] == [
+        p.chunk.chunk_id for p in sel.select_detailed(*args)
+    ]
 
 
 # ---------------------------------------------------------------------------
