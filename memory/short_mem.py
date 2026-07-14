@@ -22,6 +22,8 @@ from langchain_core.messages import (
     ChatMessage,
     HumanMessage,
     SystemMessage,
+    message_to_dict,
+    messages_from_dict,
 )
 
 # PySpark is optional — required only for Delta mode; the in-memory backend
@@ -65,19 +67,10 @@ def _jload(s: str) -> Any:
     return json.loads(s)
 
 
-def _sql_quote(s: str) -> str:
-    """Escape a value for safe inlining inside a single-quoted SQL literal.
-
-    Keys are internally generated today, but the DELETE statements in Delta
-    mode interpolate them into SQL text; doubling single quotes prevents a
-    stray quote from breaking (or injecting into) the statement.
-    """
-    return s.replace("'", "''")
-
-
-# LIKE-pattern escape character.  '~' is used instead of the conventional
-# backslash so the escaped pattern survives Spark SQL string-literal
-# processing without a second layer of backslash doubling.
+# LIKE-pattern escape character.  All Delta-mode SQL passes values through
+# Spark's parameter markers (spark.sql(sql, args)), so there is no
+# string-literal layer to survive; '~' is simply the escape char declared in
+# the LIKE's ESCAPE clause.
 _LIKE_ESCAPE = "~"
 
 
@@ -144,6 +137,19 @@ class _InMemoryBackend:
                 "updated_at": updated_at,
                 "source": source or (existing["source"] if existing else None),
             }
+
+    def replace_all(self, rows: List[_RawRecord], now: float) -> None:
+        """Atomically replace the whole store with *rows*."""
+        fresh: Dict[str, Dict[str, Any]] = {}
+        for key, value_json, tags_json, created_at, updated_at, source in rows:
+            fresh[key] = {
+                "value": value_json,
+                "tags": tags_json if tags_json is not None else _jdump([]),
+                "created_at": created_at if created_at is not None else now,
+                "updated_at": updated_at,
+                "source": source,
+            }
+        self._mem = fresh
 
     def get(self, key: str) -> Optional[str]:
         rec = self._mem.get(key)
@@ -227,7 +233,7 @@ class _DeltaBackend:
             df = df.filter(F.col("kv_key").startswith(prefix))
         return df
 
-    def upsert(self, rows: List[_RawRecord], now: float) -> None:
+    def _stage(self, rows: List[_RawRecord], now: float) -> "DataFrame":
         # created_at=None (not supplied) defaults to now; the MERGE's
         # WHEN MATCHED branch never touches created_at, so an existing
         # row's creation time is preserved on update.
@@ -235,12 +241,14 @@ class _DeltaBackend:
             (key, value_json, tags_json, created_at if created_at is not None else now, updated_at, source)
             for key, value_json, tags_json, created_at, updated_at, source in rows
         ]
+        return self._spark.createDataFrame(staged_rows, schema=_schema())
+
+    def upsert(self, rows: List[_RawRecord], now: float) -> None:
         # Unique per-call view name: a fixed name would let two concurrent
         # writers on the same SparkSession clobber each other's staged rows
         # between createOrReplaceTempView and MERGE.
         view = f"_kv_upsert_{uuid.uuid4().hex}"
-        staged = self._spark.createDataFrame(staged_rows, schema=_schema())
-        staged.createOrReplaceTempView(view)
+        self._stage(rows, now).createOrReplaceTempView(view)
         try:
             self._spark.sql(f"""
                 MERGE INTO {self._table} AS target
@@ -253,6 +261,20 @@ class _DeltaBackend:
                     target.source     = COALESCE(source.source, target.source)
                 WHEN NOT MATCHED THEN INSERT *
             """)
+        finally:
+            self._spark.catalog.dropTempView(view)
+
+    def replace_all(self, rows: List[_RawRecord], now: float) -> None:
+        """Atomically replace the table contents with *rows*.
+
+        ``INSERT OVERWRITE`` is a single Delta commit, so a reader never
+        observes the empty intermediate state a DELETE-then-insert would
+        expose (and a crash cannot leave the table emptied).
+        """
+        view = f"_kv_replace_{uuid.uuid4().hex}"
+        self._stage(rows, now).createOrReplaceTempView(view)
+        try:
+            self._spark.sql(f"INSERT OVERWRITE {self._table} SELECT * FROM {view}")
         finally:
             self._spark.catalog.dropTempView(view)
 
@@ -280,11 +302,16 @@ class _DeltaBackend:
         return bool(self._df(prefix).limit(1).count())
 
     def delete_many(self, keys: List[str]) -> int:
-        key_set = set(keys)
-        existing = self._df().filter(F.col("kv_key").isin(list(key_set))).count()
+        key_list = list(set(keys))
+        existing = self._df().filter(F.col("kv_key").isin(key_list)).count()
         if existing:
-            quoted = ", ".join(f"'{_sql_quote(k)}'" for k in key_set)
-            self._spark.sql(f"DELETE FROM {self._table} WHERE kv_key IN ({quoted})")
+            # Named parameter markers (Spark >= 3.4) — key values never
+            # touch the SQL text, so no quoting/escaping is needed.
+            markers = ", ".join(f":k{i}" for i in range(len(key_list)))
+            args = {f"k{i}": key for i, key in enumerate(key_list)}
+            self._spark.sql(
+                f"DELETE FROM {self._table} WHERE kv_key IN ({markers})", args
+            )
         return existing
 
     def clear_prefix(self, prefix: str) -> int:
@@ -292,11 +319,13 @@ class _DeltaBackend:
         # LIKE wildcards in the prefix must be escaped: '_' matches any
         # character, so "msg::thread_1::" would otherwise also delete
         # "msg::threadX1::…" — unlike every read path, which matches
-        # the prefix literally via startswith.
-        pattern = _sql_like_prefix(prefix)
+        # the prefix literally via startswith. The pattern itself is passed
+        # as a parameter marker, never inlined into the SQL text.
+        pattern = _sql_like_prefix(prefix) + "%"
         self._spark.sql(
             f"DELETE FROM {self._table} "
-            f"WHERE kv_key LIKE '{_sql_quote(pattern)}%' ESCAPE '{_LIKE_ESCAPE}'"
+            f"WHERE kv_key LIKE :pattern ESCAPE '{_LIKE_ESCAPE}'",
+            {"pattern": pattern},
         )
         return count
 
@@ -511,27 +540,30 @@ class SparkKVStore:
         }
 
     def restore(self, snapshot: Dict[str, Any]) -> None:
-        """Overwrite store contents from a snapshot dict.
+        """Overwrite store contents from a snapshot dict, atomically.
 
         The snapshot's ``created_at``/``updated_at`` are preserved (a
         restored store previously re-stamped every entry to restore time,
-        losing the history the snapshot carried).
+        losing the history the snapshot carried). The replacement is a
+        single backend operation — one Delta ``INSERT OVERWRITE`` commit —
+        so a crash mid-restore cannot leave the store emptied the way the
+        old clear-then-write sequence could.
         """
-        self.clear()
-        entries = []
+        now = _now()
+        rows: List[_RawRecord] = []
         for key, data in snapshot.items():
-            entry: Dict[str, Any] = {
-                "key": key,
-                "value": data["value"],
-                "tags": data.get("tags", []),
-                "source": data.get("source"),
-            }
-            if data.get("created_at") is not None:
-                entry["created_at"] = data["created_at"]
-            if data.get("updated_at") is not None:
-                entry["updated_at"] = data["updated_at"]
-            entries.append(entry)
-        self.set_many(entries)
+            updated_at = data.get("updated_at")
+            rows.append(
+                (
+                    key,
+                    _jdump(data["value"]),
+                    _jdump(data.get("tags", [])),
+                    data.get("created_at"),  # None → backend defaults to now
+                    updated_at if updated_at is not None else now,
+                    data.get("source"),
+                )
+            )
+        self._backend.replace_all(rows, now)
 
     # ---- Diagnostics -------------------------------------------------------
 
@@ -558,7 +590,12 @@ class KVChatMessageHistory(BaseChatMessageHistory):
     Key layout
     ----------
     msg::{session_id}::{epoch_micros:016d}-{rand4}
-        → {"role":..., "content":..., "meta":..., "ts":...}
+        → {"message": <langchain message_to_dict>, "ts": ...}
+
+    Values carry the full ``message_to_dict`` payload, so tool calls,
+    ``usage_metadata``, ``response_metadata``, names, and ids all
+    round-trip losslessly. Legacy rows written by the pre-lossless schema
+    ({"role":..., "content":..., "meta":..., "ts":...}) are still read.
 
     Keys embed a microsecond timestamp plus a random suffix, so they are
     collision-free with no read-modify-write sequence counter (the old
@@ -606,6 +643,11 @@ class KVChatMessageHistory(BaseChatMessageHistory):
         result: List[BaseMessage] = []
         for _, rec in pairs:
             data = rec["value"]  # already deserialised by all_records
+            if "message" in data:
+                result.append(messages_from_dict([data["message"]])[0])
+                continue
+            # Legacy rows from the pre-lossless schema: {"role", "content",
+            # "meta"}. Kept readable so existing Delta tables keep working.
             role = data.get("role", "human")
             cls = self._TYPE_MAP.get(role)
             meta = data.get("meta", {})
@@ -634,9 +676,10 @@ class KVChatMessageHistory(BaseChatMessageHistory):
                 {
                     "key": self._msg_key(ts),
                     "value": {
-                        "role": role,
-                        "content": message.content,
-                        "meta": message.additional_kwargs,
+                        # Lossless LangChain serialisation: tool_calls,
+                        # usage_metadata, response_metadata, name, id all
+                        # survive the round-trip.
+                        "message": message_to_dict(message),
                         "ts": ts,
                     },
                     "tags": ["message", role, self.session_id],
@@ -678,19 +721,29 @@ class KVChatMessageHistory(BaseChatMessageHistory):
 
     def get_session_metadata(self) -> Dict[str, Any]:
         pairs = self._store.all_records(prefix=self._msg_prefix)
+        usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         if not pairs:
             return {
                 "session_id": self.session_id,
                 "message_count": 0,
                 "first_message": None,
                 "last_message": None,
+                "total_usage": usage,
             }
         timestamps = [rec["value"]["ts"] for _, rec in pairs]
+        for _, rec in pairs:
+            # usage_metadata is persisted by the lossless message payload;
+            # legacy rows (no "message" envelope) simply contribute nothing.
+            meta = rec["value"].get("message", {}).get("data", {})
+            for field, count in (meta.get("usage_metadata") or {}).items():
+                if field in usage and isinstance(count, int):
+                    usage[field] += count
         return {
             "session_id": self.session_id,
             "message_count": len(pairs),
             "first_message": _iso(min(timestamps)),
             "last_message": _iso(max(timestamps)),
+            "total_usage": usage,
         }
 
 

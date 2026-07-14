@@ -362,9 +362,12 @@ any of these silently changes behavior.
 
 `tests/` runs without a JVM, network, or API keys: the memory
 tests use the in-memory backend, and the pipeline and validation tests inject
-`FakeListChatModel`. The Delta backend (`_DeltaBackend`) has **no automated
-coverage** in this suite — it requires a live Spark session — so changes to
-it need manual verification against Databricks. Behavior-preserving
+`FakeListChatModel`. The two KV backends share one behavioral contract suite
+(`tests/test_backend_contract.py`): the in-memory half always runs, and the
+Delta half runs the identical tests against a local delta-spark session,
+skipping itself where pyspark + delta-spark + a JVM are unavailable — where
+it cannot run, `_DeltaBackend` changes still need manual verification
+against Databricks. Behavior-preserving
 refactors of the chunker/batcher have historically been verified by
 snapshotting full batcher output (batch membership, I/O fields, reason
 strings, ordering) on a synthetic multi-file corpus and diffing against the

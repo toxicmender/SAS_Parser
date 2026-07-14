@@ -91,14 +91,27 @@ a zero-padded microsecond timestamp plus a short random suffix, so they are
 collision-free without any read-modify-write sequence counter and sort
 lexicographically in time order (legacy `{seq:08d}` keys sort before them). On
 Databricks the Delta backend uses `MERGE INTO` for upserts (`set_many` batches
-several entries into one MERGE) and `DELETE FROM` for deletes.
+several entries into one MERGE) and `DELETE FROM` for deletes; every value the
+SQL sees goes through Spark parameter markers (`spark.sql(sql, args)`, Spark ≥
+3.4), never string interpolation. `restore()` is a single `INSERT OVERWRITE`
+commit, so a crash mid-restore cannot leave the table emptied.
+
+Message values carry the full LangChain `message_to_dict` payload
+(`{"message": …, "ts": …}`), so tool calls, `usage_metadata`,
+`response_metadata`, names, and ids round-trip losslessly;
+`get_session_metadata()` sums the persisted `usage_metadata` into per-thread
+`total_usage` token counts. Rows written by the pre-lossless schema
+(`{"role", "content", "meta", "ts"}`) are still readable.
 
 ### Invariant — in-memory mode stays Spark-free
 
 `_InMemoryBackend` (and therefore `DatabricksMemory()` with no arguments) must
 import and run without pyspark installed; the pyspark requirement lives inside
-`_DeltaBackend.__init__` only. `_DeltaBackend` has no automated coverage in the
-test suite — it requires a live Spark session — so changes to it need manual
+`_DeltaBackend.__init__` only. Both backends are held to one behavioral
+contract by `tests/test_backend_contract.py`: the in-memory half always runs,
+and the Delta half runs the identical tests against a local delta-spark
+session, skipping itself where pyspark + delta-spark + a JVM are unavailable.
+Where the Delta tests cannot run, changes to `_DeltaBackend` still need manual
 verification against Databricks.
 
 ---

@@ -21,7 +21,6 @@ from memory.short_mem import (
     SparkKVStore,
     ThreadMemoryManager,
     _sql_like_prefix,
-    _sql_quote,
 )
 
 
@@ -152,12 +151,6 @@ class TestFacadeInMemory(unittest.TestCase):
         self.assertEqual(sorted(kv.keys()), ["a", "b"])
 
 
-class TestSqlQuote(unittest.TestCase):
-    def test_doubles_single_quotes(self):
-        self.assertEqual(_sql_quote("o'brien"), "o''brien")
-        self.assertEqual(_sql_quote("plain"), "plain")
-
-
 class TestSqlLikePrefix(unittest.TestCase):
     def test_underscore_and_percent_escaped(self):
         self.assertEqual(_sql_like_prefix("msg::thread_1::"), "msg::thread~_1::")
@@ -283,6 +276,108 @@ class TestRoleRoundTrip(unittest.TestCase):
         h = KVChatMessageHistory("t1", store)
         h.add_message(SystemMessage(content="be brief"))
         self.assertIsInstance(h.messages[0], SystemMessage)
+
+
+class TestLosslessSerialisation(unittest.TestCase):
+    """The stored payload is message_to_dict, so nothing is dropped."""
+
+    def _history(self) -> KVChatMessageHistory:
+        return KVChatMessageHistory("t1", SparkKVStore(spark=None, table=None))
+
+    def test_tool_calls_round_trip(self):
+        from langchain_core.messages import AIMessage
+
+        h = self._history()
+        h.add_message(
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "run_sql", "args": {"q": "select 1"}, "id": "call-1"}],
+            )
+        )
+        msg = h.messages[0]
+        self.assertIsInstance(msg, AIMessage)
+        self.assertEqual(msg.tool_calls[0]["name"], "run_sql")
+        self.assertEqual(msg.tool_calls[0]["args"], {"q": "select 1"})
+        self.assertEqual(msg.tool_calls[0]["id"], "call-1")
+
+    def test_tool_message_round_trips_with_tool_call_id(self):
+        from langchain_core.messages import ToolMessage
+
+        h = self._history()
+        h.add_message(ToolMessage(content="42", tool_call_id="call-1"))
+        msg = h.messages[0]
+        self.assertIsInstance(msg, ToolMessage)
+        self.assertEqual(msg.tool_call_id, "call-1")
+
+    def test_id_and_response_metadata_round_trip(self):
+        from langchain_core.messages import AIMessage
+
+        h = self._history()
+        h.add_message(
+            AIMessage(
+                content="a",
+                id="msg-abc",
+                response_metadata={"model_name": "m", "finish_reason": "stop"},
+            )
+        )
+        msg = h.messages[0]
+        self.assertEqual(msg.id, "msg-abc")
+        self.assertEqual(msg.response_metadata["finish_reason"], "stop")
+
+    def test_usage_metadata_summed_in_session_metadata(self):
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        h = self._history()
+        h.add_messages(
+            [
+                HumanMessage(content="q1"),
+                AIMessage(
+                    content="a1",
+                    usage_metadata={
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "total_tokens": 15,
+                    },
+                ),
+                AIMessage(
+                    content="a2",
+                    usage_metadata={
+                        "input_tokens": 20,
+                        "output_tokens": 7,
+                        "total_tokens": 27,
+                    },
+                ),
+            ]
+        )
+        usage = h.get_session_metadata()["total_usage"]
+        self.assertEqual(usage["input_tokens"], 30)
+        self.assertEqual(usage["output_tokens"], 12)
+        self.assertEqual(usage["total_tokens"], 42)
+        # And the usage survives the message round-trip itself.
+        self.assertEqual(h.messages[1].usage_metadata["total_tokens"], 15)
+
+    def test_empty_thread_reports_zero_usage(self):
+        usage = self._history().get_session_metadata()["total_usage"]
+        self.assertEqual(
+            usage, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        )
+
+    def test_legacy_row_shape_still_readable(self):
+        from langchain_core.messages import HumanMessage
+
+        store = SparkKVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store)
+        # Row written by the pre-lossless schema.
+        store.set(
+            "msg::t1::00000001",
+            {"role": "human", "content": "old", "meta": {"k": "v"}, "ts": 1.0},
+        )
+        h.add_user_message("new")
+        msgs = h.messages
+        self.assertIsInstance(msgs[0], HumanMessage)
+        self.assertEqual(msgs[0].content, "old")
+        self.assertEqual(msgs[0].additional_kwargs, {"k": "v"})
+        self.assertEqual(msgs[1].content, "new")
 
 
 class TestThreadListingFromStore(unittest.TestCase):
