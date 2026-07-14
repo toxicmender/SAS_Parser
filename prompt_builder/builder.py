@@ -295,7 +295,7 @@ class PromptBuilder:
             return None
         user = [p.chunk for p in picks if p.chunk.role is DocRole.USER_INSTRUCTION]
         reference = [
-            p.chunk for p in picks if p.chunk.role is not DocRole.USER_INSTRUCTION
+            p for p in picks if p.chunk.role is not DocRole.USER_INSTRUCTION
         ]
         logger.debug(
             f"build: {len(user)} user + {len(reference)} reference chunk(s) injected"
@@ -378,15 +378,33 @@ class PromptBuilder:
             lines.append("")
         return "\n".join(lines).rstrip()
 
-    def _format_reference(self, picks: list[InstructionChunk]) -> str:
+    @staticmethod
+    def _selection_reason(pick: SelectedInstruction) -> str:
+        """
+        Why a reference chunk was injected, for its header — so the model can
+        weigh an authoritative construct/hazard match above a merely related
+        topical hit.
+        """
+        if pick.construct_key is not None and pick.tier in (
+            SelectionTier.HAZARD,
+            SelectionTier.CONSTRUCT,
+        ):
+            return f"{pick.tier.value}: {pick.construct_key.name}"
+        return pick.tier.value  # pinned | topical
+
+    def _format_reference(self, picks: list[SelectedInstruction]) -> str:
         lines = [f"## {self.heading}", ""]
-        for chunk in picks:
+        for pick in picks:
+            chunk = pick.chunk
             pages = (
                 f"p. {chunk.page_start}"
                 if chunk.page_start == chunk.page_end
                 else f"pp. {chunk.page_start}-{chunk.page_end}"
             )
-            lines.append(f"### [{chunk.doc_id} · {chunk.section_path} · {pages}]")
+            lines.append(
+                f"### [{chunk.doc_id} · {chunk.section_path} · {pages} · "
+                f"{self._selection_reason(pick)}]"
+            )
             lines.append(self._body_of(chunk))
             lines.append("")
         return "\n".join(lines).rstrip()

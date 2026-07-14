@@ -267,12 +267,17 @@ returns a Markdown block or `None`:
 
 ## Relevant migration guidance
 
-### [functions · … > INTNX Function · pp. 1109-1118]
+### [functions · … > INTNX Function · pp. 1109-1118 · construct: intnx]
 INTNX Function  Increments a date, time, or datetime value …
 
-### [spark_guide · … > DataFrames and SQL · p. 15]
+### [spark_guide · … > DataFrames and SQL · p. 15 · topical]
 …
 ```
+
+Each reference chunk's header ends with its **selection reason** —
+`construct: <name>` / `hazard: <name>` for deterministic lookup hits,
+`pinned`, or `topical` — so the model can weigh an authoritative match for
+the item's exact construct above a merely related retrieved section.
 
 ### Focus hints (directional stimulus)
 

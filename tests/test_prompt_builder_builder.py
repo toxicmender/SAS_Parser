@@ -59,7 +59,10 @@ def test_build_formats_markdown_block():
     assert block.index("## Focus hints") < block.index(
         "## Relevant migration guidance"
     )
-    assert "### [functions · Funcs > INTNX Function · pp. 41-43]" in block
+    assert (
+        "### [functions · Funcs > INTNX Function · pp. 41-43 · construct: intnx]"
+        in block
+    )
     assert "advances a sas date" in block
     # The retrieval-only breadcrumb prefix is stripped from the body.
     assert "Funcs > INTNX Function\n\nadvances" not in block
@@ -76,7 +79,7 @@ def test_single_page_citation_format():
         [_chunk("c0", "Funcs > A", "body text here", keys=[key], page_start=7, page_end=7)]
     )
     block = pb.build("anything", [key])  # deterministic construct hit
-    assert "· p. 7]" in block
+    assert "· p. 7 ·" in block
 
 
 def test_pinned_section_appears_in_block():
@@ -261,6 +264,38 @@ def test_hints_construct_labels_by_kind():
     assert (
         "- Constructs to map: PROC SQL, hash object, %LET macro statement" in block
     )
+
+
+# ---------------------------------------------------------------------------
+# Selection-reason annotations on reference chunk headers
+# ---------------------------------------------------------------------------
+
+
+def test_reference_header_annotates_hazard_reason():
+    pb = PromptBuilder(_hazard_corpus())
+    block = pb.build("zzz", [SYMPUT])
+    assert "· hazard: symput]" in block
+
+
+def test_reference_header_annotates_topical_reason():
+    pb = PromptBuilder(_hazard_corpus())
+    block = pb.build("advance a date interval with dataframe", [])
+    assert "· topical]" in block
+
+
+def test_reference_header_annotates_pinned_reason():
+    pb = PromptBuilder(_corpus(), pinned_sections=["Output Format"])
+    block = pb.build("zzz nothing", [])
+    assert "· pinned]" in block
+
+
+def test_reason_annotations_distinguish_construct_from_topical():
+    # INTNX arrives via construct lookup; the Spark chunk via ranking — the
+    # same block must label the two provenances differently.
+    pb = PromptBuilder(_hazard_corpus())
+    block = pb.build("advance a date interval with dataframe", [INTNX])
+    assert "INTNX Function · pp. 41-43 · construct: intnx]" in block
+    assert "· topical]" in block
 
 
 # ---------------------------------------------------------------------------
