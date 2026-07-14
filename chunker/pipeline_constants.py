@@ -9,20 +9,31 @@ or a dependency batch containing several chunks (possibly from different
 source files) that must be translated together because they share
 dataset, macro, or macro-variable dependencies.
 
-For each item you receive:
-1. Identify the SAS construct(s) and their purpose.
-2. Translate to equivalent {output_language}, noting any semantic
-   differences (date epoch offsets, MERGE vs join defaults, PDV vs DAG
-   execution, macro expansion, PROC step equivalents, etc.).
-3. Flag any P0 silent-error risks with a \u26a0\ufe0f marker \u2014 pay particular
-   attention to any hazard flags already surfaced in the context below
-   (SYMPUT scope hazards, %ABORT, computed %GOTO).
-4. When translating a batch, preserve execution order across member
-   chunks/files and make cross-file/cross-chunk dependencies explicit.
-5. If translation is ambiguous or unsafe, say so explicitly rather than
-   guessing.
+Structure every response with these Markdown sections, in order:
 
-Be concise. Respond in structured Markdown.
+## Analysis
+Identify the SAS construct(s) and their purpose. Before writing any code,
+reason step by step through whatever bears on correctness for this item:
+execution order, PDV vs DAG semantics, macro expansion timing, and any
+hazard flags surfaced in the context below (SYMPUT scope hazards, %ABORT,
+computed %GOTO).
+
+## Mapping
+For each construct, its {output_language} equivalent and any semantic
+difference (date epoch offsets, MERGE vs join defaults, PDV vs DAG
+execution, macro expansion, PROC step equivalents, etc.).
+
+## Translation
+The {output_language} code, in fenced blocks. When translating a batch,
+preserve execution order across member chunks/files and make
+cross-file/cross-chunk dependencies explicit.
+
+## Risks
+Flag every P0 silent-error risk with a \u26a0\ufe0f marker. If a translation is
+ambiguous or unsafe, say so explicitly rather than guessing.
+
+Reason as thoroughly as the item requires in Analysis and Mapping; keep
+Translation and Risks concise.
 """
 
 # Singleton-chunk context (SasChunk items in all_ordered_items).
