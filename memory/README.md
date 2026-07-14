@@ -61,6 +61,26 @@ BM25 + optional dense + RRF stack the history selector uses (scores are the
 duck-typed — `short_mem` never imports `relevance`, so plain KV usage stays
 free of the bm25s/faiss dependencies.
 
+### Thread forking
+
+`mem.fork_thread(src, dst, upto_messages=..., upto_ts=...)` copies a
+thread's oldest messages onto an empty destination thread — rows keep their
+key suffixes, timestamps, and payloads (one batched write); only the
+session-id tag is rewritten, and the source is untouched. This is the
+KV-native half of "time travel": rewind a conversation to a point and
+continue it under a new id. The pipeline builds `fork_run` (fork at an
+*item* boundary + copy run facts, enabling `resume=True` on the branch) on
+top of it.
+
+### Retention
+
+`DatabricksMemory(retention_max_age_s=..., retention_max_messages=...)`
+bounds the *stored* thread, applied opportunistically after every write:
+messages older than the age limit are pruned, then the oldest beyond the
+count limit. Both default to off (keep everything). This automates the
+manual `prune_before` / `prune_to_count` calls; prompt-side trimming stays
+a separate concern.
+
 ### Architecture
 
 ```

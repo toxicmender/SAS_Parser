@@ -103,8 +103,9 @@ memory/
                         Store is duck-typed; imports only memory.turns.
   short_mem.py          SparkKVStore façade over two backends
                         (_InMemoryBackend dict / _DeltaBackend Spark+Delta),
-                        KVChatMessageHistory (BaseChatMessageHistory),
-                        ThreadMemoryManager, KVMemoryStore (optional injected
+                        KVChatMessageHistory (BaseChatMessageHistory, with
+                        optional after-write retention), ThreadMemoryManager
+                        (incl. fork_thread), KVMemoryStore (optional injected
                         HybridRanker upgrades kv.search to hybrid retrieval),
                         and the DatabricksMemory entry-point façade.
 
@@ -292,8 +293,21 @@ by the selector; a store-less summarizer is auto-wired to the pipeline's
 `memory.kv`. And the pipeline records one small **run fact** per processed
 item into the KV layer (`run::<thread>::item::<item_id>`: status, index,
 timing — never the response text, which already lives in `msg::`), readable
-via `get_run_facts(thread_id)`; this is the durable which-items-completed
-record that resume support builds on.
+via `get_run_facts(thread_id)`.
+
+Run facts power two control features. **Resume**: `run_file` / `run_text` /
+`run_files` accept `resume=True` — items whose fact reads `ok` on the
+thread are skipped (their stored responses recovered from the thread's
+turn pairs, `skipped: True` in the output; error facts are reprocessed and
+overwritten), so a crashed run continues instead of replaying completed
+turns. **Fork**: `fork_run(src, dst, upto_items=k)` copies the first *k*
+turn pairs plus their `ok` facts onto an empty thread
+(`DatabricksMemory.fork_thread` underneath, preserving keys/timestamps);
+rerunning with `thread_id=dst, resume=True` redoes everything after item
+*k* on the branched history — KV-native time travel, no checkpointer.
+Storage growth is bounded, when wanted, by
+`DatabricksMemory(retention_max_age_s=..., retention_max_messages=...)`,
+applied after each write.
 
 `memory.short_mem` stores everything as namespaced KV rows
 (`msg::<thread>::<μs-timestamp>-<rand>` for messages). The

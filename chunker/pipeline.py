@@ -13,7 +13,12 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+)
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableConfig, RunnableLambda
 from langgraph.graph import START, MessagesState, StateGraph
@@ -553,15 +558,24 @@ class SasLLMPipeline:
     # ------------------------------------------------------------------
 
     def run_file(
-        self, path: str, *, thread_id: str | None = None
+        self, path: str, *, thread_id: str | None = None, resume: bool = False
     ) -> list[dict[str, Any]]:
-        """Chunk + batch the SAS file at *path*, run every item through the LLM."""
-        logger.info(f"run_file: '{path}'")
+        """Chunk + batch the SAS file at *path*, run every item through the LLM.
+
+        With ``resume=True``, items whose run fact already reads ``ok`` on
+        this thread are skipped (their stored responses are returned), so a
+        crashed run picks up where it stopped instead of replaying — and
+        re-appending — completed turns.
+        """
+        logger.info(f"run_file: '{path}'  resume={resume}")
         result = self.chunker.chunk_file(path)
         batch_result = self.batcher.batch(result)
         tid = thread_id or self._default_thread_id([result.source_id or path])
         return self._process(
-            batch_result.all_ordered_items, result.diagnostics, thread_id=tid
+            batch_result.all_ordered_items,
+            result.diagnostics,
+            thread_id=tid,
+            resume=resume,
         )
 
     def run_text(
@@ -570,33 +584,85 @@ class SasLLMPipeline:
         *,
         source_id: str | None = None,
         thread_id: str | None = None,
+        resume: bool = False,
     ) -> list[dict[str, Any]]:
-        """Chunk + batch the SAS *source* string, run every item through the LLM."""
+        """Chunk + batch the SAS *source* string, run every item through the LLM.
+
+        ``resume`` behaves as in :meth:`run_file`.
+        """
         label = source_id or "<inline>"
-        logger.info(f"run_text: source_id='{label}'  chars={len(source)}")
+        logger.info(f"run_text: source_id='{label}'  chars={len(source)}  resume={resume}")
         result = self.chunker.chunk_text(source, source_id=source_id)
         batch_result = self.batcher.batch(result)
         tid = thread_id or self._default_thread_id([result.source_id or label])
         return self._process(
-            batch_result.all_ordered_items, result.diagnostics, thread_id=tid
+            batch_result.all_ordered_items,
+            result.diagnostics,
+            thread_id=tid,
+            resume=resume,
         )
 
     def run_files(
-        self, paths: list[str], *, thread_id: str | None = None
+        self,
+        paths: list[str],
+        *,
+        thread_id: str | None = None,
+        resume: bool = False,
     ) -> list[dict[str, Any]]:
         """
         Chunk every file in *paths*, resolve cross-file dependency batches
         via :class:`MultiFileBatcher`, and run every batch/singleton
         through the LLM on **one shared thread** for the whole corpus.
+
+        ``resume`` behaves as in :meth:`run_file`.
         """
-        logger.info(f"run_files: {len(paths)} file(s)")
+        logger.info(f"run_files: {len(paths)} file(s)  resume={resume}")
         file_results = [self.chunker.chunk_file(p) for p in paths]
         corpus = SasCorpus(file_results=file_results)
         multi_result = self.multi_batcher.batch(corpus)
         tid = thread_id or self._default_thread_id(corpus.source_ids)
         return self._process(
-            multi_result.all_ordered_items, corpus.all_diagnostics, thread_id=tid
+            multi_result.all_ordered_items,
+            corpus.all_diagnostics,
+            thread_id=tid,
+            resume=resume,
         )
+
+    def fork_run(
+        self,
+        src_thread_id: str,
+        dst_thread_id: str,
+        *,
+        upto_items: int | None = None,
+    ) -> int:
+        """Fork a run's conversation at item boundary *upto_items*.
+
+        Copies the first ``upto_items`` (human, AI) turn pairs of
+        *src_thread_id* — every pair when ``None`` — plus their ``ok`` run
+        facts onto the empty thread *dst_thread_id*. Rerunning the same
+        source with ``thread_id=dst_thread_id, resume=True`` then skips
+        the copied items and continues from item ``upto_items + 1`` on the
+        forked history: rewind, edit, re-run — without a checkpointer.
+        Returns the number of messages copied.
+        """
+        copied = self._memory.fork_thread(
+            src_thread_id,
+            dst_thread_id,
+            upto_messages=None if upto_items is None else upto_items * 2,
+        )
+        for fact in self.get_run_facts(src_thread_id):
+            index = fact.get("index", 0)
+            if upto_items is not None and index > upto_items:
+                continue
+            if fact.get("status") != "ok":
+                continue
+            value = {k: v for k, v in fact.items() if k != "item_id"}
+            self._record_run_fact(dst_thread_id, fact["item_id"], value)
+        logger.info(
+            f"fork_run: '{src_thread_id}' -> '{dst_thread_id}'  "
+            f"upto_items={upto_items}  messages_copied={copied}"
+        )
+        return copied
 
     def get_thread_messages(self, thread_id: str) -> list[BaseMessage]:
         """Return the raw message history stored for *thread_id*."""
@@ -654,6 +720,20 @@ class SasLLMPipeline:
     def _default_thread_id(source_ids: list[str]) -> str:
         return "run::" + "+".join(source_ids)
 
+    @staticmethod
+    def _recovered_response(messages: list[BaseMessage], fact: dict[str, Any]) -> str | None:
+        """The stored AI response for a completed item, or ``None``.
+
+        A run halts on its first failure and each item persists exactly one
+        (human, AI) pair, so completed item *i* (1-based fact index) maps to
+        message ``2 * i - 1``. Anything inconsistent — a hand-edited thread,
+        retention pruning — degrades to ``None`` rather than guessing.
+        """
+        position = 2 * fact.get("index", 0) - 1
+        if 0 < position < len(messages) and isinstance(messages[position], AIMessage):
+            return messages[position].content
+        return None
+
     def _record_run_fact(
         self, thread_id: str, item_id: str, fact: dict[str, Any]
     ) -> None:
@@ -690,11 +770,31 @@ class SasLLMPipeline:
         diagnostics: list[SasDiagnostic],
         *,
         thread_id: str,
+        resume: bool = False,
     ) -> list[dict[str, Any]]:
         total = len(items)
         if not items:
             logger.warning(f"_process: nothing to process  thread='{thread_id}'")
             return []
+
+        # Resume: items whose run fact reads "ok" are skipped; their stored
+        # responses are recovered from the thread's (human, AI) turn pairs.
+        # Error facts do NOT skip — a failed item is reprocessed and its
+        # fact overwritten.
+        completed: dict[str, dict[str, Any]] = {}
+        recovered: list[BaseMessage] = []
+        if resume:
+            completed = {
+                f["item_id"]: f
+                for f in self.get_run_facts(thread_id)
+                if f.get("status") == "ok"
+            }
+            if completed:
+                recovered = self._memory.get_thread(thread_id).messages
+                logger.info(
+                    f"_process: resume  thread='{thread_id}'  "
+                    f"{len(completed)} item(s) already complete"
+                )
 
         logger.info(
             f"_process: invoking LLM for {total} item(s)  thread='{thread_id}'  model={self.model}"
@@ -705,6 +805,31 @@ class SasLLMPipeline:
         for idx, item in enumerate(items, start=1):
             is_batch = isinstance(item, SasBatch)
             item_id = item.batch_id if is_batch else item.chunk_id
+
+            fact = completed.get(item_id)
+            if fact is not None:
+                logger.info(
+                    f"_process: item {idx}/{total}  id={item_id}  already "
+                    f"complete; skipping  thread={thread_id}"
+                )
+                outputs.append(
+                    {
+                        "item_id": item_id,
+                        "is_batch": is_batch,
+                        "chunk_ids": item.chunk_ids
+                        if is_batch
+                        else [item.chunk_id],
+                        "source_files": item.source_files
+                        if is_batch
+                        else [item.source_id or "unknown"],
+                        "kind": None if is_batch else item.kind.value,
+                        "response": self._recovered_response(recovered, fact),
+                        "thread_id": thread_id,
+                        "skipped": True,
+                    }
+                )
+                continue
+
             logger.info(
                 f"_process: item {idx}/{total}  id={item_id}  is_batch={is_batch}  thread={thread_id}"
             )
@@ -782,6 +907,7 @@ class SasLLMPipeline:
                     "kind": None if is_batch else item.kind.value,
                     "response": ai_text,
                     "thread_id": thread_id,
+                    "skipped": False,
                 }
             )
 

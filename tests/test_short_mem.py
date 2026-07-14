@@ -448,6 +448,122 @@ class TestThreadListingFromStore(unittest.TestCase):
         self.assertEqual(mgr.list_threads(), ["threadX1"])
 
 
+class TestForkThread(unittest.TestCase):
+    def test_fork_copies_messages_in_order_and_leaves_source_intact(self):
+        mem = DatabricksMemory()
+        src = mem.get_thread("t1")
+        src.add_user_message("q1")
+        src.add_ai_message("a1")
+        src.add_user_message("q2")
+        src.add_ai_message("a2")
+
+        copied = mem.fork_thread("t1", "t2")
+
+        self.assertEqual(copied, 4)
+        self.assertEqual(
+            [m.content for m in mem.get_thread("t2").messages],
+            ["q1", "a1", "q2", "a2"],
+        )
+        self.assertEqual(len(mem.get_thread("t1").messages), 4)
+        self.assertEqual(mem.threads.list_threads(), ["t1", "t2"])
+
+    def test_fork_upto_messages_takes_oldest_prefix(self):
+        mem = DatabricksMemory()
+        src = mem.get_thread("t1")
+        for i in range(3):
+            src.add_user_message(f"q{i}")
+            src.add_ai_message(f"a{i}")
+
+        copied = mem.fork_thread("t1", "t2", upto_messages=2)
+
+        self.assertEqual(copied, 2)
+        self.assertEqual(
+            [m.content for m in mem.get_thread("t2").messages], ["q0", "a0"]
+        )
+
+    def test_fork_upto_ts_cuts_strictly_before(self):
+        from unittest import mock
+
+        mem = DatabricksMemory()
+        src = mem.get_thread("t1")
+        with mock.patch("memory.short_mem._now", return_value=100.0):
+            src.add_user_message("old")
+        with mock.patch("memory.short_mem._now", return_value=200.0):
+            src.add_user_message("new")
+
+        copied = mem.fork_thread("t1", "t2", upto_ts=150.0)
+
+        self.assertEqual(copied, 1)
+        self.assertEqual(
+            [m.content for m in mem.get_thread("t2").messages], ["old"]
+        )
+
+    def test_fork_preserves_key_suffixes_and_rewrites_session_tag(self):
+        store = SparkKVStore(spark=None, table=None)
+        mgr = ThreadMemoryManager(store)
+        mgr.get_thread("t1").add_user_message("q1")
+        mgr.fork_thread("t1", "t2")
+
+        src_suffixes = [k[len("msg::t1::") :] for k in store.keys("msg::t1::")]
+        dst_suffixes = [k[len("msg::t2::") :] for k in store.keys("msg::t2::")]
+        self.assertEqual(sorted(src_suffixes), sorted(dst_suffixes))
+
+        (_, rec), = store.all_records(prefix="msg::t2::")
+        self.assertIn("t2", rec["tags"])
+        self.assertNotIn("t1", rec["tags"])
+
+    def test_fork_rejects_nonempty_destination_and_self(self):
+        mem = DatabricksMemory()
+        mem.get_thread("t1").add_user_message("q")
+        mem.get_thread("t2").add_user_message("occupied")
+        with self.assertRaises(ValueError):
+            mem.fork_thread("t1", "t2")
+        with self.assertRaises(ValueError):
+            mem.fork_thread("t1", "t1")
+
+
+class TestRetention(unittest.TestCase):
+    def test_max_messages_prunes_oldest_after_write(self):
+        store = SparkKVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store, max_messages=2)
+        h.add_user_message("m1")
+        h.add_ai_message("m2")
+        h.add_user_message("m3")
+        self.assertEqual([m.content for m in h.messages], ["m2", "m3"])
+
+    def test_max_age_prunes_expired_messages(self):
+        from unittest import mock
+
+        store = SparkKVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store, max_age_s=50.0)
+        with mock.patch("memory.short_mem._now", return_value=100.0):
+            h.add_user_message("old")
+        with mock.patch("memory.short_mem._now", return_value=200.0):
+            h.add_user_message("new")
+        self.assertEqual([m.content for m in h.messages], ["new"])
+
+    def test_facade_forwards_retention_to_threads(self):
+        mem = DatabricksMemory(retention_max_messages=2)
+        t = mem.get_thread("t1")
+        for i in range(3):
+            t.add_user_message(f"m{i}")
+        self.assertEqual([m.content for m in t.messages], ["m1", "m2"])
+
+    def test_no_retention_keeps_everything(self):
+        mem = DatabricksMemory()
+        t = mem.get_thread("t1")
+        for i in range(5):
+            t.add_user_message(f"m{i}")
+        self.assertEqual(len(t.messages), 5)
+
+    def test_invalid_retention_params_raise(self):
+        store = SparkKVStore(spark=None, table=None)
+        with self.assertRaises(ValueError):
+            KVChatMessageHistory("t1", store, max_age_s=0)
+        with self.assertRaises(ValueError):
+            KVChatMessageHistory("t1", store, max_messages=0)
+
+
 class TestPruneBefore(unittest.TestCase):
     def test_prune_removes_only_older_messages(self):
         from unittest import mock

@@ -597,6 +597,15 @@ class KVChatMessageHistory(BaseChatMessageHistory):
     round-trip losslessly. Legacy rows written by the pre-lossless schema
     ({"role":..., "content":..., "meta":..., "ts":...}) are still read.
 
+    Retention
+    ---------
+    ``max_age_s`` / ``max_messages`` (both off by default) bound the
+    *stored* thread, applied opportunistically after every write: messages
+    older than ``max_age_s`` seconds are pruned, then the oldest messages
+    beyond ``max_messages`` are pruned. This automates what
+    :meth:`prune_before` does manually — prompt-side trimming remains a
+    separate concern.
+
     Keys embed a microsecond timestamp plus a random suffix, so they are
     collision-free with no read-modify-write sequence counter (the old
     ``idx::{session_id}`` get-then-set raced under concurrent writers and
@@ -615,8 +624,21 @@ class KVChatMessageHistory(BaseChatMessageHistory):
 
     _TYPE_MAP = {"human": HumanMessage, "ai": AIMessage, "system": SystemMessage}
 
-    def __init__(self, session_id: str, store: SparkKVStore) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        store: SparkKVStore,
+        *,
+        max_age_s: float | None = None,
+        max_messages: int | None = None,
+    ) -> None:
+        if max_age_s is not None and max_age_s <= 0:
+            raise ValueError(f"max_age_s must be > 0, got {max_age_s}")
+        if max_messages is not None and max_messages < 1:
+            raise ValueError(f"max_messages must be >= 1, got {max_messages}")
         self.session_id = session_id
+        self.max_age_s = max_age_s
+        self.max_messages = max_messages
         self._store = store
         self._idx_key = f"idx::{session_id}"  # legacy counter key, cleanup only
         self._msg_prefix = f"msg::{session_id}::"
@@ -686,6 +708,7 @@ class KVChatMessageHistory(BaseChatMessageHistory):
                 }
             )
         self._store.set_many(entries)
+        self._apply_retention()
 
     def clear(self) -> None:
         self._store.clear_prefix(self._msg_prefix)
@@ -712,10 +735,36 @@ class KVChatMessageHistory(BaseChatMessageHistory):
             if rec["value"].get("ts", 0.0) < cutoff_ts
         ]
         removed = self._store.delete_many(stale)
-        logger.info(
-            f"prune_before: session '{self.session_id}' removed {removed} message(s)"
+        # DEBUG when nothing was pruned: age-based retention calls this
+        # after every write, and a no-op should not spam INFO.
+        logger.log(
+            logging.INFO if removed else logging.DEBUG,
+            f"prune_before: session '{self.session_id}' removed {removed} message(s)",
         )
         return removed
+
+    def prune_to_count(self, max_messages: int) -> int:
+        """Delete the oldest messages beyond the newest *max_messages*.
+
+        Returns the number removed.
+        """
+        pairs = self._store.all_records(prefix=self._msg_prefix)
+        excess = len(pairs) - max_messages
+        if excess <= 0:
+            return 0
+        pairs.sort(key=lambda kv: kv[0][len(self._msg_prefix) :])
+        removed = self._store.delete_many([key for key, _ in pairs[:excess]])
+        logger.info(
+            f"prune_to_count: session '{self.session_id}' removed {removed} "
+            f"message(s) beyond the newest {max_messages}"
+        )
+        return removed
+
+    def _apply_retention(self) -> None:
+        if self.max_age_s is not None:
+            self.prune_before(_now() - self.max_age_s)
+        if self.max_messages is not None:
+            self.prune_to_count(self.max_messages)
 
     # ---- Helpers -----------------------------------------------------------
 
@@ -761,16 +810,94 @@ class ThreadMemoryManager:
     mgr = ThreadMemoryManager(store)
     t1  = mgr.get_thread("user-123-support")
     t1.add_user_message("My order is late.")
+
+    ``max_age_s`` / ``max_messages`` are forwarded to every
+    :class:`KVChatMessageHistory` this manager creates (storage-side
+    retention, applied after each write).
     """
 
-    def __init__(self, store: SparkKVStore) -> None:
+    def __init__(
+        self,
+        store: SparkKVStore,
+        *,
+        max_age_s: float | None = None,
+        max_messages: int | None = None,
+    ) -> None:
         self._store = store
+        self._max_age_s = max_age_s
+        self._max_messages = max_messages
         self._threads: Dict[str, KVChatMessageHistory] = {}
 
     def get_thread(self, thread_id: str) -> KVChatMessageHistory:
         if thread_id not in self._threads:
-            self._threads[thread_id] = KVChatMessageHistory(thread_id, self._store)
+            self._threads[thread_id] = KVChatMessageHistory(
+                thread_id,
+                self._store,
+                max_age_s=self._max_age_s,
+                max_messages=self._max_messages,
+            )
         return self._threads[thread_id]
+
+    def fork_thread(
+        self,
+        src_thread_id: str,
+        dst_thread_id: str,
+        *,
+        upto_messages: int | None = None,
+        upto_ts: float | None = None,
+    ) -> int:
+        """Copy *src*'s messages (oldest first) into the empty thread *dst*.
+
+        The KV-native half of "time travel": rewind a conversation to a
+        point — the first ``upto_messages`` messages, and/or those with
+        ``ts`` strictly before ``upto_ts`` — and continue it under a new
+        thread id, leaving the original untouched. Rows are copied with
+        their key suffixes, timestamps, and payloads intact (one batched
+        write), so ordering and history survive exactly; only the
+        session-id tag is rewritten. Returns the number of messages
+        copied.
+
+        Raises ``ValueError`` if *dst* already has messages or equals
+        *src*.
+        """
+        if src_thread_id == dst_thread_id:
+            raise ValueError(f"cannot fork thread '{src_thread_id}' onto itself")
+        src_prefix = f"msg::{src_thread_id}::"
+        dst_prefix = f"msg::{dst_thread_id}::"
+        if self._store.has_prefix(dst_prefix):
+            raise ValueError(
+                f"destination thread '{dst_thread_id}' is not empty"
+            )
+        records = self._store.all_records(prefix=src_prefix)
+        records.sort(key=lambda kv: kv[0][len(src_prefix) :])
+        if upto_ts is not None:
+            records = [
+                (key, rec)
+                for key, rec in records
+                if rec["value"].get("ts", 0.0) < upto_ts
+            ]
+        if upto_messages is not None:
+            records = records[:upto_messages]
+        entries = [
+            {
+                "key": dst_prefix + key[len(src_prefix) :],
+                "value": rec["value"],
+                "tags": [
+                    dst_thread_id if tag == src_thread_id else tag
+                    for tag in rec["tags"]
+                ],
+                "source": rec["source"],
+                "created_at": rec["created_at"],
+                "updated_at": rec["updated_at"],
+            }
+            for key, rec in records
+        ]
+        self._store.set_many(entries)
+        logger.info(
+            f"fork_thread: copied {len(entries)} message(s) "
+            f"'{src_thread_id}' -> '{dst_thread_id}'"
+        )
+        return len(entries)
 
     def list_threads(self) -> List[str]:
         """Thread ids with at least one stored message.
@@ -990,6 +1117,11 @@ class DatabricksMemory:
         Optional ``memory.relevance.HybridRanker`` forwarded to the
         :class:`KVMemoryStore`, upgrading ``mem.kv.search`` from a
         substring scan to hybrid BM25 (+ optional dense) retrieval.
+    retention_max_age_s, retention_max_messages : float | int | None
+        Storage-side retention forwarded to every chat thread: after each
+        write, messages older than ``retention_max_age_s`` seconds are
+        pruned, then the oldest beyond ``retention_max_messages`` are.
+        Both ``None`` (default) keeps every message forever.
 
     Usage — Databricks
     ------------------
@@ -1016,13 +1148,36 @@ class DatabricksMemory:
         spark: "SparkSession | None" = None,
         table: Optional[str] = None,
         ranker: Any | None = None,
+        retention_max_age_s: float | None = None,
+        retention_max_messages: int | None = None,
     ) -> None:
         self._store = SparkKVStore(spark=spark, table=table)
-        self.threads = ThreadMemoryManager(store=self._store)
+        self.threads = ThreadMemoryManager(
+            store=self._store,
+            max_age_s=retention_max_age_s,
+            max_messages=retention_max_messages,
+        )
         self.kv = KVMemoryStore(store=self._store, namespace="kv", ranker=ranker)
 
     def get_thread(self, thread_id: str) -> KVChatMessageHistory:
         return self.threads.get_thread(thread_id)
+
+    def fork_thread(
+        self,
+        src_thread_id: str,
+        dst_thread_id: str,
+        *,
+        upto_messages: int | None = None,
+        upto_ts: float | None = None,
+    ) -> int:
+        """Copy *src*'s messages into the empty thread *dst* — see
+        :meth:`ThreadMemoryManager.fork_thread`."""
+        return self.threads.fork_thread(
+            src_thread_id,
+            dst_thread_id,
+            upto_messages=upto_messages,
+            upto_ts=upto_ts,
+        )
 
     def snapshot(self) -> Dict[str, Any]:
         """Dump entire store to a plain dict (JSON-serialisable)."""

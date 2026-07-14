@@ -274,6 +274,84 @@ def test_run_facts_isolated_per_thread():
 
 
 # ---------------------------------------------------------------------------
+# Resume + fork_run — crash recovery and KV-native time travel
+# ---------------------------------------------------------------------------
+
+
+def test_resume_skips_completed_items_and_recovers_responses():
+    mem = DatabricksMemory()
+    fake_llm = FakeListChatModel(responses=["resp 1", "resp 2"])
+    pipeline = SasLLMPipeline(model="unused", memory=mem, llm=fake_llm)
+
+    c1 = _mk_chunk("f1-chunk-0001", "etl.sas", "data work.a; run;")
+    c2 = _mk_chunk("f1-chunk-0002", "etl.sas", "proc print data=work.a; run;")
+
+    # First run "crashed" after item 1: only c1 was processed.
+    pipeline._process(items=[c1], diagnostics=[], thread_id="run::etl.sas")
+
+    outputs = pipeline._process(
+        items=[c1, c2], diagnostics=[], thread_id="run::etl.sas", resume=True
+    )
+
+    assert outputs[0]["skipped"] is True
+    assert outputs[0]["response"] == "resp 1"  # recovered from the thread
+    assert outputs[1]["skipped"] is False
+    assert outputs[1]["response"] == "resp 2"
+    # c1 was not replayed: exactly one turn pair per item.
+    assert len(pipeline.get_thread_messages("run::etl.sas")) == 4
+
+
+def test_resume_reprocesses_items_with_error_facts():
+    mem = DatabricksMemory()
+    fake_llm = FakeListChatModel(responses=["resp 1", "resp 2"])
+    pipeline = SasLLMPipeline(model="unused", memory=mem, llm=fake_llm)
+
+    c1 = _mk_chunk("f1-chunk-0001", "etl.sas", "data work.a; run;")
+    pipeline._process(items=[c1], diagnostics=[], thread_id="run::etl.sas")
+    c2 = _mk_chunk("f1-chunk-0002", "etl.sas", "proc print data=work.a; run;")
+    # Simulate a crashed second item: an error fact, no persisted turn.
+    mem.kv.set(
+        "run::run::etl.sas::item::f1-chunk-0002",
+        {"status": "error", "index": 2, "error": "boom"},
+    )
+
+    outputs = pipeline._process(
+        items=[c1, c2], diagnostics=[], thread_id="run::etl.sas", resume=True
+    )
+
+    assert outputs[1]["skipped"] is False  # error fact does not skip
+    assert outputs[1]["response"] == "resp 2"
+    facts = pipeline.get_run_facts("run::etl.sas")
+    assert [f["status"] for f in facts] == ["ok", "ok"]  # overwritten
+
+
+def test_fork_run_then_resume_continues_from_the_fork():
+    mem = DatabricksMemory()
+    fake_llm = FakeListChatModel(responses=["resp 1", "resp 2", "resp 2 redone"])
+    pipeline = SasLLMPipeline(model="unused", memory=mem, llm=fake_llm)
+
+    c1 = _mk_chunk("f1-chunk-0001", "etl.sas", "data work.a; run;")
+    c2 = _mk_chunk("f1-chunk-0002", "etl.sas", "proc print data=work.a; run;")
+    pipeline._process(items=[c1, c2], diagnostics=[], thread_id="run::v1")
+
+    # Rewind to after item 1 and redo item 2 on a fresh branch.
+    copied = pipeline.fork_run("run::v1", "run::v2", upto_items=1)
+    assert copied == 2  # one (human, AI) pair
+
+    outputs = pipeline._process(
+        items=[c1, c2], diagnostics=[], thread_id="run::v2", resume=True
+    )
+
+    assert outputs[0]["skipped"] is True
+    assert outputs[0]["response"] == "resp 1"
+    assert outputs[1]["skipped"] is False
+    assert outputs[1]["response"] == "resp 2 redone"
+    # The branch has its own full history; the original is untouched.
+    assert len(pipeline.get_thread_messages("run::v2")) == 4
+    assert [m.content for m in pipeline.get_thread_messages("run::v1")][-1] == "resp 2"
+
+
+# ---------------------------------------------------------------------------
 # Rolling summarization wiring
 # ---------------------------------------------------------------------------
 
