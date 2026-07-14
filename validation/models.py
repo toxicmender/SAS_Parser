@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, model_validator
 
 from chunker.models import SasBatch, SasChunk
 
@@ -43,17 +43,45 @@ class ValidationCase(BaseModel):
     required_terms: list[str] = Field(default_factory=list)
 
 
-class CaseRun(BaseModel):
+class EvaluationRun(BaseModel):
     """
-    Everything a metric needs to score one case: the case itself, the
-    batches/singleton chunks the batcher produced (re-derived by the runner,
-    aligned positionally with *outputs*), and the pipeline's raw output dicts
-    (``item_id`` / ``response`` / ... — see ``SasLLMPipeline._process``).
+    Case-free unit of scoring: everything a metric needs to evaluate one
+    conversation-sized body of LLM output, wherever it came from.
+
+    Three provenances share this shape:
+
+    - **offline case** (:class:`CaseRun` subclass): the runner drove the
+      pipeline and re-derived *items*, expectations come from the case;
+    - **existing thread**: *prompts*/*outputs* reconstructed from the memory
+      store's (human, AI) turn pairs, no *items* (chunker metadata is not
+      persisted) — see ``validation.conversation``;
+    - **arbitrary transcript**: caller-supplied (prompt, response) pairs.
+
+    Fields
+    ------
+    run_id
+        Label carried into :class:`CaseResult.case_id` — a case id, a
+        thread id, or a caller-chosen transcript name.
+    items
+        Batches/singleton chunks aligned positionally with *outputs*.
+        Empty when no chunker metadata exists (thread/transcript modes);
+        metrics that need it then skip or fall back to *prompts*.
+    prompts
+        The human side of each turn, aligned with *outputs*. Empty in the
+        offline case mode (the runner scores outputs against *items*).
+    outputs
+        Raw output dicts (``item_id`` / ``response`` / ... — see
+        ``SasLLMPipeline._process``); only ``response`` is required.
+    required_terms, reference_translation
+        Optional expectations (see :class:`ValidationCase` for semantics).
     """
 
-    case: ValidationCase
-    items: list[SasBatch | SasChunk]
+    run_id: str
+    items: list[SasBatch | SasChunk] = Field(default_factory=list)
+    prompts: list[str] = Field(default_factory=list)
     outputs: list[dict[str, Any]]
+    required_terms: list[str] = Field(default_factory=list)
+    reference_translation: str | None = None
 
     @property
     def responses(self) -> list[str]:
@@ -62,6 +90,36 @@ class CaseRun(BaseModel):
     @property
     def joined_responses(self) -> str:
         return "\n\n".join(self.responses)
+
+    @property
+    def expected_units(self) -> int:
+        """How many answers this run *should* contain: one per item when
+        chunker metadata exists, else one per prompt, else whatever
+        outputs arrived (an all-outputs transcript is taken at face value)."""
+        return len(self.items) or len(self.prompts) or len(self.outputs)
+
+
+class CaseRun(EvaluationRun):
+    """
+    Offline-case specialisation of :class:`EvaluationRun`: the case itself,
+    the batches/singleton chunks the batcher produced (re-derived by the
+    runner, aligned positionally with *outputs*), and the pipeline's raw
+    output dicts. ``run_id`` and the expectation fields derive from the case.
+    """
+
+    case: ValidationCase
+
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_from_case(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "case" in data:
+            case = data["case"]
+            if isinstance(case, dict):
+                case = ValidationCase(**case)
+            data.setdefault("run_id", case.case_id)
+            data.setdefault("required_terms", list(case.required_terms))
+            data.setdefault("reference_translation", case.reference_translation)
+        return data
 
 
 class MetricResult(BaseModel):

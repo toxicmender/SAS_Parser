@@ -23,6 +23,8 @@ from chunker.models import SasBatch, SasChunk, SasChunkKind, SasChunkMetadata
 from chunker.pipeline import SasLLMPipeline
 from validation import (
     DatasetFidelityMetric,
+    Evaluator,
+    EvaluationRun,
     LLMJudgeMetric,
     PythonSyntaxMetric,
     ReferenceSimilarityMetric,
@@ -31,6 +33,9 @@ from validation import (
     ValidationCase,
     ValidationRunner,
     load_cases,
+    run_from_thread,
+    validate_thread,
+    validate_transcript,
 )
 from validation.models import CaseRun
 
@@ -351,6 +356,169 @@ def test_report_markdown_lists_cases_and_metrics():
     assert "md_case" in md
     assert "python_syntax" in md
     assert ("PASSED" in md) or ("FAILED" in md)
+
+
+# ---------------------------------------------------------------------------
+# Evaluator on case-free EvaluationRuns
+# ---------------------------------------------------------------------------
+
+
+def test_evaluator_scores_run_with_items():
+    chunk = _mk_chunk("c1", input_datasets=["work.in"], output_datasets=["work.out"])
+    run = EvaluationRun(
+        run_id="manual",
+        items=[chunk],
+        outputs=[{"item_id": "c1", "response": GOOD_RESPONSE + " work.in work.out"}],
+    )
+    result = Evaluator().evaluate(run)
+    assert result.case_id == "manual"
+    assert result.item_count == 1
+    by_name = {m.metric: m for m in result.metrics}
+    assert by_name["response_coverage"].score == 1.0
+    assert by_name["dataset_fidelity"].score == 1.0
+    assert by_name["python_syntax"].score == 1.0
+
+
+def test_evaluator_scores_run_without_items():
+    run = EvaluationRun(
+        run_id="itemless",
+        prompts=["translate this step", "translate that step"],
+        outputs=[
+            {"item_id": "turn-1", "response": GOOD_RESPONSE},
+            {"item_id": "turn-2", "response": ""},
+        ],
+        required_terms=["saveAsTable"],
+    )
+    result = Evaluator().evaluate(run)
+    assert result.item_count == 2  # falls back to the prompt count
+    by_name = {m.metric: m for m in result.metrics}
+    assert by_name["response_coverage"].score == pytest.approx(0.5)
+    assert by_name["dataset_fidelity"].skipped  # no item metadata
+    assert by_name["required_terms"].score == 1.0
+
+
+def test_case_run_derives_expectations_from_case():
+    run = _mk_run(
+        [_mk_chunk("c1")],
+        ["x"],
+        case_id="derived",
+        required_terms=["groupBy"],
+        reference_translation="ref",
+    )
+    assert run.run_id == "derived"
+    assert run.required_terms == ["groupBy"]
+    assert run.reference_translation == "ref"
+
+
+# ---------------------------------------------------------------------------
+# Live conversations: threads and transcripts
+# ---------------------------------------------------------------------------
+
+
+def test_validate_thread_post_hoc_from_pipeline():
+    # Run a conversation first, then score it without re-running anything.
+    pipeline = _pipeline([GOOD_RESPONSE] * 4)
+    thread_id = "live::etl"
+    pipeline.run_text(
+        "data work.sales_clean;\n  set work.sales_raw;\nrun;\n",
+        source_id="etl.sas",
+        thread_id=thread_id,
+    )
+
+    result = validate_thread(
+        pipeline, thread_id, required_terms=["saveAsTable"]
+    )
+    assert result.case_id == thread_id
+    assert result.item_count >= 1
+    by_name = {m.metric: m for m in result.metrics}
+    assert by_name["response_coverage"].score == 1.0
+    assert by_name["python_syntax"].score == 1.0
+    assert by_name["required_terms"].score == 1.0
+    assert by_name["dataset_fidelity"].skipped  # items are not persisted
+
+
+def test_run_from_thread_labels_outputs_with_run_fact_item_ids():
+    pipeline = _pipeline([GOOD_RESPONSE] * 4)
+    thread_id = "live::ids"
+    outputs = pipeline.run_text(
+        "data work.a; x=1; run;", source_id="ids.sas", thread_id=thread_id
+    )
+
+    run = run_from_thread(pipeline, thread_id)
+    assert [o["item_id"] for o in run.outputs] == [o["item_id"] for o in outputs]
+    assert run.prompts  # human sides reconstructed
+    assert run.responses == [o["response"] for o in outputs]
+
+
+def test_run_from_thread_empty_thread_raises():
+    pipeline = _pipeline([GOOD_RESPONSE])
+    with pytest.raises(ValueError, match="no messages"):
+        run_from_thread(pipeline, "never-ran")
+
+
+def test_validate_transcript_pairs_and_messages():
+    result = validate_transcript(
+        [("translate step 1", GOOD_RESPONSE), ("translate step 2", GOOD_RESPONSE)],
+        run_id="pairs",
+        required_terms=["spark"],
+    )
+    assert result.case_id == "pairs"
+    by_name = {m.metric: m for m in result.metrics}
+    assert by_name["response_coverage"].score == 1.0
+    assert by_name["required_terms"].score == 1.0
+    assert by_name["dataset_fidelity"].skipped
+
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    msg_result = validate_transcript(
+        [HumanMessage("translate step 1"), AIMessage(GOOD_RESPONSE)],
+        run_id="messages",
+    )
+    assert msg_result.case_id == "messages"
+    by_name = {m.metric: m for m in msg_result.metrics}
+    assert by_name["response_coverage"].score == 1.0
+    assert by_name["python_syntax"].score == 1.0
+
+
+def test_validate_transcript_unanswered_turn_lowers_coverage():
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    result = validate_transcript(
+        [
+            HumanMessage("q1"),
+            AIMessage(GOOD_RESPONSE),
+            HumanMessage("q2, still awaiting a reply"),
+        ]
+    )
+    by_name = {m.metric: m for m in result.metrics}
+    assert by_name["response_coverage"].score == pytest.approx(0.5)
+    assert not by_name["response_coverage"].passed
+
+
+def test_validate_transcript_empty_raises():
+    with pytest.raises(ValueError, match="empty transcript"):
+        validate_transcript([])
+
+
+def test_llm_judge_falls_back_to_prompts_without_items():
+    judge = LLMJudgeMetric(llm=FakeListChatModel(responses=["SCORE: 5"]))
+    run = EvaluationRun(
+        run_id="t", prompts=["translate: data a; run;"],
+        outputs=[{"item_id": "turn-1", "response": "df = spark.table('a')"}],
+    )
+    result = judge.evaluate(run)
+    assert result.score == 1.0
+    assert not result.skipped
+
+
+def test_llm_judge_skips_without_any_source_context():
+    judge = LLMJudgeMetric(llm=FakeListChatModel(responses=["SCORE: 5"]))
+    run = EvaluationRun(
+        run_id="t", outputs=[{"item_id": "turn-1", "response": "code"}]
+    )
+    result = judge.evaluate(run)
+    assert result.skipped
+    assert result.passed
 
 
 # ---------------------------------------------------------------------------

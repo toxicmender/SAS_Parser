@@ -23,7 +23,8 @@ from uuid import uuid4
 
 from chunker.pipeline import SasLLMPipeline
 
-from .metrics import ValidationMetric, default_metrics
+from .evaluator import Evaluator
+from .metrics import ValidationMetric
 from .models import CaseResult, CaseRun, ValidationCase, ValidationReport
 
 logger = logging.getLogger(__name__)
@@ -50,11 +51,15 @@ class ValidationRunner:
         metrics: Sequence[ValidationMetric] | None = None,
     ) -> None:
         self.pipeline = pipeline
-        self.metrics = list(metrics) if metrics is not None else default_metrics()
+        self._evaluator = Evaluator(metrics=metrics)
         logger.info(
             f"ValidationRunner: model={pipeline.model}  "
             f"metrics=[{', '.join(m.name for m in self.metrics)}]"
         )
+
+    @property
+    def metrics(self) -> list[ValidationMetric]:
+        return self._evaluator.metrics
 
     def run_case(self, case: ValidationCase) -> CaseResult:
         """Run one case through the pipeline and every metric."""
@@ -88,10 +93,7 @@ class ValidationRunner:
             )
 
         run = CaseRun(case=case, items=items, outputs=outputs)
-        results = [metric.evaluate(run) for metric in self.metrics]
-        case_result = CaseResult(
-            case_id=case.case_id, item_count=len(items), metrics=results
-        )
+        case_result = self._evaluator.evaluate(run)
         logger.info(
             f"run_case: '{case.case_id}' done  items={len(items)}  "
             f"score={case_result.score:.3f}  passed={case_result.passed}  "

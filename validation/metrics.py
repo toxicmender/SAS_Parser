@@ -26,7 +26,7 @@ import app_config
 
 from chunker.models import SasBatch, SasChunk
 
-from .models import CaseRun, MetricResult
+from .models import EvaluationRun, MetricResult
 
 logger = logging.getLogger(__name__)
 
@@ -100,11 +100,13 @@ def _mentions(name: str, response: str) -> bool:
 
 class ValidationMetric(ABC):
     """
-    Base class: one case in, one :class:`MetricResult` out.
+    Base class: one :class:`EvaluationRun` in, one :class:`MetricResult` out.
 
     Subclasses set ``name`` (also the config.json key prefix,
     ``validation.<name>_threshold``) and ``default_threshold``, and implement
-    :meth:`evaluate`.
+    :meth:`evaluate`. Runs without chunker metadata (``items`` empty — live
+    threads, arbitrary transcripts) must degrade cleanly: score from what is
+    present, or skip.
     """
 
     name: str = "metric"
@@ -119,7 +121,7 @@ class ValidationMetric(ABC):
         )
 
     @abstractmethod
-    def evaluate(self, run: CaseRun) -> MetricResult: ...
+    def evaluate(self, run: EvaluationRun) -> MetricResult: ...
 
     def _result(
         self, score: float, details: str = "", *, skipped: bool = False
@@ -146,26 +148,26 @@ class ValidationMetric(ABC):
 
 
 class ResponseCoverageMetric(ValidationMetric):
-    """Every batch/singleton item must have produced a non-empty response.
+    """Every expected unit must have produced a non-empty response.
 
-    Scores ``non-empty responses / items``, so both an empty response and a
-    missing output (item/output count mismatch) lower the score.
+    The denominator is :attr:`EvaluationRun.expected_units` — items when
+    chunker metadata exists, turns otherwise — so both an empty response and
+    a missing output (unit/output count mismatch) lower the score.
     """
 
     name = "response_coverage"
     default_threshold = 1.0
 
-    def evaluate(self, run: CaseRun) -> MetricResult:
-        if not run.items:
-            return self._result(0.0, "chunker/batcher produced no items")
+    def evaluate(self, run: EvaluationRun) -> MetricResult:
+        total = run.expected_units
+        if not total:
+            return self._result(0.0, "no items or turns to cover")
         answered = sum(
-            1
-            for response in run.responses[: len(run.items)]
-            if response.strip()
+            1 for response in run.responses[:total] if response.strip()
         )
         return self._result(
-            answered / len(run.items),
-            f"{answered}/{len(run.items)} item(s) answered",
+            answered / total,
+            f"{answered}/{total} unit(s) answered",
         )
 
 
@@ -181,7 +183,7 @@ class DatasetFidelityMetric(ValidationMetric):
     name = "dataset_fidelity"
     default_threshold = 0.75
 
-    def evaluate(self, run: CaseRun) -> MetricResult:
+    def evaluate(self, run: EvaluationRun) -> MetricResult:
         expected = 0
         mentioned = 0
         missing: list[str] = []
@@ -193,7 +195,12 @@ class DatasetFidelityMetric(ValidationMetric):
                 else:
                     missing.append(name)
         if expected == 0:
-            return self._result(1.0, "no datasets to check", skipped=True)
+            detail = (
+                "no item metadata (datasets unknown)"
+                if not run.items
+                else "no datasets to check"
+            )
+            return self._result(1.0, detail, skipped=True)
         details = f"{mentioned}/{expected} dataset name(s) covered"
         if missing:
             details += f"; missing: {', '.join(sorted(set(missing)))}"
@@ -212,7 +219,7 @@ class PythonSyntaxMetric(ValidationMetric):
     name = "python_syntax"
     default_threshold = 1.0
 
-    def evaluate(self, run: CaseRun) -> MetricResult:
+    def evaluate(self, run: EvaluationRun) -> MetricResult:
         blocks: list[str] = []
         for response in run.responses:
             blocks.extend(_python_blocks(response))
@@ -234,17 +241,17 @@ class PythonSyntaxMetric(ValidationMetric):
 
 
 class RequiredTermsMetric(ValidationMetric):
-    """Case-authored substrings that must appear somewhere in the output.
+    """Caller-declared substrings that must appear somewhere in the output.
 
     Case-insensitive containment over the concatenated responses; skipped
-    when the case declares no ``required_terms``.
+    when the run declares no ``required_terms``.
     """
 
     name = "required_terms"
     default_threshold = 1.0
 
-    def evaluate(self, run: CaseRun) -> MetricResult:
-        terms = run.case.required_terms
+    def evaluate(self, run: EvaluationRun) -> MetricResult:
+        terms = run.required_terms
         if not terms:
             return self._result(1.0, "no required terms declared", skipped=True)
         haystack = run.joined_responses.lower()
@@ -257,19 +264,19 @@ class RequiredTermsMetric(ValidationMetric):
 
 
 class ReferenceSimilarityMetric(ValidationMetric):
-    """Token-F1 similarity against the case's golden translation.
+    """Token-F1 similarity against the run's golden translation.
 
     Order-insensitive multiset F1 over identifier-ish tokens — deliberately
     lexical (two correct translations can differ structurally), so treat it
     as a drift alarm against a known-good baseline, not a correctness proof.
-    Skipped when the case has no ``reference_translation``.
+    Skipped when the run has no ``reference_translation``.
     """
 
     name = "reference_similarity"
     default_threshold = 0.5
 
-    def evaluate(self, run: CaseRun) -> MetricResult:
-        reference = run.case.reference_translation
+    def evaluate(self, run: EvaluationRun) -> MetricResult:
+        reference = run.reference_translation
         if not reference:
             return self._result(1.0, "no reference translation", skipped=True)
         score = _token_f1(run.joined_responses, reference)

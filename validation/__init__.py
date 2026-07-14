@@ -1,10 +1,17 @@
-"""Offline validation harness for the SAS -> LLM pipeline.
+"""Validation harness for the SAS -> LLM pipeline: offline cases and
+post-hoc live conversations.
 
 Public API:
 
-- :class:`ValidationCase`, :class:`CaseRun`, :class:`MetricResult`,
-  :class:`CaseResult`, :class:`ValidationReport` — data models.
-- :class:`ValidationRunner` — cases -> pipeline -> metrics -> report.
+- :class:`ValidationCase`, :class:`EvaluationRun`, :class:`CaseRun`,
+  :class:`MetricResult`, :class:`CaseResult`, :class:`ValidationReport`
+  — data models.
+- :class:`ValidationRunner` — offline: cases -> pipeline -> metrics -> report.
+- :class:`Evaluator` — the scoring core: one EvaluationRun -> one CaseResult.
+- :func:`validate_thread` / :func:`run_from_thread` — post-hoc scoring of an
+  existing memory-store thread, without re-running the pipeline.
+- :func:`validate_transcript` / :func:`run_from_transcript` — scoring of
+  arbitrary (prompt, response) transcripts.
 - :func:`default_metrics` and the deterministic metric classes.
 - :class:`LLMJudgeMetric` — optional LLM-as-judge metric (needs a model).
 - :func:`load_cases` — JSON case files -> cases.
@@ -14,7 +21,14 @@ Public API:
 See validation/README.md and the CLI (``python -m validation --help``).
 """
 
+from .conversation import (
+    run_from_thread,
+    run_from_transcript,
+    validate_thread,
+    validate_transcript,
+)
 from .dataset import load_cases
+from .evaluator import Evaluator
 from .judge import LLMJudgeMetric
 from .metrics import (
     DatasetFidelityMetric,
@@ -28,6 +42,7 @@ from .metrics import (
 from .models import (
     CaseResult,
     CaseRun,
+    EvaluationRun,
     MetricResult,
     ValidationCase,
     ValidationReport,
@@ -39,6 +54,8 @@ __all__ = [
     "CaseResult",
     "CaseRun",
     "DatasetFidelityMetric",
+    "EvaluationRun",
+    "Evaluator",
     "LLMJudgeMetric",
     "MetricResult",
     "PythonSyntaxMetric",
@@ -53,4 +70,8 @@ __all__ = [
     "load_cases",
     "load_runs",
     "log_report",
+    "run_from_thread",
+    "run_from_transcript",
+    "validate_thread",
+    "validate_transcript",
 ]
