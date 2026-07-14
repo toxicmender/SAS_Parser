@@ -9,12 +9,15 @@ import hashlib
 import logging
 import re
 from collections import defaultdict
+from pathlib import Path
 from typing import Any, Callable
 
 import bm25s
 import faiss
 import numpy as np
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import BaseMessage
+
+from .turns import approx_token_count, group_turns, turn_text
 
 logger = logging.getLogger(__name__)
 
@@ -25,24 +28,67 @@ def _tokenize(text: str) -> list[str]:
     return _TOKEN_RE.findall(text.lower())
 
 
-def _group_turns(history: list[BaseMessage]) -> list[list[BaseMessage]]:
-    """
-    Group a chronological message list into turns: each HumanMessage opens
-    a new turn and every following non-human message (AI, tool, …) joins
-    it. Leading non-human messages form a turn of their own, so no message
-    is ever dropped by grouping.
-    """
-    turns: list[list[BaseMessage]] = []
-    for msg in history:
-        if isinstance(msg, HumanMessage) or not turns:
-            turns.append([msg])
-        else:
-            turns[-1].append(msg)
-    return turns
+def _sha(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 
-def _turn_text(turn: list[BaseMessage]) -> str:
-    return "\n".join(str(m.content) for m in turn)
+# Turn helpers live in memory.turns (shared with memory.summarize, which
+# must not import this module's bm25s/faiss stack); the old private names
+# are kept as aliases for existing importers.
+_group_turns = group_turns
+_turn_text = turn_text
+
+
+class DiskCachedEmbeddings:
+    """
+    Wrap a LangChain ``Embeddings`` with an on-disk document-embedding cache.
+
+    Embedding a large fixed corpus is the one genuinely expensive step of
+    turning dense retrieval on; the vectors never change between runs. Document
+    embeddings are memoised to an ``.npz`` keyed by content SHA-1 (queries,
+    which vary every call, are passed straight through). Sits under
+    :class:`HybridRanker`'s in-process cache, so a warm disk cache means no
+    model call at all on subsequent runs.
+    """
+
+    def __init__(self, embeddings: Any, cache_path: str) -> None:
+        self._embeddings = embeddings
+        self._cache_path = Path(cache_path)
+        self._cache: dict[str, np.ndarray] = self._load()
+
+    def _load(self) -> dict[str, np.ndarray]:
+        if not self._cache_path.exists():
+            return {}
+        try:
+            with np.load(self._cache_path) as data:
+                keys = data["keys"]
+                vecs = data["vecs"]
+        except (OSError, ValueError, KeyError) as exc:
+            logger.warning(f"DiskCachedEmbeddings: unreadable cache: {exc}")
+            return {}
+        return {str(k): vecs[i] for i, k in enumerate(keys)}
+
+    def _save(self) -> None:
+        self._cache_path.parent.mkdir(parents=True, exist_ok=True)
+        keys = list(self._cache)
+        vecs = np.stack([self._cache[k] for k in keys]).astype("float32")
+        np.savez(self._cache_path, keys=np.array(keys, dtype="U40"), vecs=vecs)
+
+    def embed_documents(self, texts: list[str]) -> list[np.ndarray]:
+        missing = [i for i, t in enumerate(texts) if _sha(t) not in self._cache]
+        if missing:
+            logger.info(
+                f"DiskCachedEmbeddings: embedding {len(missing)} new / "
+                f"{len(texts)} document(s) ({len(texts) - len(missing)} cached)"
+            )
+            fresh = self._embeddings.embed_documents([texts[i] for i in missing])
+            for i, vec in zip(missing, fresh):
+                self._cache[_sha(texts[i])] = np.asarray(vec, dtype=np.float32)
+            self._save()
+        return [self._cache[_sha(t)] for t in texts]
+
+    def embed_query(self, text: str) -> Any:
+        return self._embeddings.embed_query(text)
 
 
 class HybridRanker:
@@ -253,7 +299,7 @@ class HybridRanker:
         return vec / max(float(np.linalg.norm(vec)), 1e-12)
 
     def embed_cached(self, texts: list[str]) -> np.ndarray:
-        keys = [hashlib.sha1(t.encode("utf-8")).hexdigest() for t in texts]
+        keys = [_sha(t) for t in texts]
         missing = [
             (k, t) for k, t in zip(keys, texts) if k not in self._embedding_cache
         ]
@@ -285,6 +331,18 @@ class RelevantHistorySelector:
         Total turn pairs to keep per call (including the always-kept tail).
     always_keep_last : int
         Most recent pairs kept unconditionally, for continuity.
+    max_tokens : int | None
+        Optional token envelope for the selected history. Relevance-ranked
+        pairs are packed best-first while they fit; a pair that would
+        overflow is skipped so smaller relevant pairs can still fill the
+        remaining budget. The always-kept tail is exempt — it is included
+        even when it alone exceeds the budget. ``None`` (default) keeps
+        pure ``top_k`` counting. When set, selection also runs on short
+        histories that ``top_k`` alone would have passed through whole.
+    token_counter : Callable[[str], int] | None
+        Counts tokens for the ``max_tokens`` budget. ``None`` (default)
+        uses the offline ~4-chars/token estimate
+        (:func:`memory.turns.approx_token_count`).
     embeddings : Any | None
         LangChain ``Embeddings`` instance, or a provider string forwarded
         to ``langchain.embeddings.init_embeddings`` (e.g.
@@ -307,20 +365,27 @@ class RelevantHistorySelector:
         embeddings: Any | None = None,
         rrf_k: int = 60,
         reranker: Callable[[str, list[str]], list[float]] | None = None,
+        max_tokens: int | None = None,
+        token_counter: Callable[[str], int] | None = None,
     ) -> None:
         if top_k < 1:
             raise ValueError(f"top_k must be >= 1, got {top_k}")
         if always_keep_last < 0:
             raise ValueError(f"always_keep_last must be >= 0, got {always_keep_last}")
+        if max_tokens is not None and max_tokens < 1:
+            raise ValueError(f"max_tokens must be >= 1, got {max_tokens}")
         self.top_k = top_k
         self.always_keep_last = always_keep_last
         self.rrf_k = rrf_k
+        self.max_tokens = max_tokens
+        self._count_tokens = token_counter or approx_token_count
         self._ranker = HybridRanker(
             embeddings=embeddings, rrf_k=rrf_k, reranker=reranker
         )
         logger.info(
             f"RelevantHistorySelector: top_k={top_k}  "
             f"always_keep_last={always_keep_last}  "
+            f"max_tokens={max_tokens}  "
             f"dense={'on' if self._ranker.has_dense else 'off'}  "
             f"reranker={'on' if self._ranker.has_reranker else 'off'}  rrf_k={rrf_k}"
         )
@@ -334,22 +399,25 @@ class RelevantHistorySelector:
         Return the subset of *history* to prompt for *query*: the
         ``top_k`` most relevant turn pairs (always including the last
         ``always_keep_last``), flattened back to messages in their
-        original chronological order.
+        original chronological order. With ``max_tokens`` set, ranked
+        pairs are additionally packed into that token envelope.
         """
         if not history:
             return []
-        turns = _group_turns(history)
-        if len(turns) <= self.top_k:
+        turns = group_turns(history)
+        if self.max_tokens is None and len(turns) <= self.top_k:
             return list(history)
 
-        keep_last = min(self.always_keep_last, self.top_k)
+        # With a token budget the selection body also runs on short
+        # histories, so the tail must never exceed the turn count.
+        keep_last = min(self.always_keep_last, self.top_k, len(turns))
         tail = list(range(len(turns) - keep_last, len(turns)))
         candidates = list(range(len(turns) - keep_last))
         slots = self.top_k - keep_last
 
+        docs = [turn_text(t) for t in turns]
         chosen: list[int] = []
-        if slots > 0:
-            docs = [_turn_text(t) for t in turns]
+        if slots > 0 and candidates:
             fused = self._fuse(docs, candidates, query)
             if fused is None:
                 logger.debug("select: no scorer has signal; recency fallback")
@@ -361,7 +429,7 @@ class RelevantHistorySelector:
                     query,
                     window_size=max(4 * self.top_k, self.top_k),
                 )
-            chosen = fused[:slots]
+            chosen = self._pack(fused, docs, tail, slots)
 
         selected = sorted(set(chosen) | set(tail))
         logger.debug(
@@ -369,6 +437,38 @@ class RelevantHistorySelector:
             f"relevant={sorted(chosen)}  tail={tail}"
         )
         return [m for i in selected for m in turns[i]]
+
+    def _pack(
+        self, fused: list[int], docs: list[str], tail: list[int], slots: int
+    ) -> list[int]:
+        """Take up to *slots* pairs from *fused*, best-first.
+
+        Without a budget this is a plain slice. With one, the always-kept
+        tail is charged first (but included regardless — it is a floor
+        guarantee, not a candidate), then ranked pairs are packed while
+        they fit; an oversized pair is skipped, not a stopping point, so
+        smaller relevant pairs behind it can still use the budget.
+        """
+        if self.max_tokens is None:
+            return fused[:slots]
+        budget = self.max_tokens - sum(self._count_tokens(docs[i]) for i in tail)
+        chosen: list[int] = []
+        skipped = 0
+        for idx in fused:
+            if len(chosen) >= slots:
+                break
+            cost = self._count_tokens(docs[idx])
+            if cost <= budget:
+                chosen.append(idx)
+                budget -= cost
+            else:
+                skipped += 1
+        if skipped:
+            logger.debug(
+                f"_pack: skipped {skipped} ranked pair(s) over the "
+                f"max_tokens={self.max_tokens} budget"
+            )
+        return chosen
 
     # ------------------------------------------------------------------
     # Internals — delegate scoring to the shared HybridRanker

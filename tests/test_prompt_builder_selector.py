@@ -14,8 +14,9 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
+from memory.relevance import DiskCachedEmbeddings
 from prompt_builder.models import ConstructKey, DocRole, InstructionChunk
-from prompt_builder.selector import DiskCachedEmbeddings, InstructionSelector
+from prompt_builder.selector import InstructionSelector
 from prompt_builder.user_instructions import UserInstructionSet
 
 

@@ -229,3 +229,89 @@ def test_snapshot_delegates_to_memory():
     snap = pipeline.snapshot()
     assert snap == mem.snapshot()
     assert any("run::etl.sas" in k for k in snap)
+
+
+# ---------------------------------------------------------------------------
+# Run facts — the per-item KV write channel
+# ---------------------------------------------------------------------------
+
+
+def test_run_facts_recorded_per_item():
+    fake_llm = FakeListChatModel(responses=["resp 1", "resp 2"])
+    mem = DatabricksMemory()
+    pipeline = SasLLMPipeline(model="unused", memory=mem, llm=fake_llm)
+
+    chunks = [
+        _mk_chunk("f1-chunk-0001", "etl.sas", "data work.a; run;"),
+        _mk_chunk("f1-chunk-0002", "etl.sas", "proc print data=work.a; run;"),
+    ]
+    pipeline._process(items=chunks, diagnostics=[], thread_id="run::etl.sas")
+
+    facts = pipeline.get_run_facts("run::etl.sas")
+    assert [f["item_id"] for f in facts] == ["f1-chunk-0001", "f1-chunk-0002"]
+    assert all(f["status"] == "ok" for f in facts)
+    assert [f["index"] for f in facts] == [1, 2]
+    assert all(f["response_chars"] == len("resp 1") for f in facts)
+    # Facts live in the KV layer, isolated from the msg:: history.
+    assert len(pipeline.get_thread_messages("run::etl.sas")) == 4
+
+
+def test_run_facts_isolated_per_thread():
+    fake_llm = FakeListChatModel(responses=["a", "b"])
+    pipeline = SasLLMPipeline(model="unused", memory=DatabricksMemory(), llm=fake_llm)
+    pipeline._process(
+        items=[_mk_chunk("c1", "a.sas", "data work.a; run;")],
+        diagnostics=[],
+        thread_id="run::a.sas",
+    )
+    pipeline._process(
+        items=[_mk_chunk("c2", "b.sas", "data work.b; run;")],
+        diagnostics=[],
+        thread_id="run::b.sas",
+    )
+    assert [f["item_id"] for f in pipeline.get_run_facts("run::a.sas")] == ["c1"]
+    assert [f["item_id"] for f in pipeline.get_run_facts("run::b.sas")] == ["c2"]
+
+
+# ---------------------------------------------------------------------------
+# Rolling summarization wiring
+# ---------------------------------------------------------------------------
+
+
+def test_summarizer_gets_pipeline_store_and_summary_never_persisted():
+    from langchain_core.messages import SystemMessage
+    from memory.summarize import RollingSummarizer
+
+    fake_llm = FakeListChatModel(responses=["resp 1", "resp 2", "resp 3"])
+    mem = DatabricksMemory()
+    summarizer = RollingSummarizer(
+        lambda prompt: "condensed history",
+        trigger_tokens=1,
+        keep_last_turns=0,
+    )
+    pipeline = SasLLMPipeline(
+        model="unused",
+        memory=mem,
+        llm=fake_llm,
+        window_k=None,
+        summarizer=summarizer,
+    )
+    # A store-less summarizer is wired to the pipeline's KV layer.
+    assert summarizer.store is mem.kv
+
+    chunks = [
+        _mk_chunk(f"f1-chunk-000{i}", "etl.sas", f"data work.t{i}; run;")
+        for i in range(3)
+    ]
+    pipeline._process(items=chunks, diagnostics=[], thread_id="run::etl.sas")
+
+    # The summary state lives in the KV layer and covered the folded turns…
+    state = mem.kv.get("summary::run::etl.sas")
+    assert state is not None
+    assert state["summary"] == "condensed history"
+    assert state["covered_turns"] == 2  # item 3 saw 2 completed turns
+    # …while the persisted history stays pure human/AI — the summary
+    # SystemMessage is prompted but never stored.
+    history = pipeline.get_thread_messages("run::etl.sas")
+    assert len(history) == 6
+    assert not any(isinstance(m, SystemMessage) for m in history)

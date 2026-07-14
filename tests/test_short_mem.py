@@ -151,6 +151,50 @@ class TestFacadeInMemory(unittest.TestCase):
         self.assertEqual(sorted(kv.keys()), ["a", "b"])
 
 
+class TestHybridKVSearch(unittest.TestCase):
+    """KVMemoryStore.search with an injected HybridRanker (BM25-only here)."""
+
+    def _mem(self):
+        from memory.relevance import HybridRanker
+
+        return DatabricksMemory(ranker=HybridRanker())
+
+    def test_ranks_lexical_match_first(self):
+        mem = self._mem()
+        mem.kv.set("goal", "build a revenue pipeline", tags=["project"])
+        mem.kv.set("note", "unrelated grocery list", tags=[])
+        hits = mem.kv.search("revenue pipeline")
+        self.assertEqual(hits[0][0], "goal")
+
+    def test_matches_on_tags_and_keys_too(self):
+        mem = self._mem()
+        mem.kv.set("alpha", "nothing textual", tags=["billing"])
+        mem.kv.set("beta", "other content", tags=["misc"])
+        hits = mem.kv.search("billing")
+        self.assertEqual(hits[0][0], "alpha")
+
+    def test_no_signal_returns_empty(self):
+        mem = self._mem()
+        mem.kv.set("goal", "build a revenue pipeline")
+        self.assertEqual(mem.kv.search("zzz_absent_token"), [])
+
+    def test_empty_store_returns_empty(self):
+        self.assertEqual(self._mem().kv.search("anything"), [])
+
+    def test_top_k_honoured_and_scores_descend(self):
+        mem = self._mem()
+        for i in range(4):
+            mem.kv.set(f"k{i}", f"pipeline doc {'pipeline ' * i}")
+        hits = mem.kv.search("pipeline", top_k=2)
+        self.assertEqual(len(hits), 2)
+        self.assertGreater(hits[0][1], hits[1][1])
+
+    def test_without_ranker_substring_scan_still_works(self):
+        mem = DatabricksMemory()
+        mem.kv.set("goal", "RAG pipeline")
+        self.assertEqual(mem.kv.search("pipeline")[0][0], "goal")
+
+
 class TestSqlLikePrefix(unittest.TestCase):
     def test_underscore_and_percent_escaped(self):
         self.assertEqual(_sql_like_prefix("msg::thread_1::"), "msg::thread~_1::")

@@ -811,11 +811,26 @@ class KVMemoryStore:
     kv.set("goal", "RAG pipeline", tags=["project"])
     kv.ingest_text("Long document text …", name="spec", chunk_size=500)
     kv.search("pipeline")
+
+    Parameters
+    ----------
+    ranker : Any | None
+        Optional :class:`memory.relevance.HybridRanker` (duck-typed — this
+        module never imports relevance, keeping plain KV usage free of the
+        bm25s/faiss dependencies). When set, :meth:`search` ranks entries
+        with the BM25 + optional dense + RRF stack instead of the naive
+        substring scan.
     """
 
-    def __init__(self, store: SparkKVStore, namespace: str = "kv") -> None:
+    def __init__(
+        self,
+        store: SparkKVStore,
+        namespace: str = "kv",
+        ranker: Any | None = None,
+    ) -> None:
         self._store = store
         self._ns = namespace + "::"
+        self._ranker = ranker
 
     def _k(self, key: str) -> str:
         return f"{self._ns}{key}"
@@ -866,8 +881,46 @@ class KVMemoryStore:
     # ---- Search ------------------------------------------------------------
 
     def search(self, query: str, top_k: int = 5) -> List[Tuple[str, float]]:
-        raw = self._store.search(query, prefix=self._ns, top_k=top_k)
-        return [(k[len(self._ns) :], score) for k, score in raw]
+        """Rank entries against *query*, best first, as (short_key, score).
+
+        With a ``ranker`` injected this is hybrid retrieval (BM25 +
+        optional dense, RRF-fused, optional reranker) over each entry's
+        key, JSON value, and tags; scores are the 1/rank of the fused
+        order. No-signal queries return ``[]``. Without a ranker it falls
+        back to the store's substring scan.
+        """
+        if self._ranker is None:
+            raw = self._store.search(query, prefix=self._ns, top_k=top_k)
+            return [(k[len(self._ns) :], score) for k, score in raw]
+        records = self._store.all_records(prefix=self._ns)
+        if not records:
+            return []
+        short_keys = [k[len(self._ns) :] for k, _ in records]
+        docs = [
+            f"{short_key}\n{_jdump(rec['value'])}\n{' '.join(rec['tags'])}"
+            for short_key, (_, rec) in zip(short_keys, records)
+        ]
+        candidates = list(range(len(docs)))
+        rankings = []
+        bm25 = self._ranker.bm25_ranking(docs, candidates, query)
+        if bm25 is not None:
+            rankings.append(bm25)
+        if self._ranker.has_dense:
+            dense = self._ranker.dense_ranking(docs, candidates, query)
+            if dense is not None:
+                rankings.append(dense)
+        if not rankings:
+            logger.debug(f"search: no scorer has signal for {query!r}")
+            return []
+        fused = self._ranker.rrf_fuse(rankings)
+        if self._ranker.has_reranker:
+            fused = self._ranker.rerank(
+                fused, docs, query, window_size=max(4 * top_k, top_k)
+            )
+        return [
+            (short_keys[i], 1.0 / (rank + 1))
+            for rank, i in enumerate(fused[:top_k])
+        ]
 
     # ---- Text ingestion ----------------------------------------------------
 
@@ -933,6 +986,10 @@ class DatabricksMemory:
     table : str | None
         Fully-qualified Delta table name, e.g. ``"main.ml.langchain_memory"``.
         Pass ``None`` (default) for local in-memory operation.
+    ranker : Any | None
+        Optional ``memory.relevance.HybridRanker`` forwarded to the
+        :class:`KVMemoryStore`, upgrading ``mem.kv.search`` from a
+        substring scan to hybrid BM25 (+ optional dense) retrieval.
 
     Usage — Databricks
     ------------------
@@ -958,10 +1015,11 @@ class DatabricksMemory:
         self,
         spark: "SparkSession | None" = None,
         table: Optional[str] = None,
+        ranker: Any | None = None,
     ) -> None:
         self._store = SparkKVStore(spark=spark, table=table)
         self.threads = ThreadMemoryManager(store=self._store)
-        self.kv = KVMemoryStore(store=self._store, namespace="kv")
+        self.kv = KVMemoryStore(store=self._store, namespace="kv", ranker=ranker)
 
     def get_thread(self, thread_id: str) -> KVChatMessageHistory:
         return self.threads.get_thread(thread_id)

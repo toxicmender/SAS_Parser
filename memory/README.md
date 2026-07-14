@@ -1,14 +1,24 @@
 # memory
 
 Chat-history and KV persistence layer for the pipeline, plus relevance-based
-history selection. The two modules are independent and never import `chunker`
-or each other.
+history selection and rolling summarization. No module here imports
+`chunker`, and the three feature modules never import each other — in
+LangChain context-engineering terms they cover **write** (`short_mem`),
+**select** (`relevance`), and **compress** (`summarize`) independently.
 
 - `short_mem.py` — durable chat history and a tagged KV store, backed by a
   plain Python dict locally or a Databricks Delta table in production.
 - `relevance.py` — `RelevantHistorySelector`, an alternative to recency-window
   trimming that prompts the history turns most *relevant* to the current
-  request.
+  request (optionally packed into a `max_tokens` budget), plus the shared
+  `HybridRanker` retrieval stack and `DiskCachedEmbeddings`.
+- `summarize.py` — `RollingSummarizer`, one running summary per thread:
+  turns older than a recency tail are folded (monotonically, oldest first)
+  into a KV-stored summary that is prompted but never persisted to the
+  message history.
+- `turns.py` — dependency-light turn grouping and token-estimate helpers
+  shared by `relevance` and `summarize` (so `summarize` never drags in
+  bm25s/faiss).
 
 `memory` is a regular package (not a PEP-420 namespace package) so packaging
 tools and import machinery treat it uniformly.
@@ -38,7 +48,18 @@ thread.add_ai_message("Hi! How can I help?")
 
 mem.kv.set("project_goal", "RAG pipeline", tags=["project"])
 mem.kv.search("pipeline")
+
+# Optional: hybrid search over the KV store (BM25 + optional dense + RRF)
+from memory.relevance import HybridRanker
+mem = DatabricksMemory(ranker=HybridRanker())
 ```
+
+`DatabricksMemory(ranker=...)` / `KVMemoryStore(ranker=...)` upgrade
+`kv.search` from the naive substring scan to the same
+BM25 + optional dense + RRF stack the history selector uses (scores are the
+1/rank of the fused order; no-signal queries return `[]`). The ranker is
+duck-typed — `short_mem` never imports `relevance`, so plain KV usage stays
+free of the bm25s/faiss dependencies.
 
 ### Architecture
 
@@ -167,6 +188,18 @@ The most recent `always_keep_last` pairs are always kept regardless of score,
 and the selected pairs are returned in their original chronological order —
 relevance decides *which* pairs are prompted, never their order.
 
+### Token budget (`max_tokens`)
+
+`top_k` counts pairs regardless of size; passing `max_tokens` additionally
+packs the ranked pairs into a token envelope: pairs are taken best-first
+while they fit, an oversized pair is *skipped* (not a stopping point) so
+smaller relevant pairs behind it can still use the budget, and the
+always-kept tail is exempt — it is included even when it alone exceeds the
+budget. With a budget set, selection also runs on histories short enough
+that `top_k` alone would pass through whole. Token counting defaults to the
+offline ~4-chars/token estimate (`memory.turns.approx_token_count`); pass
+`token_counter` for a real tokenizer.
+
 ### Notes
 
 - **FAISS index choice:** `IndexFlatIP` is exact brute-force search, identical
@@ -183,6 +216,45 @@ Logger name: `memory.relevance`
 
 | Level | When emitted |
 |-------|--------------|
-| DEBUG | Per-select selection summary; embedding-cache misses; no-signal recency fallback |
+| DEBUG | Per-select selection summary; embedding-cache misses; no-signal recency fallback; over-budget skips |
 | INFO | Selector construction |
 | WARNING | Query produced no tokens (BM25 stage skipped) |
+
+---
+
+## summarize — rolling thread summarization
+
+The **compress** channel: selection decides which turns are prompted
+verbatim; `RollingSummarizer` guarantees a floor of information about
+everything else. Once the turns older than a `keep_last_turns` recency tail
+jointly reach `trigger_tokens`, they are folded — monotonically, oldest
+first, one LLM call per fold — into a single running summary per thread,
+stored under `summary::{thread_id}` in a KV store and returned as one
+`SystemMessage` to prepend to the prompt.
+
+```python
+from memory.summarize import RollingSummarizer
+
+summarizer = RollingSummarizer(model)          # any .invoke model or str->str callable
+pipeline = SasLLMPipeline(summarizer=summarizer)  # store auto-wired to mem.kv
+```
+
+Design points:
+
+- **Coverage is positional, not selection-based.** What the relevance
+  selector drops varies per query; summarizing "dropped" turns would
+  re-summarize the same content endlessly. A monotonic prefix is summarized
+  exactly once, and the selector remains free to surface any covered turn
+  verbatim when it becomes relevant again.
+- **Prompted, never persisted.** The summary lives in the KV layer, not the
+  `msg::` history — it is re-derivable from the full stored thread, and it
+  must not pollute relevance scoring (the pipeline prepends it *after*
+  trimming/selection).
+- **Self-healing.** If a thread shrinks below the covered turn count
+  (cleared or forked), the stale summary is discarded and rebuilt.
+- The `store` is duck-typed (`get`/`set`/`delete`) — `KVMemoryStore` fits,
+  and `SasLLMPipeline` injects its own `memory.kv` into a store-less
+  summarizer. Without any store, state is process-local.
+
+Logger name: `memory.summarize` (INFO on construction and each fold,
+WARNING on a shrunken-thread reset).

@@ -83,20 +83,30 @@ llm_client/
                         from chunker or memory.
 
 memory/
+  turns.py              Dependency-light turn grouping + approx token count,
+                        shared by relevance and summarize (so summarize never
+                        imports the bm25s/faiss stack). A leaf module.
   relevance.py          HybridRanker: shared BM25 (bm25s) + optional dense
                         retrieval (LangChain Embeddings + FAISS IndexFlatIP),
                         RRF fusion, optional reranker hook, content-hashed
                         embedding cache — with a stateless per-call mode and an
-                        index-once/query-many static-corpus mode.
-                        RelevantHistorySelector layers history policy on top:
-                        relevance-based selection of prompted history turn
-                        pairs, always-keep-last tail, recency fallback.
+                        index-once/query-many static-corpus mode — plus
+                        DiskCachedEmbeddings (on-disk .npz document-embedding
+                        cache). RelevantHistorySelector layers history policy
+                        on top: relevance-based selection of prompted history
+                        turn pairs, always-keep-last tail, recency fallback,
+                        optional max_tokens packing.
                         Imports nothing from chunker or memory.short_mem.
+  summarize.py          RollingSummarizer: one rolling summary per thread —
+                        turns older than a recency tail fold monotonically
+                        into a KV-stored summary (prompted, never persisted).
+                        Store is duck-typed; imports only memory.turns.
   short_mem.py          SparkKVStore façade over two backends
                         (_InMemoryBackend dict / _DeltaBackend Spark+Delta),
                         KVChatMessageHistory (BaseChatMessageHistory),
-                        ThreadMemoryManager, KVMemoryStore, and the
-                        DatabricksMemory entry-point façade.
+                        ThreadMemoryManager, KVMemoryStore (optional injected
+                        HybridRanker upgrades kv.search to hybrid retrieval),
+                        and the DatabricksMemory entry-point façade.
 
 prompt_builder/
   models.py             Pydantic models: InstructionChunk, DocSection,
@@ -114,8 +124,9 @@ prompt_builder/
                         on-disk extraction cache keyed by file SHA-256.
   selector.py           InstructionSelector: construct-key lookup (hazard-
                         first, stop-listed) + HybridRanker topical ranking
-                        under a word budget; DiskCachedEmbeddings for the
-                        dense stage. Imports memory.relevance only.
+                        under a word budget; the dense stage uses
+                        memory.relevance.DiskCachedEmbeddings. Imports
+                        memory.relevance only.
   builder.py            PromptBuilder façade: read -> chunk -> index at
                         construction, then build(query, constructs) -> a
                         Markdown guidance block or None.
@@ -164,8 +175,8 @@ Import direction is strictly downward: `keywords` and `models` import
 nothing from the package; `scanner` and `metadata` import from them;
 `chunker.py` imports from all four; `batcher` imports from `keywords`,
 `metadata`, `models`; `pipeline` sits on top and is the **only** module that
-imports `memory.short_mem`, `memory.relevance`, `llm_client`, and
-`prompt_builder`. `memory`, `llm_client`, and `prompt_builder` never import
+imports `memory.short_mem`, `memory.relevance`, `memory.summarize`,
+`llm_client`, and `prompt_builder`. `memory`, `llm_client`, and `prompt_builder` never import
 `chunker` (or each other) — `prompt_builder` reuses `memory.relevance` for
 retrieval, and the SAS-metadata → `(query, constructs)` mapping that feeds it
 lives in `pipeline`, precisely so `prompt_builder` needs no `chunker` import.
@@ -266,11 +277,23 @@ lexical retrieval, optional FAISS dense retrieval over embeddings, RRF
 fusion, optional reranker), always including the most recent
 `always_keep_last` pairs and preserving chronological order. Scorers with
 no signal (all scores tied) are excluded from fusion; with no signal at
-all, selection degrades to recency. Either way, trimming affects only the
-prompt — storage keeps every turn. All items of one
-`run_file`/`run_text`/`run_files` call share one thread
+all, selection degrades to recency. The selector optionally packs its picks
+into a `max_tokens` budget (tail exempt, oversized pairs skipped). Either
+way, trimming affects only the prompt — storage keeps every turn. All items
+of one `run_file`/`run_text`/`run_files` call share one thread
 (`thread_id = "run::<source ids>"`), so the LLM sees the run's accumulated
 context batch by batch.
+
+Two optional layers complement trimming. A `memory.summarize.RollingSummarizer`
+(passed as `summarizer=`) folds turns older than its recency tail into one
+running summary per thread, prepended as a SystemMessage *after*
+trimming/selection — so it is never dropped by the window and never scored
+by the selector; a store-less summarizer is auto-wired to the pipeline's
+`memory.kv`. And the pipeline records one small **run fact** per processed
+item into the KV layer (`run::<thread>::item::<item_id>`: status, index,
+timing — never the response text, which already lives in `msg::`), readable
+via `get_run_facts(thread_id)`; this is the durable which-items-completed
+record that resume support builds on.
 
 `memory.short_mem` stores everything as namespaced KV rows
 (`msg::<thread>::<μs-timestamp>-<rand>` for messages). The
@@ -321,12 +344,15 @@ any of these silently changes behavior.
    (O(n²) growth in the Delta table) and duplicate the canonical store.
    Corollary: one graph invocation is one conversational turn — the node
    persists exactly the last state message plus the response. **Ephemeral
-   reference guidance is the one thing prompted but not persisted:** when a
-   `prompt_builder` is set, per-item instruction chunks are injected through
-   an `instructions` placeholder carried in the run config, never added to
-   the graph state or the store. This keeps re-derivable guidance out of the
-   O(n) history and out of `RelevantHistorySelector`'s scoring — *stored = the
-   item message; prompted = item message + ephemeral guidance*.
+   context is prompted but never persisted to the `msg::` history** — two
+   kinds: (a) reference guidance — when a `prompt_builder` is set, per-item
+   instruction chunks are injected through an `instructions` placeholder
+   carried in the run config; (b) the rolling summary — when a `summarizer`
+   is set, its SystemMessage is prepended after trimming/selection and its
+   state lives under the KV `summary::` key. Both are re-derivable, would
+   bloat the O(n) history, and must stay out of
+   `RelevantHistorySelector`'s scoring — *stored = the item message;
+   prompted = summary + selected history + guidance + item message*.
 
 6. **In-memory mode must stay Spark-free.** `_InMemoryBackend` (and
    therefore `DatabricksMemory()` with no arguments) must import and run
@@ -351,7 +377,8 @@ any of these silently changes behavior.
   when DEBUG is off; per-call entry/exit and LLM-paced logs are unguarded.
   Logger names follow modules: `chunker.chunker`, `chunker.scanner`,
   `chunker.metadata`, `chunker.batcher`, `chunker.pipeline`,
-  `memory.short_mem`, `memory.relevance`, `llm_client.client`.
+  `memory.short_mem`, `memory.relevance`, `memory.summarize`,
+  `llm_client.client`.
 - **Names:** dataset/macro/libref names are lowercased at extraction;
   quoted physical paths keep a leading `'` so they can never collide with
   identifiers.

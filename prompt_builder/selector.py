@@ -25,15 +25,13 @@ Logger name: ``prompt_builder.selector``.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from collections import defaultdict
-from pathlib import Path
 from typing import Any, Callable, Iterable
 
-import numpy as np
-
-from memory.relevance import HybridRanker
+# DiskCachedEmbeddings moved to memory.relevance so any HybridRanker consumer
+# (this selector, the KV store's hybrid search) can share the on-disk cache.
+from memory.relevance import DiskCachedEmbeddings, HybridRanker
 
 from .models import ConstructKey, InstructionChunk
 from .user_instructions import (
@@ -77,10 +75,6 @@ DEFAULT_HAZARD_CONSTRUCTS: frozenset[ConstructKey] = frozenset(
 )
 
 
-def _sha(text: str) -> str:
-    return hashlib.sha1(text.encode("utf-8")).hexdigest()
-
-
 def _interleave(lists: list[list[int]]) -> list[int]:
     """Round-robin merge: firsts of every list, then seconds, and so on."""
     out: list[int] = []
@@ -89,58 +83,6 @@ def _interleave(lists: list[list[int]]) -> list[int]:
             if position < len(xs):
                 out.append(xs[position])
     return out
-
-
-class DiskCachedEmbeddings:
-    """
-    Wrap a LangChain ``Embeddings`` with an on-disk document-embedding cache.
-
-    Embedding the 6–9k-chunk corpus is the one genuinely expensive step of
-    turning dense retrieval on; the vectors never change between runs. Document
-    embeddings are memoised to an ``.npz`` keyed by content SHA-1 (queries,
-    which vary every call, are passed straight through). Sits under
-    :class:`~memory.relevance.HybridRanker`'s in-process cache, so a warm disk
-    cache means no model call at all on subsequent runs.
-    """
-
-    def __init__(self, embeddings: Any, cache_path: str) -> None:
-        self._embeddings = embeddings
-        self._cache_path = Path(cache_path)
-        self._cache: dict[str, np.ndarray] = self._load()
-
-    def _load(self) -> dict[str, np.ndarray]:
-        if not self._cache_path.exists():
-            return {}
-        try:
-            with np.load(self._cache_path) as data:
-                keys = data["keys"]
-                vecs = data["vecs"]
-        except (OSError, ValueError, KeyError) as exc:
-            logger.warning(f"DiskCachedEmbeddings: unreadable cache: {exc}")
-            return {}
-        return {str(k): vecs[i] for i, k in enumerate(keys)}
-
-    def _save(self) -> None:
-        self._cache_path.parent.mkdir(parents=True, exist_ok=True)
-        keys = list(self._cache)
-        vecs = np.stack([self._cache[k] for k in keys]).astype("float32")
-        np.savez(self._cache_path, keys=np.array(keys, dtype="U40"), vecs=vecs)
-
-    def embed_documents(self, texts: list[str]) -> list[np.ndarray]:
-        missing = [i for i, t in enumerate(texts) if _sha(t) not in self._cache]
-        if missing:
-            logger.info(
-                f"DiskCachedEmbeddings: embedding {len(missing)} new / "
-                f"{len(texts)} document(s) ({len(texts) - len(missing)} cached)"
-            )
-            fresh = self._embeddings.embed_documents([texts[i] for i in missing])
-            for i, vec in zip(missing, fresh):
-                self._cache[_sha(texts[i])] = np.asarray(vec, dtype=np.float32)
-            self._save()
-        return [self._cache[_sha(t)] for t in texts]
-
-    def embed_query(self, text: str) -> Any:
-        return self._embeddings.embed_query(text)
 
 
 class InstructionSelector:

@@ -410,3 +410,65 @@ def test_pipeline_prompts_relevant_pair_not_recency_window():
 
     # Storage is untouched by prompt-side selection: all 8 messages kept.
     assert len(pipeline.get_thread_messages("run::etl.sas")) == 8
+
+
+# ---------------------------------------------------------------------------
+# Token-budget-aware selection (max_tokens)
+# ---------------------------------------------------------------------------
+
+
+def _word_counter(text: str) -> int:
+    return len(text.split())
+
+
+def test_max_tokens_skips_oversized_pair_but_keeps_smaller_relevant_one():
+    selector = RelevantHistorySelector(
+        top_k=3,
+        always_keep_last=1,
+        max_tokens=12,
+        token_counter=_word_counter,
+    )
+    history = _mk_history(
+        "sales figures small",          # pair 0: relevant, cheap (5 words)
+        "sales " * 30,                  # pair 1: relevant but over budget
+        "closing remarks",              # pair 2: always-kept tail
+    )
+    selected = selector.select(history, "sales figures")
+    text = "\n".join(str(m.content) for m in selected)
+
+    assert "sales figures small" in text        # fits the budget
+    assert "closing remarks" in text            # tail guarantee
+    assert "sales sales sales" not in text      # oversized pair skipped
+
+
+def test_max_tokens_engages_selection_on_short_histories():
+    # Without a budget, len(turns) <= top_k passes the history through
+    # whole; with one, packing still applies.
+    selector = RelevantHistorySelector(
+        top_k=6,
+        always_keep_last=1,
+        max_tokens=6,
+        token_counter=_word_counter,
+    )
+    history = _mk_history("alpha beta gamma delta", "epsilon zeta", "tail turn")
+    selected = selector.select(history, "alpha")
+    assert 0 < len(selected) < len(history)
+
+
+def test_tail_kept_even_when_alone_it_exceeds_the_budget():
+    selector = RelevantHistorySelector(
+        top_k=2,
+        always_keep_last=1,
+        max_tokens=1,
+        token_counter=_word_counter,
+    )
+    history = _mk_history("first turn", "an oversized tail " * 10)
+    selected = selector.select(history, "first")
+    text = "\n".join(str(m.content) for m in selected)
+    assert "an oversized tail" in text
+
+
+def test_max_tokens_none_keeps_plain_topk_slicing():
+    selector = RelevantHistorySelector(top_k=2, always_keep_last=1)
+    history = _mk_history("a", "b", "c")
+    assert selector.select(history, "zzz_no_signal") is not None

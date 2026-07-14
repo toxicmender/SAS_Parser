@@ -20,6 +20,7 @@ from langgraph.graph import START, MessagesState, StateGraph
 from llm_client import LLMClient, LLMClientConfig
 from memory.relevance import RelevantHistorySelector
 from memory.short_mem import DatabricksMemory
+from memory.summarize import RollingSummarizer
 from prompt_builder import ConstructKey, PromptBuilder, UserInstructionSet
 
 from .batcher import MultiFileBatcher, SasChunkBatcher
@@ -299,6 +300,15 @@ class SasLLMPipeline:
         turn pairs most relevant to the current batch/chunk message
         (BM25 + optional FAISS dense retrieval, RRF-fused) instead of the
         recency window. ``None`` (default) keeps ``window_k`` behaviour.
+    summarizer : RollingSummarizer | None
+        Rolling thread summarization (``memory.summarize``): turns older
+        than the summarizer's recency tail are folded into one running
+        summary per thread, prepended to every prompt as a SystemMessage
+        after trimming/selection. Like reference guidance, the summary is
+        **prompted but never persisted** to the ``msg::`` history — it
+        lives in the KV layer and is re-derivable from the full stored
+        thread. A summarizer constructed without a ``store`` is given this
+        pipeline's ``memory.kv``. ``None`` (default) disables compression.
     include_options_chunks, include_comment_chunks : bool
         Forwarded to the batchers.
     memory : DatabricksMemory | None
@@ -355,6 +365,7 @@ class SasLLMPipeline:
         system_prompt: str | None = None,
         window_k: int | None = 6,
         history_selector: RelevantHistorySelector | None = None,
+        summarizer: RollingSummarizer | None = None,
         include_options_chunks: bool = True,
         include_comment_chunks: bool = False,
         memory: DatabricksMemory | None = None,
@@ -409,6 +420,12 @@ class SasLLMPipeline:
 
         self._memory = memory or self._build_default_memory(spark, delta_table)
 
+        self._summarizer = summarizer
+        if summarizer is not None and summarizer.store is None:
+            # Summaries persist beside the thread they compress, so
+            # snapshot()/restore() carry them along with the history.
+            summarizer.store = self._memory.kv
+
         # llm_client owns construction (temperature, output cap, rate limiter)
         # and invocation (429 retry, input-token budget). An injected chat model
         # replaces only the construction half; retry and budget still apply.
@@ -436,6 +453,11 @@ class SasLLMPipeline:
         def _trim(inputs: dict[str, Any]) -> dict[str, Any]:
             history: list[BaseMessage] = inputs.get("history", [])
             instructions = inputs.get("instructions", [])
+            # The rolling summary (if any) is prepended AFTER trimming or
+            # selection: it is not a turn, must never be dropped by the
+            # window, and must not participate in relevance scoring.
+            summary = inputs.get("summary")
+            prefix: list[BaseMessage] = [summary] if summary is not None else []
             if self._history_selector is not None:
                 selected = self._history_selector.select(history, inputs["input"])
                 logger.debug(
@@ -443,7 +465,7 @@ class SasLLMPipeline:
                 )
                 return {
                     "input": inputs["input"],
-                    "history": selected,
+                    "history": prefix + selected,
                     "instructions": instructions,
                 }
             k = self.window_k
@@ -455,7 +477,7 @@ class SasLLMPipeline:
                 history = history[-(k * 2) :]
             return {
                 "input": inputs["input"],
-                "history": history,
+                "history": prefix + history,
                 "instructions": instructions,
             }
 
@@ -474,11 +496,20 @@ class SasLLMPipeline:
             instructions = config["configurable"].get("instructions", [])
             history = self._memory.get_thread(thread_id)
             input_message = state["messages"][-1]
+            history_messages = history.messages
+            # The rolling summary is ephemeral like the guidance: prompted
+            # (prepended in _trim), never persisted to the msg:: history.
+            summary = (
+                self._summarizer.refresh(thread_id, history_messages)
+                if self._summarizer is not None
+                else None
+            )
             response = chain.invoke(
                 {
                     "input": input_message.content,
-                    "history": history.messages,
+                    "history": history_messages,
                     "instructions": instructions,
+                    "summary": summary,
                 }
             )
             history.add_messages([input_message, response])
@@ -585,6 +616,24 @@ class SasLLMPipeline:
         logger.info("snapshot: delegating to DatabricksMemory")
         return self._memory.snapshot()
 
+    def get_run_facts(self, thread_id: str) -> list[dict[str, Any]]:
+        """Per-item outcome records written during a run, in item order.
+
+        One record per processed item, stored in the KV layer under
+        ``run::{thread_id}::item::{item_id}`` as the run progresses —
+        durable evidence of *which items completed* (status, index,
+        timing) that later batches, later runs, and the planned resume
+        feature can query without replaying the message history.
+        """
+        prefix = f"run::{thread_id}::item::"
+        facts = [
+            {"item_id": item["key"][len(prefix) :], **item["value"]}
+            for item in self._memory.kv.all_items()
+            if item["key"].startswith(prefix)
+        ]
+        facts.sort(key=lambda f: f.get("index", 0))
+        return facts
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -604,6 +653,19 @@ class SasLLMPipeline:
     @staticmethod
     def _default_thread_id(source_ids: list[str]) -> str:
         return "run::" + "+".join(source_ids)
+
+    def _record_run_fact(
+        self, thread_id: str, item_id: str, fact: dict[str, Any]
+    ) -> None:
+        """Write one per-item outcome record to the KV layer (the "write
+        context" channel): small facts only — the full response already
+        lives in the msg:: history and is never duplicated here."""
+        self._memory.kv.set(
+            f"run::{thread_id}::item::{item_id}",
+            fact,
+            tags=["run-item", thread_id],
+            source="pipeline",
+        )
 
     def _instruction_messages(
         self, item: SasBatch | SasChunk
@@ -667,15 +729,40 @@ class SasLLMPipeline:
                     {"messages": [HumanMessage(user_msg)]}, cfg
                 )
                 response = state["messages"][-1]
-            except Exception:
+            except Exception as exc:
                 logger.error(
                     f"_process: LLM call failed  item={item_id}  thread={thread_id}",
                     exc_info=True,
+                )
+                self._record_run_fact(
+                    thread_id,
+                    item_id,
+                    {
+                        "status": "error",
+                        "index": idx,
+                        "total": total,
+                        "is_batch": is_batch,
+                        "error": repr(exc),
+                        "ts": time.time(),
+                    },
                 )
                 raise
 
             elapsed = time.perf_counter() - t_item
             ai_text = response.content
+            self._record_run_fact(
+                thread_id,
+                item_id,
+                {
+                    "status": "ok",
+                    "index": idx,
+                    "total": total,
+                    "is_batch": is_batch,
+                    "elapsed_s": round(elapsed, 3),
+                    "response_chars": len(ai_text),
+                    "ts": time.time(),
+                },
+            )
             logger.info(
                 f"_process: item {item_id} done  elapsed={elapsed:.3f}s  response_chars={len(ai_text)}"
             )
