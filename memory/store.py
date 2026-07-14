@@ -665,15 +665,19 @@ class KVChatMessageHistory(BaseChatMessageHistory):
         self._msg_prefix = f"msg::{session_id}::"
         self._last_us = 0
         # Read cache: after the first full load, .messages only fetches
-        # rows whose key sorts after the last one seen (records_after) —
+        # rows whose key sorts after the cache frontier (records_after) —
         # an append-only tail read instead of a per-call prefix rescan.
-        # Message keys are time-ordered, so appends from any writer sort
-        # after the cache frontier; the cache is invalidated whenever this
+        # The frontier is the last cached key's bare microsecond tick, NOT
+        # the full key: another writer can land on the same tick (the
+        # _last_us bump is per-instance) with a random suffix that sorts
+        # below ours, so each refresh re-reads the frontier tick and
+        # dedupes via _cache_keys. The cache is invalidated whenever this
         # instance deletes messages (clear / prune / retention). A writer
         # bypassing this instance to *delete or backdate* rows is not
         # detected until then.
         self._msg_cache: Optional[List[BaseMessage]] = None
-        self._cache_last_key = ""
+        self._cache_keys: set[str] = set()
+        self._cache_frontier = ""
 
     def _msg_key(self, ts: float) -> str:
         """Build a time-ordered, collision-free message key for *ts*."""
@@ -707,21 +711,32 @@ class KVChatMessageHistory(BaseChatMessageHistory):
         if self._msg_cache is None:
             pairs = self._store.all_records(prefix=self._msg_prefix)
             self._msg_cache = []
+            self._cache_keys = set()
         else:
-            pairs = self._store.records_after(self._msg_prefix, self._cache_last_key)
+            pairs = self._store.records_after(self._msg_prefix, self._cache_frontier)
+            # The frontier tick is re-read in full; drop what is cached.
+            pairs = [kv for kv in pairs if kv[0] not in self._cache_keys]
             if not pairs:
                 return list(self._msg_cache)
-        # Sort by the key suffix: zero-padded timestamps (and legacy
-        # zero-padded sequence numbers) order lexicographically by time.
-        pairs.sort(key=lambda kv: kv[0][len(self._msg_prefix) :])
-        self._msg_cache.extend(self._decode_message(rec["value"]) for _, rec in pairs)
         if pairs:
-            self._cache_last_key = pairs[-1][0]
+            # Sort by the key suffix: zero-padded timestamps (and legacy
+            # zero-padded sequence numbers) order lexicographically by time.
+            pairs.sort(key=lambda kv: kv[0][len(self._msg_prefix) :])
+            self._msg_cache.extend(
+                self._decode_message(rec["value"]) for _, rec in pairs
+            )
+            self._cache_keys.update(key for key, _ in pairs)
+            # Frontier = the last key's bare tick (random suffix stripped):
+            # it sorts before every key on that tick, so a same-tick append
+            # from another writer is still fetched on the next read.
+            last_suffix = pairs[-1][0][len(self._msg_prefix) :]
+            self._cache_frontier = self._msg_prefix + last_suffix.split("-", 1)[0]
         return list(self._msg_cache)
 
     def _invalidate_cache(self) -> None:
         self._msg_cache = None
-        self._cache_last_key = ""
+        self._cache_keys = set()
+        self._cache_frontier = ""
 
     def add_message(self, message: BaseMessage) -> None:
         self.add_messages([message])

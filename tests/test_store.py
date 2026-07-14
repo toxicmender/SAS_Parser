@@ -505,10 +505,41 @@ class TestMessageReadCache(unittest.TestCase):
         h1 = KVChatMessageHistory("t1", store)
         h1.add_user_message("q1")
         _ = h1.messages
-        # A second writer over the same store appends; keys are
-        # time-ordered so h1's tail read sees them.
+        # A second writer over the same store appends; h1's tail read
+        # re-reads from the frontier tick, so it sees them even when both
+        # writes share a microsecond (see the same-tick test below).
         KVChatMessageHistory("t1", store).add_user_message("q2")
         self.assertEqual([m.content for m in h1.messages], ["q1", "q2"])
+
+    def test_same_tick_append_with_lower_suffix_is_picked_up(self):
+        # Two writers can land on the same microsecond tick (the _last_us
+        # bump is per-instance); within a tick, key order falls to the
+        # random suffix. A frontier of the full last key made a same-tick
+        # append with a lower-sorting suffix permanently invisible to the
+        # cached reader — this pins the adversarial ordering directly.
+        from langchain_core.messages import HumanMessage, message_to_dict
+
+        store = KVStore(spark=None, table=None)
+        h1 = KVChatMessageHistory("t1", store)
+        h1.add_user_message("q1")
+        _ = h1.messages  # warm the cache
+
+        ((q1_key, q1_rec),) = store.all_records(prefix="msg::t1::")
+        tick = q1_key[len("msg::t1::") :].split("-", 1)[0]
+        # Suffix "-" sorts below "-<any hex>", i.e. below q1's key.
+        store.set(
+            f"msg::t1::{tick}-",
+            {
+                "message": message_to_dict(HumanMessage(content="q2")),
+                "ts": q1_rec["value"]["ts"],
+            },
+            tags=["message", "human", "t1"],
+        )
+        self.assertEqual(
+            sorted(m.content for m in h1.messages), ["q1", "q2"]
+        )
+        # Refreshing must not duplicate the re-read frontier tick.
+        self.assertEqual(len(h1.messages), 2)
 
     def test_facade_restore_invalidates_thread_caches(self):
         mem = MemoryHub()
