@@ -348,6 +348,71 @@ def test_unmatched_example_never_surfaces_topically():
 
 
 # ---------------------------------------------------------------------------
+# Language scoping — [lang: ...] filters user chunks by the run's target
+# ---------------------------------------------------------------------------
+
+
+LANG_RULES = """\
+## Always rule
+Applies to every target.
+
+## [lang: sparksql] Emit SQL
+Target Spark SQL, not the DataFrame API.
+
+## [lang: pyspark] Emit DataFrames
+Target the PySpark DataFrame API.
+
+## [when: proc:sql] [lang: sparksql] SQL joins
+Translate PROC SQL directly to Spark SQL.
+"""
+
+
+def _lang_selector() -> InstructionSelector:
+    return InstructionSelector(
+        _corpus(), user_instructions=UserInstructionSet.from_text(LANG_RULES)
+    )
+
+
+def test_language_filters_out_other_language_rules():
+    sel = _lang_selector()
+    ids = [c.chunk_id for c in sel.select("zzz", [], language="SparkSQL")]
+    # always rule + the sparksql rule; the pyspark rule is dropped.
+    assert "user::c0000" in ids  # always (agnostic)
+    assert "user::c0001" in ids  # [lang: sparksql]
+    assert "user::c0002" not in ids  # [lang: pyspark]
+
+
+def test_language_normalization_is_forgiving():
+    sel = _lang_selector()
+    for spelling in ("SparkSQL", "spark sql", "spark_sql", "SPARK-SQL"):
+        ids = [c.chunk_id for c in sel.select("zzz", [], language=spelling)]
+        assert "user::c0001" in ids
+        assert "user::c0002" not in ids
+
+
+def test_language_none_keeps_every_language_rule():
+    sel = _lang_selector()
+    ids = [c.chunk_id for c in sel.select("zzz", [], language=None)]
+    assert {"user::c0001", "user::c0002"} <= set(ids)
+
+
+def test_language_and_construct_scope_combine():
+    sel = _lang_selector()
+    # The [when: proc:sql] [lang: sparksql] rule needs both to fire.
+    for_sparksql = [c.chunk_id for c in sel.select("zzz", [SQL], language="sparksql")]
+    for_pyspark = [c.chunk_id for c in sel.select("zzz", [SQL], language="pyspark")]
+    assert "user::c0003" in for_sparksql
+    assert "user::c0003" not in for_pyspark  # wrong language
+
+
+def test_language_filter_leaves_reference_chunks_untouched():
+    sel = _lang_selector()
+    # Reference chunks carry no lang tags -> always pass the filter.
+    ids = [c.chunk_id for c in sel.select("zzz", [INTNX], language="sparksql")]
+    assert "c0" in ids  # INTNX reference section
+
+
+# ---------------------------------------------------------------------------
 # select_detailed — tier/construct provenance
 # ---------------------------------------------------------------------------
 

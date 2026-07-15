@@ -333,6 +333,68 @@ class SasBatch(BaseModel):
         """True when this batch spans more than one source file."""
         return len(self.source_files) > 1
 
+    # ------------------------------------------------------------------
+    # Aggregated construct metadata (deduplicated sets over member chunks).
+    #
+    # These roll up the per-chunk identifiers a batch actually uses so a
+    # consumer can answer "does this batch use INTCK / a hash object / PROC
+    # SQL?" with an O(1) hashed set membership test, instead of re-scanning
+    # every chunk's metadata. The instruction-guidance layer keys targeted
+    # reference/user instructions off exactly these sets (via the pipeline's
+    # metadata -> ConstructKey mapping), so an instruction for a construct is
+    # injected only when the construct is present in the batch.
+    # ------------------------------------------------------------------
+
+    @property
+    def recognized_functions(self) -> set[str]:
+        """SAS functions recognised across member chunks (e.g. ``intnx``)."""
+        return {fn for c in self.chunks for fn in c.metadata.recognized_functions}
+
+    @property
+    def recognized_call_routines(self) -> set[str]:
+        """CALL routines recognised across member chunks (e.g. ``symput``)."""
+        return {
+            r for c in self.chunks for r in c.metadata.recognized_call_routines
+        }
+
+    @property
+    def component_objects(self) -> set[str]:
+        """DATA-step component objects declared in the batch (``hash``, ...)."""
+        return {o for c in self.chunks for o in c.metadata.component_objects}
+
+    @property
+    def proc_names(self) -> set[str]:
+        """Names of the PROCs the batch runs (e.g. ``sql``, ``means``)."""
+        return {
+            c.metadata.proc_name
+            for c in self.chunks
+            if c.kind is SasChunkKind.PROC_STEP and c.metadata.proc_name
+        }
+
+    @property
+    def global_statement_keywords(self) -> set[str]:
+        """Global-statement keywords present in the batch (``libname``, ...)."""
+        return {
+            c.metadata.global_statement_keyword
+            for c in self.chunks
+            if c.metadata.global_statement_keyword
+        }
+
+    @property
+    def has_symput_scope_hazard(self) -> bool:
+        """True if any member chunk carries a CALL SYMPUT scope hazard."""
+        return any(c.metadata.symput_scope_hazard for c in self.chunks)
+
+    @property
+    def has_abort(self) -> bool:
+        """True if any member chunk contains a macro %ABORT."""
+        return any(c.metadata.contains_abort for c in self.chunks)
+
+    @property
+    def has_computed_goto(self) -> bool:
+        """True if any member chunk contains a computed %GOTO."""
+        return any(c.metadata.contains_computed_goto for c in self.chunks)
+
     def model_post_init(self, __context: object) -> None:  # noqa: ANN001
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(

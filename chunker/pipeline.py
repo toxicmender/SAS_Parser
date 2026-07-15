@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from langchain_core.messages import (
     AIMessage,
@@ -96,13 +96,72 @@ def _query_for_item(item: SasBatch | SasChunk) -> str:
     return " ".join(_query_for_chunk(c) for c in chunks)
 
 
+class _IdentifierSets(NamedTuple):
+    """An item's construct identifiers as deduplicated sets, plus hazard flags.
+
+    A :class:`SasBatch` exposes these aggregates directly (its set properties);
+    a lone :class:`SasChunk` is normalised to the same shape here, so
+    :func:`_constructs_for_item` has a single, hashing-based code path.
+    """
+
+    proc_names: set[str]
+    functions: set[str]
+    call_routines: set[str]
+    component_objects: set[str]
+    global_statement_keywords: set[str]
+    symput_scope_hazard: bool
+    contains_abort: bool
+    contains_computed_goto: bool
+
+
+def _identifier_sets(item: SasBatch | SasChunk) -> _IdentifierSets:
+    """The item's construct identifiers as sets (batch aggregates or one chunk)."""
+    if isinstance(item, SasBatch):
+        return _IdentifierSets(
+            proc_names=item.proc_names,
+            functions=item.recognized_functions,
+            call_routines=item.recognized_call_routines,
+            component_objects=item.component_objects,
+            global_statement_keywords=item.global_statement_keywords,
+            symput_scope_hazard=item.has_symput_scope_hazard,
+            contains_abort=item.has_abort,
+            contains_computed_goto=item.has_computed_goto,
+        )
+    m = item.metadata
+    proc = (
+        {m.proc_name}
+        if item.kind is SasChunkKind.PROC_STEP and m.proc_name
+        else set()
+    )
+    globals_ = (
+        {m.global_statement_keyword} if m.global_statement_keyword else set()
+    )
+    return _IdentifierSets(
+        proc_names=proc,
+        functions=set(m.recognized_functions),
+        call_routines=set(m.recognized_call_routines),
+        component_objects=set(m.component_objects),
+        global_statement_keywords=globals_,
+        symput_scope_hazard=m.symput_scope_hazard,
+        contains_abort=m.contains_abort,
+        contains_computed_goto=m.contains_computed_goto,
+    )
+
+
 def _constructs_for_item(item: SasBatch | SasChunk) -> list[ConstructKey]:
     """The SAS constructs an item uses, as reference-lookup keys.
+
+    Driven off the item's aggregated identifier *sets* (see
+    :class:`_IdentifierSets`): each name becomes a frozen — therefore hashable
+    — :class:`ConstructKey`, deduplicated through a hashed ``seen`` set, so the
+    selector's construct lookup (also hash-based) fires an instruction for a
+    construct only when that construct is actually present in the batch. Sets
+    are iterated in sorted order to keep the key sequence deterministic.
 
     Hazard flags add their canonical construct even when the name extractor
     missed it, so the selector still pulls the SYMPUT / %GOTO / %ABORT section.
     """
-    chunks = item.chunks if isinstance(item, SasBatch) else [item]
+    ids = _identifier_sets(item)
     keys: list[ConstructKey] = []
     seen: set[ConstructKey] = set()
 
@@ -114,23 +173,22 @@ def _constructs_for_item(item: SasBatch | SasChunk) -> list[ConstructKey]:
             seen.add(key)
             keys.append(key)
 
-    for chunk in chunks:
-        m = chunk.metadata
-        if chunk.kind is SasChunkKind.PROC_STEP:
-            add("proc", m.proc_name)
-        for fn in m.recognized_functions:
-            add("function", fn)
-        for routine in m.recognized_call_routines:
-            add("call_routine", routine)
-        for obj in m.component_objects:
-            add("component_object", obj)
-        add("global_statement", m.global_statement_keyword)
-        if m.symput_scope_hazard:
-            add("call_routine", "symput")
-        if m.contains_computed_goto:
-            add("macro_statement", "goto")
-        if m.contains_abort:
-            add("macro_statement", "abort")
+    for name in sorted(ids.proc_names):
+        add("proc", name)
+    for name in sorted(ids.functions):
+        add("function", name)
+    for name in sorted(ids.call_routines):
+        add("call_routine", name)
+    for name in sorted(ids.component_objects):
+        add("component_object", name)
+    for name in sorted(ids.global_statement_keywords):
+        add("global_statement", name)
+    if ids.symput_scope_hazard:
+        add("call_routine", "symput")
+    if ids.contains_computed_goto:
+        add("macro_statement", "goto")
+    if ids.contains_abort:
+        add("macro_statement", "abort")
     return keys
 
 
@@ -427,7 +485,9 @@ class SasLLMPipeline:
                     "corpus-less PromptBuilder for the user instructions"
                 )
                 prompt_builder = PromptBuilder(
-                    [], user_instructions=user_instructions
+                    [],
+                    user_instructions=user_instructions,
+                    output_language=output_language,
                 )
             else:
                 if prompt_builder.user_instructions is not None:
@@ -445,6 +505,7 @@ class SasLLMPipeline:
         )
         self.model = model
         self.window_k = window_k
+        self._output_language = output_language
         self._history_selector = history_selector
         self._prompt_builder = prompt_builder
 
@@ -803,7 +864,9 @@ class SasLLMPipeline:
             return []
         query = _query_for_item(item)
         constructs = _constructs_for_item(item)
-        guidance = self._prompt_builder.build(query, constructs)
+        guidance = self._prompt_builder.build(
+            query, constructs, output_language=self._output_language
+        )
         if not guidance:
             return []
         item_id = item.batch_id if isinstance(item, SasBatch) else item.chunk_id

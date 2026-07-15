@@ -346,7 +346,45 @@ Wide fact tables are partitioned by load_date.
 
 ## [example: proc:sql] SQL join                        <- few-shot example
 One worked SAS -> PySpark pair demonstrating the response shape.
+
+## [when: proc:sql] [lang: sparksql] SQL joins          <- language-scoped
+Translate PROC SQL directly to Spark SQL.               (stacked groups)
 ```
+
+### Output-language scoping (`[lang: ...]`)
+
+A heading may carry several leading bracket groups, combined as **AND**
+across clauses. A `[lang: sparksql, pyspark]` group restricts a section to
+the named target output language(s); it is a *modifier*, so it stacks with a
+primary scope (`## [when: proc:sql] [lang: sparksql] SQL rules` fires only
+for a SparkSQL run whose item uses PROC SQL). A section with no `[lang: ...]`
+is language-agnostic. Matching is case/space/underscore-insensitive
+(`normalize_language` folds `"SparkSQL"`, `"Spark SQL"`, `"spark_sql"` to one
+key), and the run's `output_language` is applied at **selection time** — the
+pipeline passes `SasLLMPipeline(output_language=...)` into `build()`, and a
+non-matching-language chunk is skipped like an over-budget one. With
+`output_language=None` the filter is off (language-scoped sections are all
+kept), so a builder used without a language over-includes rather than
+silently dropping rules.
+
+### Loading a directory of files (`from_dir`)
+
+`UserInstructionSet.from_dir(dir)` merges every `*.md` under *dir* (sorted
+path order, deterministic fingerprint). A file's **first path component**,
+when nested, names the target language: sections in `<dir>/sparksql/*.md`
+are scoped `[lang: sparksql]` unless they set their own `[lang: ...]`; files
+directly under *dir* or under a `_`-prefixed subdirectory (e.g. `_common/`)
+are language-agnostic. So one directory holds guidance for several targets
+side by side, and the active-language filter picks the right slice per run.
+Point config.json `user_instructions.dir` at such a directory (it takes
+precedence over `user_instructions.path`); a missing directory warns and
+continues, like a missing file.
+
+The package ships a starter set at `prompt_builder/instructions/sparksql/`
+(overview, constructs, datetime, macros, worked examples) synthesised from
+the Spark SQL reference and PySpark SQL API docs — load it with
+`from_dir("prompt_builder/instructions")` and run the pipeline with
+`output_language="SparkSQL"`.
 
 `[example: <keys>]` sections hold **few-shot worked pairs** — curated
 SAS → target translations demonstrating the full desired response shape
