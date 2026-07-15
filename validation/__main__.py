@@ -4,10 +4,10 @@ Usage
 -----
     # deterministic metrics against a live model
     # (needs ANTHROPIC_API_KEY and the `anthropic` extra):
-    python -m validation validation/cases --model claude-haiku-4-5-20251001
+    python -m validation validation/cases --model claude-sonnet-4-5
 
     # additionally grade each translation with an LLM judge:
-    python -m validation validation/cases --judge-model claude-haiku-4-5-20251001
+    python -m validation validation/cases --judge-model claude-sonnet-4-5
 
     # append the run to the local Spark-parquet history (./validation_runs):
     python -m validation validation/cases --track
@@ -88,7 +88,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default="claude-haiku-4-5-20251001",
+        default="claude-sonnet-4-5",
         help="LangChain chat-model string for the pipeline under test.",
     )
     parser.add_argument(

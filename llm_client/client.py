@@ -52,7 +52,7 @@ class LLMClientConfig(BaseModel):
     ----------
     model : str
         LangChain chat-model string forwarded to ``init_chat_model``,
-        e.g. ``"claude-haiku-4-5-20251001"``. Also accepted under the
+        e.g. ``"claude-sonnet-4-5"``. Also accepted under the
         alias ``model_name``. Config key: ``llm_client.model``.
     base_url : str | None
         Provider endpoint override (proxy / gateway URL), forwarded as
@@ -123,7 +123,7 @@ class LLMClientConfig(BaseModel):
     # wrong-typed entry to the hard default with a WARNING.
     model: str = Field(
         default_factory=lambda: app_config.llm_client_value(
-            "model", "claude-haiku-4-5-20251001"
+            "model", "claude-sonnet-4-5"
         ),
         validation_alias=AliasChoices("model", "model_name"),
     )

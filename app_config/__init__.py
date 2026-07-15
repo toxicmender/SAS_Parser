@@ -66,7 +66,9 @@ def load_config() -> dict[str, Any]:
         if not path.is_file():
             continue
         try:
-            _cache = json.loads(path.read_text(encoding="utf-8"))
+            # utf-8-sig also accepts BOM-less files; Windows editors and
+            # PowerShell 5.1 commonly prepend a BOM, which plain utf-8 rejects.
+            _cache = json.loads(path.read_text(encoding="utf-8-sig"))
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning(f"load_config: unreadable '{path}': {exc}; skipping")
             continue
@@ -128,6 +130,33 @@ def get_typed_value(
     return value
 
 
+# Chat-model identifiers this deployment can actually reach. An
+# llm_client.model config value that names anything else is ignored with a
+# WARNING (the default applies), the same degrade-don't-crash rule as a
+# wrong-typed entry. Provider-prefixed ("anthropic:claude-opus-4-6") and
+# date-suffixed ("claude-sonnet-4-5-20250929") forms of an accessible model
+# are accepted.
+ACCESSIBLE_MODELS: tuple[str, ...] = (
+    "claude-sonnet-4-5",  # Anthropic Claude Sonnet 4.5
+    "claude-opus-4-6",    # Anthropic Claude Opus 4.6
+    "gpt-5.4",            # OpenAI GPT-5.4
+    "gemini-3.1-pro",     # Google Gemini 3.1 Pro
+)
+
+
+def is_accessible_model(model: str) -> bool:
+    """
+    True when *model* names one of :data:`ACCESSIBLE_MODELS`, tolerating a
+    LangChain provider prefix ("anthropic:...") and a dated snapshot suffix
+    ("-20250929").
+    """
+    bare = model.split(":", 1)[-1]
+    return any(
+        bare == known or bare.startswith(f"{known}-")
+        for known in ACCESSIBLE_MODELS
+    )
+
+
 # JSON types accepted per llm_client key. The section's parse rules live
 # here beside the loader — one schema — instead of scattered through the
 # LLMClientConfig default factories. api_key is deliberately absent:
@@ -154,10 +183,23 @@ def llm_client_value(key: str, default: Any = None) -> Any:
     config error. Wrong-typed file values are ignored with a WARNING and
     *default* applies. ``url_headers`` must additionally map to string
     values (JSON object keys are always strings) or the whole mapping is
-    ignored.
+    ignored, and ``model`` must name one of :data:`ACCESSIBLE_MODELS` or the
+    entry is likewise ignored.
     """
     expected = _LLM_CLIENT_TYPES[key]
     value = get_typed_value("llm_client", key, expected, default)
+    if (
+        key == "model"
+        and isinstance(value, str)
+        and value != default
+        and not is_accessible_model(value)
+    ):
+        logger.warning(
+            f"llm_client_value: config.json llm_client.model {value!r} is not "
+            f"an accessible model (accessible: {', '.join(ACCESSIBLE_MODELS)}); "
+            f"ignoring it (default {default!r} applies)"
+        )
+        return default
     if (
         key == "url_headers"
         and isinstance(value, dict)

@@ -73,10 +73,10 @@ CLI (exit code gates CI — 0 iff every case passed):
 
 ```bash
 # deterministic metrics against a live model (needs ANTHROPIC_API_KEY):
-python -m validation validation/cases --model claude-haiku-4-5-20251001
+python -m validation validation/cases --model claude-sonnet-4-5
 
 # + LLM judge, + append to the local run history (./validation_runs):
-python -m validation validation/cases --judge-model claude-haiku-4-5-20251001 --track
+python -m validation validation/cases --judge-model claude-sonnet-4-5 --track
 
 # on Databricks, target a Delta table instead:
 python -m validation validation/cases --track --table main.qa.validation_runs

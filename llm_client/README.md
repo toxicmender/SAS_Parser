@@ -12,7 +12,7 @@ The package imports nothing from `chunker` or `memory`.
 from llm_client import LLMClient, LLMClientConfig
 
 client = LLMClient(LLMClientConfig(
-    model="claude-haiku-4-5-20251001",   # alias: model_name=
+    model="claude-sonnet-4-5",   # alias: model_name=
     temperature=0.2,
     max_input_tokens=100_000,
     requests_per_second=2.0,

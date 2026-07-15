@@ -273,7 +273,7 @@ class SasLLMPipeline:
     Parameters
     ----------
     model : str
-        LangChain chat-model string, e.g. ``"claude-haiku-4-5-20251001"``.
+        LangChain chat-model string, e.g. ``"claude-sonnet-4-5"``.
     temperature : float | None
         Sampling temperature for the LLM. ``None`` (default) keeps the
         provider default. Forwarded to :class:`llm_client.LLMClientConfig`.
@@ -388,7 +388,7 @@ class SasLLMPipeline:
 
     def __init__(
         self,
-        model: str = "claude-haiku-4-5-20251001",
+        model: str = "claude-sonnet-4-5",
         *,
         temperature: float | None = None,
         max_input_tokens: int | None = None,

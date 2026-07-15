@@ -7,7 +7,7 @@ runnable offline. Wire it in explicitly::
     from llm_client import LLMClient, LLMClientConfig
     from validation import LLMJudgeMetric, ValidationRunner, default_metrics
 
-    judge = LLMJudgeMetric(llm=LLMClient(LLMClientConfig(model="claude-haiku-4-5-20251001")))
+    judge = LLMJudgeMetric(llm=LLMClient(LLMClientConfig(model="claude-sonnet-4-5")))
     runner = ValidationRunner(pipeline, metrics=[*default_metrics(), judge])
 
 Any object with a LangChain-style ``invoke(input) -> message`` works as the
