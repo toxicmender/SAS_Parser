@@ -20,6 +20,12 @@ from prompt_builder.user_instructions import (
     SCOPE_TOPIC,
     SCOPE_WHEN,
     UserInstructionSet,
+    kinds_of,
+    langs_of,
+    metas_of,
+    normalize_kind,
+    normalize_language,
+    normalize_meta,
     scope_of,
 )
 
@@ -149,6 +155,126 @@ def test_chunk_text_leads_with_title_and_ids_are_unique():
 
 
 # ---------------------------------------------------------------------------
+# [lang: ...] directive and stacked bracket groups
+# ---------------------------------------------------------------------------
+
+
+def test_lang_directive_scopes_a_section():
+    ins = UserInstructionSet.from_text(
+        "## [lang: sparksql] Emit SQL\nTarget Spark SQL."
+    )
+    chunk = ins.chunks[0]
+    assert scope_of(chunk) == SCOPE_ALWAYS  # lang is a modifier, not a scope
+    assert chunk.section_path == "Emit SQL"
+    assert langs_of(chunk) == ["sparksql"]
+    assert ins.diagnostics == []
+
+
+def test_lang_directive_normalizes_and_dedupes():
+    ins = UserInstructionSet.from_text(
+        "## [lang: Spark SQL, spark_sql, PySpark] Rule\nbody"
+    )
+    assert langs_of(ins.chunks[0]) == ["sparksql", "pyspark"]
+
+
+def test_agnostic_section_has_no_lang():
+    ins = UserInstructionSet.from_text("## Output format\nbody")
+    assert langs_of(ins.chunks[0]) == []
+
+
+def test_stacked_when_and_lang_groups_combine():
+    ins = UserInstructionSet.from_text(
+        "## [when: proc:sql] [lang: sparksql] SQL rules\nbody"
+    )
+    chunk = ins.chunks[0]
+    assert scope_of(chunk) == SCOPE_WHEN
+    assert chunk.construct_keys == [ConstructKey(kind="proc", name="sql")]
+    assert langs_of(chunk) == ["sparksql"]
+    assert chunk.section_path == "SQL rules"
+    assert ins.diagnostics == []
+
+
+def test_stacked_lang_before_topic():
+    ins = UserInstructionSet.from_text(
+        "## [lang: sparksql] [topic] Partitioning\nbody"
+    )
+    chunk = ins.chunks[0]
+    assert scope_of(chunk) == SCOPE_TOPIC
+    assert langs_of(chunk) == ["sparksql"]
+    assert chunk.section_path == "Partitioning"
+
+
+def test_normalize_language_helper():
+    assert (
+        normalize_language("SparkSQL")
+        == normalize_language("Spark SQL")
+        == normalize_language("spark_sql")
+        == "sparksql"
+    )
+
+
+# ---------------------------------------------------------------------------
+# [kind: ...] and [meta: ...] modifier clauses
+# ---------------------------------------------------------------------------
+
+
+def test_kind_directive_scopes_a_section():
+    ins = UserInstructionSet.from_text(
+        "## [kind: DATA_STEP, proc step] Rule\nbody"
+    )
+    chunk = ins.chunks[0]
+    assert scope_of(chunk) == SCOPE_ALWAYS  # kind is a modifier, not a scope
+    assert kinds_of(chunk) == ["DATA_STEP", "PROC_STEP"]  # normalized + deduped
+    assert chunk.section_path == "Rule"
+    assert ins.diagnostics == []
+
+
+def test_meta_directive_scopes_a_section():
+    ins = UserInstructionSet.from_text(
+        "## [meta: symput_hazard, Unclosed-Block] Rule\nbody"
+    )
+    chunk = ins.chunks[0]
+    assert scope_of(chunk) == SCOPE_ALWAYS
+    assert metas_of(chunk) == ["symput_hazard", "unclosed_block"]
+    assert ins.diagnostics == []
+
+
+def test_all_modifiers_stack_with_a_primary_scope():
+    ins = UserInstructionSet.from_text(
+        "## [when: proc:sql] [kind: PROC_STEP] [meta: symput_hazard] "
+        "[lang: sparksql] Rule\nbody"
+    )
+    chunk = ins.chunks[0]
+    assert scope_of(chunk) == SCOPE_WHEN
+    assert chunk.construct_keys == [ConstructKey(kind="proc", name="sql")]
+    assert kinds_of(chunk) == ["PROC_STEP"]
+    assert metas_of(chunk) == ["symput_hazard"]
+    assert langs_of(chunk) == ["sparksql"]
+    assert chunk.section_path == "Rule"
+    assert ins.diagnostics == []
+
+
+def test_agnostic_section_has_no_kind_or_meta():
+    ins = UserInstructionSet.from_text("## Output format\nbody")
+    assert kinds_of(ins.chunks[0]) == []
+    assert metas_of(ins.chunks[0]) == []
+
+
+def test_normalize_kind_and_meta_helpers():
+    assert normalize_kind("data step") == normalize_kind("DATA-STEP") == "DATA_STEP"
+    assert normalize_meta("Symput Hazard") == "symput_hazard"
+
+
+def test_kind_meta_survive_document_round_trip():
+    ins = UserInstructionSet.from_text(
+        "## [kind: DATA_STEP] [meta: symput_hazard] Rule\nbody"
+    )
+    rebuilt = InstructionChunk.from_document(ins.chunks[0].to_document())
+    assert kinds_of(rebuilt) == ["DATA_STEP"]
+    assert metas_of(rebuilt) == ["symput_hazard"]
+
+
+# ---------------------------------------------------------------------------
 # Graceful degradation — diagnostics, never exceptions, over-inclusion
 # ---------------------------------------------------------------------------
 
@@ -213,6 +339,77 @@ def test_from_file_reads_and_records_source(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# from_dir — merged markdown files, subdirectory names the target language
+# ---------------------------------------------------------------------------
+
+
+def _write_instruction_tree(root):
+    (root / "sparksql").mkdir(parents=True)
+    (root / "pyspark").mkdir(parents=True)
+    (root / "_common").mkdir(parents=True)
+    (root / "sparksql" / "sql.md").write_text(
+        "## SQL rule\nEmit Spark SQL.", encoding="utf-8"
+    )
+    (root / "pyspark" / "df.md").write_text(
+        "## DF rule\nEmit DataFrames.", encoding="utf-8"
+    )
+    (root / "_common" / "format.md").write_text(
+        "## Format\nStructured markdown.", encoding="utf-8"
+    )
+    (root / "top.md").write_text("## Top rule\nAlways.", encoding="utf-8")
+
+
+def test_from_dir_scopes_by_subdirectory_language(tmp_path):
+    _write_instruction_tree(tmp_path)
+    ins = UserInstructionSet.from_dir(str(tmp_path))
+    by_title = {c.section_path: c for c in ins.chunks}
+    assert langs_of(by_title["SQL rule"]) == ["sparksql"]
+    assert langs_of(by_title["DF rule"]) == ["pyspark"]
+    assert langs_of(by_title["Format"]) == []  # _common is agnostic
+    assert langs_of(by_title["Top rule"]) == []  # root file is agnostic
+
+
+def test_from_dir_merges_all_files_with_unique_ids(tmp_path):
+    _write_instruction_tree(tmp_path)
+    ins = UserInstructionSet.from_dir(str(tmp_path))
+    assert len(ins) == 4
+    ids = [c.chunk_id for c in ins.chunks]
+    assert len(ids) == len(set(ids))
+    assert ins.source == str(tmp_path)
+
+
+def test_from_dir_explicit_lang_overrides_subdirectory(tmp_path):
+    (tmp_path / "sparksql").mkdir()
+    (tmp_path / "sparksql" / "x.md").write_text(
+        "## Odd\n## [lang: pyspark] Override\nbody", encoding="utf-8"
+    )
+    ins = UserInstructionSet.from_dir(str(tmp_path))
+    override = next(c for c in ins.chunks if c.section_path == "Override")
+    assert langs_of(override) == ["pyspark"]
+
+
+def test_from_dir_fingerprint_stable_and_content_sensitive(tmp_path):
+    _write_instruction_tree(tmp_path)
+    a = UserInstructionSet.from_dir(str(tmp_path))
+    b = UserInstructionSet.from_dir(str(tmp_path))
+    assert a.fingerprint == b.fingerprint and len(a.fingerprint) == 16
+    (tmp_path / "sparksql" / "sql.md").write_text(
+        "## SQL rule\nEmit Spark SQL, always.", encoding="utf-8"
+    )
+    c = UserInstructionSet.from_dir(str(tmp_path))
+    assert c.fingerprint != a.fingerprint
+
+
+def test_from_dir_missing_directory_returns_empty(tmp_path, caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="prompt_builder.user_instructions"):
+        ins = UserInstructionSet.from_dir(str(tmp_path / "nope"))
+    assert len(ins) == 0
+    assert "not a directory" in caplog.text
+
+
+# ---------------------------------------------------------------------------
 # from_config — the standing instructions file
 # ---------------------------------------------------------------------------
 
@@ -252,6 +449,70 @@ def test_from_config_loads_configured_file(monkeypatch, tmp_path):
         assert ins is not None
         assert ins.source == str(rules_path)
         assert ins.fingerprint == UserInstructionSet.from_text(RULES).fingerprint
+    finally:
+        app_config.clear_cache()
+
+
+def test_from_config_loads_configured_dir(monkeypatch, tmp_path):
+    import app_config
+
+    instr = tmp_path / "instructions"
+    (instr / "sparksql").mkdir(parents=True)
+    (instr / "sparksql" / "sql.md").write_text(
+        "## SQL rule\nEmit Spark SQL.", encoding="utf-8"
+    )
+    _isolated_config(
+        monkeypatch, tmp_path, {"user_instructions": {"dir": str(instr)}}
+    )
+    try:
+        ins = UserInstructionSet.from_config()
+        assert ins is not None
+        assert [langs_of(c) for c in ins.chunks] == [["sparksql"]]
+    finally:
+        app_config.clear_cache()
+
+
+def test_from_config_dir_takes_precedence_over_path(monkeypatch, tmp_path):
+    import app_config
+
+    instr = tmp_path / "instructions"
+    (instr / "sparksql").mkdir(parents=True)
+    (instr / "sparksql" / "sql.md").write_text(
+        "## SQL rule\nEmit Spark SQL.", encoding="utf-8"
+    )
+    path_file = tmp_path / "single.md"
+    path_file.write_text("## Single\nbody", encoding="utf-8")
+    _isolated_config(
+        monkeypatch,
+        tmp_path,
+        {"user_instructions": {"dir": str(instr), "path": str(path_file)}},
+    )
+    try:
+        ins = UserInstructionSet.from_config()
+        assert ins is not None
+        assert [c.section_path for c in ins.chunks] == ["SQL rule"]
+    finally:
+        app_config.clear_cache()
+
+
+def test_from_config_missing_dir_warns_and_returns_none(
+    monkeypatch, tmp_path, caplog
+):
+    import logging
+
+    import app_config
+
+    _isolated_config(
+        monkeypatch,
+        tmp_path,
+        {"user_instructions": {"dir": str(tmp_path / "gone")}},
+    )
+    try:
+        with caplog.at_level(
+            logging.WARNING, logger="prompt_builder.user_instructions"
+        ):
+            assert UserInstructionSet.from_config() is None
+        assert "not found" in caplog.text
     finally:
         app_config.clear_cache()
 

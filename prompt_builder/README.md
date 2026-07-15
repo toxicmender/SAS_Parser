@@ -346,7 +346,66 @@ Wide fact tables are partitioned by load_date.
 
 ## [example: proc:sql] SQL join                        <- few-shot example
 One worked SAS -> PySpark pair demonstrating the response shape.
+
+## [when: proc:sql] [lang: sparksql] SQL joins          <- language-scoped
+Translate PROC SQL directly to Spark SQL.               (stacked groups)
+
+## [kind: DATA_STEP] [meta: symput_hazard] SYMPUT       <- kind/metadata-scoped
+Trace the write/read ordering before translating.
 ```
+
+### Modifier clauses: language, chunk kind, metadata (`[lang:]`/`[kind:]`/`[meta:]`)
+
+A heading may carry several leading bracket groups, combined as **AND** across
+clauses. Beyond the primary scope (`when`/`topic`/`example`, else always),
+three *modifier* clauses stack on to restrict a section further — each passes
+only when the item matches it, and a section that omits a clause is agnostic
+on that axis:
+
+- **`[lang: sparksql, pyspark]`** — the run's `output_language` must be one of
+  the listed targets. Matching is case/space/underscore-insensitive
+  (`normalize_language` folds `"SparkSQL"`, `"Spark SQL"`, `"spark_sql"` to one
+  key). Applied at **selection time**: the pipeline passes
+  `SasLLMPipeline(output_language=...)` into `build()`. With
+  `output_language=None` this axis is off (language-scoped sections are all
+  kept), so a builder used without a language over-includes rather than
+  silently dropping rules.
+- **`[kind: DATA_STEP, PROC_STEP]`** — the item must use one of the listed
+  `SasChunkKind` values (`normalize_kind` folds `data step`/`data-step` to
+  `DATA_STEP`).
+- **`[meta: symput_hazard, unclosed_block]`** — the item's metadata must raise
+  one of the listed predicate flags. The vocabulary (owned by the pipeline):
+  `symput_hazard`, `abort`, `computed_goto`, `component_object`,
+  `unclosed_block`, `includes`, `defines_macros`, `invokes_macros`,
+  `produces_macrovars`, `automatic_vars`.
+
+So `## [when: proc:sql] [kind: PROC_STEP] [meta: symput_hazard] [lang: sparksql]
+Rule` fires only for a SparkSQL run whose item is a PROC step that uses PROC SQL
+*and* carries a SYMPUT hazard. The item's kinds and flags reach the selector as
+plain strings — the pipeline computes them in `_kinds_for_item` /
+`_meta_flags_for_item` (unioned over a batch's member chunks) — so
+`prompt_builder` still imports nothing from `chunker`. Unlike `[lang:]`, the
+`[kind:]`/`[meta:]` axes have no "off" state: a caller that passes no kinds/flags
+simply never fires a kind/meta-scoped rule (like `[when:]` with no constructs).
+
+### Loading a directory of files (`from_dir`)
+
+`UserInstructionSet.from_dir(dir)` merges every `*.md` under *dir* (sorted
+path order, deterministic fingerprint). A file's **first path component**,
+when nested, names the target language: sections in `<dir>/sparksql/*.md`
+are scoped `[lang: sparksql]` unless they set their own `[lang: ...]`; files
+directly under *dir* or under a `_`-prefixed subdirectory (e.g. `_common/`)
+are language-agnostic. So one directory holds guidance for several targets
+side by side, and the active-language filter picks the right slice per run.
+Point config.json `user_instructions.dir` at such a directory (it takes
+precedence over `user_instructions.path`); a missing directory warns and
+continues, like a missing file.
+
+The package ships a starter set at `prompt_builder/instructions/sparksql/`
+(overview, constructs, datetime, macros, worked examples) synthesised from
+the Spark SQL reference and PySpark SQL API docs — load it with
+`from_dir("prompt_builder/instructions")` and run the pipeline with
+`output_language="SparkSQL"`.
 
 `[example: <keys>]` sections hold **few-shot worked pairs** — curated
 SAS → target translations demonstrating the full desired response shape

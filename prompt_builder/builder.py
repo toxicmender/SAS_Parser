@@ -192,6 +192,11 @@ class PromptBuilder:
         hazard items). ``None`` (default) reads
         ``prompt_builder.reasoning_directives`` from config.json, falling
         back to ``True``.
+    output_language : str | None
+        Default target output language for :meth:`build`, used to filter
+        language-scoped user instructions (``[lang: ...]`` sections). ``None``
+        (default) leaves those sections unfiltered; a per-call
+        ``build(output_language=...)`` argument overrides this.
     heading : str
         Markdown H2 heading for the reference-guidance block.
     project_heading : str
@@ -219,6 +224,7 @@ class PromptBuilder:
         reranker: Callable[[str, list[str]], list[float]] | None = None,
         focus_hints: bool | None = None,
         reasoning_directives: bool | None = None,
+        output_language: str | None = None,
         heading: str = "Relevant migration guidance",
         project_heading: str = "Project instructions",
         hints_heading: str = "Focus hints",
@@ -239,6 +245,9 @@ class PromptBuilder:
         self.reasoning_directives = app_config.resolve(
             reasoning_directives, "prompt_builder", "reasoning_directives", True
         )
+        # Default output language for build(); a per-call argument overrides
+        # it. None leaves language-scoped user instructions unfiltered.
+        self.output_language = output_language
         self.heading = heading
         self.project_heading = project_heading
         self.hints_heading = hints_heading
@@ -286,6 +295,7 @@ class PromptBuilder:
             reranker=self._reranker,
             focus_hints=self.focus_hints,
             reasoning_directives=self.reasoning_directives,
+            output_language=self.output_language,
             heading=self.heading,
             project_heading=self.project_heading,
             hints_heading=self.hints_heading,
@@ -346,7 +356,13 @@ class PromptBuilder:
         )
 
     def build(
-        self, query: str, constructs: Iterable[ConstructKey] = ()
+        self,
+        query: str,
+        constructs: Iterable[ConstructKey] = (),
+        *,
+        output_language: str | None = None,
+        kinds: Iterable[str] = (),
+        meta_flags: Iterable[str] = (),
     ) -> str | None:
         """
         The Markdown block(s) for one item — a ``## Project instructions``
@@ -357,13 +373,24 @@ class PromptBuilder:
         examples (last, adjacent to the item it demonstrates for), each
         omitted when empty — or ``None`` when nothing at all is relevant (so
         the caller injects no block).
+
+        *output_language*, *kinds*, and *meta_flags* filter language-,
+        chunk-kind-, and metadata-scoped user instructions (see
+        :meth:`InstructionSelector.select_detailed`); *output_language*
+        ``None`` falls back to the builder's construction-time value.
         """
         constructs = list(constructs)
+        language = (
+            output_language if output_language is not None else self.output_language
+        )
         picks = self._selector.select_detailed(
             query,
             constructs,
             max_words=self.max_instruction_words,
             top_k=self.top_k,
+            language=language,
+            kinds=kinds,
+            meta_flags=meta_flags,
         )
         if not picks:
             logger.debug("build: no relevant instruction chunks; no block")

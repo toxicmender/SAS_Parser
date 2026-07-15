@@ -16,10 +16,12 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from langchain_core.messages import AIMessage
 
-from chunker.models import SasChunk, SasChunkKind, SasChunkMetadata
+from chunker.models import SasBatch, SasChunk, SasChunkKind, SasChunkMetadata
 from chunker.pipeline import (
     SasLLMPipeline,
     _constructs_for_item,
+    _kinds_for_item,
+    _meta_flags_for_item,
     _query_for_item,
 )
 from memory.store import MemoryHub
@@ -119,6 +121,142 @@ def test_component_objects_map_to_constructs_and_query():
         chunk
     )
     assert "hash object" in _query_for_item(chunk)
+
+
+# ---------------------------------------------------------------------------
+# SasBatch construct-metadata aggregation (sets) and batch-level gating
+# ---------------------------------------------------------------------------
+
+
+def _meta_chunk(chunk_id: str, **meta) -> SasChunk:
+    kind = meta.pop("kind", SasChunkKind.DATA_STEP)
+    return SasChunk(
+        chunk_id=chunk_id,
+        source_id="etl.sas",
+        text="x;",
+        kind=kind,
+        start_line=1,
+        end_line=1,
+        start_char=0,
+        end_char=2,
+        metadata=SasChunkMetadata(**meta),
+    )
+
+
+def _batch(*chunks: SasChunk) -> SasBatch:
+    return SasBatch(batch_id="batch-001", chunks=list(chunks))
+
+
+def test_sasbatch_aggregates_member_metadata_as_sets():
+    batch = _batch(
+        _meta_chunk("c1", recognized_functions=["intck", "intnx"]),
+        _meta_chunk("c2", recognized_functions=["intnx"], component_objects=["hash"]),
+        _meta_chunk("c3", kind=SasChunkKind.PROC_STEP, proc_name="sql"),
+        _meta_chunk("c4", recognized_call_routines=["symput"], symput_scope_hazard=True),
+    )
+    assert batch.recognized_functions == {"intck", "intnx"}  # deduped union
+    assert batch.recognized_call_routines == {"symput"}
+    assert batch.component_objects == {"hash"}
+    assert batch.proc_names == {"sql"}
+    assert batch.has_symput_scope_hazard is True
+    assert batch.has_abort is False
+    assert isinstance(batch.recognized_functions, set)
+
+
+def test_batch_model_dump_stays_json_serializable():
+    # The set-valued aggregates are plain properties, not fields, so they do
+    # not leak into model_dump() (json.dumps would choke on a set).
+    import json
+
+    batch = _batch(_meta_chunk("c1", recognized_functions=["intck"]))
+    json.dumps(batch.model_dump())  # must not raise
+
+
+def test_constructs_for_item_unions_across_batch_members():
+    batch = _batch(
+        _meta_chunk("c1", recognized_functions=["intck"]),
+        _meta_chunk("c2", recognized_functions=["intnx"], component_objects=["hash"]),
+    )
+    keys = _constructs_for_item(batch)
+    assert ConstructKey(kind="function", name="intck") in keys
+    assert ConstructKey(kind="function", name="intnx") in keys
+    assert ConstructKey(kind="component_object", name="hash") in keys
+
+
+def test_instruction_injected_only_when_construct_present_in_batch():
+    # Two construct-scoped rules; a batch pulls only the ones whose construct
+    # it actually uses — the load-bearing gating the request asks us to verify.
+    rules = (
+        "## [when: function:intck] INTCK rule\nCount interval boundaries.\n"
+        "## [when: function:intnx] INTNX rule\nAdvance by intervals."
+    )
+    builder = PromptBuilder([], user_instructions=rules)
+
+    intck_batch = _batch(_meta_chunk("c1", recognized_functions=["intck"]))
+    out = builder.build(
+        _query_for_item(intck_batch), _constructs_for_item(intck_batch)
+    )
+    assert "INTCK rule" in out
+    assert "INTNX rule" not in out  # not used by this batch -> not injected
+
+    other_batch = _batch(_meta_chunk("c2", recognized_functions=["put"]))
+    assert builder.build(
+        _query_for_item(other_batch), _constructs_for_item(other_batch)
+    ) is None  # neither rule's construct present -> no guidance at all
+
+
+# ---------------------------------------------------------------------------
+# [kind:] / [meta:] item mapping and end-to-end gating
+# ---------------------------------------------------------------------------
+
+
+def test_kinds_for_item_unions_member_kinds():
+    batch = _batch(
+        _meta_chunk("c1", kind=SasChunkKind.DATA_STEP),
+        _meta_chunk("c2", kind=SasChunkKind.PROC_STEP, proc_name="sql"),
+    )
+    assert _kinds_for_item(batch) == {"DATA_STEP", "PROC_STEP"}
+    assert _kinds_for_item(_intnx_chunk()) == {"DATA_STEP"}
+
+
+def test_meta_flags_for_item_maps_metadata_predicates():
+    batch = _batch(
+        _meta_chunk("c1", symput_scope_hazard=True),
+        _meta_chunk("c2", component_objects=["hash"], has_unclosed_block=True),
+    )
+    flags = _meta_flags_for_item(batch)
+    assert {"symput_hazard", "component_object", "unclosed_block"} <= flags
+    assert "abort" not in flags
+
+
+def test_kind_and_meta_gate_instruction_injection_end_to_end():
+    rules = (
+        "## [kind: PROC_STEP] PROC rule\nOnly for PROC steps.\n"
+        "## [meta: symput_hazard] SYMPUT rule\nMind the write/read ordering."
+    )
+    builder = PromptBuilder([], user_instructions=rules)
+
+    proc_batch = _batch(_meta_chunk("c1", kind=SasChunkKind.PROC_STEP, proc_name="sql"))
+    out = builder.build(
+        _query_for_item(proc_batch),
+        _constructs_for_item(proc_batch),
+        kinds=_kinds_for_item(proc_batch),
+        meta_flags=_meta_flags_for_item(proc_batch),
+    )
+    assert "PROC rule" in out
+    assert "SYMPUT rule" not in out  # no hazard flag on this batch
+
+    hazard_batch = _batch(
+        _meta_chunk("c2", kind=SasChunkKind.DATA_STEP, symput_scope_hazard=True)
+    )
+    out2 = builder.build(
+        _query_for_item(hazard_batch),
+        _constructs_for_item(hazard_batch),
+        kinds=_kinds_for_item(hazard_batch),
+        meta_flags=_meta_flags_for_item(hazard_batch),
+    )
+    assert "SYMPUT rule" in out2
+    assert "PROC rule" not in out2  # not a PROC step
 
 
 # ---------------------------------------------------------------------------
