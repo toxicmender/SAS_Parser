@@ -19,7 +19,10 @@ Usage
     # needs ANTHROPIC_API_KEY and the `anthropic` extra installed:
     #   uv pip install -e ".[anthropic]"
     python demo_run.py path/to/sas_dir
-    python demo_run.py path/to/sas_dir --model claude-haiku-4-5-20251001 --debug
+    python demo_run.py path/to/sas_dir --model claude-sonnet-4-5 --debug
+
+Without ``--model``, the model comes from config.json (``llm_client.model``),
+falling back to the code default when that entry is null or absent.
 
 Run from the repo root so the default ``reference_docs`` path resolves.
 """
@@ -31,10 +34,13 @@ import logging
 import sys
 from pathlib import Path
 
+import app_config
 from chunker import SasLLMPipeline
 from prompt_builder import PromptBuilder
 
 logger = logging.getLogger("demo_run")
+
+_DEFAULT_MODEL = "claude-sonnet-4-5"
 
 
 def _discover_sas_files(sas_dir: Path, pattern: str) -> list[str]:
@@ -69,8 +75,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default="claude-haiku-4-5-20251001",
-        help="LangChain chat-model string (default: claude-haiku-4-5-20251001).",
+        default=None,
+        help="LangChain chat-model string. Overrides config.json "
+        f"llm_client.model (default when both are unset: {_DEFAULT_MODEL}).",
     )
     parser.add_argument(
         "--output-language",
@@ -119,16 +126,26 @@ def main(argv: list[str] | None = None) -> int:
     logger.info(f"building instruction corpus from {args.reference_dir}")
     builder = PromptBuilder.from_reference_dir(str(args.reference_dir))
 
+    # CLI flag > config.json llm_client.model > code default. Resolved here
+    # because passing the argparse value unconditionally would count as an
+    # "explicit argument" downstream and shadow the config.json entry.
+    if args.model:
+        model = args.model
+        logger.info(f"model from --model: {model}")
+    else:
+        model = app_config.llm_client_value("model", _DEFAULT_MODEL)
+        logger.info(f"model from config.json/default: {model}")
+
     # In-memory message store (delta_table=None) — no Spark/JVM is booted.
     pipeline = SasLLMPipeline(
-        model=args.model,
+        model=model,
         output_language=args.output_language,
         prompt_builder=builder,
     )
 
     # run_files chunks every file and batches the corpus via MultiFileBatcher,
     # then runs every batch/singleton through the LLM on one shared thread.
-    logger.info(f"running pipeline over {len(sas_files)} file(s) with model={args.model}")
+    logger.info(f"running pipeline over {len(sas_files)} file(s) with model={model}")
     outputs = pipeline.run_files(sas_files)
 
     logger.info(f"pipeline produced {len(outputs)} item response(s)")

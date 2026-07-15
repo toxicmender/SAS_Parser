@@ -35,7 +35,7 @@ from prompt_builder import PromptBuilder
 # Load + chunk + index the reference corpus once (cached on disk after run 1).
 builder = PromptBuilder.from_reference_dir("reference_docs")
 
-pipeline = SasLLMPipeline(model="claude-haiku-4-5-20251001", prompt_builder=builder)
+pipeline = SasLLMPipeline(model="claude-sonnet-4-5", prompt_builder=builder)
 pipeline.run_file("etl.sas")   # each item's prompt now carries relevant guidance
 ```
 

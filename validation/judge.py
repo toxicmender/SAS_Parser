@@ -7,7 +7,7 @@ runnable offline. Wire it in explicitly::
     from llm_client import LLMClient, LLMClientConfig
     from validation import LLMJudgeMetric, ValidationRunner, default_metrics
 
-    judge = LLMJudgeMetric(llm=LLMClient(LLMClientConfig(model="claude-haiku-4-5-20251001")))
+    judge = LLMJudgeMetric(llm=LLMClient(LLMClientConfig(model="claude-sonnet-4-5")))
     runner = ValidationRunner(pipeline, metrics=[*default_metrics(), judge])
 
 Any object with a LangChain-style ``invoke(input) -> message`` works as the
@@ -26,7 +26,7 @@ from typing import Any
 from chunker.models import SasBatch, SasChunk
 
 from .metrics import ValidationMetric
-from .models import CaseRun, MetricResult
+from .models import EvaluationRun, MetricResult
 
 logger = logging.getLogger(__name__)
 
@@ -86,15 +86,23 @@ class LLMJudgeMetric(ValidationMetric):
         self._llm = llm
         self._output_language = output_language
 
-    def evaluate(self, run: CaseRun) -> MetricResult:
-        if not run.items:
-            return self._result(0.0, "chunker/batcher produced no items")
+    def evaluate(self, run: EvaluationRun) -> MetricResult:
+        # Source context per unit: the item's SAS text when chunker metadata
+        # exists, else the turn's prompt (a pipeline thread's human message
+        # embeds the SAS chunk text, so judging stays meaningful). With
+        # neither there is nothing to grade *against* — skip, don't fail.
+        if run.items:
+            sources = [_item_source(item) for item in run.items]
+        elif run.prompts:
+            sources = run.prompts
+        else:
+            return self._result(1.0, "no source context to judge", skipped=True)
         scores: list[float] = []
         unparseable = 0
-        for item, response in zip(run.items, run.responses):
+        for source, response in zip(sources, run.responses):
             prompt = _JUDGE_TEMPLATE.format(
                 output_language=self._output_language,
-                sas_source=_item_source(item),
+                sas_source=source,
                 translation=response,
             )
             reply = self._llm.invoke(prompt)
@@ -102,13 +110,15 @@ class LLMJudgeMetric(ValidationMetric):
             match = _SCORE_RE.search(reply_text)
             if match is None:
                 logger.warning(
-                    f"llm_judge: unparseable judge reply for case "
-                    f"'{run.case.case_id}': {reply_text[:80]!r}"
+                    f"llm_judge: unparseable judge reply for run "
+                    f"'{run.run_id}': {reply_text[:80]!r}"
                 )
                 unparseable += 1
                 scores.append(0.0)
                 continue
             scores.append((int(match.group(1)) - 1) / 4)
+        if not scores:
+            return self._result(0.0, "no responses to judge")
         details = f"mean of {len(scores)} judged item(s)"
         if unparseable:
             details += f"; {unparseable} unparseable repl(y/ies) scored 0"

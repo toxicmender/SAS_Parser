@@ -1,11 +1,18 @@
 # validation
 
-Offline validation harness for the SAS → LLM pipeline: run a set of
-declarative evaluation cases through `SasLLMPipeline`, score the LLM outputs
-with deterministic metrics (plus an optional LLM judge), and optionally
-append each run to a **Spark-backed history** — a local parquet directory by
-default (`./validation_runs`; no server, no service), a Delta table on
-Databricks.
+Validation harness for the SAS → LLM pipeline, with two front doors over one
+scoring core:
+
+- **Offline cases**: run declarative evaluation cases through
+  `SasLLMPipeline` and score the outputs (`ValidationRunner`).
+- **Live conversations** (post-hoc, observe-only): score a conversation that
+  already happened — an existing memory-store thread by `thread_id`, or any
+  arbitrary (prompt, response) transcript — without re-running the pipeline.
+
+Both produce the same result models, scored by deterministic metrics (plus
+an optional LLM judge), and optionally append to a **Spark-backed history**
+— a local parquet directory by default (`./validation_runs`; no server, no
+service), a Delta table on Databricks.
 
 ## Why pyspark for tracking
 
@@ -27,31 +34,36 @@ pipeline's inputs/outputs, and Spark is only booted inside
 ## Layout
 
 ```
-models.py    ValidationCase, CaseRun, MetricResult, CaseResult,
-             ValidationReport (with to_markdown()).
-metrics.py   Deterministic metrics + default_metrics():
-               response_coverage    every item answered            (>= 1.0)
-               dataset_fidelity     item's dataset names appear
-                                    in its response                (>= 0.75)
-               python_syntax        fenced Python blocks ast.parse (>= 1.0)
-               required_terms       case-declared substrings       (>= 1.0)
-               reference_similarity token-F1 vs golden reference   (>= 0.5)
-judge.py     LLMJudgeMetric — grades functional equivalence 1–5 with any
-             LangChain-style model (or an llm_client.LLMClient). Opt-in;
-             never part of default_metrics().
-runner.py    ValidationRunner: cases -> pipeline -> metrics -> report.
-dataset.py   load_cases(): *.json case files (inline sas_source or a
-             sas_path reference next to the JSON).
-tracking.py  log_report(): one row per (run, case, metric) appended to a
-             Spark target — parquet directory locally, saveAsTable (Delta)
-             on Databricks. load_runs() reads the history back as a
-             DataFrame for trend queries.
-cases/       Sample cases.
+models.py        ValidationCase, EvaluationRun (case-free scoring unit),
+                 CaseRun (case-derived subclass), MetricResult, CaseResult,
+                 ValidationReport (with to_markdown()).
+metrics.py       Deterministic metrics + default_metrics():
+                   response_coverage    every unit answered            (>= 1.0)
+                   dataset_fidelity     item's dataset names appear
+                                        in its response                (>= 0.75)
+                   python_syntax        fenced Python blocks ast.parse (>= 1.0)
+                   required_terms       declared substrings            (>= 1.0)
+                   reference_similarity token-F1 vs golden reference   (>= 0.5)
+judge.py         LLMJudgeMetric — grades functional equivalence 1–5 with any
+                 LangChain-style model (or an llm_client.LLMClient). Opt-in;
+                 never part of default_metrics().
+evaluator.py     Evaluator — the scoring core: one EvaluationRun in, one
+                 CaseResult out. Everything funnels through here.
+runner.py        ValidationRunner: cases -> pipeline -> Evaluator -> report.
+conversation.py  validate_thread() / validate_transcript() (and their
+                 run_from_*() builders): post-hoc live-conversation scoring.
+dataset.py       load_cases(): *.json case files (inline sas_source or a
+                 sas_path reference next to the JSON).
+tracking.py      log_report(): one row per (run, case, metric) appended to a
+                 Spark target — parquet directory locally, saveAsTable
+                 (Delta) on Databricks. load_runs() reads the history back
+                 as a DataFrame for trend queries.
+cases/           Sample cases.
 ```
 
 Thresholds resolve with the repo-wide precedence rule (`app_config`):
 explicit constructor argument > config.json `validation.<name>_threshold` >
-the metric's class default. Metrics that a case carries no signal for
+the metric's class default. Metrics that a run carries no signal for
 (no reference translation, no required terms, no datasets) report
 `skipped` — they pass and are excluded from the case score.
 
@@ -61,10 +73,10 @@ CLI (exit code gates CI — 0 iff every case passed):
 
 ```bash
 # deterministic metrics against a live model (needs ANTHROPIC_API_KEY):
-python -m validation validation/cases --model claude-haiku-4-5-20251001
+python -m validation validation/cases --model claude-sonnet-4-5
 
 # + LLM judge, + append to the local run history (./validation_runs):
-python -m validation validation/cases --judge-model claude-haiku-4-5-20251001 --track
+python -m validation validation/cases --judge-model claude-sonnet-4-5 --track
 
 # on Databricks, target a Delta table instead:
 python -m validation validation/cases --track --table main.qa.validation_runs
@@ -81,6 +93,49 @@ pipeline = SasLLMPipeline(llm=FakeListChatModel(responses=["..."]))
 report = ValidationRunner(pipeline).run(load_cases("validation/cases"))
 print(report.to_markdown())
 ```
+
+## Live conversations (post-hoc)
+
+Score a thread the pipeline already ran — reconstructed from the memory
+store's (human, AI) turn pairs, never re-executed:
+
+```python
+from validation import validate_thread
+
+# after pipeline.run_text(..., thread_id="run::job1.sas") has happened:
+result = validate_thread(pipeline, "run::job1.sas", required_terms=["groupBy"])
+print(result.passed, result.score)
+```
+
+`validate_thread` accepts a `SasLLMPipeline` or a bare `MemoryHub`; with a
+pipeline the outputs carry their real item ids (recovered from the run
+facts), otherwise turns are labelled `turn-<n>`. From the CLI, against a
+Delta-backed store:
+
+```bash
+python -m validation --thread run::job1.sas --delta-table main.ml.langchain_memory
+```
+
+Arbitrary transcripts work too — `(prompt, response)` pairs or a LangChain
+message list:
+
+```python
+from validation import validate_transcript
+
+result = validate_transcript(
+    [("translate: data a; run;", "```python\ndf = spark.table('a')\n```")],
+    run_id="adhoc",
+)
+```
+
+Caveats of item-less scoring: the chunker/batcher items are not persisted,
+so `dataset_fidelity` skips ("no item metadata"), `response_coverage` counts
+turns instead of items, and the LLM judge grades against each turn's prompt
+(which, for pipeline threads, embeds the SAS chunk text). Failure handling
+is observe-only: results are returned/logged, nothing gates or retries.
+Wrap results in a `ValidationReport(model=..., results=[...])` to reuse
+`to_markdown()` / `log_report()` — `case_id` simply carries the thread or
+transcript id.
 
 Querying the accumulated history:
 

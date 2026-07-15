@@ -75,6 +75,16 @@ def test_unreadable_file_is_skipped(monkeypatch, tmp_path):
     assert app_config.get_value("x", "y", "fallback") == "fallback"
 
 
+def test_bom_prefixed_file_loads(_isolated_config):
+    # Windows editors and PowerShell 5.1 commonly prepend a UTF-8 BOM, which
+    # the loader must tolerate (utf-8-sig) instead of skipping the file.
+    _isolated_config.write_bytes(
+        b"\xef\xbb\xbf" + json.dumps({"sas_chunker": {"min_words": 42}}).encode("utf-8")
+    )
+    app_config.clear_cache()
+    assert app_config.get_value("sas_chunker", "min_words", 300) == 42
+
+
 def test_repo_config_json_matches_code_defaults():
     """The shipped template must be a no-op: every value == the hard default."""
     repo_cfg = json.loads(
@@ -184,6 +194,33 @@ def test_llm_client_value_checks_url_header_values(_isolated_config):
     assert app_config.llm_client_value("url_headers") == {"X-Team": "sas"}
 
 
+def test_llm_client_model_accepts_accessible_variants(_isolated_config):
+    # Bare IDs, provider prefixes, and dated snapshots of accessible models
+    # all resolve; the allowlist spans every provider we can reach.
+    for value in (
+        "claude-sonnet-4-5",
+        "anthropic:claude-opus-4-6",
+        "claude-sonnet-4-5-20250929",
+        "openai:gpt-5.4",
+        "gemini-3.1-pro",
+    ):
+        _set(_isolated_config, {"llm_client": {"model": value}})
+        assert app_config.llm_client_value("model") == value
+
+
+def test_llm_client_model_rejects_inaccessible_with_warning(
+    _isolated_config, caplog
+):
+    _set(_isolated_config, {"llm_client": {"model": "claude-2.1"}})
+    with caplog.at_level(logging.WARNING, logger="app_config"):
+        assert (
+            app_config.llm_client_value("model", "fallback-model")
+            == "fallback-model"
+        )
+    assert "claude-2.1" in caplog.text
+    assert "not an accessible model" in caplog.text
+
+
 def test_llm_client_value_rejects_unknown_key():
     # api_key is deliberately outside the schema: secrets never come from
     # config.json, and any other unknown key is a programming error.
@@ -207,7 +244,7 @@ def test_malformed_llm_client_section_degrades_gracefully(_isolated_config):
         },
     )
     cfg = LLMClientConfig()  # must not raise: bad entries -> hard defaults
-    assert cfg.model == "claude-haiku-4-5-20251001"
+    assert cfg.model == "claude-sonnet-4-5"
     assert cfg.timeout is None
     assert cfg.temperature is None
     assert cfg.url_headers is None
@@ -221,7 +258,7 @@ def test_llm_client_endpoint_knobs_read_config(_isolated_config):
         _isolated_config,
         {
             "llm_client": {
-                "model": "cfg-model",
+                "model": "claude-opus-4-6",
                 "base_url": "https://gateway.example/v1",
                 "url_headers": {"X-Team": "sas"},
                 "timeout": 30,
@@ -232,7 +269,7 @@ def test_llm_client_endpoint_knobs_read_config(_isolated_config):
         },
     )
     cfg = LLMClientConfig()
-    assert cfg.model == "cfg-model"
+    assert cfg.model == "claude-opus-4-6"
     assert cfg.base_url == "https://gateway.example/v1"
     assert cfg.url_headers == {"X-Team": "sas"}
     assert cfg.timeout == 30
@@ -254,5 +291,5 @@ def test_defaults_without_config(_isolated_config):
     assert InstructionChunker().max_words == 900
     assert PromptBuilder([]).max_instruction_words == 1500
     assert LLMClientConfig().max_input_tokens is None
-    assert LLMClientConfig().model == "claude-haiku-4-5-20251001"
+    assert LLMClientConfig().model == "claude-sonnet-4-5"
     assert LLMClientConfig().max_retries == 3

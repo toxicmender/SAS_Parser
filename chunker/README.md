@@ -56,7 +56,7 @@ is only needed when you use it):
 ```python
 from chunker import SasLLMPipeline
 
-pipeline = SasLLMPipeline(model="claude-haiku-4-5-20251001")
+pipeline = SasLLMPipeline(model="claude-sonnet-4-5")
 outputs  = pipeline.run_files(["macros.sas", "etl.sas", "reports.sas"])
 ```
 
