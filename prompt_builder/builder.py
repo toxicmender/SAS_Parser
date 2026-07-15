@@ -361,6 +361,8 @@ class PromptBuilder:
         constructs: Iterable[ConstructKey] = (),
         *,
         output_language: str | None = None,
+        kinds: Iterable[str] = (),
+        meta_flags: Iterable[str] = (),
     ) -> str | None:
         """
         The Markdown block(s) for one item — a ``## Project instructions``
@@ -372,9 +374,10 @@ class PromptBuilder:
         omitted when empty — or ``None`` when nothing at all is relevant (so
         the caller injects no block).
 
-        *output_language* filters language-scoped user instructions (see
-        :meth:`InstructionSelector.select_detailed`); ``None`` falls back to
-        the builder's construction-time ``output_language``.
+        *output_language*, *kinds*, and *meta_flags* filter language-,
+        chunk-kind-, and metadata-scoped user instructions (see
+        :meth:`InstructionSelector.select_detailed`); *output_language*
+        ``None`` falls back to the builder's construction-time value.
         """
         constructs = list(constructs)
         language = (
@@ -386,6 +389,8 @@ class PromptBuilder:
             max_words=self.max_instruction_words,
             top_k=self.top_k,
             language=language,
+            kinds=kinds,
+            meta_flags=meta_flags,
         )
         if not picks:
             logger.debug("build: no relevant instruction chunks; no block")

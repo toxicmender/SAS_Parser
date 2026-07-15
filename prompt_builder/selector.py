@@ -44,8 +44,12 @@ from .user_instructions import (
     SCOPE_TOPIC,
     SCOPE_WHEN,
     UserInstructionSet,
+    kinds_of,
     langs_of,
+    metas_of,
+    normalize_kind,
     normalize_language,
+    normalize_meta,
     scope_of,
 )
 
@@ -185,9 +189,11 @@ class InstructionSelector:
         )
 
         self._wc = [len(c.text.split()) for c in self._chunks]
-        # Per-chunk language scope (empty = language-agnostic). Reference
-        # chunks never carry lang tags, so they pass any language filter.
+        # Per-chunk modifier scopes (empty = agnostic on that axis). Reference
+        # chunks never carry these tags, so they pass every modifier filter.
         self._langs = [frozenset(langs_of(c)) for c in self._chunks]
+        self._kinds = [frozenset(kinds_of(c)) for c in self._chunks]
+        self._metas = [frozenset(metas_of(c)) for c in self._chunks]
 
         self._by_construct: dict[ConstructKey, list[int]] = defaultdict(list)
         for i, chunk in enumerate(self._chunks[:reference_count]):
@@ -235,15 +241,17 @@ class InstructionSelector:
         max_words: int = 1500,
         top_k: int = 6,
         language: str | None = None,
+        kinds: Iterable[str] = (),
+        meta_flags: Iterable[str] = (),
     ) -> list[InstructionChunk]:
         """
         Chunks to inject for one item, in priority order — user always ->
         user construct-matched -> user examples -> reference pinned ->
         hazard constructs -> other constructs -> user topical -> reference
         topical — filling ``max_words`` and taking at most ``top_k`` topical
-        chunks in total. Empty when nothing is relevant. *language* filters
-        out any chunk scoped to a different output language (see
-        :meth:`select_detailed`).
+        chunks in total. Empty when nothing is relevant. *language*, *kinds*,
+        and *meta_flags* filter out chunks scoped to a different target /
+        chunk kind / metadata flag (see :meth:`select_detailed`).
         """
         return [
             pick.chunk
@@ -253,6 +261,8 @@ class InstructionSelector:
                 max_words=max_words,
                 top_k=top_k,
                 language=language,
+                kinds=kinds,
+                meta_flags=meta_flags,
             )
         ]
 
@@ -264,6 +274,8 @@ class InstructionSelector:
         max_words: int = 1500,
         top_k: int = 6,
         language: str | None = None,
+        kinds: Iterable[str] = (),
+        meta_flags: Iterable[str] = (),
     ) -> list[SelectedInstruction]:
         """
         :meth:`select`, but each pick carries its provenance — the
@@ -271,12 +283,23 @@ class InstructionSelector:
         tiers, the construct key that matched — so formatting can treat
         picks differently by tier (e.g. render hazard hits as focus hints).
 
-        *language* is the run's ``output_language``. When given, a chunk
-        scoped to specific languages (via ``[lang: ...]``) is skipped unless
-        one of them matches; language-agnostic chunks always pass. ``None``
-        disables the filter — every language-scoped chunk is kept.
+        Three orthogonal modifier filters gate every chunk that declares the
+        matching scope (an undeclared chunk always passes that axis):
+
+        * *language* — the run's ``output_language``; a ``[lang: ...]`` chunk
+          passes only when one of its languages matches. ``None`` disables
+          this axis (every language-scoped chunk is kept).
+        * *kinds* — the item's :class:`~chunker.models.SasChunkKind` values; a
+          ``[kind: ...]`` chunk passes only when they intersect.
+        * *meta_flags* — the item's metadata predicate flags; a ``[meta: ...]``
+          chunk passes only when they intersect.
+
+        The item's kinds/flags arrive as plain strings from the pipeline, so
+        the selector needs no ``chunker`` import.
         """
         active_lang = normalize_language(language) if language else None
+        item_kinds = frozenset(normalize_kind(k) for k in kinds)
+        item_metas = frozenset(normalize_meta(m) for m in meta_flags)
         chosen: list[SelectedInstruction] = []
         chosen_set: set[int] = set()
         used = 0
@@ -292,11 +315,17 @@ class InstructionSelector:
             nonlocal used, user_used
             if idx in chosen_set:
                 return False
+            # Modifier gates: a chunk scoped on an axis is skipped unless the
+            # item matches it. An unscoped chunk (empty set) passes the axis.
             if (
                 active_lang is not None
                 and self._langs[idx]
                 and active_lang not in self._langs[idx]
             ):
+                return False
+            if self._kinds[idx] and not (self._kinds[idx] & item_kinds):
+                return False
+            if self._metas[idx] and not (self._metas[idx] & item_metas):
                 return False
             is_user = idx >= self._reference_count
             over_user_cap = (

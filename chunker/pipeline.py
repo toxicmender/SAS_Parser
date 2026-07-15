@@ -192,6 +192,47 @@ def _constructs_for_item(item: SasBatch | SasChunk) -> list[ConstructKey]:
     return keys
 
 
+def _kinds_for_item(item: SasBatch | SasChunk) -> set[str]:
+    """The SasChunkKind values an item uses, as ``[kind: ...]`` scope tokens."""
+    chunks = item.chunks if isinstance(item, SasBatch) else [item]
+    return {c.kind.value for c in chunks}
+
+
+# Metadata predicate flags, keyed by the ``[meta: ...]`` token an instruction
+# scopes on. Each maps to a metadata attribute that is truthy when the flag
+# holds; the pipeline owns this vocabulary so prompt_builder treats the tokens
+# as opaque. Kept in sync with the docstring in user_instructions.py.
+_META_FLAG_ATTRS: tuple[tuple[str, str], ...] = (
+    ("symput_hazard", "symput_scope_hazard"),
+    ("abort", "contains_abort"),
+    ("computed_goto", "contains_computed_goto"),
+    ("component_object", "component_objects"),
+    ("unclosed_block", "has_unclosed_block"),
+    ("includes", "includes"),
+    ("defines_macros", "defines_macros"),
+    ("invokes_macros", "invokes_macros"),
+    ("produces_macrovars", "produces_macrovars"),
+    ("automatic_vars", "referenced_automatic_vars"),
+)
+
+
+def _meta_flags_for_item(item: SasBatch | SasChunk) -> set[str]:
+    """The metadata predicate flags an item raises, as ``[meta: ...]`` tokens.
+
+    Unioned over member chunks (a batch flag holds if any member raises it),
+    so an instruction scoped ``[meta: symput_hazard]`` fires for a batch that
+    contains a SYMPUT scope hazard anywhere inside it.
+    """
+    chunks = item.chunks if isinstance(item, SasBatch) else [item]
+    flags: set[str] = set()
+    for chunk in chunks:
+        m = chunk.metadata
+        for token, attr in _META_FLAG_ATTRS:
+            if token not in flags and getattr(m, attr):
+                flags.add(token)
+    return flags
+
+
 def _diagnostics_for_chunk(
     chunk: SasChunk, diagnostics: list[SasDiagnostic]
 ) -> list[SasDiagnostic]:
@@ -865,7 +906,11 @@ class SasLLMPipeline:
         query = _query_for_item(item)
         constructs = _constructs_for_item(item)
         guidance = self._prompt_builder.build(
-            query, constructs, output_language=self._output_language
+            query,
+            constructs,
+            output_language=self._output_language,
+            kinds=_kinds_for_item(item),
+            meta_flags=_meta_flags_for_item(item),
         )
         if not guidance:
             return []

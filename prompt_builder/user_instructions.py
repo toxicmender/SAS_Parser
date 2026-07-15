@@ -18,13 +18,25 @@ scope:
   ``[example]`` (no keys) is unconditional — shown to every item.
 
 A heading may carry several leading bracket groups, combined as AND across
-clauses. ``## [lang: sparksql, pyspark] ...`` restricts a section to the
-named output language(s); it is a modifier, so it stacks with a primary
-scope — ``## [when: proc:sql] [lang: sparksql] SQL rules`` fires only for a
-SparkSQL run whose item uses PROC SQL. A section with no ``[lang: ...]`` is
-language-agnostic. Matching is case/space/underscore-insensitive
-(:func:`normalize_language`), and the run's ``output_language`` is applied
-at selection time.
+clauses. Three **modifier** clauses stack with a primary scope (they never
+set one of their own), each restricting the section further:
+
+* ``## [lang: sparksql, pyspark] ...`` — the run's ``output_language`` must
+  be one of the listed targets. A section with no ``[lang: ...]`` is
+  language-agnostic.
+* ``## [kind: DATA_STEP, PROC_STEP] ...`` — the item must use one of the
+  listed :class:`~chunker.models.SasChunkKind` values.
+* ``## [meta: symput_hazard, unclosed_block] ...`` — the item's metadata must
+  raise one of the listed predicate flags (the vocabulary the pipeline emits:
+  ``symput_hazard``, ``abort``, ``computed_goto``, ``component_object``,
+  ``unclosed_block``, ``includes``, ``defines_macros``, ``invokes_macros``,
+  ``produces_macrovars``, ``automatic_vars``).
+
+So ``## [when: proc:sql] [kind: PROC_STEP] [lang: sparksql] SQL rules`` fires
+only for a SparkSQL run whose item is a PROC step using PROC SQL. All three
+match case/space/underscore-insensitively and are applied at selection time;
+the item's kinds/flags reach the selector as plain strings from the
+pipeline, so this module stays free of any ``chunker`` import.
 
 A heading-less string is a single always-on instruction; non-empty text
 before the first heading becomes an always-on "General" instruction. Parsing
@@ -48,7 +60,7 @@ import hashlib
 import logging
 import re
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable, NamedTuple
 
 import app_config
 from pydantic import BaseModel, Field
@@ -63,16 +75,19 @@ SCOPE_TOPIC = "topic"
 SCOPE_EXAMPLE = "example"
 
 # A heading carries zero or more leading ``[...]`` groups; each is one scope
-# clause (``when:``/``topic``/``example``/``lang:``). Groups combine as AND
-# across clauses: a single primary scope (when/topic/example, else always)
-# coexists with orthogonal ``lang:`` filters — e.g.
-# ``## [when: proc:sql] [lang: sparksql] SQL rules``.
+# clause (``when:``/``topic``/``example``/``lang:``/``kind:``/``meta:``).
+# Groups combine as AND across clauses: a single primary scope (when/topic/
+# example, else always) coexists with the orthogonal ``lang:``/``kind:``/
+# ``meta:`` filters — e.g.
+# ``## [when: proc:sql] [kind: PROC_STEP] [lang: sparksql] SQL rules``.
 _HEADING_RE = re.compile(r"^\s{0,3}##+\s*(?P<heading>.*\S)\s*$", re.MULTILINE)
 _GROUP_RE = re.compile(r"^\[(?P<body>[^\]]*)\]")
 _KEY_RE = re.compile(r"^[a-z_]\w*:\S+$")
 
 _SCOPE_TAG_PREFIX = "scope:"
 _LANG_TAG_PREFIX = "lang:"
+_KIND_TAG_PREFIX = "kind:"
+_META_TAG_PREFIX = "meta:"
 
 _PREAMBLE_TITLE = "General"
 
@@ -87,12 +102,47 @@ def normalize_language(name: str) -> str:
     return re.sub(r"[\s_-]+", "", name.lower())
 
 
+def normalize_kind(name: str) -> str:
+    """Fold a ``[kind: ...]`` token to a :class:`SasChunkKind` value key.
+
+    Upper-cased with spaces/hyphens folded to underscores, so ``data step``,
+    ``data-step``, and ``DATA_STEP`` all match the ``DATA_STEP`` chunk kind.
+    """
+    return re.sub(r"[\s-]+", "_", name.strip().upper())
+
+
+def normalize_meta(name: str) -> str:
+    """Fold a ``[meta: ...]`` predicate token to its comparison key.
+
+    Lower-cased with spaces/hyphens folded to underscores, matching the flag
+    vocabulary the pipeline emits (``symput_hazard``, ``unclosed_block``, ...).
+    """
+    return re.sub(r"[\s-]+", "_", name.strip().lower())
+
+
 def _scope_tag(scope: str) -> str:
     return f"{_SCOPE_TAG_PREFIX}{scope}"
 
 
-def _lang_tag(language: str) -> str:
-    return f"{_LANG_TAG_PREFIX}{language}"
+def _tags_with_prefix(chunk: InstructionChunk, prefix: str) -> list[str]:
+    return [
+        tag.removeprefix(prefix) for tag in chunk.tags if tag.startswith(prefix)
+    ]
+
+
+def _section_tags(
+    scope: str,
+    langs: Iterable[str],
+    kinds: Iterable[str],
+    metas: Iterable[str],
+) -> list[str]:
+    """The tag list stored on a parsed instruction chunk: scope + modifiers."""
+    return [
+        _scope_tag(scope),
+        *(f"{_LANG_TAG_PREFIX}{x}" for x in langs),
+        *(f"{_KIND_TAG_PREFIX}{x}" for x in kinds),
+        *(f"{_META_TAG_PREFIX}{x}" for x in metas),
+    ]
 
 
 def scope_of(chunk: InstructionChunk) -> str:
@@ -110,11 +160,27 @@ def langs_of(chunk: InstructionChunk) -> list[str]:
     non-empty list restricts the chunk to those languages (matched at
     selection time against the run's ``output_language``).
     """
-    return [
-        tag.removeprefix(_LANG_TAG_PREFIX)
-        for tag in chunk.tags
-        if tag.startswith(_LANG_TAG_PREFIX)
-    ]
+    return _tags_with_prefix(chunk, _LANG_TAG_PREFIX)
+
+
+def kinds_of(chunk: InstructionChunk) -> list[str]:
+    """The :class:`SasChunkKind` values a chunk is scoped to.
+
+    Empty means kind-agnostic. A non-empty list restricts the chunk to items
+    that use one of those chunk kinds (matched at selection time against the
+    item's kinds).
+    """
+    return _tags_with_prefix(chunk, _KIND_TAG_PREFIX)
+
+
+def metas_of(chunk: InstructionChunk) -> list[str]:
+    """The metadata predicate flags a chunk is scoped to.
+
+    Empty means metadata-agnostic. A non-empty list restricts the chunk to
+    items whose metadata raises one of those flags (matched at selection time
+    against the item's flags).
+    """
+    return _tags_with_prefix(chunk, _META_TAG_PREFIX)
 
 
 class UserInstructionSet(BaseModel):
@@ -154,7 +220,7 @@ class UserInstructionSet(BaseModel):
         section. Explicit ``[lang: ...]`` on a section overrides the default.
         """
         fingerprint = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
-        fallback_langs = [normalize_language(l) for l in default_langs if l]
+        fallback_langs = [normalize_language(x) for x in default_langs if x]
         chunks: list[InstructionChunk] = []
         diagnostics: list[InstructionDiagnostic] = []
 
@@ -168,10 +234,10 @@ class UserInstructionSet(BaseModel):
                     )
                 )
                 continue
-            scope, clean_title, keys, langs = _parse_heading(
-                title, doc_id, diagnostics
-            )
-            section_langs = langs or fallback_langs
+            parsed = _parse_heading(title, doc_id, diagnostics)
+            scope, clean_title, keys = parsed.scope, parsed.title, parsed.keys
+            kinds, metas = parsed.kinds, parsed.metas
+            section_langs = parsed.langs or fallback_langs
             chunks.append(
                 InstructionChunk(
                     chunk_id=f"{doc_id}::c{len(chunks):04d}",
@@ -182,7 +248,7 @@ class UserInstructionSet(BaseModel):
                     page_end=0,
                     role=DocRole.USER_INSTRUCTION,
                     construct_keys=keys,
-                    tags=[_scope_tag(scope), *(_lang_tag(l) for l in section_langs)],
+                    tags=_section_tags(scope, section_langs, kinds, metas),
                 )
             )
 
@@ -359,16 +425,37 @@ def _split_sections(text: str) -> list[tuple[str, str]]:
     return sections
 
 
+class _ParsedHeading(NamedTuple):
+    scope: str
+    title: str
+    keys: list[ConstructKey]
+    langs: list[str]
+    kinds: list[str]
+    metas: list[str]
+
+
+class _GroupResult(NamedTuple):
+    # scope is None for pure modifiers (lang/kind/meta), which never set a
+    # primary scope; a recognised primary group (when/topic/example/always)
+    # sets it. keys belong to the primary scope; the rest are modifier tokens.
+    scope: str | None
+    keys: list[ConstructKey]
+    langs: list[str]
+    kinds: list[str]
+    metas: list[str]
+
+
 def _parse_heading(
     heading: str,
     doc_id: str,
     diagnostics: list[InstructionDiagnostic],
-) -> tuple[str, str, list[ConstructKey], list[str]]:
-    """``(scope, clean_title, construct_keys, langs)`` for one section heading.
+) -> _ParsedHeading:
+    """The scope, clean title, and every scope clause for one section heading.
 
     Consumes every leading ``[...]`` group. One primary scope (when/topic/
-    example, else always) is combined with any orthogonal ``[lang: ...]``
-    filters. When several primary-scope groups appear the last one wins.
+    example, else always) is combined with any orthogonal ``[lang: ...]`` /
+    ``[kind: ...]`` / ``[meta: ...]`` filters. When several primary-scope
+    groups appear the last one wins.
     """
     text = heading.strip()
     groups: list[str] = []
@@ -381,28 +468,34 @@ def _parse_heading(
     title = text.strip()
 
     if not groups:
-        return SCOPE_ALWAYS, title, [], []
+        return _ParsedHeading(SCOPE_ALWAYS, title, [], [], [], [])
 
     scope = SCOPE_ALWAYS
     keys: list[ConstructKey] = []
     langs: list[str] = []
+    kinds: list[str] = []
+    metas: list[str] = []
+
+    def _extend(dest: list[str], src: list[str]) -> None:
+        for token in src:
+            if token not in dest:
+                dest.append(token)
+
     for body in groups:
-        g_scope, g_keys, g_langs = _classify_group(
-            body, heading, doc_id, diagnostics
-        )
-        if g_scope is not None:
-            scope = g_scope
-            if g_keys:
-                keys = g_keys
-        for language in g_langs:
-            if language not in langs:
-                langs.append(language)
+        result = _classify_group(body, heading, doc_id, diagnostics)
+        if result.scope is not None:
+            scope = result.scope
+            if result.keys:
+                keys = result.keys
+        _extend(langs, result.langs)
+        _extend(kinds, result.kinds)
+        _extend(metas, result.metas)
 
     # A directive-only heading (no trailing title) falls back to the last
     # directive body as its label, matching the pre-stacking behaviour.
     if not title:
         title = groups[-1] or _PREAMBLE_TITLE
-    return scope, title, keys, langs
+    return _ParsedHeading(scope, title, keys, langs, kinds, metas)
 
 
 def _classify_group(
@@ -410,29 +503,35 @@ def _classify_group(
     heading: str,
     doc_id: str,
     diagnostics: list[InstructionDiagnostic],
-) -> tuple[str | None, list[ConstructKey], list[str]]:
-    """One bracket group -> ``(primary_scope | None, keys, langs)``.
+) -> _GroupResult:
+    """Classify one bracket group into a scope and/or modifier tokens.
 
-    ``lang:`` groups return ``None`` as the scope (a modifier, not a primary
-    scope); every other recognised group returns its scope. Unknown groups
+    ``lang:`` / ``kind:`` / ``meta:`` groups are modifiers (scope ``None``);
+    every other recognised group carries a primary scope. Unknown groups
     degrade to always-on with a diagnostic.
     """
     lowered = body.lower()
 
     if lowered == SCOPE_TOPIC:
-        return SCOPE_TOPIC, [], []
+        return _GroupResult(SCOPE_TOPIC, [], [], [], [])
 
     if lowered == SCOPE_EXAMPLE:
         # Bare [example]: an unconditional few-shot example, shown to every item.
-        return SCOPE_EXAMPLE, [], []
+        return _GroupResult(SCOPE_EXAMPLE, [], [], [], [])
 
     if lowered.startswith("lang:"):
-        return None, [], _parse_lang_tokens(body[5:])
+        return _GroupResult(None, [], _parse_lang_tokens(body[5:]), [], [])
+
+    if lowered.startswith("kind:"):
+        return _GroupResult(None, [], [], _parse_scoped_tokens(body[5:], normalize_kind), [])
+
+    if lowered.startswith("meta:"):
+        return _GroupResult(None, [], [], [], _parse_scoped_tokens(body[5:], normalize_meta))
 
     if lowered.startswith("example:"):
         keys = _parse_when_keys(body[8:], heading, doc_id, diagnostics)
         if keys:
-            return SCOPE_EXAMPLE, keys, []
+            return _GroupResult(SCOPE_EXAMPLE, keys, [], [], [])
         # No usable key: keep it an example (not an always-on rule, which
         # would pollute the rules block) but drop the condition — shown to
         # every item rather than silently vanishing.
@@ -445,12 +544,12 @@ def _classify_group(
                 doc_id=doc_id,
             )
         )
-        return SCOPE_EXAMPLE, [], []
+        return _GroupResult(SCOPE_EXAMPLE, [], [], [], [])
 
     if lowered.startswith("when:"):
         keys = _parse_when_keys(body[5:], heading, doc_id, diagnostics)
         if keys:
-            return SCOPE_WHEN, keys, []
+            return _GroupResult(SCOPE_WHEN, keys, [], [], [])
         # No usable key: over-include rather than silently drop the rule.
         diagnostics.append(
             InstructionDiagnostic(
@@ -460,7 +559,7 @@ def _classify_group(
                 doc_id=doc_id,
             )
         )
-        return SCOPE_ALWAYS, [], []
+        return _GroupResult(SCOPE_ALWAYS, [], [], [], [])
 
     diagnostics.append(
         InstructionDiagnostic(
@@ -470,17 +569,22 @@ def _classify_group(
             doc_id=doc_id,
         )
     )
-    return SCOPE_ALWAYS, [], []
+    return _GroupResult(SCOPE_ALWAYS, [], [], [], [])
 
 
 def _parse_lang_tokens(raw: str) -> list[str]:
     """Comma-separated ``[lang: ...]`` tokens, normalized and de-duped."""
-    langs: list[str] = []
+    return _parse_scoped_tokens(raw, normalize_language)
+
+
+def _parse_scoped_tokens(raw: str, normalize: Callable[[str], str]) -> list[str]:
+    """Comma-separated modifier tokens, normalized via *normalize* and deduped."""
+    out: list[str] = []
     for token in raw.split(","):
-        language = normalize_language(token.strip())
-        if language and language not in langs:
-            langs.append(language)
-    return langs
+        value = normalize(token.strip())
+        if value and value not in out:
+            out.append(value)
+    return out
 
 
 def _parse_when_keys(

@@ -39,8 +39,10 @@ several languages coexist here without leaking into each other.
 
 Standard `user_instructions` heading directives apply — `## [when: proc:sql]
 …`, `## [topic] …`, `## [example: …] …` — and stack with the implicit
-language scope. A section may override the directory's language with its own
-`## [lang: …] …`. See `prompt_builder/README.md` for the full grammar.
+language scope and the other modifier clauses `## [kind: PROC_STEP] …` and
+`## [meta: symput_hazard] …`. A section may override the directory's language
+with its own `## [lang: …] …`. See `prompt_builder/README.md` for the full
+grammar.
 
 The SparkSQL set is synthesised from the [Spark SQL
 reference](https://spark.apache.org/docs/latest/sql-ref.html) and the

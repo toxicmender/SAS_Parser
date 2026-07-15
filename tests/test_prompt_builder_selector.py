@@ -413,6 +413,74 @@ def test_language_filter_leaves_reference_chunks_untouched():
 
 
 # ---------------------------------------------------------------------------
+# Kind / meta scoping — [kind: ...] / [meta: ...] filter by the item's kinds
+# and metadata flags (passed as plain strings by the pipeline)
+# ---------------------------------------------------------------------------
+
+
+KIND_META_RULES = """\
+## Always rule
+Applies to every item.
+
+## [kind: DATA_STEP] Data-step rule
+Only for DATA steps.
+
+## [meta: symput_hazard] Hazard rule
+Only when a SYMPUT scope hazard is present.
+
+## [kind: PROC_STEP] [when: proc:sql] SQL step rule
+PROC SQL steps only.
+"""
+
+
+def _km_selector() -> InstructionSelector:
+    return InstructionSelector(
+        _corpus(), user_instructions=UserInstructionSet.from_text(KIND_META_RULES)
+    )
+
+
+def test_kind_scoped_rule_fires_only_for_matching_kind():
+    sel = _km_selector()
+    for_data = [c.chunk_id for c in sel.select("zzz", [], kinds=["DATA_STEP"])]
+    for_proc = [c.chunk_id for c in sel.select("zzz", [], kinds=["PROC_STEP"])]
+    assert "user::c0001" in for_data  # [kind: DATA_STEP]
+    assert "user::c0001" not in for_proc
+    assert "user::c0000" in for_proc  # always rule still fires
+
+
+def test_kind_matching_is_normalized():
+    sel = _km_selector()
+    ids = [c.chunk_id for c in sel.select("zzz", [], kinds=["data step"])]
+    assert "user::c0001" in ids  # "data step" -> DATA_STEP
+
+
+def test_meta_scoped_rule_fires_only_when_flag_present():
+    sel = _km_selector()
+    with_flag = [c.chunk_id for c in sel.select("zzz", [], meta_flags=["symput_hazard"])]
+    without = [c.chunk_id for c in sel.select("zzz", [], meta_flags=[])]
+    assert "user::c0002" in with_flag
+    assert "user::c0002" not in without
+
+
+def test_kind_and_construct_scope_combine():
+    sel = _km_selector()
+    # [kind: PROC_STEP] [when: proc:sql] needs both the kind and the construct.
+    both = [c.chunk_id for c in sel.select("zzz", [SQL], kinds=["PROC_STEP"])]
+    wrong_kind = [c.chunk_id for c in sel.select("zzz", [SQL], kinds=["DATA_STEP"])]
+    no_construct = [c.chunk_id for c in sel.select("zzz", [], kinds=["PROC_STEP"])]
+    assert "user::c0003" in both
+    assert "user::c0003" not in wrong_kind
+    assert "user::c0003" not in no_construct
+
+
+def test_unpassed_kind_meta_never_fire_scoped_rules():
+    sel = _km_selector()
+    # A caller that passes no kinds/flags gets only the agnostic always rule.
+    ids = [c.chunk_id for c in sel.select("zzz", [])]
+    assert ids == ["user::c0000"]
+
+
+# ---------------------------------------------------------------------------
 # select_detailed — tier/construct provenance
 # ---------------------------------------------------------------------------
 

@@ -20,6 +20,8 @@ from chunker.models import SasBatch, SasChunk, SasChunkKind, SasChunkMetadata
 from chunker.pipeline import (
     SasLLMPipeline,
     _constructs_for_item,
+    _kinds_for_item,
+    _meta_flags_for_item,
     _query_for_item,
 )
 from memory.store import MemoryHub
@@ -201,6 +203,60 @@ def test_instruction_injected_only_when_construct_present_in_batch():
     assert builder.build(
         _query_for_item(other_batch), _constructs_for_item(other_batch)
     ) is None  # neither rule's construct present -> no guidance at all
+
+
+# ---------------------------------------------------------------------------
+# [kind:] / [meta:] item mapping and end-to-end gating
+# ---------------------------------------------------------------------------
+
+
+def test_kinds_for_item_unions_member_kinds():
+    batch = _batch(
+        _meta_chunk("c1", kind=SasChunkKind.DATA_STEP),
+        _meta_chunk("c2", kind=SasChunkKind.PROC_STEP, proc_name="sql"),
+    )
+    assert _kinds_for_item(batch) == {"DATA_STEP", "PROC_STEP"}
+    assert _kinds_for_item(_intnx_chunk()) == {"DATA_STEP"}
+
+
+def test_meta_flags_for_item_maps_metadata_predicates():
+    batch = _batch(
+        _meta_chunk("c1", symput_scope_hazard=True),
+        _meta_chunk("c2", component_objects=["hash"], has_unclosed_block=True),
+    )
+    flags = _meta_flags_for_item(batch)
+    assert {"symput_hazard", "component_object", "unclosed_block"} <= flags
+    assert "abort" not in flags
+
+
+def test_kind_and_meta_gate_instruction_injection_end_to_end():
+    rules = (
+        "## [kind: PROC_STEP] PROC rule\nOnly for PROC steps.\n"
+        "## [meta: symput_hazard] SYMPUT rule\nMind the write/read ordering."
+    )
+    builder = PromptBuilder([], user_instructions=rules)
+
+    proc_batch = _batch(_meta_chunk("c1", kind=SasChunkKind.PROC_STEP, proc_name="sql"))
+    out = builder.build(
+        _query_for_item(proc_batch),
+        _constructs_for_item(proc_batch),
+        kinds=_kinds_for_item(proc_batch),
+        meta_flags=_meta_flags_for_item(proc_batch),
+    )
+    assert "PROC rule" in out
+    assert "SYMPUT rule" not in out  # no hazard flag on this batch
+
+    hazard_batch = _batch(
+        _meta_chunk("c2", kind=SasChunkKind.DATA_STEP, symput_scope_hazard=True)
+    )
+    out2 = builder.build(
+        _query_for_item(hazard_batch),
+        _constructs_for_item(hazard_batch),
+        kinds=_kinds_for_item(hazard_batch),
+        meta_flags=_meta_flags_for_item(hazard_batch),
+    )
+    assert "SYMPUT rule" in out2
+    assert "PROC rule" not in out2  # not a PROC step
 
 
 # ---------------------------------------------------------------------------

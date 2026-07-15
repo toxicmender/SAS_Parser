@@ -20,8 +20,12 @@ from prompt_builder.user_instructions import (
     SCOPE_TOPIC,
     SCOPE_WHEN,
     UserInstructionSet,
+    kinds_of,
     langs_of,
+    metas_of,
+    normalize_kind,
     normalize_language,
+    normalize_meta,
     scope_of,
 )
 
@@ -207,6 +211,67 @@ def test_normalize_language_helper():
         == normalize_language("spark_sql")
         == "sparksql"
     )
+
+
+# ---------------------------------------------------------------------------
+# [kind: ...] and [meta: ...] modifier clauses
+# ---------------------------------------------------------------------------
+
+
+def test_kind_directive_scopes_a_section():
+    ins = UserInstructionSet.from_text(
+        "## [kind: DATA_STEP, proc step] Rule\nbody"
+    )
+    chunk = ins.chunks[0]
+    assert scope_of(chunk) == SCOPE_ALWAYS  # kind is a modifier, not a scope
+    assert kinds_of(chunk) == ["DATA_STEP", "PROC_STEP"]  # normalized + deduped
+    assert chunk.section_path == "Rule"
+    assert ins.diagnostics == []
+
+
+def test_meta_directive_scopes_a_section():
+    ins = UserInstructionSet.from_text(
+        "## [meta: symput_hazard, Unclosed-Block] Rule\nbody"
+    )
+    chunk = ins.chunks[0]
+    assert scope_of(chunk) == SCOPE_ALWAYS
+    assert metas_of(chunk) == ["symput_hazard", "unclosed_block"]
+    assert ins.diagnostics == []
+
+
+def test_all_modifiers_stack_with_a_primary_scope():
+    ins = UserInstructionSet.from_text(
+        "## [when: proc:sql] [kind: PROC_STEP] [meta: symput_hazard] "
+        "[lang: sparksql] Rule\nbody"
+    )
+    chunk = ins.chunks[0]
+    assert scope_of(chunk) == SCOPE_WHEN
+    assert chunk.construct_keys == [ConstructKey(kind="proc", name="sql")]
+    assert kinds_of(chunk) == ["PROC_STEP"]
+    assert metas_of(chunk) == ["symput_hazard"]
+    assert langs_of(chunk) == ["sparksql"]
+    assert chunk.section_path == "Rule"
+    assert ins.diagnostics == []
+
+
+def test_agnostic_section_has_no_kind_or_meta():
+    ins = UserInstructionSet.from_text("## Output format\nbody")
+    assert kinds_of(ins.chunks[0]) == []
+    assert metas_of(ins.chunks[0]) == []
+
+
+def test_normalize_kind_and_meta_helpers():
+    assert normalize_kind("data step") == normalize_kind("DATA-STEP") == "DATA_STEP"
+    assert normalize_meta("Symput Hazard") == "symput_hazard"
+
+
+def test_kind_meta_survive_document_round_trip():
+    ins = UserInstructionSet.from_text(
+        "## [kind: DATA_STEP] [meta: symput_hazard] Rule\nbody"
+    )
+    rebuilt = InstructionChunk.from_document(ins.chunks[0].to_document())
+    assert kinds_of(rebuilt) == ["DATA_STEP"]
+    assert metas_of(rebuilt) == ["symput_hazard"]
 
 
 # ---------------------------------------------------------------------------
