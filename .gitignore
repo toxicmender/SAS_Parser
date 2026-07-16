@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# Local secrets / environment (Vault AppRole creds, API keys, ...)
+.env
+
 # Test & coverage reports (CI uploads these as artifacts)
 .coverage
 coverage.xml

@@ -40,5 +40,14 @@
     "llm_judge_threshold": null,
     "table": null,
     "path": null
+  },
+  "_vault_comment": "Non-secret Vault connection settings only. Secrets (VAULT_TOKEN, VAULT_ROLE_ID, VAULT_SECRET_ID) come from the environment, never this file. address/namespace also read from VAULT_ADDR/VAULT_NAMESPACE, which win over these.",
+  "vault": {
+    "address": null,
+    "namespace": null,
+    "mount_point": null,
+    "kv_version": null,
+    "timeout": null,
+    "verify": null
   }
 }
