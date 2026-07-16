@@ -14,6 +14,12 @@ shared batches), and feeds every batch + singleton through the LLM on one
 thread. Per-item reference guidance is retrieved from the `reference_docs`
 corpus and injected ephemerally.
 
+A `validation.LiveValidator` is attached by default, so each batch is scored
+the moment its response returns (deterministic, offline metrics — no extra
+model call) and the verdict is stored in that run's conversation memory
+beside the item's run fact. The demo prints the per-item verdict and an
+aggregate; pass ``--no-validate`` to turn it off.
+
 Usage
 -----
     # needs ANTHROPIC_API_KEY and the `anthropic` extra installed:
@@ -37,6 +43,7 @@ from pathlib import Path
 import app_config
 from chunker import SasLLMPipeline
 from prompt_builder import PromptBuilder
+from validation import LiveValidator
 
 logger = logging.getLogger("demo_run")
 
@@ -91,6 +98,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="If set, write each item's LLM response to a file under this dir.",
     )
     parser.add_argument(
+        "--no-validate",
+        action="store_true",
+        help="Disable the inline LiveValidator (on by default), which scores "
+        "each item as it is answered and stores the verdict in run memory.",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable DEBUG logging for the whole pipeline.",
@@ -136,11 +149,17 @@ def main(argv: list[str] | None = None) -> int:
         model = app_config.llm_client_value("model", _DEFAULT_MODEL)
         logger.info(f"model from config.json/default: {model}")
 
+    # Inline validation (on unless --no-validate): the deterministic, offline
+    # suite scores each item as its response returns, adding no model call, and
+    # stores every verdict in the run's conversation memory.
+    validator = None if args.no_validate else LiveValidator()
+
     # In-memory message store (delta_table=None) — no Spark/JVM is booted.
     pipeline = SasLLMPipeline(
         model=model,
         output_language=args.output_language,
         prompt_builder=builder,
+        validator=validator,
     )
 
     # run_files chunks every file and batches the corpus via MultiFileBatcher,
@@ -153,10 +172,11 @@ def main(argv: list[str] | None = None) -> int:
         args.out_dir.mkdir(parents=True, exist_ok=True)
 
     for out in outputs:
+        verdict = _format_verdict(out.get("validation"))
         header = (
             f"=== {out['item_id']} "
             f"({'batch' if out['is_batch'] else out['kind']}) "
-            f"files={out['source_files']} ==="
+            f"files={out['source_files']}{verdict} ==="
         )
         print(f"\n{header}")
         print(out["response"])
@@ -168,7 +188,49 @@ def main(argv: list[str] | None = None) -> int:
             )
             logger.debug(f"wrote {dest}")
 
+    if validator is not None:
+        _log_validation_summary(outputs)
+
     return 0
+
+
+def _format_verdict(validation: dict | None) -> str:
+    """`  [PASS score=0.95]` for one item's stored verdict, or `""`."""
+    if not validation:
+        return ""
+    status = "PASS" if validation["passed"] else "FAIL"
+    return f"  [{status} score={validation['score']:.2f}]"
+
+
+def _log_validation_summary(outputs: list[dict]) -> None:
+    """Aggregate the per-item inline verdicts and log pass/fail counts.
+
+    The verdicts also live in the run's conversation memory
+    (``pipeline.get_validation_facts(thread_id)``); this is just the run-end
+    read of what was scored inline.
+    """
+    verdicts = [o["validation"] for o in outputs if o.get("validation")]
+    if not verdicts:
+        logger.warning("inline validation on, but no verdicts were recorded")
+        return
+    passed = sum(1 for v in verdicts if v["passed"])
+    mean_score = sum(v["score"] for v in verdicts) / len(verdicts)
+    logger.info(
+        f"inline validation: {passed}/{len(verdicts)} item(s) passed  "
+        f"mean_score={mean_score:.3f}"
+    )
+    for out in outputs:
+        v = out.get("validation")
+        if v and not v["passed"]:
+            failed = [
+                m["metric"]
+                for m in v["metrics"]
+                if not m["passed"] and not m["skipped"]
+            ]
+            logger.warning(
+                f"  FAIL {out['item_id']}  score={v['score']:.3f}  "
+                f"metrics_below_threshold={failed}"
+            )
 
 
 if __name__ == "__main__":

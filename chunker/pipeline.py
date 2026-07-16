@@ -483,6 +483,15 @@ class SasLLMPipeline:
         no reference PDFs at all. Selected rules render in a
         ``## Project instructions`` block and are ephemeral like all
         guidance: prompted, never persisted.
+    validator : Any | None
+        Optional inline validator (``validation.live.LiveValidator`` —
+        duck-typed, so this package imports nothing from ``validation``,
+        which itself imports this one). When set, each item is scored the
+        moment its response returns and the verdict is written to this run's
+        conversation memory, beside its run fact (see
+        :meth:`get_validation_facts`). Observe-only: a failing or erroring
+        validation never retries the item or aborts the run. ``None``
+        (default) disables inline validation entirely.
     """
 
     def __init__(
@@ -514,6 +523,7 @@ class SasLLMPipeline:
         llm: Any | None = None,
         prompt_builder: PromptBuilder | None = None,
         user_instructions: "str | UserInstructionSet | None" = None,
+        validator: Any | None = None,
     ) -> None:
         if user_instructions is None:
             # A standing instructions file (config.json user_instructions.path)
@@ -549,6 +559,7 @@ class SasLLMPipeline:
         self._output_language = output_language
         self._history_selector = history_selector
         self._prompt_builder = prompt_builder
+        self._validator = validator
 
         self.chunker = SasSemanticChunker(min_words=min_words, max_words=max_words)
         self.batcher = SasChunkBatcher(include_options_chunks=include_options_chunks)
@@ -850,6 +861,25 @@ class SasLLMPipeline:
         facts.sort(key=lambda f: f.get("index", 0))
         return facts
 
+    def get_validation_facts(self, thread_id: str) -> list[dict[str, Any]]:
+        """Per-item inline-validation verdicts recorded for *thread_id*.
+
+        Present only when the pipeline was built with a ``validator``: each
+        item scored during the run leaves one record under
+        ``validation::{thread_id}::item::{item_id}`` (score, passed, per-metric
+        results, index/total), stored beside the run facts by
+        ``validation.live.LiveValidator``. Ordered by item index; empty when
+        no validator ran on the thread.
+        """
+        prefix = f"validation::{thread_id}::item::"
+        facts = [
+            {"item_id": item["key"][len(prefix) :], **item["value"]}
+            for item in self._memory.kv.all_items()
+            if item["key"].startswith(prefix)
+        ]
+        facts.sort(key=lambda f: f.get("index") or 0)
+        return facts
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -1052,6 +1082,29 @@ class SasLLMPipeline:
                 f"{ai_text[:120].replace(chr(10), chr(0x21B5))!r}"
             )
 
+            # Inline validation of the item just sent to the LLM. Observe-only:
+            # the verdict is stored in this thread's memory (beside the run
+            # fact) and attached to the output, but a failing — or erroring —
+            # validation never retries the item or aborts the run.
+            validation: dict[str, Any] | None = None
+            if self._validator is not None:
+                try:
+                    result = self._validator.validate_item(
+                        item,
+                        ai_text,
+                        thread_id=thread_id,
+                        kv=self._memory.kv,
+                        index=idx,
+                        total=total,
+                    )
+                    validation = result.model_dump()
+                except Exception:
+                    logger.warning(
+                        f"_process: inline validation failed  item={item_id}  "
+                        f"thread={thread_id}",
+                        exc_info=True,
+                    )
+
             outputs.append(
                 {
                     "item_id": item_id,
@@ -1064,6 +1117,7 @@ class SasLLMPipeline:
                     "response": ai_text,
                     "thread_id": thread_id,
                     "skipped": False,
+                    "validation": validation,
                 }
             )
 

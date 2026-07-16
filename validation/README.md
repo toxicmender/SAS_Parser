@@ -52,6 +52,9 @@ evaluator.py     Evaluator — the scoring core: one EvaluationRun in, one
 runner.py        ValidationRunner: cases -> pipeline -> Evaluator -> report.
 conversation.py  validate_thread() / validate_transcript() (and their
                  run_from_*() builders): post-hoc live-conversation scoring.
+live.py          LiveValidator: inline per-item scoring during a run, with
+                 the verdict stored in that conversation's memory.
+                 validations_for_thread() reads the verdicts back.
 dataset.py       load_cases(): *.json case files (inline sas_source or a
                  sas_path reference next to the JSON).
 tracking.py      log_report(): one row per (run, case, metric) appended to a
@@ -93,6 +96,44 @@ pipeline = SasLLMPipeline(llm=FakeListChatModel(responses=["..."]))
 report = ValidationRunner(pipeline).run(load_cases("validation/cases"))
 print(report.to_markdown())
 ```
+
+## Inline validation (during the run)
+
+Score each item **as it is answered**, and store the verdict in the same
+conversation memory the run uses — no post-hoc pass, no separate history.
+Opt in by handing the pipeline a `LiveValidator`:
+
+```python
+from chunker import SasLLMPipeline
+from validation import LiveValidator, validations_for_thread
+
+pipeline = SasLLMPipeline(model="claude-sonnet-4-5", validator=LiveValidator())
+pipeline.run_text(sas_source, source_id="job1.sas", thread_id="run::job1.sas")
+
+# One verdict per item, filed beside that item's run fact:
+facts = pipeline.get_validation_facts("run::job1.sas")   # or
+facts = validations_for_thread(pipeline._memory.kv, "run::job1.sas")
+for f in facts:
+    print(f["item_id"], f["score"], f["passed"])
+```
+
+Each item is scored the instant its response returns, through the same
+`Evaluator` core as every other mode, so an inline verdict equals a post-hoc
+one over that single item. Because it scores **one item at a time**, the item
+carries its own metadata: `dataset_fidelity` scores precisely (it does not
+skip the way a metadata-less thread does), and `response_coverage` counts
+that one item. The default suite is deterministic and offline, so inline
+validation adds no model call; append an `LLMJudgeMetric`
+(`LiveValidator(metrics=[...])`) to grade each item with a judge — that call
+is per-item and blocking.
+
+Storage mirrors the run facts (`validation::{thread_id}::item::{item_id}`
+against `run::{thread_id}::item::{item_id}`): same thread, same per-item
+granularity, small facts only (the response itself stays in the `msg::`
+history). It is **observe-only** — a failing item is neither retried nor
+allowed to abort the run, and the pipeline swallows any validator error so a
+scoring bug can never break a translation run. Each `run_*` output dict also
+carries the item's verdict under a `"validation"` key.
 
 ## Live conversations (post-hoc)
 

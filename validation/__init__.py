@@ -12,6 +12,10 @@ Public API:
   existing memory-store thread, without re-running the pipeline.
 - :func:`validate_transcript` / :func:`run_from_transcript` — scoring of
   arbitrary (prompt, response) transcripts.
+- :class:`LiveValidator` / :func:`validations_for_thread` — inline scoring:
+  the pipeline scores each item as its response returns and stores the
+  verdict in that conversation's memory (opt in via ``SasLLMPipeline(...,
+  validator=LiveValidator())``).
 - :func:`default_metrics` and the deterministic metric classes.
 - :class:`LLMJudgeMetric` — optional LLM-as-judge metric (needs a model).
 - :func:`load_cases` — JSON case files -> cases.
@@ -30,6 +34,7 @@ from .conversation import (
 from .dataset import load_cases
 from .evaluator import Evaluator
 from .judge import LLMJudgeMetric
+from .live import LiveValidator, validations_for_thread
 from .metrics import (
     DatasetFidelityMetric,
     PythonSyntaxMetric,
@@ -57,6 +62,7 @@ __all__ = [
     "EvaluationRun",
     "Evaluator",
     "LLMJudgeMetric",
+    "LiveValidator",
     "MetricResult",
     "PythonSyntaxMetric",
     "ReferenceSimilarityMetric",
@@ -74,4 +80,5 @@ __all__ = [
     "run_from_transcript",
     "validate_thread",
     "validate_transcript",
+    "validations_for_thread",
 ]

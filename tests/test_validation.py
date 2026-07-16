@@ -25,6 +25,7 @@ from validation import (
     DatasetFidelityMetric,
     Evaluator,
     EvaluationRun,
+    LiveValidator,
     LLMJudgeMetric,
     PythonSyntaxMetric,
     ReferenceSimilarityMetric,
@@ -36,6 +37,7 @@ from validation import (
     run_from_thread,
     validate_thread,
     validate_transcript,
+    validations_for_thread,
 )
 from validation.models import CaseRun
 
@@ -519,6 +521,112 @@ def test_llm_judge_skips_without_any_source_context():
     result = judge.evaluate(run)
     assert result.skipped
     assert result.passed
+
+
+# ---------------------------------------------------------------------------
+# Inline validation (during the run)
+# ---------------------------------------------------------------------------
+
+
+def test_live_validator_scores_single_item_and_stores_in_kv():
+    from memory.store import MemoryHub
+
+    kv = MemoryHub().kv
+    chunk = _mk_chunk(
+        "c1", input_datasets=["work.sales_raw"], output_datasets=["work.sales_clean"]
+    )
+    result = LiveValidator().validate_item(
+        chunk, GOOD_RESPONSE, thread_id="t1", kv=kv, index=1, total=1
+    )
+    # One item carries its own metadata, so dataset_fidelity scores it
+    # precisely rather than skipping the way a metadata-less thread does.
+    by_name = {m.metric: m for m in result.metrics}
+    assert by_name["dataset_fidelity"].score == 1.0
+    assert not by_name["dataset_fidelity"].skipped
+    assert by_name["python_syntax"].score == 1.0
+    assert result.passed
+
+    # The verdict is stored in the conversation KV, keyed per item.
+    stored = validations_for_thread(kv, "t1")
+    assert [f["item_id"] for f in stored] == ["c1"]
+    assert stored[0]["passed"] is True
+    assert stored[0]["index"] == 1
+    assert stored[0]["score"] == pytest.approx(result.score)
+
+
+def _validated_pipeline(responses, validator=None):
+    return SasLLMPipeline(
+        llm=FakeListChatModel(responses=responses),
+        validator=validator or LiveValidator(),
+    )
+
+
+def test_inline_validation_runs_per_item_and_persists_to_thread():
+    # Two independent DATA steps -> two items, each scored as it is answered.
+    source = "data work.a; x=1; run;\n\ndata work.b; y=2; run;\n"
+    r1 = "```python\na = 1\n```\nwork.a done."
+    r2 = "```python\nb = 2\n```\nwork.b done."
+    pipeline = _validated_pipeline([r1, r2])
+    thread_id = "run::inline"
+    outputs = pipeline.run_text(source, source_id="inline.sas", thread_id=thread_id)
+
+    # A verdict per item, both on the output dicts and in conversation memory.
+    assert all(o["validation"] is not None for o in outputs)
+    assert all(o["validation"]["passed"] for o in outputs)
+
+    facts = pipeline.get_validation_facts(thread_id)
+    assert len(facts) == 2
+    assert [f["index"] for f in facts] == [1, 2]
+    assert all(f["passed"] for f in facts)
+    # Filed beside the run facts, on the same thread, one-to-one.
+    run_ids = {f["item_id"] for f in pipeline.get_run_facts(thread_id)}
+    assert {f["item_id"] for f in facts} == run_ids
+
+
+def test_inline_validation_records_failing_item_without_aborting():
+    # Prose-only response fails python_syntax but the run still completes and
+    # the (failing) verdict is stored -- observe-only, no retry/abort.
+    pipeline = _validated_pipeline(["I would translate work.a to a DataFrame."])
+    thread_id = "run::failing"
+    outputs = pipeline.run_text(
+        "data work.a; x=1; run;", source_id="f.sas", thread_id=thread_id
+    )
+
+    assert len(outputs) == 1  # run completed
+    (fact,) = pipeline.get_validation_facts(thread_id)
+    assert fact["passed"] is False
+    by_name = {m["metric"]: m for m in fact["metrics"]}
+    assert by_name["python_syntax"]["score"] == 0.0
+
+
+def test_inline_validation_swallows_validator_errors():
+    class _BrokenValidator:
+        def validate_item(self, *args, **kwargs):
+            raise RuntimeError("boom")
+
+    pipeline = _validated_pipeline(
+        [GOOD_RESPONSE], validator=_BrokenValidator()
+    )
+    thread_id = "run::broken"
+    # A scoring bug must never break a translation run.
+    outputs = pipeline.run_text(
+        "data work.a; run;", source_id="b.sas", thread_id=thread_id
+    )
+    assert outputs[0]["response"] == GOOD_RESPONSE
+    assert outputs[0]["validation"] is None
+    assert pipeline.get_validation_facts(thread_id) == []
+    # The run itself still succeeded and recorded its run fact.
+    assert pipeline.get_run_facts(thread_id)[0]["status"] == "ok"
+
+
+def test_no_validator_leaves_validation_absent_and_facts_empty():
+    pipeline = _pipeline([GOOD_RESPONSE])
+    thread_id = "run::novalidator"
+    outputs = pipeline.run_text(
+        "data work.a; run;", source_id="n.sas", thread_id=thread_id
+    )
+    assert outputs[0]["validation"] is None
+    assert pipeline.get_validation_facts(thread_id) == []
 
 
 # ---------------------------------------------------------------------------
