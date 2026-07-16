@@ -24,13 +24,35 @@ correction); tune with ``--validation-retries N`` (``0`` = observe-only).
 
 Usage
 -----
-    # needs ANTHROPIC_API_KEY and the `anthropic` extra installed:
+    # needs the `anthropic` extra installed:
     #   uv pip install -e ".[anthropic]"
+    #
+    # API key, either:
+    #   - ANTHROPIC_API_KEY in the environment (default), or
+    #   - fetched from Vault via AppRole app-based auth (--vault-secret);
+    #     needs the `vault` extra and VAULT_ADDR / VAULT_ROLE_ID /
+    #     VAULT_SECRET_ID set (see below).
     python demo_run.py path/to/sas_dir
     python demo_run.py path/to/sas_dir --model claude-sonnet-4-5 --debug
+    python demo_run.py path/to/sas_dir --vault-secret llm/anthropic
 
 Without ``--model``, the model comes from config.json (``llm_client.model``),
 falling back to the code default when that entry is null or absent.
+
+Vault (app-based auth)
+----------------------
+Passing ``--vault-secret PATH`` retrieves the LLM API key from HashiCorp Vault
+using **AppRole** auth — the app authenticates with a role_id / secret_id pair
+(its own application identity) rather than a personal token. Set:
+
+    VAULT_ADDR=https://vault.example:8200
+    VAULT_ROLE_ID=...        # the app's role
+    VAULT_SECRET_ID=...      # the app's secret
+
+then ``--vault-secret llm/anthropic`` reads the ``api_key`` field of the KV
+secret at that path (override the field with ``--vault-key``). Any ambient
+``VAULT_TOKEN`` is ignored so the demo always runs under the AppRole identity.
+Keep these out of source control — put them in ``.env`` (gitignored).
 
 Run from the repo root so the default ``reference_docs`` path resolves.
 """
@@ -40,6 +62,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import app_config
@@ -61,6 +84,56 @@ def _discover_sas_files(sas_dir: Path, pattern: str) -> list[str]:
     """
     paths = sorted(sas_dir.rglob(pattern))
     return [str(p) for p in paths]
+
+
+def _load_dotenv() -> None:
+    """Load ``.env`` (repo root, walking up from cwd) into the environment.
+
+    Existing environment variables win (``override=False``), so a value already
+    exported in the shell still takes precedence over the file. A missing
+    ``.env`` is a no-op. python-dotenv is a declared dependency, but the import
+    is guarded so the demo still runs if it is somehow absent.
+    """
+    try:
+        from dotenv import find_dotenv, load_dotenv
+    except ImportError:
+        logger.debug("python-dotenv not installed; skipping .env load")
+        return
+    path = find_dotenv(usecwd=True)  # search from cwd (the repo root), walking up
+    if path and load_dotenv(path):
+        logger.debug(f"loaded environment from {path}")
+
+
+def _fetch_api_key_from_vault(secret_path: str, secret_key: str) -> str:
+    """Retrieve the LLM API key from Vault using AppRole (app-based) auth.
+
+    The app logs in with a role_id / secret_id pair (``VAULT_ROLE_ID`` /
+    ``VAULT_SECRET_ID``) — its own application identity — rather than a
+    personal token; any ambient ``VAULT_TOKEN`` is dropped so this path always
+    exercises AppRole. Connection settings (``VAULT_ADDR``, mount, ...) resolve
+    via :meth:`app_config.vault.VaultConfig.from_env`. Configuration or lookup
+    problems exit non-zero with a readable message rather than a traceback.
+    """
+    from app_config.vault import VaultClient, VaultConfig, VaultError
+
+    base = VaultConfig.from_env()
+    if not (base.role_id and base.secret_id):
+        raise SystemExit(
+            "--vault-secret needs AppRole credentials: set VAULT_ROLE_ID and "
+            "VAULT_SECRET_ID (and VAULT_ADDR), or omit --vault-secret to use "
+            "ANTHROPIC_API_KEY directly"
+        )
+    approle = replace(base, token=None)  # force app identity, ignore any token
+    try:
+        key = VaultClient(approle).get_secret(secret_path, secret_key)
+    except VaultError as exc:
+        raise SystemExit(f"could not fetch API key from Vault: {exc}") from exc
+    if not isinstance(key, str) or not key:
+        raise SystemExit(
+            f"Vault secret '{secret_path}' field '{secret_key}' is empty or "
+            "not a string"
+        )
+    return key
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -92,6 +165,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--output-language",
         default="PySpark",
         help="Target language named in the system prompt (default: PySpark).",
+    )
+    parser.add_argument(
+        "--vault-secret",
+        default=None,
+        help="Vault KV path (relative to the mount) holding the LLM API key, "
+        "retrieved via AppRole app-based auth (VAULT_ADDR / VAULT_ROLE_ID / "
+        "VAULT_SECRET_ID). When set, its value is used as the API key instead "
+        "of ANTHROPIC_API_KEY.",
+    )
+    parser.add_argument(
+        "--vault-key",
+        default="api_key",
+        help="Field within the --vault-secret secret to read (default: api_key).",
     )
     parser.add_argument(
         "--out-dir",
@@ -129,6 +215,10 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
 
+    # Populate the environment from .env before anything reads it (the Vault
+    # AppRole creds and ANTHROPIC_API_KEY live there); real shell env wins.
+    _load_dotenv()
+
     if not args.sas_dir.is_dir():
         logger.error(f"sas_dir is not a directory: {args.sas_dir}")
         return 2
@@ -159,6 +249,16 @@ def main(argv: list[str] | None = None) -> int:
         model = app_config.llm_client_value("model", _DEFAULT_MODEL)
         logger.info(f"model from config.json/default: {model}")
 
+    # API key: from Vault via AppRole when --vault-secret is given, else None
+    # (the pipeline then defers to ANTHROPIC_API_KEY / the provider env var).
+    api_key = None
+    if args.vault_secret:
+        api_key = _fetch_api_key_from_vault(args.vault_secret, args.vault_key)
+        logger.info(
+            f"API key from Vault secret '{args.vault_secret}' "
+            f"(field '{args.vault_key}') via AppRole"
+        )
+
     # Inline validation (on unless --no-validate): the deterministic, offline
     # suite scores each item as its response returns, adding no model call, and
     # stores every verdict in the run's conversation memory.
@@ -167,6 +267,7 @@ def main(argv: list[str] | None = None) -> int:
     # In-memory message store (delta_table=None) — no Spark/JVM is booted.
     pipeline = SasLLMPipeline(
         model=model,
+        api_key=api_key,
         output_language=args.output_language,
         prompt_builder=builder,
         validator=validator,
