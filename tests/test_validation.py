@@ -18,6 +18,7 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from memory.store import MemoryHub
 
 from chunker.models import SasBatch, SasChunk, SasChunkKind, SasChunkMetadata
 from chunker.pipeline import SasLLMPipeline
@@ -627,6 +628,216 @@ def test_no_validator_leaves_validation_absent_and_facts_empty():
     )
     assert outputs[0]["validation"] is None
     assert pipeline.get_validation_facts(thread_id) == []
+
+
+def test_resume_recovers_stored_validation_verdicts():
+    # A verdict written before an interruption is stored per item; resuming
+    # the same thread recovers it onto the skipped item's output, shaped
+    # identically to a freshly-scored one.
+    pipeline = _validated_pipeline([GOOD_RESPONSE, GOOD_RESPONSE])
+    c1 = _mk_chunk(
+        "c1", input_datasets=["work.sales_raw"], output_datasets=["work.sales_clean"]
+    )
+    c2 = _mk_chunk("c2")
+    thread_id = "run::resume-val"
+
+    # First attempt "crashes" after item 1: only c1 processed and scored.
+    pipeline._process(items=[c1], diagnostics=[], thread_id=thread_id)
+    assert len(pipeline.get_validation_facts(thread_id)) == 1
+
+    outputs = pipeline._process(
+        items=[c1, c2], diagnostics=[], thread_id=thread_id, resume=True
+    )
+
+    assert outputs[0]["skipped"] is True
+    assert outputs[0]["validation"] is not None
+    assert outputs[0]["validation"]["passed"] is True
+    # Recovered verdict is the bare CaseResult dump: bookkeeping keys stripped.
+    assert "ts" not in outputs[0]["validation"]
+    assert "index" not in outputs[0]["validation"]
+    # Freshly scored item is shaped identically to the recovered one.
+    assert outputs[1]["skipped"] is False
+    assert set(outputs[0]["validation"]) == set(outputs[1]["validation"])
+
+
+def test_resume_without_stored_verdict_leaves_validation_none():
+    # A run that had no validator on the first attempt has no stored verdict;
+    # resuming must not invent one for the skipped item.
+    first = _pipeline([GOOD_RESPONSE])  # no validator
+    thread_id = "run::resume-noverdict"
+    first._process(items=[_mk_chunk("c1")], diagnostics=[], thread_id=thread_id)
+
+    # Same store, now with a validator attached, resumes the thread.
+    resumed = SasLLMPipeline(
+        llm=FakeListChatModel(responses=[GOOD_RESPONSE]),
+        memory=first._memory,
+        validator=LiveValidator(),
+    )
+    outputs = resumed._process(
+        items=[_mk_chunk("c1"), _mk_chunk("c2")],
+        diagnostics=[],
+        thread_id=thread_id,
+        resume=True,
+    )
+    assert outputs[0]["skipped"] is True
+    assert outputs[0]["validation"] is None  # nothing stored to recover
+    assert outputs[1]["validation"] is not None  # newly scored
+
+
+PROSE_ONLY = "I would translate work.a into a DataFrame, mentioning work.a."
+
+
+def _retry_pipeline(responses, retries=1, validator=None):
+    return SasLLMPipeline(
+        llm=FakeListChatModel(responses=responses),
+        validator=validator or LiveValidator(),
+        validation_retries=retries,
+    )
+
+
+def test_validation_retries_regenerates_failing_item_until_it_passes():
+    # First answer is prose-only (fails python_syntax); the retry produces
+    # code covering the step's datasets and passes. Only the final, passing
+    # turn should persist.
+    pipeline = _retry_pipeline([PROSE_ONLY, GOOD_RESPONSE], retries=1)
+    thread_id = "run::retry-pass"
+    outputs = pipeline.run_text(
+        "data work.sales_clean;\n  set work.sales_raw;\nrun;\n",
+        source_id="r.sas",
+        thread_id=thread_id,
+    )
+
+    assert outputs[0]["validation"]["passed"] is True  # final verdict kept
+    (fact,) = pipeline.get_validation_facts(thread_id)
+    assert fact["passed"] is True
+    # Exactly one (human, AI) pair remains — the rolled-back attempt is gone.
+    assert len(pipeline.get_thread_messages(thread_id)) == 2
+    assert pipeline.get_thread_messages(thread_id)[-1].content == GOOD_RESPONSE
+    # The run fact records how many attempts it took.
+    assert pipeline.get_run_facts(thread_id)[0]["attempts"] == 2
+
+
+def test_validation_retries_accepts_last_attempt_when_budget_exhausted():
+    # Every attempt fails; the run still completes and keeps the last answer.
+    pipeline = _retry_pipeline([PROSE_ONLY, PROSE_ONLY], retries=1)
+    thread_id = "run::retry-exhausted"
+    outputs = pipeline.run_text(
+        "data work.a; x=1; run;", source_id="r.sas", thread_id=thread_id
+    )
+
+    assert outputs[0]["validation"]["passed"] is False
+    assert len(pipeline.get_thread_messages(thread_id)) == 2  # no duplicate turns
+    assert pipeline.get_run_facts(thread_id)[0]["attempts"] == 2
+
+
+def test_retries_zero_stays_observe_only():
+    # The default policy: a failing item is scored and stored but never redone.
+    pipeline = _validated_pipeline([PROSE_ONLY])  # validation_retries defaults to 0
+    thread_id = "run::observe-only"
+    outputs = pipeline.run_text(
+        "data work.a; x=1; run;", source_id="r.sas", thread_id=thread_id
+    )
+    assert outputs[0]["validation"]["passed"] is False
+    assert pipeline.get_run_facts(thread_id)[0]["attempts"] == 1
+
+
+def test_resume_redoes_stored_failing_item_when_retries_enabled():
+    # A prior run left item 1 with a FAILING verdict. Resuming with retries
+    # enabled rewinds to it and regenerates, rather than skipping it as done.
+    c1 = _mk_chunk("c1")
+    c2 = _mk_chunk("c2")
+
+    mem = MemoryHub()
+    # First attempt (observe-only): item 1 answered with prose (fails), item 2
+    # never reached.
+    first = SasLLMPipeline(
+        llm=FakeListChatModel(responses=[PROSE_ONLY]),
+        memory=mem,
+        validator=LiveValidator(),
+    )
+    first._process(items=[c1], diagnostics=[], thread_id="run::redo")
+    assert first.get_validation_facts("run::redo")[0]["passed"] is False
+
+    # Resume on the same store: item 1's stored verdict failed, so it is not
+    # "done" — it is regenerated (now with code) and the run continues to c2.
+    resumed = SasLLMPipeline(
+        llm=FakeListChatModel(responses=[GOOD_RESPONSE, GOOD_RESPONSE]),
+        memory=mem,
+        validator=LiveValidator(),
+        validation_retries=1,
+    )
+    outputs = resumed._process(
+        items=[c1, c2], diagnostics=[], thread_id="run::redo", resume=True
+    )
+
+    assert outputs[0]["skipped"] is False  # redone, not skipped
+    assert outputs[0]["validation"]["passed"] is True
+    assert outputs[1]["validation"]["passed"] is True
+    facts = {f["item_id"]: f for f in resumed.get_validation_facts("run::redo")}
+    assert facts["c1"]["passed"] is True and facts["c2"]["passed"] is True
+    # One clean turn pair per item after the rewind+redo.
+    assert len(resumed.get_thread_messages("run::redo")) == 4
+
+
+def test_resume_keeps_passing_prefix_and_redoes_from_first_failure():
+    # Items 1 (pass) and 2 (fail) both completed; resume must keep 1 and
+    # regenerate from 2 onward.
+    c1 = _mk_chunk(
+        "c1", input_datasets=["work.sales_raw"], output_datasets=["work.sales_clean"]
+    )
+    c2 = _mk_chunk("c2")
+
+    mem = MemoryHub()
+    # Observe-only prior run: c1 passes, c2 fails, both recorded as they are.
+    first = SasLLMPipeline(
+        llm=FakeListChatModel(responses=[GOOD_RESPONSE, PROSE_ONLY]),
+        memory=mem,
+        validator=LiveValidator(),
+    )
+    first._process(items=[c1, c2], diagnostics=[], thread_id="run::prefix")
+    assert first.get_validation_facts("run::prefix")[0]["passed"] is True
+    assert first.get_validation_facts("run::prefix")[1]["passed"] is False
+    c1_answer = first.get_thread_messages("run::prefix")[1].content
+
+    resumed = SasLLMPipeline(
+        llm=FakeListChatModel(responses=[GOOD_RESPONSE]),
+        memory=mem,
+        validator=LiveValidator(),
+        validation_retries=1,
+    )
+    outputs = resumed._process(
+        items=[c1, c2], diagnostics=[], thread_id="run::prefix", resume=True
+    )
+
+    assert outputs[0]["skipped"] is True  # passing prefix item kept
+    assert outputs[1]["skipped"] is False  # failing item regenerated
+    assert outputs[1]["validation"]["passed"] is True
+    # Item 1's original answer is untouched; still one pair per item.
+    msgs = resumed.get_thread_messages("run::prefix")
+    assert len(msgs) == 4
+    assert msgs[1].content == c1_answer
+
+
+def test_fork_run_copies_validation_verdicts_onto_the_branch():
+    pipeline = _validated_pipeline([GOOD_RESPONSE, GOOD_RESPONSE, GOOD_RESPONSE])
+    c1 = _mk_chunk(
+        "c1", input_datasets=["work.sales_raw"], output_datasets=["work.sales_clean"]
+    )
+    c2 = _mk_chunk("c2")
+    pipeline._process(items=[c1, c2], diagnostics=[], thread_id="run::v1")
+    assert len(pipeline.get_validation_facts("run::v1")) == 2
+
+    pipeline.fork_run("run::v1", "run::v2", upto_items=1)
+    forked = pipeline.get_validation_facts("run::v2")
+    assert [f["item_id"] for f in forked] == ["c1"]  # only up to the fork point
+    assert forked[0]["passed"] is True
+
+    # Resuming the branch recovers the copied verdict for the skipped item.
+    outputs = pipeline._process(
+        items=[c1, c2], diagnostics=[], thread_id="run::v2", resume=True
+    )
+    assert outputs[0]["skipped"] is True
+    assert outputs[0]["validation"]["passed"] is True
 
 
 # ---------------------------------------------------------------------------

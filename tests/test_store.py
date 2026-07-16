@@ -692,5 +692,46 @@ class TestPruneBefore(unittest.TestCase):
         self.assertFalse(mem.get_thread("t1").has_messages())
 
 
+class TestTruncateTo(unittest.TestCase):
+    def test_truncate_keeps_oldest_and_drops_newest(self):
+        from langchain_core.messages import HumanMessage
+
+        store = KVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store)
+        for i in range(6):
+            h.add_message(HumanMessage(content=f"m{i}"))
+
+        removed = h.truncate_to(4)
+        self.assertEqual(removed, 2)
+        # The two NEWEST were dropped (unlike prune_to_count, which drops old).
+        self.assertEqual([m.content for m in h.messages], ["m0", "m1", "m2", "m3"])
+
+    def test_truncate_noop_when_within_budget(self):
+        store = KVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store)
+        h.add_user_message("a")
+        h.add_ai_message("b")
+        self.assertEqual(h.truncate_to(2), 0)
+        self.assertEqual(h.truncate_to(5), 0)
+        self.assertEqual(len(h.messages), 2)
+
+    def test_truncate_to_zero_clears_and_allows_clean_reappend(self):
+        store = KVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store)
+        h.add_user_message("a")
+        h.add_ai_message("b")
+        self.assertEqual(h.truncate_to(0), 2)
+        self.assertEqual(h.messages, [])
+        # Re-appends after a rewind still sort after nothing — order is sane.
+        h.add_user_message("c")
+        self.assertEqual([m.content for m in h.messages], ["c"])
+
+    def test_truncate_rejects_negative(self):
+        store = KVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store)
+        with self.assertRaises(ValueError):
+            h.truncate_to(-1)
+
+
 if __name__ == "__main__":
     unittest.main()

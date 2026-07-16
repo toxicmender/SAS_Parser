@@ -356,6 +356,13 @@ def _format_batch_message(
 # ---------------------------------------------------------------------------
 
 
+# Bookkeeping keys the pipeline adds around a stored inline-validation verdict
+# (index/total/ts, plus item_id added by the reader). Stripped when a verdict
+# is recovered on resume so the recovered `validation` value matches the shape
+# a freshly-scored item carries (the bare CaseResult dump).
+_RECOVERED_VALIDATION_DROP = frozenset({"item_id", "index", "total", "ts"})
+
+
 class SasLLMPipeline:
     """
     End-to-end pipeline: SAS source(s) -> semantic chunks -> dependency
@@ -489,9 +496,23 @@ class SasLLMPipeline:
         which itself imports this one). When set, each item is scored the
         moment its response returns and the verdict is written to this run's
         conversation memory, beside its run fact (see
-        :meth:`get_validation_facts`). Observe-only: a failing or erroring
+        :meth:`get_validation_facts`). With ``validation_retries == 0``
+        (default) validation is observe-only: a failing or erroring
         validation never retries the item or aborts the run. ``None``
         (default) disables inline validation entirely.
+    validation_retries : int
+        How many times to *re-generate* an item that fails inline validation
+        before accepting its answer (``0``, default, keeps the observe-only
+        policy — score and store, never act). Requires a ``validator``.
+        On a failing verdict the just-produced turn is rolled back and the
+        item is re-prompted with a corrective note naming the metrics that
+        fell short (ephemeral, like reference guidance — prompted, never
+        persisted), then re-scored; the loop stops as soon as an attempt
+        passes or the budget is exhausted, and the final attempt's turn and
+        verdict are what persist. This same switch also makes **resume**
+        validation-aware: an item whose stored verdict failed no longer
+        counts as done, so a resumed run rewinds to the earliest unsatisfied
+        item and regenerates from there.
     """
 
     def __init__(
@@ -524,7 +545,18 @@ class SasLLMPipeline:
         prompt_builder: PromptBuilder | None = None,
         user_instructions: "str | UserInstructionSet | None" = None,
         validator: Any | None = None,
+        validation_retries: int = 0,
     ) -> None:
+        if validation_retries < 0:
+            raise ValueError(
+                f"validation_retries must be >= 0, got {validation_retries}"
+            )
+        if validation_retries and validator is None:
+            logger.warning(
+                f"SasLLMPipeline: validation_retries={validation_retries} has no "
+                "effect without a validator; validation-driven retry/resume "
+                "stays disabled"
+            )
         if user_instructions is None:
             # A standing instructions file (config.json user_instructions.path)
             # applies whenever no explicit set is passed.
@@ -560,6 +592,11 @@ class SasLLMPipeline:
         self._history_selector = history_selector
         self._prompt_builder = prompt_builder
         self._validator = validator
+        # Validation-driven retry/resume is active only with both a validator
+        # and a positive budget; otherwise validation stays observe-only.
+        self._validation_retries = (
+            validation_retries if validator is not None else 0
+        )
 
         self.chunker = SasSemanticChunker(min_words=min_words, max_words=max_words)
         self.batcher = SasChunkBatcher(include_options_chunks=include_options_chunks)
@@ -724,8 +761,9 @@ class SasLLMPipeline:
         """Chunk + batch the SAS file at *path*, run every item through the LLM.
 
         With ``resume=True``, items whose run fact already reads ``ok`` on
-        this thread are skipped (their stored responses are returned), so a
-        crashed run picks up where it stopped instead of replaying — and
+        this thread are skipped (their stored responses — and any inline
+        validation verdict recorded for them — are returned), so a crashed
+        run picks up where it stopped instead of replaying — and
         re-appending — completed turns.
         """
         logger.info(f"run_file: '{path}'  resume={resume}")
@@ -819,6 +857,14 @@ class SasLLMPipeline:
                 continue
             value = {k: v for k, v in fact.items() if k != "item_id"}
             self._record_run_fact(dst_thread_id, fact["item_id"], value)
+        # Carry the copied items' inline verdicts onto the fork too, so a
+        # forked-then-resumed run recovers them the same way a plain resume
+        # does (no-op when the source run had no validator).
+        for fact in self.get_validation_facts(src_thread_id):
+            if upto_items is not None and (fact.get("index") or 0) > upto_items:
+                continue
+            value = {k: v for k, v in fact.items() if k != "item_id"}
+            self._record_validation_fact(dst_thread_id, fact["item_id"], value)
         logger.info(
             f"fork_run: '{src_thread_id}' -> '{dst_thread_id}'  "
             f"upto_items={upto_items}  messages_copied={copied}"
@@ -914,6 +960,25 @@ class SasLLMPipeline:
             return messages[position].content
         return None
 
+    @staticmethod
+    def _recovered_validation(
+        fact: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """The stored inline-validation verdict for a recovered item, or ``None``.
+
+        Normalises the KV-stored fact back to the bare ``CaseResult`` dump a
+        freshly-scored item carries — dropping the pipeline's bookkeeping keys
+        (see :data:`_RECOVERED_VALIDATION_DROP`) — so a resumed run's outputs
+        are shaped identically whether an item was replayed or recovered.
+        ``None`` when the original attempt had no validator (or scoring failed
+        then and left no verdict).
+        """
+        if not fact:
+            return None
+        return {
+            k: v for k, v in fact.items() if k not in _RECOVERED_VALIDATION_DROP
+        }
+
     def _record_run_fact(
         self, thread_id: str, item_id: str, fact: dict[str, Any]
     ) -> None:
@@ -924,6 +989,20 @@ class SasLLMPipeline:
             f"run::{thread_id}::item::{item_id}",
             fact,
             tags=["run-item", thread_id],
+            source="pipeline",
+        )
+
+    def _record_validation_fact(
+        self, thread_id: str, item_id: str, fact: dict[str, Any]
+    ) -> None:
+        """Upsert one inline-validation verdict under the same key schema
+        ``validation.live.LiveValidator`` uses (``validation::{thread_id}::``
+        ``item::{item_id}``), so a fork's copied verdicts read back through
+        :meth:`get_validation_facts` exactly like inline-written ones."""
+        self._memory.kv.set(
+            f"validation::{thread_id}::item::{item_id}",
+            fact,
+            tags=["validation", thread_id],
             source="pipeline",
         )
 
@@ -950,6 +1029,207 @@ class SasLLMPipeline:
         )
         return [SystemMessage(guidance)]
 
+    @staticmethod
+    def _validation_feedback_message(result: Any) -> SystemMessage:
+        """A corrective note naming the metrics an attempt failed.
+
+        Injected — ephemerally, like reference guidance — before a retry so
+        the model revises rather than repeats. Lists only the metrics that
+        were scored and fell below threshold (skipped/passing ones carry no
+        signal), with each metric's own ``details`` string.
+        """
+        failed = [m for m in result.metrics if not m.passed and not m.skipped]
+        lines = [
+            "## Automated validation of your previous answer FAILED",
+            f"Overall score {result.score:.2f}. Revise the translation to fix "
+            "the issues below, preserving everything that was already correct:",
+        ]
+        for m in failed:
+            detail = m.details.strip() if m.details else "below threshold"
+            lines.append(
+                f"- **{m.metric}** (score {m.score:.2f} < {m.threshold:.2f}): {detail}"
+            )
+        return SystemMessage("\n".join(lines))
+
+    def _answer_item(
+        self,
+        item: SasBatch | SasChunk,
+        idx: int,
+        total: int,
+        *,
+        thread_id: str,
+        user_msg: str,
+        base_instructions: list[BaseMessage],
+    ) -> tuple[str, Any, int]:
+        """Generate (and, if enabled, iteratively repair) one item's answer.
+
+        Sends *user_msg* on *thread_id*; when a validator is attached the
+        response is scored inline. With ``validation_retries > 0`` a failing
+        verdict rolls the just-appended turn back off the thread (via
+        :meth:`KVChatMessageHistory.truncate_to`) and re-prompts with a
+        corrective note, up to the retry budget, so exactly one — the final —
+        (human, AI) pair persists per item. Returns
+        ``(response_text, CaseResult | None, attempts)``; the ``CaseResult``
+        is ``None`` when no validator ran or scoring raised (swallowed, as in
+        the observe-only policy). Any LLM-call exception propagates to the
+        caller, which records the error fact.
+        """
+        item_id = item.batch_id if isinstance(item, SasBatch) else item.chunk_id
+        history = self._memory.get_thread(thread_id)
+        max_attempts = 1 + self._validation_retries
+        feedback: list[BaseMessage] = []
+        attempt = 0
+        while True:
+            attempt += 1
+            # Roll-back point: everything already committed for earlier items.
+            # Only needed when a retry might follow (else skip the history load).
+            len_before = len(history.messages) if max_attempts > 1 else 0
+            cfg: RunnableConfig = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "instructions": base_instructions + feedback,
+                }
+            }
+            state = self._graph.invoke({"messages": [HumanMessage(user_msg)]}, cfg)
+            ai_text = state["messages"][-1].content
+
+            result: Any = None
+            if self._validator is not None:
+                try:
+                    result = self._validator.validate_item(
+                        item,
+                        ai_text,
+                        thread_id=thread_id,
+                        kv=self._memory.kv,
+                        index=idx,
+                        total=total,
+                    )
+                except Exception:
+                    logger.warning(
+                        f"_answer_item: inline validation failed  item={item_id}  "
+                        f"thread={thread_id}",
+                        exc_info=True,
+                    )
+
+            passed = result.passed if result is not None else True
+            if passed or attempt >= max_attempts:
+                if not passed:
+                    logger.warning(
+                        f"_answer_item: item={item_id} still failing after "
+                        f"{attempt} attempt(s); accepting last answer  "
+                        f"thread={thread_id}"
+                    )
+                return ai_text, result, attempt
+
+            logger.info(
+                f"_answer_item: item={item_id} failed validation "
+                f"(score={result.score:.3f}) on attempt {attempt}/{max_attempts}; "
+                f"rolling back and retrying  thread={thread_id}"
+            )
+            # Drop this attempt's turn pair so the retry replaces it in place.
+            history.truncate_to(len_before)
+            feedback = [self._validation_feedback_message(result)]
+
+    def _resume_state(
+        self, items: list[SasBatch | SasChunk], thread_id: str
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], list[BaseMessage]]:
+        """Resolve what a resume can skip and what it must redo.
+
+        Returns ``(completed, completed_validations, recovered)`` where
+        *completed* maps item_id -> run fact for items that may be skipped and
+        their responses recovered, *completed_validations* maps item_id ->
+        stored verdict, and *recovered* is the pre-rewind message snapshot the
+        skipped items' responses are read from.
+
+        With validation-driven retry active, an ``ok`` item whose stored
+        verdict *failed* is not "done": the thread is rewound to the earliest
+        such (or otherwise-missing) item and that item's — and every later
+        item's — run/validation facts and turns are dropped, so the main loop
+        regenerates from there on a clean, consistent history. Without it,
+        this reproduces the original policy: every ``ok`` item is skipped.
+        """
+        ok_facts = {
+            f["item_id"]: f
+            for f in self.get_run_facts(thread_id)
+            if f.get("status") == "ok"
+        }
+        completed_validations = {
+            f["item_id"]: f for f in self.get_validation_facts(thread_id)
+        }
+        recovered: list[BaseMessage] = []
+        if ok_facts:
+            recovered = self._memory.get_thread(thread_id).messages
+
+        if not self._validation_retries:
+            if ok_facts:
+                logger.info(
+                    f"_process: resume  thread='{thread_id}'  {len(ok_facts)} "
+                    f"item(s) already complete  "
+                    f"{len(completed_validations)} stored verdict(s)"
+                )
+            return ok_facts, completed_validations, recovered
+
+        # Validation-aware resume: find the first item that is not "done and
+        # good" (missing, errored, or an ok item whose stored verdict failed).
+        def _satisfied(item_id: str) -> bool:
+            if item_id not in ok_facts:
+                return False
+            verdict = completed_validations.get(item_id)
+            # No verdict → cannot call it a failure; treat as satisfied.
+            return verdict is None or verdict.get("passed", True)
+
+        redo_start: int | None = None
+        for pos, item in enumerate(items, start=1):
+            item_id = item.batch_id if isinstance(item, SasBatch) else item.chunk_id
+            if not _satisfied(item_id):
+                redo_start = pos
+                break
+
+        if redo_start is None:
+            logger.info(
+                f"_process: resume  thread='{thread_id}'  all {len(items)} "
+                f"item(s) complete and passing; nothing to redo"
+            )
+            return ok_facts, completed_validations, recovered
+
+        self._rewind_for_resume(items, thread_id, redo_start)
+        completed = {
+            item.batch_id if isinstance(item, SasBatch) else item.chunk_id: ok_facts[
+                item.batch_id if isinstance(item, SasBatch) else item.chunk_id
+            ]
+            for pos, item in enumerate(items, start=1)
+            if pos < redo_start
+        }
+        logger.info(
+            f"_process: resume  thread='{thread_id}'  keeping {len(completed)} "
+            f"passing item(s), regenerating from item {redo_start}/{len(items)}"
+        )
+        return completed, completed_validations, recovered
+
+    def _rewind_for_resume(
+        self, items: list[SasBatch | SasChunk], thread_id: str, redo_start: int
+    ) -> None:
+        """Rewind *thread_id* to just before item *redo_start* (1-based).
+
+        Truncates the thread to the ``redo_start - 1`` completed (human, AI)
+        pairs that precede it and drops the run/validation facts of item
+        *redo_start* and every later item, so the main loop regenerates them
+        onto a clean, append-only history instead of leaving stale turns and
+        facts behind.
+        """
+        keep_pairs = redo_start - 1
+        removed = self._memory.get_thread(thread_id).truncate_to(keep_pairs * 2)
+        for pos, item in enumerate(items, start=1):
+            if pos < redo_start:
+                continue
+            item_id = item.batch_id if isinstance(item, SasBatch) else item.chunk_id
+            self._memory.kv.delete(f"run::{thread_id}::item::{item_id}")
+            self._memory.kv.delete(f"validation::{thread_id}::item::{item_id}")
+        logger.info(
+            f"_rewind_for_resume: thread='{thread_id}'  rewound to item "
+            f"{redo_start} (kept {keep_pairs} pair(s), removed {removed} message(s))"
+        )
+
     def _process(
         self,
         items: list[SasBatch | SasChunk],
@@ -964,23 +1244,17 @@ class SasLLMPipeline:
             return []
 
         # Resume: items whose run fact reads "ok" are skipped; their stored
-        # responses are recovered from the thread's (human, AI) turn pairs.
-        # Error facts do NOT skip — a failed item is reprocessed and its
-        # fact overwritten.
+        # responses (and inline verdicts) are recovered from the thread's
+        # (human, AI) turn pairs. Error facts do NOT skip — a failed item is
+        # reprocessed and its fact overwritten. With validation-driven retry
+        # active, an ok-but-failing item is redone too (see _resume_state).
         completed: dict[str, dict[str, Any]] = {}
+        completed_validations: dict[str, dict[str, Any]] = {}
         recovered: list[BaseMessage] = []
         if resume:
-            completed = {
-                f["item_id"]: f
-                for f in self.get_run_facts(thread_id)
-                if f.get("status") == "ok"
-            }
-            if completed:
-                recovered = self._memory.get_thread(thread_id).messages
-                logger.info(
-                    f"_process: resume  thread='{thread_id}'  "
-                    f"{len(completed)} item(s) already complete"
-                )
+            completed, completed_validations, recovered = self._resume_state(
+                items, thread_id
+            )
 
         logger.info(
             f"_process: invoking LLM for {total} item(s)  thread='{thread_id}'  model={self.model}"
@@ -1012,6 +1286,9 @@ class SasLLMPipeline:
                         "response": self._recovered_response(recovered, fact),
                         "thread_id": thread_id,
                         "skipped": True,
+                        "validation": self._recovered_validation(
+                            completed_validations.get(item_id)
+                        ),
                     }
                 )
                 continue
@@ -1027,19 +1304,22 @@ class SasLLMPipeline:
             )
             # Per-item guidance rides in the config, not the state, so it is
             # prompted without ever entering the persisted message history.
-            cfg: RunnableConfig = {
-                "configurable": {
-                    "thread_id": thread_id,
-                    "instructions": self._instruction_messages(item),
-                }
-            }
+            base_instructions = self._instruction_messages(item)
 
             t_item = time.perf_counter()
             try:
-                state = self._graph.invoke(
-                    {"messages": [HumanMessage(user_msg)]}, cfg
+                # Generate — and, when validation_retries > 0, iteratively
+                # repair — the answer. Scoring, the retry loop, and the
+                # roll-back of superseded attempts all live in _answer_item;
+                # exactly one (human, AI) pair persists per item.
+                ai_text, result, attempts = self._answer_item(
+                    item,
+                    idx,
+                    total,
+                    thread_id=thread_id,
+                    user_msg=user_msg,
+                    base_instructions=base_instructions,
                 )
-                response = state["messages"][-1]
             except Exception as exc:
                 logger.error(
                     f"_process: LLM call failed  item={item_id}  thread={thread_id}",
@@ -1060,7 +1340,6 @@ class SasLLMPipeline:
                 raise
 
             elapsed = time.perf_counter() - t_item
-            ai_text = response.content
             self._record_run_fact(
                 thread_id,
                 item_id,
@@ -1071,40 +1350,21 @@ class SasLLMPipeline:
                     "is_batch": is_batch,
                     "elapsed_s": round(elapsed, 3),
                     "response_chars": len(ai_text),
+                    "attempts": attempts,
                     "ts": time.time(),
                 },
             )
             logger.info(
-                f"_process: item {item_id} done  elapsed={elapsed:.3f}s  response_chars={len(ai_text)}"
+                f"_process: item {item_id} done  elapsed={elapsed:.3f}s  "
+                f"attempts={attempts}  response_chars={len(ai_text)}"
             )
             logger.debug(
                 f"_process: item {item_id} response preview: "
                 f"{ai_text[:120].replace(chr(10), chr(0x21B5))!r}"
             )
 
-            # Inline validation of the item just sent to the LLM. Observe-only:
-            # the verdict is stored in this thread's memory (beside the run
-            # fact) and attached to the output, but a failing — or erroring —
-            # validation never retries the item or aborts the run.
-            validation: dict[str, Any] | None = None
-            if self._validator is not None:
-                try:
-                    result = self._validator.validate_item(
-                        item,
-                        ai_text,
-                        thread_id=thread_id,
-                        kv=self._memory.kv,
-                        index=idx,
-                        total=total,
-                    )
-                    validation = result.model_dump()
-                except Exception:
-                    logger.warning(
-                        f"_process: inline validation failed  item={item_id}  "
-                        f"thread={thread_id}",
-                        exc_info=True,
-                    )
-
+            # The verdict is already stored in this thread's memory by
+            # _answer_item (beside the run fact); attach it to the output.
             outputs.append(
                 {
                     "item_id": item_id,
@@ -1117,7 +1377,7 @@ class SasLLMPipeline:
                     "response": ai_text,
                     "thread_id": thread_id,
                     "skipped": False,
-                    "validation": validation,
+                    "validation": result.model_dump() if result is not None else None,
                 }
             )
 
