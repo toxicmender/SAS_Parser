@@ -27,11 +27,15 @@ here). The stored value is the item's :class:`~validation.models.CaseResult`
 (``score`` / ``passed`` / per-metric results) plus ``index`` / ``total`` /
 ``ts``.
 
-Observe-only
-------------
-A verdict is stored and returned; a failing item is never retried and never
-aborts the run (the pipeline additionally swallows any validator error).
-This matches the standing failure-handling policy in ``validation/README.md``.
+Observe-only by default
+-----------------------
+The validator itself only scores and stores — it never re-runs the model or
+aborts the run, and the pipeline additionally swallows any validator error.
+Whether a *failing* verdict is then acted upon is the pipeline's decision:
+with ``SasLLMPipeline(validation_retries=0)`` (the default) it is not, matching
+the standing policy in ``validation/README.md``; with a positive budget the
+pipeline re-generates the item with corrective feedback (and treats a stored
+failing verdict as not-done on resume). See ``SasLLMPipeline._answer_item``.
 
 Logger name: ``validation.live``.
 """

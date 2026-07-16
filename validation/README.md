@@ -130,10 +130,37 @@ is per-item and blocking.
 Storage mirrors the run facts (`validation::{thread_id}::item::{item_id}`
 against `run::{thread_id}::item::{item_id}`): same thread, same per-item
 granularity, small facts only (the response itself stays in the `msg::`
-history). It is **observe-only** — a failing item is neither retried nor
-allowed to abort the run, and the pipeline swallows any validator error so a
-scoring bug can never break a translation run. Each `run_*` output dict also
-carries the item's verdict under a `"validation"` key.
+history). Each `run_*` output dict also carries the item's verdict under a
+`"validation"` key. The pipeline always swallows any validator error, so a
+scoring bug can never break a translation run.
+
+### Acting on the verdict — `validation_retries`
+
+By default (`validation_retries=0`) inline validation is **observe-only**: a
+failing item is neither retried nor allowed to abort the run. Set
+`SasLLMPipeline(validator=LiveValidator(), validation_retries=N)` to make the
+verdict *actionable*:
+
+```python
+pipeline = SasLLMPipeline(validator=LiveValidator(), validation_retries=2)
+```
+
+- **Improving the batch (inline).** When an item fails, its just-produced
+  turn is rolled back off the thread (`KVChatMessageHistory.truncate_to`) and
+  the item is re-prompted with a corrective note naming the metrics that fell
+  short — ephemeral, like reference guidance: prompted, never persisted. The
+  loop stops as soon as an attempt passes or the budget is spent, and the
+  final attempt's turn and verdict are the ones that persist. Exactly one
+  (human, AI) pair survives per item, so the history invariants hold. The
+  run fact records the `attempts` it took.
+- **Resuming.** The same switch makes `resume=True` validation-aware: an item
+  whose *stored* verdict failed no longer counts as done. The run rewinds to
+  the earliest unsatisfied item (missing, errored, or failed), drops that
+  item's and every later item's turns and facts, and regenerates from there
+  on a clean history — the passing prefix is kept and recovered as before.
+
+With no validator attached, `validation_retries` has no effect (a warning is
+logged) and the run stays observe-only.
 
 ## Live conversations (post-hoc)
 

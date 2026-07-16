@@ -820,6 +820,31 @@ class KVChatMessageHistory(BaseChatMessageHistory):
         )
         return removed
 
+    def truncate_to(self, keep: int) -> int:
+        """Delete the *newest* messages, keeping only the oldest *keep*.
+
+        The tail-side counterpart to :meth:`prune_to_count` (which drops the
+        oldest): a rewind primitive. Keys embed a time-ordered tick, so the
+        newest rows are simply the last ones in key order. Used to roll a
+        turn back — dropping the just-appended (human, AI) pair so it can be
+        re-generated without leaving a duplicate — and to rewind a thread to
+        an item boundary on resume. Returns the number removed.
+        """
+        if keep < 0:
+            raise ValueError(f"keep must be >= 0, got {keep}")
+        pairs = self._store.all_records(prefix=self._msg_prefix)
+        if len(pairs) <= keep:
+            return 0
+        pairs.sort(key=lambda kv: kv[0][len(self._msg_prefix) :])
+        removed = self._store.delete_many([key for key, _ in pairs[keep:]])
+        if removed:
+            self._invalidate_cache()
+        logger.info(
+            f"truncate_to: session '{self.session_id}' removed {removed} "
+            f"message(s), keeping the oldest {keep}"
+        )
+        return removed
+
     def _apply_retention(self) -> None:
         if self.max_age_s is not None:
             self.prune_before(_now() - self.max_age_s)

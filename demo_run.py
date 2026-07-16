@@ -18,7 +18,9 @@ A `validation.LiveValidator` is attached by default, so each batch is scored
 the moment its response returns (deterministic, offline metrics — no extra
 model call) and the verdict is stored in that run's conversation memory
 beside the item's run fact. The demo prints the per-item verdict and an
-aggregate; pass ``--no-validate`` to turn it off.
+aggregate; pass ``--no-validate`` to turn it off. A failing item is
+re-generated once by default (with the failed metrics fed back as a
+correction); tune with ``--validation-retries N`` (``0`` = observe-only).
 
 Usage
 -----
@@ -104,6 +106,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "each item as it is answered and stores the verdict in run memory.",
     )
     parser.add_argument(
+        "--validation-retries",
+        type=int,
+        default=1,
+        help="Re-generate an item that fails inline validation up to this "
+        "many times, re-prompting with the failed metrics as feedback "
+        "(default 1; pass 0 for observe-only: score and store, never act).",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable DEBUG logging for the whole pipeline.",
@@ -160,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
         output_language=args.output_language,
         prompt_builder=builder,
         validator=validator,
+        validation_retries=args.validation_retries,
     )
 
     # run_files chunks every file and batches the corpus via MultiFileBatcher,
