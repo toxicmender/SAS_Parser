@@ -147,6 +147,20 @@ app_config/
                         argument > config.json > hard default; JSON null means
                         "unset". Searched via SAS_PARSER_CONFIG env var, cwd,
                         then repo root. A leaf package — imports nothing.
+  vault.py              HashiCorp Vault credential client (get_secret).
+                        Non-secret connection settings from VAULT_* env vars >
+                        config.json `vault`; token / AppRole creds from the
+                        environment only. hvac imported lazily (extra: vault).
+  databricks.py         Databricks workspace settings: host, warehouse/cluster,
+                        Unity Catalog catalog+schema (full_table_name()), and
+                        the credential. Auth: notebook (on-cluster) > pat
+                        (DATABRICKS_TOKEN) > azure-ad (via azure.py). SDK /
+                        SQL connector imported lazily (extra: databricks).
+  azure.py              Microsoft Entra ID auth: AzureAuthClient.get_token()
+                        via client_credentials (secret or certificate) or
+                        device_code, with per-scope expiry-aware caching.
+                        Client secret from AZURE_CLIENT_SECRET only; msal
+                        imported lazily (extra: azure).
 
 validation/
   models.py             Pydantic models: ValidationCase, CaseRun,
@@ -184,8 +198,12 @@ imports `memory.store`, `memory.relevance`, `memory.summarize`,
 retrieval, and the SAS-metadata → `(query, constructs)` mapping that feeds it
 lives in `pipeline`, precisely so `prompt_builder` needs no `chunker` import.
 `app_config` is a leaf every package may import (like `chunker.keywords`, it
-imports nothing): `chunker`, `llm_client`, and `prompt_builder` read their
-word/token-limit defaults through it. `validation` sits *above* the whole
+imports nothing from this repo outside itself): `chunker`, `llm_client`, and
+`prompt_builder` read their word/token-limit defaults through it. Its
+credential submodules — `vault`, `azure`, `databricks` — import only the
+`app_config` loader and, in `databricks`'s case, `azure`; each defers its
+third-party client to a lazy import inside the call that needs it, so the
+package stays dependency-free to import. `validation` sits *above* the whole
 stack, beside the CLI entry points: it drives `chunker.pipeline` and may
 import anything, and nothing imports it back.
 

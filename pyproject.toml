@@ -16,10 +16,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-anthropic = ["langchain-anthropic>=0.3"]
-openai    = ["langchain-openai>=0.2"]
-vault     = ["hvac>=2.0"]
-dev       = ["pytest>=8", "pytest-cov", "ruff"]
+anthropic  = ["langchain-anthropic>=0.3"]
+openai     = ["langchain-openai>=0.2"]
+vault      = ["hvac>=2.0"]
+azure      = ["msal>=1.28"]
+databricks = ["databricks-sdk>=0.30", "databricks-sql-connector>=3.0"]
+dev        = ["pytest>=8", "pytest-cov", "ruff"]
 
 [tool.setuptools.packages.find]
 where = ["."]
