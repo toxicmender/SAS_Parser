@@ -49,5 +49,26 @@
     "kv_version": null,
     "timeout": null,
     "verify": null
+  },
+  "_databricks_comment": "Non-secret Databricks workspace settings only. The token (DATABRICKS_TOKEN) comes from the environment, never this file; on a cluster no credential is needed, and off-cluster an Entra ID service principal (see 'azure') is preferred over a PAT. Every key here is also read from its standard DATABRICKS_* env var, which wins over this file.",
+  "databricks": {
+    "host": null,
+    "http_path": null,
+    "warehouse_id": null,
+    "cluster_id": null,
+    "catalog": null,
+    "schema": null,
+    "timeout": null
+  },
+  "_azure_comment": "Non-secret Microsoft Entra ID (Azure AD) settings only. The client secret (AZURE_CLIENT_SECRET) comes from the environment, never this file. tenant_id/client_id/authority_host/scopes/certificate_* also read from AZURE_TENANT_ID/AZURE_CLIENT_ID/AZURE_AUTHORITY_HOST/AZURE_SCOPES/AZURE_CLIENT_CERTIFICATE_PATH/AZURE_CLIENT_CERTIFICATE_THUMBPRINT, which win over these. flow: 'client_credentials' (service principal) or 'device_code' (interactive user login); null infers it from the credentials present.",
+  "azure": {
+    "tenant_id": null,
+    "client_id": null,
+    "authority_host": null,
+    "scopes": null,
+    "flow": null,
+    "timeout": null,
+    "certificate_path": null,
+    "certificate_thumbprint": null
   }
 }
