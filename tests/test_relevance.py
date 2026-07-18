@@ -172,6 +172,7 @@ def test_dense_ranking_finds_semantic_match():
     ]
     selector = RelevantHistorySelector(top_k=1, embeddings=_VocabEmbeddings())
     ranking = selector._dense_ranking(docs, [0, 1, 2], "sales figures please")
+    assert ranking is not None
     assert ranking[0] == 0
 
 
@@ -366,7 +367,7 @@ class _RecordingChatModel:
 
 
 def test_pipeline_prompts_relevant_pair_not_recency_window():
-    from chunker.models import SasChunk, SasChunkKind, SasChunkMetadata
+    from chunker.models import SasBatch, SasChunk, SasChunkKind, SasChunkMetadata
     from chunker.pipeline import SasLLMPipeline
     from memory.store import MemoryHub
 
@@ -392,7 +393,7 @@ def test_pipeline_prompts_relevant_pair_not_recency_window():
         window_k=None,
         history_selector=RelevantHistorySelector(top_k=2, always_keep_last=1),
     )
-    chunks = [
+    chunks: list[SasBatch | SasChunk] = [
         _mk_chunk("c1", "data work.zzunique_first_xq; run;"),  # relevant to c4
         _mk_chunk("c2", "proc means data=work.midstream_a; run;"),
         _mk_chunk("c3", "proc freq data=work.midstream_b; run;"),

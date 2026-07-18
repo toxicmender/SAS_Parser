@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import pathlib
 import sys
+from typing import Any
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -79,10 +80,15 @@ class _FakeKvV1:
 
 class _FakeClient:
     def __init__(self, store, authenticated=True):
-        self.secrets = type("S", (), {})()
-        self.secrets.kv = type("KV", (), {})()
-        self.secrets.kv.v2 = _FakeKvV2(store)
-        self.secrets.kv.v1 = _FakeKvV1(store)
+        # Stub the hvac client.secrets.kv.v1/v2 namespace with dynamically-built
+        # objects. Bound through Any-typed locals so the attribute assignments
+        # aren't flagged against the empty synthesized classes.
+        kv: Any = type("KV", (), {})()
+        kv.v2 = _FakeKvV2(store)
+        kv.v1 = _FakeKvV1(store)
+        secrets: Any = type("S", (), {})()
+        secrets.kv = kv
+        self.secrets = secrets
         self._authenticated = authenticated
 
     def is_authenticated(self):

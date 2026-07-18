@@ -29,6 +29,42 @@ jobs:
       - name: Ruff lint
         run: uvx ruff@0.15.20 check . --output-format=github
 
+  types:
+    name: Types (pyright ratchet)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # All extras so optional imports (msal, hvac, delta, databricks, ...)
+      # resolve; otherwise pyright reports them as missing and the counts drift
+      # from a local run. [tool.pyright] points pyright at this .venv.
+      - name: Install dependencies
+        run: >
+          uv sync --locked
+          --extra dev --extra anthropic --extra openai
+          --extra vault --extra azure --extra databricks
+
+      # Pinned like ruff so local and CI agree on the exact diagnostics.
+      - name: Pyright
+        run: uvx pyright@1.1.406 --outputjson > pyright.json
+
+      # Gate: fail only when a file already in the baseline gains errors. New
+      # modules and tests/ are not gated (see scripts/pyright_ratchet.py).
+      - name: Ratchet against baseline
+        run: uv run python scripts/pyright_ratchet.py --input pyright.json
+
+      # Advisory: surface tests/ type errors without blocking (tests are
+      # excluded from [tool.pyright].include, so point pyright at them here).
+      - name: Type-check tests (advisory)
+        if: always()
+        continue-on-error: true
+        run: uvx pyright@1.1.406 tests
+
   test:
     name: Tests & coverage
     runs-on: ubuntu-latest

@@ -19,6 +19,16 @@ from prompt_builder.catalog import DocumentSpec
 from prompt_builder.models import ConstructKey, DocRole, InstructionChunk
 
 
+def _built(block: str | None) -> str:
+    """Assert build() produced a block and narrow str | None -> str.
+
+    The tests below expect a non-empty block; asserting here gives a clear
+    failure instead of a TypeError on the first `in`/`.startswith` and keeps
+    the type checker happy at every use site."""
+    assert block is not None
+    return block
+
+
 def _chunk(chunk_id, section_path, body, *, keys=None, page_start=1, page_end=1):
     return InstructionChunk(
         chunk_id=chunk_id,
@@ -51,8 +61,7 @@ def _corpus():
 
 def test_build_formats_markdown_block():
     pb = PromptBuilder(_corpus())
-    block = pb.build("advance a date interval", [INTNX])
-    assert block is not None
+    block = _built(pb.build("advance a date interval", [INTNX]))
     # Focus hints (directional stimulus) render above the reference guidance.
     assert block.startswith("## Focus hints")
     assert "- Constructs to map: INTNX function" in block
@@ -78,14 +87,13 @@ def test_single_page_citation_format():
     pb = PromptBuilder(
         [_chunk("c0", "Funcs > A", "body text here", keys=[key], page_start=7, page_end=7)]
     )
-    block = pb.build("anything", [key])  # deterministic construct hit
+    block = _built(pb.build("anything", [key]))  # deterministic construct hit
     assert "· p. 7 ·" in block
 
 
 def test_pinned_section_appears_in_block():
     pb = PromptBuilder(_corpus(), pinned_sections=["Output Format"])
-    block = pb.build("zzz nothing", [])
-    assert block is not None
+    block = _built(pb.build("zzz nothing", []))
     assert "Output Format" in block
 
 
@@ -100,7 +108,7 @@ def test_max_instruction_words_caps_block():
         ),
     ]
     pb = PromptBuilder(big, max_instruction_words=420)
-    block = pb.build("w1 w2", [INTNX, ConstructKey(kind="function", name="b")])
+    block = _built(pb.build("w1 w2", [INTNX, ConstructKey(kind="function", name="b")]))
     # Only the first ~400-word chunk fits the 420 budget.
     assert "Funcs > A" in block
     assert "Funcs > B" not in block
@@ -116,8 +124,7 @@ def test_user_instructions_render_in_project_block_above_guidance():
         _corpus(),
         user_instructions="## Output rules\nAlways emit a risk table.",
     )
-    block = pb.build("zzz", [INTNX])
-    assert block is not None
+    block = _built(pb.build("zzz", [INTNX]))
     assert block.startswith("## Project instructions")
     assert "### Output rules" in block
     assert "Always emit a risk table." in block
@@ -131,8 +138,7 @@ def test_user_instructions_render_in_project_block_above_guidance():
 
 def test_user_instructions_only_no_reference_corpus():
     pb = PromptBuilder([], user_instructions="Always target Delta Lake tables.")
-    block = pb.build("anything at all", [])
-    assert block is not None
+    block = _built(pb.build("anything at all", []))
     assert block.startswith("## Project instructions")
     assert "Always target Delta Lake tables." in block
     assert "## Relevant migration guidance" not in block
@@ -149,17 +155,17 @@ def test_with_user_instructions_rebuilds_over_same_corpus():
     original = PromptBuilder(_corpus(), user_instructions="## Old\nOLDMARK body.")
     rebuilt = original.with_user_instructions("## New\nNEWMARK body.")
 
-    block = rebuilt.build("zzz", [INTNX])
+    block = _built(rebuilt.build("zzz", [INTNX]))
     assert "NEWMARK" in block
     assert "OLDMARK" not in block
     assert "INTNX Function" in block  # reference corpus carried over
     # The original builder is untouched.
-    assert "OLDMARK" in original.build("zzz", [])
+    assert "OLDMARK" in _built(original.build("zzz", []))
 
 
 def test_no_user_instructions_output_unchanged():
     pb = PromptBuilder(_corpus())
-    block = pb.build("advance a date interval", [INTNX])
+    block = _built(pb.build("advance a date interval", [INTNX]))
     assert block.startswith("## Focus hints")
     assert "## Relevant migration guidance" in block
     assert "## Project instructions" not in block
@@ -190,7 +196,7 @@ def _hazard_corpus():
 
 def test_hints_hazard_line_carries_caution():
     pb = PromptBuilder(_hazard_corpus())
-    block = pb.build("zzz", [SYMPUT])
+    block = _built(pb.build("zzz", [SYMPUT]))
     assert "## Focus hints" in block
     assert (
         "- ⚠️ Hazards to address explicitly: CALL SYMPUT routine — "
@@ -204,13 +210,13 @@ def test_hints_hazard_listed_even_without_reference_match():
     # No SYMPUT section in the corpus: the construct lookup finds nothing,
     # but the item still deserves the hazard caution.
     pb = PromptBuilder(_corpus())
-    block = pb.build("advance a date interval", [INTNX, SYMPUT])
+    block = _built(pb.build("advance a date interval", [INTNX, SYMPUT]))
     assert "⚠️ Hazards to address explicitly: CALL SYMPUT routine" in block
 
 
 def test_hints_topics_line_from_topical_picks():
     pb = PromptBuilder(_hazard_corpus())
-    block = pb.build("advance a date interval with dataframe", [])
+    block = _built(pb.build("advance a date interval with dataframe", []))
     assert "- Related reference topics:" in block
     assert "DataFrames and SQL" in block.split("## Relevant migration guidance")[0]
 
@@ -219,7 +225,7 @@ def test_hints_render_between_project_and_reference_blocks():
     pb = PromptBuilder(
         _corpus(), user_instructions="## Output rules\nAlways emit a risk table."
     )
-    block = pb.build("zzz", [INTNX])
+    block = _built(pb.build("zzz", [INTNX]))
     assert (
         block.index("## Project instructions")
         < block.index("## Focus hints")
@@ -230,14 +236,13 @@ def test_hints_render_between_project_and_reference_blocks():
 def test_hints_absent_when_nothing_to_hint():
     # Pinned-only selection: no hazards, no construct hits, no topical picks.
     pb = PromptBuilder(_corpus(), pinned_sections=["Output Format"])
-    block = pb.build("zzz nothing", [])
-    assert block is not None
+    block = _built(pb.build("zzz nothing", []))
     assert "## Focus hints" not in block
 
 
 def test_focus_hints_flag_disables_block():
     pb = PromptBuilder(_corpus(), focus_hints=False)
-    block = pb.build("advance a date interval", [INTNX])
+    block = _built(pb.build("advance a date interval", [INTNX]))
     assert block.startswith("## Relevant migration guidance")
     assert "## Focus hints" not in block
 
@@ -245,7 +250,7 @@ def test_focus_hints_flag_disables_block():
 def test_with_user_instructions_preserves_focus_hints_flag():
     pb = PromptBuilder(_corpus(), focus_hints=False)
     rebuilt = pb.with_user_instructions("## A\nrule body")
-    block = rebuilt.build("zzz", [INTNX])
+    block = _built(rebuilt.build("zzz", [INTNX]))
     assert "## Focus hints" not in block
 
 
@@ -260,7 +265,7 @@ def test_hints_construct_labels_by_kind():
         _chunk("p1", "Objects > Hash Object", "in-memory lookup", keys=[keys[1]]),
         _chunk("p2", "Macro > %LET Statement", "assigns macro vars", keys=[keys[2]]),
     ]
-    block = PromptBuilder(corpus).build("zzz", keys)
+    block = _built(PromptBuilder(corpus).build("zzz", keys))
     assert (
         "- Constructs to map: PROC SQL, hash object, %LET macro statement" in block
     )
@@ -273,7 +278,7 @@ def test_hints_construct_labels_by_kind():
 
 def test_directives_rendered_for_hazard_item():
     pb = PromptBuilder(_hazard_corpus())
-    block = pb.build("zzz", [SYMPUT])
+    block = _built(pb.build("zzz", [SYMPUT]))
     assert "## Reasoning directives" in block
     assert "Before writing the translation, in your Analysis:" in block
     assert "a CALL SYMPUT value is not available until the step" in block
@@ -288,27 +293,27 @@ def test_directives_rendered_for_hazard_item():
 def test_directives_survive_missing_reference_section():
     # No SYMPUT section in this corpus; the item still gets the directive.
     pb = PromptBuilder(_corpus())
-    block = pb.build("advance a date interval", [INTNX, SYMPUT])
+    block = _built(pb.build("advance a date interval", [INTNX, SYMPUT]))
     assert "## Reasoning directives" in block
 
 
 def test_no_directives_for_hazard_free_item():
     pb = PromptBuilder(_corpus())
-    block = pb.build("advance a date interval", [INTNX])
+    block = _built(pb.build("advance a date interval", [INTNX]))
     assert "## Reasoning directives" not in block
 
 
 def test_duplicate_hazards_yield_one_directive():
     goto = ConstructKey(kind="macro_statement", name="goto")
     pb = PromptBuilder(_hazard_corpus())
-    block = pb.build("zzz", [SYMPUT, SYMPUT, goto])
+    block = _built(pb.build("zzz", [SYMPUT, SYMPUT, goto]))
     assert block.count("a CALL SYMPUT value is not available") == 1
     assert "%GOTO target" in block
 
 
 def test_reasoning_directives_flag_disables_block():
     pb = PromptBuilder(_hazard_corpus(), reasoning_directives=False)
-    block = pb.build("zzz", [SYMPUT])
+    block = _built(pb.build("zzz", [SYMPUT]))
     assert "## Reasoning directives" not in block
     assert "## Focus hints" in block  # independent of the hints flag
 
@@ -316,7 +321,7 @@ def test_reasoning_directives_flag_disables_block():
 def test_with_user_instructions_preserves_directives_flag():
     pb = PromptBuilder(_hazard_corpus(), reasoning_directives=False)
     rebuilt = pb.with_user_instructions("## A\nrule body")
-    assert "## Reasoning directives" not in rebuilt.build("zzz", [SYMPUT])
+    assert "## Reasoning directives" not in _built(rebuilt.build("zzz", [SYMPUT]))
 
 
 # ---------------------------------------------------------------------------
@@ -326,19 +331,19 @@ def test_with_user_instructions_preserves_directives_flag():
 
 def test_reference_header_annotates_hazard_reason():
     pb = PromptBuilder(_hazard_corpus())
-    block = pb.build("zzz", [SYMPUT])
+    block = _built(pb.build("zzz", [SYMPUT]))
     assert "· hazard: symput]" in block
 
 
 def test_reference_header_annotates_topical_reason():
     pb = PromptBuilder(_hazard_corpus())
-    block = pb.build("advance a date interval with dataframe", [])
+    block = _built(pb.build("advance a date interval with dataframe", []))
     assert "· topical]" in block
 
 
 def test_reference_header_annotates_pinned_reason():
     pb = PromptBuilder(_corpus(), pinned_sections=["Output Format"])
-    block = pb.build("zzz nothing", [])
+    block = _built(pb.build("zzz nothing", []))
     assert "· pinned]" in block
 
 
@@ -346,7 +351,7 @@ def test_reason_annotations_distinguish_construct_from_topical():
     # INTNX arrives via construct lookup; the Spark chunk via ranking — the
     # same block must label the two provenances differently.
     pb = PromptBuilder(_hazard_corpus())
-    block = pb.build("advance a date interval with dataframe", [INTNX])
+    block = _built(pb.build("advance a date interval with dataframe", [INTNX]))
     assert "INTNX Function · pp. 41-43 · construct: intnx]" in block
     assert "· topical]" in block
 
@@ -371,7 +376,7 @@ out = df.withColumn("d", F.add_months("d", 1))
 
 def test_matched_example_renders_in_worked_examples_block():
     pb = PromptBuilder(_corpus(), user_instructions=EXAMPLE_INSTRUCTIONS)
-    block = pb.build("zzz", [INTNX])
+    block = _built(pb.build("zzz", [INTNX]))
     assert "## Worked examples" in block
     assert "### Date advance" in block
     assert "F.add_months" in block
@@ -387,13 +392,13 @@ def test_matched_example_renders_in_worked_examples_block():
 
 def test_unmatched_example_not_rendered():
     pb = PromptBuilder(_corpus(), user_instructions=EXAMPLE_INSTRUCTIONS)
-    block = pb.build("zzz", [])
+    block = _built(pb.build("zzz", []))
     assert "## Worked examples" not in block
 
 
 def test_examples_work_without_reference_corpus():
     pb = PromptBuilder([], user_instructions=EXAMPLE_INSTRUCTIONS)
-    block = pb.build("zzz", [INTNX])
+    block = _built(pb.build("zzz", [INTNX]))
     assert "## Worked examples" in block
     assert "## Relevant migration guidance" not in block
 
@@ -427,6 +432,5 @@ def test_from_specs_loads_and_builds(tmp_path):
     pdf = _write_funcs_pdf(tmp_path / "funcs.pdf")
     spec = DocumentSpec(path=pdf, doc_id="functions", section_level=2)
     pb = PromptBuilder.from_specs([spec], cache_dir=str(tmp_path / "cache"))
-    block = pb.build("advance a date", [INTNX])
-    assert block is not None
+    block = _built(pb.build("advance a date", [INTNX]))
     assert "INTNX Function" in block

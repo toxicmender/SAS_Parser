@@ -74,7 +74,9 @@ def _mk_run(
     outputs = [
         {"item_id": f"item-{i}", "response": r} for i, r in enumerate(responses)
     ]
-    return CaseRun(case=case, items=items, outputs=outputs)
+    # run_id is derived from `case` by CaseRun's before-validator, which pyright
+    # can't see (mirrors validation/runner.py).
+    return CaseRun(case=case, items=items, outputs=outputs)  # pyright: ignore[reportCallIssue]
 
 
 GOOD_RESPONSE = (

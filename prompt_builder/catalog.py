@@ -55,7 +55,12 @@ def _code_fingerprint() -> str:
 
         digest = hashlib.sha256()
         for module in (_pr, _dc):
-            digest.update(Path(module.__file__).read_bytes())
+            # __file__ is Optional only for namespace packages and builtins;
+            # both of these are ordinary file-backed modules.
+            source = module.__file__
+            if source is None:  # pragma: no cover - unreachable in a normal install
+                raise RuntimeError(f"{module.__name__} has no __file__ to hash")
+            digest.update(Path(source).read_bytes())
         _CODE_HASH = digest.hexdigest()[:12]
     return _CODE_HASH
 

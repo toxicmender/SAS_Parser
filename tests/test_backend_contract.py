@@ -186,7 +186,9 @@ class TestInMemoryContract(KVStoreContract):
 def delta_spark(tmp_path_factory):
     pytest.importorskip("pyspark")
     pytest.importorskip("delta", reason="delta-spark not installed")
-    from delta import configure_spark_with_delta_pip
+    # delta-spark isn't a project dependency (installed only where the Delta
+    # backend is exercised); the importorskip above guards this at runtime.
+    from delta import configure_spark_with_delta_pip  # pyright: ignore[reportMissingImports]
     from pyspark.sql import SparkSession
 
     warehouse = tmp_path_factory.mktemp("delta-warehouse")

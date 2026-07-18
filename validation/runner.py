@@ -21,6 +21,7 @@ import time
 from typing import Sequence
 from uuid import uuid4
 
+from chunker.models import SasBatch
 from chunker.pipeline import SasLLMPipeline
 
 from .evaluator import Evaluator
@@ -82,7 +83,7 @@ class ValidationRunner:
         elapsed = time.perf_counter() - t0
 
         derived_ids = [
-            i.batch_id if hasattr(i, "batch_id") else i.chunk_id for i in items
+            i.batch_id if isinstance(i, SasBatch) else i.chunk_id for i in items
         ]
         output_ids = [o["item_id"] for o in outputs]
         if derived_ids != output_ids:
@@ -92,7 +93,9 @@ class ValidationRunner:
                 f"({derived_ids} vs {output_ids}); scoring positionally"
             )
 
-        run = CaseRun(case=case, items=items, outputs=outputs)
+        # run_id and the expectation fields are filled in from `case` by
+        # CaseRun._derive_from_case, a before-validator pyright can't see.
+        run = CaseRun(case=case, items=items, outputs=outputs)  # pyright: ignore[reportCallIssue]
         case_result = self._evaluator.evaluate(run)
         logger.info(
             f"run_case: '{case.case_id}' done  items={len(items)}  "

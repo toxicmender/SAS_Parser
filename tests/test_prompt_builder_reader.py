@@ -81,6 +81,7 @@ def test_parse_construct_key(title, expected):
     if expected is None:
         assert key is None
     else:
+        assert key is not None
         assert (key.kind, key.name) == expected
 
 

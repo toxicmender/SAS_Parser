@@ -110,7 +110,9 @@ def test_requests_per_second_builds_rate_limiter(monkeypatch):
 
 
 def test_model_name_alias_accepted():
-    assert LLMClientConfig(model_name="alias-model").model == "alias-model"
+    # model_name is a validation_alias for `model` (populate_by_name); pyright
+    # doesn't synthesize it as a constructor kwarg, but pydantic accepts it.
+    assert LLMClientConfig(model_name="alias-model").model == "alias-model"  # pyright: ignore[reportCallIssue]
     assert LLMClientConfig(model="plain-model").model == "plain-model"
 
 
@@ -120,7 +122,8 @@ def test_endpoint_overrides_forwarded(monkeypatch):
         LLMClientConfig(
             model="some-model",
             base_url="https://gateway.example/v1",
-            api_key="sk-secret",
+            # pydantic coerces a plain str into the SecretStr field at runtime.
+            api_key="sk-secret",  # pyright: ignore[reportArgumentType]
             url_headers={"X-Team": "sas"},
             timeout=42.5,
             model_kwargs={"top_k": 40},
@@ -135,7 +138,8 @@ def test_endpoint_overrides_forwarded(monkeypatch):
 
 
 def test_api_key_masked_in_repr():
-    cfg = LLMClientConfig(api_key="sk-secret")
+    # Plain str is coerced into the SecretStr field by pydantic at runtime.
+    cfg = LLMClientConfig(api_key="sk-secret")  # pyright: ignore[reportArgumentType]
     assert "sk-secret" not in repr(cfg)
     assert "sk-secret" not in str(cfg)
 

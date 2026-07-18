@@ -695,8 +695,11 @@ class SasLLMPipeline:
             # Reference guidance is prompted via `instructions` but is NOT part
             # of the persisted turn — it is re-derivable, would bloat the store,
             # and would pollute relevance-based history selection.
-            thread_id = config["configurable"]["thread_id"]
-            instructions = config["configurable"].get("instructions", [])
+            # "configurable" is NotRequired on RunnableConfig; the graph is
+            # always invoked with one, and thread_id below is genuinely required.
+            configurable = config.get("configurable", {})
+            thread_id = configurable["thread_id"]
+            instructions = configurable.get("instructions", [])
             history = self._memory.get_thread(thread_id)
             input_message = state["messages"][-1]
             history_messages = history.messages

@@ -6,7 +6,7 @@ import logging
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
     from langchain_core.documents import Document
@@ -45,7 +45,7 @@ class InstructionDiagnostic(BaseModel):
         return f"[{self.code}]{where}{page}: {self.message}"
 
 
-class ConstructKey(BaseModel):
+class ConstructKey(BaseModel, frozen=True):
     """
     A normalised SAS construct a reference section documents, e.g.
     ``ConstructKey(kind="function", name="intnx")`` for "INTNX Function".
@@ -53,9 +53,10 @@ class ConstructKey(BaseModel):
     Frozen so it is hashable and can be matched, in a set, against the
     constructs a pipeline item's metadata reports. ``name`` is always
     lowercased at construction by the parser.
-    """
 
-    model_config = ConfigDict(frozen=True)
+    Frozen via the class keyword rather than ``model_config`` so type
+    checkers see the generated ``__hash__`` and accept it as a dict key.
+    """
 
     kind: str  # function | call_routine | macro_function | macro_statement |
     #            global_statement | proc | format | informat | option |

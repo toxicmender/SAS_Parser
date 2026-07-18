@@ -260,11 +260,17 @@ def _client_credential(config: AzureAuthConfig) -> Any:
     """
     if config.client_secret:
         return config.client_secret
+    certificate_path = config.certificate_path
+    if certificate_path is None:
+        raise AzureAuthError(
+            "certificate-based login needs azure.certificate_path plus "
+            "azure.certificate_thumbprint"
+        )
     try:
-        private_key = Path(config.certificate_path).read_text(encoding="utf-8")
+        private_key = Path(certificate_path).read_text(encoding="utf-8")
     except OSError as exc:
         raise AzureAuthError(
-            f"could not read Azure certificate '{config.certificate_path}': {exc}"
+            f"could not read Azure certificate '{certificate_path}': {exc}"
         ) from exc
     return {"private_key": private_key, "thumbprint": config.certificate_thumbprint}
 

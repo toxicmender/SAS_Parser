@@ -196,6 +196,7 @@ def test_instruction_injected_only_when_construct_present_in_batch():
     out = builder.build(
         _query_for_item(intck_batch), _constructs_for_item(intck_batch)
     )
+    assert out is not None
     assert "INTCK rule" in out
     assert "INTNX rule" not in out  # not used by this batch -> not injected
 
@@ -243,6 +244,7 @@ def test_kind_and_meta_gate_instruction_injection_end_to_end():
         kinds=_kinds_for_item(proc_batch),
         meta_flags=_meta_flags_for_item(proc_batch),
     )
+    assert out is not None
     assert "PROC rule" in out
     assert "SYMPUT rule" not in out  # no hazard flag on this batch
 
@@ -255,6 +257,7 @@ def test_kind_and_meta_gate_instruction_injection_end_to_end():
         kinds=_kinds_for_item(hazard_batch),
         meta_flags=_meta_flags_for_item(hazard_batch),
     )
+    assert out2 is not None
     assert "SYMPUT rule" in out2
     assert "PROC rule" not in out2  # not a PROC step
 
@@ -362,7 +365,9 @@ def test_pipeline_level_instructions_replace_builders_own():
     assert USER_MARKER in prompted
     assert OLD_MARKER not in prompted
     # The original builder object is untouched.
-    assert OLD_MARKER in builder.build("zzz", [])
+    old_block = builder.build("zzz", [])
+    assert old_block is not None
+    assert OLD_MARKER in old_block
 
 
 def test_conditional_rule_scoped_end_to_end():

@@ -18,6 +18,9 @@ coverage.xml
 junit.xml
 htmlcov/
 
+# Pyright report consumed by the ratchet (scripts/pyright_ratchet.py)
+pyright.json
+
 # prompt_builder on-disk extraction cache
 .prompt_builder_cache/
 

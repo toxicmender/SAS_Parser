@@ -13,7 +13,7 @@ import json
 import logging
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.messages import (
@@ -27,7 +27,19 @@ from langchain_core.messages import (
 )
 
 # PySpark is optional — required only for Delta mode; the in-memory backend
-# (table=None) must import and run without it.
+# (table=None) must import and run without it. The type checker imports these
+# unconditionally so uses below aren't "possibly unbound"; _PYSPARK_AVAILABLE
+# is what actually gates them at runtime.
+if TYPE_CHECKING:
+    from pyspark.sql import DataFrame, SparkSession
+    from pyspark.sql import functions as F
+    from pyspark.sql.types import (
+        DoubleType,
+        StringType,
+        StructField,
+        StructType,
+    )
+
 try:
     from pyspark.sql import DataFrame, SparkSession
     from pyspark.sql import functions as F
@@ -112,7 +124,7 @@ def _schema():
 # Delta-schema column order (value/tags kept JSON-serialised). Upsert rows with
 # created_at=None get each backend's preservation semantics (keep existing on
 # update, default to now on insert).
-_RawRecord = Tuple[str, str, Optional[str], float, float, Optional[str]]
+_RawRecord = Tuple[str, str, Optional[str], Optional[float], float, Optional[str]]
 
 
 class _InMemoryBackend:
@@ -204,7 +216,7 @@ class _DeltaBackend:
     format if it does not already exist.
     """
 
-    def __init__(self, spark: "SparkSession", table: str) -> None:
+    def __init__(self, spark: "SparkSession | None", table: str) -> None:
         if not _PYSPARK_AVAILABLE:
             raise RuntimeError("pyspark is not installed. Run: pip install pyspark")
         if spark is None:
@@ -706,8 +718,11 @@ class KVChatMessageHistory(BaseChatMessageHistory):
         # being silently rewritten as human messages.
         return ChatMessage(role=role, content=data["content"], additional_kwargs=meta)
 
+    # BaseChatMessageHistory annotates `messages` as a plain attribute, but
+    # documents overriding it as a property — which is what this lazy,
+    # cache-backed read needs.
     @property
-    def messages(self) -> List[BaseMessage]:
+    def messages(self) -> List[BaseMessage]:  # pyright: ignore[reportIncompatibleVariableOverride]
         if self._msg_cache is None:
             pairs = self._store.all_records(prefix=self._msg_prefix)
             self._msg_cache = []
@@ -741,7 +756,7 @@ class KVChatMessageHistory(BaseChatMessageHistory):
     def add_message(self, message: BaseMessage) -> None:
         self.add_messages([message])
 
-    def add_messages(self, messages: List[BaseMessage]) -> None:
+    def add_messages(self, messages: Sequence[BaseMessage]) -> None:
         """Persist several messages in ONE store write (one Delta MERGE)."""
         ts = _now()
         entries = []

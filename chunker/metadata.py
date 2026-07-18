@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import Any
 
 from .keywords import (
     _MACRO_CALL_RE,
@@ -638,7 +639,7 @@ def _merge_meta(parent: SasChunkMetadata, child: SasChunkMetadata) -> SasChunkMe
     new field shape to pick a rule rather than inherit a wrong default.
     Computed fields derive from their stored inputs and are not merged.
     """
-    merged: dict[str, object] = {}
+    merged: dict[str, Any] = {}
     for name, field in SasChunkMetadata.model_fields.items():
         p = getattr(parent, name)
         c = getattr(child, name)
