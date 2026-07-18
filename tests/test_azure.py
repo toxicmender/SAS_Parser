@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import pathlib
 import sys
+from typing import Any
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -104,7 +105,7 @@ class _FakePublicApp:
 
 def _sp_config(**kwargs):
     """A service-principal config: client_credentials flow, secret credential."""
-    base = dict(
+    base: dict[str, Any] = dict(
         tenant_id="t-1", client_id="c-1", client_secret="s-1", scopes=_SCOPES
     )
     base.update(kwargs)

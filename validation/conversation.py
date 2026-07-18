@@ -24,7 +24,7 @@ Logger name: ``validation.conversation``.
 from __future__ import annotations
 
 import logging
-from typing import Any, Sequence
+from typing import Any, Sequence, cast
 
 from langchain_core.messages import BaseMessage
 from memory.turns import group_turns
@@ -185,11 +185,14 @@ def run_from_transcript(
     items = list(transcript)
     if not items:
         raise ValueError("empty transcript: nothing to validate")
+    # A Transcript is one shape or the other throughout, so the first item
+    # decides for the whole list.
     if isinstance(items[0], BaseMessage):
-        prompts, responses = _pairs_from_messages(items)
+        prompts, responses = _pairs_from_messages(cast("list[BaseMessage]", items))
     else:
-        prompts = [str(p) for p, _ in items]
-        responses = [str(r) for _, r in items]
+        pairs = cast("list[tuple[str, str]]", items)
+        prompts = [str(p) for p, _ in pairs]
+        responses = [str(r) for _, r in pairs]
     logger.info(f"run_from_transcript: '{run_id}'  turns={len(prompts)}")
     return EvaluationRun(
         run_id=run_id,

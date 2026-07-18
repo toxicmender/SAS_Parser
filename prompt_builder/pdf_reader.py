@@ -23,6 +23,7 @@ import logging
 import re
 import unicodedata
 from collections import Counter
+from typing import Any, cast
 
 import pymupdf
 
@@ -238,7 +239,11 @@ class PdfReader:
         doc = pymupdf.open(path)
         try:
             page_count = doc.page_count
-            raw_pages = [doc[i].get_text("text") for i in range(page_count)]
+            # get_text's return shape follows its format argument; "text" is
+            # always str, but the signature unions every format's shape.
+            raw_pages = [
+                cast(str, doc[i].get_text("text")) for i in range(page_count)
+            ]
             self._flag_missing_text(raw_pages, doc_id, diagnostics)
             cleaned_pages = [
                 _normalize_text(p)
@@ -562,7 +567,9 @@ def _find_heading(full: str, title: str, start: int, end: int) -> int | None:
 def _page_size_lines(page: pymupdf.Page) -> list[tuple[str, float]]:
     """Each line on *page* as ``(text, max-span-size)``, in reading order."""
     lines: list[tuple[str, float]] = []
-    for block in page.get_text("dict").get("blocks", []):
+    # "dict" always yields a dict here; see the cast note in PdfReader.read.
+    page_dict = cast("dict[str, Any]", page.get_text("dict"))
+    for block in page_dict.get("blocks", []):
         for line in block.get("lines", []):
             spans = line.get("spans", [])
             if not spans:

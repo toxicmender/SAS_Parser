@@ -64,8 +64,10 @@ def _validate_thread(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    # __doc__ is None under `python -OO`, which strips docstrings.
     parser = argparse.ArgumentParser(
-        prog="python -m validation", description=__doc__.splitlines()[0]
+        prog="python -m validation",
+        description=__doc__.splitlines()[0] if __doc__ else None,
     )
     parser.add_argument(
         "cases",

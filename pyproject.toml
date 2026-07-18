@@ -47,3 +47,24 @@ source = [
 markers = [
     "slow: end-to-end tests over the real reference_docs corpus; skipped when the PDFs are absent",
 ]
+
+[tool.pyright]
+# Shipped code only. tests/ is deliberately out of the gate (see
+# scripts/pyright_ratchet.py); build/ is a gitignored stale wheel tree.
+include = [
+    "app_config",
+    "chunker",
+    "memory",
+    "llm_client",
+    "prompt_builder",
+    "validation",
+    "main.py",
+    "demo_run.py",
+]
+exclude = ["**/build/**", "**/.venv/**", "**/__pycache__/**"]
+# Resolve the same interpreter and installed packages CI uses (uv's .venv),
+# so optional deps (msal, hvac, delta, ...) don't read as missing imports.
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.12"
+typeCheckingMode = "standard"

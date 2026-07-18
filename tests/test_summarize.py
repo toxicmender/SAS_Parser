@@ -122,6 +122,7 @@ def test_invoke_style_model_supported():
 
     s = RollingSummarizer(InvokeModel(), trigger_tokens=1, keep_last_turns=0)
     msg = s.refresh("t1", _mk_history("a", "b"))
+    assert msg is not None
     assert "invoked summary" in msg.content
 
 

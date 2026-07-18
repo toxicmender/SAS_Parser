@@ -273,7 +273,9 @@ class VaultClient:
             url=config.address,
             namespace=config.namespace,
             verify=config.verify,
-            timeout=config.timeout,
+            # hvac's stub types timeout as int, but it reaches requests, which
+            # takes float seconds; casting would floor sub-second timeouts to 0.
+            timeout=config.timeout,  # pyright: ignore[reportArgumentType]
         )
         _authenticate(client, config)
         return client

@@ -155,6 +155,24 @@ class HybridRanker:
     def has_reranker(self) -> bool:
         return self._reranker is not None
 
+    def _require_embeddings(self) -> Any:
+        """The embeddings backend, or a clear error. Guarded by :attr:`has_dense`."""
+        if self._embeddings is None:
+            raise RuntimeError(
+                "dense retrieval needs embeddings: construct HybridRanker with "
+                "embeddings=, or check has_dense first"
+            )
+        return self._embeddings
+
+    def _require_reranker(self) -> Callable[[str, list[str]], list[float]]:
+        """The reranker hook, or a clear error. Guarded by :attr:`has_reranker`."""
+        if self._reranker is None:
+            raise RuntimeError(
+                "rerank() needs a reranker: construct HybridRanker with "
+                "reranker=, or check has_reranker first"
+            )
+        return self._reranker
+
     # ------------------------------------------------------------------
     # Stateless per-call ranking (corpus differs every call)
     # ------------------------------------------------------------------
@@ -187,7 +205,7 @@ class HybridRanker:
         """Best-first candidate ranking, or ``None`` when cosine has no signal."""
         vectors = self.embed_cached([docs[i] for i in candidates])
         query_vec = self._normalize(
-            np.asarray(self._embeddings.embed_query(query), dtype=np.float32)
+            np.asarray(self._require_embeddings().embed_query(query), dtype=np.float32)
         )
         index = faiss.IndexFlatIP(vectors.shape[1])
         index.add(vectors)
@@ -209,7 +227,7 @@ class HybridRanker:
     ) -> list[int]:
         """Re-order the top ``window_size`` of *fused* with the reranker hook."""
         window = fused[:window_size]
-        scores = self._reranker(query, [docs[i] for i in window])
+        scores = self._require_reranker()(query, [docs[i] for i in window])
         order = sorted(range(len(window)), key=lambda j: (-scores[j], -window[j]))
         return [window[j] for j in order] + fused[len(window) :]
 
@@ -275,7 +293,9 @@ class HybridRanker:
 
         if self._faiss is not None:
             query_vec = self._normalize(
-                np.asarray(self._embeddings.embed_query(text), dtype=np.float32)
+                np.asarray(
+                    self._require_embeddings().embed_query(text), dtype=np.float32
+                )
             )
             similarities, order = self._faiss.search(query_vec[None, :], n)
             if float(similarities.max()) - float(similarities.min()) >= 1e-9:
@@ -308,7 +328,9 @@ class HybridRanker:
                 f"embed_cached: embedding {len(missing)} new text(s) "
                 f"({len(texts) - len(missing)} cached)"
             )
-            new_vectors = self._embeddings.embed_documents([t for _, t in missing])
+            new_vectors = self._require_embeddings().embed_documents(
+                [t for _, t in missing]
+            )
             for (key, _), vec in zip(missing, new_vectors):
                 self._embedding_cache[key] = self._normalize(
                     np.asarray(vec, dtype=np.float32)

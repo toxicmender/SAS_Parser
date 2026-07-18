@@ -207,7 +207,7 @@ def test_pipeline_window_trimming_limits_injected_history():
         window_k=1,  # keep only last 1 human/ai pair in the prompt
     )
 
-    chunks = [
+    chunks: list[SasBatch | SasChunk] = [
         _mk_chunk(f"f1-chunk-000{i}", "etl.sas", f"data work.t{i}; run;")
         for i in range(3)
     ]
@@ -241,7 +241,7 @@ def test_run_facts_recorded_per_item():
     mem = MemoryHub()
     pipeline = SasLLMPipeline(model="unused", memory=mem, llm=fake_llm)
 
-    chunks = [
+    chunks: list[SasBatch | SasChunk] = [
         _mk_chunk("f1-chunk-0001", "etl.sas", "data work.a; run;"),
         _mk_chunk("f1-chunk-0002", "etl.sas", "proc print data=work.a; run;"),
     ]
@@ -377,7 +377,7 @@ def test_summarizer_gets_pipeline_store_and_summary_never_persisted():
     # A store-less summarizer is wired to the pipeline's KV layer.
     assert summarizer.store is mem.kv
 
-    chunks = [
+    chunks: list[SasBatch | SasChunk] = [
         _mk_chunk(f"f1-chunk-000{i}", "etl.sas", f"data work.t{i}; run;")
         for i in range(3)
     ]

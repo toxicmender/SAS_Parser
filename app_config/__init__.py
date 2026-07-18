@@ -68,12 +68,13 @@ def load_config() -> dict[str, Any]:
         try:
             # utf-8-sig also accepts BOM-less files; Windows editors and
             # PowerShell 5.1 commonly prepend a BOM, which plain utf-8 rejects.
-            _cache = json.loads(path.read_text(encoding="utf-8-sig"))
+            config = json.loads(path.read_text(encoding="utf-8-sig"))
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning(f"load_config: unreadable '{path}': {exc}; skipping")
             continue
         logger.info(f"load_config: using '{path}'")
-        return _cache
+        _cache = config
+        return config
     logger.info("load_config: no config.json found; using hard defaults")
     _cache = {}
     return _cache

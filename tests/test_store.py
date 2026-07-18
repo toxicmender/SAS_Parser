@@ -310,6 +310,7 @@ class TestRoleRoundTrip(unittest.TestCase):
         h.add_message(ChatMessage(role="tool", content="result"))
         msgs = h.messages
         self.assertEqual(len(msgs), 1)
+        assert isinstance(msgs[0], ChatMessage)  # .role is ChatMessage-only
         self.assertEqual(msgs[0].role, "tool")
         self.assertEqual(msgs[0].content, "result")
 
@@ -339,7 +340,7 @@ class TestLosslessSerialisation(unittest.TestCase):
             )
         )
         msg = h.messages[0]
-        self.assertIsInstance(msg, AIMessage)
+        assert isinstance(msg, AIMessage)
         self.assertEqual(msg.tool_calls[0]["name"], "run_sql")
         self.assertEqual(msg.tool_calls[0]["args"], {"q": "select 1"})
         self.assertEqual(msg.tool_calls[0]["id"], "call-1")
@@ -350,7 +351,7 @@ class TestLosslessSerialisation(unittest.TestCase):
         h = self._history()
         h.add_message(ToolMessage(content="42", tool_call_id="call-1"))
         msg = h.messages[0]
-        self.assertIsInstance(msg, ToolMessage)
+        assert isinstance(msg, ToolMessage)
         self.assertEqual(msg.tool_call_id, "call-1")
 
     def test_id_and_response_metadata_round_trip(self):
@@ -398,7 +399,10 @@ class TestLosslessSerialisation(unittest.TestCase):
         self.assertEqual(usage["output_tokens"], 12)
         self.assertEqual(usage["total_tokens"], 42)
         # And the usage survives the message round-trip itself.
-        self.assertEqual(h.messages[1].usage_metadata["total_tokens"], 15)
+        msg = h.messages[1]
+        assert isinstance(msg, AIMessage)
+        assert msg.usage_metadata is not None
+        self.assertEqual(msg.usage_metadata["total_tokens"], 15)
 
     def test_empty_thread_reports_zero_usage(self):
         usage = self._history().get_session_metadata()["total_usage"]
@@ -497,7 +501,7 @@ class TestMessageReadCache(unittest.TestCase):
         h = KVChatMessageHistory("t1", store)
         h.add_user_message("q1")
         first = h.messages
-        first.append("garbage")
+        first.append(first[0])  # mutate the returned list; store must be unaffected
         self.assertEqual(len(h.messages), 1)
 
     def test_appends_from_another_instance_are_picked_up(self):

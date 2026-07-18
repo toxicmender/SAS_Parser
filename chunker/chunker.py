@@ -458,7 +458,7 @@ class SasSemanticChunker:
             cls = _classify(stripped)
 
             # ── block-opener: collect the whole block ───────────────────────
-            if cls in _BLOCK_OPENERS:
+            if cls is not None and cls in _BLOCK_OPENERS:
                 flush_unknown()
                 block_units, index, unclosed = self._collect_block(units, index, cls)
                 r = _Region(
@@ -568,12 +568,12 @@ class SasSemanticChunker:
 
             # Only DATA/PROC openers implicitly close a DATA/PROC block; a %MACRO
             # block is closed only by %MEND, so nested steps are collected.
-            implicit_close = (
-                cls in _BLOCK_OPENERS
+            if (
+                cls is not None
+                and cls in _BLOCK_OPENERS
                 and block
                 and kind in {SasChunkKind.DATA_STEP, SasChunkKind.PROC_STEP}
-            )
-            if implicit_close:
+            ):
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
                         f"_collect_block: implicit close  {kind.value} at unit {index}  next_kind={cls.value}"

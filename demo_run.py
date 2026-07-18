@@ -137,7 +137,10 @@ def _fetch_api_key_from_vault(secret_path: str, secret_key: str) -> str:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    # __doc__ is None under `python -OO`, which strips docstrings.
+    parser = argparse.ArgumentParser(
+        description=__doc__.splitlines()[0] if __doc__ else None
+    )
     parser.add_argument(
         "sas_dir",
         type=Path,
