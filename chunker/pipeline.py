@@ -1086,7 +1086,7 @@ class SasLLMPipeline:
             attempt += 1
             # Roll-back point: everything already committed for earlier items.
             # Only needed when a retry might follow (else skip the history load).
-            len_before = len(history.messages) if max_attempts > 1 else 0
+            len_before = history.message_count() if max_attempts > 1 else 0
             cfg: RunnableConfig = {
                 "configurable": {
                     "thread_id": thread_id,
