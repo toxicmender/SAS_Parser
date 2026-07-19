@@ -40,14 +40,14 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
-      # All extras so optional imports (msal, hvac, delta, databricks,
-      # msgraph-sdk, ...) resolve; otherwise pyright reports them as missing and
-      # the counts drift from a local run. [tool.pyright] points pyright at this
-      # .venv.
+      # All extras so optional imports (pyspark, msal, hvac, delta,
+      # databricks, msgraph-sdk, ...) resolve; otherwise pyright reports them
+      # as missing and the counts drift from a local run. [tool.pyright]
+      # points pyright at this .venv.
       - name: Install dependencies
         run: >
           uv sync --locked
-          --extra dev --extra anthropic --extra openai
+          --extra dev --extra spark --extra anthropic --extra openai
           --extra vault --extra azure --extra databricks --extra sharepoint
 
       # Pinned like ruff so local and CI agree on the exact diagnostics.
@@ -85,8 +85,10 @@ jobs:
 
       # Python version comes from .python-version; --locked fails the build
       # if uv.lock is out of sync with pyproject.toml instead of re-resolving.
+      # pyspark is an extra (in-memory mode is Spark-free); CI installs it so
+      # the Spark-backed tests (Delta contract, tracking) keep running here.
       - name: Install dependencies
-        run: uv sync --locked --extra dev
+        run: uv sync --locked --extra dev --extra spark
 
       # Slow end-to-end tests skip themselves automatically: they need the
       # user-provided reference_docs/ PDFs, which are gitignored and absent here.
