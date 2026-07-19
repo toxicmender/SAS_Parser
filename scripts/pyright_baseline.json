@@ -4,6 +4,7 @@
     "app_config/__init__.py": 0,
     "app_config/azure.py": 0,
     "app_config/databricks.py": 0,
+    "app_config/sharepoint.py": 0,
     "app_config/vault.py": 0,
     "chunker/__init__.py": 0,
     "chunker/_repl.py": 0,

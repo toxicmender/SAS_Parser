@@ -40,14 +40,15 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
-      # All extras so optional imports (msal, hvac, delta, databricks, ...)
-      # resolve; otherwise pyright reports them as missing and the counts drift
-      # from a local run. [tool.pyright] points pyright at this .venv.
+      # All extras so optional imports (msal, hvac, delta, databricks,
+      # msgraph-sdk, ...) resolve; otherwise pyright reports them as missing and
+      # the counts drift from a local run. [tool.pyright] points pyright at this
+      # .venv.
       - name: Install dependencies
         run: >
           uv sync --locked
           --extra dev --extra anthropic --extra openai
-          --extra vault --extra azure --extra databricks
+          --extra vault --extra azure --extra databricks --extra sharepoint
 
       # Pinned like ruff so local and CI agree on the exact diagnostics.
       - name: Pyright

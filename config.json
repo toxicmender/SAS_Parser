@@ -70,5 +70,14 @@
     "timeout": null,
     "certificate_path": null,
     "certificate_thumbprint": null
+  },
+  "_sharepoint_comment": "Non-secret SharePoint (Microsoft Graph) settings only. There is no secret here: authentication is delegated to the 'azure' Entra ID service principal, which mints a Graph token. Identify the site with site_id, or site_hostname + site_path; drive_id targets a specific document library (default: the site's). Every key is also read from its SHAREPOINT_* env var, which wins over this file.",
+  "sharepoint": {
+    "site_hostname": null,
+    "site_path": null,
+    "site_id": null,
+    "drive_id": null,
+    "scopes": null,
+    "timeout": null
   }
 }

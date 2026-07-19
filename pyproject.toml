@@ -21,6 +21,10 @@ openai     = ["langchain-openai>=0.2"]
 vault      = ["hvac>=2.0"]
 azure      = ["msal>=1.28"]
 databricks = ["databricks-sdk>=0.30", "databricks-sql-connector>=3.0"]
+# SharePoint over Microsoft Graph. msal comes along because auth is delegated to
+# app_config.azure (which mints the Graph token); msgraph-sdk pulls in
+# azure-identity, the kiota runtime, and httpx itself.
+sharepoint = ["msgraph-sdk>=1.5", "msal>=1.28"]
 dev        = ["pytest>=8", "pytest-cov", "ruff"]
 
 [tool.setuptools.packages.find]
