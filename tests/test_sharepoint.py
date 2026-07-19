@@ -12,6 +12,7 @@ sharepoint client cache around itself.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import pathlib
 import sys
@@ -23,6 +24,16 @@ import pytest
 
 import app_config
 from app_config import azure, sharepoint
+
+# msgraph-sdk is the optional 'sharepoint' extra: the CI test job installs only
+# --extra dev, so it is absent there. Most tests inject a fake GraphServiceClient
+# and never touch it, but a few operations import SDK model / request-config
+# classes lazily to build request bodies; those tests skip when it is missing
+# (the types job type-checks the module with the extra installed instead).
+requires_msgraph = pytest.mark.skipif(
+    importlib.util.find_spec("msgraph") is None,
+    reason="msgraph-sdk (the 'sharepoint' extra) is not installed",
+)
 
 _SHAREPOINT_ENV = (
     "SHAREPOINT_SITE_HOSTNAME",
@@ -482,6 +493,7 @@ def test_write_file_rejects_root():
 # ---------------------------------------------------------------------------
 
 
+@requires_msgraph
 def test_create_directory_posts_a_folder():
     children = _ChildrenBuilder([_Collection([])])
     item = _ItemBuilder(children=children)
@@ -495,6 +507,7 @@ def test_create_directory_posts_a_folder():
     assert body.additional_data["@microsoft.graph.conflictBehavior"] == "fail"
 
 
+@requires_msgraph
 def test_create_directory_at_root_uses_root_parent():
     children = _ChildrenBuilder([_Collection([])])
     item = _ItemBuilder(children=children)
@@ -536,6 +549,7 @@ class _ListItem:
         self.fields = _F()
 
 
+@requires_msgraph
 def test_read_list_items_flattens_fields():
     pages = [
         _Collection(
@@ -555,6 +569,7 @@ def test_read_list_items_flattens_fields():
     assert fake.sites._site_builder.lists.requested_ids == ["Tasks"]
 
 
+@requires_msgraph
 def test_read_list_items_expands_fields_by_default():
     client, _, items_builder = _site_client()
     client.read_list_items("Tasks")
@@ -562,6 +577,7 @@ def test_read_list_items_expands_fields_by_default():
     assert config.query_parameters.expand == ["fields"]
 
 
+@requires_msgraph
 def test_read_list_items_follows_paging():
     pages = [
         _Collection([_ListItem("1", {"Title": "A"})], next_link="https://next"),
