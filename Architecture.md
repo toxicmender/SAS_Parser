@@ -258,7 +258,7 @@ once, emitting typed edges:
 | `dataset_flow`       | strong | chunk reads a dataset a preceding chunk wrote |
 | `macro_body_dataset` | strong | call-site-resolved parameterised macro-body I/O |
 | `macro_invocation`   | weak   | chunk invokes a macro defined elsewhere |
-| `macro_var_flow`     | weak   | chunk reads `&name` a preceding chunk created |
+| `macro_var_flow`     | weak   | chunk reads `&name`; links to the nearest preceding creator |
 | `macro_arg_dataset`  | weak   | dataset name appears in a macro call's argument |
 
 Strong edges union their endpoints in a Union-Find immediately. Weak edges
@@ -275,6 +275,11 @@ Dataset names are canonicalised (`_canon_ds`): one-level names become
 that rewrite is inexact). Consumers link to the **nearest preceding
 producer** in corpus order — the state a sequential SAS session would
 actually read — so unrelated jobs reusing `work.tmp` stay separate.
+Macro-variable consumers follow the same rule: a chunk reading `&name`
+links only to the nearest preceding `%let`/`%global`/SYMPUT/SQL-INTO
+creator (the last assignment before the reference is the one whose value
+SAS resolves), so a name reassigned across unrelated jobs cannot fuse
+them, and a reference before any assignment gets no edge.
 
 ## Pipeline and memory
 

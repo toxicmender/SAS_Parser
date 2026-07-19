@@ -642,28 +642,36 @@ class _EdgeDiscovery:
     def _macrovar_flow(
         self, cidx: int, chunk: SasChunk, meta: SasChunkMetadata
     ) -> None:
-        # Mirrors dataset_flow for the macro-variable namespace: a chunk that
-        # creates &cutoff links to any chunk that references &cutoff.
+        # Mirrors dataset_flow for the macro-variable namespace: a consumer
+        # links to the NEAREST PRECEDING producer of &name in corpus order —
+        # the value a sequential SAS session would actually read (the last
+        # %let/SYMPUT before the reference wins). Linking every producer to
+        # every consumer (the previous policy) emitted O(producers×consumers)
+        # edges and let a producer that only executes later fuse components.
+        # Producer lists are built in ascending global-index order, so the
+        # bisect lookup also excludes self-production for free (only strictly
+        # preceding indices match).
         for mvar in meta.consumes_macrovars:
-            if mvar not in self.produces_macrovar:
+            plist = self.produces_macrovar.get(mvar)
+            if not plist:
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
                         f"edge-skip[macrovar]: '&{mvar}' read by {chunk.chunk_id} — no producer in corpus"
                     )
                 continue
-            for pidx in self.produces_macrovar[mvar]:
-                if pidx == cidx:
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(
-                            f"edge-skip[macrovar]: self-ref '&{mvar}' in {chunk.chunk_id}"
-                        )
-                    continue
-                self._add_edge(
-                    kind="macro_var_flow",
-                    from_idx=pidx,
-                    to_idx=cidx,
-                    via=f"&{mvar}",
-                )
+            pos = bisect_left(plist, cidx) - 1
+            if pos < 0:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"edge-skip[macrovar]: '&{mvar}' read by {chunk.chunk_id} — no preceding producer"
+                    )
+                continue
+            self._add_edge(
+                kind="macro_var_flow",
+                from_idx=plist[pos],
+                to_idx=cidx,
+                via=f"&{mvar}",
+            )
 
     def _macro_invocation(
         self, cidx: int, chunk: SasChunk, meta: SasChunkMetadata
