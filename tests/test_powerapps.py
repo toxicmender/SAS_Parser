@@ -397,6 +397,9 @@ def test_upload_outputs_with_validation_writes_expected_layout():
     assert "app_a/output/ts1/validation/item-2.json" in client.written
     summary = json.loads(client.written["app_a/output/ts1/validation/summary.json"])
     assert summary["items"] == 2 and summary["passed"] == 1 and summary["failed"] == 1
+    # A human-readable PDF report rendered from the inline verdicts.
+    pdf = client.written["app_a/output/ts1/validation/report.pdf"]
+    assert isinstance(pdf, bytes) and pdf[:5] == b"%PDF-"
     # The validation subfolder was created.
     assert "app_a/output/ts1/validation" in client.created_dirs
 

@@ -15,6 +15,10 @@ Usage
     # or straight into a Databricks Delta table:
     python -m validation validation/cases --track --table main.qa.validation_runs
 
+    # render the report to a local PDF, and/or upload it to SharePoint:
+    python -m validation validation/cases --pdf report.pdf
+    python -m validation validation/cases --pdf-sharepoint Reports/Validation
+
     # post-hoc: score a conversation thread already in a Delta-backed
     # memory store, without re-running the pipeline:
     python -m validation --thread run::job1.sas --delta-table main.ml.memory
@@ -121,6 +125,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         f"then ./{DEFAULT_PATH}).",
     )
     parser.add_argument(
+        "--pdf",
+        type=Path,
+        default=None,
+        help="Also render the report to this local PDF file path.",
+    )
+    parser.add_argument(
+        "--pdf-sharepoint",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="DEST",
+        help="Render the report to PDF and upload it to a SharePoint document "
+        "library. DEST is a folder (a timestamped filename is appended) or an "
+        "exact '*.pdf' path; omit DEST to use config.json "
+        "validation.report_sharepoint_path (then the library root).",
+    )
+    parser.add_argument(
         "--debug", action="store_true", help="Enable DEBUG logging."
     )
     args = parser.parse_args(argv)
@@ -164,6 +185,28 @@ def main(argv: list[str] | None = None) -> int:
     if args.track:
         run_id = log_report(report, table=args.table, path=args.path)
         print(f"logged validation run: {run_id}")
+
+    if args.pdf is not None:
+        from .pdf import report_to_pdf
+
+        args.pdf.write_bytes(report_to_pdf(report))
+        print(f"wrote PDF report: {args.pdf}")
+
+    if args.pdf_sharepoint is not None:
+        from app_config.sharepoint import SharePointError
+        from .pdf import publish_report_pdf
+
+        try:
+            item = publish_report_pdf(report, args.pdf_sharepoint or None)
+            print(
+                "uploaded PDF report to SharePoint: "
+                f"{item.get('web_url') or item.get('name')}"
+            )
+        except SharePointError as exc:
+            # The validation verdict is already printed and gates the exit code;
+            # a failed upload is surfaced loudly but does not mask that verdict.
+            logger.error(f"main: SharePoint upload failed: {exc}")
+            print(f"SharePoint upload failed: {exc}", file=sys.stderr)
 
     return 0 if report.passed else 1
 

@@ -39,6 +39,12 @@ in that run's conversation memory. In ``local`` mode it is on unless
 flag. A failing item is re-generated once by default (with the failed metrics fed
 back as a correction); tune with ``--validation-retries N`` (``0`` = observe-only).
 
+The inline verdicts also aggregate into a PDF report (`validation.report_to_pdf`
+over `validation.report_from_verdicts`): ``local`` mode writes it to ``--pdf``
+when set, and ``sharepoint`` mode always uploads it as
+``<application_name>/output/<timestamp>/validation/report.pdf`` beside the
+per-item and summary JSON.
+
 Usage
 -----
     # needs the `anthropic` extra installed:
@@ -273,6 +279,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Disable the inline LiveValidator (on by default), which scores "
         "each item as it is answered and stores the verdict in run memory.",
     )
+    local.add_argument(
+        "--pdf",
+        type=Path,
+        default=None,
+        help="Render the inline-validation verdicts to a PDF report at this "
+        "path (only when validation is on).",
+    )
     _add_common_args(local)
 
     sharepoint = sub.add_parser(
@@ -368,6 +381,23 @@ def _log_validation_summary(outputs: list[dict]) -> None:
             )
 
 
+def _validation_report(
+    outputs: list[dict], *, model: str, instructions_fingerprint: str | None = None
+):
+    """A ValidationReport reconstructed from the run's inline verdicts.
+
+    Turns the per-item ``out["validation"]`` verdicts LiveValidator produced
+    into the same aggregate report an offline run yields, so the inline run can
+    be rendered to Markdown/PDF (:mod:`validation.pdf`).
+    """
+    from validation import report_from_verdicts
+
+    verdicts = [o["validation"] for o in outputs if o.get("validation")]
+    return report_from_verdicts(
+        verdicts, model=model, instructions_fingerprint=instructions_fingerprint
+    )
+
+
 def _validation_summary(outputs: list[dict]) -> dict:
     """The aggregate pass/fail summary uploaded alongside the SharePoint run."""
     verdicts = [o["validation"] for o in outputs if o.get("validation")]
@@ -448,6 +478,19 @@ def _run_local(args: argparse.Namespace) -> int:
 
     if validator is not None:
         _log_validation_summary(outputs)
+        if args.pdf:
+            from validation import report_to_pdf
+
+            report = _validation_report(
+                outputs,
+                model=model,
+                instructions_fingerprint=pipeline.instructions_fingerprint,
+            )
+            args.pdf.write_bytes(report_to_pdf(report))
+            logger.info(f"wrote inline-validation PDF report: {args.pdf}")
+            print(f"wrote inline-validation PDF report: {args.pdf}")
+    elif args.pdf:
+        logger.warning("--pdf ignored: inline validation is off (--no-validate)")
 
     return 0
 
@@ -531,12 +574,21 @@ def _ensure_directory(client, path: str) -> None:
             raise
 
 
-def _upload_outputs(client, req, outputs: list[dict], *, validating: bool) -> str:
+def _upload_outputs(
+    client,
+    req,
+    outputs: list[dict],
+    *,
+    validating: bool,
+    instructions_fingerprint: str | None = None,
+) -> str:
     """Write responses (and validation artifacts) back to the library.
 
     Layout: ``<application_name>/output/<timestamp>/<item_id>.txt`` for each
-    response, and — when validating — ``.../validation/<item_id>.json`` per item
-    plus a ``.../validation/summary.json`` aggregate. Returns the output folder.
+    response, and — when validating — ``.../validation/<item_id>.json`` per item,
+    a ``.../validation/summary.json`` aggregate, and a human-readable
+    ``.../validation/report.pdf`` rendered from the inline verdicts. Returns the
+    output folder.
     """
     out_dir = f"{req.application_name}/output/{req.timestamp}"
     validation_dir = f"{out_dir}/validation"
@@ -558,10 +610,18 @@ def _upload_outputs(client, req, outputs: list[dict], *, validating: bool) -> st
             )
 
     if validating:
+        from validation import report_to_pdf
+
         client.write_file(
             f"{validation_dir}/summary.json",
             json.dumps(_validation_summary(outputs), indent=2),
         )
+        report = _validation_report(
+            outputs,
+            model=req.model,
+            instructions_fingerprint=instructions_fingerprint,
+        )
+        client.write_file(f"{validation_dir}/report.pdf", report_to_pdf(report))
     return out_dir
 
 
@@ -650,7 +710,11 @@ def _run_sharepoint(args: argparse.Namespace) -> int:
 
     try:
         out_dir = _upload_outputs(
-            client, req, outputs, validating=validator is not None
+            client,
+            req,
+            outputs,
+            validating=validator is not None,
+            instructions_fingerprint=pipeline.instructions_fingerprint,
         )
     except SharePointError as exc:
         logger.error(f"could not upload results to SharePoint: {exc}")
