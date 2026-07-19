@@ -1089,6 +1089,15 @@ class KVMemoryStore:
         return [k[len(self._ns) :] for k in self._store.keys(prefix=self._ns)]
 
     def all_items(self) -> List[Dict[str, Any]]:
+        return self.items_with_prefix("")
+
+    def items_with_prefix(self, prefix: str) -> List[Dict[str, Any]]:
+        """:meth:`all_items` restricted to short keys starting with *prefix*.
+
+        The filter is pushed down to the backend as a full-key prefix
+        (namespace + *prefix*), so Delta mode reads only the matching rows
+        instead of collecting the whole namespace and filtering client-side.
+        """
         return [
             {
                 "key": k[len(self._ns) :],
@@ -1097,7 +1106,7 @@ class KVMemoryStore:
                 "source": rec["source"],
                 "updated_at": _iso(rec["updated_at"]),
             }
-            for k, rec in self._store.all_records(prefix=self._ns)
+            for k, rec in self._store.all_records(prefix=self._ns + prefix)
         ]
 
     # ---- Tag queries -------------------------------------------------------

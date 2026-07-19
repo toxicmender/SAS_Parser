@@ -82,8 +82,7 @@ def _thread_item_ids(source: Any, thread_id: str) -> dict[int, str]:
         prefix = f"run::{thread_id}::item::"
         facts = [
             {"item_id": item["key"][len(prefix) :], **item["value"]}
-            for item in source.kv.all_items()
-            if item["key"].startswith(prefix)
+            for item in source.kv.items_with_prefix(prefix)
         ]
     else:
         facts = []

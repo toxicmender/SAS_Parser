@@ -902,10 +902,11 @@ class SasLLMPipeline:
         feature can query without replaying the message history.
         """
         prefix = f"run::{thread_id}::item::"
+        # Prefix-filtered read: Delta mode fetches only this thread's rows
+        # instead of collecting the whole kv namespace.
         facts = [
             {"item_id": item["key"][len(prefix) :], **item["value"]}
-            for item in self._memory.kv.all_items()
-            if item["key"].startswith(prefix)
+            for item in self._memory.kv.items_with_prefix(prefix)
         ]
         facts.sort(key=lambda f: f.get("index", 0))
         return facts
@@ -923,8 +924,7 @@ class SasLLMPipeline:
         prefix = f"validation::{thread_id}::item::"
         facts = [
             {"item_id": item["key"][len(prefix) :], **item["value"]}
-            for item in self._memory.kv.all_items()
-            if item["key"].startswith(prefix)
+            for item in self._memory.kv.items_with_prefix(prefix)
         ]
         facts.sort(key=lambda f: f.get("index") or 0)
         return facts

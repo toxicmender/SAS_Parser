@@ -158,15 +158,14 @@ def validations_for_thread(kv: Any, thread_id: str) -> list[dict[str, Any]]:
 
     Reads the records :meth:`LiveValidator.validate_item` wrote under
     ``validation::{thread_id}::item::*`` back out of the conversation KV
-    (``kv.all_items()`` — the same shape ``SasLLMPipeline.get_run_facts``
-    reads), each augmented with its ``item_id``. Ordered by the stored
-    ``index`` (unindexed records sort first).
+    (``kv.items_with_prefix()`` — a prefix-filtered read, so Delta mode
+    fetches only this thread's rows), each augmented with its ``item_id``.
+    Ordered by the stored ``index`` (unindexed records sort first).
     """
     prefix = _VALIDATION_PREFIX_TMPL.format(thread_id=thread_id)
     facts = [
         {"item_id": item["key"][len(prefix) :], **item["value"]}
-        for item in kv.all_items()
-        if item["key"].startswith(prefix)
+        for item in kv.items_with_prefix(prefix)
     ]
     facts.sort(key=lambda f: f.get("index") or 0)
     return facts
