@@ -172,6 +172,7 @@ _LLM_CLIENT_TYPES: dict[str, type | tuple[type, ...]] = {
     "model_kwargs": dict,
     "max_input_tokens": int,
     "max_output_tokens": int,
+    "prompt_caching": bool,
 }
 
 

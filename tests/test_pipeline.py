@@ -432,3 +432,55 @@ def test_endpoint_overrides_reach_init_chat_model(monkeypatch):
     assert captured["timeout"] == 42.5
     assert captured["model_kwargs"] == {"top_k": 40}
     assert captured["stop"] == ["END"]  # llm_kwargs escape hatch, merged last
+
+
+# ---------------------------------------------------------------------------
+# Prompt caching (Anthropic cache_control on the system prompt)
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_caching_marks_system_block_for_anthropic_models():
+    from langchain_core.messages import SystemMessage
+
+    mem = MemoryHub()
+    pipeline = SasLLMPipeline(
+        model="claude-sonnet-4-5",
+        memory=mem,
+        llm=FakeListChatModel(responses=["ok"]),
+        prompt_caching=True,
+    )
+    system_msg = pipeline._prompt.messages[0]
+    assert isinstance(system_msg, SystemMessage)
+    (block,) = system_msg.content
+    assert block["type"] == "text"
+    assert block["cache_control"] == {"type": "ephemeral"}
+    assert "PySpark" in block["text"]  # the real system prompt rides in the block
+
+    # End-to-end: the block-shaped system message flows through the graph.
+    c1 = _mk_chunk("f1-chunk-0001", "etl.sas", "data work.a; run;")
+    out = pipeline._process(items=[c1], diagnostics=[], thread_id="run::cache")
+    assert out[0]["response"] == "ok"
+
+
+def test_prompt_caching_ignored_for_non_anthropic_models():
+    from langchain_core.messages import SystemMessage
+
+    pipeline = SasLLMPipeline(
+        model="gpt-5.4",
+        memory=MemoryHub(),
+        llm=FakeListChatModel(responses=["ok"]),
+        prompt_caching=True,
+    )
+    # Falls back to the plain template tuple (no concrete SystemMessage).
+    assert not isinstance(pipeline._prompt.messages[0], SystemMessage)
+
+
+def test_prompt_caching_off_by_default():
+    from langchain_core.messages import SystemMessage
+
+    pipeline = SasLLMPipeline(
+        model="claude-sonnet-4-5",
+        memory=MemoryHub(),
+        llm=FakeListChatModel(responses=["ok"]),
+    )
+    assert not isinstance(pipeline._prompt.messages[0], SystemMessage)

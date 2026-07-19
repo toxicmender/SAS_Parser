@@ -150,6 +150,22 @@ class TestFacadeInMemory(unittest.TestCase):
         kv.set("b", 2)
         self.assertEqual(sorted(kv.keys()), ["a", "b"])
 
+    def test_items_with_prefix_filters_at_the_store(self):
+        store = KVStore(spark=None, table=None)
+        kv = KVMemoryStore(store, namespace="kv")
+        kv.set("run::t1::item::c1", {"status": "ok"})
+        kv.set("run::t1::item::c2", {"status": "ok"})
+        kv.set("run::t2::item::c1", {"status": "ok"})
+        kv.set("validation::t1::item::c1", {"passed": True})
+        items = kv.items_with_prefix("run::t1::item::")
+        self.assertEqual(
+            sorted(i["key"] for i in items),
+            ["run::t1::item::c1", "run::t1::item::c2"],
+        )
+        # Same shape as all_items, which stays the unfiltered view.
+        self.assertEqual(items[0]["value"], {"status": "ok"})
+        self.assertEqual(len(kv.all_items()), 4)
+
 
 class TestHybridKVSearch(unittest.TestCase):
     """KVMemoryStore.search with an injected HybridRanker (BM25-only here)."""

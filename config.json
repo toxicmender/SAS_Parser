@@ -24,7 +24,8 @@
     "max_retries": null,
     "model_kwargs": null,
     "max_input_tokens": null,
-    "max_output_tokens": null
+    "max_output_tokens": null,
+    "prompt_caching": null
   },
   "user_instructions": {
     "path": null,

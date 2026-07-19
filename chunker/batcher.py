@@ -591,8 +591,11 @@ class _EdgeDiscovery:
             self._macrovar_flow(cidx, chunk, meta)
             self._macro_invocation(cidx, chunk, meta)
             if chunk.kind == SasChunkKind.MACRO_CALL:
-                self._macro_arg_datasets(cidx, chunk)
-                self._resolve_macro_body(cidx, chunk, meta)
+                # Parsed once per call chunk; the text never changes mid-walk,
+                # and both passes below need the same (positional, keyword) split.
+                call_args = _parse_call_args(chunk.text)
+                self._macro_arg_datasets(cidx, chunk, call_args)
+                self._resolve_macro_body(cidx, chunk, meta, call_args)
 
         cf_count = sum(1 for e in self.edges if e.cross_file)
         logger.info(
@@ -639,28 +642,36 @@ class _EdgeDiscovery:
     def _macrovar_flow(
         self, cidx: int, chunk: SasChunk, meta: SasChunkMetadata
     ) -> None:
-        # Mirrors dataset_flow for the macro-variable namespace: a chunk that
-        # creates &cutoff links to any chunk that references &cutoff.
+        # Mirrors dataset_flow for the macro-variable namespace: a consumer
+        # links to the NEAREST PRECEDING producer of &name in corpus order —
+        # the value a sequential SAS session would actually read (the last
+        # %let/SYMPUT before the reference wins). Linking every producer to
+        # every consumer (the previous policy) emitted O(producers×consumers)
+        # edges and let a producer that only executes later fuse components.
+        # Producer lists are built in ascending global-index order, so the
+        # bisect lookup also excludes self-production for free (only strictly
+        # preceding indices match).
         for mvar in meta.consumes_macrovars:
-            if mvar not in self.produces_macrovar:
+            plist = self.produces_macrovar.get(mvar)
+            if not plist:
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
                         f"edge-skip[macrovar]: '&{mvar}' read by {chunk.chunk_id} — no producer in corpus"
                     )
                 continue
-            for pidx in self.produces_macrovar[mvar]:
-                if pidx == cidx:
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(
-                            f"edge-skip[macrovar]: self-ref '&{mvar}' in {chunk.chunk_id}"
-                        )
-                    continue
-                self._add_edge(
-                    kind="macro_var_flow",
-                    from_idx=pidx,
-                    to_idx=cidx,
-                    via=f"&{mvar}",
-                )
+            pos = bisect_left(plist, cidx) - 1
+            if pos < 0:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"edge-skip[macrovar]: '&{mvar}' read by {chunk.chunk_id} — no preceding producer"
+                    )
+                continue
+            self._add_edge(
+                kind="macro_var_flow",
+                from_idx=plist[pos],
+                to_idx=cidx,
+                via=f"&{mvar}",
+            )
 
     def _macro_invocation(
         self, cidx: int, chunk: SasChunk, meta: SasChunkMetadata
@@ -682,10 +693,15 @@ class _EdgeDiscovery:
                 via=f"%{mac}",
             )
 
-    def _macro_arg_datasets(self, cidx: int, chunk: SasChunk) -> None:
+    def _macro_arg_datasets(
+        self,
+        cidx: int,
+        chunk: SasChunk,
+        call_args: tuple[list[str], dict[str, str]],
+    ) -> None:
         # Scan only the parsed argument values, deduped so one dataset name
         # yields at most one edge; link to the nearest preceding producer.
-        arg_pos, arg_kw = _parse_call_args(chunk.text)
+        arg_pos, arg_kw = call_args
         seen_arg_ds: set[str] = set()
         for val in (*arg_pos, *arg_kw.values()):
             for tok in _ARG_DS_TOKEN_RE.findall(val):
@@ -709,7 +725,11 @@ class _EdgeDiscovery:
                 )
 
     def _resolve_macro_body(
-        self, cidx: int, chunk: SasChunk, meta: SasChunkMetadata
+        self,
+        cidx: int,
+        chunk: SasChunk,
+        meta: SasChunkMetadata,
+        call_args: tuple[list[str], dict[str, str]],
     ) -> None:
         # Parameterised resolution: the call invokes a macro whose body
         # references a dataset only through a parameter (e.g. "data &ds.;" in
@@ -717,6 +737,7 @@ class _EdgeDiscovery:
         # treat the resolved name as if this chunk produced/consumed it. Under
         # nearest-preceding-producer semantics this mid-walk registration is
         # correct: the output exists only once the call has executed.
+        pos_args, kw_args = call_args
         for mac in meta.invokes_macros:
             if mac not in self.defines_macro:
                 continue
@@ -725,7 +746,6 @@ class _EdgeDiscovery:
             if not (def_meta.body_param_outputs or def_meta.body_param_inputs):
                 continue
 
-            pos_args, kw_args = _parse_call_args(chunk.text)
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     f"macro_body_dataset: call {chunk.chunk_id} invokes %{mac}  pos_args={pos_args}  kw_args={kw_args}"
@@ -872,6 +892,18 @@ def _absorb_context(
     """
     n = len(flat_chunks)
 
+    # next_substantive[i]: nearest following same-file chunk that is not a
+    # context kind, or None. One backward pass replaces the per-chunk forward
+    # rescan, which was quadratic on long runs of consecutive context chunks.
+    next_substantive: list[int | None] = [None] * n
+    nxt: int | None = None
+    for idx in range(n - 1, -1, -1):
+        if idx + 1 < n and file_of[idx + 1] != file_of[idx]:
+            nxt = None  # don't cross file boundaries
+        next_substantive[idx] = nxt
+        if flat_chunks[idx].kind not in _CONTEXT_KINDS:
+            nxt = idx
+
     for idx, chunk in enumerate(flat_chunks):
         kind = chunk.kind
         is_option = kind in _OPTION_KINDS and include_options
@@ -885,32 +917,28 @@ def _absorb_context(
                 )
             continue
 
-        my_file = file_of[idx]
-        for nxt_idx in range(idx + 1, n):
-            if file_of[nxt_idx] != my_file:
-                break  # don't cross file boundaries
-            nxt_chunk = flat_chunks[nxt_idx]
-            if nxt_chunk.kind in _CONTEXT_KINDS:
-                continue  # skip consecutive context chunks
-            reason = "options_context" if is_option else "comment_context"
-            merged = uf.union(idx, nxt_idx)
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    f"absorb[{reason}]: {chunk.chunk_id} ← {nxt_chunk.chunk_id}  merged={merged}"
+        nxt_idx = next_substantive[idx]
+        if nxt_idx is None:
+            continue
+        nxt_chunk = flat_chunks[nxt_idx]
+        reason = "options_context" if is_option else "comment_context"
+        merged = uf.union(idx, nxt_idx)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"absorb[{reason}]: {chunk.chunk_id} ← {nxt_chunk.chunk_id}  merged={merged}"
+            )
+        if merged:
+            edges.append(
+                _Edge(
+                    kind=reason,
+                    from_id=chunk.chunk_id,
+                    to_id=nxt_chunk.chunk_id,
+                    via=f"[{reason}]",
+                    from_global_idx=idx,
+                    to_global_idx=nxt_idx,
+                    cross_file=False,
                 )
-            if merged:
-                edges.append(
-                    _Edge(
-                        kind=reason,
-                        from_id=chunk.chunk_id,
-                        to_id=nxt_chunk.chunk_id,
-                        via=f"[{reason}]",
-                        from_global_idx=idx,
-                        to_global_idx=nxt_idx,
-                        cross_file=False,
-                    )
-                )
-            break
+            )
 
 
 def _resolve_weak_edges(

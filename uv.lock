@@ -215,18 +215,6 @@ wheels = [
 ]
 
 [[package]]
-name = "bm25"
-version = "0.3.9"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "bm25s", extra = ["cli", "core"] },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/f4/e3/215fd0226af95c92bd833bc8d4b3bb48e946e744bd153374a38443a6f86b/bm25-0.3.9.tar.gz", hash = "sha256:1464c9f98d3f4074b79084aebdc211644b1229559b02dd96d63b9b693fbdd8f3", size = 6824, upload-time = "2026-05-13T23:08:29.929Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/01/f2/f5edcd096d3130916510cf375a41e636451bfddbc0b934443d6d14b048d1/bm25-0.3.9-py3-none-any.whl", hash = "sha256:f9255f572101e8796f1d6c75233931232862ec5c305ffaeef1152ad134932406", size = 6246, upload-time = "2026-05-13T23:08:28.513Z" },
-]
-
-[[package]]
 name = "bm25s"
 version = "0.3.9"
 source = { registry = "https://pypi.org/simple" }
@@ -239,9 +227,6 @@ wheels = [
 ]
 
 [package.optional-dependencies]
-cli = [
-    { name = "rich" },
-]
 core = [
     { name = "numba" },
     { name = "orjson" },
@@ -2297,19 +2282,6 @@ wheels = [
 ]
 
 [[package]]
-name = "rich"
-version = "15.0.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "markdown-it-py" },
-    { name = "pygments" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/c0/8f/0722ca900cc807c13a6a0c696dacf35430f72e0ec571c4275d2371fca3e9/rich-15.0.0.tar.gz", hash = "sha256:edd07a4824c6b40189fb7ac9bc4c52536e9780fbbfbddf6f1e2502c31b068c36", size = 230680, upload-time = "2026-04-12T08:24:00.75Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/82/3b/64d4899d73f91ba49a8c18a8ff3f0ea8f1c1d75481760df8c68ef5235bf5/rich-15.0.0-py3-none-any.whl", hash = "sha256:33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb", size = 310654, upload-time = "2026-04-12T08:24:02.83Z" },
-]
-
-[[package]]
 name = "ruff"
 version = "0.15.20"
 source = { registry = "https://pypi.org/simple" }
@@ -2339,14 +2311,13 @@ name = "sas-parser"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "bm25" },
+    { name = "bm25s", extra = ["core"] },
     { name = "faiss-cpu" },
     { name = "langchain" },
     { name = "langgraph" },
     { name = "markdown-it-py" },
     { name = "pydantic" },
     { name = "pymupdf" },
-    { name = "pyspark" },
     { name = "python-dotenv" },
 ]
 
@@ -2373,13 +2344,16 @@ sharepoint = [
     { name = "msal" },
     { name = "msgraph-sdk" },
 ]
+spark = [
+    { name = "pyspark" },
+]
 vault = [
     { name = "hvac" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "bm25", specifier = ">=0.3.9" },
+    { name = "bm25s", extras = ["core"], specifier = ">=0.3.9" },
     { name = "databricks-sdk", marker = "extra == 'databricks'", specifier = ">=0.30" },
     { name = "databricks-sql-connector", marker = "extra == 'databricks'", specifier = ">=3.0" },
     { name = "faiss-cpu", specifier = ">=1.14.3" },
@@ -2394,13 +2368,13 @@ requires-dist = [
     { name = "msgraph-sdk", marker = "extra == 'sharepoint'", specifier = ">=1.5" },
     { name = "pydantic", specifier = ">=2.13.4" },
     { name = "pymupdf", specifier = ">=1.28.0" },
-    { name = "pyspark", specifier = ">=4.1.2" },
+    { name = "pyspark", marker = "extra == 'spark'", specifier = ">=4.1.2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest-cov", marker = "extra == 'dev'" },
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "ruff", marker = "extra == 'dev'" },
 ]
-provides-extras = ["anthropic", "openai", "vault", "azure", "databricks", "sharepoint", "dev"]
+provides-extras = ["spark", "anthropic", "openai", "vault", "azure", "databricks", "sharepoint", "dev"]
 
 [[package]]
 name = "six"

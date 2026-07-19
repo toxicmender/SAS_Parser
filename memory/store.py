@@ -13,6 +13,7 @@ import json
 import logging
 import time
 import uuid
+from bisect import bisect_left, bisect_right, insort
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 from langchain_core.chat_history import BaseChatMessageHistory
@@ -128,14 +129,33 @@ _RawRecord = Tuple[str, str, Optional[str], Optional[float], float, Optional[str
 
 
 class _InMemoryBackend:
-    """Plain-dict backend for local / CI use.  No pyspark, no JVM."""
+    """Plain-dict backend for local / CI use.  No pyspark, no JVM.
+
+    Beside the dict, a sorted key list is maintained so the prefix reads
+    (``records_after`` / ``keys`` / ``has_prefix`` / ``clear_prefix``)
+    bisect straight to the matching range — keys sharing a prefix are
+    contiguous in sorted order — instead of scanning every key per call
+    (O(store) per read, O(n²) over an n-message run).
+    """
 
     def __init__(self) -> None:
         self._mem: Dict[str, Dict[str, Any]] = {}
+        self._sorted_keys: List[str] = []
+
+    def _prefix_range(self, prefix: str) -> Tuple[int, int]:
+        """(lo, hi) index range of keys starting with *prefix* in the sorted list."""
+        lo = bisect_left(self._sorted_keys, prefix)
+        hi = lo
+        n = len(self._sorted_keys)
+        while hi < n and self._sorted_keys[hi].startswith(prefix):
+            hi += 1
+        return lo, hi
 
     def upsert(self, rows: List[_RawRecord], now: float) -> None:
         for key, value_json, tags_json, created_at, updated_at, source in rows:
             existing = self._mem.get(key)
+            if existing is None:
+                insort(self._sorted_keys, key)
             self._mem[key] = {
                 "value": value_json,
                 # tags=None / source=None on update preserve the existing
@@ -162,6 +182,7 @@ class _InMemoryBackend:
                 "source": source,
             }
         self._mem = fresh
+        self._sorted_keys = sorted(fresh)
 
     def get(self, key: str) -> Optional[str]:
         rec = self._mem.get(key)
@@ -171,34 +192,50 @@ class _InMemoryBackend:
         return self.records_after(prefix, "")
 
     def records_after(self, prefix: str, after_key: str) -> List[_RawRecord]:
-        return [
-            (k, r["value"], r["tags"], r["created_at"], r["updated_at"], r["source"])
-            for k, r in self._mem.items()
-            if (not prefix or k.startswith(prefix)) and k > after_key
-        ]
+        lo = bisect_right(self._sorted_keys, after_key)
+        if prefix:
+            lo = max(lo, bisect_left(self._sorted_keys, prefix))
+        out: List[_RawRecord] = []
+        for i in range(lo, len(self._sorted_keys)):
+            k = self._sorted_keys[i]
+            if prefix and not k.startswith(prefix):
+                break
+            r = self._mem[k]
+            out.append(
+                (k, r["value"], r["tags"], r["created_at"], r["updated_at"], r["source"])
+            )
+        return out
 
     def keys(self, prefix: str = "") -> List[str]:
-        return [k for k in self._mem if not prefix or k.startswith(prefix)]
+        if not prefix:
+            return list(self._sorted_keys)
+        lo, hi = self._prefix_range(prefix)
+        return self._sorted_keys[lo:hi]
 
     def has_prefix(self, prefix: str) -> bool:
-        return any(k.startswith(prefix) for k in self._mem)
+        i = bisect_left(self._sorted_keys, prefix)
+        return i < len(self._sorted_keys) and self._sorted_keys[i].startswith(prefix)
 
     def delete_many(self, keys: List[str]) -> int:
         removed = 0
         for k in keys:
             if k in self._mem:
                 del self._mem[k]
+                del self._sorted_keys[bisect_left(self._sorted_keys, k)]
                 removed += 1
         return removed
 
     def clear_prefix(self, prefix: str) -> int:
-        targets = [k for k in self._mem if k.startswith(prefix)]
+        lo, hi = self._prefix_range(prefix)
+        targets = self._sorted_keys[lo:hi]
         for k in targets:
             del self._mem[k]
+        del self._sorted_keys[lo:hi]
         return len(targets)
 
     def clear(self) -> None:
         self._mem.clear()
+        self._sorted_keys.clear()
 
     def count(self) -> int:
         return len(self._mem)
@@ -546,8 +583,9 @@ class KVStore:
             score = 0.0
             if q in key.lower():
                 score += 2.0
-            if q in value_json.lower():
-                score += value_json.lower().count(q) * 1.0
+            value_lower = value_json.lower()
+            if q in value_lower:
+                score += value_lower.count(q) * 1.0
             for tag in _jload(tags_json) if tags_json else []:
                 if q in tag.lower():
                     score += 1.5
@@ -718,11 +756,9 @@ class KVChatMessageHistory(BaseChatMessageHistory):
         # being silently rewritten as human messages.
         return ChatMessage(role=role, content=data["content"], additional_kwargs=meta)
 
-    # BaseChatMessageHistory annotates `messages` as a plain attribute, but
-    # documents overriding it as a property — which is what this lazy,
-    # cache-backed read needs.
-    @property
-    def messages(self) -> List[BaseMessage]:  # pyright: ignore[reportIncompatibleVariableOverride]
+    def _refresh(self) -> List[BaseMessage]:
+        """Bring the read cache up to date and return it — the *internal*
+        list, which callers must not mutate (``messages`` copies it)."""
         if self._msg_cache is None:
             pairs = self._store.all_records(prefix=self._msg_prefix)
             self._msg_cache = []
@@ -732,7 +768,7 @@ class KVChatMessageHistory(BaseChatMessageHistory):
             # The frontier tick is re-read in full; drop what is cached.
             pairs = [kv for kv in pairs if kv[0] not in self._cache_keys]
             if not pairs:
-                return list(self._msg_cache)
+                return self._msg_cache
         if pairs:
             # Sort by the key suffix: zero-padded timestamps (and legacy
             # zero-padded sequence numbers) order lexicographically by time.
@@ -746,7 +782,18 @@ class KVChatMessageHistory(BaseChatMessageHistory):
             # from another writer is still fetched on the next read.
             last_suffix = pairs[-1][0][len(self._msg_prefix) :]
             self._cache_frontier = self._msg_prefix + last_suffix.split("-", 1)[0]
-        return list(self._msg_cache)
+        return self._msg_cache
+
+    # BaseChatMessageHistory annotates `messages` as a plain attribute, but
+    # documents overriding it as a property — which is what this lazy,
+    # cache-backed read needs.
+    @property
+    def messages(self) -> List[BaseMessage]:  # pyright: ignore[reportIncompatibleVariableOverride]
+        return list(self._refresh())
+
+    def message_count(self) -> int:
+        """Number of stored messages, without copying the message list."""
+        return len(self._refresh())
 
     def _invalidate_cache(self) -> None:
         self._msg_cache = None
@@ -1089,6 +1136,15 @@ class KVMemoryStore:
         return [k[len(self._ns) :] for k in self._store.keys(prefix=self._ns)]
 
     def all_items(self) -> List[Dict[str, Any]]:
+        return self.items_with_prefix("")
+
+    def items_with_prefix(self, prefix: str) -> List[Dict[str, Any]]:
+        """:meth:`all_items` restricted to short keys starting with *prefix*.
+
+        The filter is pushed down to the backend as a full-key prefix
+        (namespace + *prefix*), so Delta mode reads only the matching rows
+        instead of collecting the whole namespace and filtering client-side.
+        """
         return [
             {
                 "key": k[len(self._ns) :],
@@ -1097,7 +1153,7 @@ class KVMemoryStore:
                 "source": rec["source"],
                 "updated_at": _iso(rec["updated_at"]),
             }
-            for k, rec in self._store.all_records(prefix=self._ns)
+            for k, rec in self._store.all_records(prefix=self._ns + prefix)
         ]
 
     # ---- Tag queries -------------------------------------------------------
