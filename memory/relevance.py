@@ -13,9 +13,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 import bm25s
-import faiss
 import numpy as np
 from langchain_core.messages import BaseMessage
+
+# faiss is imported lazily inside HybridRanker.index() — the only remaining
+# consumer — so BM25-only pipelines never pay its import cost.
 
 from .turns import approx_token_count, group_turns, turn_text
 
@@ -142,6 +144,10 @@ class HybridRanker:
         self._embeddings = embeddings
         self._reranker = reranker
         self._embedding_cache: dict[str, np.ndarray] = {}
+        # Content-hashed tokenization cache (mirrors _embedding_cache): a
+        # chat thread's turns are append-only during a run, so per-call BM25
+        # re-tokenization only pays for documents not seen before.
+        self._token_cache: dict[str, list[str]] = {}
         # Static-corpus state, populated by index(); unused in per-call mode.
         self._corpus: list[str] = []
         self._bm25: Any | None = None
@@ -177,6 +183,15 @@ class HybridRanker:
     # Stateless per-call ranking (corpus differs every call)
     # ------------------------------------------------------------------
 
+    def _tokenize_cached(self, text: str) -> list[str]:
+        """Tokenize *text*, memoised by content hash (see ``_token_cache``)."""
+        key = _sha(text)
+        tokens = self._token_cache.get(key)
+        if tokens is None:
+            tokens = _tokenize(text)
+            self._token_cache[key] = tokens
+        return tokens
+
     def bm25_ranking(
         self, docs: list[str], candidates: list[int], query: str
     ) -> list[int] | None:
@@ -187,7 +202,7 @@ class HybridRanker:
             return None
         # "_" placeholder keeps a pathological empty doc from breaking the
         # index; it can never match a real query token.
-        corpus = [_tokenize(docs[i]) or ["_"] for i in candidates]
+        corpus = [self._tokenize_cached(docs[i]) or ["_"] for i in candidates]
         retriever = bm25s.BM25()
         retriever.index(corpus, show_progress=False)
         scores = retriever.get_scores(query_tokens)
@@ -207,12 +222,18 @@ class HybridRanker:
         query_vec = self._normalize(
             np.asarray(self._require_embeddings().embed_query(query), dtype=np.float32)
         )
-        index = faiss.IndexFlatIP(vectors.shape[1])
-        index.add(vectors)
-        similarities, order = index.search(query_vec[None, :], len(candidates))
-        if float(similarities.max()) - float(similarities.min()) < 1e-9:
+        # One matrix-vector product replaces the FAISS index this method used
+        # to build per call: vectors are already L2-normalised, so the inner
+        # products are the same cosine scores IndexFlatIP produced. Remaining
+        # ties break toward recency, matching bm25_ranking (FAISS left tie
+        # order unspecified).
+        sims = vectors @ query_vec
+        if float(sims.max()) - float(sims.min()) < 1e-9:
             return None  # every doc tied — ordering would be arbitrary
-        return [candidates[j] for j in order[0] if j != -1]
+        order = sorted(
+            range(len(candidates)), key=lambda j: (-float(sims[j]), -candidates[j])
+        )
+        return [candidates[j] for j in order]
 
     def rrf_fuse(self, rankings: list[list[int]]) -> list[int]:
         scores: dict[int, float] = defaultdict(float)
@@ -249,10 +270,12 @@ class HybridRanker:
             self._bm25 = None
             self._faiss = None
             return
-        tokenized = [_tokenize(d) or ["_"] for d in self._corpus]
+        tokenized = [self._tokenize_cached(d) or ["_"] for d in self._corpus]
         self._bm25 = bm25s.BM25()
         self._bm25.index(tokenized, show_progress=False)
         if self._embeddings is not None:
+            import faiss  # deferred: only the index-once/query-many path needs it
+
             vectors = self.embed_cached(self._corpus)
             self._faiss = faiss.IndexFlatIP(vectors.shape[1])
             self._faiss.add(vectors)
