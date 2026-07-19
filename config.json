@@ -79,5 +79,14 @@
     "drive_id": null,
     "scopes": null,
     "timeout": null
+  },
+  "_powerapps_comment": "Which SharePoint list the Power Apps conversion requests live in, and the *internal* names of its columns (which often differ from the display names). Used by 'demo_run.py sharepoint'. list_name is required at run time. Column names default to RequestId/ApplicationName/LiveValidation/Model/Timestamp when null. Every key is also read from its POWERAPPS_* env var (POWERAPPS_LIST_NAME, POWERAPPS_<NAME>_FIELD), which wins over this file.",
+  "powerapps": {
+    "list_name": null,
+    "request_id_field": null,
+    "application_name_field": null,
+    "live_validation_field": null,
+    "model_field": null,
+    "timestamp_field": null
   }
 }
