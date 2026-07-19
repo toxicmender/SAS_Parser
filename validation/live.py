@@ -44,13 +44,13 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 
 from chunker.models import SasBatch, SasChunk
 
 from .evaluator import Evaluator
 from .metrics import ValidationMetric
-from .models import CaseResult, EvaluationRun
+from .models import CaseResult, EvaluationRun, MetricResult, ValidationReport
 
 logger = logging.getLogger(__name__)
 
@@ -170,3 +170,76 @@ def validations_for_thread(kv: Any, thread_id: str) -> list[dict[str, Any]]:
     ]
     facts.sort(key=lambda f: f.get("index") or 0)
     return facts
+
+
+def report_from_verdicts(
+    verdicts: Iterable[dict[str, Any]],
+    *,
+    model: str = "live-validation",
+    instructions_fingerprint: str | None = None,
+) -> ValidationReport:
+    """Aggregate stored inline verdicts into a :class:`ValidationReport`.
+
+    Each verdict is one item's :class:`~validation.models.CaseResult` as a dict
+    — an ``out["validation"]`` value from a pipeline run, or a record from
+    :func:`validations_for_thread` /
+    :meth:`~chunker.pipeline.SasLLMPipeline.get_validation_facts`. The extra
+    ``item_id`` / ``index`` / ``total`` / ``ts`` keys those readers add are
+    ignored (``CaseResult`` drops unknown fields), and the per-item order is
+    taken as given — pass already-ordered verdicts.
+
+    The point is reuse: an inline run gets the same report surface the offline
+    runner produces, so its verdicts flow straight into ``to_markdown()``,
+    :mod:`validation.pdf`, and :func:`validation.tracking.log_report`.
+
+    Parameters
+    ----------
+    model : str
+        Label for the run under test — pass the pipeline's real model string;
+        the default marks a report whose model was not supplied.
+    instructions_fingerprint : str | None
+        The active user-instruction fingerprint
+        (:attr:`SasLLMPipeline.instructions_fingerprint`), so an inline report
+        is never compared as equal to one scored under different instructions.
+    """
+    results = [_case_result(v) for v in verdicts]
+    return ValidationReport(
+        model=model,
+        instructions_fingerprint=instructions_fingerprint,
+        results=results,
+    )
+
+
+def _case_result(verdict: dict[str, Any]) -> CaseResult:
+    """One inline verdict dict rebuilt as a :class:`CaseResult`.
+
+    Reads the ``CaseResult`` fields (``case_id`` / ``item_count`` / ``metrics``)
+    and recomputes ``score`` / ``passed``, tolerating both a full
+    :meth:`CaseResult.model_dump` and a leaner record: the item id falls back to
+    the reader-supplied ``item_id`` then a placeholder, and ``item_count`` to 1.
+    """
+    return CaseResult(
+        case_id=verdict.get("case_id") or verdict.get("item_id") or "item",
+        item_count=verdict.get("item_count", 1),
+        metrics=[MetricResult.model_validate(m) for m in verdict.get("metrics", [])],
+    )
+
+
+def report_from_thread(
+    kv: Any,
+    thread_id: str,
+    *,
+    model: str = "live-validation",
+    instructions_fingerprint: str | None = None,
+) -> ValidationReport:
+    """A :class:`ValidationReport` over *thread_id*'s stored inline verdicts.
+
+    Convenience over :func:`report_from_verdicts` that first reads the verdicts
+    back from the conversation KV with :func:`validations_for_thread` (their
+    stored ``index`` already orders them).
+    """
+    return report_from_verdicts(
+        validations_for_thread(kv, thread_id),
+        model=model,
+        instructions_fingerprint=instructions_fingerprint,
+    )

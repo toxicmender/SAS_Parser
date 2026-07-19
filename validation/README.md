@@ -61,6 +61,10 @@ tracking.py      log_report(): one row per (run, case, metric) appended to a
                  Spark target — parquet directory locally, saveAsTable
                  (Delta) on Databricks. load_runs() reads the history back
                  as a DataFrame for trend queries.
+pdf.py           report_to_pdf(): render a report's to_markdown() to a PDF
+                 (markdown-it-py -> HTML -> PyMuPDF Story). publish_report_pdf()
+                 renders and uploads it to a SharePoint document library via
+                 app_config.sharepoint.
 cases/           Sample cases.
 ```
 
@@ -83,6 +87,10 @@ python -m validation validation/cases --judge-model claude-sonnet-4-5 --track
 
 # on Databricks, target a Delta table instead:
 python -m validation validation/cases --track --table main.qa.validation_runs
+
+# render the markdown report to a PDF — locally, and/or into SharePoint:
+python -m validation validation/cases --pdf report.pdf
+python -m validation validation/cases --pdf-sharepoint Reports/Validation
 ```
 
 Programmatic, fully offline (this is what tests/test_validation.py does):
@@ -96,6 +104,31 @@ pipeline = SasLLMPipeline(llm=FakeListChatModel(responses=["..."]))
 report = ValidationRunner(pipeline).run(load_cases("validation/cases"))
 print(report.to_markdown())
 ```
+
+## PDF report (and SharePoint)
+
+The same `to_markdown()` report renders to a paginated PDF —
+markdown-it-py turns it into HTML (the metric table included), PyMuPDF's
+`Story` lays it across A4 pages — and, on request, uploads to a SharePoint
+document library through `app_config.sharepoint`:
+
+```python
+from validation import report_to_pdf, publish_report_pdf
+
+pdf_bytes = report_to_pdf(report)               # or report_to_pdf(markdown_str)
+open("report.pdf", "wb").write(pdf_bytes)
+
+# render + upload; a folder dest gets a timestamped filename, a *.pdf dest is
+# used verbatim. Auth/site settings come from app_config.sharepoint (needs the
+# `sharepoint` extra and an Entra ID service principal).
+publish_report_pdf(report, "Reports/Validation")
+```
+
+The SharePoint destination resolves with the repo-wide precedence rule:
+the explicit argument, else config.json `validation.report_sharepoint_path`,
+else the library root. Rendering needs only PyMuPDF (a core dependency) and
+markdown-it-py — no SharePoint extra; uploading imports `app_config.sharepoint`
+lazily, so `import validation` stays cheap.
 
 ## Inline validation (during the run)
 
@@ -116,6 +149,27 @@ facts = validations_for_thread(pipeline._memory.kv, "run::job1.sas")
 for f in facts:
     print(f["item_id"], f["score"], f["passed"])
 ```
+
+The per-item verdicts also aggregate into the same `ValidationReport` an
+offline run produces, so an inline run reuses `to_markdown()`, the PDF renderer,
+and the Spark history without a second scoring pass:
+
+```python
+from validation import report_from_thread, report_to_pdf, publish_report_pdf
+
+report = report_from_thread(
+    pipeline._memory.kv, "run::job1.sas",
+    model="claude-sonnet-4-5",
+    instructions_fingerprint=pipeline.instructions_fingerprint,
+)
+open("inline_report.pdf", "wb").write(report_to_pdf(report))   # local, or
+publish_report_pdf(report, "Reports/Validation")               # SharePoint
+```
+
+`report_from_verdicts` is the same builder over a raw list of verdict dicts —
+e.g. the `out["validation"]` values a `run_*` call returns. `demo_run.py` uses
+exactly this: `--pdf` writes the inline report locally in `local` mode, and
+`sharepoint` mode uploads it as `.../validation/report.pdf` beside the JSON.
 
 Each item is scored the instant its response returns, through the same
 `Evaluator` core as every other mode, so an inline verdict equals a post-hoc
