@@ -13,6 +13,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+import app_config
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
@@ -57,6 +58,13 @@ logger = logging.getLogger(__name__)
 
 def _fmt_list(xs: list[str] | None) -> str:
     return ", ".join(xs) if xs else "none"
+
+
+def _is_anthropic_model(model: str) -> bool:
+    """True when *model* resolves to an Anthropic chat model — a bare
+    ``claude-*`` name or an explicit LangChain ``anthropic:`` provider
+    prefix. Gates provider-specific request features (prompt caching)."""
+    return model.startswith("claude") or model.startswith("anthropic:")
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +430,17 @@ class SasLLMPipeline:
         ``init_chat_model`` call (the :class:`llm_client.LLMClientConfig`
         field ``kwargs``), overriding anything the named knobs produced.
         Ignored when ``llm`` is injected.
+    prompt_caching : bool | None
+        Anthropic prompt caching for the system prompt: when enabled and
+        ``model`` is an Anthropic model, the system prompt is sent as a
+        content block carrying a ``cache_control`` breakpoint, so every
+        item after a run's first reads it from the provider cache (~10%
+        of input cost) instead of re-paying full price. ``None``
+        (default) defers to config.json ``llm_client.prompt_caching``,
+        then ``False``. Prompts shorter than the model's minimum
+        cacheable prefix (~1024 tokens on ``claude-sonnet-4-5``; larger
+        on newer models) are silently not cached — harmless. Ignored for
+        non-Anthropic models.
     min_words, max_words : int | None
         Forwarded to :class:`SasSemanticChunker`. ``None`` (default) lets
         the chunker read ``sas_chunker.*`` from config.json (see the
@@ -529,6 +548,7 @@ class SasLLMPipeline:
         timeout: float | None = None,
         model_kwargs: dict[str, Any] | None = None,
         llm_kwargs: dict[str, Any] | None = None,
+        prompt_caching: bool | None = None,
         min_words: int | None = None,
         max_words: int | None = None,
         output_language: str = "PySpark",
@@ -582,9 +602,20 @@ class SasLLMPipeline:
                 prompt_builder = prompt_builder.with_user_instructions(
                     user_instructions
                 )
+        if prompt_caching is None:
+            prompt_caching = bool(
+                app_config.llm_client_value("prompt_caching", False)
+            )
+        self._prompt_caching = prompt_caching and _is_anthropic_model(model)
+        if prompt_caching and not self._prompt_caching:
+            logger.warning(
+                f"SasLLMPipeline: prompt_caching requested but model "
+                f"{model!r} is not an Anthropic model; caching stays off"
+            )
         logger.info(
             f"SasLLMPipeline.__init__  model={model}  output_language={output_language}  "
-            f"window_k={window_k}  guidance={'on' if prompt_builder else 'off'}"
+            f"window_k={window_k}  guidance={'on' if prompt_builder else 'off'}  "
+            f"prompt_caching={'on' if self._prompt_caching else 'off'}"
         )
         self.model = model
         self.window_k = window_k
@@ -642,9 +673,28 @@ class SasLLMPipeline:
             if value is not None:
                 llm_config_kwargs[key] = value
         self._llm_client = LLMClient(LLMClientConfig(**llm_config_kwargs), llm=llm)
+        # With prompt caching on, the system prompt travels as a content
+        # block with a cache_control breakpoint (a concrete SystemMessage,
+        # exempt from template interpolation); Anthropic then serves the
+        # prompt prefix up to that block from cache on every item after the
+        # run's first. The breakpoint sits on the system block — history
+        # varies per item under trimming/selection, so it is the one
+        # stable prefix.
+        if self._prompt_caching:
+            system_entry: Any = SystemMessage(
+                content=[
+                    {
+                        "type": "text",
+                        "text": self._system_prompt,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+            )
+        else:
+            system_entry = ("system", self._system_prompt)
         prompt = ChatPromptTemplate.from_messages(
             [
-                ("system", self._system_prompt),
+                system_entry,
                 MessagesPlaceholder("history"),
                 # Ephemeral per-item reference guidance: 0 or 1 SystemMessage,
                 # prompted but never persisted (see _call_model).
@@ -652,6 +702,9 @@ class SasLLMPipeline:
                 ("human", "{input}"),
             ]
         )
+        # Kept on the instance for introspection (tests assert the
+        # cache_control block; the chain below captures it by closure).
+        self._prompt = prompt
 
         def _trim(inputs: dict[str, Any]) -> dict[str, Any]:
             history: list[BaseMessage] = inputs.get("history", [])
