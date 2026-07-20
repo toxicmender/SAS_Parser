@@ -167,6 +167,7 @@ _LLM_CLIENT_TYPES: dict[str, type | tuple[type, ...]] = {
     "base_url": str,
     "url_headers": dict,
     "timeout": (int, float),
+    "cert_file": str,
     "temperature": (int, float),
     "max_retries": int,
     "model_kwargs": dict,

@@ -11,6 +11,8 @@ injecting fakes (FakeListChatModel or small stubs). Retry tests set
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 import pathlib
 import sys
 
@@ -135,6 +137,39 @@ def test_endpoint_overrides_forwarded(monkeypatch):
     assert captured["default_headers"] == {"X-Team": "sas"}
     assert captured["timeout"] == 42.5
     assert captured["model_kwargs"] == {"top_k": 40}
+
+
+def test_cert_file_exported_as_ssl_cert_file(monkeypatch, tmp_path):
+    _capture_init(monkeypatch)
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    cert = tmp_path / "gateway.crt"
+    cert.write_text("-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n")
+
+    LLMClient(LLMClientConfig(model="some-model", cert_file=str(cert)))
+
+    assert os.environ["SSL_CERT_FILE"] == str(cert.resolve())
+
+
+def test_missing_cert_file_warns_and_leaves_env_alone(monkeypatch, tmp_path, caplog):
+    _capture_init(monkeypatch)
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+
+    with caplog.at_level(logging.WARNING, logger="llm_client.client"):
+        LLMClient(
+            LLMClientConfig(model="some-model", cert_file=str(tmp_path / "nope.crt"))
+        )
+
+    assert "SSL_CERT_FILE" not in os.environ
+    assert any("does not exist" in record.message for record in caplog.records)
+
+
+def test_unset_cert_file_leaves_env_alone(monkeypatch):
+    _capture_init(monkeypatch)
+    monkeypatch.setenv("SSL_CERT_FILE", "preexisting.pem")
+
+    LLMClient(LLMClientConfig(model="some-model", cert_file=None))
+
+    assert os.environ["SSL_CERT_FILE"] == "preexisting.pem"
 
 
 def test_api_key_masked_in_repr():

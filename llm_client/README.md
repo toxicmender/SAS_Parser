@@ -21,6 +21,7 @@ client = LLMClient(LLMClientConfig(
     api_key="...",                       # SecretStr — masked in repr/logs
     url_headers={"X-Team": "sas"},       # sent as default_headers
     timeout=60.0,
+    cert_file="certs/gateway.crt",       # TLS trust for the gateway
     model_kwargs={"top_k": 40},          # provider request-body extras
     kwargs={},                           # escape hatch, merged last
 ))
@@ -41,6 +42,14 @@ chain = prompt | client.as_runnable()
   `langchain_core.rate_limiters.InMemoryRateLimiter` that throttles request
   *starts* client-side. `api_key` is a `SecretStr`: masked in `repr`, never
   logged, and deliberately not readable from config.json.
+- **Gateway TLS trust**: `cert_file` names a PEM certificate bundle (e.g.
+  `gateway.crt`) used to verify the endpoint's TLS certificate — needed when
+  `base_url` points at a gateway signed by an internal CA. It is exported as
+  the standard `SSL_CERT_FILE` environment variable (process-wide) before the
+  model is built, which the httpx-based provider SDKs honour; there is no
+  per-model hook, as e.g. `ChatAnthropic` builds its HTTP client internally.
+  A missing file is skipped with a WARNING and the default trust store
+  applies.
 - **Transient-error handling**: rate limits (HTTP 429), overload / server
   errors (500, 502, 503, 504, 529), timeouts, and connection drops are retried
   with capped exponential backoff and jitter (attempt *n* waits
@@ -71,8 +80,8 @@ WARNING and the hard default applies, instead of failing construction.
 
 An injected `llm` (e.g. a fake in tests) still gets the retry and input-token
 layers; construction-time knobs (`temperature`, `max_output_tokens`,
-`base_url`, `api_key`, `url_headers`, `timeout`, `model_kwargs`, `kwargs`,
-`requests_per_second`) do not apply to it.
+`base_url`, `api_key`, `url_headers`, `timeout`, `cert_file`, `model_kwargs`,
+`kwargs`, `requests_per_second`) do not apply to it.
 
 ## Public API
 
@@ -90,5 +99,5 @@ Logger name: `llm_client.client`
 |-------|--------------|
 | DEBUG | Token-count results per call |
 | INFO | Model construction (api_key presence and header *names* only — never values) |
-| WARNING | Transient-error retry waits; token-counter fallback (once) |
+| WARNING | Transient-error retry waits; token-counter fallback (once); `cert_file` missing or overriding a pre-set `SSL_CERT_FILE` |
 | ERROR | Input-token budget exceeded; retry budget exhausted (exception raised after logging) |
