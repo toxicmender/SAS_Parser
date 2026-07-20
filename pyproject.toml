@@ -57,6 +57,13 @@ source = [
 markers = [
     "slow: end-to-end tests over the real reference_docs corpus; skipped when the PDFs are absent",
 ]
+filterwarnings = [
+    # langgraph-internal deserialisation with the default `allowed_objects`
+    # (pending-deprecated by langchain-core >= 1.3.3); no call site in this
+    # repo can pass the explicit value. Mirrors the import-time filter in
+    # chunker/pipeline.py for occurrences at run time under other versions.
+    "ignore:.*allowed_objects.*:PendingDeprecationWarning",
+]
 
 [tool.pyright]
 # Shipped code only. tests/ is deliberately out of the gate (see

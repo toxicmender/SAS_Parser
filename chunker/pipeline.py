@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import time
+import warnings
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import app_config
@@ -22,7 +23,22 @@ from langchain_core.messages import (
 )
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableConfig, RunnableLambda
-from langgraph.graph import START, MessagesState, StateGraph
+
+# Some langgraph releases build their checkpoint serde with langchain-core's
+# default `allowed_objects`, which langchain-core >= 1.3.3 answers with a
+# LangChainPendingDeprecationWarning ("The default value of `allowed_objects`
+# will change in a future version...") at import time. The deserialisation
+# happens inside langgraph — no call site in this repo can pass the explicit
+# value — so exactly that message is silenced around the import. The locked
+# versions pass allowed_objects="core" themselves and emit nothing.
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*allowed_objects.*",
+        category=PendingDeprecationWarning,
+    )
+    from langgraph.graph import START, MessagesState, StateGraph
+
 from llm_client import LLMClient, LLMClientConfig
 from memory.relevance import RelevantHistorySelector
 from memory.store import MemoryHub
