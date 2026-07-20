@@ -90,7 +90,7 @@ KVStore                      ← façade over one of two interchangeable backend
 │
 ├── KVChatMessageHistory     ← BaseChatMessageHistory for one thread/session
 ├── ThreadMemoryManager      ← manages many independent threads
-├── KVMemoryStore            ← tagged KV store with search + text ingestion
+├── KVMemoryStore            ← tagged KV store with search
 └── MemoryHub                ← unified façade (recommended entry point)
 ```
 

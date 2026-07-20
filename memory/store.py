@@ -1089,7 +1089,6 @@ class KVMemoryStore:
     -----
     kv = KVMemoryStore(store, namespace="kv")
     kv.set("goal", "RAG pipeline", tags=["project"])
-    kv.ingest_text("Long document text …", name="spec", chunk_size=500)
     kv.search("pipeline")
 
     Parameters
@@ -1210,31 +1209,6 @@ class KVMemoryStore:
             (short_keys[i], 1.0 / (rank + 1))
             for rank, i in enumerate(fused[:top_k])
         ]
-
-    # ---- Text ingestion ----------------------------------------------------
-
-    def ingest_text(
-        self,
-        text: str,
-        name: str,
-        chunk_size: int = 500,
-        tags: Optional[List[str]] = None,
-        source: Optional[str] = None,
-    ) -> List[str]:
-        """Chunk text and store each chunk. Returns list of short keys created."""
-        words = text.split()
-        step = max(1, chunk_size // 2)
-        chunks = [
-            " ".join(words[i : i + chunk_size])
-            for i in range(0, max(1, len(words) - chunk_size + 1), step)
-        ]
-        base_tags = (tags or []) + ["chunk", name]
-        created: List[str] = []
-        for idx, chunk in enumerate(chunks):
-            key = f"{name}::chunk{idx}"
-            self.set(key, chunk, tags=base_tags, source=source or name)
-            created.append(key)
-        return created
 
     # ---- Snapshot ----------------------------------------------------------
 
