@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 import app_config
@@ -72,6 +74,17 @@ class LLMClientConfig(BaseModel):
         Per-request timeout in seconds, forwarded as ``timeout``.
         ``None`` keeps the provider default. Config key:
         ``llm_client.timeout``.
+    cert_file : str | None
+        Path to a PEM certificate bundle (e.g. ``gateway.crt``) used to
+        verify the endpoint's TLS certificate — needed when ``base_url``
+        points at a gateway whose certificate is signed by an internal
+        CA. Exported as the standard ``SSL_CERT_FILE`` environment
+        variable (process-wide) before the model is built, which the
+        httpx-based provider SDKs honour; there is no per-model hook,
+        as e.g. ``ChatAnthropic`` builds its HTTP client internally. A
+        missing file is skipped with a WARNING and the default trust
+        store applies. ``None`` leaves the environment untouched.
+        Config key: ``llm_client.cert_file``.
     temperature : float | None
         Sampling temperature. ``None`` (default) leaves the provider
         default untouched. Config key: ``llm_client.temperature``.
@@ -137,6 +150,9 @@ class LLMClientConfig(BaseModel):
     timeout: float | None = Field(
         default_factory=lambda: app_config.llm_client_value("timeout"),
         gt=0.0,
+    )
+    cert_file: str | None = Field(
+        default_factory=lambda: app_config.llm_client_value("cert_file")
     )
     temperature: float | None = Field(
         default_factory=lambda: app_config.llm_client_value("temperature"),
@@ -245,7 +261,30 @@ class LLMClient:
         return self._model
 
     @staticmethod
+    def _apply_cert_file(cert_file: str) -> None:
+        """Export *cert_file* as ``SSL_CERT_FILE`` so the provider SDK's
+        httpx client verifies TLS against it (there is no per-model hook —
+        e.g. ``ChatAnthropic`` builds its HTTP client internally)."""
+        path = Path(cert_file)
+        if not path.is_file():
+            logger.warning(
+                f"_apply_cert_file: cert_file '{cert_file}' does not exist; "
+                f"ignoring it (the default TLS trust store applies)"
+            )
+            return
+        resolved = str(path.resolve())
+        previous = os.environ.get("SSL_CERT_FILE")
+        if previous is not None and previous != resolved:
+            logger.warning(
+                f"_apply_cert_file: overriding SSL_CERT_FILE='{previous}' "
+                f"with configured cert_file '{resolved}'"
+            )
+        os.environ["SSL_CERT_FILE"] = resolved
+
+    @staticmethod
     def _build_model(config: LLMClientConfig) -> Any:
+        if config.cert_file is not None:
+            LLMClient._apply_cert_file(config.cert_file)
         kwargs: dict[str, Any] = {}
         if config.temperature is not None:
             kwargs["temperature"] = config.temperature
@@ -275,6 +314,7 @@ class LLMClient:
             f"max_output_tokens={config.max_output_tokens}  "
             f"base_url={config.base_url}  "
             f"timeout={config.timeout}  "
+            f"cert_file={config.cert_file}  "
             f"api_key={'set' if config.api_key else 'unset'}  "
             f"url_headers={sorted(config.url_headers) if config.url_headers else None}  "
             f"model_kwargs={config.model_kwargs}  "

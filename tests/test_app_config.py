@@ -109,6 +109,7 @@ def test_repo_config_json_matches_code_defaults():
         "base_url": None,
         "url_headers": None,
         "timeout": None,
+        "cert_file": None,
         "temperature": None,
         "max_retries": None,
         "model_kwargs": None,
@@ -267,6 +268,7 @@ def test_llm_client_endpoint_knobs_read_config(_isolated_config):
                 "base_url": "https://gateway.example/v1",
                 "url_headers": {"X-Team": "sas"},
                 "timeout": 30,
+                "cert_file": "certs/gateway.crt",
                 "temperature": 0.4,
                 "max_retries": 7,
                 "model_kwargs": {"top_k": 40},
@@ -278,6 +280,7 @@ def test_llm_client_endpoint_knobs_read_config(_isolated_config):
     assert cfg.base_url == "https://gateway.example/v1"
     assert cfg.url_headers == {"X-Team": "sas"}
     assert cfg.timeout == 30
+    assert cfg.cert_file == "certs/gateway.crt"
     assert cfg.temperature == 0.4
     assert cfg.max_retries == 7
     assert cfg.model_kwargs == {"top_k": 40}

@@ -20,6 +20,7 @@
     "base_url": null,
     "url_headers": null,
     "timeout": null,
+    "cert_file": null,
     "temperature": null,
     "max_retries": null,
     "model_kwargs": null,

@@ -300,6 +300,7 @@ prompt additionally carries a block of reference guidance (see
 `prompt_builder/`), injected via an ephemeral `instructions` placeholder that
 is **prompted but never persisted**. `llm_client.LLMClient` owns
 model construction (temperature, output-token cap, endpoint overrides,
+gateway TLS trust via a configured `cert_file` exported as `SSL_CERT_FILE`,
 proactive rate limiter) and sync + async invocation (input-token budget,
 transient-error retry with backoff); an injected `llm` still gets the
 retry/budget layers.
