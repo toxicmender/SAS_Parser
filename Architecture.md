@@ -69,8 +69,9 @@ chunker/
                         resolution, context absorption, batch construction.
                         SasChunkBatcher is a one-file convenience over
                         MultiFileBatcher.
-  pipeline.py           SasLLMPipeline: formatting of chunk/batch prompts and
-                        the LangGraph StateGraph wiring.
+  pipeline.py           SasLLMPipeline: formatting of chunk/batch prompts,
+                        the LangGraph StateGraph wiring, and opt-in Anthropic
+                        prompt caching on the system prompt.
   pipeline_constants.py Prompt templates.
   _repl.py              print_iterable REPL helper (imported by nothing).
 
@@ -89,10 +90,14 @@ memory/
                         shared by relevance and summarize (so summarize never
                         imports the bm25s/faiss stack). A leaf module.
   relevance.py          HybridRanker: shared BM25 (bm25s) + optional dense
-                        retrieval (LangChain Embeddings + FAISS IndexFlatIP),
-                        RRF fusion, optional reranker hook, content-hashed
-                        embedding cache — with a stateless per-call mode and an
-                        index-once/query-many static-corpus mode — plus
+                        retrieval (LangChain Embeddings), RRF fusion,
+                        optional reranker hook, content-hashed embedding and
+                        tokenization caches — with a stateless per-call mode
+                        (dense scores are a numpy matrix-vector product over
+                        the normalised vectors; ties break toward recency)
+                        and an index-once/query-many static-corpus mode
+                        (FAISS IndexFlatIP, imported lazily inside index() so
+                        BM25-only pipelines never pay for faiss) — plus
                         DiskCachedEmbeddings (on-disk .npz document-embedding
                         cache). RelevantHistorySelector layers history policy
                         on top: relevance-based selection of prompted history
@@ -296,11 +301,22 @@ proactive rate limiter) and sync + async invocation (input-token budget,
 transient-error retry with backoff); an injected `llm` still gets the
 retry/budget layers.
 
+With `prompt_caching` enabled (constructor argument, else config.json
+`llm_client.prompt_caching`) and an Anthropic model (`claude-*` or
+`anthropic:`-prefixed), the system prompt travels as a content block
+carrying a `cache_control` breakpoint, so every item after a run's first
+reads it from the provider cache at a fraction of input cost. The
+breakpoint sits on the system block only — prompted history varies per
+item under trimming/selection, so the system prompt is the one stable
+prefix. Non-Anthropic models keep the plain template (with a WARNING if
+caching was requested); prompts under the model's minimum cacheable
+prefix are silently not cached, which is harmless.
+
 Prompted-history trimming has two modes: the default `window_k` recency
 window, or — when a `memory.relevance.RelevantHistorySelector` is passed as
 `history_selector` — relevance-based selection: each call keeps the
 `top_k` turn pairs most relevant to the current batch/chunk message (BM25
-lexical retrieval, optional FAISS dense retrieval over embeddings, RRF
+lexical retrieval, optional dense retrieval over embeddings, RRF
 fusion, optional reranker), always including the most recent
 `always_keep_last` pairs and preserving chronological order. Scorers with
 no signal (all scores tied) are excluded from fusion; with no signal at
@@ -403,7 +419,9 @@ any of these silently changes behavior.
    therefore `MemoryHub()` with no arguments) must import and run
    without pyspark installed; the pyspark requirement lives inside
    `_DeltaBackend.__init__` only. The pipeline never boots a SparkSession
-   unless `delta_table` is set.
+   unless `delta_table` is set. Accordingly pyspark is declared as the
+   optional `spark` extra in pyproject.toml, never a core dependency —
+   CI installs the extra in the test and pyright jobs.
 
 7. **`SasBatch.reason` strings and item ordering are pinned by tests.**
    Edge-emission order is observable output, not an implementation detail.
