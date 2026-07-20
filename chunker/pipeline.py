@@ -29,7 +29,11 @@ from memory.store import MemoryHub
 from memory.summarize import RollingSummarizer
 from prompt_builder import ConstructKey, PromptBuilder, UserInstructionSet
 
-from .batcher import MultiFileBatcher, SasChunkBatcher
+from .batcher import (
+    MultiFileBatcher,
+    SasChunkBatcher,
+    parse_databricks_mapping_csv,
+)
 from .chunker import SasSemanticChunker
 from .models import (
     SasBatch,
@@ -469,6 +473,23 @@ class SasLLMPipeline:
         pipeline's ``memory.kv``. ``None`` (default) disables compression.
     include_options_chunks, include_comment_chunks : bool
         Forwarded to the batchers.
+    databricks_mapping : dict[str, str] | None
+        SAS→Databricks dataset-name mapping forwarded to the batchers
+        (see :func:`chunker.batcher.replace_dataset_names`): batch and
+        chunk metadata dataset names — and ``%let`` values holding a
+        dataset reference — are rewritten to Unity Catalog
+        ``catalog.schema.table`` names before prompting.  Default:
+        ``None`` (no renaming).
+    databricks_mapping_sharepoint : str | None
+        Path (relative to the configured SharePoint document library —
+        see :mod:`app_config.sharepoint`) of a CSV file holding the
+        SAS→Databricks mapping, parsed by
+        :func:`chunker.batcher.parse_databricks_mapping_csv` (column 1 the
+        SAS libref or ``libref.member``, column 2 the Databricks target).
+        Read once at construction; a failure to read or an empty parse
+        raises so a run never proceeds silently unmapped.  When both this
+        and ``databricks_mapping`` are given, they merge with the explicit
+        dict winning per key.  Default: ``None``.
     memory : MemoryHub | None
         Pre-built memory.store facade. If omitted, one is constructed from
         ``spark``/``delta_table``.
@@ -558,6 +579,8 @@ class SasLLMPipeline:
         summarizer: RollingSummarizer | None = None,
         include_options_chunks: bool = True,
         include_comment_chunks: bool = False,
+        databricks_mapping: dict[str, str] | None = None,
+        databricks_mapping_sharepoint: str | None = None,
         memory: MemoryHub | None = None,
         spark: "SparkSession | None" = None,
         delta_table: str | None = None,
@@ -629,11 +652,26 @@ class SasLLMPipeline:
             validation_retries if validator is not None else 0
         )
 
+        # SAS→Databricks dataset renaming: a SharePoint-hosted CSV mapping
+        # merges under any explicit dict (the in-code argument wins per key),
+        # and the combined mapping is forwarded to both batchers, which apply
+        # it as a post-pass after grouping.
+        if databricks_mapping_sharepoint:
+            sp_mapping = self._load_sharepoint_databricks_mapping(
+                databricks_mapping_sharepoint
+            )
+            databricks_mapping = {**sp_mapping, **(databricks_mapping or {})}
+        self.databricks_mapping = databricks_mapping or None
+
         self.chunker = SasSemanticChunker(min_words=min_words, max_words=max_words)
-        self.batcher = SasChunkBatcher(include_options_chunks=include_options_chunks)
+        self.batcher = SasChunkBatcher(
+            include_options_chunks=include_options_chunks,
+            databricks_mapping=self.databricks_mapping,
+        )
         self.multi_batcher = MultiFileBatcher(
             include_options_chunks=include_options_chunks,
             include_comment_chunks=include_comment_chunks,
+            databricks_mapping=self.databricks_mapping,
         )
 
         self._system_prompt = system_prompt or _SYSTEM_PROMPT_TEMPLATE.format(
@@ -806,6 +844,35 @@ class SasLLMPipeline:
                 .getOrCreate()
             )
         return MemoryHub(spark=spark, table=delta_table)
+
+    @staticmethod
+    def _load_sharepoint_databricks_mapping(path: str) -> dict[str, str]:
+        """
+        Read the SAS→Databricks mapping CSV at *path* in the configured
+        SharePoint document library and parse it into a mapping dict.
+
+        ``utf-8-sig`` decoding strips the BOM Excel stamps on exported
+        CSVs.  An unreadable file (``SharePointError``) propagates, and a
+        file that parses to zero entries raises ``ValueError`` — both mean
+        the operator asked for renaming that cannot happen, which should
+        stop the run rather than silently produce SAS-named output.
+        """
+        from app_config.sharepoint import get_sharepoint_client
+
+        logger.info(
+            f"SasLLMPipeline: reading Databricks mapping CSV from SharePoint '{path}'"
+        )
+        body = get_sharepoint_client().read_file(path)
+        mapping = parse_databricks_mapping_csv(body.decode("utf-8-sig"))
+        if not mapping:
+            raise ValueError(
+                f"SharePoint Databricks mapping '{path}' parsed to zero entries; "
+                f"expected CSV rows of <sas_libref_or_dataset>,<databricks_target>"
+            )
+        logger.info(
+            f"SasLLMPipeline: loaded {len(mapping)} Databricks mapping entries from SharePoint"
+        )
+        return mapping
 
     # ------------------------------------------------------------------
     # Public API

@@ -1,6 +1,11 @@
 """SAS semantic chunker, dependency batcher, and LangChain pipeline. See chunker/README.md."""
 
-from .batcher import MultiFileBatcher, SasChunkBatcher
+from .batcher import (
+    MultiFileBatcher,
+    SasChunkBatcher,
+    parse_databricks_mapping_csv,
+    replace_dataset_names,
+)
 from .chunker import SasSemanticChunker
 from .models import (
     SasBatch,
@@ -21,6 +26,9 @@ __all__ = [
     "SasChunkBatcher",
     # multi-file batcher
     "MultiFileBatcher",
+    # Databricks dataset-name mapping post-pass
+    "replace_dataset_names",
+    "parse_databricks_mapping_csv",
     # models — single-file
     "SasChunk",
     "SasChunkKind",

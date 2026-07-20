@@ -484,3 +484,104 @@ def test_prompt_caching_off_by_default():
         llm=FakeListChatModel(responses=["ok"]),
     )
     assert not isinstance(pipeline._prompt.messages[0], SystemMessage)
+
+
+# ---------------------------------------------------------------------------
+# SAS→Databricks dataset-name mapping (SharePoint CSV step)
+# ---------------------------------------------------------------------------
+
+
+class _FakeSharePointClient:
+    """Duck-typed stand-in for app_config.sharepoint's client: read_file only."""
+
+    def __init__(self, files: dict[str, bytes]):
+        self.files = files
+        self.read_paths: list[str] = []
+
+    def read_file(self, path: str) -> bytes:
+        self.read_paths.append(path)
+        return self.files[path]
+
+
+_MAPPING_CSV = (
+    b"sas_name,databricks_name\n"
+    b"work,dev.staging\n"
+    b"mylib,prod.sales\n"
+)
+
+
+def _patch_sharepoint(monkeypatch, files: dict[str, bytes]) -> _FakeSharePointClient:
+    import app_config.sharepoint as sp_mod
+
+    fake = _FakeSharePointClient(files)
+    monkeypatch.setattr(sp_mod, "get_sharepoint_client", lambda: fake)
+    return fake
+
+
+def test_databricks_mapping_loaded_from_sharepoint_csv(monkeypatch):
+    fake = _patch_sharepoint(monkeypatch, {"maps/sas_to_databricks.csv": _MAPPING_CSV})
+    pipeline = SasLLMPipeline(
+        model="unused",
+        memory=MemoryHub(),
+        llm=FakeListChatModel(responses=["ok"]),
+        databricks_mapping_sharepoint="maps/sas_to_databricks.csv",
+    )
+    assert fake.read_paths == ["maps/sas_to_databricks.csv"]
+    assert pipeline.databricks_mapping == {
+        "work": "dev.staging",
+        "mylib": "prod.sales",
+    }
+    # The mapping reaches both batchers and rewrites batched dataset names.
+    src = (
+        "data work.clean;\n set mylib.raw;\n run;\n"
+        "proc means data=work.clean; run;\n"
+    )
+    chunk_result = pipeline.chunker.chunk_text(src, source_id="etl.sas")
+    batch_result = pipeline.batcher.batch(chunk_result)
+    all_outputs = [
+        ds
+        for b in batch_result.batches
+        for ds in b.output_datasets
+    ] + [
+        ds for c in batch_result.singletons for ds in c.metadata.output_datasets
+    ]
+    assert "dev.staging.clean" in all_outputs
+    assert pipeline.multi_batcher.databricks_mapping == pipeline.databricks_mapping
+
+
+def test_explicit_databricks_mapping_overrides_sharepoint_csv(monkeypatch):
+    _patch_sharepoint(monkeypatch, {"m.csv": _MAPPING_CSV})
+    pipeline = SasLLMPipeline(
+        model="unused",
+        memory=MemoryHub(),
+        llm=FakeListChatModel(responses=["ok"]),
+        databricks_mapping={"work": "override.schema"},
+        databricks_mapping_sharepoint="m.csv",
+    )
+    assert pipeline.databricks_mapping == {
+        "work": "override.schema",  # explicit dict wins per key
+        "mylib": "prod.sales",  # CSV-only entries survive the merge
+    }
+
+
+def test_empty_sharepoint_mapping_csv_raises(monkeypatch):
+    import pytest
+
+    _patch_sharepoint(monkeypatch, {"m.csv": b"sas_name,databricks_name\n"})
+    with pytest.raises(ValueError, match="zero entries"):
+        SasLLMPipeline(
+            model="unused",
+            memory=MemoryHub(),
+            llm=FakeListChatModel(responses=["ok"]),
+            databricks_mapping_sharepoint="m.csv",
+        )
+
+
+def test_no_mapping_keeps_batchers_unmapped():
+    pipeline = SasLLMPipeline(
+        model="unused",
+        memory=MemoryHub(),
+        llm=FakeListChatModel(responses=["ok"]),
+    )
+    assert pipeline.databricks_mapping is None
+    assert pipeline.multi_batcher.databricks_mapping is None
