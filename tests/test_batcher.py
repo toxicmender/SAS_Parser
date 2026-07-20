@@ -886,5 +886,224 @@ class TestSingleFileChunkIds(unittest.TestCase):
         self.assertTrue(all(not cid.startswith("f1-") for cid in batched_ids))
 
 
+# ── 14. Databricks dataset-name mapping ───────────────────────────────────
+
+
+class TestDatabricksMapping(unittest.TestCase):
+    SRC = (
+        "data work.clean;\n set mylib.raw;\n run;\n"
+        "proc means data=work.clean; run;\n"
+    )
+    MAPPING = {
+        "work": "dev.staging",
+        "mylib": "prod.sales",
+    }
+
+    def test_libref_mapping_rewrites_batch_datasets(self):
+        """libref → catalog.schema rewrites batch inputs/outputs to
+        three-part Databricks names."""
+        _, br = _chunk_and_batch(self.SRC, databricks_mapping=self.MAPPING)
+        batch = br.batches[0]
+        self.assertEqual(batch.output_datasets, ["dev.staging.clean"])
+        self.assertEqual(batch.input_datasets, ["prod.sales.raw"])
+
+    def test_chunk_metadata_rewritten_in_batches_and_singletons(self):
+        src = self.SRC + "data work.other; set otherlib.src; run;\n"
+        _, br = _chunk_and_batch(src, databricks_mapping=self.MAPPING)
+        data_chunk = br.batches[0].chunks[0]
+        self.assertEqual(data_chunk.metadata.output_datasets, ["dev.staging.clean"])
+        self.assertEqual(data_chunk.metadata.input_datasets, ["prod.sales.raw"])
+        (solo,) = br.singletons
+        # Unmapped libref passes through; mapped work. member is rewritten.
+        self.assertEqual(solo.metadata.output_datasets, ["dev.staging.other"])
+        self.assertEqual(solo.metadata.input_datasets, ["otherlib.src"])
+
+    def test_exact_override_beats_libref_mapping(self):
+        mapping = {**self.MAPPING, "work.clean": "gold.curated.cleaned_v2"}
+        _, br = _chunk_and_batch(self.SRC, databricks_mapping=mapping)
+        batch = br.batches[0]
+        self.assertEqual(batch.output_datasets, ["gold.curated.cleaned_v2"])
+
+    def test_grouping_identical_with_and_without_mapping(self):
+        """The mapping is a post-pass: batch/singleton structure, chunk IDs,
+        reason strings, and required_librefs are byte-identical."""
+        _, plain = _chunk_and_batch(self.SRC)
+        _, mapped = _chunk_and_batch(self.SRC, databricks_mapping=self.MAPPING)
+        self.assertEqual(_batch_ids(plain), _batch_ids(mapped))
+        self.assertEqual(_singleton_ids(plain), _singleton_ids(mapped))
+        self.assertEqual(_ordered_chunk_ids(plain), _ordered_chunk_ids(mapped))
+        self.assertEqual(
+            [b.reason for b in plain.batches], [b.reason for b in mapped.batches]
+        )
+        self.assertEqual(
+            [b.required_librefs for b in plain.batches],
+            [b.required_librefs for b in mapped.batches],
+        )
+
+    def test_no_mapping_is_noop(self):
+        _, plain = _chunk_and_batch(self.SRC)
+        _, empty = _chunk_and_batch(self.SRC, databricks_mapping={})
+        self.assertEqual(plain.model_dump(), empty.model_dump())
+
+    def test_one_level_names_map_via_work(self):
+        """Bare one-level names were canonicalised to work.<name>, so the
+        'work' libref entry covers them."""
+        src = "data clean; set mylib.raw; run;\nproc print data=clean; run;\n"
+        _, br = _chunk_and_batch(src, databricks_mapping=self.MAPPING)
+        batch = br.batches[0]
+        self.assertEqual(batch.output_datasets, ["dev.staging.clean"])
+
+    def test_input_chunk_result_not_mutated(self):
+        cr, _ = _chunk_and_batch(self.SRC, databricks_mapping=self.MAPPING)
+        all_names = [
+            ds
+            for c in cr.chunks
+            for ds in (*c.metadata.input_datasets, *c.metadata.output_datasets)
+        ]
+        self.assertTrue(all(ds.count(".") < 2 for ds in all_names))
+
+    def test_standalone_function_on_existing_result(self):
+        from chunker import replace_dataset_names
+
+        _, plain = _chunk_and_batch(self.SRC)
+        mapped = replace_dataset_names(plain, self.MAPPING)
+        self.assertEqual(mapped.batches[0].output_datasets, ["dev.staging.clean"])
+        # original untouched
+        self.assertEqual(plain.batches[0].output_datasets, ["work.clean"])
+
+    # -- %let / %global / %local values holding a dataset reference --------
+
+    def _all_texts(self, br) -> str:
+        texts = [c.text for b in br.batches for c in b.chunks]
+        texts += [c.text for c in br.singletons]
+        return "\n".join(texts)
+
+    def test_let_value_dataset_reference_rewritten(self):
+        src = "%let src = mylib.orders;\ndata work.a; set &src; run;\n"
+        _, br = _chunk_and_batch(src, databricks_mapping=self.MAPPING)
+        joined = self._all_texts(br)
+        self.assertIn("%let src = prod.sales.orders;", joined)
+        self.assertNotIn("mylib.orders", joined)
+
+    def test_global_then_let_pattern_rewritten(self):
+        src = (
+            "%global src;\n"
+            "%let src = mylib.orders;\n"
+            "data work.a; set &src; run;\n"
+        )
+        _, br = _chunk_and_batch(src, databricks_mapping=self.MAPPING)
+        joined = self._all_texts(br)
+        self.assertIn("%global src;", joined)  # declaration untouched
+        self.assertIn("%let src = prod.sales.orders;", joined)
+
+    def test_quoted_let_value_rewritten_preserving_quotes(self):
+        src = "%let src = 'mylib.orders';\ndata work.a; set mylib.orders; run;\n"
+        _, br = _chunk_and_batch(src, databricks_mapping=self.MAPPING)
+        self.assertIn("%let src = 'prod.sales.orders';", self._all_texts(br))
+
+    def test_non_dataset_let_values_untouched(self):
+        """Only a two-level libref.member value is a dataset reference; free
+        text, numbers, and bare identifiers pass through even with 'work'
+        mapped."""
+        src = (
+            "%let cutoff = 20240101;\n"
+            "%let ttl = hello world;\n"
+            "%let name = orders;\n"
+            "data work.a; x=&cutoff; run;\n"
+        )
+        _, br = _chunk_and_batch(src, databricks_mapping=self.MAPPING)
+        joined = self._all_texts(br)
+        self.assertIn("%let cutoff = 20240101;", joined)
+        self.assertIn("%let ttl = hello world;", joined)
+        self.assertIn("%let name = orders;", joined)
+
+    def test_let_rewrite_only_with_mapped_libref(self):
+        src = "%let src = otherlib.orders;\ndata work.a; set &src; run;\n"
+        _, br = _chunk_and_batch(src, databricks_mapping=self.MAPPING)
+        self.assertIn("%let src = otherlib.orders;", self._all_texts(br))
+
+    # -- SET-statement rename and PROC OUTPUT OUT= scenarios ----------------
+
+    def test_set_statement_rename_maps_both_names(self):
+        """data new; set old; — the dataset's new name (and the old) reach
+        the mapper through the extracted metadata."""
+        src = (
+            "data work.orig; x=1; run;\n"
+            "data work.renamed; set work.orig; run;\n"
+        )
+        _, br = _chunk_and_batch(src, databricks_mapping=self.MAPPING)
+        batch = br.batches[0]
+        self.assertEqual(
+            batch.output_datasets, ["dev.staging.orig", "dev.staging.renamed"]
+        )
+        rename_chunk = batch.chunks[1]
+        self.assertEqual(rename_chunk.metadata.input_datasets, ["dev.staging.orig"])
+        self.assertEqual(
+            rename_chunk.metadata.output_datasets, ["dev.staging.renamed"]
+        )
+
+    def test_proc_output_statement_dataset_mapped(self):
+        """PROC ... OUTPUT OUT=work.stats — the OUT= name reaches the mapper
+        through the extracted metadata."""
+        src = (
+            "data work.clean; set mylib.raw; run;\n"
+            "proc means data=work.clean; var x; output out=work.stats mean=avg; run;\n"
+        )
+        _, br = _chunk_and_batch(src, databricks_mapping=self.MAPPING)
+        batch = br.batches[0]
+        self.assertIn("dev.staging.stats", batch.output_datasets)
+        proc_chunk = batch.chunks[1]
+        self.assertIn("dev.staging.stats", proc_chunk.metadata.output_datasets)
+        self.assertIn("dev.staging.clean", proc_chunk.metadata.input_datasets)
+
+
+# ── 15. Databricks mapping CSV parser ─────────────────────────────────────
+
+
+class TestDatabricksMappingCsv(unittest.TestCase):
+    def _parse(self, text: str) -> dict:
+        from chunker import parse_databricks_mapping_csv
+
+        return parse_databricks_mapping_csv(text)
+
+    def test_basic_rows_with_header(self):
+        csv_text = (
+            "sas_name,databricks_name\n"
+            "work,dev.staging\n"
+            "mylib.orders,prod.sales.orders_v2\n"
+        )
+        self.assertEqual(
+            self._parse(csv_text),
+            {"work": "dev.staging", "mylib.orders": "prod.sales.orders_v2"},
+        )
+
+    def test_comments_blanks_and_extra_columns_skipped(self):
+        csv_text = (
+            "# comment row\n"
+            "\n"
+            "WORK,dev.staging,ignored extra\n"
+        )
+        self.assertEqual(self._parse(csv_text), {"work": "dev.staging"})
+
+    def test_malformed_rows_skipped(self):
+        csv_text = "work\n,dev.staging\nmylib,prod.sales\n"
+        self.assertEqual(self._parse(csv_text), {"mylib": "prod.sales"})
+
+    def test_duplicate_key_last_wins(self):
+        csv_text = "work,dev.staging\nwork,qa.scratch\n"
+        self.assertEqual(self._parse(csv_text), {"work": "qa.scratch"})
+
+    def test_parsed_mapping_round_trips_through_batcher(self):
+        csv_text = "sas,databricks\nwork,dev.staging\nmylib,prod.sales\n"
+        mapping = self._parse(csv_text)
+        src = (
+            "data work.clean;\n set mylib.raw;\n run;\n"
+            "proc means data=work.clean; run;\n"
+        )
+        _, br = _chunk_and_batch(src, databricks_mapping=mapping)
+        self.assertEqual(br.batches[0].output_datasets, ["dev.staging.clean"])
+        self.assertEqual(br.batches[0].input_datasets, ["prod.sales.raw"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

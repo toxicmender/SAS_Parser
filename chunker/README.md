@@ -50,6 +50,37 @@ for item in result.all_ordered_items:
     ...  # SasBatch or SasChunk, cross-file batches included
 ```
 
+Databricks target names (opt-in): pass `databricks_mapping` to either batcher
+(or call `replace_dataset_names` on an existing result) to rewrite the emitted
+SAS dataset names to Unity Catalog `catalog.schema.table` names. Batching runs
+entirely on the SAS names — grouping, `reason` strings, and `required_librefs`
+are identical with or without a mapping.
+
+```python
+from chunker import SasChunkBatcher
+
+batcher = SasChunkBatcher(databricks_mapping={
+    "work":         "dev.staging",             # libref → catalog.schema
+    "sales":        "prod.sales",
+    "sales.orders": "prod.sales.orders_v2",    # exact override, wins over libref
+})
+result = batcher.batch(chunk_result)
+result.batches[0].output_datasets  # ['dev.staging.clean', ...]
+```
+
+Names created via DATA headers, SET/MERGE renames, and PROC `OUT=`/`OUTPUT
+OUT=` all reach the mapper through the extracted metadata; a dataset name
+stored in a macro variable (`%let ds = mylib.orders;`, including the
+`%global`/`%local` + `%let` pattern) is additionally rewritten in the chunk
+*text*, since a `%let` value never appears in the metadata dataset lists.
+
+The mapping can also come from a two-column CSV (`sas_name,databricks_name` —
+librefs or exact `libref.member` names) via `parse_databricks_mapping_csv`;
+`SasLLMPipeline` accepts `databricks_mapping` directly, or
+`databricks_mapping_sharepoint="path/in/library.csv"` to load that CSV from
+the configured SharePoint document library (see `app_config.sharepoint`) at
+construction, with the explicit dict winning per key when both are given.
+
 End-to-end through an LLM (`SasLLMPipeline` is imported lazily so `langchain`
 is only needed when you use it):
 

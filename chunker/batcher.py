@@ -9,6 +9,8 @@ Logger name: ``chunker.batcher``.
 
 from __future__ import annotations
 
+import csv
+import io
 import logging
 import re
 import time
@@ -350,6 +352,257 @@ def _resolve_implicit_datasets(flat_chunks: list[SasChunk]) -> None:
             # SAS sets _LAST_ to the most recently created data set; for a
             # multi-dataset DATA statement that is the last one named.
             last_created = new_out[-1]
+
+
+# ---------------------------------------------------------------------------
+# Databricks name mapping (opt-in post-pass)
+# ---------------------------------------------------------------------------
+
+# Chunk-metadata list fields that hold dataset names and are rewritten by
+# replace_dataset_names. referenced_datasets is raw-source provenance and
+# body_param_* hold parameter references, so neither is touched.
+_DS_METADATA_FIELDS = (
+    "input_datasets",
+    "output_datasets",
+    "body_literal_inputs",
+    "body_literal_outputs",
+)
+
+# A ``%let name = value`` assignment (any chunk kind — GLOBAL_STATEMENT
+# chunks, but also %LET statements inside macro bodies and steps).  Group 1
+# is everything up to the value; group 2 the raw value text up to the
+# terminating semicolon.  The optional leading ``&`` mirrors _LET_TARGET_RE
+# in metadata.py (indirect targets whose outer name is still literal).
+_LET_ASSIGN_RE = re.compile(
+    r"(%\s*let\s+&*[A-Za-z_]\w*\s*=\s*)([^;]*)",
+    re.IGNORECASE,
+)
+
+# A %LET value that IS a dataset reference: exactly one two-level
+# ``libref.member`` token (optionally with a SAS-style trailing dot).  A
+# bare one-level value is deliberately never treated as a dataset — any
+# string can be a %LET value, and only the libref makes it unambiguous.
+_TWO_LEVEL_DS_RE = re.compile(r"^([A-Za-z_]\w*\.[A-Za-z_]\w*)\.?$")
+
+
+def _split_databricks_mapping(
+    mapping: dict[str, str],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """
+    Split a user-supplied Databricks mapping into (exact, by_libref) lookup
+    dicts with lowercased keys.
+
+    A key containing a dot is an exact dataset name (``"mylib.orders"``)
+    whose value should be a full ``catalog.schema.table``; a bare key is a
+    libref (``"mylib"``) whose value should be a ``catalog.schema`` prefix
+    the member name is appended to.  Values with an unexpected dot count are
+    still applied verbatim, with a warning, since the caller may have a
+    deliberate non-three-part target.
+    """
+    exact: dict[str, str] = {}
+    by_libref: dict[str, str] = {}
+    for key, target in mapping.items():
+        k = key.strip().lower()
+        t = target.strip()
+        if not k or not t:
+            logger.warning(
+                f"databricks-mapping: ignoring empty entry {key!r} → {target!r}"
+            )
+            continue
+        if "." in k:
+            if t.count(".") != 2:
+                logger.warning(
+                    f"databricks-mapping: exact target for '{k}' is {t!r} — expected catalog.schema.table"
+                )
+            exact[k] = t
+        else:
+            if t.count(".") != 1:
+                logger.warning(
+                    f"databricks-mapping: libref target for '{k}' is {t!r} — expected catalog.schema"
+                )
+            by_libref[k] = t
+    return exact, by_libref
+
+
+def _map_ds(ds: str, exact: dict[str, str], by_libref: dict[str, str]) -> str:
+    """
+    Map one canonical SAS dataset name to its Databricks name, or return it
+    unchanged when no mapping applies.
+
+    Quoted physical paths (``'c:/tmp/x'``) and names still containing an
+    unresolved macro reference (``&``) are never mapped — neither is a
+    library member the mapping vocabulary can address.
+    """
+    if ds.startswith("'") or "&" in ds:
+        return ds
+    hit = exact.get(ds)
+    if hit is not None:
+        return hit
+    if "." not in ds:
+        return ds
+    libref, member = ds.split(".", 1)
+    target = by_libref.get(libref)
+    if target is None:
+        return ds
+    return f"{target}.{member}"
+
+
+def _map_let_values(
+    text: str, exact: dict[str, str], by_libref: dict[str, str]
+) -> str:
+    """
+    Rewrite ``%let var = libref.member;`` assignments in *text* whose value
+    is a mappable two-level dataset reference, preserving any surrounding
+    quotes.  This is how a dataset name *stored in a macro variable* — the
+    ``%let`` half of a ``%global``/``%local`` + ``%let`` pattern, or a
+    plain ``%let`` anywhere — reaches the Databricks mapping: the value is
+    never a member of the chunk-metadata dataset lists, only of the source
+    text.  Values that are not exactly one two-level token pass through
+    untouched (any string can be a %LET value; only the libref makes a
+    dataset reference unambiguous).
+    """
+
+    def _sub(m: re.Match[str]) -> str:
+        raw = m.group(2)
+        val = raw.strip()
+        quote = ""
+        if len(val) >= 2 and val[0] in ("'", '"') and val[-1] == val[0]:
+            quote = val[0]
+            val = val[1:-1].strip()
+        ds_m = _TWO_LEVEL_DS_RE.match(val)
+        if not ds_m:
+            return m.group(0)
+        ds = ds_m.group(1).lower()
+        mapped = _map_ds(ds, exact, by_libref)
+        if mapped == ds:
+            return m.group(0)
+        return f"{m.group(1)}{quote}{mapped}{quote}"
+
+    return _LET_ASSIGN_RE.sub(_sub, text)
+
+
+def parse_databricks_mapping_csv(text: str) -> dict[str, str]:
+    """
+    Parse a two-column CSV into a Databricks mapping dict for
+    :func:`replace_dataset_names`.
+
+    Column 1 is the SAS name — a libref (``work``) or an exact
+    ``libref.member`` — and column 2 the Databricks target
+    (``catalog.schema`` or ``catalog.schema.table`` respectively).  Extra
+    columns are ignored.  Blank rows and rows whose first cell starts with
+    ``#`` are skipped.  A header row is recognised (and skipped) by its
+    second cell containing no dot — a Databricks target always has at
+    least one.  A duplicated SAS name keeps the last row, with a warning.
+    """
+    mapping: dict[str, str] = {}
+    for rownum, row in enumerate(csv.reader(io.StringIO(text)), start=1):
+        cells = [c.strip() for c in row]
+        if not any(cells) or cells[0].startswith("#"):
+            continue
+        if len(cells) < 2 or not cells[0] or not cells[1]:
+            logger.warning(
+                f"databricks-mapping-csv: row {rownum} needs two non-empty columns — skipped ({row!r})"
+            )
+            continue
+        key, target = cells[0], cells[1]
+        if "." not in target:
+            logger.debug(
+                f"databricks-mapping-csv: row {rownum} target {target!r} has no dot — treated as header/malformed and skipped"
+            )
+            continue
+        norm_key = key.lower()
+        if norm_key in mapping:
+            logger.warning(
+                f"databricks-mapping-csv: duplicate SAS name '{norm_key}' at row {rownum} — last value wins ({target!r})"
+            )
+        mapping[norm_key] = target
+    logger.info(f"databricks-mapping-csv: parsed {len(mapping)} mapping entries")
+    return mapping
+
+
+def replace_dataset_names(
+    result: SasBatchResult, mapping: dict[str, str]
+) -> SasBatchResult:
+    """
+    Return a copy of *result* with SAS dataset names replaced by Databricks
+    ``<catalog>.<schema>.<table>`` names.
+
+    *mapping* accepts two key shapes, applied in priority order:
+
+    - ``"libref.member" → "catalog.schema.table"`` — exact per-dataset
+      override, checked first;
+    - ``"libref" → "catalog.schema"`` — every member of the library maps to
+      ``catalog.schema.<member>`` (one-level SAS names were already
+      canonicalised to ``work.<name>``, so mapping ``"work"`` covers them).
+
+    Names without a mapping pass through unchanged, as do quoted physical
+    paths and names containing unresolved macro references.
+
+    This is a pure post-pass: it rewrites ``SasBatch.input_datasets`` /
+    ``output_datasets`` and the dataset fields of every chunk's metadata
+    (in batches and singletons alike) on *copies* of the models.  Batching
+    itself — edge discovery, ``required_librefs``, ``reason`` strings —
+    already ran on the SAS names and is deliberately left untouched, so the
+    grouping is identical with or without a mapping.
+
+    Dataset names created through the usual statements — a DATA statement
+    header, a SET/MERGE rename step (``data work.copy; set work.orig;``),
+    a PROC ``OUTPUT OUT=`` / ``OUT=`` option — were all extracted into
+    ``input_datasets`` / ``output_datasets`` by the chunker, so they are
+    covered by the metadata rewrite above.  The one place a dataset name
+    lives *only* in source text is a macro-variable assignment
+    (``%let ds = mylib.orders;`` — including the ``%global``/``%local`` +
+    ``%let`` pattern), so chunk *text* additionally gets those ``%let``
+    values rewritten — see :func:`_map_let_values`.
+    """
+    exact, by_libref = _split_databricks_mapping(mapping)
+    if not exact and not by_libref:
+        return result
+
+    def _map_list(names: list[str]) -> list[str]:
+        # dict.fromkeys: two SAS names may collapse onto one Databricks name.
+        return list(dict.fromkeys(_map_ds(ds, exact, by_libref) for ds in names))
+
+    def _map_chunk(chunk: SasChunk) -> SasChunk:
+        meta_updates = {
+            field: mapped
+            for field in _DS_METADATA_FIELDS
+            if (mapped := _map_list(getattr(chunk.metadata, field)))
+            != getattr(chunk.metadata, field)
+        }
+        updates: dict[str, object] = {}
+        if meta_updates:
+            updates["metadata"] = chunk.metadata.model_copy(update=meta_updates)
+        new_text = _map_let_values(chunk.text, exact, by_libref)
+        if new_text != chunk.text:
+            updates["text"] = new_text
+        if not updates:
+            return chunk
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"databricks-mapping: chunk {chunk.chunk_id} remapped  metadata={meta_updates}  let_text_rewritten={'text' in updates}"
+            )
+        return chunk.model_copy(update=updates)
+
+    def _map_batch(batch: SasBatch) -> SasBatch:
+        return batch.model_copy(
+            update={
+                "chunks": [_map_chunk(c) for c in batch.chunks],
+                "input_datasets": _map_list(batch.input_datasets),
+                "output_datasets": _map_list(batch.output_datasets),
+            }
+        )
+
+    mapped = result.model_copy(
+        update={
+            "batches": [_map_batch(b) for b in result.batches],
+            "singletons": [_map_chunk(c) for c in result.singletons],
+        }
+    )
+    logger.info(
+        f"databricks-mapping: applied  exact_entries={len(exact)}  libref_entries={len(by_libref)}  batches={len(mapped.batches)}  singletons={len(mapped.singletons)}"
+    )
+    return mapped
 
 
 # ---------------------------------------------------------------------------
@@ -1299,6 +1552,10 @@ class SasChunkBatcher:
     include_options_chunks : bool
         Pull OPTIONS / GLOBAL_STATEMENT chunks that immediately precede a
         substantive chunk into that chunk's batch.  Default: ``True``.
+    databricks_mapping : dict[str, str] | None
+        Optional SAS→Databricks dataset-name mapping applied to the result
+        as a post-pass — see :func:`replace_dataset_names`.  Default:
+        ``None`` (no renaming).
     """
 
     def __init__(
@@ -1306,12 +1563,14 @@ class SasChunkBatcher:
         *,
         include_comment_chunks: bool = False,
         include_options_chunks: bool = True,
+        databricks_mapping: dict[str, str] | None = None,
     ) -> None:
         self.include_comment_chunks = include_comment_chunks
         self.include_options_chunks = include_options_chunks
         self._delegate = MultiFileBatcher(
             include_comment_chunks=include_comment_chunks,
             include_options_chunks=include_options_chunks,
+            databricks_mapping=databricks_mapping,
         )
         logger.debug(
             f"SasChunkBatcher  include_comment={include_comment_chunks}  include_options={include_options_chunks}"
@@ -1364,6 +1623,11 @@ class MultiFileBatcher:
         Pull OPTIONS / GLOBAL_STATEMENT chunks that immediately precede a
         substantive chunk into that chunk's batch (same-file only).
         Default: ``True``.
+    databricks_mapping : dict[str, str] | None
+        Optional SAS→Databricks dataset-name mapping applied to the result
+        as a post-pass — see :func:`replace_dataset_names`.  Batching runs
+        entirely on the SAS names; only the emitted dataset-name fields are
+        rewritten.  Default: ``None`` (no renaming).
 
     Usage
     -----
@@ -1389,11 +1653,13 @@ class MultiFileBatcher:
         *,
         include_comment_chunks: bool = False,
         include_options_chunks: bool = True,
+        databricks_mapping: dict[str, str] | None = None,
     ) -> None:
         self.include_comment_chunks = include_comment_chunks
         self.include_options_chunks = include_options_chunks
+        self.databricks_mapping = databricks_mapping
         logger.debug(
-            f"MultiFileBatcher  include_comment={include_comment_chunks}  include_options={include_options_chunks}"
+            f"MultiFileBatcher  include_comment={include_comment_chunks}  include_options={include_options_chunks}  databricks_mapping={'yes' if databricks_mapping else 'no'}"
         )
 
     # ------------------------------------------------------------------
@@ -1500,8 +1766,14 @@ class MultiFileBatcher:
             f"MultiFileBatcher.batch: done  files={len(corpus.file_results)}  batches={len(batches)}  cross_file_batches={cf_count}  singletons={len(singletons)}  elapsed={elapsed:.3f}s"
         )
 
-        return SasBatchResult(
+        result = SasBatchResult(
             source_ids=source_ids,
             batches=batches,
             singletons=singletons,
         )
+
+        # ── Databricks name mapping (opt-in; grouping already final) ────────
+        if self.databricks_mapping:
+            result = replace_dataset_names(result, self.databricks_mapping)
+
+        return result
