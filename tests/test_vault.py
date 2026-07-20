@@ -30,6 +30,9 @@ _VAULT_ENV = (
     "VAULT_SECRET_ID",
     "VAULT_CACERT",
     "VAULT_SKIP_VERIFY",
+    "VAULT_AUTH_PATH",
+    "VAULT_OIDC_ROLE",
+    "VAULT_AZURE_SCOPES",
 )
 
 
@@ -78,21 +81,58 @@ class _FakeKvV1:
         return {"data": self._store[(mount_point, path)]}
 
 
+class _FakeJwtAuth:
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.calls: list[dict] = []
+
+    def jwt_login(self, role, jwt, path):
+        if self.fail:
+            raise RuntimeError("role not found")
+        self.calls.append({"role": role, "jwt": jwt, "path": path})
+        return {"auth": {"client_token": "vault-token-from-jwt"}}
+
+
 class _FakeClient:
-    def __init__(self, store, authenticated=True):
-        # Stub the hvac client.secrets.kv.v1/v2 namespace with dynamically-built
-        # objects. Bound through Any-typed locals so the attribute assignments
-        # aren't flagged against the empty synthesized classes.
+    def __init__(self, store, authenticated=True, jwt_fail=False):
+        # Stub the hvac client.secrets.kv.v1/v2 and auth.jwt namespaces with
+        # dynamically-built objects. Bound through Any-typed locals so the
+        # attribute assignments aren't flagged against the empty synthesized
+        # classes.
         kv: Any = type("KV", (), {})()
         kv.v2 = _FakeKvV2(store)
         kv.v1 = _FakeKvV1(store)
         secrets: Any = type("S", (), {})()
         secrets.kv = kv
         self.secrets = secrets
+        auth: Any = type("A", (), {})()
+        auth.jwt = _FakeJwtAuth(fail=jwt_fail)
+        self.auth = auth
         self._authenticated = authenticated
 
     def is_authenticated(self):
         return self._authenticated
+
+
+class _FakeAzureClient:
+    """Duck-typed stand-in for app_config.azure.AzureAuthClient."""
+
+    def __init__(self, scopes=(), client_id=None, fail=False):
+        from app_config.azure import AzureAuthConfig
+
+        self.config = AzureAuthConfig(client_id=client_id, scopes=tuple(scopes))
+        self.fail = fail
+        self.requested_scopes: tuple[str, ...] | None = None
+
+    def get_token(self, scopes=None):
+        from app_config.azure import AzureAuthError
+
+        if self.fail:
+            raise AzureAuthError("entra said no")
+        self.requested_scopes = tuple(scopes) if scopes else self.config.scopes
+        if not self.requested_scopes:
+            raise AzureAuthError("no Azure scopes requested")
+        return "entra-jwt"
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +203,48 @@ def test_token_wins_over_approle(monkeypatch, _isolated):
     monkeypatch.setenv("VAULT_ROLE_ID", "role")
     monkeypatch.setenv("VAULT_SECRET_ID", "secret")
     assert vault.VaultConfig.from_env().auth_method == "token"
+
+
+def test_azuread_auth_method(monkeypatch, _isolated):
+    monkeypatch.setenv("VAULT_OIDC_ROLE", "sas-parser")
+    cfg = vault.VaultConfig.from_env()
+    assert cfg.auth_method == "azuread"
+    assert cfg.oidc_role == "sas-parser"
+    assert cfg.auth_path == vault.DEFAULT_AUTH_PATH
+
+
+def test_approle_wins_over_azuread(monkeypatch, _isolated):
+    monkeypatch.setenv("VAULT_ROLE_ID", "role")
+    monkeypatch.setenv("VAULT_SECRET_ID", "secret")
+    monkeypatch.setenv("VAULT_OIDC_ROLE", "sas-parser")
+    assert vault.VaultConfig.from_env().auth_method == "approle"
+
+
+def test_azuread_config_json_fallback(_isolated):
+    _set(
+        _isolated,
+        {
+            "vault": {
+                "oidc_role": "cfg-role",
+                "auth_path": "oidc",
+                "azure_scopes": ["api://vault/.default"],
+            }
+        },
+    )
+    cfg = vault.VaultConfig.from_env()
+    assert cfg.oidc_role == "cfg-role"
+    assert cfg.auth_path == "oidc"
+    assert cfg.azure_scopes == ("api://vault/.default",)
+
+
+def test_azure_scopes_env_parsing(monkeypatch, _isolated):
+    monkeypatch.setenv("VAULT_AZURE_SCOPES", "a/.default, b/.default")
+    assert vault.VaultConfig.from_env().azure_scopes == ("a/.default", "b/.default")
+
+
+def test_wrong_typed_azure_scopes_degrades(_isolated):
+    _set(_isolated, {"vault": {"azure_scopes": [1, 2]}})
+    assert vault.VaultConfig.from_env().azure_scopes == ()
 
 
 def test_secrets_never_in_repr():
@@ -251,6 +333,61 @@ def test_authentication_failure_raises():
     cfg = vault.VaultConfig(token="tok")
     fake = _FakeClient({}, authenticated=False)
     with pytest.raises(vault.VaultError, match="authentication failed"):
+        vault._authenticate(fake, cfg)
+
+
+# ---------------------------------------------------------------------------
+# azuread (Entra ID OIDC) login
+# ---------------------------------------------------------------------------
+
+
+def _patch_azure(monkeypatch, fake):
+    from app_config import azure
+
+    monkeypatch.setattr(azure, "get_azure_client", lambda: fake)
+
+
+def test_azuread_login_flow(monkeypatch):
+    fake_azure = _FakeAzureClient(scopes=("api://vault/.default",))
+    _patch_azure(monkeypatch, fake_azure)
+    cfg = vault.VaultConfig(address="https://v", oidc_role="sas", auth_path="oidc")
+    fake = _FakeClient({})
+    vault._authenticate(fake, cfg)
+    assert fake.auth.jwt.calls == [
+        {"role": "sas", "jwt": "entra-jwt", "path": "oidc"}
+    ]
+
+
+def test_azuread_vault_scopes_win(monkeypatch):
+    fake_azure = _FakeAzureClient(scopes=("azure-configured/.default",))
+    _patch_azure(monkeypatch, fake_azure)
+    cfg = vault.VaultConfig(
+        address="https://v", oidc_role="sas", azure_scopes=("vault-pinned/.default",)
+    )
+    vault._authenticate(_FakeClient({}), cfg)
+    assert fake_azure.requested_scopes == ("vault-pinned/.default",)
+
+
+def test_azuread_scopes_fall_back_to_client_id(monkeypatch):
+    fake_azure = _FakeAzureClient(client_id="abc-123")
+    _patch_azure(monkeypatch, fake_azure)
+    cfg = vault.VaultConfig(address="https://v", oidc_role="sas")
+    vault._authenticate(_FakeClient({}), cfg)
+    assert fake_azure.requested_scopes == ("abc-123/.default",)
+
+
+def test_azuread_azure_error_wrapped(monkeypatch):
+    _patch_azure(monkeypatch, _FakeAzureClient(fail=True))
+    cfg = vault.VaultConfig(address="https://v", oidc_role="sas")
+    with pytest.raises(vault.VaultError, match="could not acquire an Entra ID token"):
+        vault._authenticate(_FakeClient({}), cfg)
+
+
+def test_azuread_login_failure_wrapped(monkeypatch):
+    _patch_azure(monkeypatch, _FakeAzureClient(scopes=("s/.default",)))
+    cfg = vault.VaultConfig(address="https://v", oidc_role="sas")
+    fake = _FakeClient({}, jwt_fail=True)
+    with pytest.raises(vault.VaultError, match="azuread login failed for role 'sas'"):
         vault._authenticate(fake, cfg)
 
 

@@ -20,6 +20,27 @@ Split of concerns
   ``VAULT_SECRET_ID``). They are held in fields marked ``repr=False`` so they
   never appear in a ``repr`` or a log line.
 
+Auth methods
+------------
+Three ways in, tried in this order (:attr:`VaultConfig.auth_method`):
+
+``token``
+    ``VAULT_TOKEN`` is set — use it as-is.
+``approle``
+    ``VAULT_ROLE_ID`` + ``VAULT_SECRET_ID`` are set — AppRole login.
+``azuread``
+    ``VAULT_OIDC_ROLE`` (or ``vault.oidc_role``) is set — OIDC login backed
+    by Microsoft Entra ID (Azure AD). An Entra access token is acquired
+    through the sibling :mod:`app_config.azure` module (service principal or
+    device-code, per its own configuration) and presented as the JWT to
+    Vault's jwt/oidc auth method at ``auth/<vault.auth_path>/login`` (default
+    ``jwt``), per
+    https://developer.hashicorp.com/vault/docs/auth/jwt/oidc-providers/azuread.
+    The Vault role's ``bound_audiences`` must match the token's ``aud`` —
+    normally the app registration's client id, which is what the default
+    scope ``<client_id>/.default`` requests when neither
+    ``vault.azure_scopes`` nor the azure module's scopes are configured.
+
 Callers that want to bypass the environment entirely can construct
 :class:`VaultConfig` directly (an explicit argument always wins) or inject a
 pre-built ``hvac.Client`` into :class:`VaultClient` (custom auth backends,
@@ -32,6 +53,8 @@ The ``hvac`` client library is an *optional* dependency (extra ``vault``):
 :meth:`VaultClient._build_client`, so ``import app_config.vault`` costs nothing
 and keeps ``app_config`` the dependency-free leaf the rest of the package
 relies on. Only actually talking to Vault requires ``hvac`` to be installed.
+``azuread`` login additionally needs ``msal`` (extra ``azure``), imported just
+as lazily by :mod:`app_config.azure` when the JWT is acquired.
 
 Typical use
 -----------
@@ -63,6 +86,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MOUNT_POINT = "secret"
 DEFAULT_KV_VERSION = 2
 DEFAULT_TIMEOUT = 30.0
+DEFAULT_AUTH_PATH = "jwt"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
@@ -89,6 +113,29 @@ def _resolve_verify() -> bool | str:
     if isinstance(configured, (bool, str)):
         return configured
     return True
+
+
+def _resolve_azure_scopes() -> tuple[str, ...]:
+    """
+    Entra ID scopes to request for the ``azuread`` login JWT, from
+    ``VAULT_AZURE_SCOPES`` (space- or comma-separated) or the
+    ``vault.azure_scopes`` config list. Empty when unset — :func:`_azure_jwt`
+    then falls back to the azure module's own scopes, and finally to
+    ``<client_id>/.default``.
+    """
+    env = os.environ.get("VAULT_AZURE_SCOPES")
+    if env:
+        return tuple(env.replace(",", " ").split())
+    configured = get_typed_value("vault", "azure_scopes", list)
+    if configured is None:
+        return ()
+    if not all(isinstance(s, str) for s in configured):
+        logger.warning(
+            "vault: config.json vault.azure_scopes must be a list of strings; "
+            "ignoring it (scopes fall back to the azure section's own)"
+        )
+        return ()
+    return tuple(configured)
 
 
 @dataclass
@@ -123,6 +170,20 @@ class VaultConfig:
     verify : bool | str
         TLS verification: ``True`` (system CAs), ``False`` (disable — dev
         only), or a path to a CA bundle. See :func:`_resolve_verify`.
+    auth_path : str
+        Mount path of the jwt/oidc auth method used by ``azuread`` login
+        (``auth/<auth_path>/login``). ``VAULT_AUTH_PATH`` /
+        ``vault.auth_path``, default ``"jwt"``; set to ``"oidc"`` (or
+        wherever the method is mounted) to match the server.
+    oidc_role : str | None
+        Vault role name for ``azuread`` login. ``VAULT_OIDC_ROLE`` /
+        ``vault.oidc_role``. Setting it is what enables the method — it is
+        the role's name in Vault, not a credential.
+    azure_scopes : tuple[str, ...]
+        Entra ID scopes requested for the login JWT. ``VAULT_AZURE_SCOPES``
+        / ``vault.azure_scopes``. Empty (default) falls back to the azure
+        module's configured scopes, then to ``<client_id>/.default`` so the
+        token's audience matches a Vault role bound to the app registration.
     token : str | None
         Vault token for token auth. ``VAULT_TOKEN`` only — never from
         ``config.json``.
@@ -137,6 +198,9 @@ class VaultConfig:
     kv_version: int = DEFAULT_KV_VERSION
     timeout: float = DEFAULT_TIMEOUT
     verify: bool | str = True
+    auth_path: str = DEFAULT_AUTH_PATH
+    oidc_role: str | None = None
+    azure_scopes: tuple[str, ...] = ()
     token: str | None = field(default=None, repr=False)
     role_id: str | None = field(default=None, repr=False)
     secret_id: str | None = field(default=None, repr=False)
@@ -161,6 +225,14 @@ class VaultConfig:
                 "vault", "timeout", (int, float), DEFAULT_TIMEOUT
             ),
             verify=_resolve_verify(),
+            auth_path=(
+                os.environ.get("VAULT_AUTH_PATH")
+                or get_value("vault", "auth_path", DEFAULT_AUTH_PATH)
+            ),
+            oidc_role=(
+                os.environ.get("VAULT_OIDC_ROLE") or get_value("vault", "oidc_role")
+            ),
+            azure_scopes=_resolve_azure_scopes(),
             token=os.environ.get("VAULT_TOKEN"),
             role_id=os.environ.get("VAULT_ROLE_ID"),
             secret_id=os.environ.get("VAULT_SECRET_ID"),
@@ -170,13 +242,38 @@ class VaultConfig:
     def auth_method(self) -> str | None:
         """
         ``"token"`` when a token is set, else ``"approle"`` when both AppRole
-        credentials are set, else ``None`` (no usable credentials).
+        credentials are set, else ``"azuread"`` (Entra ID OIDC) when an
+        :attr:`oidc_role` is set, else ``None`` (no usable credentials).
         """
         if self.token:
             return "token"
         if self.role_id and self.secret_id:
             return "approle"
+        if self.oidc_role:
+            return "azuread"
         return None
+
+
+def _azure_jwt(config: VaultConfig) -> str:
+    """
+    The Entra ID access token presented as the login JWT for the ``azuread``
+    auth method, acquired through the shared :mod:`app_config.azure` client.
+    Scopes resolve as :attr:`VaultConfig.azure_scopes` > the azure module's
+    configured scopes > ``<client_id>/.default`` (the app registration's own
+    audience — what a Vault role with ``bound_audiences=<client_id>`` expects).
+    """
+    from . import azure  # sibling module; msal stays a lazy import inside it
+
+    azure_client = azure.get_azure_client()
+    scopes = config.azure_scopes or azure_client.config.scopes
+    if not scopes and azure_client.config.client_id:
+        scopes = (f"{azure_client.config.client_id}/.default",)
+    try:
+        return azure_client.get_token(scopes)
+    except azure.AzureAuthError as exc:
+        raise VaultError(
+            f"could not acquire an Entra ID token for Vault azuread login: {exc}"
+        ) from exc
 
 
 def _authenticate(client: Any, config: VaultConfig) -> None:
@@ -192,10 +289,23 @@ def _authenticate(client: Any, config: VaultConfig) -> None:
         client.auth.approle.login(
             role_id=config.role_id, secret_id=config.secret_id
         )  # hvac stores the returned token on the client
+    elif method == "azuread":
+        jwt = _azure_jwt(config)
+        try:
+            client.auth.jwt.jwt_login(
+                role=config.oidc_role, jwt=jwt, path=config.auth_path
+            )  # hvac stores the returned Vault token on the client
+        except VaultError:
+            raise
+        except Exception as exc:  # rejected JWT / unknown role / bad mount
+            raise VaultError(
+                f"Vault azuread login failed for role '{config.oidc_role}' "
+                f"at auth path '{config.auth_path}': {exc}"
+            ) from exc
     else:  # unreachable via _build_client, which checks first — defensive
         raise VaultError(
-            "no Vault credentials: set VAULT_TOKEN, or VAULT_ROLE_ID and "
-            "VAULT_SECRET_ID"
+            "no Vault credentials: set VAULT_TOKEN; VAULT_ROLE_ID and "
+            "VAULT_SECRET_ID; or VAULT_OIDC_ROLE for Entra ID OIDC login"
         )
     try:
         authenticated = client.is_authenticated()
@@ -259,8 +369,8 @@ class VaultClient:
             )
         if config.auth_method is None:
             raise VaultError(
-                "no Vault credentials: set VAULT_TOKEN, or VAULT_ROLE_ID and "
-                "VAULT_SECRET_ID"
+                "no Vault credentials: set VAULT_TOKEN; VAULT_ROLE_ID and "
+                "VAULT_SECRET_ID; or VAULT_OIDC_ROLE for Entra ID OIDC login"
             )
         try:
             import hvac

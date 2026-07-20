@@ -155,7 +155,10 @@ app_config/
   vault.py              HashiCorp Vault credential client (get_secret).
                         Non-secret connection settings from VAULT_* env vars >
                         config.json `vault`; token / AppRole creds from the
-                        environment only. hvac imported lazily (extra: vault).
+                        environment only. Auth: token > approle > azuread
+                        (Entra ID OIDC — JWT minted via azure.py, presented to
+                        Vault's jwt auth mount). hvac imported lazily
+                        (extra: vault).
   databricks.py         Databricks workspace settings: host, warehouse/cluster,
                         Unity Catalog catalog+schema (full_table_name()), and
                         the credential. Auth: notebook (on-cluster) > pat
