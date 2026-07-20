@@ -73,7 +73,8 @@ chunker/
                         the LangGraph StateGraph wiring, and opt-in Anthropic
                         prompt caching on the system prompt.
   pipeline_constants.py Prompt templates.
-  _repl.py              print_iterable REPL helper (imported by nothing).
+  _repl.py              print_iterable REPL helper (also used by demo_run.py
+                        to render per-item summary lines into its logs).
 
 llm_client/
   client.py             LLMClient / LLMClientConfig: chat-model construction

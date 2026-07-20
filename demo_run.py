@@ -98,6 +98,7 @@ Run from the repo root so the default ``reference_docs`` path resolves.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import logging
 import shutil
@@ -108,6 +109,7 @@ from pathlib import Path
 
 import app_config
 from chunker import SasLLMPipeline
+from chunker._repl import print_iterable
 from prompt_builder import PromptBuilder
 from validation import LiveValidator
 
@@ -350,6 +352,22 @@ def _format_verdict(validation: dict | None) -> str:
     return f"  [{status} score={validation['score']:.2f}]"
 
 
+def _log_item_summaries(outputs: list[dict]) -> None:
+    """One INFO block listing every item's banner line.
+
+    Rendered through :func:`chunker._repl.print_iterable` so the log carries
+    the same numbered one-per-line form the REPL helper gives when eyeballing
+    a run interactively.
+    """
+    buf = io.StringIO()
+    print_iterable(
+        (_item_header(out) for out in outputs),
+        label=f"pipeline produced {len(outputs)} item response(s)",
+        stream=buf,
+    )
+    logger.info(buf.getvalue().rstrip())
+
+
 def _log_validation_summary(outputs: list[dict]) -> None:
     """Aggregate the per-item inline verdicts and log pass/fail counts.
 
@@ -462,7 +480,7 @@ def _run_local(args: argparse.Namespace) -> int:
     logger.info(f"running pipeline over {len(sas_files)} file(s) with model={model}")
     outputs = pipeline.run_files(sas_files)
 
-    logger.info(f"pipeline produced {len(outputs)} item response(s)")
+    _log_item_summaries(outputs)
     if args.out_dir:
         args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -703,7 +721,7 @@ def _run_sharepoint(args: argparse.Namespace) -> int:
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    logger.info(f"pipeline produced {len(outputs)} item response(s)")
+    _log_item_summaries(outputs)
     for out in outputs:
         print(f"\n{_item_header(out)}")
         print(out["response"])
