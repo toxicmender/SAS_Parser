@@ -20,7 +20,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import pytest
 
 import app_config
-from app_config import azure
+from app_config import azure, databricks
 
 _AZURE_ENV = (
     "AZURE_TENANT_ID",
@@ -32,22 +32,36 @@ _AZURE_ENV = (
     "AZURE_CLIENT_CERTIFICATE_THUMBPRINT",
 )
 
+# get_azure_client falls back to the service principal in the Databricks
+# secret scope, so the Databricks env has to be isolated here too.
+_DATABRICKS_ENV = (
+    "DATABRICKS_HOST",
+    "DATABRICKS_TOKEN",
+    "DATABRICKS_SECRET_SCOPE",
+    "DATABRICKS_RUNTIME_VERSION",
+    "ARM_TENANT_ID",
+    "ARM_CLIENT_ID",
+    "ARM_CLIENT_SECRET",
+)
+
 _SCOPES = ("api://x/.default",)
 
 
 @pytest.fixture(autouse=True)
 def _isolated(monkeypatch, tmp_path):
-    """Empty config file, no Azure env vars, both caches cleared."""
+    """Empty config file, no Azure/Databricks env vars, all caches cleared."""
     cfg = tmp_path / "config.json"
     cfg.write_text("{}", encoding="utf-8")
     monkeypatch.setenv(app_config.ENV_VAR, str(cfg))
-    for var in _AZURE_ENV:
+    for var in _AZURE_ENV + _DATABRICKS_ENV:
         monkeypatch.delenv(var, raising=False)
     app_config.clear_cache()
     azure.clear_cache()
+    databricks.clear_cache()
     yield cfg
     app_config.clear_cache()
     azure.clear_cache()
+    databricks.clear_cache()
 
 
 def _set(cfg_path, mapping) -> None:
@@ -467,3 +481,111 @@ def test_get_azure_client_is_cached():
     assert azure.get_azure_client() is first
     azure.clear_cache()
     assert azure.get_azure_client() is not first
+
+
+# ---------------------------------------------------------------------------
+# Service principal pinned to an explicit identity
+# ---------------------------------------------------------------------------
+
+
+def test_for_principal_pins_the_identity(monkeypatch, _isolated):
+    # The environment supplies an unrelated identity and a sovereign-cloud
+    # authority; only the identity should be overridden.
+    monkeypatch.setenv("AZURE_TENANT_ID", "env-tenant")
+    monkeypatch.setenv("AZURE_CLIENT_ID", "env-client")
+    monkeypatch.setenv("AZURE_AUTHORITY_HOST", "https://login.microsoftonline.us")
+    cfg = azure.AzureAuthConfig.for_principal("t-pin", "c-pin", "s-pin")
+    assert (cfg.tenant_id, cfg.client_id, cfg.client_secret) == (
+        "t-pin",
+        "c-pin",
+        "s-pin",
+    )
+    assert cfg.authority_host == "https://login.microsoftonline.us"
+    assert cfg.auth_flow == azure.FLOW_CLIENT_CREDENTIALS
+
+
+def test_for_principal_clears_certificate_fields(monkeypatch, _isolated):
+    monkeypatch.setenv("AZURE_CLIENT_CERTIFICATE_PATH", "/tmp/x.pem")
+    monkeypatch.setenv("AZURE_CLIENT_CERTIFICATE_THUMBPRINT", "AABB")
+    cfg = azure.AzureAuthConfig.for_principal("t", "c", "s")
+    # The pinned secret must be unambiguously the credential.
+    assert not cfg.has_certificate
+    assert azure._client_credential(cfg) == "s"
+
+
+def test_client_for_principal_is_cached_per_identity(_isolated):
+    first = azure.get_client_for_principal("t-1", "c-1", "s-1")
+    assert azure.get_client_for_principal("t-1", "c-1", "s-1") is first
+    assert azure.get_client_for_principal("t-1", "c-2", "s-1") is not first
+    azure.clear_cache()
+    assert azure.get_client_for_principal("t-1", "c-1", "s-1") is not first
+
+
+# ---------------------------------------------------------------------------
+# Service principal sourced from Databricks secrets
+# ---------------------------------------------------------------------------
+
+
+def _databricks_secret_scope(monkeypatch, principal=("kv-t", "kv-c", "kv-s")) -> None:
+    """A workspace whose secret scope holds the service principal."""
+    monkeypatch.setenv("DATABRICKS_HOST", "https://adb-1.azuredatabricks.net")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-boot")
+    monkeypatch.setenv("DATABRICKS_SECRET_SCOPE", "kv")
+    tenant, client, secret = principal
+    values = {
+        databricks.SECRET_KEY_TENANT_ID: tenant,
+        databricks.SECRET_KEY_CLIENT_ID: client,
+        databricks.SECRET_KEY_CLIENT_SECRET: secret,
+    }
+    monkeypatch.setattr(
+        databricks,
+        "read_workspace_secrets",
+        lambda scope, keys, *, config=None: {key: values[key] for key in keys},
+    )
+
+
+def test_service_principal_read_from_databricks(monkeypatch, _isolated):
+    _databricks_secret_scope(monkeypatch)
+    principal = azure.databricks_service_principal()
+    assert (principal.tenant_id, principal.client_id) == ("kv-t", "kv-c")
+    assert principal.client_secret == "kv-s"
+
+
+def test_databricks_client_is_pinned_to_that_principal(monkeypatch, _isolated):
+    _databricks_secret_scope(monkeypatch)
+    client = azure.get_databricks_client()
+    assert (client.config.tenant_id, client.config.client_id) == ("kv-t", "kv-c")
+    assert client.config.auth_flow == azure.FLOW_CLIENT_CREDENTIALS
+
+
+def test_shared_client_falls_back_to_databricks_secrets(monkeypatch, _isolated):
+    # No AZURE_* identity at all, so the Databricks-stored principal is the
+    # only one available — this is the Vault-login path.
+    _databricks_secret_scope(monkeypatch)
+    client = azure.get_azure_client()
+    assert client.config.client_id == "kv-c"
+    # And it is the same instance the pinned accessor hands out.
+    assert client is azure.get_databricks_client()
+
+
+def test_azure_env_identity_beats_the_databricks_scope(monkeypatch, _isolated):
+    _databricks_secret_scope(monkeypatch)
+    monkeypatch.setenv("AZURE_TENANT_ID", "env-tenant")
+    monkeypatch.setenv("AZURE_CLIENT_ID", "env-client")
+    monkeypatch.setenv("AZURE_CLIENT_SECRET", "env-secret")
+    assert azure.get_azure_client().config.client_id == "env-client"
+
+
+def test_no_scope_leaves_the_environment_config_alone(_isolated):
+    # Nothing configured anywhere: the plain env config stands, and its own
+    # "no identity" error is what a caller should see.
+    assert azure.get_azure_client().config.client_id is None
+
+
+def test_unreadable_scope_surfaces_as_an_azure_error(monkeypatch, _isolated):
+    monkeypatch.setenv("DATABRICKS_SECRET_SCOPE", "kv")
+    # No workspace credential to read the scope with.
+    with pytest.raises(
+        azure.AzureAuthError, match="could not read the Entra ID service principal"
+    ):
+        azure.get_azure_client()

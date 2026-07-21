@@ -66,11 +66,14 @@ from __future__ import annotations
 import logging
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import get_typed_value, get_value
+
+if TYPE_CHECKING:  # real types without a module-scope import cycle
+    from .databricks import AzureServicePrincipal
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +226,31 @@ class AzureAuthConfig:
                 os.environ.get("AZURE_CLIENT_CERTIFICATE_THUMBPRINT")
                 or get_value("azure", "certificate_thumbprint")
             ),
+        )
+
+    @classmethod
+    def for_principal(
+        cls, tenant_id: str, client_id: str, client_secret: str
+    ) -> "AzureAuthConfig":
+        """
+        :meth:`from_env` with the identity replaced by an explicit service
+        principal.
+
+        The environment still supplies the authority host (so sovereign clouds
+        keep working), the default scopes, and the timeout; only the identity
+        is pinned. The certificate fields are cleared so *client_secret* is
+        unambiguously the credential, and the flow is pinned to
+        ``client_credentials`` — a service principal never logs in
+        interactively.
+        """
+        return replace(
+            cls.from_env(),
+            tenant_id=tenant_id,
+            client_id=client_id,
+            client_secret=client_secret,
+            certificate_path=None,
+            certificate_thumbprint=None,
+            flow=FLOW_CLIENT_CREDENTIALS,
         )
 
     @property
@@ -450,12 +478,113 @@ class AzureAuthClient:
 # cache and app_config.vault's client cache.
 _client_cache: AzureAuthClient | None = None
 
+# One client per pinned service principal, keyed by (tenant_id, client_id), so
+# repeated logins for the same identity reuse a single MSAL token cache.
+_principal_clients: dict[tuple[str, str], AzureAuthClient] = {}
+
+
+def get_client_for_principal(
+    tenant_id: str, client_id: str, client_secret: str
+) -> AzureAuthClient:
+    """
+    The process-wide :class:`AzureAuthClient` for one explicit service
+    principal, built via :meth:`AzureAuthConfig.for_principal`.
+
+    Cached on ``(tenant_id, client_id)``: callers that resolve the same
+    identity from different places share one token cache rather than
+    re-logging in. :func:`clear_cache` drops these too.
+    """
+    key = (tenant_id, client_id)
+    client = _principal_clients.get(key)
+    if client is None:
+        client = AzureAuthClient(
+            AzureAuthConfig.for_principal(tenant_id, client_id, client_secret)
+        )
+        _principal_clients[key] = client
+    return client
+
+
+def databricks_service_principal(
+    secret_scope: str | None = None,
+) -> "AzureServicePrincipal":
+    """
+    The Entra ID service principal stored in a Databricks secret scope, as an
+    :class:`~app_config.databricks.AzureServicePrincipal`.
+
+    Delegates to :meth:`app_config.databricks.DatabricksConfig.service_principal`
+    — that module owns the scope read (and the workspace credential it needs);
+    this one owns what to do with the result. *secret_scope* overrides the
+    configured ``DATABRICKS_SECRET_SCOPE`` for this lookup.
+
+    Raises
+    ------
+    AzureAuthError
+        The principal could not be resolved (no scope configured, no workspace
+        credential to read it with, or the keys are absent).
+    """
+    # Imported here, not at module scope: databricks imports *this* module for
+    # its own token minting, and only the lazy import keeps that from cycling.
+    from . import databricks
+
+    config = databricks.get_databricks_config()
+    if secret_scope is not None and secret_scope != config.secret_scope:
+        config = replace(config, secret_scope=secret_scope)
+    try:
+        return config.service_principal()
+    except databricks.DatabricksError as exc:
+        raise AzureAuthError(
+            f"could not read the Entra ID service principal from Databricks: {exc}"
+        ) from exc
+
+
+def get_databricks_client(secret_scope: str | None = None) -> AzureAuthClient:
+    """
+    An :class:`AzureAuthClient` for the service principal in the Databricks
+    secret scope — the msal login whose JWT authenticates onward services
+    (Vault's ``jwt`` auth method, in this package).
+    """
+    principal = databricks_service_principal(secret_scope)
+    return get_client_for_principal(
+        principal.tenant_id, principal.client_id, principal.client_secret
+    )
+
+
+def _databricks_fallback_client() -> AzureAuthClient | None:
+    """
+    A client for the Databricks-stored principal when one is configured, else
+    ``None`` so :func:`get_azure_client` falls through to the plain
+    environment config (and its own "no identity" error).
+    """
+    from . import databricks
+
+    if not databricks.get_databricks_config().secret_scope:
+        return None
+    logger.info(
+        "get_azure_client: no AZURE_* identity configured; falling back to the "
+        "service principal in the Databricks secret scope"
+    )
+    return get_databricks_client()
+
 
 def get_azure_client() -> AzureAuthClient:
-    """The process-wide :class:`AzureAuthClient` (built from the environment)."""
+    """
+    The process-wide :class:`AzureAuthClient`.
+
+    Built from the environment (:meth:`AzureAuthConfig.from_env`) when that
+    yields a usable identity. When it does not but a Databricks secret scope is
+    configured, the service principal is read from there instead — the lookup
+    lives here rather than in ``from_env`` so that resolving configuration
+    stays free of I/O.
+    """
     global _client_cache
     if _client_cache is None:
-        _client_cache = AzureAuthClient()
+        config = AzureAuthConfig.from_env()
+        if config.auth_flow is None:
+            fallback = _databricks_fallback_client()
+            if fallback is not None:
+                _client_cache = fallback
+                return _client_cache
+        _client_cache = AzureAuthClient(config)
     return _client_cache
 
 
@@ -465,6 +594,7 @@ def get_token(scopes: tuple[str, ...] | list[str] | None = None) -> str:
 
 
 def clear_cache() -> None:
-    """Drop the cached client and its tokens so the next access re-logs in."""
+    """Drop the cached clients and their tokens so the next access re-logs in."""
     global _client_cache
     _client_cache = None
+    _principal_clients.clear()

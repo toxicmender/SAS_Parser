@@ -89,6 +89,19 @@ DEFAULT_TIMEOUT = 30.0
 DEFAULT_AUTH_PATH = "jwt"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
+# Path of the AI Gateway credential *relative to the KV mount*: with the
+# default mount ("secret") and KV v2, this is the API's
+# <vault_addr>/v1/secret/data/appsvc/ai_gateway.
+AI_GATEWAY_PATH = "appsvc/ai_gateway"
+
+# Field names the gateway token is commonly filed under, tried in order when
+# no explicit key is given. Override with vault.ai_gateway_key when the secret
+# uses something else.
+_AI_GATEWAY_TOKEN_KEYS = ("token", "api_key", "apikey", "ai_gateway_token", "value")
+
+# Field names carrying the gateway's own endpoint, if the secret ships one.
+_AI_GATEWAY_URL_KEYS = ("base_url", "endpoint", "url")
+
 
 class VaultError(RuntimeError):
     """Vault is misconfigured, unreachable, unauthenticated, or the secret is absent.
@@ -462,6 +475,84 @@ def get_secret(
 ) -> Any:
     """Convenience read via the shared :func:`get_vault_client`."""
     return get_vault_client().get_secret(path, key, mount_point=mount_point)
+
+
+def get_ai_gateway_secret(path: str | None = None) -> dict[str, Any]:
+    """
+    The whole AI Gateway secret — by default the one at
+    :data:`AI_GATEWAY_PATH` (``<vault_addr>/v1/secret/data/appsvc/ai_gateway``
+    with the default mount and KV v2).
+
+    Read through the shared :func:`get_vault_client`, so the Vault login
+    happens once per process. With ``azuread`` auth that login presents an
+    Entra ID JWT — which, when no ``AZURE_*`` identity is configured, comes
+    from the service principal in the Databricks secret scope. See
+    :func:`app_config.azure.get_azure_client`.
+
+    Raises
+    ------
+    VaultError
+        Vault is unreachable or unauthenticated, or the secret is absent.
+    """
+    return get_secret(path or AI_GATEWAY_PATH)
+
+
+def ai_gateway_token(
+    secret: dict[str, Any] | None = None, *, key: str | None = None
+) -> str:
+    """
+    The bearer token out of the AI Gateway secret, for
+    :class:`llm_client.LLMClientConfig`.
+
+    Parameters
+    ----------
+    secret : dict[str, Any] | None
+        An already-read secret. ``None`` (default) reads it via
+        :func:`get_ai_gateway_secret`.
+    key : str | None
+        The field holding the token. ``None`` (default) uses
+        ``vault.ai_gateway_key`` from ``config.json``, else the first of
+        :data:`_AI_GATEWAY_TOKEN_KEYS` that is present — so a secret filed
+        under ``token`` or ``api_key`` needs no configuration at all.
+
+    Raises
+    ------
+    VaultError
+        The secret has no recognisable token field, or an explicitly named
+        *key* is absent. The message lists the field names that *are* there,
+        which is what you need to pick the right one.
+    """
+    data = get_ai_gateway_secret() if secret is None else secret
+    wanted = key or get_value("vault", "ai_gateway_key")
+    if wanted:
+        try:
+            return data[wanted]
+        except KeyError:
+            raise VaultError(
+                f"key '{wanted}' not found in the Vault AI Gateway secret; "
+                f"it has {sorted(data)}"
+            ) from None
+    for candidate in _AI_GATEWAY_TOKEN_KEYS:
+        if data.get(candidate):
+            return data[candidate]
+    raise VaultError(
+        f"no AI Gateway token found in the Vault secret: none of "
+        f"{list(_AI_GATEWAY_TOKEN_KEYS)} is set, and it has {sorted(data)}. "
+        f"Set vault.ai_gateway_key in config.json to name the right field"
+    )
+
+
+def ai_gateway_base_url(secret: dict[str, Any] | None = None) -> str | None:
+    """
+    The gateway endpoint carried alongside the token, if the secret ships one
+    (``base_url`` / ``endpoint`` / ``url``), else ``None`` so the configured
+    ``llm_client.base_url`` stands.
+    """
+    data = get_ai_gateway_secret() if secret is None else secret
+    for candidate in _AI_GATEWAY_URL_KEYS:
+        if data.get(candidate):
+            return data[candidate]
+    return None
 
 
 def clear_cache() -> None:

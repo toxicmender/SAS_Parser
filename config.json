@@ -43,16 +43,20 @@
     "table": null,
     "path": null
   },
-  "_vault_comment": "Non-secret Vault connection settings only. Secrets (VAULT_TOKEN, VAULT_ROLE_ID, VAULT_SECRET_ID) come from the environment, never this file. address/namespace also read from VAULT_ADDR/VAULT_NAMESPACE, which win over these.",
+  "_vault_comment": "Non-secret Vault connection settings only. Secrets (VAULT_TOKEN, VAULT_ROLE_ID, VAULT_SECRET_ID) come from the environment, never this file. address/namespace/auth_path/oidc_role/azure_scopes also read from VAULT_ADDR/VAULT_NAMESPACE/VAULT_AUTH_PATH/VAULT_OIDC_ROLE/VAULT_AZURE_SCOPES, which win over these. Setting oidc_role enables 'azuread' login: an Entra ID JWT (see 'azure' and databricks.secret_scope) is presented to the jwt auth method at auth/<auth_path>/login. ai_gateway_key names the field holding the token in the appsvc/ai_gateway secret; null tries token/api_key/apikey/ai_gateway_token/value in order.",
   "vault": {
     "address": null,
     "namespace": null,
     "mount_point": null,
     "kv_version": null,
     "timeout": null,
-    "verify": null
+    "verify": null,
+    "auth_path": null,
+    "oidc_role": null,
+    "azure_scopes": null,
+    "ai_gateway_key": null
   },
-  "_databricks_comment": "Non-secret Databricks workspace settings only. The token (DATABRICKS_TOKEN) comes from the environment, never this file; on a cluster no credential is needed, and off-cluster an Entra ID service principal (see 'azure') is preferred over a PAT. Every key here is also read from its standard DATABRICKS_* env var, which wins over this file.",
+  "_databricks_comment": "Non-secret Databricks workspace settings only. The token (DATABRICKS_TOKEN) and the service-principal secret (ARM_CLIENT_SECRET) come from the environment, never this file; on a cluster no credential is needed, and off-cluster an Entra ID service principal is preferred over a PAT. Every key here is also read from its standard env var, which wins over this file: DATABRICKS_* for the workspace ones, ARM_TENANT_ID/ARM_CLIENT_ID for the service principal (the names Databricks documents), DATABRICKS_AZURE_RESOURCE_ID for azure_workspace_resource_id, DATABRICKS_SECRET_SCOPE for secret_scope. Set azure_workspace_resource_id only when the service principal is NOT assigned to the workspace. secret_scope names a Databricks secret scope holding the service principal under sp-hsv-tenantid/sp-hsv-appid/sp-hsv-secret; reading it needs a credential of its own (a cluster runtime or a PAT).",
   "databricks": {
     "host": null,
     "http_path": null,
@@ -60,7 +64,11 @@
     "cluster_id": null,
     "catalog": null,
     "schema": null,
-    "timeout": null
+    "timeout": null,
+    "azure_tenant_id": null,
+    "azure_client_id": null,
+    "azure_workspace_resource_id": null,
+    "secret_scope": null
   },
   "_azure_comment": "Non-secret Microsoft Entra ID (Azure AD) settings only. The client secret (AZURE_CLIENT_SECRET) comes from the environment, never this file. tenant_id/client_id/authority_host/scopes/certificate_* also read from AZURE_TENANT_ID/AZURE_CLIENT_ID/AZURE_AUTHORITY_HOST/AZURE_SCOPES/AZURE_CLIENT_CERTIFICATE_PATH/AZURE_CLIENT_CERTIFICATE_THUMBPRINT, which win over these. flow: 'client_credentials' (service principal) or 'device_code' (interactive user login); null infers it from the credentials present.",
   "azure": {

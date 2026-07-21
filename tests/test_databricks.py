@@ -32,6 +32,13 @@ _DATABRICKS_ENV = (
     "DATABRICKS_CATALOG",
     "DATABRICKS_SCHEMA",
     "DATABRICKS_RUNTIME_VERSION",
+    "DATABRICKS_AZURE_RESOURCE_ID",
+    "DATABRICKS_SECRET_SCOPE",
+    # Databricks' own names for the Entra service principal; distinct from the
+    # AZURE_* identity that app_config.azure resolves.
+    "ARM_TENANT_ID",
+    "ARM_CLIENT_ID",
+    "ARM_CLIENT_SECRET",
 )
 
 _AZURE_ENV = (
@@ -67,10 +74,64 @@ def _set(cfg_path, mapping) -> None:
 
 
 def _service_principal(monkeypatch) -> None:
-    """The env of a workspace reached with an Entra ID service principal."""
+    """The env of a workspace reached with app_config.azure's shared identity."""
     monkeypatch.setenv("AZURE_TENANT_ID", "t-1")
     monkeypatch.setenv("AZURE_CLIENT_ID", "c-1")
     monkeypatch.setenv("AZURE_CLIENT_SECRET", "s-1")
+
+
+def _arm_service_principal(monkeypatch) -> None:
+    """The env of a workspace reached with a Databricks-style Entra SPN."""
+    monkeypatch.setenv("ARM_TENANT_ID", "arm-tenant")
+    monkeypatch.setenv("ARM_CLIENT_ID", "arm-client")
+    monkeypatch.setenv("ARM_CLIENT_SECRET", "arm-secret")
+
+
+class _FakeAzureClient:
+    """Stands in for AzureAuthClient, recording the config it was pinned to."""
+
+    last: "_FakeAzureClient | None" = None
+
+    def __init__(self, config=None, *, app=None):
+        self.config = config
+        self.asked: list = []
+        _FakeAzureClient.last = self
+
+    def get_token(self, scopes=None):
+        self.asked.append(scopes)
+        return f"token-for:{scopes[0]}"
+
+
+def _patched_azure_client(monkeypatch) -> type[_FakeAzureClient]:
+    """Swap AzureAuthClient out; databricks imports it lazily, inside the call."""
+    _FakeAzureClient.last = None
+    monkeypatch.setattr(azure, "AzureAuthClient", _FakeAzureClient)
+    return _FakeAzureClient
+
+
+def _patched_secrets(monkeypatch, values: dict) -> dict:
+    """A WorkspaceClient whose dbutils.secrets serves *values* keyed by (scope, key)."""
+    sdk = pytest.importorskip("databricks.sdk", reason="databricks-sdk is not installed")
+    built: dict = {}
+
+    class _Secrets:
+        @staticmethod
+        def get(scope, key):
+            try:
+                return values[(scope, key)]
+            except KeyError:
+                raise RuntimeError(f"no secret {key} in {scope}") from None
+
+    class _DbUtils:
+        secrets = _Secrets()
+
+    class _FakeWorkspaceClient:
+        def __init__(self, **kwargs):
+            built.update(kwargs)
+            self.dbutils = _DbUtils()
+
+    monkeypatch.setattr(sdk, "WorkspaceClient", _FakeWorkspaceClient)
+    return built
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +306,274 @@ def test_azure_login_failure_surfaces_as_databricks_error(monkeypatch, _isolated
 
 
 # ---------------------------------------------------------------------------
+# Azure service principal: resolution
+# ---------------------------------------------------------------------------
+
+
+def test_arm_env_vars_resolve_the_service_principal(monkeypatch, _isolated):
+    _arm_service_principal(monkeypatch)
+    monkeypatch.setenv("DATABRICKS_AZURE_RESOURCE_ID", "/subscriptions/s/rg/ws")
+    monkeypatch.setenv("DATABRICKS_SECRET_SCOPE", "kv")
+    cfg = databricks.DatabricksConfig.from_env()
+    assert (cfg.azure_tenant_id, cfg.azure_client_id) == ("arm-tenant", "arm-client")
+    assert cfg.azure_client_secret == "arm-secret"
+    assert cfg.azure_resource_id == "/subscriptions/s/rg/ws"
+    assert cfg.secret_scope == "kv"
+    assert cfg.has_service_principal
+
+
+def test_service_principal_falls_back_to_config_json(_isolated):
+    _set(
+        _isolated,
+        {
+            "databricks": {
+                "azure_tenant_id": "cfg-tenant",
+                "azure_client_id": "cfg-client",
+                "azure_workspace_resource_id": "/subscriptions/cfg",
+                "secret_scope": "cfg-scope",
+            }
+        },
+    )
+    cfg = databricks.DatabricksConfig.from_env()
+    assert (cfg.azure_tenant_id, cfg.azure_client_id) == ("cfg-tenant", "cfg-client")
+    assert cfg.azure_resource_id == "/subscriptions/cfg"
+    assert cfg.secret_scope == "cfg-scope"
+    # The secret is never read from config.json, so the principal is incomplete.
+    assert cfg.azure_client_secret is None
+    assert not cfg.has_service_principal
+
+
+def test_client_secret_never_in_repr():
+    cfg = databricks.DatabricksConfig(
+        host="https://adb-1.net",
+        azure_tenant_id="t",
+        azure_client_id="c",
+        azure_client_secret="arm-SECRET",
+    )
+    assert "arm-SECRET" not in repr(cfg)
+
+
+def test_service_principal_from_local_config_reads_no_secrets(_isolated):
+    cfg = databricks.DatabricksConfig(
+        azure_tenant_id="t-arm",
+        azure_client_id="c-arm",
+        azure_client_secret="s-arm",
+        # A scope is set too, but the complete local principal wins outright —
+        # so this must not attempt a workspace call (there is no client here).
+        secret_scope="kv",
+    )
+    principal = cfg.service_principal()
+    assert principal == databricks.AzureServicePrincipal("t-arm", "c-arm", "s-arm")
+
+
+def test_service_principal_read_from_the_secret_scope(monkeypatch, _isolated):
+    built = _patched_secrets(
+        monkeypatch,
+        {
+            ("kv", databricks.SECRET_KEY_TENANT_ID): "kv-tenant",
+            ("kv", databricks.SECRET_KEY_CLIENT_ID): "kv-client",
+            ("kv", databricks.SECRET_KEY_CLIENT_SECRET): "kv-secret",
+        },
+    )
+    cfg = databricks.DatabricksConfig(
+        host="https://adb-1.net", token="dapi-boot", secret_scope="kv"
+    )
+    assert cfg.service_principal() == databricks.AzureServicePrincipal(
+        "kv-tenant", "kv-client", "kv-secret"
+    )
+    # The scope read bootstraps off the PAT, never off the principal it fetches.
+    assert built == {"host": "https://adb-1.net", "token": "dapi-boot"}
+
+
+def test_all_three_keys_share_one_client(monkeypatch, _isolated):
+    clients: list = []
+    sdk = pytest.importorskip("databricks.sdk", reason="databricks-sdk is not installed")
+
+    class _Counting:
+        def __init__(self, **kwargs):
+            clients.append(kwargs)
+            secrets = type("S", (), {"get": staticmethod(lambda scope, key: f"v-{key}")})
+            self.dbutils = type("D", (), {"secrets": secrets()})()
+
+    monkeypatch.setattr(sdk, "WorkspaceClient", _Counting)
+    cfg = databricks.DatabricksConfig(
+        host="https://adb-1.net", token="dapi-boot", secret_scope="kv"
+    )
+    cfg.service_principal()
+    # Building a client authenticates; three keys must not mean three logins.
+    assert len(clients) == 1
+
+
+def test_service_principal_is_cached(monkeypatch, _isolated):
+    calls: list = []
+
+    def _counting_read(scope, keys, *, config=None):
+        calls.append(tuple(keys))
+        return {key: f"{key}-value" for key in keys}
+
+    monkeypatch.setattr(databricks, "read_workspace_secrets", _counting_read)
+    cfg = databricks.DatabricksConfig(
+        host="https://adb-1.net", token="dapi-boot", secret_scope="kv"
+    )
+    first = cfg.service_principal()
+    assert cfg.service_principal() is first
+    assert len(calls) == 1  # resolved once, not once per access
+
+
+def test_secret_scope_read_on_a_cluster_needs_no_pat(monkeypatch, _isolated):
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "15.4")
+    built = _patched_secrets(monkeypatch, {("kv", "sp-hsv-appid"): "kv-client"})
+    cfg = databricks.DatabricksConfig(secret_scope="kv")
+    got = databricks.read_workspace_secret("kv", "sp-hsv-appid", config=cfg)
+    assert got == "kv-client"
+    # The runtime authenticates itself; passing host or token would override it.
+    assert built == {}
+
+
+def test_secret_scope_without_a_bootstrap_credential_raises(_isolated):
+    cfg = databricks.DatabricksConfig(host="https://adb-1.net", secret_scope="kv")
+    with pytest.raises(
+        databricks.DatabricksError, match="does not come from the scope"
+    ):
+        cfg.service_principal()
+
+
+def test_missing_secret_surfaces_as_databricks_error(monkeypatch, _isolated):
+    _patched_secrets(monkeypatch, {})
+    cfg = databricks.DatabricksConfig(
+        host="https://adb-1.net", token="dapi-boot", secret_scope="kv"
+    )
+    with pytest.raises(databricks.DatabricksError, match="could not read secret"):
+        cfg.service_principal()
+
+
+def test_no_principal_anywhere_raises(_isolated):
+    with pytest.raises(
+        databricks.DatabricksError, match="no Azure service principal configured"
+    ):
+        databricks.DatabricksConfig(host="https://adb-1.net").service_principal()
+
+
+# ---------------------------------------------------------------------------
+# Azure service principal: auth_method and tokens
+# ---------------------------------------------------------------------------
+
+
+def test_azure_sp_auth_method(monkeypatch, _isolated):
+    _arm_service_principal(monkeypatch)
+    assert (
+        databricks.DatabricksConfig.from_env().auth_method == databricks.AUTH_AZURE_SP
+    )
+
+
+def test_azure_sp_beats_the_shared_azure_ad_identity(monkeypatch, _isolated):
+    _service_principal(monkeypatch)
+    _arm_service_principal(monkeypatch)
+    assert (
+        databricks.DatabricksConfig.from_env().auth_method == databricks.AUTH_AZURE_SP
+    )
+
+
+def test_pat_beats_azure_sp(monkeypatch, _isolated):
+    _arm_service_principal(monkeypatch)
+    monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-1")
+    assert databricks.DatabricksConfig.from_env().auth_method == databricks.AUTH_PAT
+
+
+def test_incomplete_arm_principal_is_not_azure_sp(monkeypatch, _isolated):
+    # A tenant and client id with no secret cannot log in.
+    monkeypatch.setenv("ARM_TENANT_ID", "arm-tenant")
+    monkeypatch.setenv("ARM_CLIENT_ID", "arm-client")
+    assert databricks.DatabricksConfig.from_env().auth_method is None
+
+
+def test_a_scope_alone_is_not_azure_sp(monkeypatch, _isolated):
+    # Reading the scope needs a credential of its own, so a principal that
+    # exists only there cannot also be what authenticates the read.
+    monkeypatch.setenv("DATABRICKS_SECRET_SCOPE", "kv")
+    assert databricks.DatabricksConfig.from_env().auth_method is None
+
+
+def test_unreachable_scope_falls_back_to_the_shared_identity(monkeypatch, _isolated):
+    # A scope with nothing to authenticate the read of it is not usable, so
+    # the shared AZURE_* identity gets its turn rather than a hard failure.
+    _service_principal(monkeypatch)
+    monkeypatch.setenv("DATABRICKS_SECRET_SCOPE", "kv")
+    monkeypatch.setattr(azure, "get_token", lambda scopes=None: "shared-token")
+    cfg = databricks.DatabricksConfig.from_env()
+    assert cfg.auth_method == databricks.AUTH_AZURE_AD
+    assert cfg.get_token() == "shared-token"
+
+
+def test_azure_sp_token_uses_the_pinned_principal(monkeypatch, _isolated):
+    _arm_service_principal(monkeypatch)
+    _patched_azure_client(monkeypatch)
+    cfg = databricks.DatabricksConfig.from_env()
+    assert cfg.get_token() == f"token-for:{databricks.AZURE_DATABRICKS_SCOPE}"
+    pinned = _FakeAzureClient.last.config
+    # Pinned to this config's principal, not to app_config.azure's AZURE_*.
+    assert (pinned.tenant_id, pinned.client_id) == ("arm-tenant", "arm-client")
+    assert pinned.client_secret == "arm-secret"
+    assert pinned.flow == azure.FLOW_CLIENT_CREDENTIALS
+
+
+def test_azure_sp_login_failure_surfaces_as_databricks_error(monkeypatch, _isolated):
+    _arm_service_principal(monkeypatch)
+
+    class _Failing(_FakeAzureClient):
+        def get_token(self, scopes=None):
+            raise azure.AzureAuthError("bad secret")
+
+    monkeypatch.setattr(azure, "AzureAuthClient", _Failing)
+    cfg = databricks.DatabricksConfig.from_env()
+    with pytest.raises(databricks.DatabricksError, match="could not mint an Entra ID"):
+        cfg.get_token()
+
+
+def test_no_credentials_error_names_the_arm_vars(_isolated):
+    with pytest.raises(databricks.DatabricksError, match="ARM_TENANT_ID"):
+        databricks.DatabricksConfig.from_env().get_token()
+
+
+# ---------------------------------------------------------------------------
+# workspace_headers (the azure_resource_id path)
+# ---------------------------------------------------------------------------
+
+
+def test_no_headers_without_a_resource_id(monkeypatch, _isolated):
+    _arm_service_principal(monkeypatch)
+    assert databricks.DatabricksConfig.from_env().workspace_headers() == {}
+
+
+def test_resource_id_headers_carry_a_management_token(monkeypatch, _isolated):
+    _arm_service_principal(monkeypatch)
+    _patched_azure_client(monkeypatch)
+    cfg = databricks.DatabricksConfig.from_env()
+    cfg.azure_resource_id = "/subscriptions/s/rg/ws"
+    assert cfg.workspace_headers() == {
+        databricks.WORKSPACE_RESOURCE_ID_HEADER: "/subscriptions/s/rg/ws",
+        databricks.SP_MANAGEMENT_TOKEN_HEADER: (
+            f"token-for:{databricks.AZURE_MANAGEMENT_SCOPE}"
+        ),
+    }
+
+
+def test_management_scope_targets_the_arm_resource():
+    # MSAL scopes are "<resource>/.default" and the resource ends in a slash,
+    # so the doubled slash is deliberate — it is the audience Databricks wants.
+    assert databricks.AZURE_MANAGEMENT_SCOPE == (
+        "https://management.core.windows.net//.default"
+    )
+
+
+def test_resource_id_ignored_on_the_pat_path(monkeypatch, _isolated):
+    monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-1")
+    monkeypatch.setenv("DATABRICKS_AZURE_RESOURCE_ID", "/subscriptions/s/rg/ws")
+    # Neither header means anything alongside a PAT.
+    assert databricks.DatabricksConfig.from_env().workspace_headers() == {}
+
+
+# ---------------------------------------------------------------------------
 # sql_http_path
 # ---------------------------------------------------------------------------
 
@@ -403,6 +732,74 @@ def test_workspace_client_defaults_to_the_shared_config(monkeypatch, _isolated):
         "host": "https://adb-shared.azuredatabricks.net",
         "token": "dapi-shared",
     }
+
+
+def test_workspace_client_hands_the_sdk_the_service_principal(monkeypatch, _isolated):
+    _arm_service_principal(monkeypatch)
+    monkeypatch.setenv("DATABRICKS_HOST", "adb-1.azuredatabricks.net")
+    monkeypatch.setenv("DATABRICKS_AZURE_RESOURCE_ID", "/subscriptions/s/rg/ws")
+    built = _patched_sdk(monkeypatch)
+    databricks.get_workspace_client()
+    # No token: the SDK runs the Entra flow itself, so it can refresh the
+    # bearer token and add the management-token header as it goes.
+    assert built == {
+        "host": "https://adb-1.azuredatabricks.net",
+        "azure_tenant_id": "arm-tenant",
+        "azure_client_id": "arm-client",
+        "azure_client_secret": "arm-secret",
+        "azure_workspace_resource_id": "/subscriptions/s/rg/ws",
+    }
+
+
+def test_workspace_client_omits_an_unset_resource_id(monkeypatch, _isolated):
+    _arm_service_principal(monkeypatch)
+    built = _patched_sdk(monkeypatch)
+    databricks.get_workspace_client(
+        databricks.DatabricksConfig(
+            host="https://adb-1.net",
+            azure_tenant_id="arm-tenant",
+            azure_client_id="arm-client",
+            azure_client_secret="arm-secret",
+        )
+    )
+    assert "azure_workspace_resource_id" not in built
+    assert "token" not in built
+
+
+def test_sql_connect_params_carry_the_resource_id_headers(monkeypatch, _isolated):
+    _arm_service_principal(monkeypatch)
+    _patched_azure_client(monkeypatch)
+    cfg = databricks.DatabricksConfig(
+        host="https://adb-1.azuredatabricks.net",
+        warehouse_id="w-1",
+        azure_tenant_id="arm-tenant",
+        azure_client_id="arm-client",
+        azure_client_secret="arm-secret",
+        azure_resource_id="/subscriptions/s/rg/ws",
+    )
+    params = cfg.sql_connect_params()
+    assert params["access_token"] == f"token-for:{databricks.AZURE_DATABRICKS_SCOPE}"
+    # The connector wants (key, value) pairs, not a mapping.
+    assert params["http_headers"] == [
+        (databricks.WORKSPACE_RESOURCE_ID_HEADER, "/subscriptions/s/rg/ws"),
+        (
+            databricks.SP_MANAGEMENT_TOKEN_HEADER,
+            f"token-for:{databricks.AZURE_MANAGEMENT_SCOPE}",
+        ),
+    ]
+
+
+def test_sql_connect_params_omit_headers_without_a_resource_id(monkeypatch, _isolated):
+    _arm_service_principal(monkeypatch)
+    _patched_azure_client(monkeypatch)
+    cfg = databricks.DatabricksConfig(
+        host="https://adb-1.net",
+        warehouse_id="w-1",
+        azure_tenant_id="arm-tenant",
+        azure_client_id="arm-client",
+        azure_client_secret="arm-secret",
+    )
+    assert "http_headers" not in cfg.sql_connect_params()
 
 
 def test_missing_sdk_raises_helpful_error(_isolated):
