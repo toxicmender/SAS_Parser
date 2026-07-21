@@ -401,3 +401,85 @@ def test_get_vault_client_is_cached():
     assert vault.get_vault_client() is first
     vault.clear_cache()
     assert vault.get_vault_client() is not first
+
+
+# ---------------------------------------------------------------------------
+# AI Gateway secret
+# ---------------------------------------------------------------------------
+
+
+def _gateway_client(monkeypatch, data, *, mount="secret", path=None) -> None:
+    """Seed the shared VaultClient with an AI Gateway secret."""
+    store = {(mount, path or vault.AI_GATEWAY_PATH): data}
+    cfg = vault.VaultConfig(address="https://v", token="s.t", mount_point=mount)
+    monkeypatch.setattr(
+        vault, "_client_cache", vault.VaultClient(cfg, client=_FakeClient(store))
+    )
+
+
+def test_ai_gateway_path_is_the_documented_one():
+    # <vault_addr>/v1/secret/data/appsvc/ai_gateway with the default mount and
+    # KV v2, where "secret" is the mount and "data" the KV v2 infix.
+    assert vault.AI_GATEWAY_PATH == "appsvc/ai_gateway"
+    assert vault.DEFAULT_MOUNT_POINT == "secret"
+    assert vault.DEFAULT_KV_VERSION == 2
+
+
+def test_get_ai_gateway_secret_reads_the_default_path(monkeypatch, _isolated):
+    _gateway_client(monkeypatch, {"token": "gw-token", "base_url": "https://gw"})
+    assert vault.get_ai_gateway_secret() == {
+        "token": "gw-token",
+        "base_url": "https://gw",
+    }
+
+
+def test_ai_gateway_token_finds_the_common_keys(monkeypatch, _isolated):
+    _gateway_client(monkeypatch, {"api_key": "gw-token"})
+    assert vault.ai_gateway_token() == "gw-token"
+
+
+def test_ai_gateway_token_prefers_an_explicit_key(monkeypatch, _isolated):
+    _gateway_client(monkeypatch, {"token": "wrong", "gateway_pat": "right"})
+    assert vault.ai_gateway_token(key="gateway_pat") == "right"
+
+
+def test_ai_gateway_key_configurable_in_config_json(monkeypatch, _isolated):
+    _set(_isolated, {"vault": {"ai_gateway_key": "gateway_pat"}})
+    _gateway_client(monkeypatch, {"token": "wrong", "gateway_pat": "right"})
+    assert vault.ai_gateway_token() == "right"
+
+
+def test_ai_gateway_token_error_lists_the_available_keys(monkeypatch, _isolated):
+    _gateway_client(monkeypatch, {"username": "u", "password": "p"})
+    with pytest.raises(vault.VaultError, match=r"\['password', 'username'\]"):
+        vault.ai_gateway_token()
+
+
+def test_ai_gateway_missing_explicit_key_raises(monkeypatch, _isolated):
+    _gateway_client(monkeypatch, {"token": "gw-token"})
+    with pytest.raises(vault.VaultError, match="key 'nope' not found"):
+        vault.ai_gateway_token(key="nope")
+
+
+def test_ai_gateway_base_url_is_optional(monkeypatch, _isolated):
+    _gateway_client(monkeypatch, {"token": "gw-token"})
+    # No endpoint in the secret leaves the configured llm_client.base_url alone.
+    assert vault.ai_gateway_base_url() is None
+
+
+def test_ai_gateway_base_url_from_the_secret(monkeypatch, _isolated):
+    _gateway_client(monkeypatch, {"token": "t", "endpoint": "https://gw.example"})
+    assert vault.ai_gateway_base_url() == "https://gw.example"
+
+
+def test_ai_gateway_reads_are_not_cached(monkeypatch, _isolated):
+    # Rotated secrets must be picked up without a restart, so every call hits
+    # Vault — the client is cached, the read is not.
+    store = {("secret", vault.AI_GATEWAY_PATH): {"token": "first"}}
+    cfg = vault.VaultConfig(address="https://v", token="s.t")
+    monkeypatch.setattr(
+        vault, "_client_cache", vault.VaultClient(cfg, client=_FakeClient(store))
+    )
+    assert vault.ai_gateway_token() == "first"
+    store[("secret", vault.AI_GATEWAY_PATH)] = {"token": "rotated"}
+    assert vault.ai_gateway_token() == "rotated"

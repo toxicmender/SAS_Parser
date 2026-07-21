@@ -180,6 +180,58 @@ class LLMClientConfig(BaseModel):
     )
     kwargs: dict[str, Any] | None = None
 
+    @classmethod
+    def from_ai_gateway(cls, **overrides: Any) -> "LLMClientConfig":
+        """
+        A config whose :attr:`api_key` is the AI Gateway token fetched from
+        Vault at :data:`app_config.vault.AI_GATEWAY_PATH`.
+
+        Completes the credential chain: the Entra ID service principal (from
+        the Databricks secret scope, or ``AZURE_*``) mints a JWT via ``msal``,
+        that JWT logs in to Vault's ``jwt`` auth method, and the secret it
+        unlocks is the gateway token set here. Nothing long-lived is stored on
+        disk and no key is read from ``config.json``.
+
+        If the secret also carries an endpoint (``base_url`` / ``endpoint`` /
+        ``url``), it is used as :attr:`base_url`; otherwise the configured
+        ``llm_client.base_url`` stands. Every other knob resolves exactly as it
+        does for ``LLMClientConfig()``.
+
+        Parameters
+        ----------
+        **overrides
+            Ordinary constructor arguments, applied last — so an explicit
+            ``base_url=`` or ``api_key=`` beats what Vault returned, keeping
+            the repo-wide "explicit argument wins" rule intact.
+
+        Raises
+        ------
+        app_config.vault.VaultError
+            Vault is unreachable or unauthenticated, or the secret is missing
+            a usable token field.
+
+        Notes
+        -----
+        This is the one construction path that performs I/O, which is why it
+        is an explicit classmethod rather than a default: ``LLMClientConfig()``
+        must stay free of network calls.
+        """
+        # Imported here so importing llm_client never pulls in hvac/msal.
+        from app_config import vault
+
+        secret = vault.get_ai_gateway_secret()
+        values: dict[str, Any] = {"api_key": SecretStr(vault.ai_gateway_token(secret))}
+        base_url = vault.ai_gateway_base_url(secret)
+        if base_url is not None:
+            values["base_url"] = base_url
+        values.update(overrides)
+        logger.info(
+            f"LLMClientConfig.from_ai_gateway: got the gateway token from Vault "
+            f"(base_url={values.get('base_url')}, "
+            f"overrides={sorted(overrides) or None})"
+        )
+        return cls(**values)
+
 
 # Server-side statuses worth retrying: throttling (429), plain server
 # errors (500/502/503/504), and Anthropic's "overloaded" (529).

@@ -139,6 +139,80 @@ def test_endpoint_overrides_forwarded(monkeypatch):
     assert captured["model_kwargs"] == {"top_k": 40}
 
 
+# ---------------------------------------------------------------------------
+# from_ai_gateway — the Vault-backed credential path
+# ---------------------------------------------------------------------------
+
+
+def _fake_gateway_secret(monkeypatch, data):
+    """Stub app_config.vault's AI Gateway read; llm_client imports it lazily."""
+    from app_config import vault
+
+    monkeypatch.setattr(vault, "get_ai_gateway_secret", lambda path=None: data)
+    return data
+
+
+def test_from_ai_gateway_sets_the_api_key(monkeypatch):
+    _fake_gateway_secret(monkeypatch, {"token": "gw-token"})
+    config = LLMClientConfig.from_ai_gateway(model="some-model")
+    assert config.api_key is not None
+    assert config.api_key.get_secret_value() == "gw-token"
+
+
+def test_from_ai_gateway_token_never_in_repr(monkeypatch):
+    _fake_gateway_secret(monkeypatch, {"token": "gw-SECRET"})
+    assert "gw-SECRET" not in repr(LLMClientConfig.from_ai_gateway())
+
+
+def test_from_ai_gateway_takes_base_url_from_the_secret(monkeypatch):
+    _fake_gateway_secret(
+        monkeypatch, {"token": "gw-token", "base_url": "https://gw.example/v1"}
+    )
+    assert LLMClientConfig.from_ai_gateway().base_url == "https://gw.example/v1"
+
+
+def test_from_ai_gateway_overrides_win(monkeypatch):
+    _fake_gateway_secret(
+        monkeypatch, {"token": "gw-token", "base_url": "https://gw.example/v1"}
+    )
+    config = LLMClientConfig.from_ai_gateway(
+        base_url="https://explicit/v1",
+        api_key="sk-explicit",  # pyright: ignore[reportArgumentType]
+    )
+    # The repo-wide rule: an explicit argument beats what Vault returned.
+    assert config.base_url == "https://explicit/v1"
+    assert config.api_key is not None
+    assert config.api_key.get_secret_value() == "sk-explicit"
+
+
+def test_from_ai_gateway_leaves_other_knobs_at_their_defaults(monkeypatch):
+    _fake_gateway_secret(monkeypatch, {"token": "gw-token"})
+    assert LLMClientConfig.from_ai_gateway().max_retries == LLMClientConfig().max_retries
+
+
+def test_from_ai_gateway_token_reaches_the_model(monkeypatch):
+    captured = _capture_init(monkeypatch)
+    _fake_gateway_secret(
+        monkeypatch, {"token": "gw-token", "endpoint": "https://gw.example/v1"}
+    )
+    LLMClient(LLMClientConfig.from_ai_gateway(model="some-model"))
+
+    assert captured["api_key"] == "gw-token"
+    assert captured["base_url"] == "https://gw.example/v1"
+
+
+def test_plain_config_does_no_vault_io(monkeypatch):
+    # LLMClientConfig() must stay free of network calls; only the explicit
+    # classmethod touches Vault.
+    from app_config import vault
+
+    def _boom(path=None):
+        raise AssertionError("LLMClientConfig() must not read Vault")
+
+    monkeypatch.setattr(vault, "get_ai_gateway_secret", _boom)
+    assert LLMClientConfig(model="some-model").api_key is None
+
+
 def test_cert_file_exported_as_ssl_cert_file(monkeypatch, tmp_path):
     _capture_init(monkeypatch)
     monkeypatch.delenv("SSL_CERT_FILE", raising=False)
