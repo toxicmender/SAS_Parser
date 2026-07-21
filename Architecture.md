@@ -18,6 +18,11 @@ manuals, target-platform guides) into retrieval-ready instruction chunks and,
 when passed to the pipeline, injects per-item guidance relevant to each work
 item's constructs — prompted to the LLM but never persisted (see invariant 5).
 
+A fifth, **complexity**, scores chunks and batches for migration effort on two
+axes — a LOW/MEDIUM/HIGH data-complexity tier and a SAS → Spark feature-parity
+rating — for triage and estimation. It reads the chunker's output and is
+deliberately not wired into the pipeline.
+
 ```
                  +----------------------+
   SAS source(s) ─▶ SasSemanticChunker   │──▶ SasChunkResult (per file)
@@ -195,6 +200,31 @@ validation/
                         ...] [--track]; exit code gates CI.
   cases/                Sample cases. Like tests/, the package does not ship
                         in the wheel.
+
+complexity/
+  models.py             Pydantic models: ComplexityTier (LOW/MEDIUM/HIGH) and
+                        SparkParity (DIRECT..MANUAL) — ordered scales with
+                        max_tier() / worst_parity() helpers — ComplexitySignal,
+                        ChunkComplexity, BatchComplexity,
+                        CorpusComplexityReport (computed tier_counts /
+                        overall_tier / overall_difficulty; to_markdown()).
+  rules.py              The signal catalogue: construct -> (category, tier,
+                        parity, weight), keyed by PROC, component object,
+                        function, CALL routine, global statement, chunk kind,
+                        metadata flag, and detector name. Pure data; the single
+                        place to retune the analysis. An allowlist: an
+                        unlisted construct contributes no signal at all.
+  detectors.py          Regex scans for what SasChunkMetadata does not extract
+                        — ARRAY, DO loops, MERGE/UPDATE/MODIFY, RETAIN,
+                        FIRST./LAST., FILENAME access methods (SFTP/FTP/EMAIL/
+                        URL/PIPE/SOCKET), INFILE/FILE, LINK, DATA step GOTO.
+                        Runs on chunker.scanner._sanitise output, so comments
+                        and string literals never fire a signal; negative
+                        lookbehinds keep macro %DO out of the DATA step forms.
+  analyzer.py           ComplexityAnalyzer: aggregation only, owns no tier of
+                        its own. Tier = max signal tier (presence-based),
+                        difficulty = worst signal parity, score = sum of
+                        distinct construct weights (ranks within a tier only).
 ```
 
 Import direction is strictly downward: `keywords` and `models` import
@@ -214,7 +244,12 @@ credential submodules — `vault`, `azure`, `databricks` — import only the
 third-party client to a lazy import inside the call that needs it, so the
 package stays dependency-free to import. `validation` sits *above* the whole
 stack, beside the CLI entry points: it drives `chunker.pipeline` and may
-import anything, and nothing imports it back.
+import anything, and nothing imports it back. `complexity` sits above
+`chunker` on the same footing — it reads `chunker.models` (plus
+`chunker.scanner._sanitise`, deliberately, rather than re-implementing SAS
+comment and quote rules) and `app_config`, and nothing imports it back. It is
+never wired into the pipeline: scoring a corpus for complexity must not change
+what the LLM is asked to translate.
 
 ## Chunking model
 

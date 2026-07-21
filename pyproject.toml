@@ -38,8 +38,17 @@ where = ["."]
 # chunker/pipeline.py imports memory.short_mem, llm_client, and prompt_builder,
 # so all four packages must ship — a wheel with chunker alone breaks
 # `from chunker import SasLLMPipeline`. app_config is the dependency-free
-# config loader they all read defaults through.
-include = ["chunker*", "memory*", "llm_client*", "prompt_builder*", "app_config*"]
+# config loader they all read defaults through. complexity reads chunker's
+# output and adds no dependencies of its own, so it ships too (unlike
+# validation, whose Spark/MLflow tracking is dev-only tooling).
+include = [
+    "chunker*",
+    "memory*",
+    "llm_client*",
+    "prompt_builder*",
+    "app_config*",
+    "complexity*",
+]
 
 [tool.coverage.run]
 # Bare `--cov` (as CI passes it) measures exactly these packages; without this
@@ -51,6 +60,7 @@ source = [
     "prompt_builder",
     "app_config",
     "validation",
+    "complexity",
 ]
 
 [tool.pytest.ini_options]

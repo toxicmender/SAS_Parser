@@ -28,6 +28,12 @@
     "max_output_tokens": null,
     "prompt_caching": null
   },
+  "_complexity_comment": "Per-tier score weights for complexity analysis. Weight only ranks units within a tier; it can never change a tier, which is presence-based (any HIGH construct makes the unit HIGH). Retune which construct maps to which tier in complexity/rules.py, not here.",
+  "complexity": {
+    "weight_low": null,
+    "weight_medium": null,
+    "weight_high": null
+  },
   "user_instructions": {
     "path": null,
     "dir": null,
