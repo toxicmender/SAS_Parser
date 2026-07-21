@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import pathlib
 import sys
+from typing import Any
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -92,13 +93,14 @@ class _FakeAzureClient:
 
     last: "_FakeAzureClient | None" = None
 
-    def __init__(self, config=None, *, app=None):
+    def __init__(self, config: Any = None, *, app: Any = None):
         self.config = config
         self.asked: list = []
         _FakeAzureClient.last = self
 
     def get_token(self, scopes=None):
         self.asked.append(scopes)
+        assert scopes, "the databricks paths always request an explicit scope"
         return f"token-for:{scopes[0]}"
 
 
@@ -510,7 +512,9 @@ def test_azure_sp_token_uses_the_pinned_principal(monkeypatch, _isolated):
     _patched_azure_client(monkeypatch)
     cfg = databricks.DatabricksConfig.from_env()
     assert cfg.get_token() == f"token-for:{databricks.AZURE_DATABRICKS_SCOPE}"
-    pinned = _FakeAzureClient.last.config
+    built = _FakeAzureClient.last
+    assert built is not None
+    pinned = built.config
     # Pinned to this config's principal, not to app_config.azure's AZURE_*.
     assert (pinned.tenant_id, pinned.client_id) == ("arm-tenant", "arm-client")
     assert pinned.client_secret == "arm-secret"

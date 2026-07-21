@@ -116,7 +116,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from . import get_typed_value, get_value
 
@@ -672,7 +672,9 @@ def _bootstrap_client(config: DatabricksConfig, scope: str):
     WorkspaceClient = _import_workspace_client()
     # On a cluster the SDK picks the runtime's own credentials up, and host
     # and token are both absent by design.
-    params: dict[str, object] = {}
+    # dict[str, Any], not dict[str, object]: this is splatted into the SDK's
+    # typed __init__, and `object` is assignable to none of its parameters.
+    params: dict[str, Any] = {}
     if config.host:
         params["host"] = config.host
     if config.token:
@@ -763,7 +765,8 @@ def get_workspace_client(config: DatabricksConfig | None = None):
     method = config.auth_method
     if method == AUTH_AZURE_SP:
         principal = config.service_principal()
-        credentials: dict[str, object] = {
+        # dict[str, Any] for the same reason as _bootstrap_client's params.
+        credentials: dict[str, Any] = {
             "azure_tenant_id": principal.tenant_id,
             "azure_client_id": principal.client_id,
             "azure_client_secret": principal.client_secret,
