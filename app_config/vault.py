@@ -277,11 +277,14 @@ def _azure_jwt(config: VaultConfig) -> str:
     """
     from . import azure  # sibling module; msal stays a lazy import inside it
 
-    azure_client = azure.get_azure_client()
-    scopes = config.azure_scopes or azure_client.config.scopes
-    if not scopes and azure_client.config.client_id:
-        scopes = (f"{azure_client.config.client_id}/.default",)
+    # Client construction is inside the try too: resolving the identity can
+    # itself fail (e.g. reading the service principal out of a Databricks
+    # secret scope), and a caller should still only have to except VaultError.
     try:
+        azure_client = azure.get_azure_client()
+        scopes = config.azure_scopes or azure_client.config.scopes
+        if not scopes and azure_client.config.client_id:
+            scopes = (f"{azure_client.config.client_id}/.default",)
         return azure_client.get_token(scopes)
     except azure.AzureAuthError as exc:
         raise VaultError(

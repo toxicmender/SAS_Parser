@@ -52,13 +52,16 @@ Usage
     # for `sharepoint`, also the SharePoint extra + Entra ID identity:
     #   uv pip install -e ".[sharepoint]"
     #
-    # API key, either:
-    #   - ANTHROPIC_API_KEY in the environment (default), or
-    #   - fetched from Vault via AppRole app-based auth (--vault-secret);
-    #     needs the `vault` extra and VAULT_ADDR / VAULT_ROLE_ID /
-    #     VAULT_SECRET_ID set (see below).
+    # API key, in order of precedence:
+    #   - --vault-secret PATH: an explicit AppRole read (see below), or
+    #   - the AI Gateway chain (the default whenever Vault is configured):
+    #     an Entra ID service principal -> JWT -> Vault -> appsvc/ai_gateway;
+    #     needs the `vault` extra (see below), or
+    #   - ANTHROPIC_API_KEY in the environment, used when no Vault settings
+    #     are present or --no-gateway-auth is passed.
     python demo_run.py local path/to/sas_dir
     python demo_run.py local path/to/sas_dir --model claude-sonnet-4-5 --debug
+    python demo_run.py local path/to/sas_dir --no-gateway-auth
     python demo_run.py sharepoint --request-id REQ-1234
     python demo_run.py sharepoint --request-id REQ-1234 --vault-secret llm/anthropic
 
@@ -77,11 +80,39 @@ service principal in :mod:`app_config.azure` (``AZURE_TENANT_ID`` /
 list with ``POWERAPPS_LIST_NAME`` (see :mod:`app_config.powerapps` for the
 column-name settings). All of these may also live in ``config.json``.
 
-Vault (app-based auth)
-----------------------
-Passing ``--vault-secret PATH`` retrieves the LLM API key from HashiCorp Vault
-using **AppRole** auth — the app authenticates with a role_id / secret_id pair
-(its own application identity) rather than a personal token. Set:
+AI Gateway credential (the default)
+-----------------------------------
+With Vault configured, the pipeline's API key comes from the AI Gateway secret,
+reached with no long-lived credential on disk::
+
+    Databricks secret scope (sp-hsv-tenantid/appid/secret)
+      └─ msal client_credentials ──► Entra ID JWT
+           └─ Vault jwt_login (VAULT_OIDC_ROLE)
+                └─ secret/data/appsvc/ai_gateway ──► api_key [+ base_url]
+
+The service principal is whichever :func:`app_config.azure.get_azure_client`
+resolves: ``AZURE_*``/``ARM_*`` when set, else the one in the Databricks secret
+scope (``DATABRICKS_SECRET_SCOPE``, read with the cluster runtime's own
+credentials or ``DATABRICKS_TOKEN``). Set:
+
+    VAULT_ADDR=https://vault.example:8200
+    VAULT_OIDC_ROLE=...      # the Vault role, bound to the SP's app id
+
+If the secret carries a ``base_url`` / ``endpoint`` / ``url`` it becomes the
+model's endpoint; otherwise config.json's ``llm_client.base_url`` stands.
+
+This path is taken whenever ``VAULT_ADDR`` and a login method are configured.
+A *broken* Vault then fails the run rather than quietly falling back — using a
+different credential than intended is worse than stopping. With no Vault
+settings at all, the run defers to ``ANTHROPIC_API_KEY``, as does
+``--no-gateway-auth``.
+
+Vault (AppRole, explicit path)
+------------------------------
+Passing ``--vault-secret PATH`` overrides the above and retrieves the API key
+from a named secret using **AppRole** auth — the app authenticates with a
+role_id / secret_id pair (its own application identity) rather than a personal
+token. Set:
 
     VAULT_ADDR=https://vault.example:8200
     VAULT_ROLE_ID=...        # the app's role
@@ -89,7 +120,7 @@ using **AppRole** auth — the app authenticates with a role_id / secret_id pair
 
 then ``--vault-secret llm/anthropic`` reads the ``api_key`` field of the KV
 secret at that path (override the field with ``--vault-key``). Any ambient
-``VAULT_TOKEN`` is ignored so the demo always runs under the AppRole identity.
+``VAULT_TOKEN`` is ignored so this path always runs under the AppRole identity.
 Keep these out of source control — put them in ``.env`` (gitignored).
 
 Run from the repo root so the default ``reference_docs`` path resolves.
@@ -179,20 +210,86 @@ def _fetch_api_key_from_vault(secret_path: str, secret_key: str) -> str:
     return key
 
 
-def _resolve_api_key(args: argparse.Namespace) -> str | None:
-    """The LLM API key from Vault when ``--vault-secret`` is set, else ``None``.
-
-    ``None`` lets the pipeline defer to ``ANTHROPIC_API_KEY`` / the provider env
-    var. Shared by both subcommands.
+def _ai_gateway_configured() -> bool:
     """
-    if not args.vault_secret:
-        return None
-    key = _fetch_api_key_from_vault(args.vault_secret, args.vault_key)
+    True when Vault is set up well enough to try the AI Gateway chain — an
+    address plus some way to log in.
+
+    The check is deliberately about *configuration*, not reachability: a
+    workstation with no Vault settings at all falls back to the provider env
+    var (see :func:`_resolve_llm_credentials`), but a half-configured or
+    broken Vault must fail loudly rather than silently use a different
+    credential than the operator intended.
+    """
+    from app_config.vault import VaultConfig
+
+    config = VaultConfig.from_env()
+    return bool(config.address and config.auth_method)
+
+
+def _fetch_ai_gateway_credentials() -> tuple[str, str | None]:
+    """
+    The AI Gateway token, and its endpoint when the secret carries one, via
+    the Entra ID service-principal chain.
+
+    The service principal (from the Databricks secret scope, or ``ARM_*`` /
+    ``AZURE_*``) mints a JWT with ``msal``; that JWT logs in to Vault's ``jwt``
+    auth method; the session reads ``appsvc/ai_gateway``. Nothing long-lived
+    is stored on disk. Failures exit non-zero with a readable message rather
+    than a traceback.
+    """
+    from app_config.vault import VaultError, ai_gateway_base_url, ai_gateway_token
+    from app_config.vault import get_ai_gateway_secret
+
+    try:
+        secret = get_ai_gateway_secret()
+        return ai_gateway_token(secret), ai_gateway_base_url(secret)
+    except VaultError as exc:
+        raise SystemExit(
+            f"could not fetch the AI Gateway credential from Vault: {exc}\n"
+            f"Pass --no-gateway-auth to fall back to ANTHROPIC_API_KEY, or "
+            f"--vault-secret PATH to read a different secret over AppRole."
+        ) from exc
+
+
+def _resolve_llm_credentials(args: argparse.Namespace) -> tuple[str | None, str | None]:
+    """
+    ``(api_key, base_url)`` for the pipeline, resolved in this order:
+
+    1. ``--vault-secret PATH`` — an explicit AppRole read of a named secret.
+    2. The **AI Gateway chain**, the default whenever Vault is configured:
+       Entra ID service principal -> JWT -> Vault -> ``appsvc/ai_gateway``.
+    3. ``(None, None)``, letting the pipeline defer to ``ANTHROPIC_API_KEY`` /
+       the provider's own environment variable — the local-development path,
+       taken when no Vault settings are present or ``--no-gateway-auth`` is
+       passed.
+
+    Shared by both subcommands. ``base_url`` is ``None`` unless the gateway
+    secret named an endpoint, so an omitted one still defers to config.json's
+    ``llm_client.base_url``.
+    """
+    if args.vault_secret:
+        key = _fetch_api_key_from_vault(args.vault_secret, args.vault_key)
+        logger.info(
+            f"API key from Vault secret '{args.vault_secret}' "
+            f"(field '{args.vault_key}') via AppRole"
+        )
+        return key, None
+    if args.no_gateway_auth:
+        logger.info("--no-gateway-auth: deferring to ANTHROPIC_API_KEY")
+        return None, None
+    if not _ai_gateway_configured():
+        logger.info(
+            "no Vault configuration found (VAULT_ADDR and a login method); "
+            "deferring to ANTHROPIC_API_KEY"
+        )
+        return None, None
+    key, base_url = _fetch_ai_gateway_credentials()
     logger.info(
-        f"API key from Vault secret '{args.vault_secret}' "
-        f"(field '{args.vault_key}') via AppRole"
+        f"API key from the AI Gateway secret in Vault via the Entra ID "
+        f"service-principal chain (base_url={base_url or 'from config.json'})"
     )
-    return key
+    return key, base_url
 
 
 # ---------------------------------------------------------------------------
@@ -220,13 +317,19 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Vault KV path (relative to the mount) holding the LLM API key, "
         "retrieved via AppRole app-based auth (VAULT_ADDR / VAULT_ROLE_ID / "
-        "VAULT_SECRET_ID). When set, its value is used as the API key instead "
-        "of ANTHROPIC_API_KEY.",
+        "VAULT_SECRET_ID). Overrides the default AI Gateway credential.",
     )
     parser.add_argument(
         "--vault-key",
         default="api_key",
         help="Field within the --vault-secret secret to read (default: api_key).",
+    )
+    parser.add_argument(
+        "--no-gateway-auth",
+        action="store_true",
+        help="Skip the default AI Gateway credential chain (Entra ID service "
+        "principal -> JWT -> Vault -> appsvc/ai_gateway) and use "
+        "ANTHROPIC_API_KEY from the environment instead.",
     )
     parser.add_argument(
         "--validation-retries",
@@ -316,17 +419,21 @@ def _build_pipeline(
     *,
     model: str,
     api_key: str | None,
+    base_url: str | None = None,
     validator: LiveValidator | None,
 ) -> SasLLMPipeline:
     """Load the reference corpus once and wire up the pipeline.
 
     In-memory message store (``delta_table=None``) — no Spark/JVM is booted.
+    ``base_url`` is forwarded only when the AI Gateway secret named an
+    endpoint; ``None`` leaves config.json's ``llm_client.base_url`` in charge.
     """
     logger.info(f"building instruction corpus from {args.reference_dir}")
     builder = PromptBuilder.from_reference_dir(str(args.reference_dir))
     return SasLLMPipeline(
         model=model,
         api_key=api_key,
+        base_url=base_url,
         output_language=args.output_language,
         prompt_builder=builder,
         validator=validator,
@@ -471,10 +578,10 @@ def _run_local(args: argparse.Namespace) -> int:
         model = app_config.llm_client_value("model", _DEFAULT_MODEL)
         logger.info(f"model from config.json/default: {model}")
 
-    api_key = _resolve_api_key(args)
+    api_key, base_url = _resolve_llm_credentials(args)
     validator = None if args.no_validate else LiveValidator()
     pipeline = _build_pipeline(
-        args, model=model, api_key=api_key, validator=validator
+        args, model=model, api_key=api_key, base_url=base_url, validator=validator
     )
 
     logger.info(f"running pipeline over {len(sas_files)} file(s) with model={model}")
@@ -697,10 +804,10 @@ def _run_sharepoint(args: argparse.Namespace) -> int:
     for _, rel in entries:
         logger.info(f"  - {rel}")
 
-    api_key = _resolve_api_key(args)
+    api_key, base_url = _resolve_llm_credentials(args)
     validator = LiveValidator() if req.live_validation else None
     pipeline = _build_pipeline(
-        args, model=req.model, api_key=api_key, validator=validator
+        args, model=req.model, api_key=api_key, base_url=base_url, validator=validator
     )
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="sas_parser_sp_"))
