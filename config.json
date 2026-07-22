@@ -28,6 +28,14 @@
     "max_output_tokens": null,
     "prompt_caching": null
   },
+  "_complexity_comment": "Complexity analysis. 'target' names a rule-set profile under complexity/profiles/ ('sparksql', 'pyspark', ...); 'rules_path' points at a profile file of your own and wins over 'target'. The per-tier weights only rank units within a tier; they can never change a tier, which is presence-based (any HIGH construct makes the unit HIGH). Retune which construct maps to which tier by editing a profile JSON, not here.",
+  "complexity": {
+    "target": null,
+    "rules_path": null,
+    "weight_low": null,
+    "weight_medium": null,
+    "weight_high": null
+  },
   "user_instructions": {
     "path": null,
     "dir": null,

@@ -1,0 +1,848 @@
+{
+  "target": "sparksql",
+  "display_name": "Spark SQL",
+  "description": "SAS -> Spark SQL translation complexity. Tier follows the project brief (LOW: simple SQL and macro variables; MEDIUM: hashing, merge, SFTP, mail; HIGH: arrays, DO loops, %MACRO definitions). Parity ratings are grounded in reference_docs/ and the Spark SQL built-in function reference.",
+  "weights": {
+    "LOW": 1.0,
+    "MEDIUM": 2.5,
+    "HIGH": 5.0
+  },
+  "constructs": {
+    "proc": {
+      "append": {
+        "category": "simple-sql",
+        "tier": "LOW",
+        "parity": "SUPPORTED",
+        "note": "PROC APPEND maps to union"
+      },
+      "contents": {
+        "category": "metadata",
+        "tier": "LOW",
+        "parity": "SUPPORTED",
+        "note": "schema inspection"
+      },
+      "datasets": {
+        "category": "metadata",
+        "tier": "LOW",
+        "parity": "SUPPORTED",
+        "note": "catalog maintenance"
+      },
+      "ds2": {
+        "category": "procedural",
+        "tier": "HIGH",
+        "parity": "MANUAL",
+        "note": "PROC DS2 program"
+      },
+      "export": {
+        "category": "io",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "external file export"
+      },
+      "fcmp": {
+        "category": "procedural",
+        "tier": "HIGH",
+        "parity": "MANUAL",
+        "note": "PROC FCMP defines custom functions"
+      },
+      "format": {
+        "category": "format",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "user-defined formats need a lookup"
+      },
+      "freq": {
+        "category": "aggregation",
+        "tier": "LOW",
+        "parity": "SUPPORTED",
+        "note": "maps to groupBy.count"
+      },
+      "http": {
+        "category": "io-network",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "PROC HTTP call"
+      },
+      "iml": {
+        "category": "procedural",
+        "tier": "HIGH",
+        "parity": "MANUAL",
+        "note": "PROC IML matrix language"
+      },
+      "import": {
+        "category": "io",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "external file import"
+      },
+      "lua": {
+        "category": "procedural",
+        "tier": "HIGH",
+        "parity": "MANUAL",
+        "note": "PROC LUA program"
+      },
+      "means": {
+        "category": "aggregation",
+        "tier": "LOW",
+        "parity": "SUPPORTED",
+        "note": "maps to groupBy.agg"
+      },
+      "print": {
+        "category": "reporting",
+        "tier": "LOW",
+        "parity": "SUPPORTED",
+        "note": "PROC PRINT maps to show"
+      },
+      "report": {
+        "category": "reporting",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "PROC REPORT layout"
+      },
+      "soap": {
+        "category": "io-network",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "PROC SOAP call"
+      },
+      "sort": {
+        "category": "simple-sql",
+        "tier": "LOW",
+        "parity": "SUPPORTED",
+        "note": "PROC SORT maps to orderBy"
+      },
+      "sql": {
+        "category": "simple-sql",
+        "tier": "LOW",
+        "parity": "DIRECT",
+        "note": "PROC SQL maps to spark.sql"
+      },
+      "summary": {
+        "category": "aggregation",
+        "tier": "LOW",
+        "parity": "SUPPORTED",
+        "note": "maps to groupBy.agg"
+      },
+      "tabulate": {
+        "category": "reporting",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "PROC TABULATE layout"
+      },
+      "transpose": {
+        "category": "reshape",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "PROC TRANSPOSE needs pivot/stack"
+      }
+    },
+    "component_object": {
+      "appender": {
+        "category": "logging",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "SAS logging appender"
+      },
+      "hash": {
+        "category": "hashing",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "hash object lookup — becomes a join"
+      },
+      "hiter": {
+        "category": "hashing",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "hash iterator — becomes an ordered scan"
+      },
+      "javaobj": {
+        "category": "interop",
+        "tier": "HIGH",
+        "parity": "MANUAL",
+        "note": "Java object interop"
+      },
+      "logger": {
+        "category": "logging",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "SAS logging object"
+      }
+    },
+    "function": {
+      "dclose": {
+        "category": "io",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "external file I/O"
+      },
+      "dcreate": {
+        "category": "io",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "external file I/O"
+      },
+      "dif": {
+        "category": "row-state",
+        "tier": "HIGH",
+        "parity": "HARD",
+        "note": "per-call-site queue, not 'the previous row' — a conditional LAG is not lag() over a window"
+      },
+      "dopen": {
+        "category": "io",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "external file I/O"
+      },
+      "dosubl": {
+        "category": "macro-runtime",
+        "tier": "HIGH",
+        "parity": "MANUAL",
+        "note": "resolves macro code at run time"
+      },
+      "dread": {
+        "category": "io",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "external file I/O"
+      },
+      "fappend": {
+        "category": "io",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "external file I/O"
+      },
+      "fclose": {
+        "category": "io",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "external file I/O"
+      },
+      "fcopy": {
+        "category": "io",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "external file I/O"
+      },
+      "fdelete": {
+        "category": "io",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "external file I/O"
+      },
+      "fexist": {
+        "category": "io",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "external file I/O"
+      },
+      "fget": {
+        "category": "io",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "external file I/O"
+      },
+      "fileexist": {
+        "category": "io",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "external file I/O"
+      },
+      "filename": {
+        "category": "io",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "external file I/O"
+      },
+      "fopen": {
+        "category": "io",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "external file I/O"
+      },
+      "fput": {
+        "category": "io",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "external file I/O"
+      },
+      "fread": {
+        "category": "io",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "external file I/O"
+      },
+      "fwrite": {
+        "category": "io",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "external file I/O"
+      },
+      "hashing": {
+        "category": "hashing",
+        "tier": "MEDIUM",
+        "parity": "SUPPORTED",
+        "note": "hashing function — Spark SQL has md5/sha1/sha2/crc32/xxhash64; SAS MD5 returns raw bytes, so a PUT(...,$hex32.) wrapper is usually implied"
+      },
+      "hashing_file": {
+        "category": "hashing",
+        "tier": "MEDIUM",
+        "parity": "SUPPORTED",
+        "note": "hashing function — Spark SQL has md5/sha1/sha2/crc32/xxhash64; SAS MD5 returns raw bytes, so a PUT(...,$hex32.) wrapper is usually implied"
+      },
+      "hashing_hmac": {
+        "category": "hashing",
+        "tier": "MEDIUM",
+        "parity": "SUPPORTED",
+        "note": "hashing function — Spark SQL has md5/sha1/sha2/crc32/xxhash64; SAS MD5 returns raw bytes, so a PUT(...,$hex32.) wrapper is usually implied"
+      },
+      "hashing_hmac_file": {
+        "category": "hashing",
+        "tier": "MEDIUM",
+        "parity": "SUPPORTED",
+        "note": "hashing function — Spark SQL has md5/sha1/sha2/crc32/xxhash64; SAS MD5 returns raw bytes, so a PUT(...,$hex32.) wrapper is usually implied"
+      },
+      "hashing_hmac_init": {
+        "category": "hashing",
+        "tier": "MEDIUM",
+        "parity": "SUPPORTED",
+        "note": "hashing function — Spark SQL has md5/sha1/sha2/crc32/xxhash64; SAS MD5 returns raw bytes, so a PUT(...,$hex32.) wrapper is usually implied"
+      },
+      "hashing_init": {
+        "category": "hashing",
+        "tier": "MEDIUM",
+        "parity": "SUPPORTED",
+        "note": "hashing function — Spark SQL has md5/sha1/sha2/crc32/xxhash64; SAS MD5 returns raw bytes, so a PUT(...,$hex32.) wrapper is usually implied"
+      },
+      "hashing_part": {
+        "category": "hashing",
+        "tier": "MEDIUM",
+        "parity": "SUPPORTED",
+        "note": "hashing function — Spark SQL has md5/sha1/sha2/crc32/xxhash64; SAS MD5 returns raw bytes, so a PUT(...,$hex32.) wrapper is usually implied"
+      },
+      "hashing_term": {
+        "category": "hashing",
+        "tier": "MEDIUM",
+        "parity": "SUPPORTED",
+        "note": "hashing function — Spark SQL has md5/sha1/sha2/crc32/xxhash64; SAS MD5 returns raw bytes, so a PUT(...,$hex32.) wrapper is usually implied"
+      },
+      "holiday": {
+        "category": "date-interval",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "SAS interval semantics differ from Spark date arithmetic"
+      },
+      "holidayck": {
+        "category": "date-interval",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "SAS interval semantics differ from Spark date arithmetic"
+      },
+      "holidaycount": {
+        "category": "date-interval",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "SAS interval semantics differ from Spark date arithmetic"
+      },
+      "holidayname": {
+        "category": "date-interval",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "SAS interval semantics differ from Spark date arithmetic"
+      },
+      "holidaynx": {
+        "category": "date-interval",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "SAS interval semantics differ from Spark date arithmetic"
+      },
+      "holidayny": {
+        "category": "date-interval",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "SAS interval semantics differ from Spark date arithmetic"
+      },
+      "holidaytest": {
+        "category": "date-interval",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "SAS interval semantics differ from Spark date arithmetic"
+      },
+      "inputc": {
+        "category": "format",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "format applied at run time"
+      },
+      "inputn": {
+        "category": "format",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "format applied at run time"
+      },
+      "intcindex": {
+        "category": "date-interval",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "SAS interval semantics differ from Spark date arithmetic"
+      },
+      "intck": {
+        "category": "date-interval",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "SAS interval semantics differ from Spark date arithmetic"
+      },
+      "intcycle": {
+        "category": "date-interval",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "SAS interval semantics differ from Spark date arithmetic"
+      },
+      "intfit": {
+        "category": "date-interval",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "SAS interval semantics differ from Spark date arithmetic"
+      },
+      "intfmt": {
+        "category": "date-interval",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "SAS interval semantics differ from Spark date arithmetic"
+      },
+      "intget": {
+        "category": "date-interval",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "SAS interval semantics differ from Spark date arithmetic"
+      },
+      "intindex": {
+        "category": "date-interval",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "SAS interval semantics differ from Spark date arithmetic"
+      },
+      "intnest": {
+        "category": "date-interval",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "SAS interval semantics differ from Spark date arithmetic"
+      },
+      "intnx": {
+        "category": "date-interval",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "SAS interval semantics differ from Spark date arithmetic"
+      },
+      "intseas": {
+        "category": "date-interval",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "SAS interval semantics differ from Spark date arithmetic"
+      },
+      "intshift": {
+        "category": "date-interval",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "SAS interval semantics differ from Spark date arithmetic"
+      },
+      "inttest": {
+        "category": "date-interval",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "SAS interval semantics differ from Spark date arithmetic"
+      },
+      "lag": {
+        "category": "row-state",
+        "tier": "HIGH",
+        "parity": "HARD",
+        "note": "per-call-site queue, not 'the previous row' — a conditional LAG is not lag() over a window"
+      },
+      "md5": {
+        "category": "hashing",
+        "tier": "MEDIUM",
+        "parity": "SUPPORTED",
+        "note": "hashing function — Spark SQL has md5/sha1/sha2/crc32/xxhash64; SAS MD5 returns raw bytes, so a PUT(...,$hex32.) wrapper is usually implied"
+      },
+      "mopen": {
+        "category": "io",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "external file I/O"
+      },
+      "putc": {
+        "category": "format",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "format applied at run time"
+      },
+      "putn": {
+        "category": "format",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "format applied at run time"
+      },
+      "resolve": {
+        "category": "macro-runtime",
+        "tier": "HIGH",
+        "parity": "MANUAL",
+        "note": "resolves macro code at run time"
+      },
+      "sha256": {
+        "category": "hashing",
+        "tier": "MEDIUM",
+        "parity": "SUPPORTED",
+        "note": "hashing function — Spark SQL has md5/sha1/sha2/crc32/xxhash64; SAS MD5 returns raw bytes, so a PUT(...,$hex32.) wrapper is usually implied"
+      },
+      "sha256hex": {
+        "category": "hashing",
+        "tier": "MEDIUM",
+        "parity": "SUPPORTED",
+        "note": "hashing function — Spark SQL has md5/sha1/sha2/crc32/xxhash64; SAS MD5 returns raw bytes, so a PUT(...,$hex32.) wrapper is usually implied"
+      },
+      "sha256hmachex": {
+        "category": "hashing",
+        "tier": "MEDIUM",
+        "parity": "SUPPORTED",
+        "note": "hashing function — Spark SQL has md5/sha1/sha2/crc32/xxhash64; SAS MD5 returns raw bytes, so a PUT(...,$hex32.) wrapper is usually implied"
+      },
+      "symget": {
+        "category": "macro-runtime",
+        "tier": "HIGH",
+        "parity": "MANUAL",
+        "note": "resolves macro code at run time"
+      }
+    },
+    "call_routine": {
+      "execute": {
+        "category": "dynamic-code",
+        "tier": "HIGH",
+        "parity": "MANUAL",
+        "note": "CALL EXECUTE generates code at run time"
+      },
+      "module": {
+        "category": "interop",
+        "tier": "HIGH",
+        "parity": "MANUAL",
+        "note": "external routine call"
+      },
+      "sortc": {
+        "category": "reshape",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "sorts values across columns"
+      },
+      "sortn": {
+        "category": "reshape",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "sorts values across columns"
+      },
+      "symput": {
+        "category": "macro-var",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "creates a macro variable at run time"
+      },
+      "symputx": {
+        "category": "macro-var",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "creates a macro variable at run time"
+      },
+      "system": {
+        "category": "interop",
+        "tier": "HIGH",
+        "parity": "MANUAL",
+        "note": "shells out to the OS"
+      },
+      "tso": {
+        "category": "interop",
+        "tier": "HIGH",
+        "parity": "MANUAL",
+        "note": "shells out to TSO"
+      }
+    },
+    "global_statement": {
+      "filename": {
+        "category": "io",
+        "tier": "LOW",
+        "parity": "SUPPORTED",
+        "note": "file reference"
+      },
+      "footnote": {
+        "category": "reporting",
+        "tier": "LOW",
+        "parity": "SUPPORTED",
+        "note": "report footnote"
+      },
+      "global": {
+        "category": "macro-var",
+        "tier": "LOW",
+        "parity": "DIRECT",
+        "note": "%GLOBAL declaration"
+      },
+      "let": {
+        "category": "macro-var",
+        "tier": "LOW",
+        "parity": "DIRECT",
+        "note": "%LET macro variable"
+      },
+      "libname": {
+        "category": "io",
+        "tier": "LOW",
+        "parity": "SUPPORTED",
+        "note": "library assignment"
+      },
+      "local": {
+        "category": "macro-var",
+        "tier": "LOW",
+        "parity": "DIRECT",
+        "note": "%LOCAL declaration"
+      },
+      "ods": {
+        "category": "reporting",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "ODS output destination"
+      },
+      "put": {
+        "category": "logging",
+        "tier": "LOW",
+        "parity": "SUPPORTED",
+        "note": "%PUT trace"
+      },
+      "title": {
+        "category": "reporting",
+        "tier": "LOW",
+        "parity": "SUPPORTED",
+        "note": "report title"
+      }
+    },
+    "kind": {
+      "INCLUDE": {
+        "category": "io",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "%INCLUDE pulls in external source"
+      },
+      "MACRO_CALL": {
+        "category": "macro-call",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "macro invocation must be resolved"
+      },
+      "MACRO_CONTROL_FLOW": {
+        "category": "macro-control-flow",
+        "tier": "HIGH",
+        "parity": "HARD",
+        "note": "macro-level control flow generates code conditionally"
+      },
+      "MACRO_DEFINITION": {
+        "category": "macro-def",
+        "tier": "HIGH",
+        "parity": "MANUAL",
+        "note": "%MACRO definition — no Spark equivalent"
+      },
+      "UNKNOWN_BLOCK": {
+        "category": "unparsed",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "unclosed block — parse is incomplete"
+      },
+      "UNKNOWN_STATEMENT_GROUP": {
+        "category": "unparsed",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "unrecognised statements"
+      }
+    },
+    "detector": {
+      "array": {
+        "category": "array",
+        "tier": "HIGH",
+        "parity": "HARD",
+        "note": "ARRAY — aliases a group of columns, not a Spark ArrayType; needs wide-to-long restructuring, not explode()"
+      },
+      "by_group_first_last": {
+        "category": "row-state",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "FIRST./LAST. BY-group flags — need window functions"
+      },
+      "data_goto": {
+        "category": "procedural",
+        "tier": "HIGH",
+        "parity": "HARD",
+        "note": "DATA step GOTO — procedural jump"
+      },
+      "do_loop": {
+        "category": "do-loop",
+        "tier": "HIGH",
+        "parity": "HARD",
+        "note": "iterative DO — becomes vectorised columns, explode, or a UDF"
+      },
+      "do_until": {
+        "category": "do-loop",
+        "tier": "HIGH",
+        "parity": "HARD",
+        "note": "DO UNTIL — unbounded row-wise iteration"
+      },
+      "do_while": {
+        "category": "do-loop",
+        "tier": "HIGH",
+        "parity": "HARD",
+        "note": "DO WHILE — unbounded row-wise iteration"
+      },
+      "file_output": {
+        "category": "io",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "FILE writes an external raw file"
+      },
+      "filename_email": {
+        "category": "io-network",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "FILENAME EMAIL — sends mail"
+      },
+      "filename_ftp": {
+        "category": "io-network",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "FILENAME FTP transfer"
+      },
+      "filename_pipe": {
+        "category": "interop",
+        "tier": "HIGH",
+        "parity": "MANUAL",
+        "note": "FILENAME PIPE shells out to the OS"
+      },
+      "filename_sftp": {
+        "category": "io-network",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "FILENAME SFTP transfer"
+      },
+      "filename_socket": {
+        "category": "io-network",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "FILENAME SOCKET connection"
+      },
+      "filename_url": {
+        "category": "io-network",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "FILENAME URL fetch"
+      },
+      "infile": {
+        "category": "io",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "INFILE reads an external raw file"
+      },
+      "link_return": {
+        "category": "procedural",
+        "tier": "HIGH",
+        "parity": "HARD",
+        "note": "LINK/RETURN — procedural subroutine"
+      },
+      "merge": {
+        "category": "merge",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "MERGE with BY — a join, but same-named columns overlay differently"
+      },
+      "merge_no_by": {
+        "category": "merge",
+        "tier": "HIGH",
+        "parity": "HARD",
+        "note": "MERGE without BY — pairs rows by position; no Spark equivalent"
+      },
+      "modify": {
+        "category": "merge",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "MODIFY updates a dataset in place"
+      },
+      "retain": {
+        "category": "row-state",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "RETAIN carries values across rows — needs a window function"
+      },
+      "update": {
+        "category": "merge",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "UPDATE applies a transaction overlay"
+      }
+    }
+  },
+  "flags": [
+    {
+      "attr": "symput_scope_hazard",
+      "name": "symput-scope-hazard",
+      "category": "macro-var",
+      "tier": "HIGH",
+      "parity": "MANUAL",
+      "note": "CALL SYMPUT scope hazard — the variable may not outlive the step"
+    },
+    {
+      "attr": "contains_computed_goto",
+      "name": "computed-goto",
+      "category": "macro-control-flow",
+      "tier": "HIGH",
+      "parity": "MANUAL",
+      "note": "computed %GOTO — control flow is decided at run time"
+    },
+    {
+      "attr": "contains_abort",
+      "name": "abort",
+      "category": "macro-control-flow",
+      "tier": "MEDIUM",
+      "parity": "PARTIAL",
+      "note": "%ABORT terminates the job"
+    },
+    {
+      "attr": "has_unclosed_block",
+      "name": "unclosed-block",
+      "category": "unparsed",
+      "tier": "MEDIUM",
+      "parity": "PARTIAL",
+      "note": "unclosed block"
+    },
+    {
+      "attr": "defines_macros",
+      "name": "defines-macro",
+      "category": "macro-def",
+      "tier": "HIGH",
+      "parity": "MANUAL",
+      "note": "defines a macro — no Spark equivalent"
+    },
+    {
+      "attr": "invokes_macros",
+      "name": "invokes-macro",
+      "category": "macro-call",
+      "tier": "MEDIUM",
+      "parity": "PARTIAL",
+      "note": "invokes a macro that must be resolved"
+    },
+    {
+      "attr": "includes",
+      "name": "include",
+      "category": "io",
+      "tier": "MEDIUM",
+      "parity": "PARTIAL",
+      "note": "%INCLUDE pulls in external source"
+    },
+    {
+      "attr": "referenced_macro_vars",
+      "name": "macro-var-reference",
+      "category": "macro-var",
+      "tier": "LOW",
+      "parity": "DIRECT",
+      "note": "macro variable reference"
+    }
+  ]
+}
