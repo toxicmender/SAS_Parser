@@ -121,7 +121,14 @@ class ComplexitySignal(BaseModel):
         Contribution to the numeric score, used to rank chunks *within* a
         tier. Never affects the tier itself.
     evidence
-        Short human-readable note naming what was found.
+        What was actually found in this chunk — a source snippet for a
+        detector signal, empty for a metadata signal (whose ``name`` already
+        identifies it).
+    note
+        The catalogue's standing guidance for this construct: why it is rated
+        the way it is, and what the translation trap is. Kept separate from
+        *evidence* so a detector's snippet never shadows it — the guidance is
+        usually the more useful half.
     source
         ``"metadata"`` when derived from :class:`~chunker.models.SasChunkMetadata`,
         ``"detector"`` when found by this package's own regex scans.
@@ -133,11 +140,17 @@ class ComplexitySignal(BaseModel):
     parity: SparkParity
     weight: float = 1.0
     evidence: str = ""
+    note: str = ""
     source: str = "metadata"
 
+    @property
+    def detail(self) -> str:
+        """Evidence and note joined for display; either may be empty."""
+        return " — ".join(p for p in (self.evidence, self.note) if p)
+
     def __str__(self) -> str:
-        note = f": {self.evidence}" if self.evidence else ""
-        return f"{self.name} [{self.tier}/{self.parity}]{note}"
+        detail = f": {self.detail}" if self.detail else ""
+        return f"{self.name} [{self.tier}/{self.parity}]{detail}"
 
 
 class _ComplexityBase(BaseModel):

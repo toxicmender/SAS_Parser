@@ -255,14 +255,20 @@ def _resolve_weight(explicit: float | None, key: str, default: float) -> float:
 def _signal(
     name: str, spec: SignalSpec, evidence: str, source: str
 ) -> ComplexitySignal:
-    """Build a :class:`ComplexitySignal` from a catalogue *spec*."""
+    """Build a :class:`ComplexitySignal` from a catalogue *spec*.
+
+    *evidence* (what was found here) and the spec's note (standing guidance)
+    are kept in separate fields, so a detector's source snippet never shadows
+    the catalogue's explanation of why the construct is rated as it is.
+    """
     return ComplexitySignal(
         name=name,
         category=spec.category,
         tier=spec.tier,
         parity=spec.parity,
         weight=spec.weight,
-        evidence=evidence or spec.note,
+        evidence=evidence,
+        note=spec.note,
         source=source,
     )
 
@@ -283,7 +289,7 @@ def _lookup_many(
         spec = catalogue.get(name.lower())
         if spec is not None:
             out.append(
-                _signal(f"{prefix}:{name.lower()}", spec, spec.note, "metadata")
+                _signal(f"{prefix}:{name.lower()}", spec, "", "metadata")
             )
     return out
 
@@ -296,7 +302,7 @@ def _metadata_signals(
 
     kind_spec = rules.KIND_RULES.get(kind)
     if kind_spec is not None:
-        signals.append(_signal(f"kind:{kind}", kind_spec, kind_spec.note, "metadata"))
+        signals.append(_signal(f"kind:{kind}", kind_spec, "", "metadata"))
 
     if meta.proc_name:
         signals += _lookup_many("proc", [meta.proc_name], rules.PROC_RULES)
@@ -318,7 +324,7 @@ def _metadata_signals(
 
     for attr, name, spec in rules.FLAG_RULES:
         if getattr(meta, attr, None):
-            signals.append(_signal(name, spec, spec.note, "metadata"))
+            signals.append(_signal(name, spec, "", "metadata"))
 
     return signals
 

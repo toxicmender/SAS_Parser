@@ -60,8 +60,48 @@ than one.
 | Tier | Constructs | Typical Spark parity |
 | --- | --- | --- |
 | **LOW** | simple `PROC SQL`, macro variables (`%LET`, `&var`, `%GLOBAL`/`%LOCAL`), plain DATA steps, `PROC SORT`/`MEANS`/`FREQ`/`PRINT` | `DIRECT` / `SUPPORTED` |
-| **MEDIUM** | hash objects and hashing functions (`MD5`, `SHA256`), `MERGE`/`UPDATE`/`MODIFY`, `RETAIN` and `FIRST.`/`LAST.`, SFTP/FTP/email/URL `FILENAME` methods, `PROC HTTP`, `PROC TRANSPOSE`, `CALL SYMPUT`, date-interval functions (`INTNX`, `INTCK`) | `PARTIAL` |
-| **HIGH** | `ARRAY`, `DO` loops (iterative, `DO WHILE`, `DO UNTIL`), `%MACRO` definitions, macro control flow, computed `%GOTO`, `CALL EXECUTE`, `SYMGET`/`RESOLVE`/`DOSUBL`, `LAG`/`DIF`, `PROC FCMP`/`IML`/`DS2`, `FILENAME PIPE` | `HARD` / `MANUAL` |
+| **MEDIUM** | hash objects and hashing functions (`MD5`, `SHA256`), **match-merge** (`MERGE` *with* `BY`), `UPDATE`/`MODIFY`, `RETAIN` and `FIRST.`/`LAST.`, SFTP/FTP/email/URL `FILENAME` methods, `PROC HTTP`, `PROC TRANSPOSE`, `CALL SYMPUT`, date-interval functions (`INTNX`, `INTCK`) | `PARTIAL` |
+| **HIGH** | `ARRAY`, `DO` loops (iterative, `DO WHILE`, `DO UNTIL`), `%MACRO` definitions, macro control flow, computed `%GOTO`, `CALL EXECUTE`, `SYMGET`/`RESOLVE`/`DOSUBL`, `LAG`/`DIF`, **one-to-one merge** (`MERGE` *without* `BY`), `PROC FCMP`/`IML`/`DS2`, `FILENAME PIPE` | `HARD` / `MANUAL` |
+
+## Where the ratings come from
+
+The tier and parity assignments are grounded in the bundled `reference_docs/`
+corpus, not in intuition. Three findings shaped the catalogue, and each is
+quoted in a comment at its rule:
+
+**A SAS `ARRAY` is not a Spark array.** *SAS Programmer's Guide: Essentials*,
+Ch. 24: "In SAS, an array is not a data structure. An array is just a
+convenient way of temporarily defining a group of variables." The
+plausible-looking mapping — array column plus `explode()` — is therefore
+**wrong**. A SAS array aliases a group of *columns*, so translating it means a
+wide-to-long restructure or per-column expressions. The rule's evidence string
+says this outright, to steer a reader (or an LLM reading the output) off the
+wrong mapping.
+
+**`MERGE` is two different constructs**, and the presence of a `BY` statement
+is the documented discriminator (Essentials, Ch. 21): match-merging "requires
+the MERGE statement together with the BY statement", while one-to-one merging
+"requires the MERGE statement without the BY statement. There is no key
+variable on which to base the merge. Instead, rows are merged implicitly by row
+number." A match-merge is a join with different overlay rules (`MEDIUM`). A
+BY-less merge has no key at all — it pairs rows positionally, which a
+distributed DataFrame has no inherent ordering to reproduce, so it rates
+`HIGH`/`HARD`. The detector splits them.
+
+**`LAG` is not `lag()`.** *SAS Functions and CALL Routines: Reference*
+describes it as returning "values from a queue": "A LAGn function stores a
+value in a queue and returns a value stored previously in that queue. Each
+occurrence of a LAGn function in a program generates its own queue." The queue
+advances only when that call site executes, so a `LAG` inside a conditional is
+**not** `lag(col)` over an ordered window. SAS's own distributed engine declines
+it outright — "not supported in a DATA step that runs in CAS" — which is the
+clearest available evidence that inter-row dependency resists distribution.
+`HIGH`/`HARD` stands.
+
+One caveat on the corpus: the bundled Spark document is an *excerpt* (127
+pages) that explicitly defers "aggregations, window functions, and joins" to
+chapters it does not include. Absence of a function there is therefore not
+evidence that Spark lacks it, and no rating below was lowered on that basis.
 
 ## Spark parity scale
 

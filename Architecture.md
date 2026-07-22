@@ -214,6 +214,11 @@ complexity/
                         metadata flag, and detector name. Pure data; the single
                         place to retune the analysis. An allowlist: an
                         unlisted construct contributes no signal at all.
+                        Ratings are grounded in reference_docs/ and the
+                        load-bearing ones quote their source in a comment (a
+                        SAS ARRAY is "not a data structure"; MERGE with vs
+                        without BY is a join vs a positional pairing; LAG
+                        returns "values from a queue", not the previous row).
   detectors.py          Regex scans for what SasChunkMetadata does not extract
                         — ARRAY, DO loops, MERGE/UPDATE/MODIFY, RETAIN,
                         FIRST./LAST., FILENAME access methods (SFTP/FTP/EMAIL/

@@ -77,7 +77,25 @@ _DO_WHILE_RE = re.compile(r"(?<!%)\bdo\s+(?<!%)while\s*\(", re.IGNORECASE)
 _DO_UNTIL_RE = re.compile(r"(?<!%)\bdo\s+(?<!%)until\s*\(", re.IGNORECASE)
 
 # Dataset-combining statements whose semantics differ from a Spark join.
+#
+# MERGE splits into two constructs that translate very differently, and the SAS
+# Programmer's Guide: Essentials (Ch. 21, "Combining Data") makes the presence
+# of a BY statement the exact discriminator:
+#
+#   "Match-merging requires the MERGE statement together with the BY
+#    statement, which specifies one or more common variables by which rows
+#    are matched."
+#   "One-to-one merging requires the MERGE statement without the BY
+#    statement. There is no key variable on which to base the merge.
+#    Instead, rows are merged implicitly by row number."
+#
+# A match-merge is a join with different overlay rules (MEDIUM). A one-to-one
+# merge has no key at all — it pairs rows positionally, which a distributed
+# DataFrame cannot reproduce without imposing an artificial ordering (HIGH).
 _MERGE_RE = re.compile(r"\bmerge\s+([A-Za-z_&][\w.&]*)", re.IGNORECASE)
+# A BY statement anywhere after the MERGE, within the same step. Chunks are
+# step-scoped, so "the rest of the chunk" is the right search window.
+_BY_STMT_RE = re.compile(r"\bby\s+[A-Za-z_&]", re.IGNORECASE)
 _MODIFY_RE = re.compile(r"\bmodify\s+([A-Za-z_&][\w.&]*)", re.IGNORECASE)
 _UPDATE_RE = re.compile(r"\bupdate\s+([A-Za-z_&][\w.&]*)", re.IGNORECASE)
 
@@ -135,6 +153,28 @@ def _detect_simple(
     return found
 
 
+def _detect_merge(mt: str) -> list[DetectedConstruct]:
+    """MERGE statements in sanitised text *mt*, split by BY presence.
+
+    Emits ``merge`` for a match-merge (a BY statement follows it in the same
+    step) and ``merge_no_by`` for a one-to-one, positional merge. See the
+    comment on :data:`_MERGE_RE` for the documented rule this implements.
+    """
+    found: list[DetectedConstruct] = []
+    seen: set[str] = set()
+    for m in _MERGE_RE.finditer(mt):
+        # The BY belongs to the same step, and a chunk is step-scoped, so the
+        # remainder of the chunk is the correct window to look in.
+        has_by = bool(_BY_STMT_RE.search(mt, m.end()))
+        name = "merge" if has_by else "merge_no_by"
+        qualifier = "with BY" if has_by else "no BY — positional"
+        evidence = f"{_snippet(m.group(0))} ({qualifier})"
+        if evidence not in seen:
+            seen.add(evidence)
+            found.append(DetectedConstruct(name, evidence))
+    return found
+
+
 def detect_constructs(text: str) -> list[DetectedConstruct]:
     """Every supplementary construct found in SAS source *text*.
 
@@ -155,7 +195,7 @@ def detect_constructs(text: str) -> list[DetectedConstruct]:
         found += _detect_simple("do_until", _DO_UNTIL_RE, mt, "")
 
     if "merge" in low:
-        found += _detect_simple("merge", _MERGE_RE, mt, "")
+        found += _detect_merge(mt)
     if "modify" in low:
         found += _detect_simple("modify", _MODIFY_RE, mt, "")
     if "update" in low:

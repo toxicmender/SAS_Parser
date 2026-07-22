@@ -75,11 +75,12 @@ class TestLowTier(unittest.TestCase):
 class TestMediumTier(unittest.TestCase):
     """Hashing, MERGE, SFTP, and mail are MEDIUM."""
 
-    def test_merge_is_medium(self):
+    def test_match_merge_with_by_is_medium(self):
         scored = _only("data work.out;\n  merge work.a work.b;\n  by id;\nrun;\n")
         self.assertEqual(scored.tier, ComplexityTier.MEDIUM)
         self.assertEqual(scored.translation_difficulty, SparkParity.PARTIAL)
         self.assertIn("merge", _names(scored))
+        self.assertNotIn("merge_no_by", _names(scored))
 
     def test_hash_object_is_medium(self):
         scored = _only(
@@ -158,6 +159,15 @@ class TestHighTier(unittest.TestCase):
         self.assertEqual(scored.translation_difficulty, SparkParity.MANUAL)
         self.assertIn("kind:MACRO_DEFINITION", _names(scored))
 
+    def test_one_to_one_merge_without_by_is_high(self):
+        """Essentials Ch. 21: a BY-less MERGE pairs rows by position, with no
+        key variable — there is no Spark join that reproduces it."""
+        scored = _only("data work.out;\n  merge work.a work.b;\nrun;\n")
+        self.assertEqual(scored.tier, ComplexityTier.HIGH)
+        self.assertEqual(scored.translation_difficulty, SparkParity.HARD)
+        self.assertIn("merge_no_by", _names(scored))
+        self.assertNotIn("merge", _names(scored))
+
     def test_call_execute_is_high(self):
         scored = _only(
             "data _null_;\n  set work.in;\n  call execute('%report');\nrun;\n"
@@ -233,7 +243,7 @@ class TestDetectors(unittest.TestCase):
 
     def test_detects_core_constructs(self):
         found = self._found(
-            "data x;\n  merge a b;\n  array s{3} s1-s3;\n  retain t 0;\n"
+            "data x;\n  merge a b;\n  by id;\n  array s{3} s1-s3;\n  retain t 0;\n"
             "  do i = 1 to 3;\n    t + s{i};\n  end;\n"
             "  if first.id then flag = 1;\nrun;\n"
         )
@@ -241,6 +251,20 @@ class TestDetectors(unittest.TestCase):
             {"merge", "array", "retain", "do_loop", "by_group_first_last"},
             found & {"merge", "array", "retain", "do_loop", "by_group_first_last"},
         )
+
+    def test_merge_split_keys_off_the_by_statement(self):
+        with_by = self._found("data x;\n  merge a b;\n  by id;\nrun;\n")
+        without_by = self._found("data x;\n  merge a b;\nrun;\n")
+        self.assertIn("merge", with_by)
+        self.assertNotIn("merge_no_by", with_by)
+        self.assertIn("merge_no_by", without_by)
+        self.assertNotIn("merge", without_by)
+
+    def test_by_before_merge_does_not_count(self):
+        """A BY belonging to an earlier SET does not make a later MERGE a
+        match-merge; only a BY *after* the MERGE does."""
+        found = self._found("data x;\n  set a;\n  by id;\n  merge b c;\nrun;\n")
+        self.assertIn("merge_no_by", found)
 
     def test_macro_do_is_not_a_data_step_do_loop(self):
         found = self._found("%macro m;\n  %do i = 1 %to 10;\n  %end;\n%mend;\n")
@@ -287,7 +311,8 @@ class TestDetectors(unittest.TestCase):
     def test_every_detector_name_has_a_catalogue_entry(self):
         """A detector with no rules entry would be silently dropped."""
         source = (
-            "data x;\n  merge a b;\n  modify c;\n  update d;\n  array s{2} s1-s2;\n"
+            "data x;\n  merge a b;\n  by k;\n  merge e f;\n"
+            "  modify c;\n  update d;\n  array s{2} s1-s2;\n"
             "  retain t;\n  do i = 1 to 2;\n  end;\n  do while (a);\n  end;\n"
             "  do until (b);\n  end;\n  if first.id;\n  infile 'r.txt';\n"
             "  file print;\n  link sub;\n  goto top;\nrun;\n"
@@ -412,6 +437,23 @@ class TestAnalyzerOptions(unittest.TestCase):
         proc = _only("proc sort data=work.a;\nrun;\n")
         sort_signal = next(s for s in proc.signals if s.name == "proc:sort")
         self.assertEqual(sort_signal.source, "metadata")
+
+    def test_detector_evidence_does_not_shadow_the_catalogue_note(self):
+        """The standing guidance is usually more useful than the snippet, so
+        both must survive on the signal."""
+        scored = _only(self.ARRAY_STEP)
+        array_signal = next(s for s in scored.signals if s.name == "array")
+        self.assertIn("array s", array_signal.evidence.lower())
+        self.assertIn("not a Spark ArrayType", array_signal.note)
+        self.assertIn(array_signal.evidence, array_signal.detail)
+        self.assertIn(array_signal.note, array_signal.detail)
+
+    def test_metadata_signal_carries_note_without_evidence(self):
+        proc = _only("proc sort data=work.a;\nrun;\n")
+        sort_signal = next(s for s in proc.signals if s.name == "proc:sort")
+        self.assertEqual(sort_signal.evidence, "")
+        self.assertTrue(sort_signal.note)
+        self.assertEqual(sort_signal.detail, sort_signal.note)
 
     def test_high_signals_expose_the_drivers(self):
         scored = _only(

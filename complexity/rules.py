@@ -164,8 +164,15 @@ _INTERVAL_FUNCTIONS = frozenset(
     }
 )
 
-# Row-ordering-dependent functions: they read values from *other* rows of the
-# implicit DATA step loop, which only a Spark window function can express.
+# Row-ordering-dependent functions. LAG looks like Spark's lag() window
+# function but is not: SAS Functions and CALL Routines: Reference describes it
+# as returning "values from a queue" — "A LAGn function stores a value in a
+# queue and returns a value stored previously in that queue. Each occurrence of
+# a LAGn function in a program generates its own queue." The queue advances
+# only when that call site executes, so a LAG inside a conditional does NOT
+# equal lag(col) over an ordered window. SAS's own distributed engine declines
+# it ("not supported in a DATA step that runs in CAS"), which is the clearest
+# possible signal that inter-row dependency resists distribution.
 _ROW_STATE_FUNCTIONS = frozenset({"lag", "dif"})
 
 # Runtime macro resolution — the value is not knowable statically.
@@ -223,7 +230,8 @@ FUNCTION_RULES: dict[str, SignalSpec] = {
         _high(
             "row-state",
             SparkParity.HARD,
-            "reads prior rows — needs a Spark window function",
+            "per-call-site queue, not 'the previous row' — a conditional LAG "
+            "is not lag() over a window",
         ),
     ),
     **_expand(
@@ -385,10 +393,18 @@ FLAG_RULES: tuple[tuple[str, str, SignalSpec], ...] = (
 # ---------------------------------------------------------------------------
 
 DETECTOR_RULES: dict[str, SignalSpec] = {
+    # NOT a Spark ArrayType column. Essentials Ch. 24 is explicit: "In SAS, an
+    # array is not a data structure. An array is just a convenient way of
+    # temporarily defining a group of variables." So the plausible-looking
+    # mapping to an array column plus explode() is wrong — a SAS array aliases
+    # a group of *columns*, and translating it means a wide-to-long
+    # restructure or per-column expressions. The note says so explicitly to
+    # steer a reader (or an LLM) off the wrong mapping.
     "array": _high(
         "array",
         SparkParity.HARD,
-        "ARRAY — row-wise column iteration, needs restructuring",
+        "ARRAY — aliases a group of columns, not a Spark ArrayType; "
+        "needs wide-to-long restructuring, not explode()",
     ),
     "do_loop": _high(
         "do-loop",
@@ -401,10 +417,22 @@ DETECTOR_RULES: dict[str, SignalSpec] = {
     "do_until": _high(
         "do-loop", SparkParity.HARD, "DO UNTIL — unbounded row-wise iteration"
     ),
+    # Match-merge: a join, but SAS overlays same-named variables from the
+    # last data set read, which a Spark join does not do.
     "merge": _medium(
         "merge",
         SparkParity.PARTIAL,
-        "MERGE — overlay and unmatched-key rules differ from a Spark join",
+        "MERGE with BY — a join, but same-named columns overlay differently",
+    ),
+    # One-to-one merge: no key at all. Essentials Ch. 21 — "There is no key
+    # variable on which to base the merge. Instead, rows are merged implicitly
+    # by row number." A distributed DataFrame has no inherent row order, so
+    # this cannot be expressed as a join; reproducing it means manufacturing an
+    # ordering, which is why it rates HIGH rather than MEDIUM.
+    "merge_no_by": _high(
+        "merge",
+        SparkParity.HARD,
+        "MERGE without BY — pairs rows by position; no Spark equivalent",
     ),
     "modify": _medium(
         "merge", SparkParity.PARTIAL, "MODIFY updates a dataset in place"
