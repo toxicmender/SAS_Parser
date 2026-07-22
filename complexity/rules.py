@@ -1,10 +1,23 @@
-"""The signal catalogue: which SAS constructs imply which complexity tier and
-Spark parity. See complexity/README.md.
+"""Rule sets: which SAS construct implies which complexity tier and which
+translation parity, for a given target language. See complexity/README.md.
 
-Pure data: no logging, no imports from the rest of this package beyond the
-enums it classifies with. This is the single place to retune the analysis —
-:mod:`complexity.analyzer` only looks constructs up here, it never hard-codes a
-tier of its own.
+The catalogue itself is **data**, not code: it lives in JSON profiles under
+``complexity/profiles/`` and is loaded here into :class:`RuleSet`. That is what
+makes the analysis retargetable — ``sparksql.json`` rates constructs against
+Spark SQL, ``pyspark.json`` extends it with the handful of ratings that differ
+when a full Python host language is available, and an operator can point
+``complexity.rules_path`` at a file of their own without touching this package.
+
+Profile resolution, highest precedence first:
+
+1. an explicit ``path`` argument to :func:`load_ruleset`;
+2. an explicit ``target`` argument (a name under ``profiles/``);
+3. ``complexity.rules_path`` in config.json;
+4. ``complexity.target`` in config.json;
+5. :data:`DEFAULT_TARGET`.
+
+A profile may ``extends`` another by name; the child's entries are deep-merged
+over the parent's, so a derived target states only its differences.
 
 Tier assignment follows the project's brief:
 
@@ -13,483 +26,435 @@ Tier assignment follows the project's brief:
   semantics differ" constructs.
 - **HIGH** — arrays, DO loops, and ``%MACRO`` definitions.
 
-Anything not listed here contributes no signal at all, which floors a chunk at
-LOW/DIRECT. Silence means "nothing notable found", never "unknown": the
-catalogue is deliberately an allowlist of constructs whose translation cost is
-understood, so an unrecognised function never inflates a score.
+Every catalogue is an **allowlist**. A construct with no entry contributes no
+signal at all, which floors a chunk at LOW/DIRECT. Silence means "nothing
+notable found", never "unknown": an unrecognised function must not inflate a
+score.
+
+Logger name: ``complexity.rules``.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
-from .models import ComplexityTier, SparkParity
+import app_config
+
+from .models import ComplexityTier, TranslationParity
+
+logger = logging.getLogger(__name__)
+
+PROFILE_DIR = Path(__file__).parent / "profiles"
+DEFAULT_TARGET = "sparksql"
+_CONFIG_SECTION = "complexity"
+
+# Fallback per-tier score weights, used when a profile omits ``weights``.
+# Weight only ranks units within a tier — it can never change the tier itself,
+# which is presence-based (see complexity.analyzer).
+WEIGHT_LOW = 1.0
+WEIGHT_MEDIUM = 2.5
+WEIGHT_HIGH = 5.0
+
+_DEFAULT_WEIGHTS: dict[ComplexityTier, float] = {
+    ComplexityTier.LOW: WEIGHT_LOW,
+    ComplexityTier.MEDIUM: WEIGHT_MEDIUM,
+    ComplexityTier.HIGH: WEIGHT_HIGH,
+}
+
+# The construct namespaces a profile may define. Each maps to the metadata (or
+# detector) dimension the analyzer looks up; an unknown key in a profile is an
+# error rather than a silently ignored typo.
+CONSTRUCT_KINDS: frozenset[str] = frozenset(
+    {
+        "proc",
+        "component_object",
+        "function",
+        "call_routine",
+        "global_statement",
+        "kind",
+        "detector",
+    }
+)
+
+
+class RuleSetError(ValueError):
+    """A rule-set profile is missing, malformed, or self-contradictory.
+
+    Always raised rather than degraded past: a profile that does not parse
+    means the operator asked for a classification scheme that cannot be
+    applied, which should stop the analysis instead of silently scoring
+    everything against a different one.
+    """
 
 
 @dataclass(frozen=True, slots=True)
 class SignalSpec:
     """The classification attached to one recognised construct.
 
-    Fields mirror :class:`~complexity.models.ComplexitySignal` minus the
-    identity the caller supplies (``name``/``evidence``/``source``).
+    Carries no weight of its own: weight is a property of the *tier*, supplied
+    by the owning :class:`RuleSet`, so a spec can never disagree with its tier
+    about how much it is worth.
     """
 
     category: str
     tier: ComplexityTier
-    parity: SparkParity
-    weight: float
+    parity: TranslationParity
     note: str = ""
 
 
-# Default per-tier weights. Weight only ranks items *within* a tier — it can
-# never change the tier itself, which is presence-based (see analyzer).
-WEIGHT_LOW = 1.0
-WEIGHT_MEDIUM = 2.5
-WEIGHT_HIGH = 5.0
+@dataclass(frozen=True)
+class RuleSet:
+    """A complete construct catalogue for one target language.
 
+    Attributes
+    ----------
+    target
+        Profile name, e.g. ``"sparksql"``.
+    display_name
+        Human-readable target, e.g. ``"Spark SQL"`` — used in reports.
+    description
+        What this profile rates and on what basis.
+    weights
+        Per-tier score weights.
+    constructs
+        ``{construct_kind: {name: SignalSpec}}`` for the kinds in
+        :data:`CONSTRUCT_KINDS`. Names are lowercased except under ``"kind"``,
+        whose keys are ``SasChunkKind`` values.
+    flags
+        ``(metadata_attribute, signal_name, spec)`` triples for the boolean /
+        list-valued metadata flags.
+    """
 
-def _low(category: str, parity: SparkParity, note: str = "") -> SignalSpec:
-    return SignalSpec(category, ComplexityTier.LOW, parity, WEIGHT_LOW, note)
+    target: str
+    display_name: str
+    description: str
+    weights: dict[ComplexityTier, float]
+    constructs: dict[str, dict[str, SignalSpec]]
+    flags: tuple[tuple[str, str, SignalSpec], ...]
 
+    def spec(self, construct_kind: str, name: str) -> SignalSpec | None:
+        """The spec for *name* in *construct_kind*, or ``None`` if unlisted."""
+        return self.constructs.get(construct_kind, {}).get(name.lower())
 
-def _medium(category: str, parity: SparkParity, note: str = "") -> SignalSpec:
-    return SignalSpec(category, ComplexityTier.MEDIUM, parity, WEIGHT_MEDIUM, note)
+    def weight_for(self, tier: ComplexityTier) -> float:
+        """Score weight for *tier*."""
+        return self.weights.get(tier, _DEFAULT_WEIGHTS[tier])
 
+    @property
+    def construct_count(self) -> int:
+        """Total catalogued constructs, flags included."""
+        return sum(len(v) for v in self.constructs.values()) + len(self.flags)
 
-def _high(category: str, parity: SparkParity, note: str = "") -> SignalSpec:
-    return SignalSpec(category, ComplexityTier.HIGH, parity, WEIGHT_HIGH, note)
+    def __str__(self) -> str:
+        return (
+            f"RuleSet(target={self.target!r}, display_name={self.display_name!r}, "
+            f"constructs={self.construct_count})"
+        )
 
 
 # ---------------------------------------------------------------------------
-# PROC steps  — keyed by SasChunkMetadata.proc_name
+# Parsing
 # ---------------------------------------------------------------------------
 
-PROC_RULES: dict[str, SignalSpec] = {
-    # Set-oriented PROCs with a one-for-one Spark equivalent.
-    "sql": _low("simple-sql", SparkParity.DIRECT, "PROC SQL maps to spark.sql"),
-    "sort": _low("simple-sql", SparkParity.SUPPORTED, "PROC SORT maps to orderBy"),
-    "print": _low("reporting", SparkParity.SUPPORTED, "PROC PRINT maps to show"),
-    "contents": _low("metadata", SparkParity.SUPPORTED, "schema inspection"),
-    "datasets": _low("metadata", SparkParity.SUPPORTED, "catalog maintenance"),
-    "append": _low("simple-sql", SparkParity.SUPPORTED, "PROC APPEND maps to union"),
-    "means": _low("aggregation", SparkParity.SUPPORTED, "maps to groupBy.agg"),
-    "summary": _low("aggregation", SparkParity.SUPPORTED, "maps to groupBy.agg"),
-    "freq": _low("aggregation", SparkParity.SUPPORTED, "maps to groupBy.count"),
-    # Reshaping and reporting: an equivalent exists but is not mechanical.
-    "transpose": _medium(
-        "reshape", SparkParity.PARTIAL, "PROC TRANSPOSE needs pivot/stack"
-    ),
-    "report": _medium("reporting", SparkParity.PARTIAL, "PROC REPORT layout"),
-    "tabulate": _medium("reporting", SparkParity.PARTIAL, "PROC TABULATE layout"),
-    "format": _medium(
-        "format", SparkParity.PARTIAL, "user-defined formats need a lookup"
-    ),
-    "export": _medium("io", SparkParity.PARTIAL, "external file export"),
-    "import": _medium("io", SparkParity.PARTIAL, "external file import"),
-    "http": _medium("io-network", SparkParity.PARTIAL, "PROC HTTP call"),
-    "soap": _medium("io-network", SparkParity.PARTIAL, "PROC SOAP call"),
-    # Procedural / statistical PROCs with no Spark SQL counterpart.
-    "fcmp": _high(
-        "procedural", SparkParity.MANUAL, "PROC FCMP defines custom functions"
-    ),
-    "iml": _high("procedural", SparkParity.MANUAL, "PROC IML matrix language"),
-    "ds2": _high("procedural", SparkParity.MANUAL, "PROC DS2 program"),
-    "lua": _high("procedural", SparkParity.MANUAL, "PROC LUA program"),
-}
+
+def _enum(
+    raw: Any, enum: type[ComplexityTier] | type[TranslationParity], where: str
+) -> Any:
+    """Parse *raw* into *enum*, naming *where* it came from on failure."""
+    if not isinstance(raw, str):
+        raise RuleSetError(f"{where}: expected a string, got {type(raw).__name__}")
+    try:
+        return enum(raw.upper())
+    except ValueError:
+        valid = ", ".join(m.value for m in enum)
+        raise RuleSetError(
+            f"{where}: {raw!r} is not a valid {enum.__name__} (expected one of {valid})"
+        ) from None
+
+
+def _spec(entry: Any, where: str) -> SignalSpec:
+    """Parse one ``{category, tier, parity, note}`` object."""
+    if not isinstance(entry, dict):
+        raise RuleSetError(f"{where}: expected an object, got {type(entry).__name__}")
+    missing = [k for k in ("category", "tier", "parity") if k not in entry]
+    if missing:
+        raise RuleSetError(f"{where}: missing required key(s) {', '.join(missing)}")
+    category = entry["category"]
+    if not isinstance(category, str) or not category.strip():
+        raise RuleSetError(f"{where}: 'category' must be a non-empty string")
+    note = entry.get("note", "")
+    if not isinstance(note, str):
+        raise RuleSetError(f"{where}: 'note' must be a string")
+    return SignalSpec(
+        category=category,
+        tier=_enum(entry["tier"], ComplexityTier, f"{where}.tier"),
+        parity=_enum(entry["parity"], TranslationParity, f"{where}.parity"),
+        note=note,
+    )
+
+
+def _expand_groups(doc: dict[str, Any], where: str) -> dict[str, dict[str, Any]]:
+    """Expand the optional ``construct_groups`` shorthand.
+
+    A group attaches one classification to many names at once::
+
+        {"kind": "function", "names": ["md5", "sha256"],
+         "category": "hashing", "tier": "MEDIUM", "parity": "SUPPORTED"}
+
+    which keeps a profile readable when a whole function family shares a
+    rating. Groups are applied *before* the explicit ``constructs`` map, so a
+    single named entry can still override its group.
+    """
+    groups = doc.get("construct_groups", [])
+    if not isinstance(groups, list):
+        raise RuleSetError(f"{where}.construct_groups: expected a list")
+    out: dict[str, dict[str, Any]] = {}
+    for i, group in enumerate(groups):
+        at = f"{where}.construct_groups[{i}]"
+        if not isinstance(group, dict):
+            raise RuleSetError(f"{at}: expected an object")
+        kind = group.get("kind")
+        if kind not in CONSTRUCT_KINDS:
+            raise RuleSetError(
+                f"{at}.kind: {kind!r} is not a construct kind "
+                f"(expected one of {', '.join(sorted(CONSTRUCT_KINDS))})"
+            )
+        names = group.get("names")
+        if not isinstance(names, list) or not names:
+            raise RuleSetError(f"{at}.names: expected a non-empty list")
+        body = {k: v for k, v in group.items() if k not in ("kind", "names")}
+        for name in names:
+            if not isinstance(name, str):
+                raise RuleSetError(f"{at}.names: entries must be strings")
+            out.setdefault(kind, {})[name.lower()] = body
+    return out
+
+
+def _merge_raw(
+    base: dict[str, Any], child: dict[str, Any]
+) -> dict[str, Any]:
+    """Deep-merge a child profile's document over its parent's.
+
+    ``constructs`` merges per construct-kind and per construct name, so a child
+    overriding one function leaves the rest of the family intact. ``flags``
+    merges by signal name. Scalars and ``weights`` keys replace outright.
+    """
+    merged: dict[str, Any] = {**base, **{
+        k: v for k, v in child.items()
+        if k not in ("constructs", "flags", "weights", "construct_groups")
+    }}
+
+    merged["weights"] = {**base.get("weights", {}), **child.get("weights", {})}
+
+    base_c: dict[str, Any] = base.get("constructs", {})
+    child_c: dict[str, Any] = child.get("constructs", {})
+    constructs: dict[str, Any] = {k: dict(v) for k, v in base_c.items()}
+    for kind, entries in child_c.items():
+        constructs.setdefault(kind, {}).update(entries)
+    merged["constructs"] = constructs
+
+    by_name: dict[str, Any] = {f["name"]: f for f in base.get("flags", []) if "name" in f}
+    order: list[str] = list(by_name)
+    for flag in child.get("flags", []):
+        name = flag.get("name")
+        if name is None:
+            raise RuleSetError("flags: every entry needs a 'name'")
+        if name in by_name:
+            by_name[name] = {**by_name[name], **flag}
+        else:
+            by_name[name] = flag
+            order.append(name)
+    merged["flags"] = [by_name[n] for n in order]
+    return merged
+
+
+def _read_profile_doc(
+    path: Path, _seen: tuple[str, ...] = ()
+) -> dict[str, Any]:
+    """Read a profile JSON document, resolving ``extends`` recursively."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuleSetError(f"cannot read rule-set profile '{path}': {exc}") from exc
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuleSetError(f"rule-set profile '{path}' is not valid JSON: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise RuleSetError(f"rule-set profile '{path}': top level must be an object")
+
+    # Group shorthand expands before inheritance, so a parent's groups and a
+    # child's named entries compose the way the file reads.
+    groups = _expand_groups(doc, path.name)
+    if groups:
+        constructs = {k: dict(v) for k, v in groups.items()}
+        for kind, entries in doc.get("constructs", {}).items():
+            constructs.setdefault(kind, {}).update(entries)
+        doc = {**doc, "constructs": constructs}
+
+    parent_name = doc.get("extends")
+    if parent_name is None:
+        return doc
+    if not isinstance(parent_name, str):
+        raise RuleSetError(f"rule-set profile '{path}': 'extends' must be a string")
+    target = doc.get("target", path.stem)
+    if parent_name in _seen or parent_name == target:
+        chain = " -> ".join([*_seen, str(target), parent_name])
+        raise RuleSetError(f"rule-set profile '{path}': circular extends chain {chain}")
+    parent_path = PROFILE_DIR / f"{parent_name}.json"
+    if not parent_path.is_file():
+        raise RuleSetError(
+            f"rule-set profile '{path}' extends unknown profile {parent_name!r} "
+            f"(looked for {parent_path})"
+        )
+    parent_doc = _read_profile_doc(parent_path, (*_seen, str(target)))
+    return _merge_raw(parent_doc, doc)
+
+
+def _ruleset_from_doc(doc: dict[str, Any], where: str) -> RuleSet:
+    """Validate a resolved profile document into a :class:`RuleSet`."""
+    target = doc.get("target")
+    if not isinstance(target, str) or not target.strip():
+        raise RuleSetError(f"{where}: 'target' must be a non-empty string")
+
+    weights = dict(_DEFAULT_WEIGHTS)
+    raw_weights = doc.get("weights", {})
+    if not isinstance(raw_weights, dict):
+        raise RuleSetError(f"{where}.weights: expected an object")
+    for key, value in raw_weights.items():
+        tier = _enum(key, ComplexityTier, f"{where}.weights key")
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise RuleSetError(f"{where}.weights.{key}: expected a number")
+        weights[tier] = float(value)
+
+    raw_constructs = doc.get("constructs", {})
+    if not isinstance(raw_constructs, dict):
+        raise RuleSetError(f"{where}.constructs: expected an object")
+    unknown = set(raw_constructs) - CONSTRUCT_KINDS
+    if unknown:
+        raise RuleSetError(
+            f"{where}.constructs: unknown construct kind(s) "
+            f"{', '.join(sorted(unknown))} "
+            f"(expected one of {', '.join(sorted(CONSTRUCT_KINDS))})"
+        )
+    constructs: dict[str, dict[str, SignalSpec]] = {}
+    for kind, entries in raw_constructs.items():
+        if not isinstance(entries, dict):
+            raise RuleSetError(f"{where}.constructs.{kind}: expected an object")
+        # Chunk-kind keys are SasChunkKind values (upper case); every other
+        # namespace is looked up by a lowercased identifier.
+        constructs[kind] = {
+            (name if kind == "kind" else name.lower()): _spec(
+                entry, f"{where}.constructs.{kind}.{name}"
+            )
+            for name, entry in entries.items()
+        }
+
+    raw_flags = doc.get("flags", [])
+    if not isinstance(raw_flags, list):
+        raise RuleSetError(f"{where}.flags: expected a list")
+    flags: list[tuple[str, str, SignalSpec]] = []
+    for i, entry in enumerate(raw_flags):
+        at = f"{where}.flags[{i}]"
+        if not isinstance(entry, dict):
+            raise RuleSetError(f"{at}: expected an object")
+        attr = entry.get("attr")
+        name = entry.get("name")
+        if not isinstance(attr, str) or not attr:
+            raise RuleSetError(f"{at}.attr: expected a non-empty string")
+        if not isinstance(name, str) or not name:
+            raise RuleSetError(f"{at}.name: expected a non-empty string")
+        flags.append((attr, name, _spec(entry, at)))
+
+    return RuleSet(
+        target=target,
+        display_name=str(doc.get("display_name") or target),
+        description=str(doc.get("description") or ""),
+        weights=weights,
+        constructs=constructs,
+        flags=tuple(flags),
+    )
+
 
 # ---------------------------------------------------------------------------
-# DATA step component objects  — keyed by SasChunkMetadata.component_objects
+# Loading
 # ---------------------------------------------------------------------------
 
-COMPONENT_OBJECT_RULES: dict[str, SignalSpec] = {
-    "hash": _medium(
-        "hashing", SparkParity.PARTIAL, "hash object lookup — becomes a join"
-    ),
-    "hiter": _medium(
-        "hashing", SparkParity.PARTIAL, "hash iterator — becomes an ordered scan"
-    ),
-    "javaobj": _high("interop", SparkParity.MANUAL, "Java object interop"),
-    "logger": _medium("logging", SparkParity.PARTIAL, "SAS logging object"),
-    "appender": _medium("logging", SparkParity.PARTIAL, "SAS logging appender"),
-}
-
-# ---------------------------------------------------------------------------
-# Functions  — keyed by SasChunkMetadata.recognized_functions
-#
-# Grouped by translation concern rather than listed one-by-one, so the whole
-# family shares a spec and new members are picked up by editing one frozenset.
-# ---------------------------------------------------------------------------
-
-_HASHING_FUNCTIONS = frozenset(
-    {
-        "md5",
-        "sha256",
-        "sha256hex",
-        "sha256hmachex",
-        "hashing",
-        "hashing_file",
-        "hashing_hmac",
-        "hashing_hmac_file",
-        "hashing_hmac_init",
-        "hashing_init",
-        "hashing_part",
-        "hashing_term",
-    }
-)
-
-# SAS date/datetime *interval* functions. Spark has date arithmetic, but SAS
-# interval semantics (SAME/CONTINUOUS alignment, custom intervals, shift
-# operators) do not carry over unexamined.
-_INTERVAL_FUNCTIONS = frozenset(
-    {
-        "intnx",
-        "intck",
-        "intcindex",
-        "intcycle",
-        "intfit",
-        "intfmt",
-        "intget",
-        "intindex",
-        "intnest",
-        "intseas",
-        "intshift",
-        "inttest",
-        "holiday",
-        "holidayck",
-        "holidaycount",
-        "holidayname",
-        "holidaynx",
-        "holidayny",
-        "holidaytest",
-    }
-)
-
-# Row-ordering-dependent functions. LAG looks like Spark's lag() window
-# function but is not: SAS Functions and CALL Routines: Reference describes it
-# as returning "values from a queue" — "A LAGn function stores a value in a
-# queue and returns a value stored previously in that queue. Each occurrence of
-# a LAGn function in a program generates its own queue." The queue advances
-# only when that call site executes, so a LAG inside a conditional does NOT
-# equal lag(col) over an ordered window. SAS's own distributed engine declines
-# it ("not supported in a DATA step that runs in CAS"), which is the clearest
-# possible signal that inter-row dependency resists distribution.
-_ROW_STATE_FUNCTIONS = frozenset({"lag", "dif"})
-
-# Runtime macro resolution — the value is not knowable statically.
-_MACRO_RUNTIME_FUNCTIONS = frozenset({"symget", "resolve", "dosubl"})
-
-# Dynamic format/informat application (the format itself is a runtime value).
-_DYNAMIC_FORMAT_FUNCTIONS = frozenset({"putn", "putc", "inputn", "inputc"})
-
-# External file I/O via the DATA step's file interface.
-_FILE_IO_FUNCTIONS = frozenset(
-    {
-        "fopen",
-        "fclose",
-        "fget",
-        "fput",
-        "fwrite",
-        "fread",
-        "fappend",
-        "fcopy",
-        "fdelete",
-        "filename",
-        "fileexist",
-        "fexist",
-        "dopen",
-        "dclose",
-        "dread",
-        "dcreate",
-        "mopen",
-    }
-)
+_CACHE: dict[str, RuleSet] = {}
 
 
-def _expand(
-    names: frozenset[str], spec: SignalSpec
-) -> dict[str, SignalSpec]:
-    """Attach *spec* to every name in *names*."""
-    return dict.fromkeys(names, spec)
+def available_profiles() -> list[str]:
+    """Names of the profiles bundled under ``complexity/profiles/``, sorted."""
+    if not PROFILE_DIR.is_dir():
+        return []
+    return sorted(p.stem for p in PROFILE_DIR.glob("*.json"))
 
 
-FUNCTION_RULES: dict[str, SignalSpec] = {
-    **_expand(
-        _HASHING_FUNCTIONS,
-        _medium("hashing", SparkParity.PARTIAL, "hashing function"),
-    ),
-    **_expand(
-        _INTERVAL_FUNCTIONS,
-        _medium(
-            "date-interval",
-            SparkParity.PARTIAL,
-            "SAS interval semantics differ from Spark date arithmetic",
-        ),
-    ),
-    **_expand(
-        _ROW_STATE_FUNCTIONS,
-        _high(
-            "row-state",
-            SparkParity.HARD,
-            "per-call-site queue, not 'the previous row' — a conditional LAG "
-            "is not lag() over a window",
-        ),
-    ),
-    **_expand(
-        _MACRO_RUNTIME_FUNCTIONS,
-        _high(
-            "macro-runtime",
-            SparkParity.MANUAL,
-            "resolves macro code at run time",
-        ),
-    ),
-    **_expand(
-        _DYNAMIC_FORMAT_FUNCTIONS,
-        _medium("format", SparkParity.PARTIAL, "format applied at run time"),
-    ),
-    **_expand(
-        _FILE_IO_FUNCTIONS,
-        _medium("io", SparkParity.PARTIAL, "external file I/O"),
-    ),
-}
-
-# ---------------------------------------------------------------------------
-# CALL routines  — keyed by SasChunkMetadata.recognized_call_routines
-# ---------------------------------------------------------------------------
-
-CALL_ROUTINE_RULES: dict[str, SignalSpec] = {
-    "symput": _medium(
-        "macro-var", SparkParity.PARTIAL, "creates a macro variable at run time"
-    ),
-    "symputx": _medium(
-        "macro-var", SparkParity.PARTIAL, "creates a macro variable at run time"
-    ),
-    "execute": _high(
-        "dynamic-code", SparkParity.MANUAL, "CALL EXECUTE generates code at run time"
-    ),
-    "module": _high("interop", SparkParity.MANUAL, "external routine call"),
-    "system": _high("interop", SparkParity.MANUAL, "shells out to the OS"),
-    "tso": _high("interop", SparkParity.MANUAL, "shells out to TSO"),
-    "sortc": _medium("reshape", SparkParity.PARTIAL, "sorts values across columns"),
-    "sortn": _medium("reshape", SparkParity.PARTIAL, "sorts values across columns"),
-}
-
-# ---------------------------------------------------------------------------
-# Global statements  — keyed by SasChunkMetadata.global_statement_keyword
-# ---------------------------------------------------------------------------
-
-GLOBAL_STATEMENT_RULES: dict[str, SignalSpec] = {
-    "let": _low("macro-var", SparkParity.DIRECT, "%LET macro variable"),
-    "global": _low("macro-var", SparkParity.DIRECT, "%GLOBAL declaration"),
-    "local": _low("macro-var", SparkParity.DIRECT, "%LOCAL declaration"),
-    "put": _low("logging", SparkParity.SUPPORTED, "%PUT trace"),
-    "libname": _low("io", SparkParity.SUPPORTED, "library assignment"),
-    "title": _low("reporting", SparkParity.SUPPORTED, "report title"),
-    "footnote": _low("reporting", SparkParity.SUPPORTED, "report footnote"),
-    "ods": _medium("reporting", SparkParity.PARTIAL, "ODS output destination"),
-    # FILENAME is only LOW as a plain path alias; the access-method detectors
-    # (SFTP / EMAIL / URL) add their own MEDIUM signal on top.
-    "filename": _low("io", SparkParity.SUPPORTED, "file reference"),
-}
-
-# ---------------------------------------------------------------------------
-# Chunk kinds  — keyed by SasChunkKind.value
-# ---------------------------------------------------------------------------
-
-KIND_RULES: dict[str, SignalSpec] = {
-    "MACRO_DEFINITION": _high(
-        "macro-def",
-        SparkParity.MANUAL,
-        "%MACRO definition — no Spark equivalent",
-    ),
-    "MACRO_CALL": _medium(
-        "macro-call", SparkParity.PARTIAL, "macro invocation must be resolved"
-    ),
-    "MACRO_CONTROL_FLOW": _high(
-        "macro-control-flow",
-        SparkParity.HARD,
-        "macro-level control flow generates code conditionally",
-    ),
-    "INCLUDE": _medium(
-        "io", SparkParity.PARTIAL, "%INCLUDE pulls in external source"
-    ),
-    "UNKNOWN_BLOCK": _medium(
-        "unparsed", SparkParity.PARTIAL, "unclosed block — parse is incomplete"
-    ),
-    "UNKNOWN_STATEMENT_GROUP": _medium(
-        "unparsed", SparkParity.PARTIAL, "unrecognised statements"
-    ),
-}
-
-# ---------------------------------------------------------------------------
-# Boolean metadata flags  — (attribute name, spec)
-#
-# Each entry names a truthy attribute of SasChunkMetadata that, when set,
-# contributes its spec. List-valued attributes count as set when non-empty.
-# ---------------------------------------------------------------------------
-
-FLAG_RULES: tuple[tuple[str, str, SignalSpec], ...] = (
-    (
-        "symput_scope_hazard",
-        "symput-scope-hazard",
-        _high(
-            "macro-var",
-            SparkParity.MANUAL,
-            "CALL SYMPUT scope hazard — the variable may not outlive the step",
-        ),
-    ),
-    (
-        "contains_computed_goto",
-        "computed-goto",
-        _high(
-            "macro-control-flow",
-            SparkParity.MANUAL,
-            "computed %GOTO — control flow is decided at run time",
-        ),
-    ),
-    (
-        "contains_abort",
-        "abort",
-        _medium(
-            "macro-control-flow", SparkParity.PARTIAL, "%ABORT terminates the job"
-        ),
-    ),
-    (
-        "has_unclosed_block",
-        "unclosed-block",
-        _medium("unparsed", SparkParity.PARTIAL, "unclosed block"),
-    ),
-    (
-        "defines_macros",
-        "defines-macro",
-        _high(
-            "macro-def", SparkParity.MANUAL, "defines a macro — no Spark equivalent"
-        ),
-    ),
-    (
-        "invokes_macros",
-        "invokes-macro",
-        _medium(
-            "macro-call", SparkParity.PARTIAL, "invokes a macro that must be resolved"
-        ),
-    ),
-    (
-        "includes",
-        "include",
-        _medium("io", SparkParity.PARTIAL, "%INCLUDE pulls in external source"),
-    ),
-    (
-        "referenced_macro_vars",
-        "macro-var-reference",
-        _low("macro-var", SparkParity.DIRECT, "macro variable reference"),
-    ),
-)
-
-# ---------------------------------------------------------------------------
-# Detector-found constructs  — keyed by the detector's construct name
-#
-# These cover what SasChunkMetadata does not extract: DATA step ARRAY and DO
-# statements, the MERGE statement, and FILENAME access methods (SFTP / EMAIL /
-# URL). See complexity/detectors.py.
-# ---------------------------------------------------------------------------
-
-DETECTOR_RULES: dict[str, SignalSpec] = {
-    # NOT a Spark ArrayType column. Essentials Ch. 24 is explicit: "In SAS, an
-    # array is not a data structure. An array is just a convenient way of
-    # temporarily defining a group of variables." So the plausible-looking
-    # mapping to an array column plus explode() is wrong — a SAS array aliases
-    # a group of *columns*, and translating it means a wide-to-long
-    # restructure or per-column expressions. The note says so explicitly to
-    # steer a reader (or an LLM) off the wrong mapping.
-    "array": _high(
-        "array",
-        SparkParity.HARD,
-        "ARRAY — aliases a group of columns, not a Spark ArrayType; "
-        "needs wide-to-long restructuring, not explode()",
-    ),
-    "do_loop": _high(
-        "do-loop",
-        SparkParity.HARD,
-        "iterative DO — becomes vectorised columns, explode, or a UDF",
-    ),
-    "do_while": _high(
-        "do-loop", SparkParity.HARD, "DO WHILE — unbounded row-wise iteration"
-    ),
-    "do_until": _high(
-        "do-loop", SparkParity.HARD, "DO UNTIL — unbounded row-wise iteration"
-    ),
-    # Match-merge: a join, but SAS overlays same-named variables from the
-    # last data set read, which a Spark join does not do.
-    "merge": _medium(
-        "merge",
-        SparkParity.PARTIAL,
-        "MERGE with BY — a join, but same-named columns overlay differently",
-    ),
-    # One-to-one merge: no key at all. Essentials Ch. 21 — "There is no key
-    # variable on which to base the merge. Instead, rows are merged implicitly
-    # by row number." A distributed DataFrame has no inherent row order, so
-    # this cannot be expressed as a join; reproducing it means manufacturing an
-    # ordering, which is why it rates HIGH rather than MEDIUM.
-    "merge_no_by": _high(
-        "merge",
-        SparkParity.HARD,
-        "MERGE without BY — pairs rows by position; no Spark equivalent",
-    ),
-    "modify": _medium(
-        "merge", SparkParity.PARTIAL, "MODIFY updates a dataset in place"
-    ),
-    "update": _medium(
-        "merge", SparkParity.PARTIAL, "UPDATE applies a transaction overlay"
-    ),
-    "retain": _medium(
-        "row-state",
-        SparkParity.PARTIAL,
-        "RETAIN carries values across rows — needs a window function",
-    ),
-    "by_group_first_last": _medium(
-        "row-state",
-        SparkParity.PARTIAL,
-        "FIRST./LAST. BY-group flags — need window functions",
-    ),
-    "filename_sftp": _medium(
-        "io-network", SparkParity.PARTIAL, "FILENAME SFTP transfer"
-    ),
-    "filename_ftp": _medium(
-        "io-network", SparkParity.PARTIAL, "FILENAME FTP transfer"
-    ),
-    "filename_email": _medium(
-        "io-network", SparkParity.PARTIAL, "FILENAME EMAIL — sends mail"
-    ),
-    "filename_url": _medium(
-        "io-network", SparkParity.PARTIAL, "FILENAME URL fetch"
-    ),
-    "filename_socket": _medium(
-        "io-network", SparkParity.PARTIAL, "FILENAME SOCKET connection"
-    ),
-    "filename_pipe": _high(
-        "interop", SparkParity.MANUAL, "FILENAME PIPE shells out to the OS"
-    ),
-    "infile": _medium(
-        "io", SparkParity.PARTIAL, "INFILE reads an external raw file"
-    ),
-    "file_output": _medium(
-        "io", SparkParity.PARTIAL, "FILE writes an external raw file"
-    ),
-    "link_return": _high(
-        "procedural", SparkParity.HARD, "LINK/RETURN — procedural subroutine"
-    ),
-    "data_goto": _high(
-        "procedural", SparkParity.HARD, "DATA step GOTO — procedural jump"
-    ),
-}
+def profile_path(target: str) -> Path:
+    """Filesystem path of the bundled profile named *target*."""
+    return PROFILE_DIR / f"{target}.json"
 
 
-# Every catalogue the analyzer consults, for introspection and tests.
-ALL_RULES: dict[str, dict[str, SignalSpec]] = {
-    "proc": PROC_RULES,
-    "component_object": COMPONENT_OBJECT_RULES,
-    "function": FUNCTION_RULES,
-    "call_routine": CALL_ROUTINE_RULES,
-    "global_statement": GLOBAL_STATEMENT_RULES,
-    "kind": KIND_RULES,
-    "detector": DETECTOR_RULES,
-}
+def load_ruleset(
+    target: str | None = None,
+    *,
+    path: str | Path | None = None,
+    use_cache: bool = True,
+) -> RuleSet:
+    """Load a :class:`RuleSet`, resolving the profile per the module docstring.
+
+    Parameters
+    ----------
+    target
+        Profile name under ``complexity/profiles/`` (e.g. ``"pyspark"``).
+    path
+        An explicit profile file, taking precedence over *target*. Lets an
+        operator supply a catalogue this package does not ship.
+    use_cache
+        Reuse a previously parsed rule set for the same source. ``False``
+        re-reads from disk (tests that rewrite a profile use it).
+    """
+    if path is None:
+        path_cfg = app_config.get_typed_value(_CONFIG_SECTION, "rules_path", str)
+        if target is None and path_cfg:
+            path = path_cfg
+
+    if path is not None:
+        resolved = Path(path)
+        key = f"path:{resolved.resolve()}"
+        if not resolved.is_file():
+            raise RuleSetError(f"rule-set profile not found: {resolved}")
+    else:
+        if target is None:
+            target = app_config.get_typed_value(
+                _CONFIG_SECTION, "target", str, DEFAULT_TARGET
+            )
+        resolved = profile_path(str(target))
+        key = f"target:{target}"
+        if not resolved.is_file():
+            known = ", ".join(available_profiles()) or "none"
+            raise RuleSetError(
+                f"unknown complexity target {target!r} "
+                f"(no {resolved.name} in {PROFILE_DIR}); available: {known}"
+            )
+
+    if use_cache and key in _CACHE:
+        return _CACHE[key]
+
+    ruleset = _ruleset_from_doc(_read_profile_doc(resolved), resolved.name)
+    logger.info(
+        f"load_ruleset: target={ruleset.target}  display_name={ruleset.display_name!r}  "
+        f"constructs={ruleset.construct_count}  source={resolved}"
+    )
+    if use_cache:
+        _CACHE[key] = ruleset
+    return ruleset
+
+
+def clear_cache() -> None:
+    """Drop parsed rule sets (mirrors ``app_config.clear_cache``; tests use it)."""
+    _CACHE.clear()

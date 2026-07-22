@@ -7,9 +7,11 @@ on two orthogonal axes:
   variables, MEDIUM for hashing / MERGE / SFTP / mail, HIGH for arrays, DO
   loops, and ``%MACRO`` definitions. Presence-based: a unit's tier is the
   highest tier among the constructs it contains.
-- **SAS -> Spark feature parity** (:class:`SparkParity`) — from ``DIRECT`` (a
-  literal equivalent exists) to ``MANUAL`` (a human must redesign it). A unit's
-  ``translation_difficulty`` is the worst parity among its constructs.
+- **Feature parity with the target language** (:class:`TranslationParity`) —
+  from ``DIRECT`` (a literal equivalent exists) to ``MANUAL`` (a human must
+  redesign it). A unit's ``translation_difficulty`` is the worst parity among
+  its constructs. Which construct earns which rating is per-target data, so the
+  same analysis retargets from Spark SQL to PySpark by switching profile.
 
 Public API:
 
@@ -19,13 +21,15 @@ Public API:
 - :class:`ChunkComplexity`, :class:`BatchComplexity`,
   :class:`CorpusComplexityReport`, :class:`ComplexitySignal` — result models.
   ``CorpusComplexityReport.to_markdown()`` renders a summary table.
-- :class:`ComplexityTier`, :class:`SparkParity` — the two scales, plus the
+- :class:`ComplexityTier`, :class:`TranslationParity` — the two scales, plus the
   :func:`max_tier` / :func:`worst_parity` aggregation helpers.
 - :func:`detect_constructs` — the supplementary ARRAY / DO / MERGE / FILENAME
   scans, usable on their own.
 - :func:`sort_by_complexity` — order scored units hardest-first.
-- :mod:`complexity.rules` — the signal catalogue; edit it to retune tiers and
-  parity ratings without touching the analyzer.
+- :class:`RuleSet` / :func:`load_ruleset` / :func:`available_profiles` — the
+  target-language rule sets, loaded from JSON profiles under
+  ``complexity/profiles/``. Retune tiers and parity ratings, or add a target,
+  by editing or adding a profile — no code change needed.
 
 This package reads the chunker's output and is imported by nobody in the
 pipeline: complexity analysis is standalone, so scoring a corpus never changes
@@ -44,13 +48,20 @@ from .models import (
     ComplexitySignal,
     ComplexityTier,
     CorpusComplexityReport,
-    SparkParity,
+    TranslationParity,
     max_tier,
     parity_rank,
     tier_rank,
     worst_parity,
 )
-from .rules import SignalSpec
+from .rules import (
+    DEFAULT_TARGET,
+    RuleSet,
+    RuleSetError,
+    SignalSpec,
+    available_profiles,
+    load_ruleset,
+)
 
 __all__ = [
     # analyzer
@@ -66,11 +77,16 @@ __all__ = [
     "CorpusComplexityReport",
     # scales + helpers
     "ComplexityTier",
-    "SparkParity",
+    "TranslationParity",
     "max_tier",
     "worst_parity",
     "tier_rank",
     "parity_rank",
-    # catalogue
+    # rule sets / targets
+    "RuleSet",
+    "RuleSetError",
     "SignalSpec",
+    "available_profiles",
+    "load_ruleset",
+    "DEFAULT_TARGET",
 ]

@@ -5,8 +5,11 @@ test_complexity.py — unit tests for the complexity analysis package
 Run:  python -m pytest tests/test_complexity.py -v
 """
 
+import json
 import pathlib
+import shutil
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -15,7 +18,7 @@ from chunker import SasChunkBatcher, SasSemanticChunker
 from complexity import (
     ComplexityAnalyzer,
     ComplexityTier,
-    SparkParity,
+    TranslationParity,
     detect_constructs,
     max_tier,
     sort_by_complexity,
@@ -51,7 +54,7 @@ class TestLowTier(unittest.TestCase):
     def test_macro_variable_is_low(self):
         scored = _only("%let cutoff = 100;\n")
         self.assertEqual(scored.tier, ComplexityTier.LOW)
-        self.assertEqual(scored.translation_difficulty, SparkParity.DIRECT)
+        self.assertEqual(scored.translation_difficulty, TranslationParity.DIRECT)
         self.assertIn("global_statement:let", _names(scored))
 
     def test_simple_proc_sql_is_low(self):
@@ -59,7 +62,7 @@ class TestLowTier(unittest.TestCase):
             "proc sql;\n  create table work.out as select * from work.in;\nquit;\n"
         )
         self.assertEqual(scored.tier, ComplexityTier.LOW)
-        self.assertEqual(scored.translation_difficulty, SparkParity.DIRECT)
+        self.assertEqual(scored.translation_difficulty, TranslationParity.DIRECT)
         self.assertIn("proc:sql", _names(scored))
 
     def test_plain_data_step_is_low(self):
@@ -78,7 +81,7 @@ class TestMediumTier(unittest.TestCase):
     def test_match_merge_with_by_is_medium(self):
         scored = _only("data work.out;\n  merge work.a work.b;\n  by id;\nrun;\n")
         self.assertEqual(scored.tier, ComplexityTier.MEDIUM)
-        self.assertEqual(scored.translation_difficulty, SparkParity.PARTIAL)
+        self.assertEqual(scored.translation_difficulty, TranslationParity.PARTIAL)
         self.assertIn("merge", _names(scored))
         self.assertNotIn("merge_no_by", _names(scored))
 
@@ -127,7 +130,7 @@ class TestHighTier(unittest.TestCase):
             "data work.out;\n  set work.in;\n  array s{12} s1-s12;\n  s{1} = 0;\nrun;\n"
         )
         self.assertEqual(scored.tier, ComplexityTier.HIGH)
-        self.assertEqual(scored.translation_difficulty, SparkParity.HARD)
+        self.assertEqual(scored.translation_difficulty, TranslationParity.HARD)
         self.assertIn("array", _names(scored))
 
     def test_iterative_do_loop_is_high(self):
@@ -156,7 +159,7 @@ class TestHighTier(unittest.TestCase):
             "%macro build(ds=);\n  data out;\n    set &ds;\n  run;\n%mend build;\n"
         )
         self.assertEqual(scored.tier, ComplexityTier.HIGH)
-        self.assertEqual(scored.translation_difficulty, SparkParity.MANUAL)
+        self.assertEqual(scored.translation_difficulty, TranslationParity.MANUAL)
         self.assertIn("kind:MACRO_DEFINITION", _names(scored))
 
     def test_one_to_one_merge_without_by_is_high(self):
@@ -164,7 +167,7 @@ class TestHighTier(unittest.TestCase):
         key variable — there is no Spark join that reproduces it."""
         scored = _only("data work.out;\n  merge work.a work.b;\nrun;\n")
         self.assertEqual(scored.tier, ComplexityTier.HIGH)
-        self.assertEqual(scored.translation_difficulty, SparkParity.HARD)
+        self.assertEqual(scored.translation_difficulty, TranslationParity.HARD)
         self.assertIn("merge_no_by", _names(scored))
         self.assertNotIn("merge", _names(scored))
 
@@ -186,7 +189,7 @@ class TestAggregationRules(unittest.TestCase):
             "  array s{3} s1-s3;\nrun;\n"
         )
         self.assertEqual(scored.tier, ComplexityTier.HIGH)
-        self.assertEqual(scored.translation_difficulty, SparkParity.HARD)
+        self.assertEqual(scored.translation_difficulty, TranslationParity.HARD)
         # Both signals survive — the MEDIUM one is not discarded.
         self.assertIn("merge", _names(scored))
         self.assertIn("array", _names(scored))
@@ -201,7 +204,7 @@ class TestAggregationRules(unittest.TestCase):
 
     def test_helpers_default_to_floor_on_empty(self):
         self.assertEqual(max_tier([]), ComplexityTier.LOW)
-        self.assertEqual(worst_parity([]), SparkParity.DIRECT)
+        self.assertEqual(worst_parity([]), TranslationParity.DIRECT)
 
     def test_helpers_pick_extremes(self):
         self.assertEqual(
@@ -209,8 +212,8 @@ class TestAggregationRules(unittest.TestCase):
             ComplexityTier.HIGH,
         )
         self.assertEqual(
-            worst_parity([SparkParity.DIRECT, SparkParity.MANUAL, SparkParity.PARTIAL]),
-            SparkParity.MANUAL,
+            worst_parity([TranslationParity.DIRECT, TranslationParity.MANUAL, TranslationParity.PARTIAL]),
+            TranslationParity.MANUAL,
         )
 
     def test_repeated_construct_counted_once_in_score(self):
@@ -319,12 +322,14 @@ class TestDetectors(unittest.TestCase):
             "filename a sftp 'x'; filename b email 'y'; filename c url 'z';\n"
             "filename d pipe 'p'; filename e ftp 'q'; filename g socket 'h';\n"
         )
-        for construct in detect_constructs(source):
-            self.assertIn(
-                construct.name,
-                rules.DETECTOR_RULES,
-                f"detector '{construct.name}' has no DETECTOR_RULES entry",
-            )
+        for profile in rules.available_profiles():
+            ruleset = rules.load_ruleset(profile)
+            for construct in detect_constructs(source):
+                self.assertIsNotNone(
+                    ruleset.spec("detector", construct.name),
+                    f"detector '{construct.name}' has no 'detector' entry in "
+                    f"profile {profile!r}",
+                )
 
 
 class TestBatchAggregation(unittest.TestCase):
@@ -342,7 +347,7 @@ class TestBatchAggregation(unittest.TestCase):
         self.assertTrue(report.batches, "expected the two steps to batch together")
         batch = report.batches[0]
         self.assertEqual(batch.tier, ComplexityTier.HIGH)
-        self.assertEqual(batch.translation_difficulty, SparkParity.HARD)
+        self.assertEqual(batch.translation_difficulty, TranslationParity.HARD)
         self.assertEqual(len(batch.members), 2)
         self.assertAlmostEqual(batch.score, sum(m.score for m in batch.members))
         self.assertIn("t.sas", batch.source_files)
@@ -374,7 +379,7 @@ class TestReport(unittest.TestCase):
 
     def test_overall_tier_and_difficulty_are_worst_case(self):
         self.assertEqual(self.report.overall_tier, ComplexityTier.HIGH)
-        self.assertEqual(self.report.overall_difficulty, SparkParity.MANUAL)
+        self.assertEqual(self.report.overall_difficulty, TranslationParity.MANUAL)
 
     def test_total_score_sums_items(self):
         self.assertAlmostEqual(
@@ -468,48 +473,262 @@ class TestAnalyzerOptions(unittest.TestCase):
 
 
 class TestCatalogueIntegrity(unittest.TestCase):
-    def test_every_spec_weight_matches_its_tier(self):
-        expected = {
-            ComplexityTier.LOW: rules.WEIGHT_LOW,
-            ComplexityTier.MEDIUM: rules.WEIGHT_MEDIUM,
-            ComplexityTier.HIGH: rules.WEIGHT_HIGH,
-        }
-        for catalogue_name, catalogue in rules.ALL_RULES.items():
-            for key, spec in catalogue.items():
-                self.assertEqual(
-                    spec.weight,
-                    expected[spec.tier],
-                    f"{catalogue_name}[{key}] weight does not match its tier",
-                )
+    """Every shipped profile must parse and be internally consistent."""
+
+    def test_bundled_profiles_are_discoverable(self):
+        profiles = rules.available_profiles()
+        self.assertIn("sparksql", profiles)
+        self.assertIn("pyspark", profiles)
+
+    def test_every_bundled_profile_loads(self):
+        for name in rules.available_profiles():
+            ruleset = rules.load_ruleset(name)
+            self.assertEqual(ruleset.target, name)
+            self.assertTrue(ruleset.display_name)
+            self.assertGreater(ruleset.construct_count, 0)
 
     def test_every_spec_has_a_category(self):
-        for catalogue_name, catalogue in rules.ALL_RULES.items():
-            for key, spec in catalogue.items():
-                self.assertTrue(
-                    spec.category, f"{catalogue_name}[{key}] has no category"
-                )
+        for name in rules.available_profiles():
+            ruleset = rules.load_ruleset(name)
+            for kind, catalogue in ruleset.constructs.items():
+                for key, spec in catalogue.items():
+                    self.assertTrue(
+                        spec.category, f"{name}:{kind}[{key}] has no category"
+                    )
+            for attr, signal_name, spec in ruleset.flags:
+                self.assertTrue(attr)
+                self.assertTrue(spec.category, f"{name}:flag[{signal_name}]")
+
+    def test_every_profile_covers_all_three_tier_weights(self):
+        for name in rules.available_profiles():
+            ruleset = rules.load_ruleset(name)
+            for tier in ComplexityTier:
+                self.assertIsInstance(ruleset.weight_for(tier), float)
 
     def test_brief_constructs_land_in_their_stated_tiers(self):
-        """The tier assignments the project brief names, asserted directly."""
-        self.assertEqual(
-            rules.PROC_RULES["sql"].tier, ComplexityTier.LOW
-        )
-        self.assertEqual(
-            rules.GLOBAL_STATEMENT_RULES["let"].tier, ComplexityTier.LOW
-        )
-        for key in ("hash",):
+        """The tier assignments the project brief names, asserted directly.
+
+        Tiers describe the SAS side, so they must hold for *every* target —
+        only parity may move between profiles.
+        """
+        for name in rules.available_profiles():
+            rs = rules.load_ruleset(name)
+            self.assertEqual(rs.spec("proc", "sql").tier, ComplexityTier.LOW, name)
             self.assertEqual(
-                rules.COMPONENT_OBJECT_RULES[key].tier, ComplexityTier.MEDIUM
+                rs.spec("global_statement", "let").tier, ComplexityTier.LOW, name
             )
-        for key in ("merge", "filename_sftp", "filename_email"):
             self.assertEqual(
-                rules.DETECTOR_RULES[key].tier, ComplexityTier.MEDIUM
+                rs.spec("component_object", "hash").tier, ComplexityTier.MEDIUM, name
             )
-        for key in ("array", "do_loop", "do_while", "do_until"):
-            self.assertEqual(rules.DETECTOR_RULES[key].tier, ComplexityTier.HIGH)
+            for key in ("merge", "filename_sftp", "filename_email"):
+                self.assertEqual(
+                    rs.spec("detector", key).tier,
+                    ComplexityTier.MEDIUM,
+                    f"{name}:{key}",
+                )
+            for key in ("array", "do_loop", "do_while", "do_until", "merge_no_by"):
+                self.assertEqual(
+                    rs.spec("detector", key).tier, ComplexityTier.HIGH, f"{name}:{key}"
+                )
+            self.assertEqual(
+                rs.constructs["kind"]["MACRO_DEFINITION"].tier,
+                ComplexityTier.HIGH,
+                name,
+            )
+
+    def test_hashing_functions_are_supported_in_spark_sql(self):
+        """Spark SQL ships md5/sha1/sha2/crc32/xxhash64, so the SAS hashing
+        functions are a mechanical rewrite, not a semantic mismatch. The hash
+        *object* is a lookup table and stays PARTIAL."""
+        rs = rules.load_ruleset("sparksql")
+        self.assertEqual(rs.spec("function", "md5").parity, TranslationParity.SUPPORTED)
         self.assertEqual(
-            rules.KIND_RULES["MACRO_DEFINITION"].tier, ComplexityTier.HIGH
+            rs.spec("function", "sha256").parity, TranslationParity.SUPPORTED
         )
+        self.assertEqual(
+            rs.spec("component_object", "hash").parity, TranslationParity.PARTIAL
+        )
+
+
+class TestRetargeting(unittest.TestCase):
+    """The same analysis, remapped to another output language."""
+
+    MACRO = "%macro build(ds=);\n  data o;\n    set &ds;\n  run;\n%mend build;\n"
+    DO_STEP = (
+        "data work.out;\n  set work.in;\n  do i = 1 to 10;\n    t + i;\n  end;\nrun;\n"
+    )
+
+    def test_default_target_is_spark_sql(self):
+        self.assertEqual(ComplexityAnalyzer().target, rules.DEFAULT_TARGET)
+        self.assertEqual(ComplexityAnalyzer().target, "sparksql")
+
+    def test_macro_definition_is_manual_for_sql_but_hard_for_pyspark(self):
+        """Pure SQL has no procedural host language; PySpark does, so a %MACRO
+        maps onto a parameterised Python function."""
+        sql = _only(self.MACRO, target="sparksql")
+        py = _only(self.MACRO, target="pyspark")
+        self.assertEqual(sql.translation_difficulty, TranslationParity.MANUAL)
+        self.assertEqual(py.translation_difficulty, TranslationParity.HARD)
+        # The SAS-side tier is a property of the source, not the target.
+        self.assertEqual(sql.tier, py.tier)
+
+    def test_do_loop_parity_moves_but_tier_does_not(self):
+        sql = _only(self.DO_STEP, target="sparksql")
+        py = _only(self.DO_STEP, target="pyspark")
+        self.assertEqual(sql.tier, ComplexityTier.HIGH)
+        self.assertEqual(py.tier, ComplexityTier.HIGH)
+        self.assertEqual(sql.translation_difficulty, TranslationParity.HARD)
+        self.assertEqual(py.translation_difficulty, TranslationParity.PARTIAL)
+
+    def test_derived_profile_inherits_everything_it_does_not_restate(self):
+        sql = rules.load_ruleset("sparksql")
+        py = rules.load_ruleset("pyspark")
+        # pyspark.json never mentions PROC SORT; it inherits the rating.
+        self.assertEqual(
+            py.spec("proc", "sort").parity, sql.spec("proc", "sort").parity
+        )
+        self.assertEqual(py.spec("detector", "array").tier, ComplexityTier.HIGH)
+        # It restates array's note, so that one differs.
+        self.assertNotEqual(
+            py.spec("detector", "array").note, sql.spec("detector", "array").note
+        )
+        # Inheritance must not drop constructs.
+        self.assertGreaterEqual(py.construct_count, sql.construct_count)
+
+    def test_results_and_report_record_their_target(self):
+        report = _analyze(self.MACRO, target="pyspark")
+        self.assertEqual(report.target, "pyspark")
+        self.assertEqual(report.target_display, "PySpark")
+        self.assertTrue(all(c.target == "pyspark" for c in report.chunks))
+        self.assertIn("PySpark", report.to_markdown())
+
+    def test_explicit_ruleset_wins_over_target(self):
+        sql = rules.load_ruleset("sparksql")
+        analyzer = ComplexityAnalyzer(target="pyspark", ruleset=sql)
+        self.assertEqual(analyzer.target, "sparksql")
+
+
+class TestRuleSetLoading(unittest.TestCase):
+    """JSON profile loading, inheritance, and validation."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _write(self, doc) -> str:
+        path = pathlib.Path(self.tmp) / "custom.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        return str(path)
+
+    def _minimal(self, **over):
+        doc = {
+            "target": "custom",
+            "display_name": "Custom Target",
+            "weights": {"LOW": 2.0, "MEDIUM": 4.0, "HIGH": 8.0},
+            "constructs": {
+                "detector": {
+                    "array": {
+                        "category": "array",
+                        "tier": "MEDIUM",
+                        "parity": "SUPPORTED",
+                        "note": "arrays are easy here",
+                    }
+                }
+            },
+        }
+        doc.update(over)
+        return doc
+
+    def test_custom_profile_file_overrides_the_catalogue(self):
+        path = self._write(self._minimal())
+        scored = _only(
+            "data o;\n  set a;\n  array s{3} s1-s3;\nrun;\n",
+            rules_path=path,
+        )
+        # This profile rates ARRAY as MEDIUM/SUPPORTED, not HIGH/HARD.
+        self.assertEqual(scored.tier, ComplexityTier.MEDIUM)
+        self.assertEqual(scored.translation_difficulty, TranslationParity.SUPPORTED)
+        self.assertEqual(scored.target, "custom")
+
+    def test_profile_weights_are_used_for_scoring(self):
+        path = self._write(self._minimal())
+        scored = _only(
+            "data o;\n  set a;\n  array s{3} s1-s3;\nrun;\n", rules_path=path
+        )
+        self.assertEqual(scored.score, 4.0)  # the profile's MEDIUM weight
+
+    def test_construct_groups_expand(self):
+        doc = self._minimal(
+            construct_groups=[
+                {
+                    "kind": "function",
+                    "names": ["md5", "sha256"],
+                    "category": "hashing",
+                    "tier": "LOW",
+                    "parity": "DIRECT",
+                }
+            ]
+        )
+        ruleset = rules.load_ruleset(path=self._write(doc), use_cache=False)
+        self.assertEqual(ruleset.spec("function", "md5").tier, ComplexityTier.LOW)
+        self.assertEqual(ruleset.spec("function", "sha256").tier, ComplexityTier.LOW)
+
+    def test_unknown_target_raises_with_available_names(self):
+        with self.assertRaises(rules.RuleSetError) as ctx:
+            rules.load_ruleset("klingon")
+        self.assertIn("klingon", str(ctx.exception))
+        self.assertIn("sparksql", str(ctx.exception))
+
+    def test_missing_profile_file_raises(self):
+        with self.assertRaises(rules.RuleSetError):
+            rules.load_ruleset(path=str(pathlib.Path(self.tmp) / "nope.json"))
+
+    def test_malformed_json_raises(self):
+        path = pathlib.Path(self.tmp) / "bad.json"
+        path.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(rules.RuleSetError):
+            rules.load_ruleset(path=str(path), use_cache=False)
+
+    def test_invalid_tier_names_the_offending_key(self):
+        doc = self._minimal()
+        doc["constructs"]["detector"]["array"]["tier"] = "EXTREME"
+        with self.assertRaises(rules.RuleSetError) as ctx:
+            rules.load_ruleset(path=self._write(doc), use_cache=False)
+        message = str(ctx.exception)
+        self.assertIn("EXTREME", message)
+        self.assertIn("array", message)
+
+    def test_invalid_parity_is_rejected(self):
+        doc = self._minimal()
+        doc["constructs"]["detector"]["array"]["parity"] = "TRIVIAL"
+        with self.assertRaises(rules.RuleSetError):
+            rules.load_ruleset(path=self._write(doc), use_cache=False)
+
+    def test_unknown_construct_kind_is_rejected(self):
+        doc = self._minimal()
+        doc["constructs"]["procz"] = {}
+        with self.assertRaises(rules.RuleSetError) as ctx:
+            rules.load_ruleset(path=self._write(doc), use_cache=False)
+        self.assertIn("procz", str(ctx.exception))
+
+    def test_missing_required_key_is_rejected(self):
+        doc = self._minimal()
+        del doc["constructs"]["detector"]["array"]["parity"]
+        with self.assertRaises(rules.RuleSetError) as ctx:
+            rules.load_ruleset(path=self._write(doc), use_cache=False)
+        self.assertIn("parity", str(ctx.exception))
+
+    def test_extends_unknown_profile_is_rejected(self):
+        doc = self._minimal(extends="does-not-exist")
+        with self.assertRaises(rules.RuleSetError) as ctx:
+            rules.load_ruleset(path=self._write(doc), use_cache=False)
+        self.assertIn("does-not-exist", str(ctx.exception))
+
+    def test_self_extends_is_rejected_rather_than_looping(self):
+        doc = self._minimal(target="sparksql", extends="sparksql")
+        with self.assertRaises(rules.RuleSetError) as ctx:
+            rules.load_ruleset(path=self._write(doc), use_cache=False)
+        self.assertIn("circular", str(ctx.exception))
 
 
 if __name__ == "__main__":

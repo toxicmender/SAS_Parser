@@ -1,0 +1,120 @@
+{
+  "target": "pyspark",
+  "display_name": "PySpark",
+  "extends": "sparksql",
+  "description": "SAS -> PySpark translation complexity. Extends the Spark SQL profile and restates only the constructs that rate differently when a full Python host language surrounds the DataFrame API. Tiers are unchanged throughout — the data-complexity of a SAS construct does not depend on what it is being translated into; only the parity ratings move.",
+  "constructs": {
+    "kind": {
+      "MACRO_DEFINITION": {
+        "category": "macro-def",
+        "tier": "HIGH",
+        "parity": "HARD",
+        "note": "%MACRO definition -> a parameterised Python function; a real mapping exists here, unlike in pure SQL, but the code-generation semantics still have to be unwound"
+      },
+      "MACRO_CONTROL_FLOW": {
+        "category": "macro-control-flow",
+        "tier": "HIGH",
+        "parity": "PARTIAL",
+        "note": "macro-level control flow -> ordinary Python if/for around DataFrame calls"
+      },
+      "MACRO_CALL": {
+        "category": "macro-call",
+        "tier": "MEDIUM",
+        "parity": "SUPPORTED",
+        "note": "macro invocation -> a Python function call"
+      }
+    },
+    "detector": {
+      "do_loop": {
+        "category": "do-loop",
+        "tier": "HIGH",
+        "parity": "PARTIAL",
+        "note": "iterative DO -> a Python loop over columns, or a pandas UDF; still a rewrite, but expressible in the host language"
+      },
+      "do_while": {
+        "category": "do-loop",
+        "tier": "HIGH",
+        "parity": "HARD",
+        "note": "DO WHILE -> unbounded row-wise iteration; a pandas UDF can express it, at a cost"
+      },
+      "do_until": {
+        "category": "do-loop",
+        "tier": "HIGH",
+        "parity": "HARD",
+        "note": "DO UNTIL -> unbounded row-wise iteration; a pandas UDF can express it, at a cost"
+      },
+      "array": {
+        "category": "array",
+        "tier": "HIGH",
+        "parity": "HARD",
+        "note": "ARRAY still aliases a group of columns, not a Spark ArrayType — but a Python loop over df.columns expresses the wide-to-long rewrite directly"
+      },
+      "link_return": {
+        "category": "procedural",
+        "tier": "HIGH",
+        "parity": "PARTIAL",
+        "note": "LINK/RETURN -> a Python helper function"
+      }
+    },
+    "call_routine": {
+      "execute": {
+        "category": "dynamic-code",
+        "tier": "HIGH",
+        "parity": "HARD",
+        "note": "CALL EXECUTE generates code at run time; Python can build and run the equivalent, so this is a rewrite rather than a redesign"
+      },
+      "module": {
+        "category": "interop",
+        "tier": "HIGH",
+        "parity": "HARD",
+        "note": "external routine call -> a Python library call, where an equivalent library exists"
+      }
+    },
+    "function": {
+      "symget": {
+        "category": "macro-runtime",
+        "tier": "HIGH",
+        "parity": "HARD",
+        "note": "runtime macro-variable read -> a Python variable, once the macro layer is unwound"
+      },
+      "resolve": {
+        "category": "macro-runtime",
+        "tier": "HIGH",
+        "parity": "HARD",
+        "note": "resolves macro code at run time -> Python string building plus an explicit call"
+      },
+      "dosubl": {
+        "category": "macro-runtime",
+        "tier": "HIGH",
+        "parity": "HARD",
+        "note": "submits SAS code mid-step -> a Python function call at the same point"
+      }
+    },
+    "proc": {
+      "fcmp": {
+        "category": "procedural",
+        "tier": "HIGH",
+        "parity": "HARD",
+        "note": "PROC FCMP defines custom functions -> a Python function, registered as a UDF where it is used in an expression"
+      }
+    }
+  },
+  "flags": [
+    {
+      "attr": "defines_macros",
+      "name": "defines-macro",
+      "category": "macro-def",
+      "tier": "HIGH",
+      "parity": "HARD",
+      "note": "defines a macro -> a parameterised Python function"
+    },
+    {
+      "attr": "invokes_macros",
+      "name": "invokes-macro",
+      "category": "macro-call",
+      "tier": "MEDIUM",
+      "parity": "SUPPORTED",
+      "note": "invokes a macro -> a Python function call"
+    }
+  ]
+}

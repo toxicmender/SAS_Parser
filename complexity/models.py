@@ -23,8 +23,15 @@ class ComplexityTier(StrEnum):
     HIGH = "HIGH"
 
 
-class SparkParity(StrEnum):
-    """How well a SAS construct maps onto Spark SQL / PySpark.
+class TranslationParity(StrEnum):
+    """How well a SAS construct maps onto **the target language**.
+
+    The scale is language-neutral; which construct earns which rating is
+    per-target data, supplied by a :class:`~complexity.rules.RuleSet` loaded
+    from a JSON profile. The same construct can legitimately rate differently
+    against Spark SQL and against PySpark — a ``%MACRO`` definition has no
+    counterpart in pure SQL (``MANUAL``) but maps onto a parameterised Python
+    function (``HARD``).
 
     Ordered DIRECT < SUPPORTED < PARTIAL < HARD < MANUAL by
     :data:`_PARITY_RANK`, from "translates one-for-one" to "no equivalent
@@ -34,18 +41,15 @@ class SparkParity(StrEnum):
         A literal equivalent exists (``PROC SQL`` select -> ``spark.sql``).
     SUPPORTED
         Idiomatic equivalent exists, mechanical rewrite (``PROC SORT`` ->
-        ``orderBy``).
+        ``ORDER BY`` / ``orderBy``).
     PARTIAL
-        Equivalent exists but semantics differ enough to need care (SAS
-        ``MERGE`` is not a plain join — unmatched-key and overlay rules
-        differ from ``DataFrame.join``).
+        Equivalent exists but semantics differ enough to need care (a SAS
+        match-merge is not a plain join — same-named columns overlay).
     HARD
         No direct equivalent; needs restructuring into a different paradigm
-        (row-wise ``DO`` loops -> vectorised columns, ``explode``, or a UDF).
+        (row-wise ``DO`` loops -> vectorised columns or a UDF).
     MANUAL
-        Outside the translation target entirely; a human decision is
-        required (``%MACRO`` definitions have no Spark counterpart — they
-        become parameterised Python functions or templating).
+        Outside the target entirely; a human decision is required.
     """
 
     DIRECT = "DIRECT"
@@ -64,12 +68,12 @@ _TIER_RANK: dict[ComplexityTier, int] = {
     ComplexityTier.HIGH: 2,
 }
 
-_PARITY_RANK: dict[SparkParity, int] = {
-    SparkParity.DIRECT: 0,
-    SparkParity.SUPPORTED: 1,
-    SparkParity.PARTIAL: 2,
-    SparkParity.HARD: 3,
-    SparkParity.MANUAL: 4,
+_PARITY_RANK: dict[TranslationParity, int] = {
+    TranslationParity.DIRECT: 0,
+    TranslationParity.SUPPORTED: 1,
+    TranslationParity.PARTIAL: 2,
+    TranslationParity.HARD: 3,
+    TranslationParity.MANUAL: 4,
 }
 
 
@@ -78,7 +82,7 @@ def tier_rank(tier: ComplexityTier) -> int:
     return _TIER_RANK[tier]
 
 
-def parity_rank(parity: SparkParity) -> int:
+def parity_rank(parity: TranslationParity) -> int:
     """Sort key for *parity* (DIRECT=0 < ... < MANUAL=4)."""
     return _PARITY_RANK[parity]
 
@@ -93,9 +97,9 @@ def max_tier(tiers: list[ComplexityTier]) -> ComplexityTier:
     return max(tiers, key=tier_rank, default=ComplexityTier.LOW)
 
 
-def worst_parity(parities: list[SparkParity]) -> SparkParity:
+def worst_parity(parities: list[TranslationParity]) -> TranslationParity:
     """The least-translatable parity in *parities*; DIRECT for an empty list."""
-    return max(parities, key=parity_rank, default=SparkParity.DIRECT)
+    return max(parities, key=parity_rank, default=TranslationParity.DIRECT)
 
 
 class ComplexitySignal(BaseModel):
@@ -137,7 +141,7 @@ class ComplexitySignal(BaseModel):
     name: str
     category: str
     tier: ComplexityTier
-    parity: SparkParity
+    parity: TranslationParity
     weight: float = 1.0
     evidence: str = ""
     note: str = ""
@@ -162,9 +166,12 @@ class _ComplexityBase(BaseModel):
 
     tier: ComplexityTier = ComplexityTier.LOW
     score: float = 0.0
-    translation_difficulty: SparkParity = SparkParity.DIRECT
+    translation_difficulty: TranslationParity = TranslationParity.DIRECT
     signals: list[ComplexitySignal] = Field(default_factory=list)
     rationale: str = ""
+    # Which rule-set profile produced this verdict. A parity rating is only
+    # meaningful against a named target, so every result carries its own.
+    target: str = ""
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -222,6 +229,11 @@ class CorpusComplexityReport(BaseModel):
     source_ids: list[str] = Field(default_factory=list)
     chunks: list[ChunkComplexity] = Field(default_factory=list)
     batches: list[BatchComplexity] = Field(default_factory=list)
+    # The rule-set profile every unit below was scored against, and its
+    # human-readable name — reports state the target so two reports scored
+    # against different languages are never mistaken for comparable.
+    target: str = ""
+    target_display: str = ""
 
     @property
     def items(self) -> list[ChunkComplexity | BatchComplexity]:
@@ -245,7 +257,7 @@ class CorpusComplexityReport(BaseModel):
 
     @computed_field  # type: ignore[prop-decorator]
     @property
-    def overall_difficulty(self) -> SparkParity:
+    def overall_difficulty(self) -> TranslationParity:
         """Worst Spark parity anywhere in the corpus."""
         return worst_parity([item.translation_difficulty for item in self.items])
 
@@ -277,6 +289,7 @@ class CorpusComplexityReport(BaseModel):
         lines = [
             "# SAS chunk complexity report",
             "",
+            f"- Target: **{self.target_display or self.target or 'unknown'}**",
             f"- Sources: {', '.join(self.source_ids) or 'none'}",
             f"- Scored units: {len(self.items)} "
             f"({len(self.batches)} batch(es), {len(self.chunks)} chunk(s))",

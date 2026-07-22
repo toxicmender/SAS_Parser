@@ -19,9 +19,13 @@ when passed to the pipeline, injects per-item guidance relevant to each work
 item's constructs — prompted to the LLM but never persisted (see invariant 5).
 
 A fifth, **complexity**, scores chunks and batches for migration effort on two
-axes — a LOW/MEDIUM/HIGH data-complexity tier and a SAS → Spark feature-parity
-rating — for triage and estimation. It reads the chunker's output and is
-deliberately not wired into the pipeline.
+axes — a LOW/MEDIUM/HIGH data-complexity tier (a property of the SAS source)
+and a feature-parity rating against the output language (a property of the
+SAS/target pair) — for triage and estimation. The catalogue that assigns those
+ratings is JSON data under `complexity/profiles/`, one file per target, so the
+analysis retargets from Spark SQL to PySpark (or anything else) without a code
+change. It reads the chunker's output and is deliberately not wired into the
+pipeline.
 
 ```
                  +----------------------+
@@ -203,22 +207,34 @@ validation/
 
 complexity/
   models.py             Pydantic models: ComplexityTier (LOW/MEDIUM/HIGH) and
-                        SparkParity (DIRECT..MANUAL) — ordered scales with
-                        max_tier() / worst_parity() helpers — ComplexitySignal,
+                        TranslationParity (DIRECT..MANUAL) — ordered scales
+                        with max_tier() / worst_parity() helpers —
+                        ComplexitySignal (evidence vs catalogue note),
                         ChunkComplexity, BatchComplexity,
                         CorpusComplexityReport (computed tier_counts /
                         overall_tier / overall_difficulty; to_markdown()).
-  rules.py              The signal catalogue: construct -> (category, tier,
-                        parity, weight), keyed by PROC, component object,
-                        function, CALL routine, global statement, chunk kind,
-                        metadata flag, and detector name. Pure data; the single
-                        place to retune the analysis. An allowlist: an
-                        unlisted construct contributes no signal at all.
-                        Ratings are grounded in reference_docs/ and the
-                        load-bearing ones quote their source in a comment (a
-                        SAS ARRAY is "not a data structure"; MERGE with vs
-                        without BY is a join vs a positional pairing; LAG
-                        returns "values from a queue", not the previous row).
+                        Every result records the target it was scored against.
+  rules.py              RuleSet + the JSON profile loader: resolution
+                        (explicit path > target > config > default),
+                        "extends" inheritance with per-construct deep merge,
+                        construct_groups shorthand, schema validation
+                        (RuleSetError names the offending key), and caching.
+                        Holds no ratings of its own.
+  profiles/*.json       The catalogues themselves, one per target language:
+                        construct -> (category, tier, parity, note), keyed by
+                        PROC, component object, function, CALL routine, global
+                        statement, chunk kind, metadata flag, and detector
+                        name. An allowlist: an unlisted construct contributes
+                        no signal at all. Tiers are target-independent (they
+                        describe the SAS side); only parity moves between
+                        profiles. sparksql.json is the default; pyspark.json
+                        extends it and restates only what differs. Ratings are
+                        grounded in reference_docs/ plus the published Spark
+                        SQL function reference, and the load-bearing ones
+                        quote their source in the entry's note (a SAS ARRAY is
+                        "not a data structure"; MERGE with vs without BY is a
+                        join vs a positional pairing; LAG returns "values from
+                        a queue", not the previous row).
   detectors.py          Regex scans for what SasChunkMetadata does not extract
                         — ARRAY, DO loops, MERGE/UPDATE/MODIFY, RETAIN,
                         FIRST./LAST., FILENAME access methods (SFTP/FTP/EMAIL/

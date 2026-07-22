@@ -50,6 +50,11 @@ include = [
     "complexity*",
 ]
 
+[tool.setuptools.package-data]
+# complexity/profiles/*.json IS the rule catalogue — the package scores nothing
+# without it, so the JSON must ship inside the wheel alongside the code.
+complexity = ["profiles/*.json"]
+
 [tool.coverage.run]
 # Bare `--cov` (as CI passes it) measures exactly these packages; without this
 # it would measure everything imported, tests included, inflating the total.

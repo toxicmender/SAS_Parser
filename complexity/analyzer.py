@@ -26,6 +26,7 @@ Logger name: ``complexity.analyzer``.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Iterable
 
 import app_config
@@ -38,7 +39,6 @@ from chunker.models import (
     SasCorpus,
 )
 
-from . import rules
 from .detectors import detect_constructs
 from .models import (
     BatchComplexity,
@@ -46,12 +46,12 @@ from .models import (
     ComplexitySignal,
     ComplexityTier,
     CorpusComplexityReport,
-    SparkParity,
+    TranslationParity,
     max_tier,
     tier_rank,
     worst_parity,
 )
-from .rules import SignalSpec
+from .rules import RuleSet, SignalSpec, load_ruleset
 
 logger = logging.getLogger(__name__)
 
@@ -64,11 +64,22 @@ class ComplexityAnalyzer:
 
     Parameters
     ----------
+    target : str | None
+        Rule-set profile to score against — ``"sparksql"``, ``"pyspark"``, or
+        any name under ``complexity/profiles/``. ``None`` (default) reads
+        ``complexity.target`` from config.json, then falls back to
+        :data:`complexity.rules.DEFAULT_TARGET`.
+    rules_path : str | Path | None
+        An explicit profile file, taking precedence over *target*. Lets an
+        operator supply a catalogue this package does not ship.
+    ruleset : RuleSet | None
+        A pre-built rule set, bypassing profile resolution entirely. Wins over
+        both *target* and *rules_path*.
     weight_low, weight_medium, weight_high : float | None
         Override the per-tier score weights. ``None`` (default) reads
-        ``complexity.weight_*`` from config.json, falling back to the
-        catalogue defaults (:data:`complexity.rules.WEIGHT_LOW` and friends).
-        Weights only rank units within a tier — they can never change a tier.
+        ``complexity.weight_*`` from config.json, then the profile's own
+        ``weights``. Weights only rank units within a tier — they can never
+        change a tier.
     use_detectors : bool
         Run the supplementary regex scans (:mod:`complexity.detectors`) for
         ARRAY / DO / MERGE / FILENAME-method constructs. Default ``True``;
@@ -78,28 +89,48 @@ class ComplexityAnalyzer:
 
     def __init__(
         self,
+        target: str | None = None,
         *,
+        rules_path: "str | Path | None" = None,
+        ruleset: RuleSet | None = None,
         weight_low: float | None = None,
         weight_medium: float | None = None,
         weight_high: float | None = None,
         use_detectors: bool = True,
     ) -> None:
+        self._rules = ruleset or load_ruleset(target, path=rules_path)
+        # Weight precedence: explicit argument > config.json > the profile's
+        # own weights (which themselves default to the module constants).
         self._weights: dict[ComplexityTier, float] = {
             ComplexityTier.LOW: _resolve_weight(
-                weight_low, "weight_low", rules.WEIGHT_LOW
+                weight_low, "weight_low", self._rules.weight_for(ComplexityTier.LOW)
             ),
             ComplexityTier.MEDIUM: _resolve_weight(
-                weight_medium, "weight_medium", rules.WEIGHT_MEDIUM
+                weight_medium,
+                "weight_medium",
+                self._rules.weight_for(ComplexityTier.MEDIUM),
             ),
             ComplexityTier.HIGH: _resolve_weight(
-                weight_high, "weight_high", rules.WEIGHT_HIGH
+                weight_high, "weight_high", self._rules.weight_for(ComplexityTier.HIGH)
             ),
         }
         self._use_detectors = use_detectors
         logger.info(
-            f"ComplexityAnalyzer  weights={ {t.value: w for t, w in self._weights.items()} }  "
+            f"ComplexityAnalyzer  target={self._rules.target}  "
+            f"constructs={self._rules.construct_count}  "
+            f"weights={ {t.value: w for t, w in self._weights.items()} }  "
             f"detectors={'on' if use_detectors else 'off'}"
         )
+
+    @property
+    def ruleset(self) -> RuleSet:
+        """The rule set this analyzer scores against."""
+        return self._rules
+
+    @property
+    def target(self) -> str:
+        """Name of the target-language profile in use."""
+        return self._rules.target
 
     # ------------------------------------------------------------------
     # Public API
@@ -120,6 +151,7 @@ class ComplexityAnalyzer:
             translation_difficulty=difficulty,
             signals=signals,
             rationale=_rationale(tier, difficulty, signals),
+            target=self._rules.target,
         )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"analyze_chunk: {result}")
@@ -146,6 +178,7 @@ class ComplexityAnalyzer:
             translation_difficulty=difficulty,
             signals=signals,
             rationale=_rationale(tier, difficulty, signals),
+            target=self._rules.target,
         )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"analyze_batch: {result}")
@@ -183,6 +216,8 @@ class ComplexityAnalyzer:
             source_ids=source_ids if source_ids is not None else seen_sources,
             chunks=chunks,
             batches=batches,
+            target=self._rules.target,
+            target_display=self._rules.display_name,
         )
         logger.info(f"analyze_items: {report}")
         return report
@@ -214,29 +249,37 @@ class ComplexityAnalyzer:
     def _signals_for_chunk(self, chunk: SasChunk) -> list[ComplexitySignal]:
         """Every signal a chunk raises, from metadata and (optionally) detectors."""
         raw: list[ComplexitySignal] = list(
-            _metadata_signals(chunk.kind.value, chunk.metadata)
+            _metadata_signals(
+                self._rules, chunk.kind.value, chunk.metadata, self._weights
+            )
         )
         if self._use_detectors:
             for construct in detect_constructs(chunk.text):
-                spec = rules.DETECTOR_RULES.get(construct.name)
+                spec = self._rules.spec("detector", construct.name)
                 if spec is None:
                     # A detector fired for a construct with no catalogue entry:
                     # a wiring bug, not a property of the SAS source. Log it and
                     # skip rather than inventing a classification.
                     logger.warning(
                         f"_signals_for_chunk: detector '{construct.name}' has no "
-                        f"entry in rules.DETECTOR_RULES; signal dropped "
-                        f"(chunk={chunk.chunk_id})"
+                        f"'detector' entry in target {self._rules.target!r}; signal "
+                        f"dropped (chunk={chunk.chunk_id})"
                     )
                     continue
                 raw.append(
-                    _signal(construct.name, spec, construct.evidence, "detector")
+                    _signal(
+                        construct.name,
+                        spec,
+                        construct.evidence,
+                        "detector",
+                        self._weights[spec.tier],
+                    )
                 )
         return _merge_signals(raw)
 
     def _aggregate(
         self, signals: list[ComplexitySignal]
-    ) -> tuple[ComplexityTier, SparkParity, float]:
+    ) -> tuple[ComplexityTier, TranslationParity, float]:
         """Fold signals into (tier, difficulty, score) by the module's two rules."""
         tier = max_tier([s.tier for s in signals])
         difficulty = worst_parity([s.parity for s in signals])
@@ -253,7 +296,7 @@ def _resolve_weight(explicit: float | None, key: str, default: float) -> float:
 
 
 def _signal(
-    name: str, spec: SignalSpec, evidence: str, source: str
+    name: str, spec: SignalSpec, evidence: str, source: str, weight: float
 ) -> ComplexitySignal:
     """Build a :class:`ComplexitySignal` from a catalogue *spec*.
 
@@ -266,7 +309,7 @@ def _signal(
         category=spec.category,
         tier=spec.tier,
         parity=spec.parity,
-        weight=spec.weight,
+        weight=weight,
         evidence=evidence,
         note=spec.note,
         source=source,
@@ -274,9 +317,10 @@ def _signal(
 
 
 def _lookup_many(
-    prefix: str,
+    ruleset: RuleSet,
+    construct_kind: str,
     names: Iterable[str],
-    catalogue: dict[str, SignalSpec],
+    weights: dict[ComplexityTier, float],
 ) -> list[ComplexitySignal]:
     """Signals for every *name* that has a *catalogue* entry.
 
@@ -286,45 +330,56 @@ def _lookup_many(
     """
     out: list[ComplexitySignal] = []
     for name in names:
-        spec = catalogue.get(name.lower())
+        spec = ruleset.spec(construct_kind, name)
         if spec is not None:
             out.append(
-                _signal(f"{prefix}:{name.lower()}", spec, "", "metadata")
+                _signal(
+                    f"{construct_kind}:{name.lower()}",
+                    spec,
+                    "",
+                    "metadata",
+                    weights[spec.tier],
+                )
             )
     return out
 
 
 def _metadata_signals(
-    kind: str, meta: SasChunkMetadata
+    ruleset: RuleSet,
+    kind: str,
+    meta: SasChunkMetadata,
+    weights: dict[ComplexityTier, float],
 ) -> list[ComplexitySignal]:
     """Signals derivable from a chunk's kind and extracted metadata."""
     signals: list[ComplexitySignal] = []
 
-    kind_spec = rules.KIND_RULES.get(kind)
+    kind_spec = ruleset.constructs.get("kind", {}).get(kind)
     if kind_spec is not None:
-        signals.append(_signal(f"kind:{kind}", kind_spec, "", "metadata"))
+        signals.append(
+            _signal(
+                f"kind:{kind}", kind_spec, "", "metadata", weights[kind_spec.tier]
+            )
+        )
 
     if meta.proc_name:
-        signals += _lookup_many("proc", [meta.proc_name], rules.PROC_RULES)
+        signals += _lookup_many(ruleset, "proc", [meta.proc_name], weights)
     signals += _lookup_many(
-        "component_object", meta.component_objects, rules.COMPONENT_OBJECT_RULES
+        ruleset, "component_object", meta.component_objects, weights
     )
+    signals += _lookup_many(ruleset, "function", meta.recognized_functions, weights)
     signals += _lookup_many(
-        "function", meta.recognized_functions, rules.FUNCTION_RULES
-    )
-    signals += _lookup_many(
-        "call_routine", meta.recognized_call_routines, rules.CALL_ROUTINE_RULES
+        ruleset, "call_routine", meta.recognized_call_routines, weights
     )
     if meta.global_statement_keyword:
         signals += _lookup_many(
-            "global_statement",
-            [meta.global_statement_keyword],
-            rules.GLOBAL_STATEMENT_RULES,
+            ruleset, "global_statement", [meta.global_statement_keyword], weights
         )
 
-    for attr, name, spec in rules.FLAG_RULES:
+    for attr, name, spec in ruleset.flags:
         if getattr(meta, attr, None):
-            signals.append(_signal(name, spec, "", "metadata"))
+            signals.append(
+                _signal(name, spec, "", "metadata", weights[spec.tier])
+            )
 
     return signals
 
@@ -358,7 +413,7 @@ def _merge_signals(
 
 def _rationale(
     tier: ComplexityTier,
-    difficulty: SparkParity,
+    difficulty: TranslationParity,
     signals: list[ComplexitySignal],
 ) -> str:
     """One-line explanation of a verdict, naming the signals that drove it."""
