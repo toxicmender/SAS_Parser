@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import time
 import warnings
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import app_config
@@ -1306,7 +1307,7 @@ class SasLLMPipeline:
             feedback = [self._validation_feedback_message(result)]
 
     def _resume_state(
-        self, items: list[SasBatch | SasChunk], thread_id: str
+        self, items: Sequence[SasBatch | SasChunk], thread_id: str
     ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], list[BaseMessage]]:
         """Resolve what a resume can skip and what it must redo.
 
@@ -1382,7 +1383,7 @@ class SasLLMPipeline:
         return completed, completed_validations, recovered
 
     def _rewind_for_resume(
-        self, items: list[SasBatch | SasChunk], thread_id: str, redo_start: int
+        self, items: Sequence[SasBatch | SasChunk], thread_id: str, redo_start: int
     ) -> None:
         """Rewind *thread_id* to just before item *redo_start* (1-based).
 
@@ -1407,7 +1408,7 @@ class SasLLMPipeline:
 
     def _process(
         self,
-        items: list[SasBatch | SasChunk],
+        items: Sequence[SasBatch | SasChunk],
         diagnostics: list[SasDiagnostic],
         *,
         thread_id: str,

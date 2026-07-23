@@ -316,8 +316,12 @@ def _response_headers(exc: BaseException) -> Any:
     return headers
 
 
-def _header_lookup(headers: Any, name: str) -> str | None:
-    """Case-insensitive header read that works for httpx.Headers or a dict."""
+def _header_lookup(headers: Any, name: str) -> Any:
+    """Case-insensitive header read that works for httpx.Headers or a dict.
+
+    Returns the raw header value (str for real HTTP headers, but ``Any`` since
+    a dict may hold anything); the caller coerces it.
+    """
     if headers is None:
         return None
     getter = getattr(headers, "get", None)
