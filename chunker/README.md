@@ -9,8 +9,12 @@ usable on its own.
 2. **Batcher** — discovers dataset / macro / macro-variable dependencies
    between chunks (within and across files) and groups inter-dependent chunks
    into batches that must be translated together.
-3. **Pipeline** — feeds batches and singleton chunks, in dependency order,
-   through a LangChain/LangGraph chat model with per-run conversational memory.
+3. **Pipeline** — feeds work items, in dependency order, through a
+   LangChain/LangGraph chat model with per-run conversational memory. Every LLM
+   call is made per `SasBatch`: before a run the batcher's ordered items are
+   coalesced (`coalesce_into_batches`) so each dependency batch is one call and
+   consecutive independent singletons are packed into synthetic `merged-NNN`
+   batches (≤ `max_merged_chunks` members) — fewer, larger requests.
 
 For the whole-system view (including `llm_client` and `memory`), see the
 repository [Architecture.md](../Architecture.md).
@@ -190,17 +194,22 @@ unrelated jobs reusing `work.tmp` stay separate.
 model node loads the thread's history from `KVChatMessageHistory`, runs
 `_trim | prompt | LLMClient`, and persists exactly the prompted message plus the
 response in one bulk `add_messages` write (trimming only limits what is
-*prompted*; storage keeps every turn). `llm_client.LLMClient` owns model
-construction (temperature, output-token cap, proactive rate limiter) and
-invocation (input-token budget, 429 retry with backoff); an injected `llm` still
-gets the retry / budget layers.
+*prompted*; storage keeps every turn).
 
 Prompted-history trimming has two modes: the default `window_k` recency window,
 or — when a `memory.relevance.RelevantHistorySelector` is passed as
 `history_selector` — relevance-based selection (see the [memory README](../memory/README.md)).
 All items of one `run_file` / `run_text` / `run_files` call share one thread
 (`thread_id = "run::<source ids>"`), so the LLM sees the run's accumulated
-context batch by batch.
+context batch by batch. Those calls send `SasBatch` objects only:
+`coalesce_into_batches` first merges the run's standalone singleton chunks into
+`merged-NNN` batches (capped at `max_merged_chunks`), so the model is never
+prompted with a bare `SasChunk`. The mapping is deterministic, so resume and
+`fork_run` reproduce the same batch ids. `llm_client.LLMClient` owns model
+construction (temperature, output-token cap, an optional proactive rate
+limiter — on for the `from_ai_gateway` credential path) and invocation
+(input-token budget, transient-error retry that honors a gateway
+`Retry-After`); an injected `llm` still gets the retry / budget layers.
 
 ## Load-bearing invariants
 

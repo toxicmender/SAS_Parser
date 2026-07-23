@@ -8,10 +8,12 @@ layers, each usable on its own:
 2. **Batcher** — discovers dataset/macro/macro-variable dependencies between
    chunks (within and across files) and groups inter-dependent chunks into
    batches that must be translated together.
-3. **Pipeline** — feeds batches and singleton chunks, in dependency order,
-   through a LangChain/LangGraph chat model with per-run conversational
-   memory persisted to a KV store (in-memory dict locally, Databricks Delta
-   in production).
+3. **Pipeline** — feeds work items, in dependency order, through a
+   LangChain/LangGraph chat model with per-run conversational memory
+   persisted to a KV store (in-memory dict locally, Databricks Delta in
+   production). Every LLM call is made per `SasBatch`: the batcher's ordered
+   items are coalesced first, so dependency batches and merged runs of
+   independent singletons are the only units prompted.
 
 An optional fourth component, **prompt_builder**, reads reference PDFs (SAS
 manuals, target-platform guides) into retrieval-ready instruction chunks and,
@@ -37,7 +39,7 @@ pipeline.
                  │ MultiFileBatcher /   │──▶ SasBatchResult
                  │ SasChunkBatcher      │    (batches + singletons)
                  +----------------------+
-                          │  all_ordered_items
+                          │  all_ordered_items → coalesce_into_batches
                           ▼
                  +----------------------+       +--------------------+
                  │ SasLLMPipeline       │──────▶│ memory.store   │
@@ -46,7 +48,7 @@ pipeline.
                  +----------------------+
                     ▲ ephemeral   │
                     │ guidance    ▼
-   +----------------------+   LLM responses, one per batch/singleton
+   +----------------------+   LLM responses, one per SasBatch
    │ prompt_builder       │◀── reference PDFs (SAS + target manuals)
    │ (PromptBuilder, opt) │
    +----------------------+
@@ -358,9 +360,11 @@ prompt additionally carries a block of reference guidance (see
 is **prompted but never persisted**. `llm_client.LLMClient` owns
 model construction (temperature, output-token cap, endpoint overrides,
 gateway TLS trust via a configured `cert_file` exported as `SSL_CERT_FILE`,
-proactive rate limiter) and sync + async invocation (input-token budget,
-transient-error retry with backoff); an injected `llm` still gets the
-retry/budget layers.
+an optional proactive rate limiter that paces request starts — on for the
+`from_ai_gateway` credential path) and sync + async invocation (input-token
+budget, transient-error retry that honors a gateway `Retry-After` /
+`retry-after-ms` header when present, else capped exponential backoff); an
+injected `llm` still gets the retry/budget layers.
 
 With `prompt_caching` enabled (constructor argument, else config.json
 `llm_client.prompt_caching`) and an Anthropic model (`claude-*` or

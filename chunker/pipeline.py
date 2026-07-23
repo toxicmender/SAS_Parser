@@ -48,11 +48,13 @@ from prompt_builder import ConstructKey, PromptBuilder, UserInstructionSet
 from .batcher import (
     MultiFileBatcher,
     SasChunkBatcher,
+    coalesce_into_batches,
     parse_databricks_mapping_csv,
 )
 from .chunker import SasSemanticChunker
 from .models import (
     SasBatch,
+    SasBatchResult,
     SasChunk,
     SasChunkKind,
     SasCorpus,
@@ -370,6 +372,13 @@ def _format_batch_message(
         standard_autocall_macros=_fmt_list(batch.standard_autocall_macros),
         required_macrovars=_fmt_list(batch.required_macrovars),
         produced_macrovars=_fmt_list(batch.produced_macrovars),
+        sas_functions=_fmt_list(sorted(batch.recognized_functions)),
+        call_routines=_fmt_list(sorted(batch.recognized_call_routines)),
+        component_objects=_fmt_list(sorted(batch.component_objects)),
+        global_statement_keywords=_fmt_list(sorted(batch.global_statement_keywords)),
+        symput_hazard="yes" if batch.has_symput_scope_hazard else "no",
+        contains_abort="yes" if batch.has_abort else "no",
+        contains_computed_goto="yes" if batch.has_computed_goto else "no",
         diagnostics="; ".join(f"[{d.code}] {d.message}" for d in diags) or "none",
         members=members,
     )
@@ -489,6 +498,15 @@ class SasLLMPipeline:
         pipeline's ``memory.kv``. ``None`` (default) disables compression.
     include_options_chunks, include_comment_chunks : bool
         Forwarded to the batchers.
+    max_merged_chunks : int
+        Every LLM call is made per :class:`SasBatch`: before a run, the
+        batcher's ordered items are coalesced so each dependency batch stays
+        one call and each maximal run of consecutive independent singleton
+        chunks is packed into synthetic ``merged-NNN`` batches of at most this
+        many members (see :func:`chunker.batcher.coalesce_into_batches`).
+        Larger values mean fewer, larger requests; the cap keeps a merged
+        prompt from blowing ``max_input_tokens``. Must be ``>= 1`` (``1``
+        wraps each singleton as its own batch without merging). Default ``8``.
     databricks_mapping : dict[str, str] | None
         SAS→Databricks dataset-name mapping forwarded to the batchers
         (see :func:`chunker.batcher.replace_dataset_names`): batch and
@@ -595,6 +613,7 @@ class SasLLMPipeline:
         summarizer: RollingSummarizer | None = None,
         include_options_chunks: bool = True,
         include_comment_chunks: bool = False,
+        max_merged_chunks: int = 8,
         databricks_mapping: dict[str, str] | None = None,
         databricks_mapping_sharepoint: str | None = None,
         memory: MemoryHub | None = None,
@@ -656,8 +675,13 @@ class SasLLMPipeline:
             f"window_k={window_k}  guidance={'on' if prompt_builder else 'off'}  "
             f"prompt_caching={'on' if self._prompt_caching else 'off'}"
         )
+        if max_merged_chunks < 1:
+            raise ValueError(
+                f"max_merged_chunks must be >= 1, got {max_merged_chunks}"
+            )
         self.model = model
         self.window_k = window_k
+        self._max_merged_chunks = max_merged_chunks
         self._output_language = output_language
         self._history_selector = history_selector
         self._prompt_builder = prompt_builder
@@ -910,7 +934,7 @@ class SasLLMPipeline:
         batch_result = self.batcher.batch(result)
         tid = thread_id or self._default_thread_id([result.source_id or path])
         return self._process(
-            batch_result.all_ordered_items,
+            self._items_as_batches(batch_result),
             result.diagnostics,
             thread_id=tid,
             resume=resume,
@@ -934,7 +958,7 @@ class SasLLMPipeline:
         batch_result = self.batcher.batch(result)
         tid = thread_id or self._default_thread_id([result.source_id or label])
         return self._process(
-            batch_result.all_ordered_items,
+            self._items_as_batches(batch_result),
             result.diagnostics,
             thread_id=tid,
             resume=resume,
@@ -960,7 +984,7 @@ class SasLLMPipeline:
         multi_result = self.multi_batcher.batch(corpus)
         tid = thread_id or self._default_thread_id(corpus.source_ids)
         return self._process(
-            multi_result.all_ordered_items,
+            self._items_as_batches(multi_result),
             corpus.all_diagnostics,
             thread_id=tid,
             resume=resume,
@@ -1084,6 +1108,18 @@ class SasLLMPipeline:
     @staticmethod
     def _default_thread_id(source_ids: list[str]) -> str:
         return "run::" + "+".join(source_ids)
+
+    def _items_as_batches(self, batch_result: SasBatchResult) -> list[SasBatch]:
+        """The run's ordered items coalesced to :class:`SasBatch` only.
+
+        Keeps the LLM invoked strictly per batch: dependency batches pass
+        through and consecutive independent singletons are merged into
+        ``merged-NNN`` batches (capped at ``max_merged_chunks`` members). See
+        :func:`chunker.batcher.coalesce_into_batches`.
+        """
+        return coalesce_into_batches(
+            batch_result.all_ordered_items, max_chunks=self._max_merged_chunks
+        )
 
     @staticmethod
     def _recovered_response(messages: list[BaseMessage], fact: dict[str, Any]) -> str | None:

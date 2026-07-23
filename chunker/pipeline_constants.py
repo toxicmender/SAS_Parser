@@ -95,6 +95,13 @@ _BATCH_CONTEXT_TEMPLATE = """\
 - Autocall macros   : {standard_autocall_macros}
 - Macrovars (req)   : {required_macrovars}
 - Macrovars (prod)  : {produced_macrovars}
+- SAS functions     : {sas_functions}
+- CALL routines     : {call_routines}
+- Component objects : {component_objects}
+- Global stmt kws   : {global_statement_keywords}
+- ⚠️ SYMPUT hazard  : {symput_hazard}
+- ⚠️ Contains ABORT: {contains_abort}
+- ⚠️ Computed GOTO : {contains_computed_goto}
 - Diagnostics       : {diagnostics}
 
 ## Batch members

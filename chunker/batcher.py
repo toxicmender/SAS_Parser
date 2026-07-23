@@ -1527,6 +1527,174 @@ def _extract_result(
 
 
 # ---------------------------------------------------------------------------
+# Singleton coalescing: present the whole run as SasBatch objects
+# ---------------------------------------------------------------------------
+
+# Members packed into one synthetic "merged" batch when coalescing consecutive
+# independent singletons. Real dependency batches are never split; this only
+# caps synthetic batches so a merged prompt cannot grow unbounded and blow the
+# LLM input-token budget. Consumers may override it.
+_DEFAULT_MERGE_MAX_CHUNKS = 8
+
+
+def _merge_singletons_into_batch(chunks: list[SasChunk], batch_id: str) -> SasBatch:
+    """Build a :class:`SasBatch` from independent singleton chunks.
+
+    Singletons carry no inter-chunk dependency edges (each is its own
+    Union-Find component), so the batch's aggregate I/O is a plain union of
+    member metadata with intra-batch producers subtracted — the same
+    accounting :func:`_make_batch` performs, minus the edge/``reason``
+    machinery that only a real dependency component has. Member order is
+    preserved (callers pass corpus order).
+    """
+    intra_outputs: set[str] = set()
+    intra_macros: set[str] = set()
+    intra_macrovars: set[str] = set()
+    for c in chunks:
+        intra_outputs.update(c.metadata.output_datasets)
+        intra_macros.update(c.metadata.defines_macros)
+        intra_macrovars.update(c.metadata.produces_macrovars)
+        intra_macrovars.update(c.metadata.declared_macro_vars)
+        if c.kind == SasChunkKind.MACRO_DEFINITION:
+            intra_outputs.update(c.metadata.body_literal_outputs)
+
+    def _dedup(pairs: list[str]) -> list[str]:
+        return list(dict.fromkeys(pairs))
+
+    source_files = _dedup([c.source_id or "<inline>" for c in chunks])
+    outputs = _dedup([ds for c in chunks for ds in c.metadata.output_datasets])
+    ext_inputs = _dedup(
+        [
+            ds
+            for c in chunks
+            for ds in c.metadata.input_datasets
+            if ds not in intra_outputs
+        ]
+    )
+    defined_macros = _dedup(
+        [mac for c in chunks for mac in c.metadata.defines_macros]
+    )
+
+    ext_macros: list[str] = []
+    standard_autocall: list[str] = []
+    seen_em: set[str] = set()
+    seen_sa: set[str] = set()
+    for c in chunks:
+        for mac in c.metadata.invokes_macros:
+            if mac in intra_macros:
+                continue
+            if mac in _STANDARD_AUTOCALL_MACROS:
+                if mac not in seen_sa:
+                    seen_sa.add(mac)
+                    standard_autocall.append(mac)
+                continue
+            if mac not in seen_em:
+                seen_em.add(mac)
+                ext_macros.append(mac)
+
+    defined_librefs: set[str] = set()
+    used_librefs: set[str] = set()
+    for c in chunks:
+        m = c.metadata
+        defined_librefs.update(m.defines_librefs)
+        for ds in (
+            *m.input_datasets,
+            *m.output_datasets,
+            *m.body_literal_inputs,
+            *m.body_literal_outputs,
+        ):
+            if ds.startswith("'") or "." not in ds:
+                continue
+            used_librefs.add(ds.split(".", 1)[0])
+    required_librefs = sorted(used_librefs - defined_librefs - _DEFAULT_LIBREFS)
+
+    produced_macrovars = _dedup(
+        [
+            mv
+            for c in chunks
+            for mv in (*c.metadata.produces_macrovars, *c.metadata.declared_macro_vars)
+        ]
+    )
+    required_macrovars = _dedup(
+        [
+            mv
+            for c in chunks
+            for mv in c.metadata.consumes_macrovars
+            if mv not in intra_macrovars
+        ]
+    )
+
+    n = len(chunks)
+    reason = (
+        f"merged {n} independent chunk(s) into one batch to reduce LLM calls"
+        if n > 1
+        else "single independent chunk"
+    )
+    return SasBatch(
+        batch_id=batch_id,
+        chunks=list(chunks),
+        reason=reason,
+        source_files=source_files,
+        input_datasets=ext_inputs,
+        output_datasets=outputs,
+        required_macros=ext_macros,
+        required_librefs=required_librefs,
+        defined_macros=defined_macros,
+        produced_macrovars=produced_macrovars,
+        required_macrovars=required_macrovars,
+        standard_autocall_macros=standard_autocall,
+    )
+
+
+def coalesce_into_batches(
+    items: list[SasBatch | SasChunk],
+    *,
+    max_chunks: int = _DEFAULT_MERGE_MAX_CHUNKS,
+) -> list[SasBatch]:
+    """Return *items* as a list of :class:`SasBatch`, so a consumer that sends
+    one request per item calls the LLM only ever per batch.
+
+    Real dependency batches pass through untouched. Each maximal run of
+    consecutive independent singleton chunks is packed into synthetic
+    ``merged-NNN`` batches of at most *max_chunks* members — fewer, larger
+    requests — while preserving corpus order: a synthetic batch never spans a
+    real batch that separates its members, so producers still precede
+    consumers. An isolated singleton becomes a one-member ``merged-NNN`` batch,
+    keeping the "always a SasBatch" invariant. The mapping is deterministic in
+    *items*, so a re-run (resume/fork) reproduces the same batch ids.
+    """
+    if max_chunks < 1:
+        max_chunks = 1
+    out: list[SasBatch] = []
+    pending: list[SasChunk] = []
+    merged_no = 0
+
+    def _flush() -> None:
+        nonlocal merged_no
+        for start in range(0, len(pending), max_chunks):
+            merged_no += 1
+            group = pending[start : start + max_chunks]
+            out.append(
+                _merge_singletons_into_batch(group, f"merged-{merged_no:03d}")
+            )
+        pending.clear()
+
+    for item in items:
+        if isinstance(item, SasBatch):
+            _flush()
+            out.append(item)
+        else:
+            pending.append(item)
+    _flush()
+
+    logger.info(
+        f"coalesce_into_batches: {len(items)} ordered item(s) -> {len(out)} "
+        f"batch(es) (max_chunks={max_chunks})"
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Single-file batcher  (unchanged public API)
 # ---------------------------------------------------------------------------
 

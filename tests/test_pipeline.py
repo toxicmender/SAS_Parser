@@ -197,6 +197,44 @@ def test_pipeline_accumulates_history_across_batches():
     assert history[3].content == "translation for item 2"
 
 
+def test_run_text_invokes_llm_only_per_batch():
+    # Every unit sent to the LLM is a SasBatch: the run's singletons are
+    # coalesced so no standalone SasChunk is ever prompted.
+    fake_llm = FakeListChatModel(responses=[f"r{i}" for i in range(10)])
+    pipeline = SasLLMPipeline(model="unused", memory=MemoryHub(), llm=fake_llm)
+
+    src = (
+        "data work.a; x=1; run;\n"
+        "data work.b; y=2; run;\n"
+        "data work.c; z=3; run;\n"
+    )
+    outputs = pipeline.run_text(src, source_id="etl.sas")
+
+    assert outputs
+    assert all(o["is_batch"] for o in outputs)
+    # Three independent steps merge into a single batch (default cap is 8).
+    assert len(outputs) == 1
+    assert outputs[0]["item_id"] == "merged-001"
+
+
+def test_max_merged_chunks_caps_calls_per_batch():
+    fake_llm = FakeListChatModel(responses=[f"r{i}" for i in range(10)])
+    pipeline = SasLLMPipeline(
+        model="unused", memory=MemoryHub(), llm=fake_llm, max_merged_chunks=1
+    )
+
+    src = (
+        "data work.a; x=1; run;\n"
+        "data work.b; y=2; run;\n"
+        "data work.c; z=3; run;\n"
+    )
+    outputs = pipeline.run_text(src, source_id="etl.sas")
+
+    # max_merged_chunks=1 wraps each singleton as its own one-member batch.
+    assert [o["item_id"] for o in outputs] == ["merged-001", "merged-002", "merged-003"]
+    assert all(o["is_batch"] for o in outputs)
+
+
 def test_pipeline_window_trimming_limits_injected_history():
     fake_llm = FakeListChatModel(responses=[f"resp {i}" for i in range(6)])
     mem = MemoryHub()

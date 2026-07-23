@@ -288,8 +288,8 @@ def test_bundled_sample_cases_load():
 # ---------------------------------------------------------------------------
 
 
-def _pipeline(responses: list[str]) -> SasLLMPipeline:
-    return SasLLMPipeline(llm=FakeListChatModel(responses=responses))
+def _pipeline(responses: list[str], **kwargs) -> SasLLMPipeline:
+    return SasLLMPipeline(llm=FakeListChatModel(responses=responses), **kwargs)
 
 
 def test_runner_end_to_end_passing_case():
@@ -338,14 +338,15 @@ def test_runner_flags_prose_only_responses():
 
 
 def test_runner_multiple_independent_items_get_distinct_responses():
-    # Two unrelated DATA steps -> two singleton items, answered in order.
+    # Two unrelated DATA steps -> two items, answered in order. Pinned to
+    # max_merged_chunks=1 so the singletons are not coalesced into one batch.
     case = ValidationCase(
         case_id="two_items",
         sas_source="data work.a; x=1; run;\n\ndata work.b; y=2; run;\n",
     )
     r1 = "```python\na = 1\n```\nwork.a done."
     r2 = "```python\nb = 2\n```\nwork.b done."
-    report = ValidationRunner(_pipeline([r1, r2])).run([case])
+    report = ValidationRunner(_pipeline([r1, r2], max_merged_chunks=1)).run([case])
 
     (result,) = report.results
     assert result.item_count == 2
@@ -557,19 +558,21 @@ def test_live_validator_scores_single_item_and_stores_in_kv():
     assert stored[0]["score"] == pytest.approx(result.score)
 
 
-def _validated_pipeline(responses, validator=None):
+def _validated_pipeline(responses, validator=None, **kwargs):
     return SasLLMPipeline(
         llm=FakeListChatModel(responses=responses),
         validator=validator or LiveValidator(),
+        **kwargs,
     )
 
 
 def test_inline_validation_runs_per_item_and_persists_to_thread():
-    # Two independent DATA steps -> two items, each scored as it is answered.
+    # Two independent DATA steps, kept as separate items (max_merged_chunks=1)
+    # so each is scored as it is answered.
     source = "data work.a; x=1; run;\n\ndata work.b; y=2; run;\n"
     r1 = "```python\na = 1\n```\nwork.a done."
     r2 = "```python\nb = 2\n```\nwork.b done."
-    pipeline = _validated_pipeline([r1, r2])
+    pipeline = _validated_pipeline([r1, r2], max_merged_chunks=1)
     thread_id = "run::inline"
     outputs = pipeline.run_text(source, source_id="inline.sas", thread_id=thread_id)
 
