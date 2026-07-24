@@ -51,13 +51,25 @@ chain = prompt | client.as_runnable()
   A missing file is skipped with a WARNING and the default trust store
   applies.
 - **Transient-error handling**: rate limits (HTTP 429), overload / server
-  errors (500, 502, 503, 504, 529), timeouts, and connection drops are retried
-  with capped exponential backoff and jitter (attempt *n* waits
-  `min(base * 2**(n-1), max)` scaled by 0.5–1.5× jitter); every other exception
-  propagates unchanged on the first occurrence, and exhausted retries are
-  logged at ERROR before the last exception propagates. Callers that persist
-  progress (e.g. `chunker.pipeline`'s per-item run facts + `resume=True`)
-  therefore only ever see failures that survived the retry budget.
+  errors (500, 502, 503, 504, 529), timeouts, and connection drops are retried.
+  When the gateway sends its own timing — a `Retry-After` (delta-seconds or
+  HTTP-date) or `retry-after-ms` header on the response — that wait is
+  **honored verbatim** (no jitter, replacing the backoff), bounded by
+  `retry_after_max_seconds` (default 300s) so a bad header can't hang the run;
+  otherwise the client falls back to capped exponential backoff with jitter
+  (attempt *n* waits `min(base * 2**(n-1), max)` scaled by 0.5–1.5×). Every
+  other exception propagates unchanged on the first occurrence, and exhausted
+  retries are logged at ERROR before the last exception propagates. Callers
+  that persist progress (e.g. `chunker.pipeline`'s per-item run facts +
+  `resume=True`) therefore only ever see failures that survived the retry
+  budget.
+- **Proactive throttle**: an `InMemoryRateLimiter` paces request *starts* at
+  `requests_per_second` (burst `max_bucket_size`) so calls stay under the
+  gateway's limit before ever tripping a 429. Off by default;
+  `LLMClientConfig.from_ai_gateway(...)` turns it on (`2.0`) for the gateway
+  credential path, and `llm_client.requests_per_second` in config.json sets it
+  for every path. Attaches at construction, so it does not apply to an
+  injected `llm`.
 - **Input-token budget**: when `max_input_tokens` is set, the prompt is counted
   before the call and `InputTokenLimitError` is raised instead of sending an
   over-budget request. Counting uses the model's own
@@ -71,9 +83,11 @@ chain = prompt | client.as_runnable()
   `ainvoke` alike.
 
 Every `LLMClientConfig` knob except `api_key`, `kwargs`, `token_counter`, and
-the rate-limiter/backoff shape can also be defaulted from the `llm_client`
-section of config.json (precedence: explicit argument > config.json > hard
-default — see the `app_config` package). File values are parsed through
+the backoff shape (`retry_base_seconds` / `retry_max_seconds` /
+`retry_after_max_seconds`) can also be defaulted from the `llm_client`
+section of config.json — including `requests_per_second` and `max_bucket_size`
+(precedence: explicit argument > config.json > hard default — see the
+`app_config` package). File values are parsed through
 `app_config.llm_client_value`, which type-checks them against the section
 schema: a wrong-typed entry (e.g. `"timeout": "sixty"`) is ignored with a
 WARNING and the hard default applies, instead of failing construction.

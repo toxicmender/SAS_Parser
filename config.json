@@ -26,7 +26,9 @@
     "model_kwargs": null,
     "max_input_tokens": null,
     "max_output_tokens": null,
-    "prompt_caching": null
+    "prompt_caching": null,
+    "requests_per_second": null,
+    "max_bucket_size": null
   },
   "_complexity_comment": "Complexity analysis. 'target' names a rule-set profile under complexity/profiles/ ('sparksql', 'pyspark', ...); 'rules_path' points at a profile file of your own and wins over 'target'. The per-tier weights only rank units within a tier; they can never change a tier, which is presence-based (any HIGH construct makes the unit HIGH). Retune which construct maps to which tier by editing a profile JSON, not here.",
   "complexity": {

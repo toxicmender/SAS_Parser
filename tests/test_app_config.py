@@ -116,6 +116,8 @@ def test_repo_config_json_matches_code_defaults():
         "max_input_tokens": None,
         "max_output_tokens": None,
         "prompt_caching": None,  # null = unset -> code default (False)
+        "requests_per_second": None,  # null = unset -> code default (2.0)
+        "max_bucket_size": None,  # null = unset -> code default (1)
     }
     assert repo_cfg["user_instructions"] == {
         "path": None,

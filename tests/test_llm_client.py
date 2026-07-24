@@ -15,6 +15,7 @@ import logging
 import os
 import pathlib
 import sys
+import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -96,6 +97,14 @@ def test_provider_defaults_left_alone_when_unset(monkeypatch):
 
     assert "temperature" not in captured
     assert "max_tokens" not in captured
+    # Proactive throttle is off by default — only the gateway path turns it on.
+    assert "rate_limiter" not in captured
+
+
+def test_rate_limiter_disabled_when_requests_per_second_none(monkeypatch):
+    captured = _capture_init(monkeypatch)
+    LLMClient(LLMClientConfig(model="some-model", requests_per_second=None))
+
     assert "rate_limiter" not in captured
 
 
@@ -188,6 +197,27 @@ def test_from_ai_gateway_overrides_win(monkeypatch):
 def test_from_ai_gateway_leaves_other_knobs_at_their_defaults(monkeypatch):
     _fake_gateway_secret(monkeypatch, {"token": "gw-token"})
     assert LLMClientConfig.from_ai_gateway().max_retries == LLMClientConfig().max_retries
+
+
+def test_from_ai_gateway_enables_proactive_throttle(monkeypatch):
+    # The gateway path paces request starts by default, while a plain config
+    # leaves the throttle off.
+    _fake_gateway_secret(monkeypatch, {"token": "gw-token"})
+    assert LLMClientConfig.from_ai_gateway().requests_per_second == 2.0
+    assert LLMClientConfig(model="some-model").requests_per_second is None
+
+
+def test_from_ai_gateway_throttle_override_wins(monkeypatch):
+    _fake_gateway_secret(monkeypatch, {"token": "gw-token"})
+    # Explicit override beats the gateway default (including turning it off).
+    assert (
+        LLMClientConfig.from_ai_gateway(requests_per_second=5.0).requests_per_second
+        == 5.0
+    )
+    assert (
+        LLMClientConfig.from_ai_gateway(requests_per_second=None).requests_per_second
+        is None
+    )
 
 
 def test_from_ai_gateway_token_reaches_the_model(monkeypatch):
@@ -413,6 +443,82 @@ class _FakeOverloadedError(Exception):
 )
 def test_is_transient_error_shapes(exc, expected):
     assert client_mod._is_transient_error(exc) is expected
+
+
+# ---------------------------------------------------------------------------
+# Gateway Retry-After handling
+# ---------------------------------------------------------------------------
+
+
+class _Resp:
+    def __init__(self, headers: dict) -> None:
+        self.headers = headers
+
+
+class _RateLimitWithHeaders(Exception):
+    """429 carrying rate-limit timing headers on ``exc.response.headers``."""
+
+    status_code = 429
+
+    def __init__(self, headers: dict, msg: str = "throttled") -> None:
+        super().__init__(msg)
+        self.response = _Resp(headers)
+
+
+def test_retry_after_seconds_parses_delta_seconds():
+    exc = _RateLimitWithHeaders({"retry-after": "7"})
+    assert client_mod._retry_after_seconds(exc) == 7.0
+
+
+def test_retry_after_ms_takes_precedence_over_retry_after():
+    exc = _RateLimitWithHeaders({"retry-after-ms": "1500", "retry-after": "5"})
+    assert client_mod._retry_after_seconds(exc) == 1.5
+
+
+def test_retry_after_is_case_insensitive_for_plain_dict():
+    exc = _RateLimitWithHeaders({"Retry-After": "3"})
+    assert client_mod._retry_after_seconds(exc) == 3.0
+
+
+def test_retry_after_http_date_form():
+    from email.utils import formatdate
+
+    exc = _RateLimitWithHeaders({"retry-after": formatdate(time.time() + 30, usegmt=True)})
+    delay = client_mod._retry_after_seconds(exc)
+    assert delay is not None
+    # Whole-second HTTP-date precision, so allow slack around the 30s target.
+    assert 20.0 <= delay <= 31.0
+
+
+def test_retry_after_absent_returns_none():
+    # A 429 without headers falls back to the client's own backoff.
+    assert client_mod._retry_after_seconds(_FakeRateLimitError("throttled")) is None
+
+
+def test_retry_delay_honors_server_value_capped():
+    model = _FlakyModel(failures=0)
+    client = LLMClient(
+        _fast_retry_config(max_retries=3, retry_after_max_seconds=10.0), llm=model
+    )
+    exc = _RateLimitWithHeaders({"retry-after": "999"})
+    # Server value honored but bounded by retry_after_max_seconds.
+    assert client._retry_delay(exc, attempt=1, attempts=4, op="invoke") == 10.0
+
+
+def test_retry_delay_uses_server_value_verbatim_within_cap():
+    client = LLMClient(_fast_retry_config(max_retries=3), llm=_FlakyModel(failures=0))
+    exc = _RateLimitWithHeaders({"retry-after-ms": "250"})
+    assert client._retry_delay(exc, attempt=1, attempts=4, op="invoke") == 0.25
+
+
+def test_retry_with_retry_after_header_eventually_succeeds():
+    model = _FlakyModel(
+        failures=1, exc=_RateLimitWithHeaders({"retry-after-ms": "1"})
+    )
+    client = LLMClient(_fast_retry_config(max_retries=2), llm=model)
+
+    assert client.invoke("hi").content == "ok"
+    assert model.calls == 2
 
 
 def test_overloaded_5xx_errors_are_retried():

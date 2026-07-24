@@ -10,6 +10,8 @@ import logging
 import os
 import random
 import time
+from datetime import datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -99,11 +101,16 @@ class LLMClientConfig(BaseModel):
         ``llm_client.max_input_tokens``.
     requests_per_second : float | None
         Proactive client-side throttle: at most this many request starts
-        per second via ``InMemoryRateLimiter``. ``None`` disables it.
-        Only applies to models built by the client (an injected ``llm``
-        is used as-is; rate limiters attach at construction time).
+        per second via ``InMemoryRateLimiter``, so calls are paced *before*
+        ever tripping a gateway 429. ``None`` (the default) disables it;
+        :meth:`from_ai_gateway` turns it on (``2.0``) for the gateway
+        credential path, since the gateway enforces a rate limit. Config
+        key: ``llm_client.requests_per_second`` sets it for every path. Only
+        applies to models built by the client (an injected ``llm`` is used
+        as-is; rate limiters attach at construction time).
     max_bucket_size : int
-        Burst allowance for the rate limiter.
+        Burst allowance for the rate limiter. Config key:
+        ``llm_client.max_bucket_size``.
     max_retries : int
         Retries *after* the first attempt for transient errors: rate
         limits (HTTP 429), overload / server errors (500, 502, 503, 504,
@@ -112,8 +119,14 @@ class LLMClientConfig(BaseModel):
         own retry layer is not configured here. Config key:
         ``llm_client.max_retries``.
     retry_base_seconds, retry_max_seconds : float
-        Exponential-backoff schedule: attempt *n* waits
-        ``min(base * 2**(n-1), max)`` scaled by 0.5–1.5x jitter.
+        Exponential-backoff schedule used when the server gives no timing
+        of its own: attempt *n* waits ``min(base * 2**(n-1), max)`` scaled
+        by 0.5–1.5x jitter.
+    retry_after_max_seconds : float
+        Safety ceiling for a server-provided wait. On a 429 the gateway's
+        ``Retry-After`` / ``retry-after-ms`` header is honored verbatim (no
+        jitter, replacing the backoff) but never waited longer than this, so
+        a pathological header value cannot hang the run. Default 300s.
     token_counter : Callable[[list[BaseMessage]], int] | None
         Custom counter for the input-token budget. ``None`` uses the
         model's own ``get_num_tokens_from_messages``, falling back to a
@@ -166,14 +179,21 @@ class LLMClientConfig(BaseModel):
         default_factory=lambda: app_config.llm_client_value("max_input_tokens"),
         gt=0,
     )
-    requests_per_second: float | None = Field(default=None, gt=0.0)
-    max_bucket_size: int = Field(default=1, gt=0)
+    requests_per_second: float | None = Field(
+        default_factory=lambda: app_config.llm_client_value("requests_per_second"),
+        gt=0.0,
+    )
+    max_bucket_size: int = Field(
+        default_factory=lambda: app_config.llm_client_value("max_bucket_size", 1),
+        gt=0,
+    )
     max_retries: int = Field(
         default_factory=lambda: app_config.llm_client_value("max_retries", 3),
         ge=0,
     )
     retry_base_seconds: float = Field(default=1.0, gt=0.0)
     retry_max_seconds: float = Field(default=30.0, gt=0.0)
+    retry_after_max_seconds: float = Field(default=300.0, gt=0.0)
     token_counter: Callable[[list[BaseMessage]], int] | None = None
     model_kwargs: dict[str, Any] | None = Field(
         default_factory=lambda: app_config.llm_client_value("model_kwargs")
@@ -194,8 +214,11 @@ class LLMClientConfig(BaseModel):
 
         If the secret also carries an endpoint (``base_url`` / ``endpoint`` /
         ``url``), it is used as :attr:`base_url`; otherwise the configured
-        ``llm_client.base_url`` stands. Every other knob resolves exactly as it
-        does for ``LLMClientConfig()``.
+        ``llm_client.base_url`` stands. This path also turns the proactive
+        throttle on by default (:attr:`requests_per_second` = ``2.0``), since
+        the gateway enforces a rate limit — unless ``config.json`` or an
+        explicit override already set it. Every other knob resolves exactly as
+        it does for ``LLMClientConfig()``.
 
         Parameters
         ----------
@@ -224,6 +247,14 @@ class LLMClientConfig(BaseModel):
         base_url = vault.ai_gateway_base_url(secret)
         if base_url is not None:
             values["base_url"] = base_url
+        # The gateway enforces a rate limit, so pace request starts by default
+        # on this path — unless the operator already set it via config.json or
+        # an explicit override (both of which must keep winning).
+        if (
+            "requests_per_second" not in overrides
+            and app_config.llm_client_value("requests_per_second") is None
+        ):
+            values["requests_per_second"] = 2.0
         values.update(overrides)
         logger.info(
             f"LLMClientConfig.from_ai_gateway: got the gateway token from Vault "
@@ -270,6 +301,85 @@ def _is_transient_error(exc: BaseException) -> bool:
         return True
     name = type(exc).__name__.lower()
     return "timeout" in name or "connect" in name or "overloaded" in name
+
+
+def _response_headers(exc: BaseException) -> Any:
+    """The HTTP response headers carried by a provider error, or ``None``.
+
+    Provider SDKs (Anthropic/OpenAI httpx-based) hang the headers off
+    ``exc.response.headers``; some also expose ``exc.headers`` directly.
+    """
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) if response is not None else None
+    if headers is None:
+        headers = getattr(exc, "headers", None)
+    return headers
+
+
+def _header_lookup(headers: Any, name: str) -> Any:
+    """Case-insensitive header read that works for httpx.Headers or a dict.
+
+    Returns the raw header value (str for real HTTP headers, but ``Any`` since
+    a dict may hold anything); the caller coerces it.
+    """
+    if headers is None:
+        return None
+    getter = getattr(headers, "get", None)
+    if callable(getter):
+        # httpx.Headers.get is already case-insensitive; a plain dict.get is
+        # exact, so a wrong-cased key falls through to the scan below.
+        try:
+            value = getter(name)
+        except Exception:
+            value = None
+        if value is not None:
+            return value
+    try:
+        low = name.lower()
+        for key, value in headers.items():
+            if isinstance(key, str) and key.lower() == low:
+                return value
+    except Exception:
+        pass
+    return None
+
+
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    """Seconds the gateway asked the caller to wait, or ``None``.
+
+    Reads the standard rate-limit timing headers a 429 (or 503) response
+    carries: ``retry-after-ms`` (milliseconds, checked first), then
+    ``Retry-After`` as either a number of seconds or an HTTP-date. Returns
+    ``None`` when no usable header is present, so the caller falls back to its
+    own exponential backoff.
+    """
+    headers = _response_headers(exc)
+    if headers is None:
+        return None
+    ms = _header_lookup(headers, "retry-after-ms")
+    if ms is not None:
+        try:
+            return max(0.0, float(ms) / 1000.0)
+        except (TypeError, ValueError):
+            pass
+    raw = _header_lookup(headers, "retry-after")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        return max(0.0, float(text))  # delta-seconds form
+    except ValueError:
+        pass
+    try:  # HTTP-date form
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    now = datetime.now(when.tzinfo) if when.tzinfo else datetime.now()
+    return max(0.0, (when - now).total_seconds())
 
 
 def _as_messages(input: LanguageModelInput) -> list[BaseMessage]:
@@ -427,6 +537,18 @@ class LLMClient:
                 f"attempt(s); giving up: {exc!r}"
             )
             return None
+        # Honor the gateway's own timing when it sends one: Retry-After /
+        # retry-after-ms is authoritative, so it replaces the backoff (no
+        # jitter), bounded only by a safety ceiling so a bad header can't hang.
+        server_delay = _retry_after_seconds(exc)
+        if server_delay is not None:
+            delay = min(server_delay, self.config.retry_after_max_seconds)
+            logger.warning(
+                f"{op}: gateway asked to retry after {server_delay:.2f}s "
+                f"(attempt {attempt}/{attempts}); honoring, waiting {delay:.2f}s "
+                f"(capped at {self.config.retry_after_max_seconds:.0f}s): {exc}"
+            )
+            return delay
         delay = min(
             self.config.retry_base_seconds * 2 ** (attempt - 1),
             self.config.retry_max_seconds,

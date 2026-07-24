@@ -24,6 +24,7 @@ instructions/
   sparksql/     -> every section scoped [lang: sparksql]
     overview.md
     constructs.md
+    functions.md
     datetime.md
     macros.md
     examples.md

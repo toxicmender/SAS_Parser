@@ -174,6 +174,8 @@ _LLM_CLIENT_TYPES: dict[str, type | tuple[type, ...]] = {
     "max_input_tokens": int,
     "max_output_tokens": int,
     "prompt_caching": bool,
+    "requests_per_second": (int, float),
+    "max_bucket_size": int,
 }
 
 

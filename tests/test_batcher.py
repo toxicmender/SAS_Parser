@@ -1105,5 +1105,66 @@ class TestDatabricksMappingCsv(unittest.TestCase):
         self.assertEqual(br.batches[0].input_datasets, ["prod.sales.raw"])
 
 
+class TestCoalesceIntoBatches(unittest.TestCase):
+    """coalesce_into_batches turns the ordered items into SasBatch-only."""
+
+    def _items(self, source: str):
+        _, br = _chunk_and_batch(source)
+        return br.all_ordered_items
+
+    def test_every_output_is_a_batch(self):
+        from chunker.batcher import coalesce_into_batches
+
+        # Three independent DATA steps -> three singletons.
+        src = "data work.a; x=1; run;\ndata work.b; y=2; run;\ndata work.c; z=3; run;\n"
+        out = coalesce_into_batches(self._items(src), max_chunks=8)
+        self.assertTrue(all(isinstance(b, SasBatch) for b in out))
+        # All three consecutive singletons merged into one batch.
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].batch_id, "merged-001")
+        self.assertEqual(len(out[0].chunks), 3)
+
+    def test_max_chunks_caps_group_size(self):
+        from chunker.batcher import coalesce_into_batches
+
+        src = "".join(f"data work.t{i}; v=1; run;\n" for i in range(5))
+        out = coalesce_into_batches(self._items(src), max_chunks=2)
+        # 5 singletons, cap 2 -> [2, 2, 1].
+        self.assertEqual([len(b.chunks) for b in out], [2, 2, 1])
+        self.assertEqual([b.batch_id for b in out], ["merged-001", "merged-002", "merged-003"])
+
+    def test_real_batches_pass_through_and_split_singleton_runs(self):
+        from chunker.batcher import coalesce_into_batches
+
+        # A dependency pair (a->print a) sits between independent singletons.
+        src = (
+            "data work.x; p=1; run;\n"           # singleton
+            "data work.dep; q=1; run;\n"          # producer
+            "proc print data=work.dep; run;\n"    # consumer -> batch with producer
+            "data work.y; r=1; run;\n"            # singleton
+        )
+        out = coalesce_into_batches(self._items(src), max_chunks=8)
+        kinds = ["real" if b.batch_id.startswith("batch") else "merged" for b in out]
+        # merged(x)  batch(dep+print)  merged(y) — singletons never span the batch.
+        self.assertEqual(kinds, ["merged", "real", "merged"])
+        self.assertEqual(len(out[1].chunks), 2)
+
+    def test_merged_batch_aggregates_external_io(self):
+        from chunker.batcher import coalesce_into_batches
+
+        # Two independent steps; work.seed produced outside the run is external.
+        src = (
+            "data work.one; set other.seed; a=1; run;\n"
+            "data work.two; b=2; run;\n"
+        )
+        out = coalesce_into_batches(self._items(src), max_chunks=8)
+        self.assertEqual(len(out), 1)
+        batch = out[0]
+        self.assertIn("other.seed", batch.input_datasets)
+        self.assertIn("work.one", batch.output_datasets)
+        self.assertIn("work.two", batch.output_datasets)
+        self.assertIn("other", batch.required_librefs)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
