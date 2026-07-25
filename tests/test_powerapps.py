@@ -404,6 +404,34 @@ def test_upload_outputs_with_validation_writes_expected_layout():
     assert "app_a/output/ts1/validation" in client.created_dirs
 
 
+def test_upload_outputs_carries_token_usage_into_summary_and_pdf():
+    from llm_client import TokenUsage
+
+    client = _FakeClient()
+    usage = TokenUsage(
+        input_tokens=12000, output_tokens=900, total_tokens=12900, calls=2
+    )
+    demo_run._upload_outputs(
+        client, _req(True), _outputs(), validating=True, token_usage=usage
+    )
+
+    summary = json.loads(client.written["app_a/output/ts1/validation/summary.json"])
+    assert summary["token_usage"]["input_tokens"] == 12000
+    assert summary["token_usage"]["calls"] == 2
+    pdf = client.written["app_a/output/ts1/validation/report.pdf"]
+    assert isinstance(pdf, bytes) and pdf[:5] == b"%PDF-"
+
+
+def test_upload_outputs_reports_no_usage_rather_than_zero():
+    # A gateway that returned no usage block must not produce a summary
+    # claiming the run cost nothing.
+    client = _FakeClient()
+    demo_run._upload_outputs(client, _req(True), _outputs(), validating=True)
+
+    summary = json.loads(client.written["app_a/output/ts1/validation/summary.json"])
+    assert summary["token_usage"] is None
+
+
 def test_upload_outputs_without_validation_skips_validation_dir():
     client = _FakeClient()
     demo_run._upload_outputs(client, _req(False), _outputs(), validating=False)
