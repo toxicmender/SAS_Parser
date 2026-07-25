@@ -86,7 +86,12 @@ logger = logging.getLogger(__name__)
 DEFAULT_MOUNT_POINT = "secret"
 DEFAULT_KV_VERSION = 2
 DEFAULT_TIMEOUT = 30.0
-DEFAULT_AUTH_PATH = "jwt"
+DEFAULT_AUTH_PATH = "jwt/azuread/inspirewellness"
+# Last-resort audience for the Entra ID token presented to Vault, used only
+# when neither VaultConfig.azure_scopes nor the azure module's own scopes nor a
+# client id is available. The doubled slash is Azure Resource Manager's
+# documented `.default` form, not a typo.
+_ARM_DEFAULT_SCOPE = "https://management.azure.com//.default"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 # Path of the AI Gateway credential *relative to the KV mount*: with the
@@ -273,7 +278,9 @@ def _azure_jwt(config: VaultConfig) -> str:
     auth method, acquired through the shared :mod:`app_config.azure` client.
     Scopes resolve as :attr:`VaultConfig.azure_scopes` > the azure module's
     configured scopes > ``<client_id>/.default`` (the app registration's own
-    audience — what a Vault role with ``bound_audiences=<client_id>`` expects).
+    audience — what a Vault role with ``bound_audiences=<client_id>`` expects)
+    > :data:`_ARM_DEFAULT_SCOPE`, for a principal with no client id to derive
+    an audience from.
     """
     from . import azure  # sibling module; msal stays a lazy import inside it
 
@@ -283,8 +290,15 @@ def _azure_jwt(config: VaultConfig) -> str:
     try:
         azure_client = azure.get_azure_client()
         scopes = config.azure_scopes or azure_client.config.scopes
-        if not scopes and azure_client.config.client_id:
-            scopes = (f"{azure_client.config.client_id}/.default",)
+        if not scopes:
+            # Nothing configured: prefer the app registration's own audience,
+            # falling back to ARM. The `else` must stay inside this branch — an
+            # explicitly configured scope always wins (the repo-wide precedence
+            # rule), so it cannot be reached when `scopes` is already set.
+            if azure_client.config.client_id:
+                scopes = (f"{azure_client.config.client_id}/.default",)
+            else:
+                scopes = (_ARM_DEFAULT_SCOPE,)
         return azure_client.get_token(scopes)
     except azure.AzureAuthError as exc:
         raise VaultError(
@@ -497,6 +511,13 @@ def get_ai_gateway_secret(path: str | None = None) -> dict[str, Any]:
     VaultError
         Vault is unreachable or unauthenticated, or the secret is absent.
     """
+    if path is None:
+        configured = get_value("vault", "ai_gateway_path")
+        if configured:
+            path = configured
+        else:
+            oidc_role = os.environ.get("VAULT_OIDC_ROLE") or get_value("vault", "oidc_role")
+            path = f"{oidc_role}/ai_gateway" if oidc_role else AI_GATEWAY_PATH
     return get_secret(path or AI_GATEWAY_PATH)
 
 

@@ -79,7 +79,8 @@ the metric's class default. Metrics that a run carries no signal for
 CLI (exit code gates CI — 0 iff every case passed):
 
 ```bash
-# deterministic metrics against a live model (needs ANTHROPIC_API_KEY):
+# deterministic metrics against a live model (needs OPENAI_API_KEY — the
+# gateway is OpenAI-compatible for every model it fronts):
 python -m validation validation/cases --model claude-sonnet-4-5
 
 # + LLM judge, + append to the local run history (./validation_runs):
@@ -170,6 +171,33 @@ publish_report_pdf(report, "Reports/Validation")               # SharePoint
 e.g. the `out["validation"]` values a `run_*` call returns. `demo_run.py` uses
 exactly this: `--pdf` writes the inline report locally in `local` mode, and
 `sharepoint` mode uploads it as `.../validation/report.pdf` beside the JSON.
+
+## Token cost
+
+A report carries two independent token figures, both `llm_client.TokenUsage`
+and both `None` when nothing reported usage:
+
+| Field | What it counts |
+|---|---|
+| `token_usage` | What the run under test cost — the pipeline's own LLM calls. |
+| `judge_token_usage` | What *grading* cost — `LLMJudgeMetric`'s calls, and any future LLM-backed metric exposing a `token_usage`. |
+
+They are kept apart deliberately: folded together, a run would look more
+expensive the more thoroughly it was checked, and judging is a choice about the
+eval, not a property of the model being evaluated. Both render into
+`to_markdown()` and therefore into the PDF.
+
+`ValidationRunner` attributes them to *its* run by snapshotting before and
+subtracting after, since the pipeline and judge belong to the caller and may
+have been used before the run or reused after it. Post-hoc thread mode reports
+only the judge figure — the translation it scores was billed in some earlier
+run. A judge wired to a raw chat model rather than an `LLMClient` reports
+nothing, and the field stays `None` rather than claiming zero.
+
+Inline runs (`report_from_verdicts`) take `token_usage=pipeline.token_usage`
+explicitly: verdicts are per item, usage is per run, so it cannot be recovered
+from the verdicts. `demo_run.py` passes it, and also writes it into
+`.../validation/summary.json`.
 
 Each item is scored the instant its response returns, through the same
 `Evaluator` core as every other mode, so an inline verdict equals a post-hoc

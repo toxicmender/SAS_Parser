@@ -355,6 +355,135 @@ def test_runner_multiple_independent_items_get_distinct_responses():
     assert report.passed
 
 
+# ---------------------------------------------------------------------------
+# Token accounting — pipeline spend and judge spend, kept apart
+# ---------------------------------------------------------------------------
+
+
+class _UsageChatModel:
+    """Chat model reporting a fixed token usage per call, like a real gateway."""
+
+    def __init__(self, responses: list[str], *, input_tokens=100, output_tokens=20):
+        self._responses = list(responses)
+        self._i = 0
+        self._input_tokens = input_tokens
+        self._output_tokens = output_tokens
+        self.calls = 0
+
+    def invoke(self, messages, config=None):
+        from langchain_core.messages import AIMessage
+
+        text = self._responses[self._i % len(self._responses)]
+        self._i += 1
+        self.calls += 1
+        return AIMessage(
+            text,
+            usage_metadata={
+                "input_tokens": self._input_tokens,
+                "output_tokens": self._output_tokens,
+                "total_tokens": self._input_tokens + self._output_tokens,
+            },
+        )
+
+    async def ainvoke(self, messages, config=None):
+        return self.invoke(messages, config)
+
+
+def test_pipeline_exposes_its_token_usage():
+    model = _UsageChatModel([GOOD_RESPONSE])
+    pipeline = SasLLMPipeline(llm=model)
+    pipeline.run_text("data work.a; run;", source_id="a.sas")
+
+    usage = pipeline.token_usage
+    assert usage.calls == model.calls
+    assert usage.input_tokens == 100 * model.calls
+    assert usage.output_tokens == 20 * model.calls
+
+
+def test_report_carries_the_run_token_usage():
+    case = ValidationCase(case_id="tokens", sas_source="data work.a; run;")
+    report = ValidationRunner(SasLLMPipeline(llm=_UsageChatModel([GOOD_RESPONSE]))).run(
+        [case]
+    )
+
+    assert report.token_usage is not None
+    assert report.token_usage.input_tokens > 0
+    # No judge in the default suite, so nothing to attribute to grading.
+    assert report.judge_token_usage is None
+
+
+def test_report_token_usage_counts_only_this_run():
+    # The runner is handed a pipeline it does not own; an earlier run's spend
+    # must not be billed to this report.
+    pipeline = SasLLMPipeline(llm=_UsageChatModel([GOOD_RESPONSE]))
+    pipeline.run_text("data work.earlier; run;", source_id="earlier.sas")
+    before = pipeline.token_usage.input_tokens
+    assert before > 0
+
+    case = ValidationCase(case_id="second", sas_source="data work.a; run;")
+    report = ValidationRunner(pipeline).run([case])
+
+    assert report.token_usage is not None
+    assert report.token_usage.input_tokens == pipeline.token_usage.input_tokens - before
+
+
+def test_judge_spend_is_reported_separately_from_the_pipeline():
+    from llm_client import LLMClient
+    from validation import LLMJudgeMetric, default_metrics
+
+    judge_model = _UsageChatModel(["SCORE: 5"], input_tokens=7, output_tokens=3)
+    judge = LLMJudgeMetric(llm=LLMClient(llm=judge_model))
+    pipeline = SasLLMPipeline(llm=_UsageChatModel([GOOD_RESPONSE]))
+    case = ValidationCase(case_id="judged", sas_source="data work.a; run;")
+
+    report = ValidationRunner(pipeline, metrics=[*default_metrics(), judge]).run([case])
+
+    assert report.judge_token_usage is not None
+    assert report.judge_token_usage.input_tokens == 7 * judge_model.calls
+    # The two figures are distinct: grading is not billed to the translation.
+    assert report.token_usage is not None
+    assert report.token_usage.input_tokens != report.judge_token_usage.input_tokens
+
+
+def test_judge_without_usage_reporting_leaves_the_field_none():
+    from validation import LLMJudgeMetric, default_metrics
+
+    # A raw chat model as judge: no usage to report, so no claim is made.
+    judge = LLMJudgeMetric(llm=FakeListChatModel(responses=["SCORE: 4"]))
+    report = ValidationRunner(
+        SasLLMPipeline(llm=_UsageChatModel([GOOD_RESPONSE])),
+        metrics=[*default_metrics(), judge],
+    ).run([ValidationCase(case_id="c", sas_source="data work.a; run;")])
+
+    assert report.judge_token_usage is None
+
+
+def test_report_without_usage_reports_nothing_rather_than_zero():
+    # FakeListChatModel carries no usage block: the report must not claim the
+    # run was free.
+    report = ValidationRunner(_pipeline([GOOD_RESPONSE])).run(
+        [ValidationCase(case_id="c", sas_source="data work.a; run;")]
+    )
+
+    assert report.token_usage is None
+    assert "tokens (pipeline)" not in report.to_markdown()
+
+
+def test_markdown_shows_both_token_lines():
+    from llm_client import TokenUsage
+    from validation import ValidationReport
+
+    report = ValidationReport(
+        model="m",
+        token_usage=TokenUsage(input_tokens=1000, output_tokens=200, calls=3),
+        judge_token_usage=TokenUsage(input_tokens=40, output_tokens=8, calls=2),
+    )
+    md = report.to_markdown()
+
+    assert "tokens (pipeline): 3 call(s)  in=1,000" in md
+    assert "tokens (judge): 2 call(s)  in=40" in md
+
+
 def test_report_markdown_lists_cases_and_metrics():
     case = ValidationCase(case_id="md_case", sas_source="data work.a; run;")
     report = ValidationRunner(_pipeline([GOOD_RESPONSE])).run([case])

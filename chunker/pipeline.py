@@ -40,7 +40,7 @@ with warnings.catch_warnings():
     )
     from langgraph.graph import START, MessagesState, StateGraph
 
-from llm_client import LLMClient, LLMClientConfig
+from llm_client import LLMClient, LLMClientConfig, TokenUsage
 from memory.relevance import RelevantHistorySelector
 from memory.store import MemoryHub
 from memory.summarize import RollingSummarizer
@@ -417,7 +417,9 @@ class SasLLMPipeline:
     Parameters
     ----------
     model : str
-        LangChain chat-model string, e.g. ``"claude-sonnet-4-5"``.
+        Model id as the AI Gateway names it, e.g. ``"claude-sonnet-4-5"``.
+        Every model reaches the gateway over its OpenAI-compatible API,
+        so the name selects the model, not the transport.
     temperature : float | None
         Sampling temperature for the LLM. ``None`` (default) keeps the
         provider default. Forwarded to :class:`llm_client.LLMClientConfig`.
@@ -434,14 +436,14 @@ class SasLLMPipeline:
         limits, overload / 5xx, timeouts, connection drops); other
         errors are never retried.
     base_url : str | None
-        Provider endpoint override (proxy / gateway URL). ``None``
+        Gateway endpoint (the OpenAI-compatible root). ``None``
         (default) defers to config.json ``llm_client.base_url``, then
-        the provider default. Ignored when ``llm`` is injected.
+        ``OPENAI_BASE_URL``. Ignored when ``llm`` is injected.
     api_key : str | None
-        Explicit API key; held as a masked ``SecretStr`` inside
-        :class:`llm_client.LLMClientConfig`, never logged. ``None``
-        (default) defers to the provider's environment variable (e.g.
-        ``ANTHROPIC_API_KEY``). Ignored when ``llm`` is injected.
+        Explicit API key (the gateway token); held as a masked
+        ``SecretStr`` inside :class:`llm_client.LLMClientConfig`, never
+        logged. ``None`` (default) defers to ``OPENAI_API_KEY`` in the
+        environment. Ignored when ``llm`` is injected.
     url_headers : dict[str, str] | None
         Extra HTTP headers sent with every LLM request (forwarded as
         ``default_headers`` — gateway auth, tracing, ...). ``None``
@@ -452,12 +454,14 @@ class SasLLMPipeline:
         config.json ``llm_client.timeout``, then the provider default.
         Ignored when ``llm`` is injected.
     model_kwargs : dict | None
-        Provider-specific request-body extras (e.g. ``{"top_k": 40}``).
-        ``None`` (default) defers to config.json
-        ``llm_client.model_kwargs``. Ignored when ``llm`` is injected.
+        Extra ``/chat/completions`` request-body fields (e.g.
+        ``{"top_k": 40}``), which is how the gateway takes model-specific
+        knobs outside the OpenAI schema. ``None`` (default) defers to
+        config.json ``llm_client.model_kwargs``. Ignored when ``llm`` is
+        injected.
     llm_kwargs : dict | None
         Escape hatch: arbitrary keyword arguments merged last into the
-        ``init_chat_model`` call (the :class:`llm_client.LLMClientConfig`
+        ``ChatOpenAI(...)`` call (the :class:`llm_client.LLMClientConfig`
         field ``kwargs``), overriding anything the named knobs produced.
         Ignored when ``llm`` is injected.
     prompt_caching : bool | None
@@ -471,6 +475,16 @@ class SasLLMPipeline:
         cacheable prefix (~1024 tokens on ``claude-sonnet-4-5``; larger
         on newer models) are silently not cached — harmless. Ignored for
         non-Anthropic models.
+
+        Requesting it is safe even against a gateway that does not
+        support it. ``cache_control`` is an Anthropic-native content-part
+        key, and whether it survives the trip through the gateway's
+        OpenAI-compatible API is a property of the gateway, not the
+        model. So :class:`llm_client.LLMClient` settles it by asking:
+        it sends the breakpoint, and if the endpoint rejects it, strips
+        it, re-sends, and drops it from every later call (one WARNING,
+        one failed request per process). The run then simply pays full
+        price for the system prompt.
     min_words, max_words : int | None
         Forwarded to :class:`SasSemanticChunker`. ``None`` (default) lets
         the chunker read ``sas_chunker.*`` from config.json (see the
@@ -1089,6 +1103,18 @@ class SasLLMPipeline:
         ]
         facts.sort(key=lambda f: f.get("index") or 0)
         return facts
+
+    @property
+    def token_usage(self) -> TokenUsage:
+        """
+        Tokens billed by this pipeline's LLM calls so far.
+
+        Cumulative over the pipeline's lifetime, not per ``run_*`` call — a
+        caller attributing one run's cost snapshots this before and subtracts
+        after (``TokenUsage`` supports ``-``). Stays at zero when the gateway
+        reports no usage block; see :attr:`llm_client.LLMClient.usage`.
+        """
+        return self._llm_client.usage
 
     # ------------------------------------------------------------------
     # Internals

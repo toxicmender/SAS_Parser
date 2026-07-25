@@ -434,21 +434,20 @@ def test_summarizer_gets_pipeline_store_and_summary_never_persisted():
 
 
 # ---------------------------------------------------------------------------
-# LLM endpoint overrides — pipeline arguments reach init_chat_model
+# LLM endpoint overrides — pipeline arguments reach the ChatOpenAI constructor
 # ---------------------------------------------------------------------------
 
 
-def test_endpoint_overrides_reach_init_chat_model(monkeypatch):
+def test_endpoint_overrides_reach_the_chat_model(monkeypatch):
     import llm_client.client as client_mod
 
     captured: dict = {}
 
-    def fake_init(model, **kwargs):
-        captured["model"] = model
+    def fake_chat_openai(**kwargs):
         captured.update(kwargs)
         return FakeListChatModel(responses=["built"])
 
-    monkeypatch.setattr(client_mod, "init_chat_model", fake_init)
+    monkeypatch.setattr(client_mod, "ChatOpenAI", fake_chat_openai)
 
     SasLLMPipeline(
         model="some-model",
@@ -466,7 +465,9 @@ def test_endpoint_overrides_reach_init_chat_model(monkeypatch):
     assert captured["temperature"] == 0.2
     assert captured["base_url"] == "https://gateway.example/v1"
     assert captured["api_key"] == "sk-secret"
-    assert captured["default_headers"] == {"X-Team": "sas"}
+    # llm_client also mirrors the key into an `api-key` header for gateways
+    # that authenticate on it; see tests/test_llm_client.py.
+    assert captured["default_headers"] == {"X-Team": "sas", "api-key": "sk-secret"}
     assert captured["timeout"] == 42.5
     assert captured["model_kwargs"] == {"top_k": 40}
     assert captured["stop"] == ["END"]  # llm_kwargs escape hatch, merged last

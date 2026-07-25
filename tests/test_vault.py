@@ -425,6 +425,45 @@ def test_ai_gateway_path_is_the_documented_one():
     assert vault.DEFAULT_KV_VERSION == 2
 
 
+def test_gateway_path_prefers_the_configured_one(monkeypatch, _isolated):
+    # vault.ai_gateway_path in config.json wins over everything else.
+    monkeypatch.setenv("VAULT_OIDC_ROLE", "some-role")
+    monkeypatch.setattr(
+        vault,
+        "get_value",
+        lambda section, key, default=None: (
+            "team/gateway" if key == "ai_gateway_path" else default
+        ),
+    )
+    _gateway_client(monkeypatch, {"token": "configured"}, path="team/gateway")
+
+    assert vault.get_ai_gateway_secret() == {"token": "configured"}
+
+
+def test_gateway_path_falls_back_to_the_oidc_role(monkeypatch, _isolated):
+    # With no configured path, the secret is looked for beside the Vault role
+    # that unlocked it: "<oidc_role>/ai_gateway".
+    monkeypatch.setenv("VAULT_OIDC_ROLE", "sas-parser")
+    _gateway_client(monkeypatch, {"token": "by-role"}, path="sas-parser/ai_gateway")
+
+    assert vault.get_ai_gateway_secret() == {"token": "by-role"}
+
+
+def test_gateway_path_falls_back_to_the_module_default(monkeypatch, _isolated):
+    # Neither configured nor a role to derive from: the documented path.
+    monkeypatch.delenv("VAULT_OIDC_ROLE", raising=False)
+    _gateway_client(monkeypatch, {"token": "default-path"})
+
+    assert vault.get_ai_gateway_secret() == {"token": "default-path"}
+
+
+def test_explicit_path_argument_beats_every_fallback(monkeypatch, _isolated):
+    monkeypatch.setenv("VAULT_OIDC_ROLE", "sas-parser")
+    _gateway_client(monkeypatch, {"token": "explicit"}, path="given/path")
+
+    assert vault.get_ai_gateway_secret("given/path") == {"token": "explicit"}
+
+
 def test_get_ai_gateway_secret_reads_the_default_path(monkeypatch, _isolated):
     _gateway_client(monkeypatch, {"token": "gw-token", "base_url": "https://gw"})
     assert vault.get_ai_gateway_secret() == {

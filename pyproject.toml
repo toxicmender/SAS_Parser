@@ -10,6 +10,10 @@ dependencies = [
     "bm25s[core]>=0.3.9",
     "faiss-cpu>=1.14.3",
     "langchain>=1.3.11",
+    # Every model is reached over the AI Gateway's OpenAI-compatible API —
+    # Anthropic- and Google-served ones included — so llm_client imports
+    # ChatOpenAI unconditionally. Core, not an extra.
+    "langchain-openai>=1.3",
     "langgraph>=1.0",
     "markdown-it-py>=3.0",
     "pydantic>=2.13.4",
@@ -22,8 +26,6 @@ dependencies = [
 # in-memory mode must import and run without pyspark (Architecture.md
 # invariant 6), so it is an extra, not a core dependency.
 spark      = ["pyspark>=4.1.2"]
-anthropic  = ["langchain-anthropic>=0.3"]
-openai     = ["langchain-openai>=0.2"]
 vault      = ["hvac>=2.0"]
 azure      = ["msal>=1.28"]
 databricks = ["databricks-sdk>=0.30", "databricks-sql-connector>=3.0"]

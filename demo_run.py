@@ -47,9 +47,8 @@ per-item and summary JSON.
 
 Usage
 -----
-    # needs the `anthropic` extra installed:
-    #   uv pip install -e ".[anthropic]"
-    # for `sharepoint`, also the SharePoint extra + Entra ID identity:
+    # the OpenAI-compatible chat-model client is a core dependency; for
+    # `sharepoint`, install that extra + Entra ID identity:
     #   uv pip install -e ".[sharepoint]"
     #
     # API key, in order of precedence:
@@ -57,8 +56,10 @@ Usage
     #   - the AI Gateway chain (the default whenever Vault is configured):
     #     an Entra ID service principal -> JWT -> Vault -> appsvc/ai_gateway;
     #     needs the `vault` extra (see below), or
-    #   - ANTHROPIC_API_KEY in the environment, used when no Vault settings
-    #     are present or --no-gateway-auth is passed.
+    #   - OPENAI_API_KEY in the environment (the gateway speaks the OpenAI
+    #     protocol for every model it fronts, so that is the variable
+    #     whatever --model names), used when no Vault settings are present
+    #     or --no-gateway-auth is passed.
     python demo_run.py local path/to/sas_dir
     python demo_run.py local path/to/sas_dir --model claude-sonnet-4-5 --debug
     python demo_run.py local path/to/sas_dir --no-gateway-auth
@@ -104,7 +105,7 @@ model's endpoint; otherwise config.json's ``llm_client.base_url`` stands.
 This path is taken whenever ``VAULT_ADDR`` and a login method are configured.
 A *broken* Vault then fails the run rather than quietly falling back — using a
 different credential than intended is worse than stopping. With no Vault
-settings at all, the run defers to ``ANTHROPIC_API_KEY``, as does
+settings at all, the run defers to ``OPENAI_API_KEY``, as does
 ``--no-gateway-auth``.
 
 Vault (AppRole, explicit path)
@@ -195,7 +196,7 @@ def _fetch_api_key_from_vault(secret_path: str, secret_key: str) -> str:
         raise SystemExit(
             "--vault-secret needs AppRole credentials: set VAULT_ROLE_ID and "
             "VAULT_SECRET_ID (and VAULT_ADDR), or omit --vault-secret to use "
-            "ANTHROPIC_API_KEY directly"
+            "OPENAI_API_KEY directly"
         )
     approle = replace(base, token=None)  # force app identity, ignore any token
     try:
@@ -247,7 +248,7 @@ def _fetch_ai_gateway_credentials() -> tuple[str, str | None]:
     except VaultError as exc:
         raise SystemExit(
             f"could not fetch the AI Gateway credential from Vault: {exc}\n"
-            f"Pass --no-gateway-auth to fall back to ANTHROPIC_API_KEY, or "
+            f"Pass --no-gateway-auth to fall back to OPENAI_API_KEY, or "
             f"--vault-secret PATH to read a different secret over AppRole."
         ) from exc
 
@@ -259,10 +260,10 @@ def _resolve_llm_credentials(args: argparse.Namespace) -> tuple[str | None, str 
     1. ``--vault-secret PATH`` — an explicit AppRole read of a named secret.
     2. The **AI Gateway chain**, the default whenever Vault is configured:
        Entra ID service principal -> JWT -> Vault -> ``appsvc/ai_gateway``.
-    3. ``(None, None)``, letting the pipeline defer to ``ANTHROPIC_API_KEY`` /
-       the provider's own environment variable — the local-development path,
-       taken when no Vault settings are present or ``--no-gateway-auth`` is
-       passed.
+    3. ``(None, None)``, letting the pipeline defer to ``OPENAI_API_KEY`` —
+       the gateway is OpenAI-compatible for every model it fronts, so that
+       is the variable whatever the model. The local-development path, taken
+       when no Vault settings are present or ``--no-gateway-auth`` is passed.
 
     Shared by both subcommands. ``base_url`` is ``None`` unless the gateway
     secret named an endpoint, so an omitted one still defers to config.json's
@@ -276,12 +277,12 @@ def _resolve_llm_credentials(args: argparse.Namespace) -> tuple[str | None, str 
         )
         return key, None
     if args.no_gateway_auth:
-        logger.info("--no-gateway-auth: deferring to ANTHROPIC_API_KEY")
+        logger.info("--no-gateway-auth: deferring to OPENAI_API_KEY")
         return None, None
     if not _ai_gateway_configured():
         logger.info(
             "no Vault configuration found (VAULT_ADDR and a login method); "
-            "deferring to ANTHROPIC_API_KEY"
+            "deferring to OPENAI_API_KEY"
         )
         return None, None
     key, base_url = _fetch_ai_gateway_credentials()
@@ -309,8 +310,8 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--output-language",
-        default="PySpark",
-        help="Target language named in the system prompt (default: PySpark).",
+        default="SparkSQL",
+        help="Target language named in the system prompt (default: SparkSQL).",
     )
     parser.add_argument(
         "--vault-secret",
@@ -329,7 +330,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Skip the default AI Gateway credential chain (Entra ID service "
         "principal -> JWT -> Vault -> appsvc/ai_gateway) and use "
-        "ANTHROPIC_API_KEY from the environment instead.",
+        "OPENAI_API_KEY from the environment instead.",
     )
     parser.add_argument(
         "--validation-retries",
@@ -369,7 +370,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     local.add_argument(
         "--model",
         default=None,
-        help="LangChain chat-model string. Overrides config.json "
+        help="Model id as the AI Gateway names it. Overrides config.json "
         f"llm_client.model (default when both are unset: {_DEFAULT_MODEL}).",
     )
     local.add_argument(
@@ -506,24 +507,51 @@ def _log_validation_summary(outputs: list[dict]) -> None:
             )
 
 
+def _log_token_usage(pipeline) -> None:
+    """Log what the run cost in tokens.
+
+    Reads the pipeline's cumulative total, which is this run's total because
+    ``demo_run`` builds a pipeline per invocation. Silent when the gateway
+    reported no usage — ``llm_client`` has already warned about that once, and
+    repeating it here would say nothing new.
+    """
+    usage = pipeline.token_usage
+    if not usage.calls:
+        return
+    logger.info(f"token usage: {usage.summary()}")
+    if usage.cache_read_tokens:
+        cached = usage.cache_read_tokens / max(1, usage.input_tokens)
+        logger.info(f"  prompt cache served {cached:.0%} of input tokens")
+
+
 def _validation_report(
-    outputs: list[dict], *, model: str, instructions_fingerprint: str | None = None
+    outputs: list[dict],
+    *,
+    model: str,
+    instructions_fingerprint: str | None = None,
+    token_usage=None,
 ):
     """A ValidationReport reconstructed from the run's inline verdicts.
 
     Turns the per-item ``out["validation"]`` verdicts LiveValidator produced
     into the same aggregate report an offline run yields, so the inline run can
-    be rendered to Markdown/PDF (:mod:`validation.pdf`).
+    be rendered to Markdown/PDF (:mod:`validation.pdf`). *token_usage* is the
+    pipeline's spend, which the verdicts cannot carry (they are per item);
+    there is no judge figure here, inline validation being the deterministic
+    suite.
     """
     from validation import report_from_verdicts
 
     verdicts = [o["validation"] for o in outputs if o.get("validation")]
     return report_from_verdicts(
-        verdicts, model=model, instructions_fingerprint=instructions_fingerprint
+        verdicts,
+        model=model,
+        instructions_fingerprint=instructions_fingerprint,
+        token_usage=token_usage,
     )
 
 
-def _validation_summary(outputs: list[dict]) -> dict:
+def _validation_summary(outputs: list[dict], *, token_usage=None) -> dict:
     """The aggregate pass/fail summary uploaded alongside the SharePoint run."""
     verdicts = [o["validation"] for o in outputs if o.get("validation")]
     passed = sum(1 for v in verdicts if v["passed"])
@@ -535,6 +563,13 @@ def _validation_summary(outputs: list[dict]) -> dict:
         "passed": passed,
         "failed": len(verdicts) - passed,
         "mean_score": mean_score,
+        # None when the gateway reported no usage, so a consumer can tell
+        # "not reported" from "reported as zero".
+        "token_usage": (
+            token_usage.model_dump()
+            if token_usage is not None and token_usage.calls
+            else None
+        ),
         "per_item": [
             {
                 "item_id": o["item_id"],
@@ -588,6 +623,7 @@ def _run_local(args: argparse.Namespace) -> int:
     outputs = pipeline.run_files(sas_files)
 
     _log_item_summaries(outputs)
+    _log_token_usage(pipeline)
     if args.out_dir:
         args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -610,6 +646,7 @@ def _run_local(args: argparse.Namespace) -> int:
                 outputs,
                 model=model,
                 instructions_fingerprint=pipeline.instructions_fingerprint,
+                token_usage=pipeline.token_usage,
             )
             args.pdf.write_bytes(report_to_pdf(report))
             logger.info(f"wrote inline-validation PDF report: {args.pdf}")
@@ -706,6 +743,7 @@ def _upload_outputs(
     *,
     validating: bool,
     instructions_fingerprint: str | None = None,
+    token_usage=None,
 ) -> str:
     """Write responses (and validation artifacts) back to the library.
 
@@ -714,6 +752,10 @@ def _upload_outputs(
     a ``.../validation/summary.json`` aggregate, and a human-readable
     ``.../validation/report.pdf`` rendered from the inline verdicts. Returns the
     output folder.
+
+    *token_usage* is the run's LLM spend
+    (:attr:`~chunker.pipeline.SasLLMPipeline.token_usage`), carried into both
+    the summary JSON and the PDF header.
     """
     out_dir = f"{req.application_name}/output/{req.timestamp}"
     validation_dir = f"{out_dir}/validation"
@@ -739,12 +781,15 @@ def _upload_outputs(
 
         client.write_file(
             f"{validation_dir}/summary.json",
-            json.dumps(_validation_summary(outputs), indent=2),
+            json.dumps(
+                _validation_summary(outputs, token_usage=token_usage), indent=2
+            ),
         )
         report = _validation_report(
             outputs,
             model=req.model,
             instructions_fingerprint=instructions_fingerprint,
+            token_usage=token_usage,
         )
         client.write_file(f"{validation_dir}/report.pdf", report_to_pdf(report))
     return out_dir
@@ -829,6 +874,7 @@ def _run_sharepoint(args: argparse.Namespace) -> int:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     _log_item_summaries(outputs)
+    _log_token_usage(pipeline)
     for out in outputs:
         print(f"\n{_item_header(out)}")
         print(out["response"])
@@ -840,6 +886,7 @@ def _run_sharepoint(args: argparse.Namespace) -> int:
             outputs,
             validating=validator is not None,
             instructions_fingerprint=pipeline.instructions_fingerprint,
+            token_usage=pipeline.token_usage,
         )
     except SharePointError as exc:
         logger.error(f"could not upload results to SharePoint: {exc}")
@@ -861,7 +908,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # Populate the environment from .env before anything reads it (the Vault
-    # AppRole creds, ANTHROPIC_API_KEY, and the SharePoint/Azure settings live
+    # AppRole creds, OPENAI_API_KEY, and the SharePoint/Azure settings live
     # there); real shell env wins.
     _load_dotenv()
 

@@ -23,6 +23,7 @@ from uuid import uuid4
 
 from chunker.models import SasBatch
 from chunker.pipeline import SasLLMPipeline
+from llm_client import TokenUsage
 
 from .evaluator import Evaluator
 from .metrics import ValidationMetric
@@ -61,6 +62,23 @@ class ValidationRunner:
     @property
     def metrics(self) -> list[ValidationMetric]:
         return self._evaluator.metrics
+
+    @property
+    def judge_token_usage(self) -> TokenUsage:
+        """
+        Tokens billed by LLM-backed *metrics* so far, summed across the suite.
+
+        Any metric exposing a ``token_usage`` is counted, so a second judged
+        metric added later is picked up without touching this. Zero when no
+        metric reports usage — the deterministic suite, or a judge wired to a
+        raw chat model rather than an :class:`llm_client.LLMClient`.
+        """
+        total = TokenUsage()
+        for metric in self.metrics:
+            usage = getattr(metric, "token_usage", None)
+            if isinstance(usage, TokenUsage):
+                total = total + usage
+        return total
 
     def run_case(self, case: ValidationCase) -> CaseResult:
         """Run one case through the pipeline and every metric."""
@@ -105,14 +123,32 @@ class ValidationRunner:
         return case_result
 
     def run(self, cases: Sequence[ValidationCase]) -> ValidationReport:
-        """Run every case and aggregate into a :class:`ValidationReport`."""
+        """Run every case and aggregate into a :class:`ValidationReport`.
+
+        Token totals are attributed to *this* run by snapshotting before and
+        subtracting after: the pipeline and judge are the caller's, and may
+        well have been used before this call or be reused after it.
+        """
         logger.info(f"run: {len(cases)} case(s)  model={self.pipeline.model}")
+        pipeline_before = self.pipeline.token_usage
+        judge_before = self.judge_token_usage
+
+        results = [self.run_case(case) for case in cases]
+
+        pipeline_usage = self.pipeline.token_usage - pipeline_before
+        judge_usage = self.judge_token_usage - judge_before
         report = ValidationReport(
             model=self.pipeline.model,
             instructions_fingerprint=self.pipeline.instructions_fingerprint,
-            results=[self.run_case(case) for case in cases],
+            results=results,
+            # A run that billed nothing reported nothing — carry None rather
+            # than a row of zeroes claiming the run was free.
+            token_usage=pipeline_usage if pipeline_usage.calls else None,
+            judge_token_usage=judge_usage if judge_usage.calls else None,
         )
         logger.info(
-            f"run: aggregate score={report.score:.3f}  passed={report.passed}"
+            f"run: aggregate score={report.score:.3f}  passed={report.passed}  "
+            f"pipeline tokens[{pipeline_usage.summary()}]  "
+            f"judge tokens[{judge_usage.summary()}]"
         )
         return report
