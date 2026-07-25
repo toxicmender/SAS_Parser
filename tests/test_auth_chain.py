@@ -7,7 +7,7 @@ The links, in order:
    (``app_config.databricks``), bootstrapped by a PAT or the cluster runtime.
 2. ``msal`` mints a JWT for that principal (``app_config.azure``).
 3. That JWT logs in to Vault's ``jwt`` auth method (``app_config.vault``).
-4. The Vault session reads the AI Gateway secret at ``appsvc/ai_gateway``.
+4. The Vault session reads the AI Gateway secret at ``<oidc_role>/ai_gateway``.
 5. The gateway token lands on ``llm_client.LLMClientConfig.api_key``.
 
 The unit tests for each module cover the branches within it; what is checked
@@ -39,6 +39,11 @@ SPN_CLIENT = "chain-client"
 SPN_SECRET = "chain-secret"
 GATEWAY_TOKEN = "gw-token-from-vault"
 MINTED_JWT = "jwt-signed-for-the-spn"
+VAULT_ROLE = "sas-parser"
+# Where get_ai_gateway_secret looks with no vault.ai_gateway_path configured:
+# the secret sits beside the Vault role that unlocked it. See
+# test_vault.py for the full precedence.
+GATEWAY_SECRET_PATH = f"{VAULT_ROLE}/ai_gateway"
 
 _ENV = (
     "DATABRICKS_HOST",
@@ -155,7 +160,7 @@ class _FakeVault:
 
     @classmethod
     def _read(cls, path, mount_point, raise_on_deleted_version):
-        if (mount_point, path) != ("secret", vault.AI_GATEWAY_PATH):
+        if (mount_point, path) != ("secret", GATEWAY_SECRET_PATH):
             raise RuntimeError(f"no secret at {mount_point}/{path}")
         return {"data": {"data": dict(cls.payload)}}
 
@@ -189,7 +194,7 @@ def chain(monkeypatch):
 
     # 3. Vault, reached with the jwt auth method.
     monkeypatch.setenv("VAULT_ADDR", "https://vault.example:8200")
-    monkeypatch.setenv("VAULT_OIDC_ROLE", "sas-parser")
+    monkeypatch.setenv("VAULT_OIDC_ROLE", VAULT_ROLE)
     hvac = pytest.importorskip("hvac", reason="hvac is not installed")
     monkeypatch.setattr(hvac, "Client", _FakeVault)
 
@@ -230,7 +235,7 @@ def test_vault_receives_the_minted_jwt(chain):
     logins = _FakeVault.instances[0].logins
     assert len(logins) == 1
     assert logins[0] == {
-        "role": "sas-parser",
+        "role": VAULT_ROLE,
         "jwt": MINTED_JWT,
         "path": vault.DEFAULT_AUTH_PATH,
     }
