@@ -43,11 +43,13 @@ jobs:
       # All extras so optional imports (pyspark, msal, hvac, delta,
       # databricks, msgraph-sdk, ...) resolve; otherwise pyright reports them
       # as missing and the counts drift from a local run. [tool.pyright]
-      # points pyright at this .venv.
+      # points pyright at this .venv. The LLM client (langchain-openai) is a
+      # core dependency now — every model is reached over the gateway's
+      # OpenAI-compatible API — so there is no anthropic/openai extra to add.
       - name: Install dependencies
         run: >
           uv sync --locked
-          --extra dev --extra spark --extra anthropic --extra openai
+          --extra dev --extra spark
           --extra vault --extra azure --extra databricks --extra sharepoint
 
       # Pinned like ruff so local and CI agree on the exact diagnostics.
