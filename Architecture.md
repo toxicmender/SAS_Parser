@@ -89,7 +89,9 @@ chunker/
 
 llm_client/
   client.py             LLMClient / LLMClientConfig: chat-model construction
-                        via init_chat_model (temperature, max output tokens,
+                        via ChatOpenAI — every model, Claude and Gemini
+                        included, is reached over the AI Gateway's
+                        OpenAI-compatible API (temperature, max output tokens,
                         endpoint overrides — base_url / api_key / headers /
                         timeout / model_kwargs, proactive InMemoryRateLimiter)
                         and sync + async invocation (input-token budget ->

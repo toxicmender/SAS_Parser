@@ -3,7 +3,7 @@ Tests for llm_client.client — construction knobs, input-token budget,
 and rate-limit retry.
 
 No network or API keys: model construction is exercised by monkeypatching
-``llm_client.client.init_chat_model`` to capture kwargs, and invocation by
+``llm_client.client.ChatOpenAI`` to capture kwargs, and invocation by
 injecting fakes (FakeListChatModel or small stubs). Retry tests set
 ``retry_base_seconds`` tiny so backoff sleeps are negligible.
 """
@@ -21,11 +21,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import pytest
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 
 import llm_client.client as client_mod
-from llm_client import InputTokenLimitError, LLMClient, LLMClientConfig
+from llm_client import InputTokenLimitError, LLMClient, LLMClientConfig, TokenUsage
 
 
 # ---------------------------------------------------------------------------
@@ -71,12 +71,11 @@ def _fast_retry_config(**overrides) -> LLMClientConfig:
 def _capture_init(monkeypatch):
     captured: dict = {}
 
-    def fake_init(model, **kwargs):
-        captured["model"] = model
+    def fake_chat_openai(**kwargs):
         captured.update(kwargs)
         return FakeListChatModel(responses=["built"])
 
-    monkeypatch.setattr(client_mod, "init_chat_model", fake_init)
+    monkeypatch.setattr(client_mod, "ChatOpenAI", fake_chat_openai)
     return captured
 
 
@@ -120,6 +119,97 @@ def test_requests_per_second_builds_rate_limiter(monkeypatch):
     assert limiter.max_bucket_size == 4
 
 
+@pytest.mark.parametrize(
+    "configured, sent",
+    [
+        # Every model goes out over the same OpenAI-compatible transport, so
+        # the name is passed through untouched...
+        ("claude-sonnet-4-5", "claude-sonnet-4-5"),
+        ("gpt-5.4", "gpt-5.4"),
+        ("gemini-3.1-pro", "gemini-3.1-pro"),
+        ("claude-sonnet-4-5-20250929", "claude-sonnet-4-5-20250929"),
+        # ...except for a LangChain provider prefix, which selected a client
+        # class and would read as an unknown model id to the gateway.
+        ("anthropic:claude-opus-4-6", "claude-opus-4-6"),
+        ("openai:gpt-5.4", "gpt-5.4"),
+    ],
+)
+def test_model_name_sent_to_the_gateway(monkeypatch, configured, sent):
+    captured = _capture_init(monkeypatch)
+    LLMClient(LLMClientConfig(model=configured))
+
+    assert captured["model"] == sent
+
+
+def test_sdk_retry_layer_is_disabled(monkeypatch):
+    # The client's own loop owns retries; the openai SDK must not re-send a
+    # 429 underneath it, out of sight of the Retry-After handling.
+    captured = _capture_init(monkeypatch)
+    LLMClient(LLMClientConfig(model="some-model", max_retries=5))
+
+    assert captured["max_retries"] == 0
+
+
+def test_responses_api_is_pinned_off(monkeypatch):
+    # A compatible gateway generally implements /chat/completions only, so
+    # langchain-openai must never infer its way to the Responses API.
+    captured = _capture_init(monkeypatch)
+    LLMClient(LLMClientConfig(model="some-model"))
+
+    assert captured["use_responses_api"] is False
+
+
+@pytest.mark.parametrize(
+    "model, expected",
+    [
+        # langchain-openai counts the GPT families natively...
+        ("gpt-5.4", None),
+        ("gpt-4o", None),
+        # ...and raises NotImplementedError for everything else, so the
+        # gateway's Claude/Gemini models need a stand-in vocabulary or the
+        # budget would be enforced against a chars//4 guess.
+        ("claude-sonnet-4-5", "gpt-5"),
+        ("gemini-3.1-pro", "gpt-5"),
+    ],
+)
+def test_tiktoken_stand_in_for_non_gpt_models(monkeypatch, model, expected):
+    captured = _capture_init(monkeypatch)
+    LLMClient(LLMClientConfig(model=model))
+
+    assert captured.get("tiktoken_model_name") == expected
+
+
+def test_non_gpt_model_counts_tokens_without_the_chars_fallback(caplog):
+    # Regression guard for the whole point of the stand-in: a real ChatOpenAI
+    # named after a Claude model must still produce a tokenizer-backed count,
+    # not trip count_tokens' approximation warning.
+    client = LLMClient(
+        LLMClientConfig(
+            model="claude-sonnet-4-5",
+            api_key="sk-test",  # pyright: ignore[reportArgumentType]
+            base_url="https://gateway.example/v1",
+        )
+    )
+
+    with caplog.at_level(logging.WARNING, logger="llm_client.client"):
+        tokens = client.count_tokens([HumanMessage("hello world " * 10)])
+
+    assert tokens > 0
+    assert not any("chars//4" in record.message for record in caplog.records)
+
+
+def test_kwargs_can_reenable_sdk_retries(monkeypatch):
+    captured = _capture_init(monkeypatch)
+    LLMClient(
+        LLMClientConfig(
+            model="some-model", kwargs={"max_retries": 2, "use_responses_api": True}
+        )
+    )
+
+    assert captured["max_retries"] == 2
+    assert captured["use_responses_api"] is True
+
+
 def test_model_name_alias_accepted():
     # model_name is a validation_alias for `model` (populate_by_name); pyright
     # doesn't synthesize it as a constructor kwarg, but pydantic accepts it.
@@ -143,9 +233,67 @@ def test_endpoint_overrides_forwarded(monkeypatch):
 
     assert captured["base_url"] == "https://gateway.example/v1"
     assert captured["api_key"] == "sk-secret"
-    assert captured["default_headers"] == {"X-Team": "sas"}
+    # The key also rides as an `api-key` header — gateways fronting Azure
+    # OpenAI authenticate on that rather than the Bearer the SDK sends.
+    assert captured["default_headers"] == {"X-Team": "sas", "api-key": "sk-secret"}
     assert captured["timeout"] == 42.5
     assert captured["model_kwargs"] == {"top_k": 40}
+
+
+def test_api_key_header_does_not_override_an_explicit_one(monkeypatch):
+    # An operator who set the header themselves means it: setdefault, not set.
+    captured = _capture_init(monkeypatch)
+    LLMClient(
+        LLMClientConfig(
+            model="some-model",
+            api_key="sk-secret",  # pyright: ignore[reportArgumentType]
+            url_headers={"api-key": "explicit-header-value"},
+        )
+    )
+
+    assert captured["default_headers"]["api-key"] == "explicit-header-value"
+
+
+def test_no_api_key_header_without_an_api_key(monkeypatch):
+    captured = _capture_init(monkeypatch)
+    LLMClient(LLMClientConfig(model="some-model", url_headers={"X-Team": "sas"}))
+
+    assert captured["default_headers"] == {"X-Team": "sas"}
+
+
+def test_api_key_value_is_never_logged(monkeypatch, caplog):
+    # The key now appears in two places (api_key= and a header); neither may
+    # reach the log, which records header names only.
+    _capture_init(monkeypatch)
+
+    with caplog.at_level(logging.INFO, logger="llm_client.client"):
+        LLMClient(
+            LLMClientConfig(
+                model="some-model",
+                api_key="sk-super-secret",  # pyright: ignore[reportArgumentType]
+            )
+        )
+
+    assert not any("sk-super-secret" in record.message for record in caplog.records)
+
+
+def test_trailing_slash_base_url_gets_the_model_appended(monkeypatch):
+    # A per-deployment gateway route: the model name completes the path.
+    captured = _capture_init(monkeypatch)
+    LLMClient(
+        LLMClientConfig(model="gpt-5.4", base_url="https://gateway.example/openai/")
+    )
+
+    assert captured["base_url"] == "https://gateway.example/openai/gpt-5.4"
+
+
+def test_base_url_without_a_trailing_slash_is_left_alone(monkeypatch):
+    captured = _capture_init(monkeypatch)
+    LLMClient(
+        LLMClientConfig(model="gpt-5.4", base_url="https://gateway.example/v1")
+    )
+
+    assert captured["base_url"] == "https://gateway.example/v1"
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +402,46 @@ def test_cert_file_exported_as_ssl_cert_file(monkeypatch, tmp_path):
     assert os.environ["SSL_CERT_FILE"] == str(cert.resolve())
 
 
+def test_cert_file_pins_explicit_httpx_clients(monkeypatch, tmp_path):
+    import ssl
+
+    import httpx
+
+    captured = _capture_init(monkeypatch)
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    # Stub the SSL/httpx machinery so the test does not need a genuinely valid
+    # CA bundle — only that a present file drives an explicit-client build.
+    contexts: list[str] = []
+    monkeypatch.setattr(
+        ssl, "create_default_context", lambda cafile=None: contexts.append(cafile)
+    )
+    monkeypatch.setattr(httpx, "Client", lambda **kw: ("sync", kw))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: ("async", kw))
+    cert = tmp_path / "gateway.crt"
+    cert.write_text("-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n")
+
+    LLMClient(LLMClientConfig(model="some-model", cert_file=str(cert)))
+
+    # Both clients are pinned, so ainvoke verifies against the bundle too.
+    assert captured["http_client"][0] == "sync"
+    assert captured["http_async_client"][0] == "async"
+    assert contexts == [str(cert.resolve())]
+
+
+def test_missing_cert_file_builds_no_httpx_client(monkeypatch, tmp_path):
+    # A missing bundle must not be handed to httpx (which would raise); the
+    # SSL_CERT_FILE export path already declined it.
+    captured = _capture_init(monkeypatch)
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+
+    LLMClient(
+        LLMClientConfig(model="some-model", cert_file=str(tmp_path / "nope.crt"))
+    )
+
+    assert "http_client" not in captured
+    assert "http_async_client" not in captured
+
+
 def test_missing_cert_file_warns_and_leaves_env_alone(monkeypatch, tmp_path, caplog):
     _capture_init(monkeypatch)
     monkeypatch.delenv("SSL_CERT_FILE", raising=False)
@@ -299,9 +487,9 @@ def test_kwargs_escape_hatch_wins_over_named_knobs(monkeypatch):
 
 def test_injected_llm_skips_construction(monkeypatch):
     def boom(*args, **kwargs):  # must never be called
-        raise AssertionError("init_chat_model called despite injected llm")
+        raise AssertionError("ChatOpenAI built despite injected llm")
 
-    monkeypatch.setattr(client_mod, "init_chat_model", boom)
+    monkeypatch.setattr(client_mod, "ChatOpenAI", boom)
     fake = FakeListChatModel(responses=["hi"])
     client = LLMClient(llm=fake)
 
@@ -535,6 +723,308 @@ def test_timeout_errors_are_retried():
 
     assert client.invoke("hi").content == "ok"
     assert model.calls == 2
+
+
+# ---------------------------------------------------------------------------
+# Prompt-cache breakpoints — probe the gateway, fall back when refused
+# ---------------------------------------------------------------------------
+
+
+def _cached_system_message() -> SystemMessage:
+    """A system prompt carrying an Anthropic-style cache breakpoint, the shape
+    chunker.pipeline builds when prompt_caching is on."""
+    return SystemMessage(
+        content=[
+            {
+                "type": "text",
+                "text": "You translate SAS.",
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+    )
+
+
+class _SchemaRejection(Exception):
+    """A gateway refusing an unknown content-part key, OpenAI 400 shape."""
+
+    status_code = 400
+
+    def __init__(self, msg: str = "Unrecognized key 'cache_control' in content part"):
+        super().__init__(msg)
+
+
+class _RecordingModel:
+    """Records the messages of every call; optionally rejects cache_control."""
+
+    def __init__(self, *, rejects_cache_control: bool = False) -> None:
+        self.rejects_cache_control = rejects_cache_control
+        self.calls: list[list] = []
+
+    @staticmethod
+    def _has_cache_control(messages) -> bool:
+        return any(
+            isinstance(part, dict) and "cache_control" in part
+            for m in messages
+            if isinstance(m.content, list)
+            for part in m.content
+        )
+
+    def invoke(self, messages, config=None):
+        self.calls.append(list(messages))
+        if self.rejects_cache_control and self._has_cache_control(messages):
+            raise _SchemaRejection()
+        return AIMessage("ok")
+
+    async def ainvoke(self, messages, config=None):
+        return self.invoke(messages, config)
+
+
+def test_cache_control_survives_on_a_gateway_that_accepts_it():
+    model = _RecordingModel()
+    client = LLMClient(_fast_retry_config(), llm=model)
+
+    assert client.invoke([_cached_system_message()]).content == "ok"
+    assert len(model.calls) == 1
+    assert model._has_cache_control(model.calls[0])  # sent, untouched
+
+
+def test_rejected_cache_control_is_stripped_and_the_call_retried(caplog):
+    model = _RecordingModel(rejects_cache_control=True)
+    client = LLMClient(_fast_retry_config(), llm=model)
+
+    with caplog.at_level(logging.WARNING, logger="llm_client.client"):
+        assert client.invoke([_cached_system_message()]).content == "ok"
+
+    assert len(model.calls) == 2  # probe, then the stripped re-send
+    assert model._has_cache_control(model.calls[0])
+    assert not model._has_cache_control(model.calls[1])
+    assert any("cache_control" in record.message for record in caplog.records)
+
+
+def test_fallback_works_with_no_retry_budget():
+    # The probe must not spend an attempt: at max_retries=0 there is none to
+    # spend, and the call still has to succeed.
+    model = _RecordingModel(rejects_cache_control=True)
+    client = LLMClient(_fast_retry_config(max_retries=0), llm=model)
+
+    assert client.invoke([_cached_system_message()]).content == "ok"
+    assert len(model.calls) == 2
+
+
+def test_fallback_leaves_the_retry_budget_intact():
+    # One cache_control demotion plus a full run of transient failures: the
+    # demotion must not have eaten one of the retries.
+    model = _RecordingModel(rejects_cache_control=True)
+    calls = {"n": 0}
+    original_invoke = model.invoke
+
+    def flaky_invoke(messages, config=None):
+        result = original_invoke(messages, config)  # raises on cache_control
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise _FakeRateLimitError("throttled")
+        return result
+
+    model.invoke = flaky_invoke
+    client = LLMClient(_fast_retry_config(max_retries=2), llm=model)
+
+    assert client.invoke([_cached_system_message()]).content == "ok"
+
+
+def test_stripping_keeps_the_prompt_text_intact():
+    model = _RecordingModel(rejects_cache_control=True)
+    client = LLMClient(_fast_retry_config(), llm=model)
+    client.invoke([_cached_system_message()])
+
+    assert model.calls[1][0].content == [
+        {"type": "text", "text": "You translate SAS."}
+    ]
+
+
+def test_the_gateway_is_only_asked_once():
+    # After a refusal the answer is remembered: later calls go out stripped,
+    # so the fallback costs one failed request per process, not per call.
+    model = _RecordingModel(rejects_cache_control=True)
+    client = LLMClient(_fast_retry_config(), llm=model)
+
+    client.invoke([_cached_system_message()])
+    client.invoke([_cached_system_message()])
+
+    assert len(model.calls) == 3  # 1 refused + 1 retry + 1 pre-stripped
+    assert not model._has_cache_control(model.calls[2])
+
+
+def test_caller_messages_are_not_mutated_by_the_fallback():
+    # The pipeline reuses its prompt template's system block across items; a
+    # retry must copy rather than edit it in place.
+    original = _cached_system_message()
+    client = LLMClient(_fast_retry_config(), llm=_RecordingModel(rejects_cache_control=True))
+    client.invoke([original])
+
+    assert original.content[0]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_unrelated_400_is_not_treated_as_a_cache_control_refusal():
+    # Stripping would not help a genuinely bad request, and a blind re-send
+    # would double its cost.
+    bad_request = type("BadRequestError", (Exception,), {"status_code": 400})(
+        "model 'nope' does not exist"
+    )
+    model = _FlakyModel(failures=99, exc=bad_request)
+    client = LLMClient(_fast_retry_config(), llm=model)
+
+    with pytest.raises(Exception, match="does not exist"):
+        client.invoke([_cached_system_message()])
+    assert model.calls == 1
+
+
+def test_cache_control_refusal_without_a_breakpoint_propagates():
+    # Same status and wording, but nothing to strip — must not loop.
+    model = _FlakyModel(failures=99, exc=_SchemaRejection())
+    client = LLMClient(_fast_retry_config(), llm=model)
+
+    with pytest.raises(_SchemaRejection):
+        client.invoke("a plain string prompt")
+    assert model.calls == 1
+
+
+def test_async_path_also_falls_back():
+    model = _RecordingModel(rejects_cache_control=True)
+    client = LLMClient(_fast_retry_config(), llm=model)
+
+    assert asyncio.run(client.ainvoke([_cached_system_message()])).content == "ok"
+    assert len(model.calls) == 2
+    assert not model._has_cache_control(model.calls[1])
+
+
+# ---------------------------------------------------------------------------
+# Token usage — logged per call, accumulated on the client
+# ---------------------------------------------------------------------------
+
+
+class _UsageModel:
+    """Returns a response carrying *usage* as LangChain's usage_metadata."""
+
+    def __init__(self, *usages) -> None:
+        self.usages = list(usages)
+
+    def invoke(self, messages, config=None):
+        return AIMessage("ok", usage_metadata=self.usages.pop(0))
+
+    async def ainvoke(self, messages, config=None):
+        return self.invoke(messages, config)
+
+
+def _usage(input_tokens, output_tokens, **details):
+    block = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+    if details:
+        block["input_token_details"] = details
+    return block
+
+
+def test_usage_is_read_from_the_response():
+    client = LLMClient(llm=_UsageModel(_usage(120, 30)))
+    client.invoke("hi")
+
+    assert client.usage.input_tokens == 120
+    assert client.usage.output_tokens == 30
+    assert client.usage.total_tokens == 150
+    assert client.usage.calls == 1
+
+
+def test_usage_accumulates_across_calls():
+    client = LLMClient(llm=_UsageModel(_usage(100, 10), _usage(200, 20)))
+    client.invoke("one")
+    client.invoke("two")
+
+    assert client.usage.input_tokens == 300
+    assert client.usage.output_tokens == 30
+    assert client.usage.calls == 2
+
+
+def test_usage_is_logged_per_call(caplog):
+    client = LLMClient(llm=_UsageModel(_usage(120, 30)))
+
+    with caplog.at_level(logging.INFO, logger="llm_client.client"):
+        client.invoke("hi")
+
+    assert any(
+        "in=120" in record.message and "out=30" in record.message
+        for record in caplog.records
+    )
+
+
+def test_cache_token_details_are_captured():
+    client = LLMClient(llm=_UsageModel(_usage(120, 30, cache_read=100)))
+    client.invoke("hi")
+
+    assert client.usage.cache_read_tokens == 100
+
+
+def test_usage_falls_back_to_the_raw_token_usage_block():
+    # A gateway whose usage block LangChain did not normalize.
+    class _RawUsageModel:
+        def invoke(self, messages, config=None):
+            return AIMessage(
+                "ok",
+                response_metadata={
+                    "token_usage": {
+                        "prompt_tokens": 80,
+                        "completion_tokens": 12,
+                        "total_tokens": 92,
+                        "prompt_tokens_details": {"cached_tokens": 64},
+                    }
+                },
+            )
+
+    client = LLMClient(llm=_RawUsageModel())
+    client.invoke("hi")
+
+    assert client.usage.input_tokens == 80
+    assert client.usage.output_tokens == 12
+    assert client.usage.cache_read_tokens == 64
+
+
+def test_missing_usage_warns_once_and_leaves_the_total_empty(caplog):
+    client = LLMClient(llm=FakeListChatModel(responses=["a", "b"]))
+
+    with caplog.at_level(logging.WARNING, logger="llm_client.client"):
+        client.invoke("one")
+        client.invoke("two")
+
+    assert client.usage == TokenUsage()
+    warnings = [r for r in caplog.records if "no token usage" in r.message]
+    assert len(warnings) == 1
+
+
+def test_malformed_usage_counts_never_break_a_successful_call():
+    # AIMessage validates usage_metadata, so a junk block can only reach us
+    # from a response object the SDK built loosely — but if one does, a call
+    # that already succeeded must not fail over its accounting.
+    class _JunkUsageResponse:
+        content = "ok"
+        usage_metadata = {"input_tokens": None, "output_tokens": "lots"}
+
+    class _JunkUsageModel:
+        def invoke(self, messages, config=None):
+            return _JunkUsageResponse()
+
+    client = LLMClient(llm=_JunkUsageModel())
+
+    assert client.invoke("hi").content == "ok"
+    assert client.usage.input_tokens == 0
+    assert client.usage.calls == 1
+
+
+def test_usage_is_recorded_on_the_async_path():
+    client = LLMClient(llm=_UsageModel(_usage(50, 5)))
+    asyncio.run(client.ainvoke("hi"))
+
+    assert client.usage.input_tokens == 50
 
 
 # ---------------------------------------------------------------------------
