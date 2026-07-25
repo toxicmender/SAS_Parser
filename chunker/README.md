@@ -93,7 +93,15 @@ from chunker import SasLLMPipeline
 
 pipeline = SasLLMPipeline(model="claude-sonnet-4-5")
 outputs  = pipeline.run_files(["macros.sas", "etl.sas", "reports.sas"])
+
+# what the run cost, as the gateway reported it
+print(pipeline.token_usage.summary())
 ```
+
+`token_usage` is cumulative over the pipeline's lifetime, not per `run_*` call:
+a caller attributing one run's spend snapshots it before and subtracts after
+(`llm_client.TokenUsage` supports `-`). It stays at zero when the gateway
+reports no usage block.
 
 ## Package layout
 

@@ -86,6 +86,19 @@ class LLMJudgeMetric(ValidationMetric):
         self._llm = llm
         self._output_language = output_language
 
+    @property
+    def token_usage(self) -> Any | None:
+        """
+        Tokens this judge has billed so far (an :class:`llm_client.TokenUsage`),
+        or ``None`` when the judge does not report any — a raw chat model or a
+        fake, neither of which accumulates usage.
+
+        Read by :class:`~validation.runner.ValidationRunner` so a report can
+        state the cost of *grading* separately from the cost of the translation
+        being graded.
+        """
+        return getattr(self._llm, "usage", None)
+
     def evaluate(self, run: EvaluationRun) -> MetricResult:
         # Source context per unit: the item's SAS text when chunker metadata
         # exists, else the turn's prompt (a pipeline thread's human message

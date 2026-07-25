@@ -47,6 +47,7 @@ import time
 from typing import Any, Iterable, Sequence
 
 from chunker.models import SasBatch, SasChunk
+from llm_client import TokenUsage
 
 from .evaluator import Evaluator
 from .metrics import ValidationMetric
@@ -176,6 +177,8 @@ def report_from_verdicts(
     *,
     model: str = "live-validation",
     instructions_fingerprint: str | None = None,
+    token_usage: TokenUsage | None = None,
+    judge_token_usage: TokenUsage | None = None,
 ) -> ValidationReport:
     """Aggregate stored inline verdicts into a :class:`ValidationReport`.
 
@@ -200,12 +203,23 @@ def report_from_verdicts(
         The active user-instruction fingerprint
         (:attr:`SasLLMPipeline.instructions_fingerprint`), so an inline report
         is never compared as equal to one scored under different instructions.
+    token_usage : TokenUsage | None
+        What the run cost — pass :attr:`SasLLMPipeline.token_usage`. Verdicts
+        do not carry token counts (they are per item, usage is per run), so
+        this cannot be recovered from *verdicts* alone; ``None`` leaves the
+        report's cost section out entirely.
+    judge_token_usage : TokenUsage | None
+        What *grading* cost, kept separate so a thoroughly-checked run does
+        not read as an expensive one. ``None`` for an inline run, whose
+        metrics are the deterministic suite.
     """
     results = [_case_result(v) for v in verdicts]
     return ValidationReport(
         model=model,
         instructions_fingerprint=instructions_fingerprint,
         results=results,
+        token_usage=token_usage,
+        judge_token_usage=judge_token_usage,
     )
 
 

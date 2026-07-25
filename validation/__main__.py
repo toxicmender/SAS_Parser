@@ -2,8 +2,8 @@
 
 Usage
 -----
-    # deterministic metrics against a live model
-    # (needs ANTHROPIC_API_KEY and the `anthropic` extra):
+    # deterministic metrics against a live model (needs OPENAI_API_KEY —
+    # the gateway is OpenAI-compatible for every model it fronts):
     python -m validation validation/cases --model claude-sonnet-4-5
 
     # additionally grade each translation with an LLM judge:
@@ -35,7 +35,7 @@ import sys
 from pathlib import Path
 
 from chunker import SasLLMPipeline
-from llm_client import LLMClient, LLMClientConfig
+from llm_client import LLMClient, LLMClientConfig, TokenUsage
 
 from .conversation import validate_thread
 from .dataset import load_cases
@@ -63,8 +63,30 @@ def _validate_thread(
     hub = MemoryHub(spark=spark, table=args.delta_table)
     result = validate_thread(hub, args.thread, metrics=metrics)
     # The pipeline model that produced the thread is not recorded in the
-    # store, so the report is labelled as post-hoc rather than guessing.
-    return ValidationReport(model="post-hoc", results=[result])
+    # store, so the report is labelled as post-hoc rather than guessing —
+    # and for the same reason there is no pipeline token figure here: the
+    # translation was billed in some earlier run. Judging it, however,
+    # happens now, and is billed now.
+    judge_usage = _judge_token_usage(metrics)
+    return ValidationReport(
+        model="post-hoc",
+        results=[result],
+        judge_token_usage=judge_usage if judge_usage.calls else None,
+    )
+
+
+def _judge_token_usage(metrics: list[ValidationMetric]) -> TokenUsage:
+    """Tokens billed by LLM-backed metrics, summed across *metrics*.
+
+    Mirrors :attr:`~validation.runner.ValidationRunner.judge_token_usage` for
+    the thread mode, which scores without a runner.
+    """
+    total = TokenUsage()
+    for metric in metrics:
+        usage = getattr(metric, "token_usage", None)
+        if isinstance(usage, TokenUsage):
+            total = total + usage
+    return total
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -95,7 +117,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--model",
         default="claude-sonnet-4-5",
-        help="LangChain chat-model string for the pipeline under test.",
+        help="Model id (as the AI Gateway names it) for the pipeline under test.",
     )
     parser.add_argument(
         "--output-language",

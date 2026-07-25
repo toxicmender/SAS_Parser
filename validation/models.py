@@ -11,6 +11,7 @@ from typing import Any
 from pydantic import BaseModel, Field, computed_field, model_validator
 
 from chunker.models import SasBatch, SasChunk
+from llm_client import TokenUsage
 
 
 class ValidationCase(BaseModel):
@@ -158,7 +159,16 @@ class CaseResult(BaseModel):
 
 
 class ValidationReport(BaseModel):
-    """Aggregate result of one validation run over a set of cases."""
+    """Aggregate result of one validation run over a set of cases.
+
+    The two token fields are kept apart on purpose: *token_usage* is what the
+    translation under test cost, *judge_token_usage* is what grading it cost.
+    Folding them together would make a run look more expensive the more
+    thoroughly it was checked, and judging is a choice about the eval, not a
+    property of the model being evaluated. Either is ``None`` when nothing
+    reported usage — a gateway that returns no usage block, or a judge that is
+    not an :class:`llm_client.LLMClient`.
+    """
 
     model: str
     created_at: datetime = Field(
@@ -168,6 +178,8 @@ class ValidationReport(BaseModel):
     # when none) — runs under different instructions are not comparable.
     instructions_fingerprint: str | None = None
     results: list[CaseResult] = Field(default_factory=list)
+    token_usage: TokenUsage | None = None
+    judge_token_usage: TokenUsage | None = None
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -192,6 +204,12 @@ class ValidationReport(BaseModel):
             f"- cases: {len(self.results)}",
             f"- aggregate score: **{self.score:.3f}**",
             f"- overall: **{'PASSED' if self.passed else 'FAILED'}**",
+        ]
+        if self.token_usage is not None:
+            lines.append(f"- tokens (pipeline): {self.token_usage.summary()}")
+        if self.judge_token_usage is not None:
+            lines.append(f"- tokens (judge): {self.judge_token_usage.summary()}")
+        lines += [
             "",
             "| case | metric | score | threshold | status | details |",
             "|---|---|---|---|---|---|",
