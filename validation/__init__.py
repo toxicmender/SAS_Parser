@@ -21,6 +21,11 @@ Public API:
   same report surface (``to_markdown()``, PDF, run history) as an offline run.
 - :func:`default_metrics` and the deterministic metric classes.
 - :class:`LLMJudgeMetric` — optional LLM-as-judge metric (needs a model).
+- :func:`judged_metrics` and the ten LLM-judged metric classes implementing
+  deepeval's definitions natively (prompt alignment, faithfulness, answer
+  relevancy, hallucination, contextual precision/relevancy, plan adherence,
+  task completion, summarization) — all opt-in, all built on
+  :class:`JudgedMetric`.
 - :func:`load_cases` — JSON case files -> cases.
 - :func:`log_report` / :func:`load_runs` — Spark-backed run history
   (local parquet directory by default, Delta table on Databricks).
@@ -30,6 +35,12 @@ Public API:
 See validation/README.md and the CLI (``python -m validation --help``).
 """
 
+from .agentic_metrics import (
+    DEFAULT_PROMPT_INSTRUCTIONS,
+    PlanAdherenceMetric,
+    PromptAlignmentMetric,
+    TaskCompletionMetric,
+)
 from .conversation import (
     run_from_thread,
     run_from_transcript,
@@ -39,6 +50,7 @@ from .conversation import (
 from .dataset import load_cases
 from .evaluator import Evaluator
 from .judge import LLMJudgeMetric
+from .judged import JudgedMetric
 from .live import (
     LiveValidator,
     report_from_thread,
@@ -46,6 +58,7 @@ from .live import (
     validations_for_thread,
 )
 from .metrics import (
+    JUDGED_METRIC_NAMES,
     DatasetFidelityMetric,
     PythonSyntaxMetric,
     ReferenceSimilarityMetric,
@@ -53,6 +66,7 @@ from .metrics import (
     ResponseCoverageMetric,
     ValidationMetric,
     default_metrics,
+    judged_metrics,
 )
 from .models import (
     CaseResult,
@@ -63,27 +77,49 @@ from .models import (
     ValidationReport,
 )
 from .pdf import publish_report_pdf, report_to_pdf
+from .rag_metrics import (
+    AnswerRelevancyMetric,
+    ContextualPrecisionMetric,
+    ContextualRelevancyMetric,
+    FaithfulnessMetric,
+    HallucinationMetric,
+)
 from .runner import ValidationRunner
+from .summarization import AnalysisSummarizationMetric, SummarizationMetric
 from .tracking import load_runs, log_report
 
 __all__ = [
+    "DEFAULT_PROMPT_INSTRUCTIONS",
+    "JUDGED_METRIC_NAMES",
+    "AnalysisSummarizationMetric",
+    "AnswerRelevancyMetric",
     "CaseResult",
     "CaseRun",
+    "ContextualPrecisionMetric",
+    "ContextualRelevancyMetric",
     "DatasetFidelityMetric",
     "EvaluationRun",
     "Evaluator",
+    "FaithfulnessMetric",
+    "HallucinationMetric",
+    "JudgedMetric",
     "LLMJudgeMetric",
     "LiveValidator",
     "MetricResult",
+    "PlanAdherenceMetric",
+    "PromptAlignmentMetric",
     "PythonSyntaxMetric",
     "ReferenceSimilarityMetric",
     "RequiredTermsMetric",
     "ResponseCoverageMetric",
+    "SummarizationMetric",
+    "TaskCompletionMetric",
     "ValidationCase",
     "ValidationMetric",
     "ValidationReport",
     "ValidationRunner",
     "default_metrics",
+    "judged_metrics",
     "load_cases",
     "load_runs",
     "log_report",

@@ -355,6 +355,41 @@ class PromptBuilder:
             **kwargs,
         )
 
+    def select(
+        self,
+        query: str,
+        constructs: Iterable[ConstructKey] = (),
+        *,
+        output_language: str | None = None,
+        kinds: Iterable[str] = (),
+        meta_flags: Iterable[str] = (),
+    ) -> list[SelectedInstruction]:
+        """
+        The chunks retrieved for one item, **in priority order**, each with its
+        provenance — the retrieval half of :meth:`build`, exposed on its own.
+
+        Splitting it out lets a caller keep the picks as well as the rendered
+        block from a *single* retrieval: the pipeline hands them to
+        ``validation`` as the item's retrieval context (the RAG metrics score
+        precision against exactly this ranking), while still injecting the
+        Markdown :meth:`build_from_picks` renders from them.
+
+        Arguments are :meth:`build`'s; *output_language* ``None`` falls back to
+        the builder's construction-time value.
+        """
+        language = (
+            output_language if output_language is not None else self.output_language
+        )
+        return self._selector.select_detailed(
+            query,
+            list(constructs),
+            max_words=self.max_instruction_words,
+            top_k=self.top_k,
+            language=language,
+            kinds=kinds,
+            meta_flags=meta_flags,
+        )
+
     def build(
         self,
         query: str,
@@ -378,20 +413,34 @@ class PromptBuilder:
         chunk-kind-, and metadata-scoped user instructions (see
         :meth:`InstructionSelector.select_detailed`); *output_language*
         ``None`` falls back to the builder's construction-time value.
+
+        :meth:`select` + :meth:`build_from_picks` is the same thing in two
+        steps, for a caller that needs the picks themselves.
         """
         constructs = list(constructs)
-        language = (
-            output_language if output_language is not None else self.output_language
-        )
-        picks = self._selector.select_detailed(
+        picks = self.select(
             query,
             constructs,
-            max_words=self.max_instruction_words,
-            top_k=self.top_k,
-            language=language,
+            output_language=output_language,
             kinds=kinds,
             meta_flags=meta_flags,
         )
+        return self.build_from_picks(picks, constructs)
+
+    def build_from_picks(
+        self,
+        picks: list[SelectedInstruction],
+        constructs: Iterable[ConstructKey] = (),
+    ) -> str | None:
+        """
+        Render already-retrieved *picks* into :meth:`build`'s Markdown block(s),
+        or ``None`` when *picks* is empty.
+
+        *constructs* are the **item's** constructs, not the selection's: the
+        hazard hint line and the reasoning directives are keyed on them so they
+        survive even when no reference section matched.
+        """
+        constructs = list(constructs)
         if not picks:
             logger.debug("build: no relevant instruction chunks; no block")
             return None

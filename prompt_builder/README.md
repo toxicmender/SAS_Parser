@@ -284,6 +284,25 @@ Each reference chunk's header ends with its **selection reason** —
 `pinned`, or `topical` — so the model can weigh an authoritative match for
 the item's exact construct above a merely related retrieved section.
 
+### Retrieval and rendering, separately
+
+`build()` is `select()` + `build_from_picks()`, and both halves are public:
+
+```python
+picks = builder.select(query, constructs, output_language="PySpark")
+block = builder.build_from_picks(picks, constructs)   # == builder.build(...)
+```
+
+`select()` returns the `SelectedInstruction`s **in priority order** — the
+ranking `InstructionSelector.select_detailed` produced. The pipeline uses the
+pair to keep both artefacts from one retrieval: the Markdown block goes into
+the prompt, and the chunk texts ride out on each output dict as that item's
+`retrieval_context`, which is what `validation`'s RAG metrics
+(`faithfulness`, `contextual_precision`, `contextual_relevancy`) score. Note
+that `build_from_picks` takes the **item's** constructs, not the selection's:
+the hazard hints and reasoning directives are keyed on them so they survive
+when no reference section matched.
+
 ### Focus hints (directional stimulus)
 
 The `## Focus hints` block is a compact per-item stimulus — the item's

@@ -103,6 +103,8 @@ class LiveValidator:
         kv: Any,
         index: int | None = None,
         total: int | None = None,
+        prompt: str | None = None,
+        retrieval_context: Sequence[str] = (),
     ) -> CaseResult:
         """Score one item's *response* and store the verdict in *kv*.
 
@@ -125,12 +127,25 @@ class LiveValidator:
         index, total
             1-based position of the item in the run and the run size, stored
             for ordering/reporting (as on the run facts). Optional.
+        prompt, retrieval_context
+            The message the item was answered from and the reference chunks
+            retrieved for it, in rank order — what the judged metrics
+            (``validation.rag_metrics`` and friends) score as ``input`` and
+            retrieved context. Both optional: the deterministic default suite
+            ignores them, and a judged metric with neither skips.
         """
         item_id = _item_id(item)
         run = EvaluationRun(
             run_id=item_id,
             items=[item],
-            outputs=[{"item_id": item_id, "response": response}],
+            prompts=[prompt] if prompt is not None else [],
+            outputs=[
+                {
+                    "item_id": item_id,
+                    "response": response,
+                    "retrieval_context": list(retrieval_context),
+                }
+            ],
         )
         result = self._evaluator.evaluate(run)
 

@@ -10,7 +10,8 @@ scoring core:
   arbitrary (prompt, response) transcript — without re-running the pipeline.
 
 Both produce the same result models, scored by deterministic metrics (plus
-an optional LLM judge), and optionally append to a **Spark-backed history**
+an optional suite of [LLM-judged metrics](#judged-metrics)), and optionally
+append to a **Spark-backed history**
 — a local parquet directory by default (`./validation_runs`; no server, no
 service), a Delta table on Databricks.
 
@@ -18,8 +19,10 @@ service), a Delta table on Databricks.
 
 - **LangSmith** requires its hosted service — ruled out by the local-only
   requirement.
-- **DeepEval** runs locally, but its interesting metrics are LLM-judged and
-  it drags in a heavy dependency tree for what this repo needs.
+- **DeepEval** runs locally, but it drags in a heavy dependency tree and a
+  second LLM-configuration path outside `llm_client`/the AI Gateway. Its
+  metric *definitions* are worth having, so the interesting ones are
+  reimplemented natively here — see [Judged metrics](#judged-metrics).
 - **MLflow** works locally, but adds a large optional dependency and (as of
   MLflow 3) pushes local users onto a SQLite store anyway.
 - **pyspark** is already a core dependency of this repo, and production runs
@@ -47,6 +50,16 @@ metrics.py       Deterministic metrics + default_metrics():
 judge.py         LLMJudgeMetric — grades functional equivalence 1–5 with any
                  LangChain-style model (or an llm_client.LLMClient). Opt-in;
                  never part of default_metrics().
+judged.py        JudgedMetric — base for every LLM-judged metric: one call
+                 path over structured output or prose JSON, shared verdict
+                 schemas, judge token accounting.
+rag_metrics.py   faithfulness, answer_relevancy, hallucination,
+                 contextual_precision, contextual_relevancy.
+agentic_metrics.py
+                 prompt_alignment, plan_adherence, task_completion.
+summarization.py summarization (the rolling thread summary) and
+                 analysis_summarization (each item's ## Analysis).
+                 All ten are opt-in via metrics.judged_metrics().
 evaluator.py     Evaluator — the scoring core: one EvaluationRun in, one
                  CaseResult out. Everything funnels through here.
 runner.py        ValidationRunner: cases -> pipeline -> Evaluator -> report.
@@ -67,6 +80,91 @@ pdf.py           report_to_pdf(): render a report's to_markdown() to a PDF
                  app_config.sharepoint.
 cases/           Sample cases.
 ```
+
+## Judged metrics
+
+Ten opt-in metrics implementing deepeval's published definitions
+(deepeval.com/docs/metrics-*) natively, on top of `JudgedMetric`. They cover
+what the deterministic suite structurally cannot: whether the model followed
+the system prompt's contract, whether the translation is grounded in the
+reference guidance `prompt_builder` retrieved (until now the retrieval layer
+had no end-to-end measurement at all), whether the `## Analysis` reasoning
+matches the code that follows it, and whether the rolling summary keeps the
+identifiers `memory.summarize` promises to keep.
+
+| metric | scores | against | scope | default |
+|---|---|---|---|---|
+| `prompt_alignment` | instructions followed / total | the declared instruction list | item | 0.80 |
+| `answer_relevancy` | relevant statements / total | the item's prompt | item | 0.70 |
+| `faithfulness` | truthful claims / total | the retrieved guidance | item | 0.70 |
+| `hallucination` | 1 − contradicted contexts / total | the item's SAS source (+ golden translation) | item | 0.80 |
+| `contextual_precision` | rank-weighted precision | the retrieved guidance vs the golden translation | item | 0.60 |
+| `contextual_relevancy` | relevant statements / total | the retrieved guidance | item | 0.50 |
+| `plan_adherence` | plan-vs-execution alignment | `analysis` vs `mapping` + `cells` | item | 0.70 |
+| `analysis_summarization` | min(alignment, coverage) | `## Analysis` vs the SAS source | item | 0.60 |
+| `summarization` | min(alignment, coverage) | the rolling summary vs the turns it covers | run | 0.60 |
+| `task_completion` | task-vs-outcome alignment | the whole run's responses | run | 0.70 |
+
+Three departures from deepeval, each also documented on the class:
+
+- **`hallucination` is inverted.** deepeval scores contradicted/total, where
+  lower is better and the threshold is a maximum. Everything here is
+  higher-is-better (`MetricResult.passed` is `score >= threshold`,
+  `CaseResult.score` is a mean, and a failing metric is fed back to the model
+  as "score X < threshold Y" on retry), so this reports **groundedness** and
+  puts deepeval's raw rate in `details`.
+- **No signal reports `skipped`, not an auto-pass 1.0.** deepeval's Plan
+  Adherence auto-passes when the trace states no plan; a skip passes *and*
+  stays out of the case mean, which is what `dataset_fidelity` and
+  `reference_similarity` already do.
+- **`faithfulness` skips deepeval's separate truths-extraction call** — the
+  retrieval context is already a short word-budgeted set of manual sections,
+  so it is handed to the classifier verbatim (2 calls per item, not 3).
+
+Per-item metrics average over the run's items, as `llm_judge` does: one
+`EvaluationRun` here is a whole run, not a single deepeval test case.
+
+```python
+from llm_client import LLMClient, LLMClientConfig
+from validation import ValidationRunner, default_metrics, judged_metrics
+
+judge = LLMClient(LLMClientConfig(model="claude-sonnet-4-5"))
+runner = ValidationRunner(
+    pipeline,
+    metrics=[*default_metrics(), *judged_metrics(judge)],          # all ten
+)
+# or a subset:
+judged_metrics(judge, include=["faithfulness", "contextual_relevancy"])
+```
+
+From the CLI (`--judge-metrics` needs `--judge-model`; `--judge-model` alone
+still means just `llm_judge`):
+
+```bash
+python -m validation validation/cases --judge-model claude-sonnet-4-5 --judge-metrics all
+python -m validation validation/cases --judge-model claude-sonnet-4-5 \
+    --judge-metrics faithfulness,contextual_precision
+```
+
+**Cost.** The full suite is roughly **15 judge calls per item plus 5 per run**,
+against `llm_judge`'s one — enable a subset unless you mean it. The spend lands
+in `ValidationReport.judge_token_usage`, separate from the pipeline's own, with
+no extra wiring: `ValidationRunner.judge_token_usage` sums `token_usage` across
+every metric that exposes one.
+
+**What each mode can score.** The judged metrics read `input` and retrieved
+context off the pipeline's output dicts (`prompt` / `retrieval_context`, which
+`SasLLMPipeline._process` records for fresh *and* resumed items). So:
+
+| mode | judged coverage |
+|---|---|
+| offline cases, inline `LiveValidator` | everything; `contextual_precision` additionally needs a `reference_translation` |
+| post-hoc thread / transcript | no retrieval context (it is ephemeral and never persisted) and no item metadata, so the three context metrics, `hallucination` and `analysis_summarization` skip; `summarization` is the one that only works here |
+
+Any judge works: an `LLMClient` is asked for a schema through
+`invoke_structured`; anything else is asked in prose and its JSON parsed out
+(fenced or embedded). An unusable reply is a warning plus a zero for that unit,
+never an exception — a scoring bug must not break a run.
 
 Thresholds resolve with the repo-wide precedence rule (`app_config`):
 explicit constructor argument > config.json `validation.<name>_threshold` >
@@ -193,7 +291,7 @@ and both `None` when nothing reported usage:
 | Field | What it counts |
 |---|---|
 | `token_usage` | What the run under test cost — the pipeline's own LLM calls. |
-| `judge_token_usage` | What *grading* cost — `LLMJudgeMetric`'s calls, and any future LLM-backed metric exposing a `token_usage`. |
+| `judge_token_usage` | What *grading* cost — every `JudgedMetric`'s calls (`LLMJudgeMetric` included), i.e. any metric exposing a `token_usage`. |
 
 They are kept apart deliberately: folded together, a run would look more
 expensive the more thoroughly it was checked, and judging is a choice about the
@@ -294,7 +392,12 @@ result = validate_transcript(
 Caveats of item-less scoring: the chunker/batcher items are not persisted,
 so `dataset_fidelity` skips ("no item metadata"), `response_coverage` counts
 turns instead of items, and the LLM judge grades against each turn's prompt
-(which, for pipeline threads, embeds the SAS chunk text). Failure handling
+(which, for pipeline threads, embeds the SAS chunk text). The reference
+guidance is ephemeral for the same reason, so the retrieval-context metrics
+skip too — see the coverage table under [Judged metrics](#judged-metrics).
+What thread mode uniquely *can* score is `summarization`: `run_from_thread`
+reads the thread's rolling summary (`summary::{thread_id}`) and the prefix of
+turns it covers straight off the store. Failure handling
 is observe-only: results are returned/logged, nothing gates or retries.
 Wrap results in a `ValidationReport(model=..., results=[...])` to reuse
 `to_markdown()` / `log_report()` — `case_id` simply carries the thread or
@@ -320,9 +423,15 @@ One JSON object (or a list) per `*.json` file:
   "description": "what this exercises",
   "sas_source": "data work.a; ... run;",
   "reference_translation": "optional golden output",
-  "required_terms": ["groupBy"]
+  "required_terms": ["groupBy"],
+  "prompt_instructions": ["Never use collect() on a full DataFrame"]
 }
 ```
+
+`prompt_instructions` is checked one by one by `prompt_alignment`; omit it and
+that metric falls back to config.json `validation.prompt_instructions`, then to
+`validation.agentic_metrics.DEFAULT_PROMPT_INSTRUCTIONS` — the system prompt's
+own standing contract — rather than skipping.
 
 Use `"sas_path": "programs/job1.sas"` (relative to the JSON file) instead of
 `sas_source` for real programs.
@@ -332,7 +441,10 @@ Use `"sas_path": "programs/job1.sas"` (relative to the JSON file) instead of
 - The deterministic metrics validate *shape and fidelity signals* — coverage,
   dataset accounting, syntactic validity, expected terms, drift vs a golden
   baseline. They do not prove functional equivalence; that is what the
-  opt-in LLM judge (and ultimately human review) is for.
+  opt-in [judged metrics](#judged-metrics) (and ultimately human review) are
+  for. Those are themselves model judgements: treat them as a strong,
+  reproducible signal, not a proof — and note that a judged run is only
+  comparable to another judged run on the same judge model.
 - `reference_similarity` is lexical token-F1: treat it as a regression alarm
   against a known-good baseline, not a correctness score.
 - `log_report`/`load_runs` boot a local Spark session, which needs a JVM

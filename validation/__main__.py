@@ -9,6 +9,13 @@ Usage
     # additionally grade each translation with an LLM judge:
     python -m validation validation/cases --judge-model claude-sonnet-4-5
 
+    # the full LLM-judged suite (deepeval's metrics, implemented natively) —
+    # or a named subset; costs ~15 judge calls per item plus 5 per run:
+    python -m validation validation/cases --judge-model claude-sonnet-4-5 \
+        --judge-metrics all
+    python -m validation validation/cases --judge-model claude-sonnet-4-5 \
+        --judge-metrics faithfulness,contextual_relevancy
+
     # append the run to the local Spark-parquet history (./validation_runs):
     python -m validation validation/cases --track
 
@@ -39,8 +46,12 @@ from llm_client import LLMClient, LLMClientConfig, TokenUsage
 
 from .conversation import validate_thread
 from .dataset import load_cases
-from .judge import LLMJudgeMetric
-from .metrics import ValidationMetric, default_metrics
+from .metrics import (
+    JUDGED_METRIC_NAMES,
+    ValidationMetric,
+    default_metrics,
+    judged_metrics,
+)
 from .models import ValidationReport
 from .runner import ValidationRunner
 from .tracking import DEFAULT_PATH, log_report
@@ -130,6 +141,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="If set, also grade each translation with this judge model.",
     )
     parser.add_argument(
+        "--judge-metrics",
+        default=None,
+        metavar="NAMES",
+        help="Comma-separated LLM-judged metrics to add (needs --judge-model), "
+        "or 'all'. Known: " + ", ".join(JUDGED_METRIC_NAMES) + ". Omit to add "
+        "only the llm_judge grade. The full suite costs roughly 15 judge calls "
+        "per item plus 5 per run.",
+    )
+    parser.add_argument(
         "--track",
         action="store_true",
         help="Append the report to the Spark-backed run history.",
@@ -175,6 +195,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if (args.cases is None) == (args.thread is None):
         parser.error("give exactly one of: a cases path, or --thread")
+    if args.judge_metrics is not None and args.judge_model is None:
+        parser.error("--judge-metrics needs --judge-model (the model to judge with)")
+    if args.judge_metrics not in (None, "all"):
+        unknown = [
+            name.strip()
+            for name in args.judge_metrics.split(",")
+            if name.strip() not in JUDGED_METRIC_NAMES
+        ]
+        if unknown:
+            parser.error(
+                f"unknown --judge-metrics: {', '.join(unknown)}; "
+                f"known: {', '.join(JUDGED_METRIC_NAMES)}, or 'all'"
+            )
     if args.thread is not None and args.delta_table is None:
         parser.error(
             "--thread needs --delta-table (an in-memory store from a past "
@@ -192,11 +225,19 @@ def main(argv: list[str] | None = None) -> int:
 
     metrics = default_metrics()
     if args.judge_model:
-        logger.info(f"main: adding LLM judge  model={args.judge_model}")
-        metrics.append(
-            LLMJudgeMetric(
-                llm=LLMClient(LLMClientConfig(model=args.judge_model)),
+        # No --judge-metrics keeps the historical meaning of --judge-model:
+        # the single llm_judge grade, one call per item.
+        include = (
+            None
+            if args.judge_metrics == "all"
+            else [name.strip() for name in (args.judge_metrics or "llm_judge").split(",")]
+        )
+        logger.info(f"main: adding judged metrics  model={args.judge_model}")
+        metrics.extend(
+            judged_metrics(
+                LLMClient(LLMClientConfig(model=args.judge_model)),
                 output_language=args.output_language,
+                include=include,
             )
         )
 

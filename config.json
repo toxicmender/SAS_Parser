@@ -50,6 +50,7 @@
     "dir": null,
     "max_words": null
   },
+  "_validation_comment": "Per-metric pass thresholds; null uses the metric class default. Every metric is higher-is-better, hallucination_threshold included: that metric reports groundedness (1 - deepeval's hallucination rate), so 0.8 means 'at most 20% of ground-truth contexts contradicted'. The thresholds below llm_judge_threshold belong to the opt-in LLM-judged suite (validation.judged_metrics); they are inert unless it is enabled. prompt_instructions is a list of strings prompt_alignment checks the response against, overriding validation.agentic_metrics.DEFAULT_PROMPT_INSTRUCTIONS.",
   "validation": {
     "response_coverage_threshold": null,
     "dataset_fidelity_threshold": null,
@@ -57,6 +58,17 @@
     "required_terms_threshold": null,
     "reference_similarity_threshold": null,
     "llm_judge_threshold": null,
+    "prompt_alignment_threshold": null,
+    "answer_relevancy_threshold": null,
+    "faithfulness_threshold": null,
+    "hallucination_threshold": null,
+    "contextual_precision_threshold": null,
+    "contextual_relevancy_threshold": null,
+    "plan_adherence_threshold": null,
+    "analysis_summarization_threshold": null,
+    "summarization_threshold": null,
+    "task_completion_threshold": null,
+    "prompt_instructions": null,
     "table": null,
     "path": null
   },

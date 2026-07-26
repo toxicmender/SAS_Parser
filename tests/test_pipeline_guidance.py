@@ -468,3 +468,67 @@ def test_irrelevant_item_injects_no_guidance():
     )
     pipeline._process(items=[chunk], diagnostics=[], thread_id="run::etl.sas")
     assert len(llm.prompts[0]) == 2  # no guidance system message added
+
+
+# ---------------------------------------------------------------------------
+# Retrieval context on the outputs (what the validation layer scores)
+# ---------------------------------------------------------------------------
+
+
+def test_outputs_carry_the_prompt_and_the_retrieved_chunks():
+    """The picks that produced the guidance block also ride out on the output
+    dict, so validation scores exactly the context the model was given."""
+    pipeline = _pipeline(_RecordingChatModel(), PromptBuilder(_guidance_corpus()))
+    (out,) = pipeline._process(
+        items=[_intnx_chunk()], diagnostics=[], thread_id="run::etl.sas"
+    )
+    assert out["retrieval_context"] == [_guidance_corpus()[0].text]
+    assert GUIDANCE_MARKER in out["retrieval_context"][0]
+    # The prompt is the item message the model actually answered.
+    assert "intnx" in out["prompt"]
+    assert "## Chunk source" in out["prompt"]
+
+
+def test_outputs_carry_empty_retrieval_context_without_a_prompt_builder():
+    pipeline = _pipeline(_RecordingChatModel(), None)
+    (out,) = pipeline._process(
+        items=[_intnx_chunk()], diagnostics=[], thread_id="run::etl.sas"
+    )
+    assert out["retrieval_context"] == []
+    assert out["prompt"]
+
+
+def test_irrelevant_item_still_reports_what_was_retrieved():
+    """Nothing relevant means no guidance block AND no retrieval context — the
+    two must agree, or contextual_relevancy would score chunks the model never
+    saw."""
+    pipeline = _pipeline(_RecordingChatModel(), PromptBuilder(_guidance_corpus()))
+    text = "proc print data=work.x; run;"
+    chunk = SasChunk(
+        chunk_id="c9",
+        source_id="etl.sas",
+        text=text,
+        kind=SasChunkKind.PROC_STEP,
+        title="print",
+        start_line=1,
+        end_line=1,
+        start_char=0,
+        end_char=len(text),
+        metadata=SasChunkMetadata(proc_name="print"),
+    )
+    (out,) = pipeline._process(
+        items=[chunk], diagnostics=[], thread_id="run::etl.sas"
+    )
+    assert out["retrieval_context"] == []
+
+
+def test_select_then_build_from_picks_reproduces_build():
+    builder = PromptBuilder(_guidance_corpus())
+    chunk = _intnx_chunk()
+    constructs = _constructs_for_item(chunk)
+    query = _query_for_item(chunk)
+    picks = builder.select(query, constructs)
+    assert [p.chunk.chunk_id for p in picks] == ["functions::c0"]
+    assert builder.build_from_picks(picks, constructs) == builder.build(
+        query, constructs
+    )
