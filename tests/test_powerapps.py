@@ -389,15 +389,30 @@ def test_upload_outputs_with_validation_writes_expected_layout():
         client, _req(True), _outputs(), validating=True
     )
     assert out_dir == "app_a/output/ts1"
-    # Responses.
-    assert "app_a/output/ts1/item-1.txt" in client.written
-    assert "print('a')" in client.written["app_a/output/ts1/item-1.txt"]
+    # One runnable notebook per source file; the cross-file batch lands in the
+    # shared notebook rather than being duplicated into a.ipynb and b.ipynb.
+    notebook = json.loads(client.written["app_a/output/ts1/a.ipynb"])
+    assert notebook["nbformat"] == 4 and notebook["nbformat_minor"] == 5
+    assert "print('a')" in json.dumps(notebook["cells"])
+    cross = json.loads(client.written["app_a/output/ts1/_cross_file.ipynb"])
+    assert "print('b')" in json.dumps(cross["cells"])
+    # ...and each participating program points at it, so a reader following
+    # b.sas alone still sees that a step belongs here.
+    for name in ("a", "b"):
+        pointer = json.loads(client.written[f"app_a/output/ts1/{name}.ipynb"])
+        assert "_cross_file.ipynb" in json.dumps(pointer["cells"])
+    assert "print('b')" not in json.dumps(
+        json.loads(client.written["app_a/output/ts1/b.ipynb"])["cells"]
+    )
     # Per-item verdicts + aggregate summary.
     assert "app_a/output/ts1/validation/item-1.json" in client.written
     assert "app_a/output/ts1/validation/item-2.json" in client.written
     summary = json.loads(client.written["app_a/output/ts1/validation/summary.json"])
     assert summary["items"] == 2 and summary["passed"] == 1 and summary["failed"] == 1
-    # A human-readable PDF report rendered from the inline verdicts.
+    # A human-readable report from the inline verdicts, Markdown and PDF.
+    assert "# Validation report" in client.written[
+        "app_a/output/ts1/validation/report.md"
+    ]
     pdf = client.written["app_a/output/ts1/validation/report.pdf"]
     assert isinstance(pdf, bytes) and pdf[:5] == b"%PDF-"
     # The validation subfolder was created.
@@ -435,6 +450,6 @@ def test_upload_outputs_reports_no_usage_rather_than_zero():
 def test_upload_outputs_without_validation_skips_validation_dir():
     client = _FakeClient()
     demo_run._upload_outputs(client, _req(False), _outputs(), validating=False)
-    assert "app_a/output/ts1/item-1.txt" in client.written
+    assert "app_a/output/ts1/a.ipynb" in client.written
     assert not any(p.startswith("app_a/output/ts1/validation") for p in client.written)
     assert "app_a/output/ts1/validation" not in client.created_dirs

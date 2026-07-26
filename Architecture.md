@@ -13,7 +13,10 @@ layers, each usable on its own:
    persisted to a KV store (in-memory dict locally, Databricks Delta in
    production). Every LLM call is made per `SasBatch`: the batcher's ordered
    items are coalesced first, so dependency batches and merged runs of
-   independent singletons are the only units prompted.
+   independent singletons are the only units prompted. The deliverable is a
+   **notebook** — one `.ipynb` per SAS source file (`chunker.notebook`) —
+   because the output is code and code should be runnable; the two report
+   surfaces, validation and complexity, are **Markdown**.
 
 An optional fourth component, **prompt_builder**, reads reference PDFs (SAS
 manuals, target-platform guides) into retrieval-ready instruction chunks and,
@@ -89,7 +92,17 @@ chunker/
   pipeline.py           SasLLMPipeline: formatting of chunk/batch prompts,
                         the LangGraph StateGraph wiring, and opt-in Anthropic
                         prompt caching on the system prompt.
-  pipeline_constants.py Prompt templates.
+  pipeline_constants.py Prompt templates — the Markdown-sections system
+                        prompt and its structured-output counterpart.
+  response_models.py    Pydantic models for the structured answer the pipeline
+                        asks for: TranslationDocument (analysis, mapping,
+                        ordered cells, risks) + to_markdown(), which renders it
+                        back to the four Markdown sections that get persisted
+                        and scored. Pydantic only; no langchain import.
+  notebook.py           Renders pipeline outputs as nbformat v4.5 notebooks —
+                        one .ipynb per SAS source file plus _cross_file.ipynb —
+                        from a TranslationDocument, or by parsing the Markdown
+                        response when there is none.
   _repl.py              print_iterable REPL helper (also used by demo_run.py
                         to render per-item summary lines into its logs).
 
@@ -211,7 +224,8 @@ validation/
                         via `table` on Databricks. Spark boots lazily inside
                         these two functions only.
   __main__.py           CLI: python -m validation <cases_dir> [--judge-model
-                        ...] [--track]; exit code gates CI.
+                        ...] [--track] [--md report.md] [--pdf report.pdf];
+                        exit code gates CI.
   cases/                Sample cases. Like tests/, the package does not ship
                         in the wheel.
 
@@ -276,6 +290,11 @@ complexity/
                         kind. Files, not batches, are the sized unit: a batch
                         may span several files while every chunk belongs to
                         exactly one.
+  __main__.py           CLI: python -m complexity <sas_dir> [--target ...]
+                        [--top N] [--out report.md]. Chunks, batches with
+                        MultiFileBatcher, and scores the *batched* units — the
+                        same work items the pipeline translates — then writes
+                        to_markdown(). Offline; never calls an LLM.
 ```
 
 Import direction is strictly downward: `keywords` and `models` import
@@ -395,6 +414,36 @@ an optional proactive rate limiter that paces request starts — on for the
 budget, transient-error retry that honors a gateway `Retry-After` /
 `retry-after-ms` header when present, else capped exponential backoff); an
 injected `llm` still gets the retry/budget layers.
+
+### Structured output and the notebook deliverable
+
+With `structured_output` on (constructor argument, else config.json
+`pipeline.structured_output`, default on) the model is asked for a
+`TranslationDocument` — analysis, per-construct mapping, an **ordered list of
+notebook cells**, and risks — via `LLMClient.invoke_structured`, which is
+`invoke` with a schema-bound model, so the input budget, retries,
+`cache_control` fallback, and usage accounting all still apply
+(`include_raw=True`, so usage rides on the raw message).
+
+What gets *persisted* is unchanged: the AI turn's content is
+`TranslationDocument.to_markdown()` — the same four `##` sections the
+unstructured prompt asks for, code in fenced blocks — with the document
+carried alongside on `additional_kwargs["translation_document"]`. That is
+deliberate. Storing the raw content would store an empty turn whenever the
+gateway answers by tool call, breaking resume (`_recovered_response`),
+relevance-based history selection, and every validation metric; rendering
+instead means conversation memory, `validation`, and the resume path never
+learn that structured output exists. The document is what `chunker.notebook`
+uses to build cells it knows are runnable, rather than guessing from fences.
+
+Degradation is two-stage and never fails a run: a model whose integration has
+no `with_structured_output` is detected at construction (the pipeline then
+sends the Markdown system prompt), and a gateway that rejects the schema
+mid-run is demoted once, for the rest of the pipeline's life, and re-sent
+unstructured — the same one-shot demotion `llm_client` applies to a refused
+`cache_control` breakpoint. A model that accepts the schema but answers badly
+arrives as `parsing_error`, and its prose is used. In every fallback the
+notebook is built by parsing the Markdown instead.
 
 With `prompt_caching` enabled (constructor argument, else config.json
 `llm_client.prompt_caching`) and an Anthropic model (`claude-*` or

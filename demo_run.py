@@ -4,8 +4,8 @@ Two modes, as argparse subcommands:
 
 ``local`` (the original flow)
     Runs the pipeline over a local directory of ``.sas`` files and optionally
-    writes each response to a local ``--out-dir``. Model, validation on/off, and
-    retries are CLI flags.
+    writes the translation as Jupyter notebooks under ``--out-dir``. Model,
+    validation on/off, and retries are CLI flags.
 
 ``sharepoint`` (Power Apps driven)
     Picks one conversion request from a SharePoint list — the row whose request
@@ -39,11 +39,25 @@ in that run's conversation memory. In ``local`` mode it is on unless
 flag. A failing item is re-generated once by default (with the failed metrics fed
 back as a correction); tune with ``--validation-retries N`` (``0`` = observe-only).
 
-The inline verdicts also aggregate into a PDF report (`validation.report_to_pdf`
-over `validation.report_from_verdicts`): ``local`` mode writes it to ``--pdf``
-when set, and ``sharepoint`` mode always uploads it as
-``<application_name>/output/<timestamp>/validation/report.pdf`` beside the
-per-item and summary JSON.
+Output formats
+--------------
+The pipeline's deliverable is code, so it ships as **notebooks**: one
+``<source>.ipynb`` per SAS file (plus ``_cross_file.ipynb`` for batches spanning
+several files), rendered by `chunker.notebook` from the structured
+`TranslationDocument` the pipeline asks for — or, when structured output is off
+or unavailable, by parsing the Markdown response. ``local`` mode writes them
+under ``--out-dir``; ``sharepoint`` mode uploads them to
+``<application_name>/output/<timestamp>/``.
+
+Reports are **Markdown**. The inline verdicts aggregate into a
+`ValidationReport` (`validation.report_from_verdicts`) whose ``to_markdown()``
+``local`` mode writes to ``--md`` and ``sharepoint`` mode uploads as
+``<application_name>/output/<timestamp>/validation/report.md``, beside the
+per-item and summary JSON. The same report still renders to PDF
+(`validation.report_to_pdf`) for anyone who wants one: ``--pdf`` locally,
+``validation/report.pdf`` on SharePoint.
+
+The offline complexity report is Markdown too — see ``python -m complexity``.
 
 Usage
 -----
@@ -61,6 +75,7 @@ Usage
     #     whatever --model names), used when no Vault settings are present
     #     or --no-gateway-auth is passed.
     python demo_run.py local path/to/sas_dir
+    python demo_run.py local path/to/sas_dir --out-dir out --md out/report.md
     python demo_run.py local path/to/sas_dir --model claude-sonnet-4-5 --debug
     python demo_run.py local path/to/sas_dir --no-gateway-auth
     python demo_run.py sharepoint --request-id REQ-1234
@@ -377,7 +392,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--out-dir",
         type=Path,
         default=None,
-        help="If set, write each item's LLM response to a file under this dir.",
+        help="If set, write the translation as Jupyter notebooks under this "
+        "dir — one .ipynb per SAS source file, plus _cross_file.ipynb for "
+        "batches spanning several files.",
+    )
+    local.add_argument(
+        "--md",
+        type=Path,
+        default=None,
+        help="Write the inline-validation report as Markdown at this path "
+        "(only when validation is on).",
     )
     local.add_argument(
         "--no-validate",
@@ -624,35 +648,44 @@ def _run_local(args: argparse.Namespace) -> int:
 
     _log_item_summaries(outputs)
     _log_token_usage(pipeline)
-    if args.out_dir:
-        args.out_dir.mkdir(parents=True, exist_ok=True)
 
     for out in outputs:
-        header = _item_header(out)
-        print(f"\n{header}")
+        print(f"\n{_item_header(out)}")
         print(out["response"])
 
-        if args.out_dir:
-            dest = args.out_dir / f"{out['item_id']}.txt"
-            dest.write_text(f"{header}\n\n{out['response']}\n", encoding="utf-8")
-            logger.debug(f"wrote {dest}")
+    if args.out_dir:
+        from chunker.notebook import write_notebooks
+
+        written = write_notebooks(
+            outputs, args.out_dir, output_language=args.output_language
+        )
+        for path in written:
+            print(f"wrote notebook: {path}")
 
     if validator is not None:
         _log_validation_summary(outputs)
-        if args.pdf:
-            from validation import report_to_pdf
-
+        if args.md or args.pdf:
             report = _validation_report(
                 outputs,
                 model=model,
                 instructions_fingerprint=pipeline.instructions_fingerprint,
                 token_usage=pipeline.token_usage,
             )
-            args.pdf.write_bytes(report_to_pdf(report))
-            logger.info(f"wrote inline-validation PDF report: {args.pdf}")
-            print(f"wrote inline-validation PDF report: {args.pdf}")
-    elif args.pdf:
-        logger.warning("--pdf ignored: inline validation is off (--no-validate)")
+            if args.md:
+                args.md.parent.mkdir(parents=True, exist_ok=True)
+                args.md.write_text(report.to_markdown(), encoding="utf-8")
+                logger.info(f"wrote inline-validation Markdown report: {args.md}")
+                print(f"wrote inline-validation Markdown report: {args.md}")
+            if args.pdf:
+                from validation import report_to_pdf
+
+                args.pdf.write_bytes(report_to_pdf(report))
+                logger.info(f"wrote inline-validation PDF report: {args.pdf}")
+                print(f"wrote inline-validation PDF report: {args.pdf}")
+    elif args.md or args.pdf:
+        logger.warning(
+            "--md/--pdf ignored: inline validation is off (--no-validate)"
+        )
 
     return 0
 
@@ -744,39 +777,42 @@ def _upload_outputs(
     validating: bool,
     instructions_fingerprint: str | None = None,
     token_usage=None,
+    output_language: str | None = None,
 ) -> str:
     """Write responses (and validation artifacts) back to the library.
 
-    Layout: ``<application_name>/output/<timestamp>/<item_id>.txt`` for each
-    response, and — when validating — ``.../validation/<item_id>.json`` per item,
-    a ``.../validation/summary.json`` aggregate, and a human-readable
-    ``.../validation/report.pdf`` rendered from the inline verdicts. Returns the
-    output folder.
+    Layout: ``<application_name>/output/<timestamp>/<source>.ipynb`` — one
+    runnable notebook per SAS source file, plus ``_cross_file.ipynb`` for
+    batches spanning several files — and, when validating,
+    ``.../validation/<item_id>.json`` per item, a ``.../validation/summary.json``
+    aggregate, and a human-readable ``.../validation/report.md`` (with the same
+    report as ``report.pdf`` beside it). Returns the output folder.
 
     *token_usage* is the run's LLM spend
-    (:attr:`~chunker.pipeline.SasLLMPipeline.token_usage`), carried into both
-    the summary JSON and the PDF header.
+    (:attr:`~chunker.pipeline.SasLLMPipeline.token_usage`), carried into the
+    summary JSON and the report header.
     """
+    from chunker.notebook import notebook_to_json, notebooks_from_outputs
+
     out_dir = f"{req.application_name}/output/{req.timestamp}"
     validation_dir = f"{out_dir}/validation"
     _ensure_directory(client, out_dir)
     if validating:
         _ensure_directory(client, validation_dir)
 
-    for out in outputs:
-        header = _item_header(out)
-        client.write_file(
-            f"{out_dir}/{out['item_id']}.txt",
-            f"{header}\n\n{out['response']}\n",
-        )
-        verdict = out.get("validation")
-        if validating and verdict is not None:
-            client.write_file(
-                f"{validation_dir}/{out['item_id']}.json",
-                json.dumps(verdict, indent=2),
-            )
+    notebooks = notebooks_from_outputs(outputs, output_language=output_language)
+    for name, notebook in notebooks.items():
+        client.write_file(f"{out_dir}/{name}.ipynb", notebook_to_json(notebook))
 
     if validating:
+        for out in outputs:
+            verdict = out.get("validation")
+            if verdict is not None:
+                client.write_file(
+                    f"{validation_dir}/{out['item_id']}.json",
+                    json.dumps(verdict, indent=2),
+                )
+
         from validation import report_to_pdf
 
         client.write_file(
@@ -791,6 +827,7 @@ def _upload_outputs(
             instructions_fingerprint=instructions_fingerprint,
             token_usage=token_usage,
         )
+        client.write_file(f"{validation_dir}/report.md", report.to_markdown())
         client.write_file(f"{validation_dir}/report.pdf", report_to_pdf(report))
     return out_dir
 
@@ -887,6 +924,7 @@ def _run_sharepoint(args: argparse.Namespace) -> int:
             validating=validator is not None,
             instructions_fingerprint=pipeline.instructions_fingerprint,
             token_usage=pipeline.token_usage,
+            output_language=args.output_language,
         )
     except SharePointError as exc:
         logger.error(f"could not upload results to SharePoint: {exc}")

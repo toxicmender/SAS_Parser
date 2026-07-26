@@ -106,6 +106,19 @@ report = ValidationRunner(pipeline).run(load_cases("validation/cases"))
 print(report.to_markdown())
 ```
 
+## Markdown report
+
+`to_markdown()` is the report's delivery format — the metric table, per-case
+rows, and the run's token totals. Both CLIs write it to a file on request:
+
+```bash
+python -m validation validation/cases --md report.md
+python demo_run.py local path/to/sas_dir --md report.md
+```
+
+`demo_run.py sharepoint` always uploads it as
+`<application_name>/output/<timestamp>/validation/report.md`.
+
 ## PDF report (and SharePoint)
 
 The same `to_markdown()` report renders to a paginated PDF —

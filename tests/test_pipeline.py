@@ -624,3 +624,146 @@ def test_no_mapping_keeps_batchers_unmapped():
     )
     assert pipeline.databricks_mapping is None
     assert pipeline.multi_batcher.databricks_mapping is None
+
+
+# ---------------------------------------------------------------------------
+# Structured output
+# ---------------------------------------------------------------------------
+
+
+class _StructuredFakeChatModel(FakeListChatModel):
+    """A fake that *can* answer a schema, unlike plain FakeListChatModel.
+
+    ``with_structured_output(..., include_raw=True)`` returns the LangChain
+    envelope, so the pipeline exercises the same unpacking a real gateway hits.
+    Set ``parsed`` to None (and ``parsing_error``) to simulate a model that
+    accepted the schema but did not honour it.
+    """
+
+    documents: list = []
+    parsing_error: object = None
+
+    def with_structured_output(self, schema, *, include_raw=False, **kwargs):
+        from langchain_core.runnables import RunnableLambda
+
+        documents = list(self.documents)
+        parsing_error = self.parsing_error
+        raw_responses = list(self.responses)
+
+        def _call(_input, config=None):
+            parsed = documents.pop(0) if documents else None
+            raw = AIMessage(raw_responses[0] if raw_responses else "")
+            if not include_raw:
+                return parsed
+            return {"raw": raw, "parsed": parsed, "parsing_error": parsing_error}
+
+        return RunnableLambda(_call)
+
+
+def _translation_document(code: str = 'df = spark.table("a")'):
+    from chunker.response_models import (
+        MappingEntry,
+        RiskNote,
+        TranslationCell,
+        TranslationDocument,
+    )
+
+    return TranslationDocument(
+        analysis="Reads and filters.",
+        mapping=[MappingEntry(sas_construct="DATA step", equivalent="filter")],
+        cells=[TranslationCell(kind="code", language="python", source=code)],
+        risks=[RiskNote(severity="P0", note="Row count may differ.")],
+    )
+
+
+def test_structured_output_attaches_the_document_and_renders_markdown():
+    doc = _translation_document()
+    fake = _StructuredFakeChatModel(responses=["ignored raw"], documents=[doc])
+    pipeline = SasLLMPipeline(model="unused", memory=MemoryHub(), llm=fake)
+
+    outputs = pipeline.run_text("data work.a; x=1; run;", source_id="etl.sas")
+
+    assert len(outputs) == 1
+    # The structured document rides alongside...
+    assert outputs[0]["document"]["cells"][0]["source"] == 'df = spark.table("a")'
+    # ...and the response is the rendered Markdown, not the raw content, so
+    # memory and the validation metrics see what they always saw.
+    response = outputs[0]["response"]
+    assert "## Analysis" in response and "## Translation" in response
+    assert "```python" in response
+    assert "ignored raw" not in response
+
+
+def test_structured_turn_persists_rendered_markdown_to_memory():
+    mem = MemoryHub()
+    doc = _translation_document()
+    fake = _StructuredFakeChatModel(responses=["ignored raw"], documents=[doc])
+    pipeline = SasLLMPipeline(model="unused", memory=mem, llm=fake)
+
+    pipeline.run_text("data work.a; x=1; run;", source_id="etl.sas", thread_id="t1")
+
+    stored = mem.get_thread("t1").messages
+    ai = [m for m in stored if isinstance(m, AIMessage)]
+    assert len(ai) == 1
+    # An empty stored turn would break resume, history selection, and scoring.
+    assert "## Translation" in ai[0].content
+    assert ai[0].additional_kwargs["translation_document"]["risks"]
+
+
+def test_resume_recovers_the_stored_document():
+    mem = MemoryHub()
+    doc = _translation_document()
+    fake = _StructuredFakeChatModel(responses=["raw"], documents=[doc, doc])
+    pipeline = SasLLMPipeline(model="unused", memory=mem, llm=fake)
+
+    src = "data work.a; x=1; run;"
+    pipeline.run_text(src, source_id="etl.sas", thread_id="t1")
+    resumed = pipeline.run_text(
+        src, source_id="etl.sas", thread_id="t1", resume=True
+    )
+
+    assert resumed[0]["skipped"] is True
+    # A recovered item must still be able to produce a notebook.
+    assert resumed[0]["document"]["cells"][0]["source"] == 'df = spark.table("a")'
+
+
+def test_unparsable_structured_response_falls_back_to_the_raw_prose():
+    fake = _StructuredFakeChatModel(
+        responses=["## Translation\n\n```python\nx = 1\n```\n"],
+        documents=[],
+        parsing_error=ValueError("schema not honoured"),
+    )
+    pipeline = SasLLMPipeline(model="unused", memory=MemoryHub(), llm=fake)
+
+    outputs = pipeline.run_text("data work.a; x=1; run;", source_id="etl.sas")
+
+    assert outputs[0]["document"] is None
+    assert "x = 1" in outputs[0]["response"]
+
+
+def test_model_without_structured_support_prompts_for_markdown():
+    # FakeListChatModel has no with_structured_output; the pipeline must not
+    # fail at construction, and must send the Markdown system prompt.
+    pipeline = SasLLMPipeline(
+        model="unused",
+        memory=MemoryHub(),
+        llm=FakeListChatModel(responses=["ok"]),
+        structured_output=True,
+    )
+    assert pipeline._structured_output is False
+    assert "Structure every response with these Markdown sections" in (
+        pipeline._system_prompt
+    )
+
+
+def test_structured_output_can_be_turned_off():
+    doc = _translation_document()
+    fake = _StructuredFakeChatModel(responses=["plain answer"], documents=[doc])
+    pipeline = SasLLMPipeline(
+        model="unused", memory=MemoryHub(), llm=fake, structured_output=False
+    )
+
+    outputs = pipeline.run_text("data work.a; x=1; run;", source_id="etl.sas")
+
+    assert outputs[0]["document"] is None
+    assert outputs[0]["response"] == "plain answer"

@@ -147,6 +147,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         f"then ./{DEFAULT_PATH}).",
     )
     parser.add_argument(
+        "--md",
+        type=Path,
+        default=None,
+        help="Also write the report as Markdown to this local file path.",
+    )
+    parser.add_argument(
         "--pdf",
         type=Path,
         default=None,
@@ -207,6 +213,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.track:
         run_id = log_report(report, table=args.table, path=args.path)
         print(f"logged validation run: {run_id}")
+
+    if args.md is not None:
+        args.md.parent.mkdir(parents=True, exist_ok=True)
+        args.md.write_text(report.to_markdown(), encoding="utf-8")
+        print(f"wrote Markdown report: {args.md}")
 
     if args.pdf is not None:
         from .pdf import report_to_pdf

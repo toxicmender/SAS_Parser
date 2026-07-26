@@ -48,6 +48,23 @@ for f in report.files_needing_breakdown:      # the Extra Large ones
     print(f.source_id, "→ split at", f.suggested_split)
 ```
 
+## CLI
+
+The report's delivery format is Markdown:
+
+```bash
+python -m complexity path/to/sas_dir --out complexity-report.md
+python -m complexity path/to/sas_dir --target pyspark --top 25
+```
+
+Without `--out` the Markdown goes to stdout. The CLI chunks every matching
+file, batches the whole corpus with `MultiFileBatcher` — so cross-file
+dataset/macro edges resolve into shared batches — and scores the *batched*
+units, the same work items the pipeline would translate, so an estimate lines
+up with the run it is estimating. `--no-cross-file` scores every file as if it
+were alone; `--size-anchor` recalibrates the T-shirt scale (lowering it rates
+every file larger). Nothing here calls an LLM or touches the network.
+
 Score against a different output language by naming its profile:
 
 ```python

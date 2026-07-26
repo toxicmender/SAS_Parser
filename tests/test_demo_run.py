@@ -189,3 +189,21 @@ def test_no_gateway_auth_defaults_to_off():
 
 def test_no_gateway_auth_parses():
     assert demo_run.parse_args(["local", "some_dir", "--no-gateway-auth"]).no_gateway_auth
+
+
+# ---------------------------------------------------------------------------
+# Output-format flags
+# ---------------------------------------------------------------------------
+
+
+def test_out_dir_and_md_parse_as_paths():
+    args = demo_run.parse_args(
+        ["local", "sas", "--out-dir", "out", "--md", "out/report.md"]
+    )
+    assert args.out_dir == pathlib.Path("out")
+    assert args.md == pathlib.Path("out/report.md")
+
+
+def test_report_flags_default_to_off():
+    args = demo_run.parse_args(["local", "sas"])
+    assert args.out_dir is None and args.md is None and args.pdf is None
