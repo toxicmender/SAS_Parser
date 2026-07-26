@@ -14,17 +14,52 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from chunker import SasChunkBatcher, SasSemanticChunker
+from chunker import MultiFileBatcher, SasChunkBatcher, SasSemanticChunker
+from chunker.models import SasCorpus
 from complexity import (
+    CROSS_FILE_CONSTRUCTS,
     ComplexityAnalyzer,
     ComplexityTier,
+    CrossFileIndex,
     TranslationParity,
+    TShirtSize,
     detect_constructs,
+    max_size,
     max_tier,
     sort_by_complexity,
     worst_parity,
 )
 from complexity import rules
+
+
+def _corpus(**files: str) -> SasCorpus:
+    """Chunk each ``name=source`` pair into a corpus, keyed by ``<name>.sas``."""
+    chunker = SasSemanticChunker()
+    return SasCorpus(
+        file_results=[
+            chunker.chunk_text(src, source_id=f"{name}.sas")
+            for name, src in files.items()
+        ]
+    )
+
+
+def _file(report, source_id: str):
+    """The FileComplexity for *source_id*, failing loudly if absent."""
+    for f in report.files:
+        if f.source_id == source_id:
+            return f
+    raise AssertionError(
+        f"no FileComplexity for {source_id!r}; have {[f.source_id for f in report.files]}"
+    )
+
+
+def _cross_names(scored) -> set[str]:
+    """Cross-file construct names on a scored unit, without the prefix."""
+    return {
+        s.name.removeprefix("cross_file:")
+        for s in scored.signals
+        if s.source == "cross_file"
+    }
 
 
 def _analyze(source: str, **kwargs):
@@ -472,6 +507,421 @@ class TestAnalyzerOptions(unittest.TestCase):
         self.assertEqual(scored.categories, sorted(set(scored.categories)))
 
 
+class TestTShirtSize(unittest.TestCase):
+    """Banding, the Fibonacci scale, the anchor, and the kind floors."""
+
+    def test_scale_is_fibonacci_and_ordered(self):
+        self.assertEqual(
+            [s.points for s in TShirtSize], [2, 3, 5, 8]
+        )
+        self.assertEqual(
+            [s.label for s in TShirtSize],
+            ["Small", "Medium", "Large", "Extra Large"],
+        )
+
+    def test_only_extra_large_needs_breakdown(self):
+        """XL is an instruction, not just a magnitude."""
+        for size in TShirtSize:
+            self.assertEqual(
+                size.needs_breakdown, size is TShirtSize.EXTRA_LARGE, size
+            )
+
+    def test_max_size_is_worst_case_and_floors_at_small(self):
+        self.assertEqual(max_size([]), TShirtSize.SMALL)
+        self.assertEqual(
+            max_size([TShirtSize.SMALL, TShirtSize.LARGE, TShirtSize.MEDIUM]),
+            TShirtSize.LARGE,
+        )
+
+    def test_anchor_raw_bands_to_medium(self):
+        """The anchor is the reference Medium file, by definition."""
+        for name in rules.available_profiles():
+            sizes = rules.load_ruleset(name).sizes
+            points = sizes.points_for(sizes.anchor_raw)
+            self.assertEqual(sizes.band_for(points), TShirtSize.MEDIUM, name)
+            self.assertAlmostEqual(points, 3.0, places=2, msg=name)
+
+    def test_banding_is_monotonic_in_raw_score(self):
+        sizes = rules.load_ruleset("sparksql").sizes
+        seen = [
+            rules.load_ruleset("sparksql").sizes.band_for(sizes.points_for(raw))
+            for raw in (1, 5, 10, 20, 30, 50, 90)
+        ]
+        ranks = [__import__("complexity").size_rank(s) for s in seen]
+        self.assertEqual(ranks, sorted(ranks), seen)
+
+    def test_lowering_the_anchor_makes_files_larger(self):
+        """Sizes are relative to the anchor, so the anchor is the master knob."""
+        source = "data a; set b; run;\nproc sort data=a; by id; run;\n"
+        big = _analyze(source, size_anchor=2.0).files[0]
+        small = _analyze(source, size_anchor=200.0).files[0]
+        self.assertGreater(big.points, small.points)
+        self.assertEqual(small.size, TShirtSize.SMALL)
+        self.assertEqual(big.size, TShirtSize.EXTRA_LARGE)
+
+    def test_macro_definition_is_never_small(self):
+        """A tiny %MACRO is never Small, however little it contains."""
+        f = _analyze("%macro noop;\n%mend noop;\n").files[0]
+        self.assertGreaterEqual(
+            __import__("complexity").size_rank(f.size),
+            __import__("complexity").size_rank(TShirtSize.MEDIUM),
+        )
+
+    def test_kind_floor_binds_and_names_itself(self):
+        """A short %MACRO bands below Medium on volume, so the floor acts."""
+        f = _analyze("%macro noop;\n%mend noop;\n").files[0]
+        self.assertEqual(f.size, TShirtSize.MEDIUM)
+        self.assertEqual(f.floored_by, "MACRO_DEFINITION")
+        # The floor is what did it, not the banding.
+        self.assertLess(f.points, 2.5)
+
+    def test_config_only_file_stays_small(self):
+        f = _analyze("%let a = 1;\n%let b = 2;\n%let c = 3;\n").files[0]
+        self.assertEqual(f.size, TShirtSize.SMALL)
+
+    def test_floored_by_is_empty_when_banding_stands_alone(self):
+        """The floor is only reported when it actually changed the answer."""
+        f = _analyze("%macro noop;\n%mend noop;\n", size_anchor=1.0).files[0]
+        self.assertEqual(f.size, TShirtSize.EXTRA_LARGE)
+        self.assertEqual(f.floored_by, "")
+
+    def test_volume_alone_can_drive_a_large_size(self):
+        """A long file of trivial steps raises no signal, but is still work.
+
+        This is the case a tier cannot express: every step here is LOW/DIRECT,
+        so a presence-based scale reads the file as trivial.
+        """
+        source = "".join(
+            f"data out{i}; set in{i}; run;\n" for i in range(40)
+        )
+        f = _analyze(source).files[0]
+        self.assertEqual(f.tier, ComplexityTier.LOW)
+        self.assertGreater(f.effort_raw, 20)
+        self.assertIn(f.size, (TShirtSize.LARGE, TShirtSize.EXTRA_LARGE))
+
+
+def _reference_file_source() -> str:
+    """The file each profile's ``anchor.describes`` names, written out.
+
+    ~200 lines: a %MACRO wrapping two DATA steps, nine further DATA steps, a
+    match-merge, a PROC SORT, a PROC SUMMARY, two LIBNAMEs used throughout.
+    """
+    lines = ['libname edw "/mnt/edw";', 'libname mart "/mnt/mart";', ""]
+    lines += ["%macro prep(ds=, out=);", "  data &out._stg;", "    set &ds;"]
+    lines += [f"    length c{i} $8;" for i in range(10)]
+    lines += ["  run;", "  data &out;", "    set &out._stg;"]
+    lines += [f'    x{i} = c{i} || "_t";' for i in range(10)]
+    lines += ["  run;", "%mend prep;", "", "%prep(ds=edw.raw, out=work.p);", ""]
+    for step in range(9):
+        lines += [f"data work.s{step};", "  set work.p;"]
+        lines += [f"  y{step}_{j} = x{j} * {j + 1};" for j in range(12)]
+        lines += ["run;", ""]
+    lines += ["data work.matched;", "  merge work.s0 work.s1;", "  by id;"]
+    lines += [f"  m{j} = y0_{j} + y1_{j};" for j in range(10)]
+    lines += ["run;", ""]
+    lines += ["proc sort data=work.matched;", "  by id;", "run;", ""]
+    lines += [
+        "proc summary data=work.matched;",
+        "  var m0 m1 m2;",
+        "  output out=mart.agg mean=;",
+        "run;",
+    ]
+    return "\n".join(lines)
+
+
+class TestAnchorCalibration(unittest.TestCase):
+    """The anchor must stay the measured score of the file it describes.
+
+    Without this, ``anchor.describes`` decays into a story about a number that
+    no longer follows from it — and since every size is relative to the anchor,
+    a drifted anchor silently re-rates the whole corpus.
+    """
+
+    def test_reference_file_measures_its_profile_anchor(self):
+        result = SasSemanticChunker().chunk_text(
+            _reference_file_source(), source_id="reference.sas"
+        )
+        for name in rules.available_profiles():
+            scored = ComplexityAnalyzer(target=name).analyze_result(result).files[0]
+            expected = rules.load_ruleset(name).sizes.anchor_raw
+            self.assertAlmostEqual(
+                scored.raw_total,
+                expected,
+                delta=1.0,
+                msg=(
+                    f"{name}: reference file measures {scored.raw_total}, but the "
+                    f"profile anchors at {expected}. Re-measure and update the "
+                    f"profile, or fix anchor.describes to match reality."
+                ),
+            )
+
+    def test_reference_file_is_medium_against_every_target(self):
+        """It is the definition of Medium, so it must read Medium everywhere."""
+        result = SasSemanticChunker().chunk_text(
+            _reference_file_source(), source_id="reference.sas"
+        )
+        for name in rules.available_profiles():
+            scored = ComplexityAnalyzer(target=name).analyze_result(result).files[0]
+            self.assertEqual(scored.size, TShirtSize.MEDIUM, name)
+
+    def test_every_anchor_documents_itself(self):
+        for name in rules.available_profiles():
+            self.assertTrue(
+                rules.load_ruleset(name).sizes.anchor_describes.strip(),
+                f"{name} anchors on an undocumented number",
+            )
+
+
+class TestSizeDimensions(unittest.TestCase):
+    """Effort, complexity, and uncertainty move a size independently."""
+
+    def test_three_dimensions_sum_to_raw_total(self):
+        f = _analyze("data a; set b; array x{3} p1-p3; run;\n").files[0]
+        self.assertAlmostEqual(
+            f.raw_total,
+            round(f.effort_raw + f.complexity_raw + f.uncertainty_raw, 3),
+        )
+
+    def test_complexity_dimension_responds_to_parity_not_just_tier(self):
+        """Same tier, different target: PySpark rates the macro more kindly."""
+        source = "%macro build(ds=);\n  data o; set &ds; run;\n%mend build;\n"
+        sql = _analyze(source, target="sparksql").files[0]
+        py = _analyze(source, target="pyspark").files[0]
+        self.assertEqual(sql.tier, py.tier)
+        self.assertGreater(sql.complexity_raw, py.complexity_raw)
+
+    def test_uncertainty_counts_unclosed_blocks(self):
+        f = _analyze("%macro broken;\n  data x; set y; run;\n").files[0]
+        self.assertGreater(f.uncertainty_raw, 0)
+
+    def test_unresolved_libref_feeds_uncertainty(self):
+        f = _analyze("data out; set ghost.tbl; run;\n").files[0]
+        self.assertIn("libref_unresolved", _cross_names(f))
+        self.assertGreater(f.uncertainty_raw, 0)
+
+    def test_unmatched_dataset_is_not_uncertainty(self):
+        """An unwritten input is a source table, not a missing dependency."""
+        corpus = _corpus(
+            one="data a; set external_src; run;\n",
+            two="data b; set c; run;\n",
+        )
+        report = ComplexityAnalyzer().analyze_corpus(corpus)
+        f = _file(report, "one.sas")
+        self.assertIn("dataset_unresolved", _cross_names(f))
+        self.assertEqual(f.uncertainty_raw, 0.0)
+
+    def test_batch_result_path_flags_incomplete_uncertainty(self):
+        """SasBatchResult carries no diagnostics; that is recorded, not hidden."""
+        result = SasSemanticChunker().chunk_text(
+            "data a; set b; run;\n", source_id="t.sas"
+        )
+        batched = ComplexityAnalyzer().analyze_batch_result(
+            SasChunkBatcher().batch(result)
+        )
+        direct = ComplexityAnalyzer().analyze_result(result)
+        self.assertFalse(batched.files[0].uncertainty_complete)
+        self.assertTrue(direct.files[0].uncertainty_complete)
+
+
+class TestCrossFile(unittest.TestCase):
+    """Resolving references against the rest of the corpus."""
+
+    LIB = "%macro build(ds=);\n  data out; set &ds; run;\n%mend build;\n%let env = prod;\n"
+    JOB = "%build(ds=work.raw);\ndata final; set out; where e = \"&env\"; run;\n"
+
+    def setUp(self):
+        self.report = ComplexityAnalyzer().analyze_corpus(
+            _corpus(lib=self.LIB, job=self.JOB)
+        )
+
+    def test_consumer_imports_and_producer_exports(self):
+        job = _cross_names(_file(self.report, "job.sas"))
+        lib = _cross_names(_file(self.report, "lib.sas"))
+        self.assertIn("macro_import", job)
+        self.assertIn("macrovar_import", job)
+        self.assertIn("macro_export", lib)
+        self.assertIn("macrovar_export", lib)
+
+    def test_dependency_direction_is_recorded(self):
+        job = _file(self.report, "job.sas").cross_file
+        lib = _file(self.report, "lib.sas").cross_file
+        assert job is not None and lib is not None
+        self.assertEqual(job.depends_on, ["lib.sas"])
+        self.assertEqual(lib.depended_on_by, ["job.sas"])
+        self.assertTrue(job.is_coupled)
+
+    def test_export_does_not_raise_the_producer_tier(self):
+        """Being depended on is scheduling effort, not translation difficulty."""
+        lib = _file(self.report, "lib.sas")
+        exports = [
+            s
+            for s in lib.signals
+            if s.name.startswith("cross_file:") and s.name.endswith("_export")
+        ]
+        self.assertTrue(exports)
+        for signal in exports:
+            self.assertEqual(signal.tier, ComplexityTier.LOW)
+            self.assertEqual(signal.parity, TranslationParity.DIRECT)
+
+    def test_same_file_reference_raises_nothing(self):
+        """A macro defined and called in one file is not a cross-file ref."""
+        report = ComplexityAnalyzer().analyze_result(
+            SasSemanticChunker().chunk_text(
+                self.LIB + "%build(ds=work.raw);\n", source_id="solo.sas"
+            )
+        )
+        self.assertNotIn("macro_import", _cross_names(report.files[0]))
+        self.assertNotIn("macro_unresolved", _cross_names(report.files[0]))
+
+    def test_libref_assigned_in_another_chunk_of_the_same_file(self):
+        """The LIBNAME is its own chunk, so file scope is what matters."""
+        report = _analyze('libname mylib "/d";\ndata mylib.o; set mylib.i; run;\n')
+        self.assertNotIn("libref_unresolved", _cross_names(report.files[0]))
+
+    def test_missing_macro_is_unresolved_only_with_a_corpus_to_search(self):
+        """HIGH/MANUAL requires having actually looked somewhere."""
+        multi = ComplexityAnalyzer().analyze_corpus(
+            _corpus(one="%ghost(x=1);\n", two="data z; set y; run;\n")
+        )
+        names = _cross_names(_file(multi, "one.sas"))
+        self.assertIn("macro_unresolved", names)
+        self.assertNotIn("macro_external", names)
+
+        solo = _analyze("%ghost(x=1);\n")
+        solo_names = _cross_names(solo.files[0])
+        self.assertIn("macro_external", solo_names)
+        self.assertNotIn("macro_unresolved", solo_names)
+
+    def test_unresolved_macro_is_manual_but_external_is_not(self):
+        multi = ComplexityAnalyzer().analyze_corpus(
+            _corpus(one="%ghost(x=1);\n", two="data z; set y; run;\n")
+        )
+        self.assertEqual(
+            _file(multi, "one.sas").translation_difficulty, TranslationParity.MANUAL
+        )
+        self.assertEqual(
+            _analyze("%ghost(x=1);\n").files[0].translation_difficulty,
+            TranslationParity.PARTIAL,
+        )
+
+    def test_standard_autocall_macros_are_never_flagged(self):
+        """%left and friends ship with SAS; calling one is not a dependency."""
+        report = ComplexityAnalyzer().analyze_corpus(
+            _corpus(one="%let x = %left(  5 );\n", two="data z; set y; run;\n")
+        )
+        names = _cross_names(_file(report, "one.sas"))
+        self.assertNotIn("macro_unresolved", names)
+        self.assertNotIn("macro_external", names)
+
+    def test_default_librefs_are_never_flagged(self):
+        report = _analyze("data work.a; set sashelp.class; run;\n")
+        self.assertNotIn("libref_unresolved", _cross_names(report.files[0]))
+
+    def test_use_cross_file_off_drops_every_cross_file_signal(self):
+        report = ComplexityAnalyzer(use_cross_file=False).analyze_corpus(
+            _corpus(lib=self.LIB, job=self.JOB)
+        )
+        self.assertEqual(_cross_names(_file(report, "job.sas")), set())
+        self.assertIsNone(_file(report, "job.sas").cross_file)
+
+    def test_lone_chunk_analysis_raises_no_cross_file_signal(self):
+        """analyze_chunk with no index has no corpus to resolve against."""
+        chunk = SasSemanticChunker().chunk_text(
+            "%ghost(x=1);\n", source_id="t.sas"
+        ).chunks[0]
+        self.assertEqual(_cross_names(ComplexityAnalyzer().analyze_chunk(chunk)), set())
+
+    def test_include_is_left_to_the_existing_metadata_signals(self):
+        """crossfile.py adds no %INCLUDE signal of its own.
+
+        The chunker already surfaces %INCLUDE through both the INCLUDE chunk
+        kind and the ``includes`` flag, and the catalogue rates both
+        MEDIUM/PARTIAL — exactly what a cross-file entry would assign. Adding a
+        third would inflate the score without adding information.
+        """
+        report = _analyze('%include "other.sas";\n')
+        self.assertEqual(_cross_names(report.files[0]), set())
+        self.assertNotIn("include", CROSS_FILE_CONSTRUCTS)
+
+    def test_chunk_ids_do_not_collide_across_files(self):
+        """Both files start at chunk-001; refs must not leak between them."""
+        index = CrossFileIndex.build(_corpus(lib=self.LIB, job=self.JOB).all_chunks)
+        lib = index.profile_for("lib.sas")
+        assert lib is not None
+        # lib.sas defines everything it uses; only job.sas depends outward.
+        self.assertEqual(lib.depends_on, [])
+        self.assertEqual(lib.depended_on_by, ["job.sas"])
+
+
+class TestFileComplexity(unittest.TestCase):
+    """The file rollup, and how it renders."""
+
+    def test_batch_spanning_two_files_still_yields_two_file_rollups(self):
+        corpus = _corpus(
+            a="data shared.mid; set shared.raw; run;\n",
+            b="data shared.out; set shared.mid; run;\n",
+        )
+        batched = MultiFileBatcher().batch(corpus)
+        report = ComplexityAnalyzer().analyze_batch_result(batched)
+        self.assertEqual(
+            sorted(f.source_id for f in report.files), ["a.sas", "b.sas"]
+        )
+
+    def test_total_points_sums_files(self):
+        report = ComplexityAnalyzer().analyze_corpus(
+            _corpus(a="data a; set b; run;\n", b="%macro m;\n%mend m;\n")
+        )
+        self.assertAlmostEqual(
+            report.total_points, round(sum(f.points for f in report.files), 1)
+        )
+
+    def test_overall_size_is_the_largest_file(self):
+        report = ComplexityAnalyzer().analyze_corpus(
+            _corpus(a="%let x = 1;\n", b="%macro m;\n%mend m;\n")
+        )
+        self.assertEqual(report.overall_size, TShirtSize.MEDIUM)
+
+    def test_size_counts_cover_every_size(self):
+        report = _analyze("data a; set b; run;\n")
+        self.assertEqual({s.value for s in TShirtSize}, set(report.size_counts))
+        self.assertEqual(len(report.files), sum(report.size_counts.values()))
+
+    def test_line_span_counts_overlapping_chunks_once(self):
+        """A split region emits a parent plus children covering the same lines."""
+        source = "".join(f"data o{i}; set i{i}; run;\n" for i in range(30))
+        f = _analyze(source).files[0]
+        self.assertLessEqual(f.line_count, source.count("\n") + 1)
+
+    def test_markdown_renders_sizes_and_breakdown(self):
+        report = _analyze(
+            "".join(f"data o{i}; set i{i}; run;\n" for i in range(60))
+        )
+        md = report.to_markdown()
+        self.assertIn("## File sizes", md)
+        self.assertIn("Overall size", md)
+        self.assertIn("Total story points", md)
+        if report.files_needing_breakdown:
+            self.assertIn("Files needing breakdown", md)
+
+    def test_extra_large_file_suggests_batch_cut_points(self):
+        source = "".join(
+            f"data step{i}; set step{i - 1}; run;\n" for i in range(1, 60)
+        )
+        result = SasSemanticChunker().chunk_text(source, source_id="big.sas")
+        report = ComplexityAnalyzer().analyze_batch_result(
+            SasChunkBatcher().batch(result)
+        )
+        f = report.files[0]
+        self.assertEqual(f.size, TShirtSize.EXTRA_LARGE)
+        self.assertTrue(f.needs_breakdown)
+        self.assertTrue(f.suggested_split, "XL file should offer cut points")
+
+    def test_non_extra_large_files_suggest_no_split(self):
+        f = _analyze("data a; set b; run;\n").files[0]
+        self.assertFalse(f.needs_breakdown)
+        self.assertEqual(f.suggested_split, [])
+
+
 class TestCatalogueIntegrity(unittest.TestCase):
     """Every shipped profile must parse and be internally consistent."""
 
@@ -535,6 +985,55 @@ class TestCatalogueIntegrity(unittest.TestCase):
                 ComplexityTier.HIGH,
                 name,
             )
+
+    def test_every_cross_file_construct_has_a_catalogue_entry(self):
+        """Mirrors the detector-coverage rule: a resolver that can emit a name
+        the catalogue does not list would silently drop the signal."""
+        for name in rules.available_profiles():
+            catalogue = set(rules.load_ruleset(name).constructs.get("cross_file", {}))
+            missing = sorted(CROSS_FILE_CONSTRUCTS - catalogue)
+            self.assertEqual(missing, [], f"{name} is missing {missing}")
+
+    def test_no_catalogue_entry_without_a_resolver_to_emit_it(self):
+        for name in rules.available_profiles():
+            catalogue = set(rules.load_ruleset(name).constructs.get("cross_file", {}))
+            orphans = sorted(catalogue - CROSS_FILE_CONSTRUCTS)
+            self.assertEqual(orphans, [], f"{name} lists unreachable {orphans}")
+
+    def test_cross_file_tiers_are_target_independent(self):
+        """Tiers describe the SAS side, so only parity may move (see below)."""
+        base = rules.load_ruleset("sparksql").constructs["cross_file"]
+        for name in rules.available_profiles():
+            other = rules.load_ruleset(name).constructs["cross_file"]
+            for key, spec in base.items():
+                self.assertEqual(other[key].tier, spec.tier, f"{name}:{key}")
+
+    def test_unresolved_macro_outranks_external_everywhere(self):
+        """Proving absence is worse than merely not having looked."""
+        for name in rules.available_profiles():
+            cf = rules.load_ruleset(name).constructs["cross_file"]
+            self.assertEqual(cf["macro_unresolved"].tier, ComplexityTier.HIGH, name)
+            self.assertEqual(
+                cf["macro_unresolved"].parity, TranslationParity.MANUAL, name
+            )
+            self.assertLess(
+                rules.load_ruleset(name).sizes.parity_weight(cf["macro_external"].parity),
+                rules.load_ruleset(name).sizes.parity_weight(
+                    cf["macro_unresolved"].parity
+                ),
+                name,
+            )
+
+    def test_every_profile_has_a_usable_size_model(self):
+        for name in rules.available_profiles():
+            sizes = rules.load_ruleset(name).sizes
+            self.assertGreater(sizes.anchor_raw, 0, name)
+            self.assertTrue(sizes.anchor_describes, f"{name} anchor is undocumented")
+            bounds = [
+                sizes.bands[s]
+                for s in (TShirtSize.SMALL, TShirtSize.MEDIUM, TShirtSize.LARGE)
+            ]
+            self.assertEqual(bounds, sorted(bounds), name)
 
     def test_hashing_functions_are_supported_in_spark_sql(self):
         """Spark SQL ships md5/sha1/sha2/crc32/xxhash64, so the SAS hashing

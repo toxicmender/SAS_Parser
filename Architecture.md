@@ -23,11 +23,17 @@ item's constructs — prompted to the LLM but never persisted (see invariant 5).
 A fifth, **complexity**, scores chunks and batches for migration effort on two
 axes — a LOW/MEDIUM/HIGH data-complexity tier (a property of the SAS source)
 and a feature-parity rating against the output language (a property of the
-SAS/target pair) — for triage and estimation. The catalogue that assigns those
-ratings is JSON data under `complexity/profiles/`, one file per target, so the
-analysis retargets from Spark SQL to PySpark (or anything else) without a code
-change. It reads the chunker's output and is deliberately not wired into the
-pipeline.
+SAS/target pair) — for triage and estimation. It also sizes each **source
+file** on the agile T-shirt scale (Small/Medium/Large/Extra Large, with
+Fibonacci story points), which the two presence-based axes cannot express: a
+long file of trivial steps raises no signal at all yet is still real work.
+Sizing combines three declared dimensions — effort, complexity, and
+uncertainty — measured relative to a documented reference file, and accounts
+for what each file borrows from and lends to the rest of the corpus. The
+catalogue that assigns those ratings is JSON data under
+`complexity/profiles/`, one file per target, so the analysis retargets from
+Spark SQL to PySpark (or anything else) without a code change. It reads the
+chunker's output and is deliberately not wired into the pipeline.
 
 ```
                  +----------------------+
@@ -210,20 +216,34 @@ validation/
                         in the wheel.
 
 complexity/
-  models.py             Pydantic models: ComplexityTier (LOW/MEDIUM/HIGH) and
-                        TranslationParity (DIRECT..MANUAL) — ordered scales
-                        with max_tier() / worst_parity() helpers —
+  models.py             Pydantic models: ComplexityTier (LOW/MEDIUM/HIGH),
+                        TranslationParity (DIRECT..MANUAL), and TShirtSize
+                        (SMALL..EXTRA_LARGE, carrying Fibonacci points and the
+                        needs_breakdown flag) — ordered scales with max_tier()
+                        / worst_parity() / max_size() helpers —
                         ComplexitySignal (evidence vs catalogue note),
-                        ChunkComplexity, BatchComplexity,
+                        ChunkComplexity, BatchComplexity, FileComplexity (the
+                        sized unit, reporting effort/complexity/uncertainty
+                        separately), CrossFileProfile,
                         CorpusComplexityReport (computed tier_counts /
-                        overall_tier / overall_difficulty; to_markdown()).
+                        overall_tier / overall_difficulty / overall_size /
+                        total_points; to_markdown()).
                         Every result records the target it was scored against.
-  rules.py              RuleSet + the JSON profile loader: resolution
-                        (explicit path > target > config > default),
-                        "extends" inheritance with per-construct deep merge,
-                        construct_groups shorthand, schema validation
-                        (RuleSetError names the offending key), and caching.
-                        Holds no ratings of its own.
+  rules.py              RuleSet + SizeModel + the JSON profile loader:
+                        resolution (explicit path > target > config >
+                        default), "extends" inheritance with per-construct
+                        deep merge, construct_groups shorthand, schema
+                        validation (RuleSetError names the offending key), and
+                        caching. Holds no ratings of its own.
+  crossfile.py          CrossFileIndex: resolves each chunk's macro, dataset,
+                        macro-variable, and libref references against the rest
+                        of the corpus into internal / import / export /
+                        unresolved, from metadata the chunker already
+                        extracts. HIGH/MANUAL "unresolved" is raised only when
+                        two or more files were in scope — with one file,
+                        absence proves nothing, so the reference is reported
+                        as merely external. Reuses the chunker's autocall-macro
+                        and default-libref sets rather than re-listing them.
   profiles/*.json       The catalogues themselves, one per target language:
                         construct -> (category, tier, parity, note), keyed by
                         PROC, component object, function, CALL routine, global
@@ -246,10 +266,16 @@ complexity/
                         Runs on chunker.scanner._sanitise output, so comments
                         and string literals never fire a signal; negative
                         lookbehinds keep macro %DO out of the DATA step forms.
-  analyzer.py           ComplexityAnalyzer: aggregation only, owns no tier of
-                        its own. Tier = max signal tier (presence-based),
-                        difficulty = worst signal parity, score = sum of
-                        distinct construct weights (ranks within a tier only).
+  analyzer.py           ComplexityAnalyzer: aggregation and sizing, owns no
+                        tier of its own. Tier = max signal tier
+                        (presence-based), difficulty = worst signal parity,
+                        score = sum of distinct construct weights (ranks
+                        within a tier only). T-shirt size = effort + complexity
+                        + uncertainty, scaled against the profile's anchor and
+                        banded on the Fibonacci rungs, then floored by chunk
+                        kind. Files, not batches, are the sized unit: a batch
+                        may span several files while every chunk belongs to
+                        exactly one.
 ```
 
 Import direction is strictly downward: `keywords` and `models` import
@@ -271,8 +297,10 @@ package stays dependency-free to import. `validation` sits *above* the whole
 stack, beside the CLI entry points: it drives `chunker.pipeline` and may
 import anything, and nothing imports it back. `complexity` sits above
 `chunker` on the same footing — it reads `chunker.models` (plus
-`chunker.scanner._sanitise`, deliberately, rather than re-implementing SAS
-comment and quote rules) and `app_config`, and nothing imports it back. It is
+`chunker.scanner._sanitise`, `chunker.keywords._STANDARD_AUTOCALL_MACROS`, and
+`chunker.batcher._DEFAULT_LIBREFS`, all deliberately, rather than
+re-implementing SAS comment and quote rules or re-listing sets that would
+drift) and `app_config`, and nothing imports it back. It is
 never wired into the pipeline: scoring a corpus for complexity must not change
 what the LLM is asked to translate.
 

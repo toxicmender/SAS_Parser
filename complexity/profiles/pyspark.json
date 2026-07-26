@@ -3,6 +3,12 @@
   "display_name": "PySpark",
   "extends": "sparksql",
   "description": "SAS -> PySpark translation complexity. Extends the Spark SQL profile and restates only the constructs that rate differently when a full Python host language surrounds the DataFrame API. Tiers are unchanged throughout — the data-complexity of a SAS construct does not depend on what it is being translated into; only the parity ratings move.",
+  "sizes": {
+    "anchor": {
+      "raw": 81.5,
+      "describes": "The SAME reference file the Spark SQL profile describes, measured against THIS profile: 81.5 rather than 87.5, because a Python host language rates the macro and its parameterisation more favourably. Anchoring each target to its own measurement of one shared reference keeps that file MEDIUM everywhere -- which is right, since it is the definition of Medium -- so what remains target-dependent is the RELATIVE construct mix: a macro-heavy file rates larger against Spark SQL than against PySpark, while a file of plain DATA steps rates the same against both. Sub-blocks not restated (bands, volume, uncertainty, floors) are inherited from sparksql."
+    }
+  },
   "constructs": {
     "kind": {
       "MACRO_DEFINITION": {
@@ -22,6 +28,20 @@
         "tier": "MEDIUM",
         "parity": "SUPPORTED",
         "note": "macro invocation -> a Python function call"
+      }
+    },
+    "cross_file": {
+      "macro_import": {
+        "category": "cross-file-macro",
+        "tier": "MEDIUM",
+        "parity": "SUPPORTED",
+        "note": "a macro defined in another file becomes a Python function imported from another module -- the dependency is real, but the language expresses it natively, which pure SQL cannot"
+      },
+      "macro_external": {
+        "category": "cross-file-macro",
+        "tier": "MEDIUM",
+        "parity": "SUPPORTED",
+        "note": "a macro defined outside this file becomes an import from a module not yet in scope; still a gap, but a mechanical one"
       }
     },
     "detector": {

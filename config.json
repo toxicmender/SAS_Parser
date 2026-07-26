@@ -30,13 +30,20 @@
     "requests_per_second": null,
     "max_bucket_size": null
   },
+  "_pipeline_comment": "Pipeline behaviour. 'structured_output' asks the model for a typed TranslationDocument (analysis / mapping / ordered notebook cells / risks) instead of free-form Markdown, so chunker.notebook knows which cells are runnable code rather than guessing from fences. The turn persisted to memory and the item's 'response' stay Markdown either way, so conversation memory, resume, and validation are unaffected; a gateway that will not honour the schema degrades to the model's prose with a warning. Set false to prompt for plain Markdown.",
+  "pipeline": {
+    "structured_output": null
+  },
   "_complexity_comment": "Complexity analysis. 'target' names a rule-set profile under complexity/profiles/ ('sparksql', 'pyspark', ...); 'rules_path' points at a profile file of your own and wins over 'target'. The per-tier weights only rank units within a tier; they can never change a tier, which is presence-based (any HIGH construct makes the unit HIGH). Retune which construct maps to which tier by editing a profile JSON, not here.",
+  "_complexity_sizing_comment": "T-shirt sizing (S/M/L/XL per source file). 'size_anchor' is the raw score of the reference MEDIUM file -- sizes are relative estimates against it, so LOWERING it makes every file rate LARGER. Its calibration, along with the band boundaries and the per-dimension weights, lives in the profile's 'sizes' block; only the anchor is exposed here because it is the one knob that moves every verdict coherently. 'use_cross_file' resolves each file's macro/dataset/macro-variable/libref references against the rest of the corpus; turning it off scores every file as if it were the only one.",
   "complexity": {
     "target": null,
     "rules_path": null,
     "weight_low": null,
     "weight_medium": null,
-    "weight_high": null
+    "weight_high": null,
+    "size_anchor": null,
+    "use_cross_file": null
   },
   "user_instructions": {
     "path": null,

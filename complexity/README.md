@@ -1,7 +1,7 @@
 # complexity
 
-Translation-complexity analysis for SAS chunks and batches. Reads what the
-chunker already produced and answers two questions per unit:
+Translation-complexity analysis for SAS chunks, batches, and files. Reads what
+the chunker already produced and answers three questions:
 
 1. **How complex is this data step?** — `LOW` / `MEDIUM` / `HIGH`
    (`ComplexityTier`). A property of the **SAS source**, so it does not change
@@ -10,6 +10,11 @@ chunker already produced and answers two questions per unit:
    (`TranslationParity`). A property of the **SAS/target pair**, so it *does*
    change: the same `%MACRO` rates `MANUAL` against Spark SQL and `HARD`
    against PySpark.
+3. **How much work is this file?** — `Small` / `Medium` / `Large` /
+   `Extra Large` (`TShirtSize`), per **source file**, with story points. Unlike
+   the first two this is **volume-aware**, and it accounts for what the file
+   borrows from and lends to the rest of the corpus. See
+   [T-shirt sizing](#t-shirt-sizing) and [Cross-file references](#cross-file-references).
 
 The catalogue that assigns those ratings is **JSON data**, not code — see
 [Retargeting](#retargeting-to-another-output-language). The package is
@@ -29,10 +34,18 @@ report = ComplexityAnalyzer().analyze_batch_result(SasChunkBatcher().batch(resul
 print(report.overall_tier)        # HIGH
 print(report.overall_difficulty)  # MANUAL
 print(report.tier_counts)         # {'LOW': 2, 'MEDIUM': 5, 'HIGH': 2}
-print(report.to_markdown())       # summary + hardest-units table
+print(report.overall_size)        # EXTRA_LARGE
+print(report.total_points)        # 12.4  — the backlog estimate
+print(report.to_markdown())       # summary + sizes + hardest-units table
 
 for item in report.hardest(5):
     print(item.tier, item.translation_difficulty, item.rationale)
+
+for f in report.files:
+    print(f.source_id, f.size.label, f.points)
+
+for f in report.files_needing_breakdown:      # the Extra Large ones
+    print(f.source_id, "→ split at", f.suggested_split)
 ```
 
 Score against a different output language by naming its profile:
@@ -130,6 +143,254 @@ A batch's tier and difficulty are the worst any member reaches; its **score is
 the sum** of its members', because ten simple steps genuinely are more work
 than one.
 
+## T-shirt sizing
+
+A tier and a parity together still cannot answer "how big is this file?". Both
+are **presence-based** — one `ARRAY` makes a file HIGH however short it is —
+and neither counts anything. A 2000-line file of plain DATA steps raises no
+signal at all, scores `0.0`, and would read as trivial. It is not.
+
+So each **source file** also gets a `TShirtSize`: `Small`, `Medium`, `Large`,
+`Extra Large`. Files rather than batches, because a batch may span several
+files (`SasBatch.source_files`) while every chunk belongs to exactly one, so a
+file rollup built from chunks is unambiguous however the corpus was batched.
+
+Four sizes, not the conventional six: XS and XXL are dropped because a size
+nobody can tell from its neighbour costs more than it explains.
+
+### The three dimensions
+
+A size is not one number. The method requires stating up front what a size
+*means* and then holding to it, so this one is declared as three terms,
+reported separately on `FileComplexity`:
+
+| Dimension | Field | Measures | Fed by |
+| --- | --- | --- | --- |
+| **Effort** | `effort_raw` | how much there is | chunks, lines, contained DATA/PROC steps, dataset I/O, macro parameters |
+| **Complexity** | `complexity_raw` | how hard it is | each distinct signal's tier weight **plus** its parity weight |
+| **Uncertainty** | `uncertainty_raw` | what we could not pin down | unresolved cross-file refs, unclosed blocks, `UNKNOWN_*` chunks, parser diagnostics |
+
+Keeping them apart is the point: a `Large` file that is large on *uncertainty*
+needs someone to go and find the missing pieces, while one large on *effort*
+just needs more hands. A single blended number hides that distinction.
+
+Including **parity** in the complexity term is what makes a size
+target-dependent. Unlike a tier, the same file is genuinely less work against
+PySpark than against Spark SQL, because a Python host language absorbs macros
+and loops that pure SQL cannot express. That is why the sizing model lives in
+the profile.
+
+### The anchor
+
+Sizing is **relative estimation against a fixed reference**, which is the
+method's own prescription — you size a story by comparing it to a reference
+story the team already knows, not by consulting a table of absolute cutoffs.
+
+The reference lives in the profile:
+
+```json
+"sizes": {
+  "anchor": {
+    "raw": 18.0,
+    "describes": "The reference MEDIUM file. Roughly 250 lines: 8-10 steps, one match-merge, a PROC SORT and a PROC SUMMARY, one %MACRO wrapping two of the steps, reading two librefs it does not assign itself."
+  }
+}
+```
+
+`points = raw / anchor.raw × scale[MEDIUM]`, then banded. **Lowering the anchor
+makes every file rate larger.** It is deliberately the one knob exposed in
+`config.json` (`complexity.size_anchor`), because it moves every verdict
+coherently, where editing a single band would just skew one rung.
+
+`87.5` is that reference file's **measured** raw score, not a guess: the file
+described above was written out and run through the analyzer. Each profile
+anchors to its *own* measurement of the same reference (PySpark reads `81.5`),
+which keeps that file Medium against every target — as the definition of Medium
+requires — so what stays target-dependent is the *relative* construct mix. A
+macro-heavy file rates larger against Spark SQL than against PySpark; a file of
+plain DATA steps rates identically against both.
+
+The anchor is *fixed data*, not recomputed per run. A corpus-relative
+(percentile) scheme would re-rate the same file differently depending on which
+files it happened to be analysed alongside, and would be undefined for a
+single-file run — useless for a tool whose whole job is planning a migration
+subset by subset.
+
+The reference file is synthetic — there is no SAS corpus in this repo to
+calibrate against — so treat the anchor as a defensible starting point, and
+argue with `anchor.describes` rather than with the individual thresholds. If
+you have a real file your team would call a textbook Medium, measure it
+(`analyze_result(...).files[0].raw_total`) and put that number in the profile.
+
+### Scale and bands
+
+Points follow the Fibonacci progression the method uses, because estimation
+confidence is geometric — the gap between Small and Medium really is smaller
+than the gap between Large and Extra Large:
+
+| Size | Points | Band (upper bound) |
+| --- | ---: | ---: |
+| `Small` | 2 | ≤ 2.5 |
+| `Medium` | 3 | ≤ 4.0 |
+| `Large` | 5 | ≤ 6.5 |
+| `Extra Large` | 8 | above 6.5 |
+
+Bands sit at the geometric midpoints of the rungs. Because points are
+continuous they also **sum**: `report.total_points` is a backlog estimate for
+the whole migration, which a purely qualitative label could never give you.
+
+### Extra Large means *split this*
+
+The top rung is an instruction, not just a magnitude — its published meaning is
+work that must be broken down before it can be estimated at all. So
+`TShirtSize.EXTRA_LARGE.needs_breakdown` is True (and no other size's is), and
+`FileComplexity.suggested_split` names the batch ids inside that file as cut
+points — batches are already dependency-respecting translation units, which
+makes them the natural seams. `to_markdown()` renders these under **Files
+needing breakdown**.
+
+### Floors
+
+Some kinds have a size floor regardless of what the numbers say
+(`sizes.min_size_by_kind`):
+
+```json
+"min_size_by_kind": {
+  "GLOBAL_STATEMENT": "SMALL",
+  "OPTIONS": "SMALL",
+  "MACRO_DEFINITION": "MEDIUM"
+}
+```
+
+A file of `%LET`/`LIBNAME`/`OPTIONS` configuration floors at `Small` — a no-op
+at the shipped anchor, stated explicitly so the intent is legible in the data
+rather than being an absence. A file defining a `%MACRO` floors at `Medium`,
+and that one **does** bind: a short macro scores well under the Medium band on
+volume, and "we found a macro definition" is worth more than its line count
+suggests. `FileComplexity.floored_by` names the kind responsible, and only when
+the floor actually changed the answer.
+
+### Worked examples
+
+Measured, not estimated — these are real outputs at the shipped anchor:
+
+| File | Effort | Cplx | Uncert | Raw | Points | Size |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Config only: 3 `%LET` + 1 `LIBNAME` | 2.0 | 2.5 | 0.0 | 4.5 | 0.2 | Small |
+| Thin macro wrapper, 1 step, 2 params | 2.5 | 21.0 | 0.0 | 23.5 | 0.8 | Medium *(floored)* |
+| 12 plain DATA steps | 42.1 | 0.0 | 0.0 | 42.1 | 1.4 | Small |
+| **The reference file** (see the anchor) | 50.0 | 37.5 | 0.0 | 87.5 | 3.0 | **Medium** |
+| Macro-heavy: arrays, DO, merges, 12 steps | 58.7 | 54.5 | 0.0 | 113.2 | 3.9 | Medium |
+| 50 plain DATA steps | 175.5 | 0.0 | 0.0 | 175.5 | 6.0 | Large |
+
+Two things worth reading off that table. The reference file lands exactly on
+3.0 points, which is what "anchored at Medium" means. And the 50-step file
+rates `Large` on **volume alone** — its complexity term is `0.0`, because
+nothing in it is individually notable. That is precisely the case a tier cannot
+express, and the reason sizing exists.
+
+### References
+
+The scale, the anchored-relative method, the effort/complexity/uncertainty
+split, and the "Extra Large means break it down" rule are taken from:
+
+- [ActiveCollab — T-shirt sizing](https://activecollab.com/blog/project-management/t-shirt-sizing)
+- [Asana — T-shirt sizing](https://asana.com/resources/t-shirt-sizing)
+- [StarAgile — T-shirt sizing in agile](https://staragile.com/blog/t-shirt-sizing-in-agile)
+
+## Cross-file references
+
+A SAS script is rarely self-contained, and what it borrows is exactly what
+makes it hard: a file you cannot translate without three others in front of you
+is more work than its own text suggests. `crossfile.py` resolves every outward
+reference against the rest of the corpus and raises ordinary
+`ComplexitySignal`s (`source="cross_file"`) on the chunk that carries the
+reference — so they flow through the same max-tier / worst-parity / summed-weight
+aggregation as everything else, and batch scores become cross-file-aware for
+free.
+
+References are resolved from metadata the chunker already extracts. No new
+source scanning:
+
+| Reference | Producer field | Consumer field |
+| --- | --- | --- |
+| macro | `defines_macros` | `invokes_macros` |
+| dataset | `output_datasets`, `body_literal_outputs` | `input_datasets` |
+| macro variable | `produces_macrovars`, `declared_macro_vars` | `consumes_macrovars` |
+| libref | `defines_librefs` | libref prefix of dataset I/O |
+
+Each reference lands in one of three states: **internal** (same file — no
+signal at all), **import/export** (satisfied by another file in the corpus), or
+**unresolved** (satisfied by nothing in scope).
+
+`%INCLUDE` is deliberately **not** among them. The chunker already surfaces it
+as both a chunk kind and a metadata flag, and the catalogue rates both
+MEDIUM/PARTIAL — precisely what a cross-file entry would assign — so adding a
+third signal would inflate the score without adding information.
+
+Two exclusion sets are reused from the chunker rather than re-listed, so they
+cannot drift: `_STANDARD_AUTOCALL_MACROS` (`%left`, `%trim`, … ship with SAS,
+so calling one is never a missing dependency) and `_DEFAULT_LIBREFS` (`work`,
+`sashelp`, … are always assigned).
+
+### Unresolved requires having actually looked
+
+The state that matters most is the one you can get wrong. `macro_unresolved`
+rates HIGH/MANUAL — you cannot translate a macro whose body you do not have —
+but that verdict is only defensible if there were *other files to search*.
+
+So the macro case has four states, not three:
+
+| Where the `%MACRO` body is | Construct | Rating |
+| --- | --- | --- |
+| same file | — | no signal |
+| another file in the corpus | `macro_import` | MEDIUM / PARTIAL |
+| **nowhere, corpus has ≥ 2 files** | `macro_unresolved` | **HIGH / MANUAL** |
+| nowhere, corpus has 1 file | `macro_external` | MEDIUM / PARTIAL |
+
+With a single file in scope, absence proves nothing — the reference is merely
+*external*, and the note says so. HIGH/MANUAL is reserved for the case where
+the corpus was searched and came up empty.
+
+`CrossFileProfile.corpus_files` records how many files were in scope, so a
+consumer can always tell which regime a verdict came from.
+
+### The full catalogue
+
+Under a profile's `cross_file` namespace:
+
+| Construct | Spark SQL rating | Reasoning |
+| --- | --- | --- |
+| `macro_import` | MEDIUM / PARTIAL | needs another file's output in scope first |
+| `macro_unresolved` | HIGH / MANUAL | body unavailable; no faithful translation exists |
+| `macro_external` | MEDIUM / PARTIAL | a gap, but not proof of absence |
+| `macro_export` | LOW / DIRECT | being depended on is effort, not difficulty |
+| `dataset_import` | MEDIUM / PARTIAL | inter-file execution ordering |
+| `dataset_export` | LOW / DIRECT | as `macro_export` |
+| `dataset_unresolved` | LOW / SUPPORTED | almost always a pre-existing source table |
+| `macrovar_import` | MEDIUM / PARTIAL | a value crosses a file boundary at run time |
+| `macrovar_export` | LOW / DIRECT | as `macro_export` |
+| `libref_import` | LOW / SUPPORTED | maps onto catalog/schema configuration |
+| `libref_unresolved` | MEDIUM / PARTIAL | physical location of the data is unknown |
+
+The `_export` directions are rated LOW/DIRECT on purpose: being depended on is
+a *scheduling* cost, not a translation one, so it nudges a file's size without
+ever inflating its tier or parity.
+
+Only `macro_unresolved` and `libref_unresolved` feed the **uncertainty**
+dimension. `dataset_unresolved` explicitly does not — reading a table no
+analysed file writes is the normal case for the first job in a pipeline, not a
+hazard.
+
+PySpark restates `macro_import` and `macro_external` as SUPPORTED, since a
+macro in another file becomes a Python function imported from another module.
+Tiers are unchanged, as everywhere else.
+
+`ComplexityAnalyzer(use_cross_file=False)` — or `complexity.use_cross_file` in
+`config.json` — scores every file as if it were the only one. `analyze_chunk(chunk)`
+called *without* an index raises no cross-file signals either: a lone chunk has
+no corpus to resolve against, and inventing one would be a guess.
+
 ## Tiers
 
 Tiers are target-independent. The parity column below is the **Spark SQL**
@@ -202,17 +463,21 @@ evidence that Spark lacks it, and no rating below was lowered on that basis.
 ## Layout
 
 ```
-models.py      ComplexityTier, TranslationParity (ordered scales) + max_tier /
-               worst_parity helpers; ComplexitySignal; ChunkComplexity,
-               BatchComplexity, CorpusComplexityReport (with to_markdown()).
-rules.py       RuleSet + the JSON profile loader (inheritance, validation,
-               caching). Holds no ratings of its own.
+models.py      ComplexityTier, TranslationParity, TShirtSize (ordered scales)
+               + max_tier / worst_parity / max_size helpers; ComplexitySignal;
+               ChunkComplexity, BatchComplexity, FileComplexity,
+               CrossFileProfile, CorpusComplexityReport (with to_markdown()).
+rules.py       RuleSet + SizeModel + the JSON profile loader (inheritance,
+               validation, caching). Holds no ratings of its own.
 profiles/      The catalogues themselves, one JSON file per target language.
                THE place to retune the analysis.
 detectors.py   Regex scans for what SasChunkMetadata does not extract:
                ARRAY, DO loops, MERGE/UPDATE/MODIFY, RETAIN, FIRST./LAST.,
                FILENAME access methods, INFILE/FILE, LINK, DATA step GOTO.
-analyzer.py    ComplexityAnalyzer — aggregation only; owns no tier of its own.
+crossfile.py   CrossFileIndex — resolves macro/dataset/macro-var/libref
+               references across the corpus into import / export / unresolved.
+analyzer.py    ComplexityAnalyzer — aggregation and sizing only; owns no tier
+               of its own.
 ```
 
 ## Where signals come from
@@ -258,7 +523,9 @@ invented classification. A test asserts every detector name has an entry.
   "rules_path": null,
   "weight_low": null,
   "weight_medium": null,
-  "weight_high": null
+  "weight_high": null,
+  "size_anchor": null,
+  "use_cross_file": null
 }
 ```
 
@@ -269,8 +536,14 @@ built-in default. Weights only rank units within a tier — they can never chang
 a tier. To retune **which construct means what**, edit a profile JSON, not the
 config.
 
+`size_anchor` overrides the profile's reference-Medium raw score; lowering it
+makes every file rate larger. The bands and per-dimension weights stay in the
+profile, because they are calibrated relative to the anchor and only make sense
+alongside it.
+
 `ComplexityAnalyzer(use_detectors=False)` restricts the analysis to what the
 chunker's own metadata reports, dropping the supplementary scans.
+`use_cross_file=False` scores every file as if it were the only one.
 
 ## Entry points
 
@@ -285,15 +558,35 @@ chunker's own metadata reports, dropping the supplementary scans.
 
 All return a `CorpusComplexityReport` except the first two.
 
+One asymmetry worth knowing: the **uncertainty** dimension folds in parser
+diagnostics, and `SasBatchResult` does not carry any. So `analyze_result` and
+`analyze_corpus` supply them automatically, while `analyze_batch_result` cannot
+and every file it produces is marked `uncertainty_complete=False` rather than
+quietly reporting a lower uncertainty than the file really has. Pass
+`diagnostics=` to `analyze_items` directly if you need the full picture from a
+batched run.
+
 ## Tests
 
-`tests/test_complexity.py` — 77 tests, no LLM and (apart from the rule-set
+`tests/test_complexity.py` — 120 tests, no LLM and (apart from the rule-set
 loader's own tests, which write temp profiles) no disk I/O. Covers each tier
 against the constructs the brief names, the max-tier/worst-parity aggregation
 rules, detector precision (comments, string literals, `%DO` vs `DO`,
 `if…then do;` blocks, MERGE with vs without BY), batch aggregation, report
 rendering, the config and `use_detectors` switches, retargeting between
 profiles, profile inheritance, and rule-set validation failures.
+
+The sizing and cross-file additions bring: Fibonacci banding and monotonicity,
+anchor rescaling in both directions, the chunk-kind floors (including a forced
+case where the `MACRO_DEFINITION` floor actually binds), `Extra Large` implying
+`needs_breakdown` and offering cut points, each of the three dimensions moving
+a size independently, volume alone driving a `Large` on a file that raises no
+signal at all, the four macro-resolution states (and that `macro_unresolved`
+requires a multi-file corpus), autocall macros and default librefs never being
+flagged, librefs assigned in another chunk of the same file, chunk-id collision
+across independently chunked files, a batch spanning two files still yielding
+two file rollups, and catalogue coverage in both directions — every construct
+`crossfile.py` can emit has a profile entry, and every entry is reachable.
 
 ```
 python -m pytest tests/test_complexity.py -v
