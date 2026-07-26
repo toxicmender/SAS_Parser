@@ -18,6 +18,20 @@ from .models import (
     SasDiagnostic,
     SasDiagnosticSeverity,
 )
+from .notebook import (
+    build_notebook,
+    document_to_cells,
+    markdown_to_cells,
+    notebook_to_json,
+    notebooks_from_outputs,
+    write_notebooks,
+)
+from .response_models import (
+    MappingEntry,
+    RiskNote,
+    TranslationCell,
+    TranslationDocument,
+)
 
 __all__ = [
     # chunker
@@ -41,6 +55,18 @@ __all__ = [
     "SasBatchResult",
     # models — multi-file input
     "SasCorpus",
+    # models — structured LLM response
+    "TranslationDocument",
+    "TranslationCell",
+    "MappingEntry",
+    "RiskNote",
+    # notebook rendering
+    "write_notebooks",
+    "notebooks_from_outputs",
+    "build_notebook",
+    "notebook_to_json",
+    "document_to_cells",
+    "markdown_to_cells",
 ]
 
 

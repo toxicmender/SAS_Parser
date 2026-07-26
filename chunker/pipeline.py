@@ -65,8 +65,10 @@ from .pipeline_constants import (
     _BATCH_CONTEXT_TEMPLATE,
     _BATCH_MEMBER_TEMPLATE,
     _CONTEXT_TEMPLATE,
+    _STRUCTURED_SYSTEM_PROMPT_TEMPLATE,
     _SYSTEM_PROMPT_TEMPLATE,
 )
+from .response_models import TranslationDocument
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
@@ -493,6 +495,16 @@ class SasLLMPipeline:
         Target language named in the system prompt (default ``"PySpark"``).
     system_prompt : str | None
         Override the default prompt from ``pipeline_constants``.
+    structured_output : bool | None
+        Ask the model for a
+        :class:`~chunker.response_models.TranslationDocument` instead of
+        free-form Markdown, so the notebook renderer knows exactly which cells
+        are runnable code (see ``chunker.notebook``). ``None`` (default) defers
+        to config.json ``pipeline.structured_output``, then ``True``. Either
+        way the *persisted* turn and the item's ``response`` are Markdown, so
+        conversation memory, resume, and every validation metric are unchanged;
+        a gateway that rejects the schema degrades to the model's prose with a
+        warning rather than failing the run.
     window_k : int | None
         Rolling-window size in (human, AI) turn-pairs kept in context per
         LLM call. ``None`` disables trimming (full history every call).
@@ -639,6 +651,7 @@ class SasLLMPipeline:
         user_instructions: "str | UserInstructionSet | None" = None,
         validator: Any | None = None,
         validation_retries: int = 0,
+        structured_output: bool | None = None,
     ) -> None:
         if validation_retries < 0:
             raise ValueError(
@@ -729,9 +742,13 @@ class SasLLMPipeline:
             databricks_mapping=self.databricks_mapping,
         )
 
-        self._system_prompt = system_prompt or _SYSTEM_PROMPT_TEMPLATE.format(
-            output_language=output_language
-        )
+        if structured_output is None:
+            structured_output = bool(
+                app_config.get_typed_value(
+                    "pipeline", "structured_output", bool, True
+                )
+            )
+        self._requested_structured_output = structured_output
 
         self._memory = memory or self._build_default_memory(spark, delta_table)
 
@@ -766,6 +783,29 @@ class SasLLMPipeline:
             if value is not None:
                 llm_config_kwargs[key] = value
         self._llm_client = LLMClient(LLMClientConfig(**llm_config_kwargs), llm=llm)
+
+        # Which system prompt to send depends on whether this chat model can
+        # actually be asked for a schema, so the prompt is settled only now
+        # that the client exists. A model that cannot (an injected stub, an
+        # older integration) falls back to prompting for Markdown, which the
+        # notebook renderer parses — the run proceeds either way.
+        self._structured_output = (
+            self._requested_structured_output
+            and self._llm_client.supports_structured_output(TranslationDocument)
+        )
+        if self._requested_structured_output and not self._structured_output:
+            logger.warning(
+                f"SasLLMPipeline: structured output requested but model "
+                f"{model!r} does not support it; prompting for Markdown instead"
+            )
+        template = (
+            _STRUCTURED_SYSTEM_PROMPT_TEMPLATE
+            if self._structured_output
+            else _SYSTEM_PROMPT_TEMPLATE
+        )
+        self._system_prompt = system_prompt or template.format(
+            output_language=output_language
+        )
         # With prompt caching on, the system prompt travels as a content
         # block with a cache_control breakpoint (a concrete SystemMessage,
         # exempt from template interpolation); Anthropic then serves the
@@ -830,7 +870,18 @@ class SasLLMPipeline:
                 "instructions": instructions,
             }
 
-        chain = RunnableLambda(_trim) | prompt | self._llm_client.as_runnable()
+        prompt_chain = RunnableLambda(_trim) | prompt
+        chain = prompt_chain | self._llm_client.as_runnable()
+        # Structured mode asks for a TranslationDocument; the envelope
+        # (raw/parsed/parsing_error) is unpacked in _structured_response so a
+        # schema the gateway will not honour degrades to the prose in `raw`
+        # instead of failing the run.
+        structured_chain = (
+            prompt_chain
+            | self._llm_client.as_structured_runnable(TranslationDocument)
+            if self._structured_output
+            else None
+        )
 
         def _call_model(
             state: MessagesState, config: RunnableConfig
@@ -856,14 +907,33 @@ class SasLLMPipeline:
                 if self._summarizer is not None
                 else None
             )
-            response = chain.invoke(
-                {
-                    "input": input_message.content,
-                    "history": history_messages,
-                    "instructions": instructions,
-                    "summary": summary,
-                }
-            )
+            payload = {
+                "input": input_message.content,
+                "history": history_messages,
+                "instructions": instructions,
+                "summary": summary,
+            }
+            if structured_chain is not None and self._structured_output:
+                try:
+                    response = self._structured_response(
+                        structured_chain.invoke(payload), thread_id
+                    )
+                except Exception:
+                    # The gateway rejected the schema request itself (as
+                    # opposed to answering it badly, which arrives as
+                    # parsing_error). Demote once, for the rest of the run, and
+                    # re-send unstructured — the same one-shot degradation
+                    # llm_client applies to a refused cache_control breakpoint.
+                    logger.warning(
+                        f"_call_model: structured request failed  "
+                        f"thread='{thread_id}'; disabling structured output for "
+                        "this pipeline and re-sending as Markdown",
+                        exc_info=True,
+                    )
+                    self._structured_output = False
+                    response = chain.invoke(payload)
+            else:
+                response = chain.invoke(payload)
             history.add_messages([input_message, response])
             return {"messages": [response]}
 
@@ -1148,6 +1218,82 @@ class SasLLMPipeline:
             batch_result.all_ordered_items, max_chunks=self._max_merged_chunks
         )
 
+    # ------------------------------------------------------------------
+    # Structured output
+    # ------------------------------------------------------------------
+
+    # Key under which a turn's TranslationDocument travels on the AI message's
+    # additional_kwargs (and so into the KV store, and back out on resume).
+    _DOCUMENT_KEY = "translation_document"
+
+    def _structured_response(
+        self, envelope: dict[str, Any], thread_id: str
+    ) -> AIMessage:
+        """Turn a structured-output envelope into the AI message to persist.
+
+        The persisted content is *rendered Markdown*, not the raw model output:
+        under ``function_calling`` the raw content is empty (the answer rode in
+        a tool call), and storing an empty AI turn would break the resume path
+        (:meth:`_recovered_response`), relevance-based history selection, and
+        every validation metric. The document itself is carried alongside on
+        ``additional_kwargs`` so a notebook can be rebuilt without re-prompting.
+
+        A schema the gateway would not honour arrives here as ``parsed=None``;
+        that degrades to the prose in ``raw`` rather than failing the run.
+        """
+        raw = envelope.get("raw")
+        parsed = envelope.get("parsed")
+        error = envelope.get("parsing_error")
+        if parsed is None:
+            if raw is None:
+                raise ValueError(
+                    "structured output returned neither a parsed document nor a "
+                    f"raw message (parsing_error={error!r})"
+                )
+            logger.warning(
+                f"_structured_response: no parsed document  thread='{thread_id}'  "
+                f"parsing_error={error!r}; falling back to the raw response, "
+                "whose notebook will be built by parsing its Markdown"
+            )
+            return raw if isinstance(raw, AIMessage) else AIMessage(str(raw))
+
+        document: TranslationDocument = parsed
+        message = AIMessage(
+            content=document.to_markdown(),
+            additional_kwargs={self._DOCUMENT_KEY: document.model_dump()},
+        )
+        if isinstance(raw, AIMessage):
+            # Keep the accounting the gateway reported: usage drives
+            # LLMClient.usage and the run's token totals, and id/metadata are
+            # what a stored turn is traced by.
+            message.id = raw.id
+            message.response_metadata = raw.response_metadata
+            message.usage_metadata = raw.usage_metadata
+        logger.debug(
+            f"_structured_response: parsed document  thread='{thread_id}'  "
+            f"cells={len(document.cells)}  risks={len(document.risks)}"
+        )
+        return message
+
+    @classmethod
+    def _document_of(cls, message: BaseMessage | None) -> dict[str, Any] | None:
+        """The TranslationDocument dict carried by *message*, or ``None``."""
+        if message is None:
+            return None
+        document = getattr(message, "additional_kwargs", {}).get(cls._DOCUMENT_KEY)
+        return document if isinstance(document, dict) else None
+
+    @classmethod
+    def _recovered_document(
+        cls, messages: list[BaseMessage], fact: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """The stored document for a completed item — see
+        :meth:`_recovered_response` for how the position is derived."""
+        position = 2 * fact.get("index", 0) - 1
+        if 0 < position < len(messages) and isinstance(messages[position], AIMessage):
+            return cls._document_of(messages[position])
+        return None
+
     @staticmethod
     def _recovered_response(messages: list[BaseMessage], fact: dict[str, Any]) -> str | None:
         """The stored AI response for a completed item, or ``None``.
@@ -1262,7 +1408,7 @@ class SasLLMPipeline:
         thread_id: str,
         user_msg: str,
         base_instructions: list[BaseMessage],
-    ) -> tuple[str, Any, int]:
+    ) -> tuple[str, dict[str, Any] | None, Any, int]:
         """Generate (and, if enabled, iteratively repair) one item's answer.
 
         Sends *user_msg* on *thread_id*; when a validator is attached the
@@ -1271,10 +1417,13 @@ class SasLLMPipeline:
         :meth:`KVChatMessageHistory.truncate_to`) and re-prompts with a
         corrective note, up to the retry budget, so exactly one — the final —
         (human, AI) pair persists per item. Returns
-        ``(response_text, CaseResult | None, attempts)``; the ``CaseResult``
-        is ``None`` when no validator ran or scoring raised (swallowed, as in
-        the observe-only policy). Any LLM-call exception propagates to the
-        caller, which records the error fact.
+        ``(response_text, document, CaseResult | None, attempts)``, where
+        *document* is the structured
+        :class:`~chunker.response_models.TranslationDocument` dump when
+        structured output produced one and ``None`` otherwise; the
+        ``CaseResult`` is ``None`` when no validator ran or scoring raised
+        (swallowed, as in the observe-only policy). Any LLM-call exception
+        propagates to the caller, which records the error fact.
         """
         item_id = item.batch_id if isinstance(item, SasBatch) else item.chunk_id
         history = self._memory.get_thread(thread_id)
@@ -1293,7 +1442,9 @@ class SasLLMPipeline:
                 }
             }
             state = self._graph.invoke({"messages": [HumanMessage(user_msg)]}, cfg)
-            ai_text = state["messages"][-1].content
+            ai_message = state["messages"][-1]
+            ai_text = ai_message.content
+            document = self._document_of(ai_message)
 
             result: Any = None
             if self._validator is not None:
@@ -1321,7 +1472,7 @@ class SasLLMPipeline:
                         f"{attempt} attempt(s); accepting last answer  "
                         f"thread={thread_id}"
                     )
-                return ai_text, result, attempt
+                return ai_text, document, result, attempt
 
             logger.info(
                 f"_answer_item: item={item_id} failed validation "
@@ -1486,6 +1637,7 @@ class SasLLMPipeline:
                         else [item.source_id or "unknown"],
                         "kind": None if is_batch else item.kind.value,
                         "response": self._recovered_response(recovered, fact),
+                        "document": self._recovered_document(recovered, fact),
                         "thread_id": thread_id,
                         "skipped": True,
                         "validation": self._recovered_validation(
@@ -1514,7 +1666,7 @@ class SasLLMPipeline:
                 # repair — the answer. Scoring, the retry loop, and the
                 # roll-back of superseded attempts all live in _answer_item;
                 # exactly one (human, AI) pair persists per item.
-                ai_text, result, attempts = self._answer_item(
+                ai_text, document, result, attempts = self._answer_item(
                     item,
                     idx,
                     total,
@@ -1577,6 +1729,7 @@ class SasLLMPipeline:
                     else [item.source_id or "unknown"],
                     "kind": None if is_batch else item.kind.value,
                     "response": ai_text,
+                    "document": document,
                     "thread_id": thread_id,
                     "skipped": False,
                     "validation": result.model_dump() if result is not None else None,

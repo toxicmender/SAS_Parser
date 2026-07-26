@@ -114,7 +114,9 @@ reports no usage block.
 | `chunker.py` | `SasSemanticChunker` orchestration (scan → group → build chunks, oversized-split with overlap). |
 | `batcher.py` | `_EdgeDiscovery` + Union-Find grouping, weak-edge resolution, context absorption, batch construction. `SasChunkBatcher` is a one-file convenience over `MultiFileBatcher`. |
 | `pipeline.py` | `SasLLMPipeline`: chunk/batch prompt formatting and the LangGraph `StateGraph` wiring. |
-| `pipeline_constants.py` | Prompt templates (importable without langchain installed). |
+| `pipeline_constants.py` | Prompt templates — the Markdown-sections system prompt and its structured-output counterpart (importable without langchain installed). |
+| `response_models.py` | `TranslationDocument` (+ `TranslationCell`, `MappingEntry`, `RiskNote`): the structured answer the pipeline asks for, and `to_markdown()`, which renders it back to the four `##` sections that get persisted and scored. Pydantic only. |
+| `notebook.py` | Renders pipeline outputs as nbformat v4.5 notebooks — one `.ipynb` per SAS source file plus `_cross_file.ipynb` — from a `TranslationDocument`, or by parsing the Markdown response when there is none. Stdlib + `response_models`. |
 | `_repl.py` | `print_iterable` REPL helper (imported by nothing). |
 
 **Import direction is strictly downward:** `keywords` and `models` import
@@ -218,6 +220,29 @@ construction (temperature, output-token cap, an optional proactive rate
 limiter — on for the `from_ai_gateway` credential path) and invocation
 (input-token budget, transient-error retry that honors a gateway
 `Retry-After`); an injected `llm` still gets the retry / budget layers.
+
+### Structured output → notebooks
+
+With `structured_output` on (constructor argument, else config.json
+`pipeline.structured_output`, default on) the model is asked for a
+`TranslationDocument` rather than free-form Markdown, so `notebook.py` knows
+which cells are runnable code instead of inferring it from fences. The turn
+*persisted* to memory is still `to_markdown()` — the same four sections, code
+in fenced blocks — with the document carried on the AI message's
+`additional_kwargs["translation_document"]` and surfaced as `document` in each
+output dict. That keeps conversation memory, resume, and every `validation`
+metric unchanged; storing the raw content instead would store an empty turn
+whenever the answer rides in a tool call. A model or gateway that cannot honour
+the schema degrades to prose (detected at construction, or demoted once
+mid-run) and the notebook is built by parsing the Markdown.
+
+```python
+from chunker.notebook import write_notebooks
+
+outputs = pipeline.run_files(sas_files)
+write_notebooks(outputs, "out", output_language="PySpark")
+# out/<source>.ipynb per file, out/_cross_file.ipynb for cross-file batches
+```
 
 ## Load-bearing invariants
 

@@ -33,7 +33,11 @@ databricks = ["databricks-sdk>=0.30", "databricks-sql-connector>=3.0"]
 # app_config.azure (which mints the Graph token); msgraph-sdk pulls in
 # azure-identity, the kiota runtime, and httpx itself.
 sharepoint = ["msgraph-sdk>=1.5", "msal>=1.28"]
-dev        = ["pytest>=8", "pytest-cov", "ruff"]
+# nbformat is a *test* dependency only: chunker.notebook writes the v4.5 JSON
+# itself (the schema is small and stable, and the runtime should not grow a
+# jupyter dependency to emit JSON), and tests/test_notebook.py validates what
+# it emits against the real published schema.
+dev        = ["pytest>=8", "pytest-cov", "ruff", "nbformat>=5.10"]
 
 [tool.setuptools.packages.find]
 where = ["."]

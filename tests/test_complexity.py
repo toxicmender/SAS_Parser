@@ -1230,5 +1230,60 @@ class TestRuleSetLoading(unittest.TestCase):
         self.assertIn("circular", str(ctx.exception))
 
 
+class TestComplexityCLI(unittest.TestCase):
+    """`python -m complexity <dir>` writes the report as Markdown."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        (self.tmp / "load.sas").write_text(
+            "%macro load;\n  data work.a;\n    set raw.a;\n  run;\n%mend load;\n"
+            "%load;\n",
+            encoding="utf-8",
+        )
+        (self.tmp / "report.sas").write_text(
+            "proc sql;\n  create table work.b as select * from work.a;\nquit;\n",
+            encoding="utf-8",
+        )
+
+    def _run(self, *args):
+        from complexity.__main__ import main
+
+        return main([str(self.tmp), *args])
+
+    def test_writes_a_markdown_report(self):
+        out = self.tmp / "report.md"
+        self.assertEqual(self._run("--out", str(out)), 0)
+        text = out.read_text(encoding="utf-8")
+        self.assertIn("# SAS chunk complexity report", text)
+        self.assertIn("## Tier breakdown", text)
+        self.assertIn("## File sizes", text)
+        # Both files were scored.
+        self.assertIn("load.sas", text)
+        self.assertIn("report.sas", text)
+
+    def test_target_selects_the_profile(self):
+        out = self.tmp / "pyspark.md"
+        self.assertEqual(self._run("--target", "pyspark", "--out", str(out)), 0)
+        self.assertIn("PySpark", out.read_text(encoding="utf-8"))
+
+    def test_creates_a_missing_output_directory(self):
+        out = self.tmp / "nested" / "deep" / "report.md"
+        self.assertEqual(self._run("--out", str(out)), 0)
+        self.assertTrue(out.is_file())
+
+    def test_no_matching_files_is_an_error_exit(self):
+        self.assertEqual(self._run("--pattern", "*.nope"), 1)
+
+    def test_report_prints_when_no_out_is_given(self):
+        import contextlib
+        import io
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.assertEqual(self._run(), 0)
+        self.assertIn("# SAS chunk complexity report", buffer.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

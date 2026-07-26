@@ -677,6 +677,8 @@ class LLMClient:
         self._cache_control_supported: bool | None = None
         self.usage = TokenUsage()
         self._model = llm if llm is not None else self._build_model(self.config)
+        # schema name -> model bound to it; see structured_model().
+        self._structured_models: dict[str, Any] = {}
 
     @property
     def chat_model(self) -> Any:
@@ -882,6 +884,10 @@ class LLMClient:
 
     def _record_usage(self, response: Any, op: str) -> None:
         """Log this call's token usage and fold it into the running total."""
+        # A structured call with include_raw=True answers
+        # {"raw", "parsed", "parsing_error"}; the usage block rides on "raw".
+        if isinstance(response, dict) and "raw" in response:
+            response = response["raw"]
         usage = _token_usage(response)
         if usage is None:
             if not self._warned_no_usage:
@@ -957,6 +963,22 @@ class LLMClient:
         :meth:`_demote_cache_control`); token usage is logged and
         accumulated on every success.
         """
+        return self._invoke_with(self._model, input, config, op="invoke")
+
+    def _invoke_with(
+        self,
+        model: Any,
+        input: LanguageModelInput,
+        config: RunnableConfig | None,
+        *,
+        op: str,
+    ) -> Any:
+        """:meth:`invoke`'s budget / retry / usage machinery, over any *model*.
+
+        Factored out so the structured-output path
+        (:meth:`invoke_structured`) is the same call with a schema-bound model
+        rather than a parallel implementation that would drift.
+        """
         messages = self._prepare(_as_messages(input))
         self._enforce_input_limit(messages)
 
@@ -970,9 +992,9 @@ class LLMClient:
         while True:
             attempt += 1
             try:
-                response = self._model.invoke(messages, config)
+                response = model.invoke(messages, config)
             except Exception as exc:
-                retry_messages = self._demote_cache_control(messages, exc, "invoke")
+                retry_messages = self._demote_cache_control(messages, exc, op)
                 if retry_messages is not None:
                     # A schema rejection, not a transient failure: re-send at
                     # once, no backoff, no attempt spent. Bounded to one pass —
@@ -981,12 +1003,12 @@ class LLMClient:
                     messages = retry_messages
                     attempt -= 1
                     continue
-                delay = self._retry_delay(exc, attempt, attempts, "invoke")
+                delay = self._retry_delay(exc, attempt, attempts, op)
                 if delay is None:
                     raise
                 time.sleep(delay)
             else:
-                self._record_usage(response, "invoke")
+                self._record_usage(response, op)
                 return response
 
     async def ainvoke(
@@ -1029,3 +1051,82 @@ class LLMClient:
         ``chain.ainvoke`` uses :meth:`ainvoke`.
         """
         return RunnableLambda(self.invoke, afunc=self.ainvoke, name="llm_client")
+
+    # ------------------------------------------------------------------
+    # Structured output
+    # ------------------------------------------------------------------
+
+    def supports_structured_output(self, schema: Any) -> bool:
+        """Whether this chat model can be asked for *schema* at all.
+
+        Answers the binding question only — whether ``with_structured_output``
+        exists and accepts the schema — not whether the gateway behind it will
+        honour the request; that shows up per call as a ``parsing_error`` (or,
+        at worst, a rejected request the caller demotes). Injected stubs and
+        integrations without the method answer ``False`` here rather than
+        raising mid-run.
+        """
+        try:
+            return self.structured_model(schema) is not None
+        except NotImplementedError:
+            logger.info(
+                f"supports_structured_output: model {self.config.model!r} does "
+                "not implement with_structured_output"
+            )
+            return False
+        except Exception as exc:
+            logger.warning(
+                f"supports_structured_output: binding the schema to model "
+                f"{self.config.model!r} failed: {exc!r}"
+            )
+            return False
+
+    def structured_model(self, schema: Any) -> Any:
+        """The chat model bound to *schema*, built once per schema and cached.
+
+        Always ``include_raw=True``: the caller needs the underlying
+        ``AIMessage`` for token usage and response metadata, and needs a
+        failure to arrive as ``parsing_error`` rather than an exception so it
+        can fall back to reading the model's prose.
+        """
+        key = getattr(schema, "__name__", repr(schema))
+        cached = self._structured_models.get(key)
+        if cached is None:
+            logger.debug(f"structured_model: binding schema {key!r}")
+            cached = self._model.with_structured_output(schema, include_raw=True)
+            self._structured_models[key] = cached
+        return cached
+
+    def invoke_structured(
+        self,
+        schema: Any,
+        input: LanguageModelInput,
+        config: RunnableConfig | None = None,
+    ) -> dict[str, Any]:
+        """Invoke the model asking for *schema*, with the same guarantees as
+        :meth:`invoke` (input budget, retries, ``cache_control`` fallback,
+        usage accounting).
+
+        Returns LangChain's ``include_raw`` envelope:
+        ``{"raw": AIMessage, "parsed": schema | None, "parsing_error": ...}``.
+        A model or gateway that cannot honour the schema surfaces here as
+        ``parsed=None`` with a ``parsing_error``, which is the caller's cue to
+        fall back — not an exception, because a usable prose answer is still in
+        ``raw``.
+        """
+        result = self._invoke_with(
+            self.structured_model(schema), input, config, op="invoke_structured"
+        )
+        if not isinstance(result, dict):
+            # A model injected by a test (or a future LangChain shape) that
+            # answers with the parsed object alone; normalize to the envelope.
+            return {"raw": None, "parsed": result, "parsing_error": None}
+        return result
+
+    def as_structured_runnable(self, schema: Any) -> Runnable[LanguageModelInput, Any]:
+        """:meth:`invoke_structured` as an LCEL Runnable bound to *schema*,
+        e.g. ``prompt | client.as_structured_runnable(TranslationDocument)``."""
+        return RunnableLambda(
+            lambda value, config=None: self.invoke_structured(schema, value, config),
+            name="llm_client_structured",
+        )

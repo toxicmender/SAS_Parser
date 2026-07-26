@@ -141,6 +141,17 @@ chain = prompt | client.as_runnable()
   a worker thread, since model-native counters may call a sync HTTP endpoint);
   `as_runnable()` binds both, so the LCEL chain works under `invoke` and
   `ainvoke` alike.
+- **Structured output**: `invoke_structured(schema, ...)` is `invoke` with a
+  schema-bound model, so the input budget, retries, `cache_control` fallback,
+  and usage accounting all still apply. It always binds `include_raw=True` and
+  returns LangChain's `{"raw", "parsed", "parsing_error"}` envelope — the
+  caller needs `raw` for token usage, and needs a model that ignored the schema
+  to arrive as `parsing_error` rather than an exception, since a usable prose
+  answer is still in `raw`. `supports_structured_output(schema)` answers the
+  binding question up front (an injected stub, or an integration without
+  `with_structured_output`, says no) so a caller can pick its prompt before the
+  first call rather than failing mid-run. `as_structured_runnable(schema)` is
+  the LCEL form.
 
 Every `LLMClientConfig` knob except `api_key`, `kwargs`, `token_counter`, and
 the backoff shape (`retry_base_seconds` / `retry_max_seconds` /
