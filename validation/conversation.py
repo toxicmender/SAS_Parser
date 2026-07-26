@@ -8,7 +8,10 @@ gates or retries a run):
   re-running the pipeline**. The chunker/batcher items are not persisted, so
   metrics that need item metadata (``dataset_fidelity``) skip; the LLM judge
   falls back to grading against the turn's prompt, which for pipeline
-  threads embeds the SAS chunk text.
+  threads embeds the SAS chunk text. The reference guidance is ephemeral too,
+  so the retrieval-context metrics skip. What thread mode uniquely *can*
+  score is the rolling summary: it is stored, so it is read back here and
+  handed to :class:`~validation.summarization.SummarizationMetric`.
 - :func:`validate_transcript` — score any (prompt, response) transcript,
   even one not produced by :class:`~chunker.pipeline.SasLLMPipeline`.
 
@@ -27,7 +30,7 @@ import logging
 from typing import Any, Sequence, cast
 
 from langchain_core.messages import BaseMessage
-from memory.turns import group_turns
+from memory.turns import group_turns, turn_text
 
 from .evaluator import Evaluator
 from .metrics import ValidationMetric
@@ -93,6 +96,55 @@ def _thread_item_ids(source: Any, thread_id: str) -> dict[int, str]:
     }
 
 
+def _thread_kv(source: Any) -> Any | None:
+    """The conversation KV store behind *source*, or ``None``.
+
+    ``MemoryHub`` exposes it as ``kv``; a ``SasLLMPipeline`` holds a hub it
+    does not re-export, so its ``_memory`` is reached the same way
+    validation/README.md documents for reading verdicts back. Duck-typed, like
+    :func:`_thread_messages`, so this module imports neither class.
+    """
+    kv = getattr(source, "kv", None)
+    if kv is not None:
+        return kv
+    return getattr(getattr(source, "_memory", None), "kv", None)
+
+
+def _rolling_summary(
+    source: Any, thread_id: str, messages: Sequence[BaseMessage]
+) -> tuple[str | None, str | None]:
+    """``(summary, summary_source)`` for *thread_id*'s rolling summary.
+
+    Reads the record :class:`memory.summarize.RollingSummarizer` stores under
+    ``summary::{thread_id}`` and rebuilds the text it covers — the first
+    ``covered_turns`` turns of the thread, which is exactly the prefix the
+    summarizer folded. ``(None, None)`` when no summary has been folded yet
+    (the common case: folding waits for ``trigger_tokens``), which skips
+    :class:`~validation.summarization.SummarizationMetric`.
+    """
+    kv = _thread_kv(source)
+    if kv is None:
+        return None, None
+    try:
+        stored = kv.get(f"summary::{thread_id}", None)
+    except Exception:
+        logger.debug(f"_rolling_summary: no summary readable for '{thread_id}'")
+        return None, None
+    if not isinstance(stored, dict):
+        return None, None
+    summary = str(stored.get("summary") or "").strip()
+    covered = int(stored.get("covered_turns", 0) or 0)
+    if not summary or covered < 1:
+        return None, None
+    turns = group_turns(list(messages))[:covered]
+    if not turns:
+        return None, None
+    logger.info(
+        f"_rolling_summary: '{thread_id}' summary covers {len(turns)} turn(s)"
+    )
+    return summary, "\n\n".join(turn_text(turn) for turn in turns)
+
+
 def _outputs(
     responses: list[str], item_ids: dict[int, str]
 ) -> list[dict[str, Any]]:
@@ -135,9 +187,10 @@ def run_from_thread(
         raise ValueError(f"thread '{thread_id}' has no messages to validate")
     prompts, responses = _pairs_from_messages(messages)
     item_ids = _thread_item_ids(source, thread_id)
+    summary, summary_source = _rolling_summary(source, thread_id, messages)
     logger.info(
         f"run_from_thread: '{thread_id}'  turns={len(prompts)}  "
-        f"labelled_items={len(item_ids)}"
+        f"labelled_items={len(item_ids)}  summary={'yes' if summary else 'no'}"
     )
     return EvaluationRun(
         run_id=thread_id,
@@ -145,6 +198,8 @@ def run_from_thread(
         outputs=_outputs(responses, item_ids),
         required_terms=list(required_terms),
         reference_translation=reference_translation,
+        summary=summary,
+        summary_source=summary_source,
     )
 
 

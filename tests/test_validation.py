@@ -1068,3 +1068,112 @@ def test_log_report_appends_parquet_rows_via_spark(tmp_path):
         m.metric for m in report.results[0].metrics
     }
     assert all(r.case_id == "tracked" for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# Prompt / retrieval context on the outputs and into the inline validator
+# ---------------------------------------------------------------------------
+
+
+def test_skipped_resumed_item_still_carries_prompt_and_retrieval_context():
+    # The two keys are derived above the resume check precisely so a recovered
+    # item stays scoreable by the judged metrics; without that, a resumed run
+    # would silently score a subset of its items.
+    pipeline = _validated_pipeline([GOOD_RESPONSE, GOOD_RESPONSE])
+    c1, c2 = _mk_chunk("c1"), _mk_chunk("c2")
+    thread_id = "run::resume-ctx"
+
+    pipeline._process(items=[c1], diagnostics=[], thread_id=thread_id)
+    outputs = pipeline._process(
+        items=[c1, c2], diagnostics=[], thread_id=thread_id, resume=True
+    )
+
+    assert outputs[0]["skipped"] is True
+    assert outputs[0]["prompt"] and "## Chunk source" in outputs[0]["prompt"]
+    assert outputs[0]["retrieval_context"] == []  # no prompt builder attached
+    # Shaped identically to the freshly-processed item.
+    assert set(outputs[0]) == set(outputs[1])
+
+
+def test_live_validator_takes_the_prompt_and_retrieval_context():
+    from memory.store import MemoryHub
+
+    kv = MemoryHub().kv
+    captured: dict = {}
+
+    class _CapturingMetric(ResponseCoverageMetric):
+        name = "response_coverage"
+
+        def evaluate(self, run):
+            captured["inputs"] = run.inputs
+            captured["context"] = run.retrieval_context_at(0)
+            return super().evaluate(run)
+
+    LiveValidator(metrics=[_CapturingMetric()]).validate_item(
+        _mk_chunk("c1"),
+        GOOD_RESPONSE,
+        thread_id="t-ctx",
+        kv=kv,
+        index=1,
+        total=1,
+        prompt="Translate this DATA step.",
+        retrieval_context=["INTNX shifts a SAS date."],
+    )
+    assert captured["inputs"] == ["Translate this DATA step."]
+    assert captured["context"] == ["INTNX shifts a SAS date."]
+
+
+def test_live_validator_defaults_leave_both_empty():
+    from memory.store import MemoryHub
+
+    captured: dict = {}
+
+    class _CapturingMetric(ResponseCoverageMetric):
+        name = "response_coverage"
+
+        def evaluate(self, run):
+            captured["inputs"] = run.inputs
+            captured["context"] = run.retrieval_context_at(0)
+            return super().evaluate(run)
+
+    LiveValidator(metrics=[_CapturingMetric()]).validate_item(
+        _mk_chunk("c1", text="data a; run;"),
+        GOOD_RESPONSE,
+        thread_id="t-plain",
+        kv=MemoryHub().kv,
+    )
+    # No prompt supplied: `inputs` falls back to the item's own SAS text.
+    assert captured["inputs"] == ["data a; run;"]
+    assert captured["context"] == []
+
+
+def test_run_from_thread_picks_up_a_rolling_summary():
+    hub = MemoryHub()
+    pipeline = _pipeline([GOOD_RESPONSE, GOOD_RESPONSE], memory=hub)
+    thread_id = "run::summarised"
+    pipeline._process(
+        items=[_mk_chunk("c1"), _mk_chunk("c2")],
+        diagnostics=[],
+        thread_id=thread_id,
+    )
+    # Stand in for RollingSummarizer having folded the first turn.
+    hub.kv.set(
+        f"summary::{thread_id}",
+        {"summary": "Translated work.a from work.b.", "covered_turns": 1},
+        tags=["summary", thread_id],
+    )
+
+    run = run_from_thread(pipeline, thread_id)
+    assert run.summary == "Translated work.a from work.b."
+    # The source is the prefix the summary covers -- one turn, not both.
+    assert run.summary_source is not None
+    assert "c1" in run.summary_source
+    assert "c2" not in run.summary_source
+
+
+def test_run_from_thread_without_a_summary_leaves_both_none():
+    pipeline = _pipeline([GOOD_RESPONSE])
+    thread_id = "run::unsummarised"
+    pipeline._process(items=[_mk_chunk("c1")], diagnostics=[], thread_id=thread_id)
+    run = run_from_thread(pipeline, thread_id)
+    assert run.summary is None and run.summary_source is None

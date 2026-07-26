@@ -21,6 +21,7 @@ import logging
 import re
 from abc import ABC, abstractmethod
 from collections import Counter
+from typing import Any, Callable, Iterable
 
 import app_config
 
@@ -286,8 +287,8 @@ class ReferenceSimilarityMetric(ValidationMetric):
 def default_metrics() -> list[ValidationMetric]:
     """The deterministic suite the runner uses when none is passed.
 
-    The LLM-judge metric is *not* included — it needs a judge model and is
-    opted into explicitly (see ``validation.judge``).
+    The LLM-judged metrics are *not* included — they need a judge model and
+    are opted into explicitly (see :func:`judged_metrics`).
     """
     return [
         ResponseCoverageMetric(),
@@ -296,3 +297,96 @@ def default_metrics() -> list[ValidationMetric]:
         RequiredTermsMetric(),
         ReferenceSimilarityMetric(),
     ]
+
+
+# Every judged metric, in the order a report reads best: instruction
+# following, then answer quality, then the retrieval layer, then the
+# whole-run verdicts. `llm_judge` leads as the coarsest, cheapest grade.
+JUDGED_METRIC_NAMES = (
+    "llm_judge",
+    "prompt_alignment",
+    "answer_relevancy",
+    "faithfulness",
+    "hallucination",
+    "contextual_precision",
+    "contextual_relevancy",
+    "plan_adherence",
+    "analysis_summarization",
+    "summarization",
+    "task_completion",
+)
+
+
+def judged_metrics(
+    llm: Any,
+    *,
+    output_language: str = "PySpark",
+    include: Iterable[str] | None = None,
+) -> list[ValidationMetric]:
+    """The LLM-judged suite, built against one judge model.
+
+    Opt-in and never part of :func:`default_metrics`: these metrics cost
+    roughly **15 judge calls per item plus 5 per run** with everything
+    enabled, against ``llm_judge``'s one. Pass *include* to enable a subset
+    (any of :data:`JUDGED_METRIC_NAMES`); ``None`` builds them all.
+
+    Parameters
+    ----------
+    llm : Any
+        The judge — an :class:`llm_client.LLMClient` (structured output plus
+        token accounting) or any LangChain-style ``invoke`` object. See
+        :class:`~validation.judged.JudgedMetric`.
+    output_language : str
+        Target language named in the judge prompts, matching the pipeline's
+        own ``output_language``.
+    include : Iterable[str] | None
+        Metric names to build. Unknown names raise ``ValueError`` rather than
+        silently scoring less than the caller asked for.
+
+    Imports are local: the judged modules import this one for
+    :class:`ValidationMetric`, so a module-level import would be circular.
+    """
+    from .agentic_metrics import (
+        PlanAdherenceMetric,
+        PromptAlignmentMetric,
+        TaskCompletionMetric,
+    )
+    from .judge import LLMJudgeMetric
+    from .rag_metrics import (
+        AnswerRelevancyMetric,
+        ContextualPrecisionMetric,
+        ContextualRelevancyMetric,
+        FaithfulnessMetric,
+        HallucinationMetric,
+    )
+    from .summarization import AnalysisSummarizationMetric, SummarizationMetric
+
+    builders: dict[str, Callable[[], ValidationMetric]] = {
+        "llm_judge": lambda: LLMJudgeMetric(
+            llm=llm, output_language=output_language
+        ),
+        "prompt_alignment": lambda: PromptAlignmentMetric(llm),
+        "answer_relevancy": lambda: AnswerRelevancyMetric(llm),
+        "faithfulness": lambda: FaithfulnessMetric(llm),
+        "hallucination": lambda: HallucinationMetric(llm),
+        "contextual_precision": lambda: ContextualPrecisionMetric(llm),
+        "contextual_relevancy": lambda: ContextualRelevancyMetric(llm),
+        "plan_adherence": lambda: PlanAdherenceMetric(llm),
+        "analysis_summarization": lambda: AnalysisSummarizationMetric(llm),
+        "summarization": lambda: SummarizationMetric(llm),
+        "task_completion": lambda: TaskCompletionMetric(
+            llm, output_language=output_language
+        ),
+    }
+    wanted = list(JUDGED_METRIC_NAMES) if include is None else list(include)
+    unknown = [name for name in wanted if name not in builders]
+    if unknown:
+        raise ValueError(
+            f"unknown judged metric(s): {', '.join(sorted(unknown))}; "
+            f"known: {', '.join(JUDGED_METRIC_NAMES)}"
+        )
+    # Built in canonical order regardless of how the caller listed them, so a
+    # report's metric rows are comparable between runs.
+    selected = [name for name in JUDGED_METRIC_NAMES if name in set(wanted)]
+    logger.info(f"judged_metrics: [{', '.join(selected)}]")
+    return [builders[name]() for name in selected]

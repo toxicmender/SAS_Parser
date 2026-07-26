@@ -35,6 +35,11 @@ class ValidationCase(BaseModel):
         Optional substrings that must appear (case-insensitively) somewhere
         in the concatenated responses, e.g. ``["createDataFrame", "groupBy"]``.
         Empty list skips :class:`~validation.metrics.RequiredTermsMetric`.
+    prompt_instructions
+        Optional instructions the response must follow, checked one by one by
+        :class:`~validation.agentic_metrics.PromptAlignmentMetric`. Empty list
+        falls back to that metric's own resolution chain (config.json, then
+        the system prompt's standing contract) rather than skipping.
     """
 
     case_id: str
@@ -42,6 +47,7 @@ class ValidationCase(BaseModel):
     sas_source: str
     reference_translation: str | None = None
     required_terms: list[str] = Field(default_factory=list)
+    prompt_instructions: list[str] = Field(default_factory=list)
 
 
 class EvaluationRun(BaseModel):
@@ -71,10 +77,22 @@ class EvaluationRun(BaseModel):
         The human side of each turn, aligned with *outputs*. Empty in the
         offline case mode (the runner scores outputs against *items*).
     outputs
-        Raw output dicts (``item_id`` / ``response`` / ... — see
-        ``SasLLMPipeline._process``); only ``response`` is required.
-    required_terms, reference_translation
+        Raw output dicts (``item_id`` / ``response`` / ``prompt`` /
+        ``retrieval_context`` / ``document`` / ... — see
+        ``SasLLMPipeline._process``); only ``response`` is required. The
+        judged metrics read the optional keys through the properties below,
+        so an output dict that lacks them degrades to a skip, never an error.
+    required_terms, reference_translation, prompt_instructions
         Optional expectations (see :class:`ValidationCase` for semantics).
+    retrieval_contexts
+        Per-unit retrieved reference chunks, in rank order, when the caller
+        supplies them explicitly. ``None`` (default) reads each unit's from
+        its output dict instead — which is where the pipeline puts them.
+    summary, summary_source
+        A generated summary and the text it summarises, for
+        :class:`~validation.summarization.SummarizationMetric`. Populated for
+        thread runs from the rolling summary the conversation carries (see
+        ``validation.conversation.run_from_thread``); ``None`` skips.
     """
 
     run_id: str
@@ -83,6 +101,10 @@ class EvaluationRun(BaseModel):
     outputs: list[dict[str, Any]]
     required_terms: list[str] = Field(default_factory=list)
     reference_translation: str | None = None
+    prompt_instructions: list[str] = Field(default_factory=list)
+    retrieval_contexts: list[list[str]] | None = None
+    summary: str | None = None
+    summary_source: str | None = None
 
     @property
     def responses(self) -> list[str]:
@@ -98,6 +120,89 @@ class EvaluationRun(BaseModel):
         chunker metadata exists, else one per prompt, else whatever
         outputs arrived (an all-outputs transcript is taken at face value)."""
         return len(self.items) or len(self.prompts) or len(self.outputs)
+
+    # ------------------------------------------------------------------
+    # Judged-metric views. Each degrades the way `expected_units` does:
+    # take the richest source present, fall back, never raise — the same
+    # EvaluationRun has to serve an offline case, a reconstructed thread,
+    # and a bare transcript.
+    # ------------------------------------------------------------------
+
+    @property
+    def inputs(self) -> list[str]:
+        """The ``input`` each response answered, aligned with :attr:`responses`.
+
+        Prefers the explicit *prompts* (thread/transcript modes), else the
+        ``prompt`` the pipeline recorded on the output dict, else the item's
+        own SAS source — an offline case scored before the pipeline carried
+        prompts still has *something* to judge relevance against. Entries are
+        ``""`` only when a unit truly carries none.
+        """
+        if self.prompts:
+            return list(self.prompts)
+        return [
+            str(output.get("prompt") or self._item_source(index) or "")
+            for index, output in enumerate(self.outputs)
+        ]
+
+    @property
+    def documents(self) -> list[dict[str, Any] | None]:
+        """Each unit's structured ``TranslationDocument`` dump, or ``None``
+        when the run was unstructured (the metrics then parse the rendered
+        Markdown sections instead)."""
+        return [
+            output.get("document") if isinstance(output.get("document"), dict) else None
+            for output in self.outputs
+        ]
+
+    def retrieval_context_at(self, index: int) -> list[str]:
+        """Reference chunks retrieved for unit *index*, in rank order.
+
+        The explicit :attr:`retrieval_contexts` wins; otherwise the output
+        dict's ``retrieval_context``. Empty when guidance was off, or when
+        the run was reconstructed from a thread (retrieval is ephemeral and
+        never persisted — the same caveat ``dataset_fidelity`` carries).
+        """
+        if self.retrieval_contexts is not None:
+            if index < len(self.retrieval_contexts):
+                return list(self.retrieval_contexts[index])
+            return []
+        if index < len(self.outputs):
+            raw = self.outputs[index].get("retrieval_context") or []
+            return [str(chunk) for chunk in raw]
+        return []
+
+    def contexts_at(self, index: int) -> list[str]:
+        """Ground-truth context for unit *index* — what a response must not
+        contradict.
+
+        deepeval's ``context`` (reference material the caller supplies), as
+        opposed to ``retrieval_context`` (what a retriever fetched): here the
+        item's SAS source, plus the golden translation when the run has one.
+        Empty when neither exists.
+        """
+        contexts = []
+        source = self._item_source(index)
+        if source:
+            contexts.append(source)
+        if self.reference_translation:
+            contexts.append(self.reference_translation)
+        return contexts
+
+    @property
+    def item_sources(self) -> list[str]:
+        """The SAS text behind each unit, in order — empty without chunker
+        metadata (thread and transcript modes)."""
+        return [self._item_source(i) for i in range(len(self.items))]
+
+    def _item_source(self, index: int) -> str:
+        """The SAS text of unit *index*, or ``""`` without chunker metadata."""
+        if index >= len(self.items):
+            return ""
+        item = self.items[index]
+        if isinstance(item, SasBatch):
+            return "\n".join(chunk.text for chunk in item.chunks)
+        return item.text
 
 
 class CaseRun(EvaluationRun):
@@ -119,6 +224,7 @@ class CaseRun(EvaluationRun):
                 case = ValidationCase(**case)
             data.setdefault("run_id", case.case_id)
             data.setdefault("required_terms", list(case.required_terms))
+            data.setdefault("prompt_instructions", list(case.prompt_instructions))
             data.setdefault("reference_translation", case.reference_translation)
         return data
 

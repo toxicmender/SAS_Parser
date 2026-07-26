@@ -1356,26 +1356,41 @@ class SasLLMPipeline:
 
     def _instruction_messages(
         self, item: SasBatch | SasChunk
-    ) -> list[BaseMessage]:
-        """Ephemeral reference-guidance message(s) for *item* — [] when none."""
+    ) -> tuple[list[BaseMessage], list[str]]:
+        """Ephemeral reference guidance for *item*, as both artefacts of one
+        retrieval: ``(messages, retrieval_context)``.
+
+        *messages* is the 0-or-1 ``SystemMessage`` that gets prompted (never
+        persisted); *retrieval_context* is the text of the chunks that were
+        retrieved, **in the selector's priority order**, which the validation
+        layer scores as this item's retrieval context (see
+        ``validation.rag_metrics``). Both are empty when no prompt builder is
+        attached or nothing was relevant.
+
+        The two come from a single :meth:`PromptBuilder.select` call — scoring
+        must see exactly the context the model saw, and re-retrieving later
+        would neither be free nor guaranteed to agree.
+        """
         if self._prompt_builder is None:
-            return []
-        query = _query_for_item(item)
+            return [], []
         constructs = _constructs_for_item(item)
-        guidance = self._prompt_builder.build(
-            query,
+        picks = self._prompt_builder.select(
+            _query_for_item(item),
             constructs,
             output_language=self._output_language,
             kinds=_kinds_for_item(item),
             meta_flags=_meta_flags_for_item(item),
         )
+        retrieval_context = [pick.chunk.text for pick in picks]
+        guidance = self._prompt_builder.build_from_picks(picks, constructs)
         if not guidance:
-            return []
+            return [], retrieval_context
         item_id = item.batch_id if isinstance(item, SasBatch) else item.chunk_id
         logger.debug(
             f"_instruction_messages: item={item_id}  guidance_chars={len(guidance)}"
+            f"  retrieved={len(retrieval_context)}"
         )
-        return [SystemMessage(guidance)]
+        return [SystemMessage(guidance)], retrieval_context
 
     @staticmethod
     def _validation_feedback_message(result: Any) -> SystemMessage:
@@ -1408,11 +1423,15 @@ class SasLLMPipeline:
         thread_id: str,
         user_msg: str,
         base_instructions: list[BaseMessage],
+        retrieval_context: Sequence[str] = (),
     ) -> tuple[str, dict[str, Any] | None, Any, int]:
         """Generate (and, if enabled, iteratively repair) one item's answer.
 
         Sends *user_msg* on *thread_id*; when a validator is attached the
-        response is scored inline. With ``validation_retries > 0`` a failing
+        response is scored inline, with *user_msg* and *retrieval_context*
+        handed over as the item's ``input`` / retrieved context so the
+        judged metrics (``validation.rag_metrics``) have something to score
+        against. With ``validation_retries > 0`` a failing
         verdict rolls the just-appended turn back off the thread (via
         :meth:`KVChatMessageHistory.truncate_to`) and re-prompts with a
         corrective note, up to the retry budget, so exactly one — the final —
@@ -1456,6 +1475,8 @@ class SasLLMPipeline:
                         kv=self._memory.kv,
                         index=idx,
                         total=total,
+                        prompt=user_msg,
+                        retrieval_context=retrieval_context,
                     )
                 except Exception:
                     logger.warning(
@@ -1619,6 +1640,19 @@ class SasLLMPipeline:
             is_batch = isinstance(item, SasBatch)
             item_id = item.batch_id if is_batch else item.chunk_id
 
+            user_msg = (
+                _format_batch_message(item, idx, total, diagnostics)
+                if is_batch
+                else _format_chunk_message(item, idx, total, diagnostics)
+            )
+            # Per-item guidance rides in the config, not the state, so it is
+            # prompted without ever entering the persisted message history.
+            # Both are derived above the resume check on purpose: a skipped
+            # item's output must still carry the prompt and retrieval context
+            # the validation layer scores against, and neither costs an LLM
+            # call — which is what the skip is there to avoid.
+            base_instructions, retrieval_context = self._instruction_messages(item)
+
             fact = completed.get(item_id)
             if fact is not None:
                 logger.info(
@@ -1636,6 +1670,8 @@ class SasLLMPipeline:
                         if is_batch
                         else [item.source_id or "unknown"],
                         "kind": None if is_batch else item.kind.value,
+                        "prompt": user_msg,
+                        "retrieval_context": retrieval_context,
                         "response": self._recovered_response(recovered, fact),
                         "document": self._recovered_document(recovered, fact),
                         "thread_id": thread_id,
@@ -1651,15 +1687,6 @@ class SasLLMPipeline:
                 f"_process: item {idx}/{total}  id={item_id}  is_batch={is_batch}  thread={thread_id}"
             )
 
-            user_msg = (
-                _format_batch_message(item, idx, total, diagnostics)
-                if is_batch
-                else _format_chunk_message(item, idx, total, diagnostics)
-            )
-            # Per-item guidance rides in the config, not the state, so it is
-            # prompted without ever entering the persisted message history.
-            base_instructions = self._instruction_messages(item)
-
             t_item = time.perf_counter()
             try:
                 # Generate — and, when validation_retries > 0, iteratively
@@ -1673,6 +1700,7 @@ class SasLLMPipeline:
                     thread_id=thread_id,
                     user_msg=user_msg,
                     base_instructions=base_instructions,
+                    retrieval_context=retrieval_context,
                 )
             except Exception as exc:
                 logger.error(
@@ -1728,6 +1756,8 @@ class SasLLMPipeline:
                     if is_batch
                     else [item.source_id or "unknown"],
                     "kind": None if is_batch else item.kind.value,
+                    "prompt": user_msg,
+                    "retrieval_context": retrieval_context,
                     "response": ai_text,
                     "document": document,
                     "thread_id": thread_id,
