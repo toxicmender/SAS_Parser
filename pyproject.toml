@@ -88,6 +88,7 @@ filterwarnings = [
 include = [
     "app_config",
     "chunker",
+    "complexity",
     "memory",
     "llm_client",
     "prompt_builder",

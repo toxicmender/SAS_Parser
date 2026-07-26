@@ -4,6 +4,7 @@
     "app_config/__init__.py": 0,
     "app_config/azure.py": 0,
     "app_config/databricks.py": 0,
+    "app_config/powerapps.py": 0,
     "app_config/sharepoint.py": 0,
     "app_config/vault.py": 0,
     "chunker/__init__.py": 0,
@@ -16,6 +17,12 @@
     "chunker/pipeline.py": 0,
     "chunker/pipeline_constants.py": 0,
     "chunker/scanner.py": 0,
+    "complexity/__init__.py": 0,
+    "complexity/analyzer.py": 0,
+    "complexity/crossfile.py": 0,
+    "complexity/detectors.py": 0,
+    "complexity/models.py": 0,
+    "complexity/rules.py": 0,
     "demo_run.py": 0,
     "llm_client/__init__.py": 0,
     "llm_client/client.py": 0,
@@ -42,6 +49,7 @@
     "validation/live.py": 0,
     "validation/metrics.py": 0,
     "validation/models.py": 0,
+    "validation/pdf.py": 0,
     "validation/runner.py": 0,
     "validation/tracking.py": 0
   }

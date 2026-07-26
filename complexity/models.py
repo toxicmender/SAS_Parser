@@ -59,6 +59,65 @@ class TranslationParity(StrEnum):
     MANUAL = "MANUAL"
 
 
+class TShirtSize(StrEnum):
+    """Overall migration size of a **source file**, on the agile T-shirt scale.
+
+    Distinct from :class:`ComplexityTier`, and deliberately so. A tier answers
+    "how hard is the hardest thing in here?" and is presence-based: one ARRAY
+    makes a file HIGH however short it is. A size answers "how much work is
+    this file?", so it is **volume-aware** — without that it would be a
+    relabelling of tier, and a 2000-line file of plain DATA steps (which raises
+    no signal at all) would read SMALL, which is wrong.
+
+    Four sizes, not six. XS/XXL are conventional but both ActiveCollab and
+    Asana recommend starting at S/M/L/XL, and a size nobody can tell apart from
+    its neighbour costs more than it explains.
+
+    Sizes are a **combination** of three declared dimensions — effort,
+    complexity, and uncertainty — following the guidance that a team must state
+    what a size represents and then hold to it. The three are reported
+    separately on :class:`FileComplexity` so a LARGE file can be read as bulky,
+    hard, or unknown; those need different responses.
+
+    Unlike a tier, a size is **target-dependent**: parity feeds the complexity
+    dimension, so the same file is legitimately more work against Spark SQL
+    than against PySpark.
+
+    Ordered SMALL < MEDIUM < LARGE < EXTRA_LARGE by :data:`_SIZE_RANK`.
+
+    EXTRA_LARGE carries an instruction, not just a magnitude: it is the
+    published meaning of the top rung ("very large tasks needing breakdown"),
+    so :attr:`needs_breakdown` is True there and only there, and
+    :attr:`FileComplexity.suggested_split` names where to cut.
+    """
+
+    SMALL = "SMALL"
+    MEDIUM = "MEDIUM"
+    LARGE = "LARGE"
+    EXTRA_LARGE = "EXTRA_LARGE"
+
+    @property
+    def label(self) -> str:
+        """Human-readable name, e.g. ``"Extra Large"``."""
+        return _SIZE_LABEL[self]
+
+    @property
+    def points(self) -> int:
+        """Nominal story points for this rung (Fibonacci: 2, 3, 5, 8).
+
+        The bridge from a qualitative size to a summable quantity. A profile's
+        ``sizes.scale`` may restate these; this is the default the bands are
+        calibrated against, and :attr:`FileComplexity.points` carries the
+        *computed* continuous value rather than the rung's nominal one.
+        """
+        return _SIZE_POINTS[self]
+
+    @property
+    def needs_breakdown(self) -> bool:
+        """Whether this size means "split this before working it"."""
+        return self is TShirtSize.EXTRA_LARGE
+
+
 # Rank tables backing the "max tier" / "worst parity" aggregation rules. Kept
 # module-private and consulted through the helpers below so no call site
 # open-codes an ordering that could drift from the enum.
@@ -74,6 +133,31 @@ _PARITY_RANK: dict[TranslationParity, int] = {
     TranslationParity.PARTIAL: 2,
     TranslationParity.HARD: 3,
     TranslationParity.MANUAL: 4,
+}
+
+_SIZE_RANK: dict[TShirtSize, int] = {
+    TShirtSize.SMALL: 0,
+    TShirtSize.MEDIUM: 1,
+    TShirtSize.LARGE: 2,
+    TShirtSize.EXTRA_LARGE: 3,
+}
+
+_SIZE_LABEL: dict[TShirtSize, str] = {
+    TShirtSize.SMALL: "Small",
+    TShirtSize.MEDIUM: "Medium",
+    TShirtSize.LARGE: "Large",
+    TShirtSize.EXTRA_LARGE: "Extra Large",
+}
+
+# Fibonacci rungs. The progression is geometric because estimation confidence
+# is: the gap between a Small and a Medium is genuinely smaller than the gap
+# between a Large and an Extra Large, and evenly-spaced rungs would imply a
+# precision the method explicitly disclaims.
+_SIZE_POINTS: dict[TShirtSize, int] = {
+    TShirtSize.SMALL: 2,
+    TShirtSize.MEDIUM: 3,
+    TShirtSize.LARGE: 5,
+    TShirtSize.EXTRA_LARGE: 8,
 }
 
 
@@ -100,6 +184,20 @@ def max_tier(tiers: list[ComplexityTier]) -> ComplexityTier:
 def worst_parity(parities: list[TranslationParity]) -> TranslationParity:
     """The least-translatable parity in *parities*; DIRECT for an empty list."""
     return max(parities, key=parity_rank, default=TranslationParity.DIRECT)
+
+
+def size_rank(size: TShirtSize) -> int:
+    """Sort key for *size* (SMALL=0 < MEDIUM=1 < LARGE=2 < EXTRA_LARGE=3)."""
+    return _SIZE_RANK[size]
+
+
+def max_size(sizes: list[TShirtSize]) -> TShirtSize:
+    """The largest size in *sizes*; SMALL for an empty list.
+
+    Used both to roll a corpus up to one headline size and to apply the
+    per-chunk-kind size floors, which are a "no smaller than" rule.
+    """
+    return max(sizes, key=size_rank, default=TShirtSize.SMALL)
 
 
 class ComplexitySignal(BaseModel):
@@ -223,12 +321,116 @@ class BatchComplexity(_ComplexityBase):
         )
 
 
+class CrossFileProfile(BaseModel):
+    """How one source file is coupled to the rest of the corpus.
+
+    Built by :mod:`complexity.crossfile` from metadata the chunker already
+    extracts. The three reference states are kept apart because they mean
+    different things for a migration:
+
+    - **imports/exports** — a real dependency on another file in the corpus.
+      Translating this file in isolation would lose context.
+    - **unresolved** — a reference satisfied by no file in scope. Only
+      assertable when the corpus holds more than one file (see
+      :attr:`corpus_files`); with a single file there is nothing to have
+      searched, so the same reference is merely *external*.
+    """
+
+    source_id: str
+    # Files whose outputs this file consumes, and which consume its outputs.
+    depends_on: list[str] = Field(default_factory=list)
+    depended_on_by: list[str] = Field(default_factory=list)
+    # Construct names resolved elsewhere in the corpus, exported to it, and
+    # satisfied nowhere — each as "<kind>:<name>" for display.
+    imports: list[str] = Field(default_factory=list)
+    exports: list[str] = Field(default_factory=list)
+    unresolved: list[str] = Field(default_factory=list)
+    # How many files were in scope when this profile was built. 1 means
+    # "unresolved" could not be established and was not claimed.
+    corpus_files: int = 1
+
+    @property
+    def is_coupled(self) -> bool:
+        """Whether this file has any cross-file reference in either direction."""
+        return bool(self.depends_on or self.depended_on_by)
+
+    def __str__(self) -> str:
+        return (
+            f"CrossFileProfile({self.source_id}, depends_on={len(self.depends_on)}, "
+            f"depended_on_by={len(self.depended_on_by)}, "
+            f"unresolved={len(self.unresolved)})"
+        )
+
+
+class FileComplexity(_ComplexityBase):
+    """Overall migration verdict for one **source file**.
+
+    The unit of T-shirt sizing. Files, not batches, because a batch may span
+    several files (``SasBatch.source_files``) while every chunk carries exactly
+    one ``source_id`` — so a file rollup built from chunks is unambiguous
+    however the corpus was batched.
+
+    Inherits ``tier`` / ``translation_difficulty`` (worst-case over its chunks,
+    the same rules as everywhere else) and adds :attr:`size`, which is the
+    volume-aware verdict those two cannot express.
+
+    The three dimensions behind :attr:`size` are reported separately: a LARGE
+    file that is large on ``uncertainty_raw`` needs its parse errors
+    investigated, while one large on ``effort_raw`` just needs more hands.
+    """
+
+    source_id: str
+    size: TShirtSize = TShirtSize.SMALL
+    # Computed position on the Fibonacci scale — continuous, so it both ranks
+    # files within a size and sums across a corpus into a backlog estimate.
+    points: float = 0.0
+    # The three declared dimensions, in raw (pre-normalisation) units.
+    effort_raw: float = 0.0
+    complexity_raw: float = 0.0
+    uncertainty_raw: float = 0.0
+    chunk_count: int = 0
+    line_count: int = 0
+    chunks: list[ChunkComplexity] = Field(default_factory=list)
+    cross_file: CrossFileProfile | None = None
+    # Batch ids inside this file, offered as cut points when it needs breaking
+    # up. Empty when the analysis was not given batches to work from.
+    suggested_split: list[str] = Field(default_factory=list)
+    # The chunk kind that forced a size floor, when one applied — so a size
+    # nobody can derive from the numbers still explains itself.
+    floored_by: str = ""
+    # False when the uncertainty dimension could not see parser diagnostics
+    # (the batch-result entry points do not carry them). Recorded rather than
+    # silently reporting a lower uncertainty than the file really has.
+    uncertainty_complete: bool = True
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def raw_total(self) -> float:
+        """Sum of the three dimensions, before scaling to points."""
+        return round(self.effort_raw + self.complexity_raw + self.uncertainty_raw, 3)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def needs_breakdown(self) -> bool:
+        """Whether this file should be split before translation."""
+        return self.size.needs_breakdown
+
+    def __str__(self) -> str:
+        return (
+            f"FileComplexity {self.source_id} size={self.size.label} "
+            f"points={self.points:.1f} tier={self.tier} "
+            f"difficulty={self.translation_difficulty} chunks={self.chunk_count}"
+        )
+
+
 class CorpusComplexityReport(BaseModel):
     """Complexity across every analysed item of a file, batch result, or corpus."""
 
     source_ids: list[str] = Field(default_factory=list)
     chunks: list[ChunkComplexity] = Field(default_factory=list)
     batches: list[BatchComplexity] = Field(default_factory=list)
+    # Per-source-file rollups, carrying the T-shirt sizes.
+    files: list[FileComplexity] = Field(default_factory=list)
     # The rule-set profile every unit below was scored against, and its
     # human-readable name — reports state the target so two reports scored
     # against different languages are never mistaken for comparable.
@@ -267,6 +469,45 @@ class CorpusComplexityReport(BaseModel):
         """Sum of every scored unit's score."""
         return round(sum(item.score for item in self.items), 3)
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def size_counts(self) -> dict[str, int]:
+        """How many files fall in each size (all four keys always present)."""
+        counts = {s.value: 0 for s in TShirtSize}
+        for f in self.files:
+            counts[f.size.value] += 1
+        return counts
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def overall_size(self) -> TShirtSize:
+        """Largest file size in the corpus.
+
+        Worst-case, like every other rollup here — a migration is not done
+        until its hardest file is done, so an average would understate it.
+        """
+        return max_size([f.size for f in self.files])
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def total_points(self) -> float:
+        """Summed story points across every file — the backlog estimate.
+
+        The reason sizes carry a numeric scale at all: a qualitative label
+        cannot be added up, and "how big is this migration?" is the question
+        the sizing exists to answer.
+        """
+        return round(sum(f.points for f in self.files), 1)
+
+    @property
+    def files_needing_breakdown(self) -> list[FileComplexity]:
+        """Files rated EXTRA_LARGE, largest first — split these before starting."""
+        return sorted(
+            (f for f in self.files if f.needs_breakdown),
+            key=lambda f: f.points,
+            reverse=True,
+        )
+
     def hardest(self, limit: int = 10) -> list[ChunkComplexity | BatchComplexity]:
         """The *limit* units most in need of attention.
 
@@ -296,6 +537,14 @@ class CorpusComplexityReport(BaseModel):
             f"- Overall tier: **{self.overall_tier}**",
             f"- Overall Spark parity: **{self.overall_difficulty}**",
             f"- Total score: {self.total_score:.2f}",
+        ]
+        if self.files:
+            lines += [
+                f"- Overall size: **{self.overall_size.label}**",
+                f"- Total story points: {self.total_points:.1f} "
+                f"across {len(self.files)} file(s)",
+            ]
+        lines += [
             "",
             "## Tier breakdown",
             "",
@@ -304,6 +553,52 @@ class CorpusComplexityReport(BaseModel):
         ]
         for tier in ComplexityTier:
             lines.append(f"| {tier.value} | {counts[tier.value]} |")
+
+        if self.files:
+            size_counts = self.size_counts
+            lines += [
+                "",
+                "## File sizes",
+                "",
+                "| File | Size | Points | Tier | Parity | Effort | Cplx | Uncert |",
+                "| --- | --- | ---: | --- | --- | ---: | ---: | ---: |",
+            ]
+            for f in sorted(self.files, key=lambda x: x.points, reverse=True):
+                lines.append(
+                    f"| {f.source_id} | {f.size.label} | {f.points:.1f} "
+                    f"| {f.tier} | {f.translation_difficulty} "
+                    f"| {f.effort_raw:.1f} | {f.complexity_raw:.1f} "
+                    f"| {f.uncertainty_raw:.1f} |"
+                )
+            lines += [
+                "",
+                "| Size | Files |",
+                "| --- | ---: |",
+            ]
+            for size in TShirtSize:
+                lines.append(f"| {size.label} | {size_counts[size.value]} |")
+
+        breakdown = self.files_needing_breakdown
+        if breakdown:
+            lines += [
+                "",
+                f"## Files needing breakdown ({len(breakdown)})",
+                "",
+                "Extra Large is a recommendation, not just a magnitude: split "
+                "these before translating them.",
+                "",
+            ]
+            for f in breakdown:
+                cuts = (
+                    ", ".join(f.suggested_split)
+                    if f.suggested_split
+                    else "no batch boundaries available — split by step"
+                )
+                lines.append(
+                    f"- **{f.source_id}** ({f.points:.1f} pts, "
+                    f"{f.chunk_count} chunks, {f.line_count} lines) — "
+                    f"suggested cut points: {cuts}"
+                )
 
         hardest = self.hardest(top)
         if hardest:
@@ -331,9 +626,16 @@ class CorpusComplexityReport(BaseModel):
 
     def __str__(self) -> str:
         counts = self.tier_counts
+        sizing = (
+            f", files={len(self.files)}, overall_size={self.overall_size}, "
+            f"points={self.total_points:.1f}"
+            if self.files
+            else ""
+        )
         return (
             f"CorpusComplexityReport(units={len(self.items)}, "
             f"overall_tier={self.overall_tier}, "
             f"difficulty={self.overall_difficulty}, "
-            f"low={counts['LOW']}, medium={counts['MEDIUM']}, high={counts['HIGH']})"
+            f"low={counts['LOW']}, medium={counts['MEDIUM']}, "
+            f"high={counts['HIGH']}{sizing})"
         )

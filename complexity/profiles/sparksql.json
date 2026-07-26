@@ -7,6 +7,49 @@
     "MEDIUM": 2.5,
     "HIGH": 5.0
   },
+  "sizes": {
+    "anchor": {
+      "raw": 87.5,
+      "describes": "The reference MEDIUM file: ~200 lines and 16 chunks, comprising a %MACRO wrapping two DATA steps, nine further DATA steps, a match-merge (MERGE with BY), a PROC SORT, a PROC SUMMARY, and two LIBNAME assignments it uses throughout. 87.5 is that file's MEASURED raw score against this profile, not an estimate -- it is what makes the scale relative estimation against a known reference rather than a table of invented cutoffs. Every size is measured against it, so retuning it moves every verdict at once: argue with this description, not with the individual thresholds."
+    },
+    "scale": {
+      "SMALL": 2,
+      "MEDIUM": 3,
+      "LARGE": 5,
+      "EXTRA_LARGE": 8
+    },
+    "bands": {
+      "SMALL": 2.5,
+      "MEDIUM": 4.0,
+      "LARGE": 6.5
+    },
+    "volume": {
+      "chunk": 0.5,
+      "line": 0.01,
+      "step": 1.0,
+      "io": 1.0,
+      "param": 0.5
+    },
+    "parity_weights": {
+      "DIRECT": 0.0,
+      "SUPPORTED": 0.5,
+      "PARTIAL": 1.5,
+      "HARD": 3.0,
+      "MANUAL": 5.0
+    },
+    "uncertainty": {
+      "unresolved_ref": 3.0,
+      "unclosed_block": 4.0,
+      "unknown_chunk": 2.0,
+      "diagnostic": 1.5
+    },
+    "min_size_by_kind": {
+      "GLOBAL_STATEMENT": "SMALL",
+      "OPTIONS": "SMALL",
+      "MACRO_DEFINITION": "MEDIUM"
+    },
+    "min_size_by_parity": {}
+  },
   "constructs": {
     "proc": {
       "append": {
@@ -654,6 +697,74 @@
         "tier": "MEDIUM",
         "parity": "PARTIAL",
         "note": "unrecognised statements"
+      }
+    },
+    "cross_file": {
+      "macro_import": {
+        "category": "cross-file-macro",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "invokes a macro whose %MACRO definition lives in another file in this corpus; the translated unit needs that file's output in scope first, so it cannot be migrated standalone"
+      },
+      "macro_export": {
+        "category": "cross-file-macro",
+        "tier": "LOW",
+        "parity": "DIRECT",
+        "note": "defines a macro other files call; being depended on is scheduling effort, not translation difficulty, so this nudges size without touching tier or parity"
+      },
+      "macro_unresolved": {
+        "category": "cross-file-macro",
+        "tier": "HIGH",
+        "parity": "MANUAL",
+        "note": "invokes a macro defined in NO analysed file; the body is unavailable, so no faithful translation exists and a human must supply or stub it. Only ever raised when more than one file was in scope -- with a single file, absence proves nothing and macro_external is used instead"
+      },
+      "macro_external": {
+        "category": "cross-file-macro",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "invokes a macro defined outside this file, with no other files in scope to search. A real translation gap, but not evidence the macro is missing -- rate it as an ordinary external dependency, not as macro_unresolved"
+      },
+      "dataset_import": {
+        "category": "cross-file-data",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "reads a dataset another analysed file writes; an execution-ordering dependency between two migrated jobs, which a pipeline scheduler has to reproduce"
+      },
+      "dataset_export": {
+        "category": "cross-file-data",
+        "tier": "LOW",
+        "parity": "DIRECT",
+        "note": "writes a dataset another analysed file reads; effort, not difficulty (see macro_export)"
+      },
+      "dataset_unresolved": {
+        "category": "cross-file-data",
+        "tier": "LOW",
+        "parity": "SUPPORTED",
+        "note": "reads a dataset no analysed file writes -- almost always a pre-existing source table rather than a missing dependency, so it is NOT counted as uncertainty. Rated low deliberately: reading an external table is the normal case, not a hazard"
+      },
+      "macrovar_import": {
+        "category": "cross-file-macro-var",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "reads a macro variable another analysed file sets; the value crosses a file boundary at run time, so the translated unit needs it passed in as a parameter or config"
+      },
+      "macrovar_export": {
+        "category": "cross-file-macro-var",
+        "tier": "LOW",
+        "parity": "DIRECT",
+        "note": "sets a macro variable another analysed file reads; effort, not difficulty (see macro_export)"
+      },
+      "libref_import": {
+        "category": "cross-file-libref",
+        "tier": "LOW",
+        "parity": "SUPPORTED",
+        "note": "uses a libref another analysed file assigns; the LIBNAME maps onto catalog/schema configuration, which is a deployment concern rather than a translation one"
+      },
+      "libref_unresolved": {
+        "category": "cross-file-libref",
+        "tier": "MEDIUM",
+        "parity": "PARTIAL",
+        "note": "uses a libref no analysed file assigns, so the physical location of the data is unknown and the target table cannot be named without asking someone"
       }
     },
     "detector": {
