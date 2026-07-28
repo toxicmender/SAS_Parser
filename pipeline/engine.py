@@ -53,7 +53,7 @@ from chunker.models import (
     SasCorpus,
     SasDiagnostic,
 )
-from llm_client import LLMClient, LLMClientConfig, TokenUsage
+from llm_client import LLMClient, LLMClientConfig, TokenUsage, tokens
 from memory.extractor import MemoryExtractor
 from memory.policy import TaskPolicy
 from memory.relevance import RelevantHistorySelector
@@ -82,6 +82,15 @@ if TYPE_CHECKING:
     from pyspark.sql import SparkSession
 
 logger = logging.getLogger(__name__)
+
+# Token-budgeted call packing defaults (see _resolve_packing_budget). The
+# hard default keeps today's 8-member merges of typical chunks forming while
+# holding per-call answer quality; the headrooms mirror what shares the
+# request with the item text — retrieved guidance (prompt_builder's
+# max_instruction_words default, ~1.3 tokens/word) and the window_k history.
+_DEFAULT_MAX_MERGED_TOKENS = 6_000
+_PACKING_GUIDANCE_HEADROOM_TOKENS = 2_000
+_PACKING_HISTORY_HEADROOM_TOKENS = 4_000
 
 
 def _is_anthropic_model(model: str) -> bool:
@@ -266,9 +275,13 @@ class SasLLMPipeline:
         global-context batch never packs, and item identity changes versus
         unpacked runs (``packed-NNN`` ids), so resume only matches runs made
         under the same budget. ``None`` (default) defers to config.json
-        ``pipeline.max_merged_tokens``, then keeps packing **off** (the
-        original count-capped singleton merging only). Must be ``>= 1``
-        when set.
+        ``pipeline.max_merged_tokens``, then to a **derived default — packing
+        is on by default**: with ``max_input_tokens`` set,
+        ``0.8 × (max_input_tokens − system prompt − guidance/history
+        headroom)`` (a budget too small to pack disables it); otherwise
+        ~6,000 tokens. Pass ``0`` (or set the config key to ``0``) to turn
+        packing off and keep the original count-capped singleton merging
+        only. Must be ``>= 1``, or ``0`` for off.
     databricks_mapping : dict[str, str] | None
         SAS→Databricks dataset-name mapping forwarded to the batchers
         (see :func:`chunker.batcher.replace_dataset_names`): batch and
@@ -531,21 +544,17 @@ class SasLLMPipeline:
             max_merged_tokens = app_config.get_typed_value(
                 "pipeline", "max_merged_tokens", int, None
             )
-        if max_merged_tokens is not None and max_merged_tokens < 1:
+        if max_merged_tokens is not None and max_merged_tokens < 0:
             raise ValueError(
-                f"max_merged_tokens must be >= 1 (or None to disable "
-                f"packing), got {max_merged_tokens}"
+                f"max_merged_tokens must be >= 1, or 0 to disable packing, "
+                f"got {max_merged_tokens}"
             )
         self.model = model
         self.window_k = window_k
         self._max_merged_chunks = max_merged_chunks
-        self._max_merged_tokens = max_merged_tokens
-        # Built once per pipeline: the packing cost function counts with the
-        # same encoding the input-token budget uses (llm_client.tokens), so
-        # the two budgets are commensurable.
-        self._item_cost = (
-            prompt_cost_estimator(model) if max_merged_tokens is not None else None
-        )
+        # None here means "derive a default"; the budget is settled below,
+        # once the system prompt exists to be measured (0 = packing off).
+        self._requested_merged_tokens = max_merged_tokens
         self._output_language = output_language
         self._history_selector = history_selector
         self._prompt_builder = prompt_builder
@@ -676,6 +685,28 @@ class SasLLMPipeline:
                 f"SasLLMPipeline: task policy folded into the system prompt  "
                 f"task='{self.task_id}'  "
                 f"fingerprint={self._memory_context.policy_fingerprint}"
+            )
+        # Token-budgeted call packing is settled only now: the derived
+        # default needs the *final* system prompt (policy included) measured
+        # under this model's encoding, and the client's resolved
+        # max_input_tokens. The cost function is built once per pipeline and
+        # counts with the same encoding the input budget uses
+        # (llm_client.tokens), so the two budgets are commensurable.
+        self._max_merged_tokens = self._resolve_packing_budget(
+            self._requested_merged_tokens,
+            self._llm_client.config.max_input_tokens,
+            self._system_prompt,
+            model,
+        )
+        self._item_cost = (
+            prompt_cost_estimator(model)
+            if self._max_merged_tokens is not None
+            else None
+        )
+        if self._max_merged_tokens is not None:
+            logger.info(
+                f"SasLLMPipeline: token-budgeted call packing on  "
+                f"max_merged_tokens={self._max_merged_tokens}"
             )
         # With prompt caching on, the system prompt travels as a content
         # block with a cache_control breakpoint (a concrete SystemMessage,
@@ -1076,6 +1107,47 @@ class SasLLMPipeline:
         if builder is None or builder.user_instructions is None:
             return None
         return builder.user_instructions.fingerprint
+
+    @staticmethod
+    def _resolve_packing_budget(
+        requested: int | None,
+        max_input_tokens: int | None,
+        system_prompt: str,
+        model: str,
+    ) -> int | None:
+        """The packing token budget actually in force, or ``None`` for off.
+
+        Precedence (the repo-wide rule): explicit argument, else config.json
+        (both already folded into *requested*; ``0`` means "packing off"),
+        else a derived default — with ``max_input_tokens`` set,
+        ``0.8 × (max_input_tokens − system prompt − guidance headroom −
+        history headroom)`` so a packed prompt plus its fixed companions
+        stays inside the input budget (derived ≤ 0 disables packing: a tiny
+        input budget leaves no room to pack); without one, a conservative
+        ~6k-token default.
+        """
+        if requested is not None:
+            return requested or None  # 0 = packing off
+        if max_input_tokens is None:
+            return _DEFAULT_MAX_MERGED_TOKENS
+        system_tokens = tokens.count_text(system_prompt, model=model)
+        derived = int(
+            0.8
+            * (
+                max_input_tokens
+                - system_tokens
+                - _PACKING_GUIDANCE_HEADROOM_TOKENS
+                - _PACKING_HISTORY_HEADROOM_TOKENS
+            )
+        )
+        if derived < 1:
+            logger.info(
+                f"_resolve_packing_budget: max_input_tokens={max_input_tokens} "
+                f"leaves no packing headroom (system={system_tokens}); "
+                f"packing stays off"
+            )
+            return None
+        return derived
 
     @staticmethod
     def _default_thread_id(source_ids: list[str]) -> str:

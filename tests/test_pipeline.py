@@ -218,7 +218,8 @@ def test_pipeline_accumulates_history_across_batches():
 
 def test_run_text_invokes_llm_only_per_batch():
     # Every unit sent to the LLM is a SasBatch: the run's singletons are
-    # coalesced so no standalone SasChunk is ever prompted.
+    # coalesced so no standalone SasChunk is ever prompted. Packing is on by
+    # default, so the three independent steps share one packed call.
     fake_llm = FakeListChatModel(responses=[f"r{i}" for i in range(10)])
     pipeline = SasLLMPipeline(model="unused", memory=MemoryHub(), llm=fake_llm)
 
@@ -231,9 +232,10 @@ def test_run_text_invokes_llm_only_per_batch():
 
     assert outputs
     assert all(o["is_batch"] for o in outputs)
-    # Three independent steps merge into a single batch (default cap is 8).
+    # Three independent steps pack into a single batch under the default
+    # token budget (well over three tiny DATA steps).
     assert len(outputs) == 1
-    assert outputs[0]["item_id"] == "merged-001"
+    assert outputs[0]["item_id"] == "packed-001"
 
 
 def test_max_merged_chunks_caps_calls_per_batch():
@@ -283,11 +285,16 @@ def test_max_merged_tokens_packs_adjacent_items_into_one_call():
     }
 
 
-def test_max_merged_tokens_off_keeps_merged_grouping():
-    # Packing stays opt-in: without the budget, the dependency batch is its
+def test_max_merged_tokens_zero_disables_packing():
+    # max_merged_tokens=0 turns packing off: the dependency batch is its
     # own call and flushes the singleton runs around it (3 calls, not 1).
     fake_llm = FakeListChatModel(responses=[f"r{i}" for i in range(10)])
-    pipeline = SasLLMPipeline(model="unused", memory=MemoryHub(), llm=fake_llm)
+    pipeline = SasLLMPipeline(
+        model="unused",
+        memory=MemoryHub(),
+        llm=fake_llm,
+        max_merged_tokens=0,
+    )
 
     src = (
         "data work.x; p=1; run;\n"
@@ -307,8 +314,32 @@ def test_max_merged_tokens_validates():
             model="unused",
             memory=MemoryHub(),
             llm=FakeListChatModel(responses=["ok"]),
-            max_merged_tokens=0,
+            max_merged_tokens=-1,
         )
+
+
+def test_packing_budget_defaults_and_derivation():
+    from pipeline.engine import _DEFAULT_MAX_MERGED_TOKENS
+
+    def _mk(**kwargs):
+        return SasLLMPipeline(
+            model="unused",
+            memory=MemoryHub(),
+            llm=FakeListChatModel(responses=["ok"]),
+            **kwargs,
+        )
+
+    # No input budget: the conservative hard default applies.
+    assert _mk()._max_merged_tokens == _DEFAULT_MAX_MERGED_TOKENS
+    # With an input budget, the packing budget derives from its headroom and
+    # scales with it.
+    derived = _mk(max_input_tokens=100_000)._max_merged_tokens
+    assert derived is not None and derived > _DEFAULT_MAX_MERGED_TOKENS
+    assert derived < 100_000
+    # A budget too small to pack under disables packing outright.
+    assert _mk(max_input_tokens=2_000)._max_merged_tokens is None
+    # An explicit budget wins over derivation.
+    assert _mk(max_merged_tokens=1_234)._max_merged_tokens == 1_234
 
 
 def test_pipeline_window_trimming_limits_injected_history():

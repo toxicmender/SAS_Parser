@@ -14,8 +14,9 @@ layers, each usable on its own:
    production). Every LLM call is made per `SasBatch`: the batcher's ordered
    items are coalesced first, so dependency batches and merged runs of
    independent singletons are the only units prompted — and, with
-   token-budgeted packing on (`max_merged_tokens`), adjacent small items
-   share a call as `packed-NNN` batches under a prompt-cost budget. The deliverable is a
+   token-budgeted packing (on by default; `max_merged_tokens`, `0` to
+   disable), adjacent small items share a call as `packed-NNN` batches
+   under a prompt-cost budget. The deliverable is a
    **notebook** — one `.ipynb` per SAS source file (`pipeline.notebook`) —
    because the output is code and code should be runnable. Multi-source
    batches split back per file via per-cell `chunk_id` attribution (the
