@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -130,6 +131,56 @@ _DEFAULT_UNCERTAINTY_WEIGHTS: dict[str, float] = {
     "diagnostic": 1.5,
 }
 
+# The three sizing dimensions, in report order.
+DIMENSIONS: tuple[str, ...] = ("effort", "complexity", "uncertainty")
+
+# Min-max window per dimension, as **multiples of the anchor**, applied after a
+# log. Anchor-relative rather than absolute so the anchor stays the single knob
+# that moves every verdict coherently (`complexity.size_anchor`): halve it and
+# every window halves with it, so every file rates larger.
+#
+# `min` is the point below which a dimension stops discriminating — a file with
+# less effort than 0.3 anchors is small however you count it — and `max` is
+# where it saturates. Both floors and ceilings are the point of a min-max: the
+# scale spends its resolution on the range real files actually occupy.
+_DEFAULT_DIMENSION_BOUNDS: dict[str, tuple[float, float]] = {
+    "effort": (0.35, 2.40),
+    "complexity": (0.35, 1.40),
+    "uncertainty": (0.00, 0.50),
+}
+
+# How far each normalised dimension can push the blend **on its own**. These
+# deliberately sum to more than 1 and the blend is clamped there, so they are
+# reaches rather than shares: a file that is nothing but volume still has to be
+# able to reach the top of the scale, because an enormous file needs breaking
+# up however plain its contents are. Effort reaches furthest for that reason;
+# uncertainty reaches least, because it asks for an investigation rather than
+# for translation hands — but being additive, it never *costs* a file anything
+# to have no unknowns in it.
+_DEFAULT_DIMENSION_WEIGHTS: dict[str, float] = {
+    "effort": 0.88,
+    "complexity": 0.50,
+    "uncertainty": 0.20,
+}
+
+# Ends of the story-point scale, when a profile states neither `sizes.scale`
+# ends nor a `sizes.story_points` range: the Fibonacci rungs the bands are
+# calibrated on.
+DEFAULT_MIN_STORY_POINTS = 2.0
+DEFAULT_MAX_STORY_POINTS = 8.0
+
+
+def _log_fraction(value: float, low: float, high: float) -> float:
+    """Where *value* sits between *low* and *high*, measured in log space.
+
+    The inverse of the geometric rescale :meth:`SizeModel.points_for` applies,
+    and the reason a band and a points value can be compared however the scale
+    is denominated. Degenerate ranges fall back to a linear fraction.
+    """
+    if low <= 0 or high <= low or value <= 0:
+        return (value - low) / (high - low) if high > low else 0.0
+    return math.log(value / low) / math.log(high / low)
+
 
 @dataclass(frozen=True)
 class SizeModel:
@@ -142,19 +193,56 @@ class SizeModel:
     re-rate the same file differently depending on which files it was analysed
     alongside, and would be undefined for a single-file run.
 
+    Raw dimensions do not become points directly. Each is **log-transformed and
+    min-max rescaled** onto 0-1 against its own anchor-relative window
+    (:meth:`normalize`), the three are blended (:meth:`blend_for`), and the
+    blend is min-max rescaled *in log space* onto the points scale
+    (:meth:`points_for`). Two reasons:
+
+    - the three dimensions are counted in incomparable units — effort runs to
+      the hundreds on line and step counts while uncertainty rarely passes ten
+      — so a plain sum silently weights them by magnitude rather than by
+      intent. Rescaling to a common 0-1 makes the mix explicit and adjustable;
+    - within a dimension the returns are diminishing: the 200th step of a file
+      tells you far less than the 20th. A log says that, a raw count does not.
+
     Attributes
     ----------
     anchor_raw
-        Raw score of the reference **Medium** file. Everything is measured
-        against it: ``points = raw / anchor_raw * scale[MEDIUM]``.
+        Raw score of the reference **Medium** file — the sum of its three
+        dimensions. Every window below is a multiple of it, so it remains the
+        single knob that moves every verdict at once: lower it and every file
+        rates larger.
+    anchor_dimensions
+        That same reference file's ``(effort, complexity, uncertainty)`` split,
+        when the profile states it. Because the dimensions are normalised
+        separately, the anchor's *composition* now matters as much as its
+        total, and a profile that declares it can be checked against the file
+        it claims to describe.
     anchor_describes
         Prose description of that reference file, so the calibration can be
         argued with instead of merely obeyed.
     scale
-        Nominal points per rung (Fibonacci by default).
+        Nominal points per rung (Fibonacci by default). Together with *bands*
+        it is the **calibration**: the two decide where each size begins, as a
+        fraction of the scale's log span.
+    min_story_points, max_story_points
+        Ends of the reported story-point range. ``None`` (default) takes them
+        from *scale*'s lowest and highest rungs. A file cannot score outside
+        them, which is what makes the rescale a min-max rather than an
+        open-ended ratio. Changing them re-denominates every ``points`` value
+        without moving a single size boundary: the bands are read as fractions
+        of the span, so a team that estimates on 1-13 gets its own numbers and
+        the same verdicts.
     bands
-        Inclusive upper bound in points for SMALL, MEDIUM, and LARGE; above the
-        LARGE bound is EXTRA_LARGE.
+        Inclusive upper bound in points for SMALL, MEDIUM, and LARGE, stated
+        against *scale*; above the LARGE bound is EXTRA_LARGE.
+    bounds
+        ``{dimension: (min, max)}`` in multiples of the anchor — the min-max
+        window each dimension is rescaled against, after the log.
+    dimension_weights
+        ``{dimension: weight}`` for blending the three normalised dimensions.
+        Normalised to sum to 1 on use, so only their ratio matters.
     volume, uncertainty
         Per-unit weights for the effort and uncertainty dimensions.
     parity_weights
@@ -169,11 +257,20 @@ class SizeModel:
 
     anchor_raw: float = DEFAULT_ANCHOR_RAW
     anchor_describes: str = ""
+    anchor_dimensions: tuple[float, float, float] | None = None
+    min_story_points: float | None = None
+    max_story_points: float | None = None
     scale: dict[TShirtSize, float] = field(
         default_factory=lambda: dict(_DEFAULT_SIZE_SCALE)
     )
     bands: dict[TShirtSize, float] = field(
         default_factory=lambda: dict(_DEFAULT_SIZE_BANDS)
+    )
+    bounds: dict[str, tuple[float, float]] = field(
+        default_factory=lambda: dict(_DEFAULT_DIMENSION_BOUNDS)
+    )
+    dimension_weights: dict[str, float] = field(
+        default_factory=lambda: dict(_DEFAULT_DIMENSION_WEIGHTS)
     )
     volume: dict[str, float] = field(
         default_factory=lambda: dict(_DEFAULT_VOLUME_WEIGHTS)
@@ -189,17 +286,126 @@ class SizeModel:
         default_factory=dict
     )
 
-    def points_for(self, raw: float) -> float:
-        """Convert a raw score to points on the anchored Fibonacci scale."""
-        if self.anchor_raw <= 0:
+    def window_for(self, dimension: str) -> tuple[float, float]:
+        """The ``(min, max)`` window for *dimension*, in raw units.
+
+        Stored anchor-relative and returned absolute, so every caller reads the
+        window the current anchor implies rather than re-deriving it.
+        """
+        lo, hi = self.bounds.get(
+            dimension, _DEFAULT_DIMENSION_BOUNDS.get(dimension, (0.0, 1.0))
+        )
+        return lo * self.anchor_raw, hi * self.anchor_raw
+
+    def normalize(self, dimension: str, raw: float) -> float:
+        """Rescale a raw dimension onto 0-1: log first, then min-max.
+
+        ``log1p`` rather than ``log`` because every dimension legitimately
+        reaches 0 — a file with nothing unresolved in it has no uncertainty at
+        all — and ``log(0)`` is not a number a size can be built on. Values
+        outside the window clamp: below the floor a dimension has stopped
+        discriminating, above the ceiling it has saturated.
+        """
+        lo, hi = self.window_for(dimension)
+        if hi <= lo:
             return 0.0
-        medium = self.scale.get(TShirtSize.MEDIUM, 3.0)
-        return round(raw / self.anchor_raw * medium, 2)
+        span = math.log1p(hi) - math.log1p(lo)
+        if span <= 0:
+            return 0.0
+        scaled = (math.log1p(max(raw, 0.0)) - math.log1p(lo)) / span
+        return min(1.0, max(0.0, scaled))
+
+    def blend_for(
+        self, effort: float, complexity: float, uncertainty: float
+    ) -> float:
+        """The three normalised dimensions as one 0-1 value.
+
+        A weighted **sum**, clamped at 1, rather than a weighted mean. The
+        weights therefore say how far each dimension reaches on its own, and
+        they sum past 1 on purpose: a mean would cap a file that is nothing but
+        volume at the effort weight, so no amount of bulk could ever ask to be
+        broken down, and every file with nothing unresolved in it would forfeit
+        the uncertainty share for having no problems.
+        """
+        raws = {
+            "effort": effort,
+            "complexity": complexity,
+            "uncertainty": uncertainty,
+        }
+        total = sum(
+            self.normalize(d, raws[d])
+            * max(self.dimension_weights.get(d, _DEFAULT_DIMENSION_WEIGHTS[d]), 0.0)
+            for d in DIMENSIONS
+        )
+        return min(1.0, total)
+
+    @property
+    def story_point_range(self) -> tuple[float, float]:
+        """The ``(min, max)`` story points a file can be reported as.
+
+        Falls back to the scale's own end rungs, so a profile that says nothing
+        about story points still reports the Fibonacci 2-8 the bands were
+        calibrated on.
+        """
+        low = self.min_story_points
+        high = self.max_story_points
+        return (
+            self.scale.get(TShirtSize.SMALL, DEFAULT_MIN_STORY_POINTS)
+            if low is None
+            else low,
+            self.scale.get(TShirtSize.EXTRA_LARGE, DEFAULT_MAX_STORY_POINTS)
+            if high is None
+            else high,
+        )
+
+    def points_for(
+        self, effort: float, complexity: float = 0.0, uncertainty: float = 0.0
+    ) -> float:
+        """Convert the three raw dimensions to points on the story-point scale.
+
+        The blend is min-max rescaled **in log space** — geometrically between
+        the ends of :attr:`story_point_range` — for the same reason the default
+        rungs are Fibonacci: the gap between Small and Medium is genuinely
+        smaller than the gap between Large and Extra Large, so equal steps of
+        evidence should be equal *ratios* of points, not equal differences. A
+        blend of 0 is exactly the minimum, a blend of 1 exactly the maximum,
+        and the reference file lands on MEDIUM by calibration.
+        """
+        low, high = self.story_point_range
+        blend = self.blend_for(effort, complexity, uncertainty)
+        if low <= 0 or high <= low:
+            # A profile may flatten or invert the range; fall back to a linear
+            # rescale rather than raising on a log of a non-positive number.
+            return round(low + blend * (high - low), 2)
+        return round(low * (high / low) ** blend, 2)
+
+    def band_blends(self) -> dict[TShirtSize, float]:
+        """Where each band's upper bound sits, as a fraction of the log span.
+
+        Read off ``scale`` and ``bands`` — the calibration — rather than off
+        the reported range, which is why re-denominating story points cannot
+        move a size boundary.
+        """
+        low = self.scale.get(TShirtSize.SMALL, DEFAULT_MIN_STORY_POINTS)
+        high = self.scale.get(TShirtSize.EXTRA_LARGE, DEFAULT_MAX_STORY_POINTS)
+        return {
+            size: _log_fraction(
+                self.bands.get(size, _DEFAULT_SIZE_BANDS[size]), low, high
+            )
+            for size in (TShirtSize.SMALL, TShirtSize.MEDIUM, TShirtSize.LARGE)
+        }
 
     def band_for(self, points: float) -> TShirtSize:
-        """The size *points* falls in, before any floor is applied."""
+        """The size *points* falls in, before any floor is applied.
+
+        Compares in blend space, so a profile reporting on 1-13 bands at the
+        same evidence as one reporting on 2-8.
+        """
+        low, high = self.story_point_range
+        position = _log_fraction(points, low, high)
+        bounds = self.band_blends()
         for size in (TShirtSize.SMALL, TShirtSize.MEDIUM, TShirtSize.LARGE):
-            if points <= self.bands.get(size, _DEFAULT_SIZE_BANDS[size]):
+            if position <= bounds[size]:
                 return size
         return TShirtSize.EXTRA_LARGE
 
@@ -371,6 +577,125 @@ def _weight_map(
     return out
 
 
+def _anchor_dimensions(
+    raw: Any, where: str, anchor_raw: float
+) -> tuple[float, float, float] | None:
+    """Parse the optional ``anchor.dimensions`` block.
+
+    Checked against ``anchor.raw`` because the two are the same measurement
+    stated twice: a split that does not add up to the total means the anchor
+    was re-measured in one place and not the other, which would quietly
+    decalibrate every size.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise RuleSetError(f"{where}: expected an object")
+    unknown = set(raw) - set(DIMENSIONS)
+    if unknown:
+        raise RuleSetError(
+            f"{where}: unknown dimension(s) {', '.join(sorted(unknown))} "
+            f"(expected {', '.join(DIMENSIONS)})"
+        )
+    missing = [d for d in DIMENSIONS if d not in raw]
+    if missing:
+        raise RuleSetError(
+            f"{where}: missing {', '.join(missing)} — state the whole split or "
+            f"none of it, since the dimensions are normalised separately"
+        )
+    values = tuple(_number(raw[d], f"{where}.{d}") for d in DIMENSIONS)
+    if any(v < 0 for v in values):
+        raise RuleSetError(f"{where}: dimensions cannot be negative")
+    if abs(sum(values) - anchor_raw) > 0.05:
+        raise RuleSetError(
+            f"{where}: {' + '.join(str(v) for v in values)} = {sum(values)}, "
+            f"which is not anchor.raw ({anchor_raw}); re-measure the reference "
+            f"file and update both"
+        )
+    return values  # type: ignore[return-value]
+
+
+def _story_points(raw: Any, where: str) -> tuple[float | None, float | None]:
+    """Parse the optional ``sizes.story_points`` block.
+
+    Either end may be stated alone; the one left out falls back to the scale's
+    own rung, so a team that only wants a different ceiling says only that.
+    """
+    if raw is None:
+        return None, None
+    if not isinstance(raw, dict):
+        raise RuleSetError(f"{where}: expected an object with min/max")
+    unknown = set(raw) - {"min", "max"}
+    if unknown:
+        raise RuleSetError(
+            f"{where}: unknown key(s) {', '.join(sorted(unknown))} "
+            f"(expected min, max)"
+        )
+    low = _number(raw["min"], f"{where}.min") if "min" in raw else None
+    high = _number(raw["max"], f"{where}.max") if "max" in raw else None
+    if low is not None and low <= 0:
+        raise RuleSetError(
+            f"{where}.min: must be greater than 0 — points are rescaled "
+            f"geometrically, so the smallest size cannot be worth nothing"
+        )
+    if low is not None and high is not None and high <= low:
+        raise RuleSetError(
+            f"{where}: max ({high}) must be greater than min ({low})"
+        )
+    return low, high
+
+
+def _bounds(raw: Any, where: str) -> dict[str, tuple[float, float]]:
+    """Parse the optional ``sizes.bounds`` block (anchor-relative min-max windows)."""
+    out = dict(_DEFAULT_DIMENSION_BOUNDS)
+    if raw is None:
+        return out
+    if not isinstance(raw, dict):
+        raise RuleSetError(f"{where}: expected an object")
+    for key, value in raw.items():
+        if key not in DIMENSIONS:
+            raise RuleSetError(
+                f"{where}.{key}: unknown dimension "
+                f"(expected one of {', '.join(DIMENSIONS)})"
+            )
+        if not isinstance(value, dict):
+            raise RuleSetError(f"{where}.{key}: expected an object with min/max")
+        unknown = set(value) - {"min", "max"}
+        if unknown:
+            raise RuleSetError(
+                f"{where}.{key}: unknown key(s) {', '.join(sorted(unknown))} "
+                f"(expected min, max)"
+            )
+        lo = _number(value.get("min", out[key][0]), f"{where}.{key}.min")
+        hi = _number(value.get("max", out[key][1]), f"{where}.{key}.max")
+        if lo < 0:
+            raise RuleSetError(f"{where}.{key}.min: cannot be negative")
+        if hi <= lo:
+            raise RuleSetError(
+                f"{where}.{key}: max ({hi}) must be greater than min ({lo}) — "
+                f"a window of zero width leaves the dimension unable to move a size"
+            )
+        out[key] = (lo, hi)
+    return out
+
+
+def _dimension_weights(raw: Any, where: str) -> dict[str, float]:
+    """Parse the optional ``sizes.dimension_weights`` block."""
+    out = _weight_map(raw, where, _DEFAULT_DIMENSION_WEIGHTS)
+    negative = [k for k, v in out.items() if v < 0]
+    if negative:
+        raise RuleSetError(
+            f"{where}: {', '.join(sorted(negative))} cannot be negative — a "
+            f"dimension can be ignored (0) but never subtract from a size"
+        )
+    if sum(out.values()) <= 0:
+        raise RuleSetError(
+            f"{where}: at least one dimension must carry weight, or no file "
+            f"can ever rate above the smallest size"
+        )
+    return out
+
+
 def _size_model(raw: Any, where: str) -> SizeModel:
     """Parse the optional ``sizes`` block into a :class:`SizeModel`."""
     if raw is None:
@@ -380,6 +705,7 @@ def _size_model(raw: Any, where: str) -> SizeModel:
 
     anchor_raw = DEFAULT_ANCHOR_RAW
     describes = ""
+    anchor_dims: tuple[float, float, float] | None = None
     anchor = raw.get("anchor")
     if anchor is not None:
         if not isinstance(anchor, dict):
@@ -391,12 +717,19 @@ def _size_model(raw: Any, where: str) -> SizeModel:
                     f"{where}.anchor.raw: must be greater than 0 "
                     f"(every size is measured against it)"
                 )
+        anchor_dims = _anchor_dimensions(
+            anchor.get("dimensions"), f"{where}.anchor.dimensions", anchor_raw
+        )
         describes = str(anchor.get("describes", ""))
 
     scale = dict(_DEFAULT_SIZE_SCALE)
     for key, value in (raw.get("scale") or {}).items():
         size = _enum(key, TShirtSize, f"{where}.scale key")
         scale[size] = _number(value, f"{where}.scale.{key}")
+
+    min_points, max_points = _story_points(
+        raw.get("story_points"), f"{where}.story_points"
+    )
 
     bands = dict(_DEFAULT_SIZE_BANDS)
     for key, value in (raw.get("bands") or {}).items():
@@ -433,8 +766,15 @@ def _size_model(raw: Any, where: str) -> SizeModel:
     return SizeModel(
         anchor_raw=anchor_raw,
         anchor_describes=describes,
+        anchor_dimensions=anchor_dims,
+        min_story_points=min_points,
+        max_story_points=max_points,
         scale=scale,
         bands=bands,
+        bounds=_bounds(raw.get("bounds"), f"{where}.bounds"),
+        dimension_weights=_dimension_weights(
+            raw.get("dimension_weights"), f"{where}.dimension_weights"
+        ),
         volume=_weight_map(
             raw.get("volume"), f"{where}.volume", _DEFAULT_VOLUME_WEIGHTS
         ),

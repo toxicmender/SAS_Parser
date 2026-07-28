@@ -6,7 +6,12 @@
   "sizes": {
     "anchor": {
       "raw": 81.5,
-      "describes": "The SAME reference file the Spark SQL profile describes, measured against THIS profile: 81.5 rather than 87.5, because a Python host language rates the macro and its parameterisation more favourably. Anchoring each target to its own measurement of one shared reference keeps that file MEDIUM everywhere -- which is right, since it is the definition of Medium -- so what remains target-dependent is the RELATIVE construct mix: a macro-heavy file rates larger against Spark SQL than against PySpark, while a file of plain DATA steps rates the same against both. Sub-blocks not restated (bands, volume, uncertainty, floors) are inherited from sparksql."
+      "dimensions": {
+        "effort": 50.0,
+        "complexity": 31.5,
+        "uncertainty": 0.0
+      },
+      "describes":"The SAME reference file the Spark SQL profile describes, measured against THIS profile: 81.5 rather than 87.5, because a Python host language rates the macro and its parameterisation more favourably. Anchoring each target to its own measurement of one shared reference keeps that file MEDIUM everywhere -- which is right, since it is the definition of Medium -- so what remains target-dependent is the RELATIVE construct mix: a macro-heavy file rates larger against Spark SQL than against PySpark, while a file of plain DATA steps rates the same against both. Sub-blocks not restated (bands, volume, uncertainty, floors) are inherited from sparksql."
     }
   },
   "constructs": {

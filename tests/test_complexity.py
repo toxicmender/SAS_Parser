@@ -6,11 +6,13 @@ Run:  python -m pytest tests/test_complexity.py -v
 """
 
 import json
+import math
 import pathlib
 import shutil
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -533,13 +535,21 @@ class TestTShirtSize(unittest.TestCase):
             TShirtSize.LARGE,
         )
 
-    def test_anchor_raw_bands_to_medium(self):
-        """The anchor is the reference Medium file, by definition."""
+    def test_anchor_dimensions_band_to_medium(self):
+        """The anchor is the reference Medium file, by definition.
+
+        Scored from its *dimension split*, not its total: each dimension is
+        rescaled against its own window, so the same 87.5 spent entirely on
+        effort would not land in the same place.
+        """
         for name in rules.available_profiles():
             sizes = rules.load_ruleset(name).sizes
-            points = sizes.points_for(sizes.anchor_raw)
+            self.assertIsNotNone(
+                sizes.anchor_dimensions, f"{name} states no anchor split"
+            )
+            points = sizes.points_for(*sizes.anchor_dimensions)
             self.assertEqual(sizes.band_for(points), TShirtSize.MEDIUM, name)
-            self.assertAlmostEqual(points, 3.0, places=2, msg=name)
+            self.assertAlmostEqual(points, 3.0, delta=0.1, msg=name)
 
     def test_banding_is_monotonic_in_raw_score(self):
         sizes = rules.load_ruleset("sparksql").sizes
@@ -553,7 +563,7 @@ class TestTShirtSize(unittest.TestCase):
     def test_lowering_the_anchor_makes_files_larger(self):
         """Sizes are relative to the anchor, so the anchor is the master knob."""
         source = "data a; set b; run;\nproc sort data=a; by id; run;\n"
-        big = _analyze(source, size_anchor=2.0).files[0]
+        big = _analyze(source, size_anchor=1.0).files[0]
         small = _analyze(source, size_anchor=200.0).files[0]
         self.assertGreater(big.points, small.points)
         self.assertEqual(small.size, TShirtSize.SMALL)
@@ -581,8 +591,12 @@ class TestTShirtSize(unittest.TestCase):
 
     def test_floored_by_is_empty_when_banding_stands_alone(self):
         """The floor is only reported when it actually changed the answer."""
-        f = _analyze("%macro noop;\n%mend noop;\n", size_anchor=1.0).files[0]
-        self.assertEqual(f.size, TShirtSize.EXTRA_LARGE)
+        source = "%macro noop;\n%mend noop;\n" + "".join(
+            f"data out{i}; set in{i}; run;\n" for i in range(40)
+        )
+        f = _analyze(source).files[0]
+        # Bands above the MACRO_DEFINITION floor on its own volume.
+        self.assertEqual(f.size, TShirtSize.LARGE)
         self.assertEqual(f.floored_by, "")
 
     def test_volume_alone_can_drive_a_large_size(self):
@@ -598,6 +612,34 @@ class TestTShirtSize(unittest.TestCase):
         self.assertEqual(f.tier, ComplexityTier.LOW)
         self.assertGreater(f.effort_raw, 20)
         self.assertIn(f.size, (TShirtSize.LARGE, TShirtSize.EXTRA_LARGE))
+
+    def test_volume_alone_can_reach_extra_large(self):
+        """Bulk on its own must be able to ask to be broken down.
+
+        The effort weight reaches past the Extra Large boundary by itself, so
+        a file of nothing but trivial steps still rates XL once there are
+        enough of them — an enormous file needs splitting however plain its
+        contents are. This is why the dimension weights are reaches summed and
+        clamped, not shares averaged.
+        """
+        f = _analyze(
+            "".join(f"data out{i}; set in{i}; run;\n" for i in range(80))
+        ).files[0]
+        self.assertEqual(f.tier, ComplexityTier.LOW)
+        self.assertEqual(f.complexity_raw, 0.0)
+        self.assertEqual(f.size, TShirtSize.EXTRA_LARGE)
+
+    def test_volume_saturates_at_the_top_of_its_window(self):
+        """Past the ceiling, more of the same stops moving the number."""
+        big = _analyze(
+            "".join(f"data out{i}; set in{i}; run;\n" for i in range(200))
+        ).files[0]
+        bigger = _analyze(
+            "".join(f"data out{i}; set in{i}; run;\n" for i in range(400))
+        ).files[0]
+        self.assertEqual(big.effort_norm, 1.0)
+        self.assertGreater(bigger.effort_raw, big.effort_raw)
+        self.assertEqual(bigger.points, big.points)
 
 
 def _reference_file_source() -> str:
@@ -629,6 +671,237 @@ def _reference_file_source() -> str:
     return "\n".join(lines)
 
 
+class TestDimensionRescale(unittest.TestCase):
+    """The log + min-max rescale that turns raw dimensions into points."""
+
+    def setUp(self):
+        self.sizes = rules.load_ruleset("sparksql").sizes
+
+    def test_window_is_anchor_relative(self):
+        """Bounds are multiples of the anchor, so the anchor moves them all."""
+        lo, hi = self.sizes.window_for("effort")
+        halved = replace(self.sizes, anchor_raw=self.sizes.anchor_raw / 2)
+        self.assertEqual(halved.window_for("effort"), (lo / 2, hi / 2))
+
+    def test_min_max_clamps_at_both_ends(self):
+        lo, hi = self.sizes.window_for("effort")
+        self.assertEqual(self.sizes.normalize("effort", 0.0), 0.0)
+        self.assertEqual(self.sizes.normalize("effort", lo), 0.0)
+        self.assertEqual(self.sizes.normalize("effort", lo / 2), 0.0)
+        self.assertEqual(self.sizes.normalize("effort", hi), 1.0)
+        self.assertEqual(self.sizes.normalize("effort", hi * 100), 1.0)
+
+    def test_normalisation_is_monotonic(self):
+        lo, hi = self.sizes.window_for("effort")
+        seen = [
+            self.sizes.normalize("effort", raw)
+            for raw in (lo, lo * 1.5, lo * 2, lo * 3, hi)
+        ]
+        self.assertEqual(seen, sorted(seen))
+
+    def test_the_log_makes_returns_diminish(self):
+        """Equal *increments* of raw effort buy less the further up you are.
+
+        The point of the log: the 200th step of a file tells you less than the
+        20th. Under a plain rescale these two gaps would be identical.
+        """
+        n = lambda raw: self.sizes.normalize("effort", raw)  # noqa: E731
+        low_gap = n(80) - n(50)
+        high_gap = n(140) - n(110)
+        self.assertGreater(low_gap, high_gap)
+
+    def test_equal_ratios_are_equal_steps(self):
+        """...and the flip side: a doubling is a doubling wherever it happens."""
+        n = lambda raw: self.sizes.normalize("effort", raw)  # noqa: E731
+        self.assertAlmostEqual(n(80) - n(40), n(160) - n(80), places=2)
+
+    def test_points_span_the_scale_ends(self):
+        """A min-max rescale bottoms out at SMALL and tops out at EXTRA_LARGE."""
+        self.assertEqual(self.sizes.points_for(0.0, 0.0, 0.0), 2.0)
+        self.assertEqual(self.sizes.points_for(1e6, 1e6, 1e6), 8.0)
+
+    def test_weights_are_reaches_not_shares(self):
+        """Each dimension pushes on its own; the blend clamps rather than dilutes.
+
+        A weighted mean would cap a volume-only file at the effort weight and
+        would dock every file that has no unknowns in it.
+        """
+        weights = self.sizes.dimension_weights
+        self.assertGreater(sum(weights.values()), 1.0)
+        self.assertGreaterEqual(
+            weights["effort"], self.sizes.band_blends()[TShirtSize.LARGE]
+        )
+        self.assertEqual(self.sizes.points_for(1e6, 1e6, 1e6), 8.0)
+
+    def test_uncertainty_adds_rather_than_taking_a_share(self):
+        clean = self.sizes.points_for(50.0, 37.5, 0.0)
+        troubled = self.sizes.points_for(50.0, 37.5, 20.0)
+        self.assertGreater(troubled, clean)
+
+    def test_points_rescale_geometrically(self):
+        """Log space, so the rungs stay Fibonacci-shaped rather than even."""
+        half = self.sizes.points_for(*self._raw_for_blend(0.5))
+        self.assertAlmostEqual(half, 4.0, places=1)  # sqrt(2 * 8), not (2 + 8)/2
+
+    def _raw_for_blend(self, blend: float) -> tuple[float, float, float]:
+        """Raw dimensions whose blend is *blend*, via effort alone."""
+        share = blend / self.sizes.dimension_weights["effort"]
+        lo, hi = self.sizes.window_for("effort")
+        return (
+            math.expm1(
+                math.log1p(lo) + share * (math.log1p(hi) - math.log1p(lo))
+            ),
+            0.0,
+            0.0,
+        )
+
+    def test_dimension_weights_decide_the_mix(self):
+        """A dimension weighted to zero cannot move a size."""
+        ignored = replace(
+            self.sizes,
+            dimension_weights={"effort": 1.0, "complexity": 0.0, "uncertainty": 0.0},
+        )
+        self.assertEqual(
+            ignored.points_for(50.0, 0.0, 0.0), ignored.points_for(50.0, 500.0, 0.0)
+        )
+        self.assertGreater(
+            self.sizes.points_for(50.0, 500.0, 0.0),
+            self.sizes.points_for(50.0, 0.0, 0.0),
+        )
+
+    def test_file_reports_both_raw_and_normalised_dimensions(self):
+        f = _analyze(
+            "".join(f"data out{i}; set in{i}; run;\n" for i in range(200))
+        ).files[0]
+        self.assertGreater(f.effort_raw, 100)
+        self.assertEqual(f.effort_norm, 1.0)
+        self.assertEqual(f.complexity_norm, 0.0)
+        self.assertAlmostEqual(
+            f.blend,
+            round(
+                rules.load_ruleset("sparksql").sizes.blend_for(
+                    f.effort_raw, f.complexity_raw, f.uncertainty_raw
+                ),
+                3,
+            ),
+        )
+
+    def test_markdown_shows_the_normalised_share(self):
+        md = _analyze("data a; set b; run;\n").to_markdown()
+        self.assertIn("| Blend |", md)
+
+
+class TestStoryPointRange(unittest.TestCase):
+    """`min_story_points` / `max_story_points` re-denominate, never re-rate."""
+
+    SOURCES = (
+        "%let a = 1;\n",
+        "".join(f"data out{i}; set in{i}; run;\n" for i in range(12)),
+        _reference_file_source(),
+        "".join(f"data out{i}; set in{i}; run;\n" for i in range(50)),
+        "".join(f"data out{i}; set in{i}; run;\n" for i in range(80)),
+    )
+
+    def test_defaults_to_the_profiles_scale(self):
+        sizes = rules.load_ruleset("sparksql").sizes
+        self.assertEqual(sizes.story_point_range, (2.0, 8.0))
+
+    def test_range_moves_the_reported_points(self):
+        for source in self.SOURCES:
+            wide = _analyze(source, min_story_points=1, max_story_points=13).files[0]
+            self.assertGreaterEqual(wide.points, 1.0)
+            self.assertLessEqual(wide.points, 13.0)
+
+    def test_range_does_not_move_a_single_size(self):
+        """The bands are fractions of the span, so the verdicts are identical."""
+        for source in self.SOURCES:
+            default = _analyze(source).files[0]
+            wide = _analyze(source, min_story_points=1, max_story_points=13).files[0]
+            self.assertEqual(wide.size, default.size, source[:30])
+            self.assertEqual(wide.blend, default.blend, source[:30])
+
+    def test_either_end_can_be_set_alone(self):
+        f = _analyze(self.SOURCES[2], max_story_points=100).files[0]
+        self.assertEqual(rules.load_ruleset("sparksql").sizes.story_point_range[0], 2.0)
+        self.assertGreater(f.points, 3.0)
+        self.assertEqual(f.size, TShirtSize.MEDIUM)
+
+    def test_range_is_read_from_the_profile(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        doc = json.loads(
+            rules.profile_path("sparksql").read_text(encoding="utf-8")
+        )
+        doc["sizes"]["story_points"] = {"min": 1, "max": 13}
+        path = pathlib.Path(tmp) / "wide.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        sizes = rules.load_ruleset(path=str(path), use_cache=False).sizes
+        self.assertEqual(sizes.story_point_range, (1.0, 13.0))
+        self.assertEqual(sizes.points_for(0.0, 0.0, 0.0), 1.0)
+        self.assertEqual(sizes.points_for(1e6, 1e6, 1e6), 13.0)
+        self.assertEqual(
+            sizes.band_for(sizes.points_for(*sizes.anchor_dimensions)),
+            TShirtSize.MEDIUM,
+        )
+
+    def test_a_zero_minimum_is_rejected(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        doc = json.loads(
+            rules.profile_path("sparksql").read_text(encoding="utf-8")
+        )
+        doc["sizes"]["story_points"] = {"min": 0, "max": 8}
+        path = pathlib.Path(tmp) / "zero.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        with self.assertRaises(rules.RuleSetError):
+            rules.load_ruleset(path=str(path), use_cache=False)
+
+
+def _extra_large_source() -> str:
+    """A file that is bulky *and* hard — the only thing that rates Extra Large.
+
+    Volume alone saturates the effort window and tops out at Large, so an XL
+    fixture has to spend the complexity dimension too: a macro carrying arrays,
+    every DO form, LAG/DIF, run-time macro resolution and procedural jumps,
+    then forty-five merge/retain steps behind it.
+    """
+    lines = [
+        "%macro run_all(ds=, out=);",
+        "  %if &ds ne %then %do;",
+        "    data &out;",
+        "      set &ds;",
+        "      array s{5} s1-s5;",
+        "      do i = 1 to 5;",
+        "        s{i} = lag(s{i});",
+        "      end;",
+        "      do while (i < 3); i + 1; end;",
+        "      do until (i > 9); i + 1; end;",
+        '      p = dif(x); q = symget("v"); r = resolve("&v");',
+        '      call execute("data _null_; run;");',
+        '      call symput("k", x);',
+        "      link fix;",
+        "      return;",
+        "      fix: y = 1;",
+        "    run;",
+        "  %end;",
+        "%mend run_all;",
+        'filename pipe_in pipe "ls -l";',
+        'filename mailer email "a@b.c";',
+        "proc fcmp outlib=work.f.g; run;",
+        "proc iml; quit;",
+    ]
+    for i in range(45):
+        lines += [
+            f"data work.g{i};",
+            f"  merge work.a{i} work.b{i};",
+            "  retain acc;",
+            f"  h = md5(put(x{i}, 8.));",
+            "  if first.id then acc = 0;",
+            "run;",
+        ]
+    return "\n".join(lines)
+
+
 class TestAnchorCalibration(unittest.TestCase):
     """The anchor must stay the measured score of the file it describes.
 
@@ -654,6 +927,30 @@ class TestAnchorCalibration(unittest.TestCase):
                     f"profile, or fix anchor.describes to match reality."
                 ),
             )
+
+    def test_reference_file_measures_its_anchor_dimensions(self):
+        """The split, not just the total — each dimension has its own window."""
+        result = SasSemanticChunker().chunk_text(
+            _reference_file_source(), source_id="reference.sas"
+        )
+        for name in rules.available_profiles():
+            scored = ComplexityAnalyzer(target=name).analyze_result(result).files[0]
+            declared = rules.load_ruleset(name).sizes.anchor_dimensions
+            measured = (
+                scored.effort_raw,
+                scored.complexity_raw,
+                scored.uncertainty_raw,
+            )
+            for dimension, want, got in zip(rules.DIMENSIONS, declared, measured):
+                self.assertAlmostEqual(
+                    got,
+                    want,
+                    delta=1.0,
+                    msg=(
+                        f"{name}: reference file measures {dimension}={got}, but "
+                        f"anchor.dimensions declares {want}"
+                    ),
+                )
 
     def test_reference_file_is_medium_against_every_target(self):
         """It is the definition of Medium, so it must read Medium everywhere."""
@@ -904,10 +1201,9 @@ class TestFileComplexity(unittest.TestCase):
             self.assertIn("Files needing breakdown", md)
 
     def test_extra_large_file_suggests_batch_cut_points(self):
-        source = "".join(
-            f"data step{i}; set step{i - 1}; run;\n" for i in range(1, 60)
+        result = SasSemanticChunker().chunk_text(
+            _extra_large_source(), source_id="big.sas"
         )
-        result = SasSemanticChunker().chunk_text(source, source_id="big.sas")
         report = ComplexityAnalyzer().analyze_batch_result(
             SasChunkBatcher().batch(result)
         )
@@ -1228,6 +1524,65 @@ class TestRuleSetLoading(unittest.TestCase):
         with self.assertRaises(rules.RuleSetError) as ctx:
             rules.load_ruleset(path=self._write(doc), use_cache=False)
         self.assertIn("circular", str(ctx.exception))
+
+    def _sizes(self, sizes: dict):
+        return rules.load_ruleset(
+            path=self._write(self._minimal(sizes=sizes)), use_cache=False
+        ).sizes
+
+    def test_bounds_are_read_from_the_profile(self):
+        sizes = self._sizes(
+            {"anchor": {"raw": 10.0}, "bounds": {"effort": {"min": 1.0, "max": 4.0}}}
+        )
+        self.assertEqual(sizes.window_for("effort"), (10.0, 40.0))
+
+    def test_inverted_bounds_are_rejected(self):
+        with self.assertRaises(rules.RuleSetError) as ctx:
+            self._sizes({"bounds": {"effort": {"min": 2.0, "max": 1.0}}})
+        self.assertIn("effort", str(ctx.exception))
+
+    def test_unknown_bounded_dimension_is_rejected(self):
+        with self.assertRaises(rules.RuleSetError) as ctx:
+            self._sizes({"bounds": {"efrot": {"min": 0.0, "max": 1.0}}})
+        self.assertIn("efrot", str(ctx.exception))
+
+    def test_negative_dimension_weight_is_rejected(self):
+        with self.assertRaises(rules.RuleSetError) as ctx:
+            self._sizes({"dimension_weights": {"uncertainty": -1.0}})
+        self.assertIn("uncertainty", str(ctx.exception))
+
+    def test_all_zero_dimension_weights_are_rejected(self):
+        with self.assertRaises(rules.RuleSetError):
+            self._sizes(
+                {
+                    "dimension_weights": {
+                        "effort": 0.0,
+                        "complexity": 0.0,
+                        "uncertainty": 0.0,
+                    }
+                }
+            )
+
+    def test_anchor_dimensions_must_sum_to_the_anchor(self):
+        with self.assertRaises(rules.RuleSetError) as ctx:
+            self._sizes(
+                {
+                    "anchor": {
+                        "raw": 10.0,
+                        "dimensions": {
+                            "effort": 5.0,
+                            "complexity": 2.0,
+                            "uncertainty": 0.0,
+                        },
+                    }
+                }
+            )
+        self.assertIn("anchor.raw", str(ctx.exception))
+
+    def test_partial_anchor_dimensions_are_rejected(self):
+        with self.assertRaises(rules.RuleSetError) as ctx:
+            self._sizes({"anchor": {"raw": 10.0, "dimensions": {"effort": 10.0}}})
+        self.assertIn("complexity", str(ctx.exception))
 
 
 class TestComplexityCLI(unittest.TestCase):

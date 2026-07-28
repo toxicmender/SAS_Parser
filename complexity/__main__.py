@@ -70,6 +70,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "profile's own calibration).",
     )
     parser.add_argument(
+        "--min-story-points",
+        type=float,
+        default=None,
+        help="Points reported for the smallest file (default: config.json "
+        "complexity.min_story_points, then the profile's scale, then 2).",
+    )
+    parser.add_argument(
+        "--max-story-points",
+        type=float,
+        default=None,
+        help="Points reported for the largest file. With --min-story-points "
+        "this re-denominates the scale (say 1 and 13); sizes do not move, "
+        "only the numbers (default: config.json complexity.max_story_points, "
+        "then the profile's scale, then 8).",
+    )
+    parser.add_argument(
         "--no-cross-file",
         action="store_true",
         help="Score each file as if it were alone, without resolving its "
@@ -118,6 +134,8 @@ def main(argv: list[str] | None = None) -> int:
         args.target,
         rules_path=args.rules_path,
         size_anchor=args.size_anchor,
+        min_story_points=args.min_story_points,
+        max_story_points=args.max_story_points,
         use_cross_file=False if args.no_cross_file else None,
     )
     # analyze_items directly rather than analyze_batch_result: a batch result

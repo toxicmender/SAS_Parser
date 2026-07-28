@@ -16,8 +16,9 @@ on two orthogonal axes, and each **source file** on a third:
   Large per source file, with Fibonacci story points. Unlike the other two this
   is volume-aware, which is the whole point: a long file of trivial steps
   raises no signal at all and would otherwise read as trivial. Size combines
-  effort, complexity, and uncertainty, measured relative to a reference file
-  documented in the profile, and accounts for cross-file coupling.
+  effort, complexity, and uncertainty — each log-transformed and min-max
+  rescaled against a window measured relative to a reference file documented in
+  the profile — and accounts for cross-file coupling.
 
 Public API:
 
