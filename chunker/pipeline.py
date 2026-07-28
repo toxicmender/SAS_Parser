@@ -13,7 +13,6 @@ from pipeline.engine import SasLLMPipeline
 from pipeline.prompting import (
     _constructs_for_item,
     _format_batch_message,
-    _format_chunk_message,
     _kinds_for_item,
     _meta_flags_for_item,
     _query_for_chunk,
@@ -31,7 +30,6 @@ __all__ = [
     "SasLLMPipeline",
     "_constructs_for_item",
     "_format_batch_message",
-    "_format_chunk_message",
     "_kinds_for_item",
     "_meta_flags_for_item",
     "_query_for_chunk",

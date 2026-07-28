@@ -73,40 +73,6 @@ the cells and `risks` concise.
 """
 
 # Singleton-chunk context (SasChunk items in all_ordered_items).
-_CONTEXT_TEMPLATE = """\
-## Program context
-- Source file       : {source_id}
-- This item         : {chunk_id} ({index}/{total_items})
-- Kind              : {kind}
-- Title             : {title}
-- Datasets (ref)    : {datasets}
-- Librefs           : {librefs}
-- Datasets (in)     : {input_datasets}
-- Datasets (out)    : {output_datasets}
-- Macros (def)      : {macro_defs}
-- Macros (call)     : {macro_calls}
-- Macro var op      : {macro_var_op}
-- Macro vars (decl) : {declared_macro_vars}
-- Macro vars (ref)  : {referenced_macro_vars}
-- Macrovars (prod)  : {produced_macrovars}
-- Macrovars (cons)  : {consumed_macrovars}
-- Global stmt kw    : {global_statement_keyword}
-- Control-flow op   : {control_flow_op}
-- SAS functions     : {sas_functions}
-- CALL routines     : {call_routines}
-- Automatic vars    : {automatic_vars}
-- \u26a0\ufe0f SYMPUT hazard  : {symput_hazard}
-- \u26a0\ufe0f Contains ABORT: {contains_abort}
-- \u26a0\ufe0f Computed GOTO : {contains_computed_goto}
-- Diagnostics       : {diagnostics}
-
-## Chunk source
-```sas
-{text}
-```
-"""
-
-# Batch context (SasBatch items in all_ordered_items).
 _BATCH_MEMBER_TEMPLATE = """\
 ### {chunk_id}  [{kind}]  ({source_id}, lines {start_line}-{end_line})
 Title: {title}

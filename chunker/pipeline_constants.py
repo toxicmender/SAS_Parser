@@ -8,7 +8,6 @@ import warnings
 from pipeline.constants import (
     _BATCH_CONTEXT_TEMPLATE,
     _BATCH_MEMBER_TEMPLATE,
-    _CONTEXT_TEMPLATE,
     _STRUCTURED_SYSTEM_PROMPT_TEMPLATE,
     _SYSTEM_PROMPT_TEMPLATE,
 )
@@ -23,7 +22,6 @@ warnings.warn(
 __all__ = [
     "_BATCH_CONTEXT_TEMPLATE",
     "_BATCH_MEMBER_TEMPLATE",
-    "_CONTEXT_TEMPLATE",
     "_STRUCTURED_SYSTEM_PROMPT_TEMPLATE",
     "_SYSTEM_PROMPT_TEMPLATE",
 ]

@@ -52,7 +52,6 @@ from chunker.chunker import SasSemanticChunker
 from chunker.models import (
     SasBatch,
     SasBatchResult,
-    SasChunk,
     SasCorpus,
     SasDiagnostic,
 )
@@ -73,7 +72,6 @@ from .constants import (
 from .prompting import (
     _constructs_for_item,
     _format_batch_message,
-    _format_chunk_message,
     _kinds_for_item,
     _meta_flags_for_item,
     _query_for_item,
@@ -117,6 +115,11 @@ class SasLLMPipeline:
     accumulated context, batch by batch, exactly like a single
     conversation about one migration job. Call with an explicit
     ``thread_id`` to resume or fork that conversation later.
+
+    Every processed item is a :class:`SasBatch` (singletons arrive wrapped
+    by ``coalesce_into_batches``), so in each output dict ``is_batch`` is
+    always ``True`` and ``kind`` always ``None`` — both kept for output-shape
+    compatibility and deprecated.
 
     Parameters
     ----------
@@ -1243,7 +1246,7 @@ class SasLLMPipeline:
         )
 
     def _instruction_messages(
-        self, item: SasBatch | SasChunk
+        self, item: SasBatch
     ) -> tuple[list[BaseMessage], list[str]]:
         """Ephemeral reference guidance for *item*, as both artefacts of one
         retrieval: ``(messages, retrieval_context)``.
@@ -1273,7 +1276,7 @@ class SasLLMPipeline:
         guidance = self._prompt_builder.build_from_picks(picks, constructs)
         if not guidance:
             return [], retrieval_context
-        item_id = item.batch_id if isinstance(item, SasBatch) else item.chunk_id
+        item_id = item.batch_id
         logger.debug(
             f"_instruction_messages: item={item_id}  guidance_chars={len(guidance)}"
             f"  retrieved={len(retrieval_context)}"
@@ -1304,7 +1307,7 @@ class SasLLMPipeline:
 
     def _answer_item(
         self,
-        item: SasBatch | SasChunk,
+        item: SasBatch,
         idx: int,
         total: int,
         *,
@@ -1332,7 +1335,7 @@ class SasLLMPipeline:
         (swallowed, as in the observe-only policy). Any LLM-call exception
         propagates to the caller, which records the error fact.
         """
-        item_id = item.batch_id if isinstance(item, SasBatch) else item.chunk_id
+        item_id = item.batch_id
         history = self._memory.get_thread(thread_id)
         max_attempts = 1 + self._validation_retries
         feedback: list[BaseMessage] = []
@@ -1414,7 +1417,7 @@ class SasLLMPipeline:
             )
 
     def _resume_state(
-        self, items: Sequence[SasBatch | SasChunk], thread_id: str
+        self, items: Sequence[SasBatch], thread_id: str
     ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], list[BaseMessage]]:
         """Resolve what a resume can skip and what it must redo.
 
@@ -1463,8 +1466,7 @@ class SasLLMPipeline:
 
         redo_start: int | None = None
         for pos, item in enumerate(items, start=1):
-            item_id = item.batch_id if isinstance(item, SasBatch) else item.chunk_id
-            if not _satisfied(item_id):
+            if not _satisfied(item.batch_id):
                 redo_start = pos
                 break
 
@@ -1477,9 +1479,7 @@ class SasLLMPipeline:
 
         self._rewind_for_resume(items, thread_id, redo_start)
         completed = {
-            item.batch_id if isinstance(item, SasBatch) else item.chunk_id: ok_facts[
-                item.batch_id if isinstance(item, SasBatch) else item.chunk_id
-            ]
+            item.batch_id: ok_facts[item.batch_id]
             for pos, item in enumerate(items, start=1)
             if pos < redo_start
         }
@@ -1490,7 +1490,7 @@ class SasLLMPipeline:
         return completed, completed_validations, recovered
 
     def _rewind_for_resume(
-        self, items: Sequence[SasBatch | SasChunk], thread_id: str, redo_start: int
+        self, items: Sequence[SasBatch], thread_id: str, redo_start: int
     ) -> None:
         """Rewind *thread_id* to just before item *redo_start* (1-based).
 
@@ -1505,9 +1505,8 @@ class SasLLMPipeline:
         for pos, item in enumerate(items, start=1):
             if pos < redo_start:
                 continue
-            item_id = item.batch_id if isinstance(item, SasBatch) else item.chunk_id
-            self._memory.kv.delete(f"run::{thread_id}::item::{item_id}")
-            self._memory.kv.delete(f"validation::{thread_id}::item::{item_id}")
+            self._memory.kv.delete(f"run::{thread_id}::item::{item.batch_id}")
+            self._memory.kv.delete(f"validation::{thread_id}::item::{item.batch_id}")
         logger.info(
             f"_rewind_for_resume: thread='{thread_id}'  rewound to item "
             f"{redo_start} (kept {keep_pairs} pair(s), removed {removed} message(s))"
@@ -1515,7 +1514,7 @@ class SasLLMPipeline:
 
     def _process(
         self,
-        items: Sequence[SasBatch | SasChunk],
+        items: Sequence[SasBatch],
         diagnostics: list[SasDiagnostic],
         *,
         thread_id: str,
@@ -1546,14 +1545,9 @@ class SasLLMPipeline:
         outputs: list[dict[str, Any]] = []
 
         for idx, item in enumerate(items, start=1):
-            is_batch = isinstance(item, SasBatch)
-            item_id = item.batch_id if is_batch else item.chunk_id
+            item_id = item.batch_id
 
-            user_msg = (
-                _format_batch_message(item, idx, total, diagnostics)
-                if is_batch
-                else _format_chunk_message(item, idx, total, diagnostics)
-            )
+            user_msg = _format_batch_message(item, idx, total, diagnostics)
             # Per-item guidance rides in the config, not the state, so it is
             # prompted without ever entering the persisted message history.
             # Both are derived above the resume check on purpose: a skipped
@@ -1571,14 +1565,10 @@ class SasLLMPipeline:
                 outputs.append(
                     {
                         "item_id": item_id,
-                        "is_batch": is_batch,
-                        "chunk_ids": item.chunk_ids
-                        if is_batch
-                        else [item.chunk_id],
-                        "source_files": item.source_files
-                        if is_batch
-                        else [item.source_id or "unknown"],
-                        "kind": None if is_batch else item.kind.value,
+                        "is_batch": True,
+                        "chunk_ids": item.chunk_ids,
+                        "source_files": item.source_files,
+                        "kind": None,
                         "prompt": user_msg,
                         "retrieval_context": retrieval_context,
                         "response": self._recovered_response(recovered, fact),
@@ -1593,7 +1583,8 @@ class SasLLMPipeline:
                 continue
 
             logger.info(
-                f"_process: item {idx}/{total}  id={item_id}  is_batch={is_batch}  thread={thread_id}"
+                f"_process: item {idx}/{total}  id={item_id}  "
+                f"members={len(item.chunks)}  thread={thread_id}"
             )
 
             t_item = time.perf_counter()
@@ -1623,7 +1614,7 @@ class SasLLMPipeline:
                         "status": "error",
                         "index": idx,
                         "total": total,
-                        "is_batch": is_batch,
+                        "is_batch": True,
                         "error": repr(exc),
                         "ts": time.time(),
                     },
@@ -1638,7 +1629,7 @@ class SasLLMPipeline:
                     "status": "ok",
                     "index": idx,
                     "total": total,
-                    "is_batch": is_batch,
+                    "is_batch": True,
                     "elapsed_s": round(elapsed, 3),
                     "response_chars": len(ai_text),
                     "attempts": attempts,
@@ -1659,12 +1650,10 @@ class SasLLMPipeline:
             outputs.append(
                 {
                     "item_id": item_id,
-                    "is_batch": is_batch,
-                    "chunk_ids": item.chunk_ids if is_batch else [item.chunk_id],
-                    "source_files": item.source_files
-                    if is_batch
-                    else [item.source_id or "unknown"],
-                    "kind": None if is_batch else item.kind.value,
+                    "is_batch": True,
+                    "chunk_ids": item.chunk_ids,
+                    "source_files": item.source_files,
+                    "kind": None,
                     "prompt": user_msg,
                     "retrieval_context": retrieval_context,
                     "response": ai_text,

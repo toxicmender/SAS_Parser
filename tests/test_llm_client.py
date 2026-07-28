@@ -1105,9 +1105,9 @@ def test_as_runnable_composes_with_prompt():
 
 def test_pipeline_enforces_input_token_budget():
     # End-to-end: SasLLMPipeline forwards max_input_tokens into LLMClient;
-    # the formatted chunk prompt (hundreds of chars) blows a 1-token budget
+    # the formatted batch prompt (hundreds of chars) blows a 1-token budget
     # under any counter, so the call must fail before reaching the fake LLM.
-    from chunker.models import SasChunk, SasChunkKind, SasChunkMetadata
+    from chunker.models import SasBatch, SasChunk, SasChunkKind, SasChunkMetadata
     from pipeline import SasLLMPipeline
     from memory.store import MemoryHub
 
@@ -1129,6 +1129,7 @@ def test_pipeline_enforces_input_token_budget():
         end_char=17,
         metadata=SasChunkMetadata(),
     )
+    batch = SasBatch(batch_id="merged-001", chunks=[chunk], source_files=["etl.sas"])
 
     with pytest.raises(InputTokenLimitError):
-        pipeline._process(items=[chunk], diagnostics=[], thread_id="run::etl.sas")
+        pipeline._process(items=[batch], diagnostics=[], thread_id="run::etl.sas")

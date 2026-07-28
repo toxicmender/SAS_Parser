@@ -32,10 +32,7 @@ from chunker.models import (
     SasChunkMetadata,
 )
 from pipeline import SasLLMPipeline
-from pipeline.prompting import (
-    _format_batch_message,
-    _format_chunk_message,
-)
+from pipeline.prompting import _format_batch_message
 
 
 def _mk_chunk(chunk_id: str, source_id: str, text: str, **meta_kwargs) -> SasChunk:
@@ -57,12 +54,25 @@ def _mk_batch(batch_id: str, chunks: list[SasChunk], **kwargs) -> SasBatch:
     return SasBatch(batch_id=batch_id, chunks=chunks, **kwargs)
 
 
+def _wrap(chunk: SasChunk) -> SasBatch:
+    """A one-member batch carrying the chunk's own id — the shape _process
+    takes now that items are SasBatch only (coalesce_into_batches wraps every
+    singleton before anything is prompted)."""
+    return SasBatch(
+        batch_id=chunk.chunk_id,
+        chunks=[chunk],
+        source_files=[chunk.source_id or "unknown"],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pure formatting functions — no Spark/LLM required
 # ---------------------------------------------------------------------------
 
 
-def test_format_chunk_message_includes_key_fields():
+def test_format_batch_message_covers_the_single_member_case():
+    # There is no per-chunk formatter any more: a lone chunk is prompted as a
+    # one-member batch, and its key fields must all surface there.
     chunk = _mk_chunk(
         "f1-chunk-0001",
         "etl.sas",
@@ -72,11 +82,18 @@ def test_format_chunk_message_includes_key_fields():
         symput_scope_hazard=True,
         symput_hazard_vars=["cutoff"],
     )
-    msg = _format_chunk_message(chunk, index=1, total=1, diagnostics=[])
+    batch = _mk_batch(
+        "merged-001",
+        [chunk],
+        source_files=["etl.sas"],
+        input_datasets=["work.in"],
+        output_datasets=["work.out"],
+    )
+    msg = _format_batch_message(batch, index=1, total=1, diagnostics=[])
 
     assert "work.in" in msg
     assert "work.out" in msg
-    assert "yes (cutoff)" in msg  # symput hazard line
+    assert "yes" in msg  # symput hazard aggregate line
     assert "data work.out; set work.in; run;" in msg
 
 
@@ -173,8 +190,9 @@ def test_pipeline_accumulates_history_across_batches():
         output_datasets=["work.a"],
     )
 
+    singleton = _mk_batch("merged-001", [c1], source_files=["etl.sas"])
     results = pipeline._process(
-        items=[batch, c1],  # a batch, then an unrelated singleton
+        items=[batch, singleton],  # a real batch, then a one-member merge
         diagnostics=[],
         thread_id="run::etl.sas",
     )
@@ -183,7 +201,7 @@ def test_pipeline_accumulates_history_across_batches():
     assert results[0]["is_batch"] is True
     assert results[0]["item_id"] == "batch-001"
     assert results[0]["response"] == "translation for item 1"
-    assert results[1]["is_batch"] is False
+    assert results[1]["item_id"] == "merged-001"
     assert results[1]["response"] == "translation for item 2"
 
     # Both turns landed in the SAME thread, in order: human/ai x2
@@ -249,7 +267,7 @@ def test_pipeline_window_trimming_limits_injected_history():
         _mk_chunk(f"f1-chunk-000{i}", "etl.sas", f"data work.t{i}; run;")
         for i in range(3)
     ]
-    pipeline._process(items=chunks, diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(items=[_wrap(c) for c in chunks], diagnostics=[], thread_id="run::etl.sas")
 
     # Full history is still persisted (trimming only affects the prompt)...
     full_history = pipeline.get_thread_messages("run::etl.sas")
@@ -262,7 +280,7 @@ def test_snapshot_delegates_to_memory():
     pipeline = SasLLMPipeline(model="unused", memory=mem, llm=fake_llm)
 
     c1 = _mk_chunk("f1-chunk-0001", "etl.sas", "data work.a; run;")
-    pipeline._process(items=[c1], diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(items=[_wrap(c1)], diagnostics=[], thread_id="run::etl.sas")
 
     snap = pipeline.snapshot()
     assert snap == mem.snapshot()
@@ -283,7 +301,7 @@ def test_run_facts_recorded_per_item():
         _mk_chunk("f1-chunk-0001", "etl.sas", "data work.a; run;"),
         _mk_chunk("f1-chunk-0002", "etl.sas", "proc print data=work.a; run;"),
     ]
-    pipeline._process(items=chunks, diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(items=[_wrap(c) for c in chunks], diagnostics=[], thread_id="run::etl.sas")
 
     facts = pipeline.get_run_facts("run::etl.sas")
     assert [f["item_id"] for f in facts] == ["f1-chunk-0001", "f1-chunk-0002"]
@@ -298,12 +316,12 @@ def test_run_facts_isolated_per_thread():
     fake_llm = FakeListChatModel(responses=["a", "b"])
     pipeline = SasLLMPipeline(model="unused", memory=MemoryHub(), llm=fake_llm)
     pipeline._process(
-        items=[_mk_chunk("c1", "a.sas", "data work.a; run;")],
+        items=[_wrap(_mk_chunk("c1", "a.sas", "data work.a; run;"))],
         diagnostics=[],
         thread_id="run::a.sas",
     )
     pipeline._process(
-        items=[_mk_chunk("c2", "b.sas", "data work.b; run;")],
+        items=[_wrap(_mk_chunk("c2", "b.sas", "data work.b; run;"))],
         diagnostics=[],
         thread_id="run::b.sas",
     )
@@ -325,10 +343,10 @@ def test_resume_skips_completed_items_and_recovers_responses():
     c2 = _mk_chunk("f1-chunk-0002", "etl.sas", "proc print data=work.a; run;")
 
     # First run "crashed" after item 1: only c1 was processed.
-    pipeline._process(items=[c1], diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(items=[_wrap(c1)], diagnostics=[], thread_id="run::etl.sas")
 
     outputs = pipeline._process(
-        items=[c1, c2], diagnostics=[], thread_id="run::etl.sas", resume=True
+        items=[_wrap(c1), _wrap(c2)], diagnostics=[], thread_id="run::etl.sas", resume=True
     )
 
     assert outputs[0]["skipped"] is True
@@ -345,7 +363,7 @@ def test_resume_reprocesses_items_with_error_facts():
     pipeline = SasLLMPipeline(model="unused", memory=mem, llm=fake_llm)
 
     c1 = _mk_chunk("f1-chunk-0001", "etl.sas", "data work.a; run;")
-    pipeline._process(items=[c1], diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(items=[_wrap(c1)], diagnostics=[], thread_id="run::etl.sas")
     c2 = _mk_chunk("f1-chunk-0002", "etl.sas", "proc print data=work.a; run;")
     # Simulate a crashed second item: an error fact, no persisted turn.
     mem.kv.set(
@@ -354,7 +372,7 @@ def test_resume_reprocesses_items_with_error_facts():
     )
 
     outputs = pipeline._process(
-        items=[c1, c2], diagnostics=[], thread_id="run::etl.sas", resume=True
+        items=[_wrap(c1), _wrap(c2)], diagnostics=[], thread_id="run::etl.sas", resume=True
     )
 
     assert outputs[1]["skipped"] is False  # error fact does not skip
@@ -370,14 +388,14 @@ def test_fork_run_then_resume_continues_from_the_fork():
 
     c1 = _mk_chunk("f1-chunk-0001", "etl.sas", "data work.a; run;")
     c2 = _mk_chunk("f1-chunk-0002", "etl.sas", "proc print data=work.a; run;")
-    pipeline._process(items=[c1, c2], diagnostics=[], thread_id="run::v1")
+    pipeline._process(items=[_wrap(c1), _wrap(c2)], diagnostics=[], thread_id="run::v1")
 
     # Rewind to after item 1 and redo item 2 on a fresh branch.
     copied = pipeline.fork_run("run::v1", "run::v2", upto_items=1)
     assert copied == 2  # one (human, AI) pair
 
     outputs = pipeline._process(
-        items=[c1, c2], diagnostics=[], thread_id="run::v2", resume=True
+        items=[_wrap(c1), _wrap(c2)], diagnostics=[], thread_id="run::v2", resume=True
     )
 
     assert outputs[0]["skipped"] is True
@@ -419,7 +437,7 @@ def test_summarizer_gets_pipeline_store_and_summary_never_persisted():
         _mk_chunk(f"f1-chunk-000{i}", "etl.sas", f"data work.t{i}; run;")
         for i in range(3)
     ]
-    pipeline._process(items=chunks, diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(items=[_wrap(c) for c in chunks], diagnostics=[], thread_id="run::etl.sas")
 
     # The summary state lives in the KV layer and covered the folded turns…
     state = mem.kv.get("summary::run::etl.sas")
@@ -497,7 +515,7 @@ def test_prompt_caching_marks_system_block_for_anthropic_models():
 
     # End-to-end: the block-shaped system message flows through the graph.
     c1 = _mk_chunk("f1-chunk-0001", "etl.sas", "data work.a; run;")
-    out = pipeline._process(items=[c1], diagnostics=[], thread_id="run::cache")
+    out = pipeline._process(items=[_wrap(c1)], diagnostics=[], thread_id="run::cache")
     assert out[0]["response"] == "ok"
 
 
