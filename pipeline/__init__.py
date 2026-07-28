@@ -7,6 +7,15 @@ lazily so that importing the response models or the notebook renderer never
 pulls in langchain/langgraph.
 """
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Static-only imports so type checkers resolve the lazily-served names
+    # precisely: without these, the union of __getattr__'s return statements
+    # (type[SasLLMPipeline] | type[MemorySetup]) leaks into every caller.
+    from .engine import SasLLMPipeline as SasLLMPipeline
+    from .setup import MemorySetup as MemorySetup
+
 from .notebook import (
     build_notebook,
     document_to_cells,
