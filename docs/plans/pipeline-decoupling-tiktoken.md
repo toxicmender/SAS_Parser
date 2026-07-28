@@ -7,6 +7,9 @@ Status: proposal (no code changed yet). Scope of this document:
 3. tiktoken as the default encoding / token estimator, with `gpt-5.4` as the
    default model.
 4. Simplification driven by the current default workflow (`demo_run.py local`).
+5. Fewer LLM calls: token-budgeted packing of singletons and adjacent small
+   batches.
+6. A complete notebook per converted SAS source file.
 
 ## 1. Evaluation of the current state
 
@@ -124,9 +127,10 @@ same units.
 
 ## 2. Plan
 
-Three phases, each independently shippable and separately committed
+Five phases, each independently shippable and separately committed
 (conventional commits, one logical change per commit). Phase 1 is pure code
-motion; phases 2–3 change behavior in narrow, stated ways.
+motion; phases 2–5 change behavior in narrow, stated ways. See §3 for
+sequencing rationale and cross-phase interactions.
 
 ### Phase 1 — move the pipeline out of `chunker` (code motion only)
 
@@ -260,8 +264,10 @@ single token-budgeted packing pass over the ordered items:
   - `max_merged_chunks` — total member chunks (kept as a secondary cap so a
     pathological corpus of tiny chunks still bounds prompt complexity).
 - A window containing a single real batch passes it through **unchanged**
-  (same `batch_id`, same reason) — the no-packing case degenerates to today's
-  behavior. A multi-item window becomes a synthetic `packed-NNN` batch whose
+  (same `batch_id`, same reason); a window containing a single singleton
+  chunk keeps today's one-member `merged-NNN` wrap (the "always a SasBatch"
+  invariant) — so the no-packing case degenerates to today's behavior.
+  A multi-item window becomes a synthetic `packed-NNN` batch whose
   aggregates are recomputed the way `_merge_singletons_into_batch` already
   does (outputs of earlier members consumed by later members become internal;
   external I/O, required macros/macrovars/librefs unioned), with reason
@@ -366,9 +372,13 @@ cannot be routed to files without guessing.
    - Document-level Analysis/Mapping/Risks cells go to every participating
      notebook — they are markdown, cheap, and each file's notebook should
      stand alone.
-   - **Degradation**: cells with a missing or unresolvable `chunk_id` — and
-     the entire markdown-fallback path, which has no attribution — fall back
-     to today's behavior (`_cross_file.ipynb` + pointer cells). Nothing gets
+   - **Degradation is all-or-nothing per item**: an item splits only when
+     *every* code cell's `chunk_id` resolves; if any code cell is untagged or
+     unresolvable — or the item came through the markdown-fallback path,
+     which has no attribution — the **whole item** falls back to today's
+     behavior (`_cross_file.ipynb` + pointer cells). A per-cell fallback
+     would scatter one item's translation across per-file notebooks *and*
+     `_cross_file.ipynb`, which is worse than either whole. Nothing gets
      worse than the status quo; `_cross_file.ipynb` becomes the exception
      path rather than the rule, and disappears entirely on a run where every
      cross-file document tags cleanly.
@@ -394,10 +404,54 @@ not visibly regress the per-file deliverable.
 
 Invariants that must survive every phase (Architecture.md §Load-bearing):
 no LangGraph checkpointer; ephemeral guidance/summary/notes never persisted;
-`chat::` key schema untouched; in-memory mode stays Spark-free; batch reason
-strings and item ordering unchanged (phases here touch none of the batcher).
+`chat::` key schema untouched; in-memory mode stays Spark-free. The batcher's
+**dependency grouping** — union-find, weak-edge resolution, batch membership,
+reason strings, corpus ordering — is untouched by every phase; Phase 4's one
+stated exception is the *coalescing* layer above it (`coalesce_into_batches`
+and the synthetic merged/packed batch ids and reasons it emits), which was
+always call-level packaging, not dependency discovery.
 
-### Suggested commit sequence
+## 3. Sequencing rationale and cross-phase interactions
+
+**Two viable tracks.** The commit sequence below is hygiene-first
+(1→2→3→4→5): the package move lands before the feature work so Phases 4–5
+edit files in their final location instead of being churned by a later move.
+If reducing LLM calls and the per-file notebook deliverable are urgent, a
+value-first track works too: Phase 2 → 4 → 5 first (4 needs 2's counter;
+5 is independent), deferring 1 and 3 — at the cost of the move later touching
+freshly-changed files. Recommendation: hygiene-first unless there is schedule
+pressure; Phase 1 is cheap and makes everything after it cleaner to review.
+
+**Interactions to keep in view:**
+
+- *Packing grows the history, not just the prompt* (4 ↔ default trimming).
+  `window_k` counts turn *pairs*; packed items make each pair bigger, so the
+  default 6-pair window can grow materially in tokens. Phase 4's budget
+  derivation accounts for it via the history-headroom term, and Phase 2's
+  counter makes `RelevantHistorySelector(max_tokens=...)` a real
+  (token-accurate) alternative when window growth becomes a problem — worth
+  revisiting the default trimming mode after Phase 4 is measured, not before.
+- *Per-call overhead economics changed by the model default* (2 ↔ 4).
+  With `gpt-5.4`, Anthropic `cache_control` is inert, but OpenAI-compatible
+  endpoints typically apply automatic server-side prompt caching to a stable
+  prefix — partially discounting the repeated system prompt. Phase 4's win is
+  therefore mostly the *history + guidance* re-send and request latency, not
+  the system prompt; the call-reduction estimate should be validated against
+  real gateway usage numbers (the `TokenUsage` cache fields already report
+  this) rather than assumed.
+- *Bigger items stress structured output* (4 ↔ 5). Packed items mean longer
+  `TranslationDocument`s with more cells to tag; if tagging reliability drops
+  with size, Phase 5's all-or-nothing fallback sends more items to
+  `_cross_file.ipynb`, silently undoing the per-file deliverable. This is the
+  concrete reason Phase 5 lands *before* Phase 4's default flip and both are
+  gated on the validation suite plus a manual notebook-output check on the
+  sample corpus.
+- *One vocabulary end to end* (2 ↔ 4). The packing cost function, the input
+  budget, the summarizer trigger, and history packing must all count with the
+  same encoding, or the packing headroom math in Phase 4's budget derivation
+  is fiction. Phase 2 is what makes that true; do not land Phase 4 without it.
+
+## 4. Suggested commit sequence
 
 1. `refactor(pipeline): move pipeline/notebook/response models out of chunker into a pipeline package` (Phase 1)
 2. `feat(llm_client): tiktoken-backed token counting by default, gpt-5.4 default model` (Phase 2)
