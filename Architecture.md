@@ -97,6 +97,11 @@ chunker/
   notebook.py           a future release.
 
 pipeline/
+  setup.py              MemorySetup: grouped memory wiring for the pipeline
+                        constructor (store hub, task policy, thread memory,
+                        extractor, chat identity) with the cross-injection
+                        logic in build(). LLM transport groups under
+                        llm_client.LLMClientConfig the same way.
   engine.py             SasLLMPipeline: the LangGraph StateGraph wiring,
                         memory/validation integration, resume and fork, and
                         opt-in Anthropic prompt caching on the system prompt.

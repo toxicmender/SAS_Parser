@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import logging
 import time
-import uuid
 import warnings
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
@@ -46,7 +45,6 @@ from chunker.batcher import (
     MultiFileBatcher,
     SasChunkBatcher,
     coalesce_into_batches,
-    parse_databricks_mapping_csv,
 )
 from chunker.chunker import SasSemanticChunker
 from chunker.models import (
@@ -56,7 +54,6 @@ from chunker.models import (
     SasDiagnostic,
 )
 from llm_client import LLMClient, LLMClientConfig, TokenUsage
-from memory.context import MemoryContext
 from memory.extractor import MemoryExtractor
 from memory.policy import TaskPolicy
 from memory.relevance import RelevantHistorySelector
@@ -77,6 +74,7 @@ from .prompting import (
     _query_for_item,
 )
 from .response_models import TranslationDocument
+from .setup import MemorySetup
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
@@ -127,7 +125,27 @@ class SasLLMPipeline:
         Model id as the AI Gateway names it, e.g. ``"gpt-5.4"`` (the
         default) or ``"claude-sonnet-4-5"``.
         Every model reaches the gateway over its OpenAI-compatible API,
-        so the name selects the model, not the transport.
+        so the name selects the model, not the transport. Ignored (the
+        config's own model wins) when ``llm_config`` is passed.
+    llm_config : LLMClientConfig | None
+        The canonical form of the LLM transport settings: a pre-built
+        :class:`llm_client.LLMClientConfig` used as-is (its ``model``
+        becomes the pipeline's model). Passing it together with any of the
+        individual transport kwargs (``model``, ``temperature``,
+        ``max_input_tokens``, ``requests_per_second``, ``max_retries``,
+        ``base_url``, ``api_key``, ``url_headers``, ``timeout``,
+        ``model_kwargs``, ``llm_kwargs``) raises ``ValueError`` — grouped
+        and legacy spellings of the same concern do not mix. ``None``
+        (default) builds one from those kwargs exactly as before.
+    memory_setup : MemorySetup | None
+        The canonical form of the memory wiring: a
+        :class:`pipeline.setup.MemorySetup` whose ``build()`` produces the
+        store hub, instruction memories, extractor, and chat identity.
+        Passing it together with any of the individual memory kwargs
+        (``memory``, ``task_id``, ``task_policy``, ``thread_memory``,
+        ``memory_extractor``, ``chat_id``, ``spark``, ``delta_table``)
+        raises ``ValueError``. ``None`` (default) builds one from those
+        kwargs exactly as before.
     temperature : float | None
         Sampling temperature for the LLM. ``None`` (default) keeps the
         provider default. Forwarded to :class:`llm_client.LLMClientConfig`.
@@ -247,16 +265,6 @@ class SasLLMPipeline:
         dataset reference — are rewritten to Unity Catalog
         ``catalog.schema.table`` names before prompting.  Default:
         ``None`` (no renaming).
-    databricks_mapping_sharepoint : str | None
-        Path (relative to the configured SharePoint document library —
-        see :mod:`app_config.sharepoint`) of a CSV file holding the
-        SAS→Databricks mapping, parsed by
-        :func:`chunker.batcher.parse_databricks_mapping_csv` (column 1 the
-        SAS libref or ``libref.member``, column 2 the Databricks target).
-        Read once at construction; a failure to read or an empty parse
-        raises so a run never proceeds silently unmapped.  When both this
-        and ``databricks_mapping`` are given, they merge with the explicit
-        dict winning per key.  Default: ``None``.
     memory : MemoryHub | None
         Pre-built memory.store facade. If omitted, one is constructed from
         ``spark``/``delta_table``.
@@ -358,6 +366,8 @@ class SasLLMPipeline:
         self,
         model: str = "gpt-5.4",
         *,
+        llm_config: LLMClientConfig | None = None,
+        memory_setup: MemorySetup | None = None,
         temperature: float | None = None,
         max_input_tokens: int | None = None,
         requests_per_second: float | None = None,
@@ -380,7 +390,6 @@ class SasLLMPipeline:
         include_comment_chunks: bool = False,
         max_merged_chunks: int = 8,
         databricks_mapping: dict[str, str] | None = None,
-        databricks_mapping_sharepoint: str | None = None,
         memory: MemoryHub | None = None,
         task_id: str | None = None,
         task_policy: TaskPolicy | None = None,
@@ -399,6 +408,62 @@ class SasLLMPipeline:
         if validation_retries < 0:
             raise ValueError(
                 f"validation_retries must be >= 0, got {validation_retries}"
+            )
+        # Grouped configs are the canonical form; the individual kwargs are
+        # the legacy spelling. Mixing the two for the same concern would make
+        # one of them silently lose, so it is rejected outright.
+        if llm_config is not None:
+            transport_kwargs = {
+                "temperature": temperature,
+                "max_input_tokens": max_input_tokens,
+                "requests_per_second": requests_per_second,
+                "base_url": base_url,
+                "api_key": api_key,
+                "url_headers": url_headers,
+                "timeout": timeout,
+                "model_kwargs": model_kwargs,
+                "llm_kwargs": llm_kwargs,
+            }
+            conflicts = sorted(k for k, v in transport_kwargs.items() if v is not None)
+            if model != "gpt-5.4":
+                conflicts.insert(0, "model")
+            if max_retries != 3:
+                conflicts.append("max_retries")
+            if conflicts:
+                raise ValueError(
+                    f"llm_config was given together with transport keyword "
+                    f"argument(s) {', '.join(conflicts)}; put them on the "
+                    f"LLMClientConfig instead"
+                )
+            model = llm_config.model
+        if memory_setup is not None:
+            memory_kwargs = {
+                "memory": memory,
+                "task_id": task_id,
+                "task_policy": task_policy,
+                "thread_memory": thread_memory,
+                "memory_extractor": memory_extractor,
+                "chat_id": chat_id,
+                "spark": spark,
+                "delta_table": delta_table,
+            }
+            conflicts = sorted(k for k, v in memory_kwargs.items() if v is not None)
+            if conflicts:
+                raise ValueError(
+                    f"memory_setup was given together with memory keyword "
+                    f"argument(s) {', '.join(conflicts)}; put them on the "
+                    f"MemorySetup instead"
+                )
+        else:
+            memory_setup = MemorySetup(
+                memory=memory,
+                task_id=task_id,
+                task_policy=task_policy,
+                thread_memory=thread_memory,
+                memory_extractor=memory_extractor,
+                chat_id=chat_id,
+                spark=spark,
+                delta_table=delta_table,
             )
         if validation_retries and validator is None:
             logger.warning(
@@ -463,15 +528,10 @@ class SasLLMPipeline:
             validation_retries if validator is not None else 0
         )
 
-        # SAS→Databricks dataset renaming: a SharePoint-hosted CSV mapping
-        # merges under any explicit dict (the in-code argument wins per key),
-        # and the combined mapping is forwarded to both batchers, which apply
-        # it as a post-pass after grouping.
-        if databricks_mapping_sharepoint:
-            sp_mapping = self._load_sharepoint_databricks_mapping(
-                databricks_mapping_sharepoint
-            )
-            databricks_mapping = {**sp_mapping, **(databricks_mapping or {})}
+        # SAS→Databricks dataset renaming, forwarded to both batchers, which
+        # apply it as a post-pass after grouping. A SharePoint-hosted CSV is
+        # the caller's job now: chunker.batcher.load_databricks_mapping_sharepoint
+        # loads one, and merging it under an explicit dict is one line there.
         self.databricks_mapping = databricks_mapping or None
 
         self.chunker = SasSemanticChunker(min_words=min_words, max_words=max_words)
@@ -493,7 +553,21 @@ class SasLLMPipeline:
             )
         self._requested_structured_output = structured_output
 
-        self._memory = memory or self._build_default_memory(spark, delta_table)
+        # All memory wiring — hub default, store injection, extractor
+        # implications, chat identity — lives in MemorySetup.build(). One
+        # pipeline instance is one *chat*: the span of a thread this object
+        # writes (Task -> Thread -> Chat -> Message); the id is per-instance,
+        # so resuming a thread from a new pipeline opens a new chat on the
+        # same thread — exactly the boundary the policy snapshot below is
+        # taken at.
+        built = memory_setup.build()
+        self._memory = built.hub
+        self.chat_id = built.chat_id
+        self.task_id = built.task_id
+        self._task_policy = built.task_policy
+        self._thread_memory = built.thread_memory
+        self._memory_context = built.context
+        self._memory_extractor = built.extractor
 
         self._summarizer = summarizer
         if summarizer is not None and summarizer.store is None:
@@ -501,70 +575,33 @@ class SasLLMPipeline:
             # snapshot()/restore() carry them along with the history.
             summarizer.store = self._memory.kv
 
-        # ---- Memory: long-term policy, short-term notes, extraction ------
-        # One pipeline instance is one *chat*: the span of a thread this
-        # object writes (Task -> Thread -> Chat -> Message). The id is
-        # per-instance, so resuming a thread from a new pipeline opens a new
-        # chat on the same thread — which is exactly the boundary the policy
-        # snapshot below is taken at.
-        self.chat_id = chat_id or uuid.uuid4().hex[:12]
-        self.task_id = task_id
-        if task_policy is None and task_id is not None:
-            task_policy = TaskPolicy(task_id, store=self._memory.kv)
-        elif task_policy is not None:
-            self.task_id = task_policy.task_id
-            if task_policy.store is None:
-                task_policy.store = self._memory.kv
-                task_policy.reload()
-        # An extractor needs somewhere to put temporary memories, so it
-        # implies a ThreadMemory even when the caller passed none.
-        if thread_memory is None and memory_extractor is not None:
-            thread_memory = memory_extractor.thread_memory or ThreadMemory()
-        if thread_memory is not None and thread_memory.store is None:
-            thread_memory.store = self._memory.kv
-        self._task_policy = task_policy
-        self._thread_memory = thread_memory
-        self._memory_context = MemoryContext(
-            policy=task_policy, thread_memory=thread_memory
-        )
-        self._memory_extractor = memory_extractor
-        if memory_extractor is not None:
-            # Wire the extractor to this pipeline's stores unless it was
-            # built with its own (an extractor sharing a policy/thread memory
-            # with the pipeline is the point — otherwise it would write
-            # memories nothing reads).
-            if memory_extractor.store is None:
-                memory_extractor.store = self._memory.kv
-            if memory_extractor.policy is None:
-                memory_extractor.policy = task_policy
-            if memory_extractor.thread_memory is None:
-                memory_extractor.thread_memory = thread_memory
-
         # llm_client owns construction (temperature, endpoint overrides,
         # output cap, rate limiter) and invocation (transient-error retry,
         # input-token budget). An injected chat model replaces only the
         # construction half; retry and budget still apply.
-        llm_config_kwargs: dict[str, Any] = {
-            "model": model,
-            "temperature": temperature,
-            "max_input_tokens": max_input_tokens,
-            "requests_per_second": requests_per_second,
-            "max_retries": max_retries,
-        }
-        # Endpoint knobs are forwarded only when set, so an omitted argument
-        # still defers to the config.json llm_client defaults (an explicit
-        # None here would override them).
-        for key, value in (
-            ("base_url", base_url),
-            ("api_key", api_key),
-            ("url_headers", url_headers),
-            ("timeout", timeout),
-            ("model_kwargs", model_kwargs),
-            ("kwargs", llm_kwargs),
-        ):
-            if value is not None:
-                llm_config_kwargs[key] = value
-        self._llm_client = LLMClient(LLMClientConfig(**llm_config_kwargs), llm=llm)
+        if llm_config is None:
+            llm_config_kwargs: dict[str, Any] = {
+                "model": model,
+                "temperature": temperature,
+                "max_input_tokens": max_input_tokens,
+                "requests_per_second": requests_per_second,
+                "max_retries": max_retries,
+            }
+            # Endpoint knobs are forwarded only when set, so an omitted
+            # argument still defers to the config.json llm_client defaults
+            # (an explicit None here would override them).
+            for key, value in (
+                ("base_url", base_url),
+                ("api_key", api_key),
+                ("url_headers", url_headers),
+                ("timeout", timeout),
+                ("model_kwargs", model_kwargs),
+                ("kwargs", llm_kwargs),
+            ):
+                if value is not None:
+                    llm_config_kwargs[key] = value
+            llm_config = LLMClientConfig(**llm_config_kwargs)
+        self._llm_client = LLMClient(llm_config, llm=llm)
 
         # Which system prompt to send depends on whether this chat model can
         # actually be asked for a schema, so the prompt is settled only now
@@ -758,58 +795,6 @@ class SasLLMPipeline:
         builder.add_edge(START, "model")
         self._graph = builder.compile()
         logger.debug("SasLLMPipeline: ready")
-
-    @staticmethod
-    def _build_default_memory(
-        spark: "SparkSession | None",
-        delta_table: str | None,
-    ) -> MemoryHub:
-        if delta_table is None:
-            # In-memory store never touches Spark, so don't boot a JVM session.
-            logger.info(
-                "SasLLMPipeline: in-memory message store (no Delta table, no "
-                "Spark session needed)"
-            )
-            return MemoryHub(spark=spark, table=None)
-        if spark is None:
-            from pyspark.sql import SparkSession
-
-            logger.info("SasLLMPipeline: no SparkSession provided, starting local one")
-            spark = (
-                SparkSession.builder.master("local[*]")
-                .appName("chunker_pipeline")
-                .getOrCreate()
-            )
-        return MemoryHub(spark=spark, table=delta_table)
-
-    @staticmethod
-    def _load_sharepoint_databricks_mapping(path: str) -> dict[str, str]:
-        """
-        Read the SAS→Databricks mapping CSV at *path* in the configured
-        SharePoint document library and parse it into a mapping dict.
-
-        ``utf-8-sig`` decoding strips the BOM Excel stamps on exported
-        CSVs.  An unreadable file (``SharePointError``) propagates, and a
-        file that parses to zero entries raises ``ValueError`` — both mean
-        the operator asked for renaming that cannot happen, which should
-        stop the run rather than silently produce SAS-named output.
-        """
-        from app_config.sharepoint import get_sharepoint_client
-
-        logger.info(
-            f"SasLLMPipeline: reading Databricks mapping CSV from SharePoint '{path}'"
-        )
-        body = get_sharepoint_client().read_file(path)
-        mapping = parse_databricks_mapping_csv(body.decode("utf-8-sig"))
-        if not mapping:
-            raise ValueError(
-                f"SharePoint Databricks mapping '{path}' parsed to zero entries; "
-                f"expected CSV rows of <sas_libref_or_dataset>,<databricks_target>"
-            )
-        logger.info(
-            f"SasLLMPipeline: loaded {len(mapping)} Databricks mapping entries from SharePoint"
-        )
-        return mapping
 
     # ------------------------------------------------------------------
     # Public API

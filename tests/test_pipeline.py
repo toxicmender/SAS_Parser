@@ -17,6 +17,7 @@ Requires: langchain-core (FakeListChatModel).
 from __future__ import annotations
 
 import pathlib
+import pytest
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -544,6 +545,83 @@ def test_prompt_caching_off_by_default():
 
 
 # ---------------------------------------------------------------------------
+# Grouped constructor configs (llm_config / memory_setup)
+# ---------------------------------------------------------------------------
+
+
+def test_llm_config_is_the_canonical_transport_form():
+    from llm_client import LLMClientConfig
+
+    config = LLMClientConfig(model="claude-sonnet-4-5", max_retries=7)
+    pipeline = SasLLMPipeline(
+        llm_config=config,
+        memory=MemoryHub(),
+        llm=FakeListChatModel(responses=["ok"]),
+    )
+    # The config's model becomes the pipeline's model...
+    assert pipeline.model == "claude-sonnet-4-5"
+    # ...and the client uses the config object as-is.
+    assert pipeline._llm_client.config is config
+
+
+def test_llm_config_conflicts_with_transport_kwargs():
+    from llm_client import LLMClientConfig
+
+    with pytest.raises(ValueError, match="base_url"):
+        SasLLMPipeline(
+            llm_config=LLMClientConfig(model="m"),
+            base_url="https://gw.example/v1",
+            memory=MemoryHub(),
+            llm=FakeListChatModel(responses=["ok"]),
+        )
+    with pytest.raises(ValueError, match="model"):
+        SasLLMPipeline(
+            model="claude-sonnet-4-5",
+            llm_config=LLMClientConfig(model="m"),
+            memory=MemoryHub(),
+            llm=FakeListChatModel(responses=["ok"]),
+        )
+
+
+def test_memory_setup_is_the_canonical_memory_form():
+    from pipeline import MemorySetup
+
+    hub = MemoryHub()
+    pipeline = SasLLMPipeline(
+        memory_setup=MemorySetup(memory=hub, chat_id="chat-42"),
+        llm=FakeListChatModel(responses=["ok"]),
+    )
+    assert pipeline._memory is hub
+    assert pipeline.chat_id == "chat-42"
+
+
+def test_memory_setup_conflicts_with_memory_kwargs():
+    from pipeline import MemorySetup
+
+    with pytest.raises(ValueError, match="chat_id"):
+        SasLLMPipeline(
+            memory_setup=MemorySetup(memory=MemoryHub()),
+            chat_id="also-given",
+            llm=FakeListChatModel(responses=["ok"]),
+        )
+
+
+def test_memory_setup_extractor_implies_thread_memory():
+    from memory.extractor import MemoryExtractor
+    from pipeline import MemorySetup
+
+    hub = MemoryHub()
+    built = MemorySetup(
+        memory=hub, memory_extractor=MemoryExtractor(model=None)
+    ).build()
+    # The extractor needs somewhere to put temporary memories, so a thread
+    # memory is implied, bound to the hub, and shared with the extractor.
+    assert built.thread_memory is not None
+    assert built.thread_memory.store is hub.kv
+    assert built.extractor.thread_memory is built.thread_memory
+
+
+# ---------------------------------------------------------------------------
 # SAS→Databricks dataset-name mapping (SharePoint CSV step)
 # ---------------------------------------------------------------------------
 
@@ -576,18 +654,22 @@ def _patch_sharepoint(monkeypatch, files: dict[str, bytes]) -> _FakeSharePointCl
 
 
 def test_databricks_mapping_loaded_from_sharepoint_csv(monkeypatch):
+    from chunker.batcher import load_databricks_mapping_sharepoint
+
     fake = _patch_sharepoint(monkeypatch, {"maps/sas_to_databricks.csv": _MAPPING_CSV})
+    mapping = load_databricks_mapping_sharepoint("maps/sas_to_databricks.csv")
+    assert fake.read_paths == ["maps/sas_to_databricks.csv"]
+    assert mapping == {
+        "work": "dev.staging",
+        "mylib": "prod.sales",
+    }
     pipeline = SasLLMPipeline(
         model="unused",
         memory=MemoryHub(),
         llm=FakeListChatModel(responses=["ok"]),
-        databricks_mapping_sharepoint="maps/sas_to_databricks.csv",
+        databricks_mapping=mapping,
     )
-    assert fake.read_paths == ["maps/sas_to_databricks.csv"]
-    assert pipeline.databricks_mapping == {
-        "work": "dev.staging",
-        "mylib": "prod.sales",
-    }
+    assert pipeline.databricks_mapping == mapping
     # The mapping reaches both batchers and rewrites batched dataset names.
     src = (
         "data work.clean;\n set mylib.raw;\n run;\n"
@@ -607,15 +689,15 @@ def test_databricks_mapping_loaded_from_sharepoint_csv(monkeypatch):
 
 
 def test_explicit_databricks_mapping_overrides_sharepoint_csv(monkeypatch):
+    # The merge is the caller's one-liner now: loaded CSV under explicit dict.
+    from chunker.batcher import load_databricks_mapping_sharepoint
+
     _patch_sharepoint(monkeypatch, {"m.csv": _MAPPING_CSV})
-    pipeline = SasLLMPipeline(
-        model="unused",
-        memory=MemoryHub(),
-        llm=FakeListChatModel(responses=["ok"]),
-        databricks_mapping={"work": "override.schema"},
-        databricks_mapping_sharepoint="m.csv",
-    )
-    assert pipeline.databricks_mapping == {
+    mapping = {
+        **load_databricks_mapping_sharepoint("m.csv"),
+        **{"work": "override.schema"},
+    }
+    assert mapping == {
         "work": "override.schema",  # explicit dict wins per key
         "mylib": "prod.sales",  # CSV-only entries survive the merge
     }
@@ -624,14 +706,11 @@ def test_explicit_databricks_mapping_overrides_sharepoint_csv(monkeypatch):
 def test_empty_sharepoint_mapping_csv_raises(monkeypatch):
     import pytest
 
+    from chunker.batcher import load_databricks_mapping_sharepoint
+
     _patch_sharepoint(monkeypatch, {"m.csv": b"sas_name,databricks_name\n"})
     with pytest.raises(ValueError, match="zero entries"):
-        SasLLMPipeline(
-            model="unused",
-            memory=MemoryHub(),
-            llm=FakeListChatModel(responses=["ok"]),
-            databricks_mapping_sharepoint="m.csv",
-        )
+        load_databricks_mapping_sharepoint("m.csv")
 
 
 def test_no_mapping_keeps_batchers_unmapped():

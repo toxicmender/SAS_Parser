@@ -22,6 +22,20 @@ outputs = pipe.run_files(["macros.sas", "etl.sas", "reports.sas"])
 print(pipe.token_usage.summary())
 ```
 
+The transport and memory concerns also take grouped configs — the canonical
+form when more than a couple of knobs are set (the individual kwargs still
+work, but do not mix the two spellings for the same concern):
+
+```python
+from llm_client import LLMClientConfig
+from pipeline import MemorySetup, SasLLMPipeline
+
+pipe = SasLLMPipeline(
+    llm_config=LLMClientConfig(model="claude-sonnet-4-5", max_retries=5),
+    memory_setup=MemorySetup(task_id="migration-2026"),
+)
+```
+
 `token_usage` is cumulative over the pipeline's lifetime, not per `run_*`
 call: a caller attributing one run's spend snapshots it before and subtracts
 after (`llm_client.TokenUsage` supports `-`). It stays at zero when the
@@ -32,6 +46,7 @@ gateway reports no usage block.
 | File | Role |
 |------|------|
 | `engine.py` | `SasLLMPipeline`: the LangGraph `StateGraph` wiring, memory/validation integration, resume and fork, opt-in Anthropic prompt caching. |
+| `setup.py` | `MemorySetup`: the grouped form of the pipeline's memory wiring (store hub, task policy, thread memory, extractor, chat identity), with the cross-injection logic in `build()`. |
 | `prompting.py` | Item → retrieval query / construct keys / scope tokens mapping (the sole SAS-metadata → `prompt_builder` bridge) and chunk/batch prompt formatting. |
 | `constants.py` | Prompt templates — the Markdown-sections system prompt and its structured-output counterpart (importable without langchain installed). |
 | `response_models.py` | `TranslationDocument` (+ `TranslationCell`, `MappingEntry`, `RiskNote`): the structured answer the pipeline asks for, and `to_markdown()`, which renders it back to the four `##` sections that get persisted and scored. Pydantic only. |

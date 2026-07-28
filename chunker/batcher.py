@@ -520,6 +520,37 @@ def parse_databricks_mapping_csv(text: str) -> dict[str, str]:
     return mapping
 
 
+def load_databricks_mapping_sharepoint(path: str) -> dict[str, str]:
+    """
+    Read the SAS→Databricks mapping CSV at *path* in the configured
+    SharePoint document library (see :mod:`app_config.sharepoint`) and parse
+    it with :func:`parse_databricks_mapping_csv`.
+
+    ``utf-8-sig`` decoding strips the BOM Excel stamps on exported CSVs.
+    An unreadable file (``SharePointError``) propagates, and a file that
+    parses to zero entries raises ``ValueError`` — both mean the operator
+    asked for renaming that cannot happen, which should stop the run rather
+    than silently produce SAS-named output. The SharePoint client is
+    imported lazily inside the call, so the batcher stays import-light.
+    """
+    from app_config.sharepoint import get_sharepoint_client
+
+    logger.info(
+        f"load_databricks_mapping_sharepoint: reading mapping CSV from SharePoint '{path}'"
+    )
+    body = get_sharepoint_client().read_file(path)
+    mapping = parse_databricks_mapping_csv(body.decode("utf-8-sig"))
+    if not mapping:
+        raise ValueError(
+            f"SharePoint Databricks mapping '{path}' parsed to zero entries; "
+            f"expected CSV rows of <sas_libref_or_dataset>,<databricks_target>"
+        )
+    logger.info(
+        f"load_databricks_mapping_sharepoint: loaded {len(mapping)} mapping entries"
+    )
+    return mapping
+
+
 def replace_dataset_names(
     result: SasBatchResult, mapping: dict[str, str]
 ) -> SasBatchResult:

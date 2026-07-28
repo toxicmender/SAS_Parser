@@ -26,6 +26,7 @@ from .response_models import (
 __all__ = [
     # orchestration (lazy)
     "SasLLMPipeline",
+    "MemorySetup",
     # structured LLM response
     "TranslationDocument",
     "TranslationCell",
@@ -47,6 +48,10 @@ def __getattr__(name: str):
         from .engine import SasLLMPipeline
 
         return SasLLMPipeline
+    if name == "MemorySetup":
+        from .setup import MemorySetup
+
+        return MemorySetup
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
