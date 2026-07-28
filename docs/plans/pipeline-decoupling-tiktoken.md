@@ -93,6 +93,35 @@ Yet the whole file is written against `SasBatch | SasChunk`:
 all to support a chunk-shaped code path that `run_file`/`run_text`/`run_files`
 can no longer reach.
 
+### 1.5 LLM-call anatomy: where calls are spent, where they can be saved
+
+One run makes exactly one LLM call per coalesced item (plus opt-in extras:
+validation retries, summarizer folds, extractor classifications). The
+coalescing layer (`chunker.batcher.coalesce_into_batches`) currently reduces
+calls only within one narrow case:
+
+- **Singletons**: each maximal run of *consecutive* independent singleton
+  chunks is packed into `merged-NNN` batches — but capped by **member count**
+  (`max_merged_chunks`, default 8), blind to size. Eight one-line `%let`
+  chunks and eight 600-word DATA steps hit the same cap, so small chunks
+  under-fill their requests while large ones can overshoot
+  `max_input_tokens`.
+- **Real dependency batches are never packed.** Every `SasBatch` from the
+  batcher passes through as its own LLM call *and* acts as a flush barrier
+  for the pending singleton run on either side of it. A corpus that batches
+  into many small two-chunk dependency batches gets no call reduction at
+  all — and each call re-pays the fixed per-call overhead (system prompt —
+  uncached on non-Anthropic models — plus history window and retrieved
+  guidance), which for small items dominates the item text itself.
+
+So the two levers are: make singleton merging **token-budgeted** instead of
+count-budgeted, and extend packing to **adjacent small batches** under the
+same budget. Both are call-level packing concerns and belong in the
+coalescing layer — the batcher's dependency grouping (union-find, weak-edge
+resolution, batch identity) must not change: batch membership and reason
+strings are pinned by tests, and complexity scoring and validation read the
+same units.
+
 ## 2. Plan
 
 Three phases, each independently shippable and separately committed
@@ -216,6 +245,88 @@ In rough order of value:
    methods so the public API is unchanged. `_answer_item`'s validation-retry
    loop stays in the engine (it owns the graph call).
 
+### Phase 4 — token-budgeted call packing (fewer LLM calls)
+
+Builds on Phase 2 (the tiktoken counter) and Phase 3.1 (batch-only path).
+Generalize `coalesce_into_batches` from "count-capped singleton runs" to a
+single token-budgeted packing pass over the ordered items:
+
+**Mechanics.**
+
+- One walk in corpus order, accumulating a window of adjacent items
+  (singletons *and* real batches). The window is emitted as one unit when
+  adding the next item would exceed either budget:
+  - `max_merged_tokens` — estimated prompt cost of the combined unit;
+  - `max_merged_chunks` — total member chunks (kept as a secondary cap so a
+    pathological corpus of tiny chunks still bounds prompt complexity).
+- A window containing a single real batch passes it through **unchanged**
+  (same `batch_id`, same reason) — the no-packing case degenerates to today's
+  behavior. A multi-item window becomes a synthetic `packed-NNN` batch whose
+  aggregates are recomputed the way `_merge_singletons_into_batch` already
+  does (outputs of earlier members consumed by later members become internal;
+  external I/O, required macros/macrovars/librefs unioned), with reason
+  `"packed N item(s) (~T tokens) to reduce LLM calls"`.
+- **Ordering is preserved by construction**: only adjacent items pack, member
+  chunks keep corpus order inside the prompt, so producers still precede
+  consumers — both across packed units and within one. Packing two batches
+  where one depends on the other is not just safe but beneficial: the model
+  sees the producing and consuming steps in one context.
+- **Exclusions**: the `is_global_context` batch (emitted first, context for
+  the whole corpus) stays unpacked — it anchors the thread's history and its
+  identity is load-bearing for relevance selection. Oversized-split
+  parent/child singletons pack like any other chunk (their text redundancy is
+  already intentional).
+
+**Token estimation.** The batcher cannot know the pipeline's prompt templates
+(import direction: `chunker` sits below `pipeline`), so the cost function is
+injected: `coalesce_into_batches(items, *, max_chunks, max_tokens=None,
+item_cost=None)` where `item_cost: Callable[[SasBatch | SasChunk], int]`.
+
+- Default (no injection): tiktoken-free estimate — `chars//4` over member
+  texts plus a per-member constant for the metadata/template overhead — so
+  the batcher stays dependency-light and offline.
+- The pipeline injects a precise counter built on Phase 2's
+  `llm_client/tokens.py`: member text tokens + measured per-member and
+  per-batch template overheads (constants measured once from the templates,
+  not by formatting every candidate window repeatedly).
+
+**Budget resolution** (new constructor arg + config key
+`pipeline.max_merged_tokens`):
+
+1. explicit argument, else
+2. config.json, else
+3. derived from `max_input_tokens` when set: `(max_input_tokens − system
+   prompt − guidance budget − history-window headroom) × 0.8`, else
+4. a conservative hard default (~6,000 tokens — large enough that today's
+   8-member merges of typical chunks still form, small enough to keep answer
+   quality per item; tune against the validation suite).
+
+**Consequences to accept and document:**
+
+- *Item identity changes.* `packed-NNN` ids replace some `merged-NNN`/real
+  batch ids, so a `resume=True` against a thread written before this change
+  (or under a different budget) finds no matching run facts and regenerates —
+  same caveat `max_merged_chunks` already carries; packing stays
+  deterministic in `(items, budgets)`, so resume within one configuration is
+  unaffected.
+- *Coarser verdicts and notebooks.* Validation scores per item, so packed
+  items get one verdict covering more code; `chunker.notebook` routing is
+  unchanged (a packed batch spanning files lands in `_cross_file.ipynb` like
+  any cross-file batch, single-file packs render into that file's notebook).
+- *Answer-quality tradeoff.* Larger prompts mean the model divides attention
+  across more steps per call. Mitigation: the budget default is deliberately
+  well under `max_input_tokens`, and the validation suite (response coverage,
+  dataset fidelity) is the regression gate — run it before/after on the
+  sample corpus and tune the default budget from that.
+- *Tests.* Coalesce-output tests that pin `merged-NNN` grouping under the
+  default config need updating in the same commit; the batcher's own
+  grouping/reason-string tests are untouched.
+
+Rollout: land the mechanism with `max_merged_tokens=None` meaning "packing of
+real batches off, singleton merging token-aware only" for one commit, then
+flip the derived default on in a separate commit — so a regression bisects to
+the flip, not the mechanism.
+
 Invariants that must survive every phase (Architecture.md §Load-bearing):
 no LangGraph checkpointer; ephemeral guidance/summary/notes never persisted;
 `chat::` key schema untouched; in-memory mode stays Spark-free; batch reason
@@ -228,3 +339,5 @@ strings and item ordering unchanged (phases here touch none of the batcher).
 3. `refactor(pipeline): batch-only processing path` (Phase 3.1)
 4. `refactor(pipeline): grouped constructor configs; SharePoint mapping load moves to demo_run` (Phase 3.2–3.3)
 5. `refactor(pipeline): extract RunLedger` (Phase 3.4)
+6. `feat(chunker): token-budgeted coalescing of singletons and adjacent small batches` (Phase 4, mechanism)
+7. `feat(pipeline): enable token-budgeted call packing by default` (Phase 4, flip)
