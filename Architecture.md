@@ -13,7 +13,9 @@ layers, each usable on its own:
    persisted to a KV store (in-memory dict locally, Databricks Delta in
    production). Every LLM call is made per `SasBatch`: the batcher's ordered
    items are coalesced first, so dependency batches and merged runs of
-   independent singletons are the only units prompted. The deliverable is a
+   independent singletons are the only units prompted — and, with
+   token-budgeted packing on (`max_merged_tokens`), adjacent small items
+   share a call as `packed-NNN` batches under a prompt-cost budget. The deliverable is a
    **notebook** — one `.ipynb` per SAS source file (`pipeline.notebook`) —
    because the output is code and code should be runnable; the two report
    surfaces, validation and complexity, are **Markdown**.

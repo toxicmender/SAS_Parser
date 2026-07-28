@@ -72,6 +72,7 @@ from .prompting import (
     _kinds_for_item,
     _meta_flags_for_item,
     _query_for_item,
+    prompt_cost_estimator,
 )
 from .response_models import TranslationDocument
 from .run_ledger import DOCUMENT_KEY, RunLedger, document_of
@@ -252,6 +253,22 @@ class SasLLMPipeline:
         Larger values mean fewer, larger requests; the cap keeps a merged
         prompt from blowing ``max_input_tokens``. Must be ``>= 1`` (``1``
         wraps each singleton as its own batch without merging). Default ``8``.
+    max_merged_tokens : int | None
+        Token-budgeted call packing: when set, coalescing accumulates
+        *adjacent* items — singletons **and** real dependency batches — into
+        one LLM call while the estimated prompt cost stays under this budget
+        (and total members under ``max_merged_chunks``), emitting multi-item
+        windows as synthetic ``packed-NNN`` batches (see
+        :func:`chunker.batcher.coalesce_into_batches`). Cost is estimated
+        with this pipeline's tokenizer
+        (:func:`pipeline.prompting.prompt_cost_estimator`), so the budget
+        and ``max_input_tokens`` count under one vocabulary. The
+        global-context batch never packs, and item identity changes versus
+        unpacked runs (``packed-NNN`` ids), so resume only matches runs made
+        under the same budget. ``None`` (default) defers to config.json
+        ``pipeline.max_merged_tokens``, then keeps packing **off** (the
+        original count-capped singleton merging only). Must be ``>= 1``
+        when set.
     databricks_mapping : dict[str, str] | None
         SAS→Databricks dataset-name mapping forwarded to the batchers
         (see :func:`chunker.batcher.replace_dataset_names`): batch and
@@ -383,6 +400,7 @@ class SasLLMPipeline:
         include_options_chunks: bool = True,
         include_comment_chunks: bool = False,
         max_merged_chunks: int = 8,
+        max_merged_tokens: int | None = None,
         databricks_mapping: dict[str, str] | None = None,
         memory: MemoryHub | None = None,
         task_id: str | None = None,
@@ -509,9 +527,25 @@ class SasLLMPipeline:
             raise ValueError(
                 f"max_merged_chunks must be >= 1, got {max_merged_chunks}"
             )
+        if max_merged_tokens is None:
+            max_merged_tokens = app_config.get_typed_value(
+                "pipeline", "max_merged_tokens", int, None
+            )
+        if max_merged_tokens is not None and max_merged_tokens < 1:
+            raise ValueError(
+                f"max_merged_tokens must be >= 1 (or None to disable "
+                f"packing), got {max_merged_tokens}"
+            )
         self.model = model
         self.window_k = window_k
         self._max_merged_chunks = max_merged_chunks
+        self._max_merged_tokens = max_merged_tokens
+        # Built once per pipeline: the packing cost function counts with the
+        # same encoding the input-token budget uses (llm_client.tokens), so
+        # the two budgets are commensurable.
+        self._item_cost = (
+            prompt_cost_estimator(model) if max_merged_tokens is not None else None
+        )
         self._output_language = output_language
         self._history_selector = history_selector
         self._prompt_builder = prompt_builder
@@ -1052,11 +1086,17 @@ class SasLLMPipeline:
 
         Keeps the LLM invoked strictly per batch: dependency batches pass
         through and consecutive independent singletons are merged into
-        ``merged-NNN`` batches (capped at ``max_merged_chunks`` members). See
+        ``merged-NNN`` batches (capped at ``max_merged_chunks`` members).
+        With ``max_merged_tokens`` set, adjacent items — small dependency
+        batches included — additionally pack into ``packed-NNN`` batches
+        under that token budget. See
         :func:`chunker.batcher.coalesce_into_batches`.
         """
         return coalesce_into_batches(
-            batch_result.all_ordered_items, max_chunks=self._max_merged_chunks
+            batch_result.all_ordered_items,
+            max_chunks=self._max_merged_chunks,
+            max_tokens=self._max_merged_tokens,
+            item_cost=self._item_cost,
         )
 
     # ------------------------------------------------------------------

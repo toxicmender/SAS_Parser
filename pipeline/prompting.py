@@ -20,12 +20,14 @@ Logger name: ``pipeline.prompting``.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 from chunker.models import (
     SasBatch,
     SasChunk,
     SasDiagnostic,
 )
+from llm_client import tokens
 from prompt_builder import ConstructKey
 
 from .constants import (
@@ -183,6 +185,34 @@ def _diagnostics_for_batch(
                 seen.append(d)
                 seen_keys.add(key)
     return seen
+
+
+def prompt_cost_estimator(
+    model: str | None = None,
+) -> Callable[[SasBatch | SasChunk], int]:
+    """A per-item prompt-token cost function under *model*'s encoding, for
+    token-budgeted packing (``coalesce_into_batches(max_tokens=...)``).
+
+    The template overheads are measured **once**, from the template text
+    itself (the format placeholders count roughly like the short values that
+    replace them), rather than formatting every candidate window — packing
+    needs an estimate that tracks the real prompt cost, not the exact
+    formatted count. Member text and title are counted with the real
+    tokenizer (:mod:`llm_client.tokens`), which degrades to chars//4 offline.
+    """
+    member_overhead = tokens.count_text(_BATCH_MEMBER_TEMPLATE, model=model)
+    context_overhead = tokens.count_text(_BATCH_CONTEXT_TEMPLATE, model=model)
+
+    def cost(item: SasBatch | SasChunk) -> int:
+        chunks = item.chunks if isinstance(item, SasBatch) else [item]
+        total = context_overhead
+        for c in chunks:
+            total += member_overhead + tokens.count_text(c.text, model=model)
+            if c.title:
+                total += tokens.count_text(c.title, model=model)
+        return total
+
+    return cost
 
 
 def _format_batch_message(

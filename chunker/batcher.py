@@ -16,6 +16,7 @@ import re
 import time
 from bisect import bisect_left, insort
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .keywords import _STANDARD_AUTOCALL_MACROS
@@ -1568,15 +1569,20 @@ def _extract_result(
 _DEFAULT_MERGE_MAX_CHUNKS = 8
 
 
-def _merge_singletons_into_batch(chunks: list[SasChunk], batch_id: str) -> SasBatch:
-    """Build a :class:`SasBatch` from independent singleton chunks.
+def _merge_singletons_into_batch(
+    chunks: list[SasChunk], batch_id: str, *, reason: str | None = None
+) -> SasBatch:
+    """Build a :class:`SasBatch` from member *chunks* with aggregate I/O.
 
-    Singletons carry no inter-chunk dependency edges (each is its own
-    Union-Find component), so the batch's aggregate I/O is a plain union of
-    member metadata with intra-batch producers subtracted — the same
-    accounting :func:`_make_batch` performs, minus the edge/``reason``
-    machinery that only a real dependency component has. Member order is
-    preserved (callers pass corpus order).
+    Written for independent singleton chunks — no inter-chunk dependency
+    edges, so the batch's aggregate I/O is a plain union of member metadata
+    with intra-batch producers subtracted, the same accounting
+    :func:`_make_batch` performs minus the edge machinery — and reused by
+    token-budgeted packing (:func:`coalesce_into_batches` with
+    ``max_tokens``), where the flattened members of adjacent items get the
+    same aggregation under an explicit *reason*. Intra-batch subtraction is
+    exact there too: outputs of earlier members consumed by later members
+    become internal. Member order is preserved (callers pass corpus order).
     """
     intra_outputs: set[str] = set()
     intra_macros: set[str] = set()
@@ -1656,11 +1662,12 @@ def _merge_singletons_into_batch(chunks: list[SasChunk], batch_id: str) -> SasBa
     )
 
     n = len(chunks)
-    reason = (
-        f"merged {n} independent chunk(s) into one batch to reduce LLM calls"
-        if n > 1
-        else "single independent chunk"
-    )
+    if reason is None:
+        reason = (
+            f"merged {n} independent chunk(s) into one batch to reduce LLM calls"
+            if n > 1
+            else "single independent chunk"
+        )
     return SasBatch(
         batch_id=batch_id,
         chunks=list(chunks),
@@ -1677,25 +1684,72 @@ def _merge_singletons_into_batch(chunks: list[SasChunk], batch_id: str) -> SasBa
     )
 
 
+# Offline fallback cost model for token-budgeted packing, used when the
+# caller injects no item_cost: ~4 chars/token over member text plus flat
+# allowances for the per-member and per-item prompt framing the consumer
+# adds (the batcher cannot see the pipeline's templates — import direction).
+_APPROX_CHARS_PER_TOKEN = 4
+_APPROX_MEMBER_OVERHEAD_TOKENS = 40
+_APPROX_ITEM_OVERHEAD_TOKENS = 160
+
+
+def _approx_item_cost(item: SasBatch | SasChunk) -> int:
+    chunks = item.chunks if isinstance(item, SasBatch) else [item]
+    return _APPROX_ITEM_OVERHEAD_TOKENS + sum(
+        len(c.text) // _APPROX_CHARS_PER_TOKEN + _APPROX_MEMBER_OVERHEAD_TOKENS
+        for c in chunks
+    )
+
+
 def coalesce_into_batches(
     items: list[SasBatch | SasChunk],
     *,
     max_chunks: int = _DEFAULT_MERGE_MAX_CHUNKS,
+    max_tokens: int | None = None,
+    item_cost: Callable[[SasBatch | SasChunk], int] | None = None,
 ) -> list[SasBatch]:
     """Return *items* as a list of :class:`SasBatch`, so a consumer that sends
     one request per item calls the LLM only ever per batch.
 
-    Real dependency batches pass through untouched. Each maximal run of
-    consecutive independent singleton chunks is packed into synthetic
-    ``merged-NNN`` batches of at most *max_chunks* members — fewer, larger
-    requests — while preserving corpus order: a synthetic batch never spans a
-    real batch that separates its members, so producers still precede
-    consumers. An isolated singleton becomes a one-member ``merged-NNN`` batch,
-    keeping the "always a SasBatch" invariant. The mapping is deterministic in
-    *items*, so a re-run (resume/fork) reproduces the same batch ids.
+    With ``max_tokens=None`` (default), real dependency batches pass through
+    untouched and each maximal run of consecutive independent singleton
+    chunks is packed into synthetic ``merged-NNN`` batches of at most
+    *max_chunks* members — fewer, larger requests — while preserving corpus
+    order: a synthetic batch never spans a real batch that separates its
+    members, so producers still precede consumers. An isolated singleton
+    becomes a one-member ``merged-NNN`` batch, keeping the "always a
+    SasBatch" invariant.
+
+    With ``max_tokens`` set, packing is **token-budgeted and extends to
+    adjacent small batches**: one walk in corpus order accumulates a window
+    of adjacent items — singletons *and* real dependency batches — emitted
+    as one unit when adding the next item would exceed either budget
+    (*max_tokens* estimated prompt cost, or *max_chunks* total member
+    chunks). A multi-item window becomes a synthetic ``packed-NNN`` batch
+    (members flattened in corpus order, aggregates recomputed with
+    intra-batch producers subtracted); a window holding a single real batch
+    passes it through unchanged, and a lone singleton keeps its one-member
+    ``merged-NNN`` wrap. Only *adjacent* items pack, so producers still
+    precede consumers — across packed units and within one. A
+    global-context batch (``is_global_context``) never packs: it anchors
+    the thread's context and passes through alone. An item alone exceeding
+    the budget is emitted alone — packing never splits an item. *item_cost*
+    estimates one item's prompt-token cost; ``None`` uses a chars//4
+    approximation with flat framing allowances (callers with a real
+    tokenizer — the pipeline — inject a precise one).
+
+    Either way the mapping is deterministic in ``(items, budgets)``, so a
+    re-run (resume/fork) reproduces the same batch ids.
     """
     if max_chunks < 1:
         max_chunks = 1
+    if max_tokens is not None:
+        return _pack_into_batches(
+            items,
+            max_chunks=max_chunks,
+            max_tokens=max_tokens,
+            item_cost=item_cost or _approx_item_cost,
+        )
     out: list[SasBatch] = []
     pending: list[SasChunk] = []
     merged_no = 0
@@ -1721,6 +1775,83 @@ def coalesce_into_batches(
     logger.info(
         f"coalesce_into_batches: {len(items)} ordered item(s) -> {len(out)} "
         f"batch(es) (max_chunks={max_chunks})"
+    )
+    return out
+
+
+def _pack_into_batches(
+    items: list[SasBatch | SasChunk],
+    *,
+    max_chunks: int,
+    max_tokens: int,
+    item_cost: Callable[[SasBatch | SasChunk], int],
+) -> list[SasBatch]:
+    """Token-budgeted packing pass — see :func:`coalesce_into_batches`."""
+    out: list[SasBatch] = []
+    window: list[SasBatch | SasChunk] = []
+    window_members = 0
+    window_cost = 0
+    merged_no = 0
+    packed_no = 0
+
+    def _members(item: SasBatch | SasChunk) -> int:
+        return len(item.chunks) if isinstance(item, SasBatch) else 1
+
+    def _flush() -> None:
+        nonlocal window_members, window_cost, merged_no, packed_no
+        if not window:
+            return
+        if len(window) == 1:
+            only = window[0]
+            if isinstance(only, SasBatch):
+                out.append(only)  # unchanged: id, reason, everything
+            else:
+                merged_no += 1
+                out.append(
+                    _merge_singletons_into_batch([only], f"merged-{merged_no:03d}")
+                )
+        else:
+            packed_no += 1
+            chunks = [
+                c
+                for item in window
+                for c in (item.chunks if isinstance(item, SasBatch) else [item])
+            ]
+            out.append(
+                _merge_singletons_into_batch(
+                    chunks,
+                    f"packed-{packed_no:03d}",
+                    reason=(
+                        f"packed {len(window)} item(s) (~{window_cost} tokens) "
+                        f"to reduce LLM calls"
+                    ),
+                )
+            )
+        window.clear()
+        window_members = 0
+        window_cost = 0
+
+    for item in items:
+        if isinstance(item, SasBatch) and item.is_global_context:
+            # Context for the whole corpus: never packed, emitted alone.
+            _flush()
+            out.append(item)
+            continue
+        cost = item_cost(item)
+        members = _members(item)
+        if window and (
+            window_members + members > max_chunks
+            or window_cost + cost > max_tokens
+        ):
+            _flush()
+        window.append(item)
+        window_members += members
+        window_cost += cost
+    _flush()
+
+    logger.info(
+        f"_pack_into_batches: {len(items)} ordered item(s) -> {len(out)} "
+        f"batch(es) (max_chunks={max_chunks}, max_tokens={max_tokens})"
     )
     return out
 

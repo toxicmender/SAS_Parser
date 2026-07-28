@@ -1,6 +1,6 @@
 # Plan: pipeline decoupling, tiktoken-by-default, and default-workflow simplification
 
-Status: Phases 1–3 implemented on this branch; Phases 4–5 still proposals. Scope of this document:
+Status: Phases 1–3 and the Phase 4 mechanism implemented on this branch (packing is opt-in via max_merged_tokens; the default flip waits for Phase 5, per §3); Phase 5 still a proposal. Scope of this document:
 
 1. Decoupling — what is coupled today and why it hurts.
 2. Abstracting the pipeline out of the `chunker` package.

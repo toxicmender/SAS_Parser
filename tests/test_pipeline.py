@@ -254,6 +254,58 @@ def test_max_merged_chunks_caps_calls_per_batch():
     assert all(o["is_batch"] for o in outputs)
 
 
+def test_max_merged_tokens_packs_adjacent_items_into_one_call():
+    # Token-budgeted packing (Phase 4): with a generous budget the whole
+    # run — independent singletons AND the dependency batch — shares one
+    # LLM call, as a packed-NNN batch.
+    fake_llm = FakeListChatModel(responses=[f"r{i}" for i in range(10)])
+    pipeline = SasLLMPipeline(
+        model="unused",
+        memory=MemoryHub(),
+        llm=fake_llm,
+        max_merged_tokens=100_000,
+    )
+
+    src = (
+        "data work.x; p=1; run;\n"
+        "data work.dep; q=1; run;\n"
+        "proc print data=work.dep; run;\n"
+        "data work.y; r=1; run;\n"
+    )
+    outputs = pipeline.run_text(src, source_id="etl.sas")
+
+    assert [o["item_id"] for o in outputs] == ["packed-001"]
+    assert len(outputs[0]["chunk_ids"]) == 4
+
+
+def test_max_merged_tokens_off_keeps_merged_grouping():
+    # Packing stays opt-in: without the budget, the dependency batch is its
+    # own call and flushes the singleton runs around it (3 calls, not 1).
+    fake_llm = FakeListChatModel(responses=[f"r{i}" for i in range(10)])
+    pipeline = SasLLMPipeline(model="unused", memory=MemoryHub(), llm=fake_llm)
+
+    src = (
+        "data work.x; p=1; run;\n"
+        "data work.dep; q=1; run;\n"
+        "proc print data=work.dep; run;\n"
+        "data work.y; r=1; run;\n"
+    )
+    outputs = pipeline.run_text(src, source_id="etl.sas")
+
+    assert len(outputs) == 3
+    assert [o["item_id"] for o in outputs][0] == "merged-001"
+
+
+def test_max_merged_tokens_validates():
+    with pytest.raises(ValueError, match="max_merged_tokens"):
+        SasLLMPipeline(
+            model="unused",
+            memory=MemoryHub(),
+            llm=FakeListChatModel(responses=["ok"]),
+            max_merged_tokens=0,
+        )
+
+
 def test_pipeline_window_trimming_limits_injected_history():
     fake_llm = FakeListChatModel(responses=[f"resp {i}" for i in range(6)])
     mem = MemoryHub()

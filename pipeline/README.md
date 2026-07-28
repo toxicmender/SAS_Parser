@@ -73,8 +73,16 @@ All items of one `run_file` / `run_text` / `run_files` call share one thread
 context batch by batch. Those calls send `SasBatch` objects only:
 `coalesce_into_batches` first merges the run's standalone singleton chunks into
 `merged-NNN` batches (capped at `max_merged_chunks`), so the model is never
-prompted with a bare `SasChunk`. The mapping is deterministic, so resume and
-`fork_run` reproduce the same batch ids. `llm_client.LLMClient` owns model
+prompted with a bare `SasChunk`. With `max_merged_tokens` set (constructor
+argument, else config.json `pipeline.max_merged_tokens`; off by default),
+coalescing is **token-budgeted call packing**: adjacent items — small
+dependency batches included — share one LLM call as `packed-NNN` batches
+while the estimated prompt cost (counted with the pipeline's tokenizer, the
+same encoding as `max_input_tokens`) stays under the budget; the
+global-context batch never packs. The mapping is deterministic in the
+budgets, so resume and `fork_run` reproduce the same batch ids — but packed
+ids differ from unpacked ones, so resume only matches runs made under the
+same budget. `llm_client.LLMClient` owns model
 construction (temperature, output-token cap, an optional proactive rate
 limiter — on for the `from_ai_gateway` credential path) and invocation
 (input-token budget, transient-error retry that honors a gateway

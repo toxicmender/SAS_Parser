@@ -1166,5 +1166,145 @@ class TestCoalesceIntoBatches(unittest.TestCase):
         self.assertIn("other", batch.required_librefs)
 
 
+class TokenBudgetedPackingTests(unittest.TestCase):
+    """coalesce_into_batches(max_tokens=...): the Phase 4 packing mode."""
+
+    # A dependency pair between singletons: merged(x) batch(dep+print) merged(y)
+    MIXED_SRC = (
+        "data work.x; p=1; run;\n"
+        "data work.dep; q=1; run;\n"
+        "proc print data=work.dep; run;\n"
+        "data work.y; r=1; run;\n"
+    )
+
+    def _items(self, source: str):
+        _, br = _chunk_and_batch(source)
+        return br.all_ordered_items
+
+    def test_adjacent_singletons_and_small_batch_pack_into_one_call(self):
+        from chunker.batcher import coalesce_into_batches
+
+        out = coalesce_into_batches(
+            self._items(self.MIXED_SRC), max_chunks=8, max_tokens=100_000
+        )
+        # Everything fits one window: singletons AND the dependency batch.
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].batch_id, "packed-001")
+        self.assertEqual(len(out[0].chunks), 4)
+        # Members keep corpus order, so producers precede consumers.
+        self.assertEqual(
+            [c.metadata.output_datasets[0] if c.metadata.output_datasets else None
+             for c in out[0].chunks][:2],
+            ["work.x", "work.dep"],
+        )
+        self.assertIn("to reduce LLM calls", out[0].reason)
+        self.assertIn("packed 3 item(s)", out[0].reason)
+
+    def test_token_budget_splits_windows(self):
+        from chunker.batcher import coalesce_into_batches
+
+        # Cost 1 per item: a budget of 2 fits two items per window.
+        out = coalesce_into_batches(
+            self._items(self.MIXED_SRC),
+            max_chunks=8,
+            max_tokens=2,
+            item_cost=lambda item: 1,
+        )
+        # [x + dep-batch] then [y]: 2-item packed window, then a lone merge.
+        self.assertEqual([b.batch_id for b in out], ["packed-001", "merged-001"])
+        self.assertEqual(len(out[0].chunks), 3)
+
+    def test_single_real_batch_window_passes_through_unchanged(self):
+        from chunker.batcher import coalesce_into_batches
+
+        items = self._items(self.MIXED_SRC)
+        real = next(i for i in items if isinstance(i, SasBatch))
+        out = coalesce_into_batches(
+            items,
+            max_chunks=8,
+            max_tokens=1,  # every item alone blows the budget
+            item_cost=lambda item: 10,
+        )
+        # Nothing packs: singletons keep the merged wrap, the real batch its id.
+        self.assertEqual(
+            [b.batch_id for b in out], ["merged-001", real.batch_id, "merged-002"]
+        )
+        self.assertEqual(out[1].reason, real.reason)
+
+    def test_member_cap_still_applies_under_token_packing(self):
+        from chunker.batcher import coalesce_into_batches
+
+        src = "".join(f"data work.t{i}; v=1; run;\n" for i in range(5))
+        out = coalesce_into_batches(
+            self._items(src),
+            max_chunks=2,
+            max_tokens=100_000,
+            item_cost=lambda item: 1,
+        )
+        self.assertEqual([len(b.chunks) for b in out], [2, 2, 1])
+        self.assertEqual(
+            [b.batch_id for b in out],
+            ["packed-001", "packed-002", "merged-001"],
+        )
+
+    def test_global_context_batch_never_packs(self):
+        from chunker.batcher import coalesce_into_batches
+
+        # A %let consumed by two otherwise-independent steps is promoted into
+        # a global-context batch, emitted first.
+        src = (
+            "%let cutoff = 2020;\n"
+            "data work.a; if year > &cutoff; run;\n"
+            "proc print data=work.other; where year > &cutoff; run;\n"
+        )
+        items = self._items(src)
+        self.assertTrue(
+            any(isinstance(i, SasBatch) and i.is_global_context for i in items)
+        )
+        out = coalesce_into_batches(
+            items, max_chunks=8, max_tokens=100_000, item_cost=lambda item: 1
+        )
+        globals_ = [b for b in out if b.is_global_context]
+        self.assertEqual(len(globals_), 1)
+        # It rides alone, id and reason untouched.
+        self.assertNotIn("packed", globals_[0].batch_id)
+
+    def test_packed_aggregates_subtract_intra_window_flow(self):
+        from chunker.batcher import coalesce_into_batches
+
+        out = coalesce_into_batches(
+            self._items(self.MIXED_SRC), max_chunks=8, max_tokens=100_000
+        )
+        batch = out[0]
+        # work.dep is produced and consumed inside the window -> internal.
+        self.assertNotIn("work.dep", batch.input_datasets)
+        self.assertIn("work.dep", batch.output_datasets)
+
+    def test_packing_is_deterministic(self):
+        from chunker.batcher import coalesce_into_batches
+
+        a = coalesce_into_batches(
+            self._items(self.MIXED_SRC), max_chunks=8, max_tokens=2,
+            item_cost=lambda item: 1,
+        )
+        b = coalesce_into_batches(
+            self._items(self.MIXED_SRC), max_chunks=8, max_tokens=2,
+            item_cost=lambda item: 1,
+        )
+        self.assertEqual(
+            [(x.batch_id, x.chunk_ids) for x in a],
+            [(x.batch_id, x.chunk_ids) for x in b],
+        )
+
+    def test_default_item_cost_scales_with_text(self):
+        from chunker.batcher import _approx_item_cost
+
+        small = self._items("data work.a; x=1; run;\n")[0]
+        big = self._items(
+            "data work.b; " + "x=1; " * 400 + "run;\n"
+        )[0]
+        self.assertGreater(_approx_item_cost(big), _approx_item_cost(small))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
