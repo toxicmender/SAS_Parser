@@ -1,13 +1,16 @@
 # memory
 
 Chat-history and KV persistence layer for the pipeline, plus relevance-based
-history selection and rolling summarization. No module here imports
-`chunker`, and the three feature modules never import each other — in
-LangChain context-engineering terms they cover **write** (`store`),
-**select** (`relevance`), and **compress** (`summarize`) independently.
+history selection, rolling summarization, and the long-/short-term
+instruction memories. No module here imports `chunker`, and the feature
+modules never import each other — in LangChain context-engineering terms
+they cover **write** (`store`), **select** (`relevance`), and **compress**
+(`summarize`) independently, with `policy`/`thread_mem`/`extractor` adding
+the **remember** channel on top of the same duck-typed KV interface.
 
 - `store.py` — durable chat history and a tagged KV store, backed by a
   plain Python dict locally or a Databricks Delta table in production.
+  Owns the Thread → Chat → Message hierarchy.
 - `relevance.py` — `RelevantHistorySelector`, an alternative to recency-window
   trimming that prompts the history turns most *relevant* to the current
   request (optionally packed into a `max_tokens` budget), plus the shared
@@ -16,12 +19,53 @@ LangChain context-engineering terms they cover **write** (`store`),
   turns older than a recency tail are folded (monotonically, oldest first)
   into a KV-stored summary that is prompted but never persisted to the
   message history.
+- `policy.py` — **long-term memory**: `TaskPolicy`, the standing
+  instructions for a *task*, stable across every thread and session it
+  spawns, folded into the (cacheable) system prompt.
+- `thread_mem.py` — **short-term memory**: `ThreadMemory`, the notes,
+  exceptions and overrides that hold for *one conversation only*, prompted
+  ephemerally and expiring on a TTL.
+- `context.py` — `MemoryContext.assemble()`, the seam that resolves both
+  instruction channels for one turn and states their precedence.
+- `extractor.py` — `MemoryExtractor`, the write path: classifies a completed
+  turn into permanent (a policy proposal, held for approval) or temporary (a
+  thread note, applied) memory, behind an offline cue gate.
 - `turns.py` — dependency-light turn grouping and token-estimate helpers
   shared by `relevance` and `summarize` (so `summarize` never drags in
   bm25s/faiss).
 
 `memory` is a regular package (not a PEP-420 namespace package) so packaging
 tools and import machinery treat it uniformly.
+
+## The memory model at a glance
+
+```
+Task ────────── TaskPolicy          long-term, task-scoped   (policy.py)
+ └── Thread ─── ThreadMemory        short-term, thread-scoped (thread_mem.py)
+      │         RollingSummarizer   compressed history        (summarize.py)
+      ├── Chat  one consumer's span of the thread             (store.py)
+      │    ├── Message
+      │    └── Message
+      └── Chat
+```
+
+One turn's prompt, in order:
+
+```
+system  = base prompt + TaskPolicy.render()        ← cacheable, stable
+history = rolling summary + selected/trimmed turns ← memory.relevance / window_k
+ephemeral = reference guidance + ThreadMemory notes ← prompted, never stored
+human   = the item
+```
+
+Where each instruction channel lands is a caching decision. The policy is
+identical for every thread and item, so it sits **inside** the
+`cache_control` breakpoint on the system block and is served from the
+provider cache after the run's first item. Thread notes differ per thread —
+folding them into that prefix would miss the cache on every thread — so they
+ride the ephemeral `instructions` placeholder *after* the breakpoint, which
+is also what keeps them out of the stored history and out of
+`RelevantHistorySelector`'s scoring.
 
 ---
 
@@ -60,6 +104,33 @@ BM25 + optional dense + RRF stack the history selector uses (scores are the
 1/rank of the fused order; no-signal queries return `[]`). The ranker is
 duck-typed — `store` never imports `relevance`, so plain KV usage stays
 free of the bm25s/faiss dependencies.
+
+### Chats — the span between a thread and its messages
+
+A **chat** is one consumer's stretch of a thread: `SasLLMPipeline` opens one
+per pipeline instance, so a resumed or forked run appears as a second chat on
+the same continuous thread.
+
+```python
+thread = mem.get_thread("user-42", chat_id="pipe-3f9c", chat_label="nightly run")
+thread.add_user_message("...")
+
+mem.chats("user-42")              # [{chat_id, label, first_key, last_key, ...}]
+thread.messages_in_chat("pipe-3f9c")
+```
+
+The chat id is deliberately **not** part of the message key. Thread ids are
+recovered from `msg::{thread}::{tick}` keys by splitting off the last segment
+(`list_threads`), `fork_thread` copies a key-prefix range, and the
+incremental read frontier is a key comparison — a third segment would break
+all three at once, and every legacy row with them. Instead one index record
+per chat (`chat::{thread}::{chat_id}`) is written **in the same batch** as
+the messages it indexes, so the index can never describe a write that did not
+land. `get_thread(..., chat_id=...)` re-stamps the active chat on every call
+rather than fixing it at creation, because thread objects are cached per id
+and two consumers sharing a manager would otherwise inherit each other's
+chat. Forking clamps chats to the copied slice: one that starts after the
+fork point is dropped, one that straddles it keeps only the copied part.
 
 ### Thread forking
 
@@ -291,3 +362,102 @@ Design points:
 
 Logger name: `memory.summarize` (INFO on construction and each fold,
 WARNING on a shrunken-thread reset).
+
+---
+
+## policy — long-term (task) memory
+
+Standing instructions for a *task*, stable across every thread and session it
+spawns. Stored as one record per task, `policy::{task_id}`.
+
+```python
+from memory.policy import TaskPolicy
+
+policy = TaskPolicy("customer_support", store=mem.kv)
+policy.add("Prefer concise responses.")
+policy.add("Escalate refund requests above $500.", overridable=False)
+
+pipeline = SasLLMPipeline(task_id="customer_support")   # loads and prompts it
+```
+
+- **Overridable vs fixed.** Each instruction declares whether a
+  conversation-specific note may override it. Preferences are overridable;
+  guardrails are not, and the rendered block says so inline — which is what
+  makes short-term overrides safe to enable at all.
+- **Snapshot, not live read.** The pipeline folds `render()` into its system
+  prompt at construction and records `fingerprint` for that text. Editing the
+  policy afterwards does not change the running pipeline (that is what keeps
+  the cached prefix stable, and what makes the fingerprint an honest record
+  of what was prompted) — the next pipeline, i.e. the next chat, picks it up.
+- **Defaults seed, they do not overwrite.** `default_instructions=` applies
+  only to a task with no stored policy, so re-running a program cannot
+  silently revert an operator's edit.
+
+## thread_mem — short-term (conversation) memory
+
+The exceptions, preferences and overrides that hold for one thread only.
+Stored as one record per thread, `tmem::{thread_id}`.
+
+```python
+from memory.thread_mem import ThreadMemory
+
+notes = ThreadMemory(store=mem.kv)
+notes.add("thread-1", "Customer prefers email.", kind="preference")
+notes.add("thread-1", "Discount approved.", kind="exception",
+          source="supervisor", ttl_s=3600)
+
+pipeline = SasLLMPipeline(thread_memory=notes)
+pipeline.remember("thread-1", "Do not offer the standard discount.")
+```
+
+Notes are **prompted, never persisted** to the `msg::` history — the same
+rule reference guidance and the rolling summary follow — and they expire:
+`ttl_s` bounds an exception's life so a stale override cannot outlive the
+approval that justified it. `fork()` copies live notes onto a branch, which
+`SasLLMPipeline.fork_run` calls, because losing "exception approved by
+supervisor" on a rewind would silently change what the branch may do.
+
+## context — assembling the two channels
+
+```python
+from memory.context import MemoryContext
+
+ctx = MemoryContext(policy=policy, thread_memory=notes)
+assembled = ctx.assemble("thread-1")
+assembled.system_suffix   # -> append to the system prompt (cacheable)
+assembled.ephemeral       # -> prompt after the cache breakpoint
+```
+
+The only place that sees both channels, and therefore the only place that can
+state their precedence: a note overrides an overridable instruction, and
+never a fixed one. That sentence is rendered with the notes, not with the
+policy, so it costs nothing on threads that have no notes.
+
+## extractor — the write path
+
+```python
+from memory.extractor import MemoryExtractor
+
+extractor = MemoryExtractor(model, policy=policy, thread_memory=notes)
+pipeline = SasLLMPipeline(memory_extractor=extractor)   # observes kept turns
+
+extractor.pending()          # permanent candidates awaiting approval
+extractor.approve(candidate_id, overridable=False)
+```
+
+Two asymmetries carry the safety story:
+
+- **The cue gate runs before the model.** A turn with no instruction-shaped
+  language ("from now on", "never", "exception", "approved", …) is skipped
+  offline, so an ordinary translation run pays no extra LLM calls.
+- **Permanent memories are proposed, not written.** A thread note expires and
+  dies with its thread; a policy instruction applies to every future thread
+  of the task, so it needs `approve()` (or `auto_apply_permanent=True`, off
+  by default, which logs a warning).
+
+Extraction runs on the turn that was *kept* — never on an attempt inline
+validation rolled back — and swallows every error: a memory write must not be
+able to fail a translation run.
+
+Logger names: `memory.policy`, `memory.thread_mem`, `memory.context`,
+`memory.extractor`.

@@ -11,8 +11,12 @@ not required (the _DeltaBackend is not covered here).
 import pathlib
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+from langchain_core.messages import AIMessage, HumanMessage
 
 from memory.store import (
     MemoryHub,
@@ -751,6 +755,158 @@ class TestTruncateTo(unittest.TestCase):
         h = KVChatMessageHistory("t1", store)
         with self.assertRaises(ValueError):
             h.truncate_to(-1)
+
+
+class TestChatIndex(unittest.TestCase):
+    """The Chat layer between Thread and Message: an index record per chat,
+    never a segment of the message key."""
+
+    def test_no_chat_record_without_an_active_chat(self):
+        store = KVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store)
+        h.add_user_message("hello")
+        self.assertEqual(h.chats(), [])
+        self.assertIsNone(h.chat_id)
+
+    def test_chat_record_tracks_range_and_count(self):
+        store = KVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store)
+        h.set_chat("chat-a", label="run 1")
+        h.add_messages([HumanMessage("q1"), AIMessage("a1")])
+        h.add_messages([HumanMessage("q2"), AIMessage("a2")])
+        (chat,) = h.chats()
+        self.assertEqual(chat["chat_id"], "chat-a")
+        self.assertEqual(chat["thread_id"], "t1")
+        self.assertEqual(chat["label"], "run 1")
+        self.assertEqual(chat["message_count"], 4)
+        self.assertLess(chat["first_key"], chat["last_key"])
+
+    def test_message_keys_keep_their_two_segment_shape(self):
+        # The chat id must not enter the message key: thread ids are
+        # recovered from those keys by splitting off the last segment.
+        store = KVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store)
+        h.set_chat("chat-a")
+        h.add_user_message("hello")
+        key = store.keys(prefix="msg::")[0]
+        self.assertEqual(key.count("::"), 2)
+        self.assertEqual(ThreadMemoryManager(store).list_threads(), ["t1"])
+
+    def test_two_chats_split_one_thread(self):
+        store = KVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store)
+        h.set_chat("chat-a")
+        h.add_messages([HumanMessage("q1"), AIMessage("a1")])
+        h.set_chat("chat-b")
+        h.add_messages([HumanMessage("q2"), AIMessage("a2")])
+        self.assertEqual([c["chat_id"] for c in h.chats()], ["chat-a", "chat-b"])
+        self.assertEqual(
+            [m.content for m in h.messages_in_chat("chat-a")], ["q1", "a1"]
+        )
+        self.assertEqual(
+            [m.content for m in h.messages_in_chat("chat-b")], ["q2", "a2"]
+        )
+        # The thread itself is unchanged: one continuous history.
+        self.assertEqual(len(h.messages), 4)
+
+    def test_resuming_a_chat_extends_its_record(self):
+        store = KVStore(spark=None, table=None)
+        first = KVChatMessageHistory("t1", store)
+        first.set_chat("chat-a")
+        first.add_user_message("q1")
+        # A second process/instance re-opening the same chat id.
+        second = KVChatMessageHistory("t1", store)
+        second.set_chat("chat-a")
+        second.add_user_message("q2")
+        (chat,) = second.chats()
+        self.assertEqual(chat["message_count"], 2)
+        self.assertEqual(len(second.messages_in_chat("chat-a")), 2)
+
+    def test_same_tick_writes_keep_the_chat_range_valid(self):
+        """Two instances appending to one chat on the same microsecond tick.
+
+        The random key suffix is per-write, so the later message can sort
+        *below* the earlier one (the same race the read cache's frontier
+        handles). Assigning last_key instead of widening the range would
+        leave first_key > last_key and the chat would read as empty.
+        """
+        store = KVStore(spark=None, table=None)
+        suffixes = [SimpleNamespace(hex="ffffffff"), SimpleNamespace(hex="00000000")]
+        with mock.patch("memory.store._now", return_value=1_700_000_000.0), mock.patch(
+            "memory.store.uuid.uuid4", side_effect=suffixes
+        ):
+            first = KVChatMessageHistory("t1", store)
+            first.set_chat("chat-a")
+            first.add_user_message("q1")
+            second = KVChatMessageHistory("t1", store)
+            second.set_chat("chat-a")
+            second.add_user_message("q2")  # same tick, lower suffix
+        keys = sorted(store.keys(prefix="msg::t1::"))
+        (chat,) = second.chats()
+        self.assertLessEqual(chat["first_key"], keys[0])
+        self.assertGreaterEqual(chat["last_key"], keys[-1])
+        self.assertEqual(len(second.messages_in_chat("chat-a")), 2)
+
+    def test_unknown_chat_reads_empty(self):
+        store = KVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store)
+        h.set_chat("chat-a")
+        h.add_user_message("q1")
+        self.assertEqual(h.messages_in_chat("nope"), [])
+
+    def test_clear_drops_the_index_too(self):
+        store = KVStore(spark=None, table=None)
+        h = KVChatMessageHistory("t1", store)
+        h.set_chat("chat-a")
+        h.add_user_message("q1")
+        h.clear()
+        self.assertEqual(h.chats(), [])
+        self.assertEqual(store.keys(prefix="chat::"), [])
+
+    def test_manager_restamps_the_chat_on_every_get(self):
+        mgr = ThreadMemoryManager(KVStore(spark=None, table=None))
+        mgr.get_thread("t1", chat_id="chat-a").add_user_message("q1")
+        # A second consumer of the same manager must not inherit chat-a.
+        mgr.get_thread("t1", chat_id="chat-b").add_user_message("q2")
+        counts = {c["chat_id"]: c["message_count"] for c in mgr.chats("t1")}
+        self.assertEqual(counts, {"chat-a": 1, "chat-b": 1})
+
+    def test_fork_clamps_chats_to_the_copied_slice(self):
+        mgr = ThreadMemoryManager(KVStore(spark=None, table=None))
+        src = mgr.get_thread("src", chat_id="chat-a")
+        src.add_messages([HumanMessage("q1"), AIMessage("a1")])
+        src.set_chat("chat-b")
+        src.add_messages([HumanMessage("q2"), AIMessage("a2")])
+        # Fork at the first turn: chat-a is copied whole, chat-b starts after
+        # the fork point and must not appear on the branch at all.
+        self.assertEqual(mgr.fork_thread("src", "dst", upto_messages=2), 2)
+        forked = mgr.chats("dst")
+        self.assertEqual([c["chat_id"] for c in forked], ["chat-a"])
+        self.assertEqual(forked[0]["thread_id"], "dst")
+        self.assertEqual(forked[0]["message_count"], 2)
+        self.assertTrue(forked[0]["first_key"].startswith("msg::dst::"))
+        self.assertEqual(
+            [m.content for m in mgr.get_thread("dst").messages_in_chat("chat-a")],
+            ["q1", "a1"],
+        )
+
+    def test_fork_truncates_a_straddling_chat(self):
+        mgr = ThreadMemoryManager(KVStore(spark=None, table=None))
+        src = mgr.get_thread("src", chat_id="chat-a")
+        src.add_messages([HumanMessage("q1"), AIMessage("a1")])
+        src.add_messages([HumanMessage("q2"), AIMessage("a2")])
+        mgr.fork_thread("src", "dst", upto_messages=2)
+        (forked,) = mgr.chats("dst")
+        self.assertEqual(forked["message_count"], 2)
+        self.assertEqual(len(mgr.get_thread("dst").messages), 2)
+
+    def test_hub_exposes_chats_and_delete_thread(self):
+        hub = MemoryHub()
+        hub.get_thread("t1", chat_id="chat-a", chat_label="run 1").add_user_message("q")
+        self.assertEqual(hub.chats("t1")[0]["label"], "run 1")
+        hub.delete_thread("t1")
+        self.assertEqual(hub.chats("t1"), [])
+        self.assertEqual(hub.threads.list_threads(), [])
 
 
 if __name__ == "__main__":
