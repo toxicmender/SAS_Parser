@@ -21,6 +21,17 @@ Resolution precedence for the target follows the repo-wide rule
 (``validation.table`` / ``validation.path``) > the local parquet default.
 A configured/explicit ``table`` always wins over ``path``.
 
+**BREAKING (schema change): ``policy_fingerprint``.** The row schema gained a
+``policy_fingerprint`` column — which long-term task policy
+(:class:`memory.policy.TaskPolicy`) the run was scored under, beside the
+``instructions_fingerprint`` that already records the reference-guidance
+instruction set. No migration is provided: appending to a history written by
+an earlier version fails on the column mismatch (a parquet directory raises
+on read/append, a saved table on ``saveAsTable``). **Point ``validation.path``
+/ ``validation.table`` at a fresh target, or drop the old one.** Existing
+history stays readable where it is; it simply cannot be appended to or unioned
+with new rows.
+
 Logger name: ``validation.tracking``.
 """
 
@@ -44,13 +55,37 @@ DEFAULT_PATH = "validation_runs"
 
 # One row per (run, case, metric); run- and case-level values are repeated on
 # each row so any slice of the table is self-describing.
-_SCHEMA_DDL = (
-    "run_id string, logged_at timestamp, model string, "
-    "instructions_fingerprint string, run_score double, "
-    "run_passed boolean, case_count int, case_id string, case_score double, "
-    "case_passed boolean, item_count int, metric string, score double, "
-    "threshold double, passed boolean, skipped boolean, details string"
+#
+# This tuple is the schema: the DDL below is generated from it, and
+# _report_rows is checked against it, so a column cannot land in one and be
+# forgotten in the other. Order is the stored column order — append new
+# columns at the end of their group rather than reordering, which would make
+# old and new files disagree about what a positional read means.
+_COLUMNS: tuple[tuple[str, str], ...] = (
+    # run level
+    ("run_id", "string"),
+    ("logged_at", "timestamp"),
+    ("model", "string"),
+    ("instructions_fingerprint", "string"),
+    ("policy_fingerprint", "string"),
+    ("run_score", "double"),
+    ("run_passed", "boolean"),
+    ("case_count", "int"),
+    # case level
+    ("case_id", "string"),
+    ("case_score", "double"),
+    ("case_passed", "boolean"),
+    ("item_count", "int"),
+    # metric level
+    ("metric", "string"),
+    ("score", "double"),
+    ("threshold", "double"),
+    ("passed", "boolean"),
+    ("skipped", "boolean"),
+    ("details", "string"),
 )
+
+_SCHEMA_DDL = ", ".join(f"{name} {sql_type}" for name, sql_type in _COLUMNS)
 
 
 def _ensure_spark(spark: "SparkSession | None") -> "SparkSession":
@@ -77,22 +112,35 @@ def _resolve_target(table: str | None, path: str | None) -> tuple[str, str]:
 def _report_rows(
     report: ValidationReport, run_id: str, logged_at: datetime
 ) -> list[dict[str, Any]]:
+    """One row per (case, metric), keyed exactly by :data:`_COLUMNS`.
+
+    The run-level values are computed once: ``report.score`` / ``passed`` are
+    computed Pydantic fields, so reading them per row would re-derive the
+    aggregate for every metric of every case.
+    """
+    run_level = {
+        "run_id": run_id,
+        "logged_at": logged_at,
+        "model": report.model,
+        "instructions_fingerprint": report.instructions_fingerprint,
+        "policy_fingerprint": report.policy_fingerprint,
+        "run_score": report.score,
+        "run_passed": report.passed,
+        "case_count": len(report.results),
+    }
     rows: list[dict[str, Any]] = []
     for result in report.results:
+        case_level = {
+            "case_id": result.case_id,
+            "case_score": result.score,
+            "case_passed": result.passed,
+            "item_count": result.item_count,
+        }
         for m in result.metrics:
             rows.append(
                 {
-                    "run_id": run_id,
-                    "logged_at": logged_at,
-                    "model": report.model,
-                    "instructions_fingerprint": report.instructions_fingerprint,
-                    "run_score": report.score,
-                    "run_passed": report.passed,
-                    "case_count": len(report.results),
-                    "case_id": result.case_id,
-                    "case_score": result.score,
-                    "case_passed": result.passed,
-                    "item_count": result.item_count,
+                    **run_level,
+                    **case_level,
                     "metric": m.metric,
                     "score": m.score,
                     "threshold": m.threshold,

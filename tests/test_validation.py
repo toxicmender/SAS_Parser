@@ -585,6 +585,41 @@ def test_run_from_thread_labels_outputs_with_run_fact_item_ids():
     assert run.responses == [o["response"] for o in outputs]
 
 
+def test_run_from_thread_carries_the_memory_the_thread_ran_under():
+    """The memory layers persist, so a post-hoc score can see what the
+    conversation was actually told — policy, its own notes, and (for the
+    leakage check) every other thread's notes."""
+    from memory.thread_mem import ThreadMemory
+
+    notes = ThreadMemory()
+    pipeline = _pipeline(
+        [GOOD_RESPONSE] * 4,
+        task_id="support",
+        thread_memory=notes,
+        user_instructions="",
+    )
+    pipeline.task_policy.add("Escalate refunds above $500.", overridable=False)
+    pipeline.remember("live::mem", "Discount approved by supervisor.", kind="exception")
+    notes.add("some::other::thread", "Do not mention the pilot programme.")
+    pipeline.run_text("data work.a; x=1; run;", thread_id="live::mem")
+
+    run = run_from_thread(pipeline, "live::mem")
+    assert [entry["text"] for entry in run.task_policy] == [
+        "Escalate refunds above $500."
+    ]
+    assert run.task_policy[0]["overridable"] is False
+    assert run.thread_notes == ["Discount approved by supervisor."]
+    assert run.foreign_notes == ["Do not mention the pilot programme."]
+
+
+def test_run_from_thread_without_memory_leaves_the_fields_empty():
+    pipeline = _pipeline([GOOD_RESPONSE] * 4)
+    pipeline.run_text("data work.a; x=1; run;", thread_id="live::plain")
+    run = run_from_thread(pipeline, "live::plain")
+    assert run.task_policy == [] and run.thread_notes == []
+    assert run.foreign_notes == []
+
+
 def test_run_from_thread_empty_thread_raises():
     pipeline = _pipeline([GOOD_RESPONSE])
     with pytest.raises(ValueError, match="no messages"):
@@ -1027,6 +1062,53 @@ def test_instructions_fingerprint_flows_into_report_and_rows():
     assert bare.instructions_fingerprint is None
 
 
+def test_policy_fingerprint_flows_into_report_and_rows():
+    """The long-term task policy is its own history column, beside the
+    reference-guidance fingerprint — the two are different inputs."""
+    from datetime import datetime, timezone
+
+    from validation.tracking import _report_rows
+
+    case = ValidationCase(case_id="policy-fp", sas_source="data work.a; run;")
+    seeded = _pipeline([GOOD_RESPONSE], task_id="sas", user_instructions="")
+    seeded.task_policy.add("Name every output table explicitly.")
+    # The policy is snapshotted into the system prompt at construction, so the
+    # run has to be driven by a pipeline built after the edit.
+    with_policy = _pipeline(
+        [GOOD_RESPONSE], task_id="sas", user_instructions="", memory=seeded._memory
+    )
+
+    report = ValidationRunner(with_policy).run([case])
+    assert report.policy_fingerprint == with_policy.policy_fingerprint
+    assert report.policy_fingerprint is not None
+    # Two independent inputs, two independent columns.
+    assert report.instructions_fingerprint != report.policy_fingerprint
+    rows = _report_rows(report, "run-1", datetime.now(timezone.utc))
+    assert all(r["policy_fingerprint"] == report.policy_fingerprint for r in rows)
+
+    # No task policy -> None recorded.
+    bare = ValidationRunner(_pipeline([GOOD_RESPONSE])).run([case])
+    assert bare.policy_fingerprint is None
+
+
+def test_report_rows_match_the_declared_schema_exactly():
+    """_COLUMNS is the schema: the DDL is generated from it, and every row
+    must carry exactly those keys — a column added to one and forgotten in
+    the other would write nulls, or fail the Spark write."""
+    from datetime import datetime, timezone
+
+    from validation.tracking import _COLUMNS, _SCHEMA_DDL, _report_rows
+
+    report = ValidationRunner(_pipeline([GOOD_RESPONSE])).run(
+        [ValidationCase(case_id="schema", sas_source="data work.a; run;")]
+    )
+    rows = _report_rows(report, "run-1", datetime.now(timezone.utc))
+    names = [name for name, _ in _COLUMNS]
+    assert rows and all(list(row) == names for row in rows)
+    assert "policy_fingerprint string" in _SCHEMA_DDL
+    assert _SCHEMA_DDL.startswith("run_id string, logged_at timestamp")
+
+
 def test_resolve_target_prefers_table_over_path():
     from validation.tracking import DEFAULT_PATH, _resolve_target
 
@@ -1062,6 +1144,11 @@ def test_log_report_appends_parquet_rows_via_spark(tmp_path):
     run_id = log_report(report, spark=spark, path=target)
 
     df = load_runs(spark=spark, path=target)
+    # The written file's columns are the declared schema, in order — the one
+    # place the DDL is exercised against a real Spark write.
+    from validation.tracking import _COLUMNS
+
+    assert df.columns == [name for name, _ in _COLUMNS]
     rows = df.collect()
     assert {r.run_id for r in rows} == {run_id}
     assert {r.metric for r in rows} == {

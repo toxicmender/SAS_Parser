@@ -10,8 +10,11 @@ gates or retries a run):
   falls back to grading against the turn's prompt, which for pipeline
   threads embeds the SAS chunk text. The reference guidance is ephemeral too,
   so the retrieval-context metrics skip. What thread mode uniquely *can*
-  score is the rolling summary: it is stored, so it is read back here and
-  handed to :class:`~validation.summarization.SummarizationMetric`.
+  score is everything the memory layers persisted: the rolling summary
+  (handed to :class:`~validation.summarization.SummarizationMetric`), the
+  task policy the thread ran under, its own short-term notes, and every
+  *other* thread's notes — which is what lets ``validation.memory_metrics``
+  audit instruction-following and note leakage after the fact.
 - :func:`validate_transcript` — score any (prompt, response) transcript,
   even one not produced by :class:`~chunker.pipeline.SasLLMPipeline`.
 
@@ -145,6 +148,61 @@ def _rolling_summary(
     return summary, "\n\n".join(turn_text(turn) for turn in turns)
 
 
+def _memory_state(source: Any, thread_id: str) -> dict[str, list[Any]]:
+    """The memory a thread ran under: policy, its own notes, others' notes.
+
+    Read straight off the KV rows (``policy::…``, ``tmem::…``) the way
+    :func:`_rolling_summary` reads the summary, so this module imports
+    nothing from ``memory``. The long-term policy comes from the pipeline
+    that ran the thread (it knows its task id); a bare ``MemoryHub`` has no
+    way to know which task a thread belonged to, so it contributes notes
+    only.
+
+    ``foreign`` is every *other* thread's notes — the corpus
+    ``memory_leakage`` checks these answers against. Empty (and the metric
+    skips) whenever the store holds only this thread's notes.
+    """
+    state: dict[str, list[Any]] = {"policy": [], "notes": [], "foreign": []}
+    policy = getattr(source, "task_policy", None)
+    as_dicts = getattr(policy, "as_dicts", None)
+    if callable(as_dicts):
+        entries = as_dicts()
+        if isinstance(entries, list):
+            state["policy"] = [e for e in entries if isinstance(e, dict)]
+    kv = _thread_kv(source)
+    if kv is None:
+        return state
+    try:
+        own = kv.get(f"tmem::{thread_id}", None)
+        items = getattr(kv, "items_with_prefix", None)
+        entries = items("tmem::") if items is not None else []
+    except Exception:
+        logger.debug(f"_memory_state: no notes readable for '{thread_id}'")
+        return state
+    state["notes"] = _note_texts(own)
+    for entry in entries:
+        if entry.get("key") == f"tmem::{thread_id}":
+            continue
+        state["foreign"].extend(_note_texts(entry.get("value")))
+    logger.info(
+        f"_memory_state: '{thread_id}'  policy={len(state['policy'])}  "
+        f"notes={len(state['notes'])}  foreign_notes={len(state['foreign'])}"
+    )
+    return state
+
+
+def _note_texts(stored: Any) -> list[str]:
+    """Note texts out of one stored ``tmem::`` record (see
+    ``memory.thread_mem``); ``[]`` for anything unreadable."""
+    if not isinstance(stored, list):
+        return []
+    return [
+        str(raw["text"]).strip()
+        for raw in stored
+        if isinstance(raw, dict) and str(raw.get("text", "")).strip()
+    ]
+
+
 def _outputs(
     responses: list[str], item_ids: dict[int, str]
 ) -> list[dict[str, Any]]:
@@ -188,9 +246,11 @@ def run_from_thread(
     prompts, responses = _pairs_from_messages(messages)
     item_ids = _thread_item_ids(source, thread_id)
     summary, summary_source = _rolling_summary(source, thread_id, messages)
+    memory = _memory_state(source, thread_id)
     logger.info(
         f"run_from_thread: '{thread_id}'  turns={len(prompts)}  "
-        f"labelled_items={len(item_ids)}  summary={'yes' if summary else 'no'}"
+        f"labelled_items={len(item_ids)}  summary={'yes' if summary else 'no'}  "
+        f"policy={len(memory['policy'])}  notes={len(memory['notes'])}"
     )
     return EvaluationRun(
         run_id=thread_id,
@@ -200,6 +260,9 @@ def run_from_thread(
         reference_translation=reference_translation,
         summary=summary,
         summary_source=summary_source,
+        task_policy=memory["policy"],
+        thread_notes=memory["notes"],
+        foreign_notes=memory["foreign"],
     )
 
 

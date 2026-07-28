@@ -140,6 +140,10 @@ class ValidationRunner:
         report = ValidationReport(
             model=self.pipeline.model,
             instructions_fingerprint=self.pipeline.instructions_fingerprint,
+            # getattr: the runner duck-types its pipeline (tests inject
+            # stand-ins), and a pipeline predating long-term memory has no
+            # policy to fingerprint.
+            policy_fingerprint=getattr(self.pipeline, "policy_fingerprint", None),
             results=results,
             # A run that billed nothing reported nothing — carry None rather
             # than a row of zeroes claiming the run was free.

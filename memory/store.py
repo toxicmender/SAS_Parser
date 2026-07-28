@@ -662,6 +662,23 @@ class KVChatMessageHistory(BaseChatMessageHistory):
     ----------
     msg::{session_id}::{epoch_micros:016d}-{rand4}
         → {"message": <langchain message_to_dict>, "ts": ...}
+    chat::{session_id}::{chat_id}
+        → {"chat_id", "label", "started_at", "first_key", "last_key",
+           "message_count", ...}   (only when a chat is active — see below)
+
+    Chats
+    -----
+    A **chat** is one span of a thread: the messages written by one
+    consumer, e.g. one ``SasLLMPipeline`` instance (Task → Thread → Chat →
+    Message). Set one with :meth:`set_chat` and every later
+    :meth:`add_messages` extends its record in the *same* store write.
+
+    The chat id is deliberately **not** part of the message key. Thread ids
+    are recovered from message keys by splitting off the last ``::`` segment
+    (:meth:`ThreadMemoryManager.list_threads`), the fork copy is a key-prefix
+    range, and the incremental read frontier is a key comparison — a third
+    segment would break all three, and every legacy row at once. An index
+    record costs one extra upserted row per write instead.
 
     Values carry the full ``message_to_dict`` payload, so tool calls,
     ``usage_metadata``, ``response_metadata``, names, and ids all
@@ -713,7 +730,15 @@ class KVChatMessageHistory(BaseChatMessageHistory):
         self._store = store
         self._idx_key = f"idx::{session_id}"  # legacy counter key, cleanup only
         self._msg_prefix = f"msg::{session_id}::"
+        self._chat_prefix = f"chat::{session_id}::"
         self._last_us = 0
+        # Active chat (None = messages are written with no chat record, the
+        # pre-chat behaviour). The state dict is read from the store on the
+        # first write for a given chat id, so a second process resuming the
+        # same chat extends its record instead of restarting it.
+        self._chat_id: Optional[str] = None
+        self._chat_label: Optional[str] = None
+        self._chat_state: Optional[Dict[str, Any]] = None
         # Read cache: after the first full load, .messages only fetches
         # rows whose key sorts after the cache frontier (records_after) —
         # an append-only tail read instead of a per-call prefix rescan.
@@ -824,12 +849,119 @@ class KVChatMessageHistory(BaseChatMessageHistory):
                     "tags": ["message", role, self.session_id],
                 }
             )
+        if not entries:
+            return
+        chat_entry = self._chat_entry(
+            entries[0]["key"], entries[-1]["key"], len(entries)
+        )
+        if chat_entry is not None:
+            # Same batch as the messages it indexes: one Delta MERGE, and the
+            # index can never describe a write that did not land.
+            entries.append(chat_entry)
         self._store.set_many(entries)
         self._apply_retention()
 
+    # ---- Chats -------------------------------------------------------------
+
+    def set_chat(self, chat_id: Optional[str], *, label: Optional[str] = None) -> None:
+        """Attach later writes to *chat_id* (``None`` detaches).
+
+        Idempotent and cheap: re-stamping the same id keeps the loaded chat
+        state, so a consumer may call this every time it takes the thread —
+        which is what makes a shared :class:`ThreadMemoryManager` safe when
+        two pipelines write to one thread.
+        """
+        if chat_id != self._chat_id:
+            self._chat_state = None
+        self._chat_id = chat_id
+        self._chat_label = label
+
+    @property
+    def chat_id(self) -> Optional[str]:
+        """The chat later writes are attributed to, or ``None``."""
+        return self._chat_id
+
+    def _chat_entry(
+        self, first_key: str, last_key: str, added: int
+    ) -> Optional[Dict[str, Any]]:
+        """The chat index row to write alongside a batch of messages."""
+        if self._chat_id is None:
+            return None
+        if self._chat_state is None:
+            stored = self._store.get(self._chat_prefix + self._chat_id)
+            self._chat_state = stored if isinstance(stored, dict) else None
+        now = _now()
+        if self._chat_state is None:
+            self._chat_state = {
+                "chat_id": self._chat_id,
+                "thread_id": self.session_id,
+                "label": self._chat_label,
+                "started_at": now,
+                "first_key": first_key,
+                "last_key": last_key,
+                "message_count": 0,
+            }
+        state = self._chat_state
+        if self._chat_label and not state.get("label"):
+            state["label"] = self._chat_label
+        # Widened, never overwritten: another instance appending to the same
+        # chat can land on the same microsecond tick with a random suffix
+        # that sorts *below* the stored one (the _last_us bump is
+        # per-instance — the same race _refresh's frontier handles), and an
+        # assigned last_key could then sort before first_key, leaving the
+        # recorded range empty.
+        state["first_key"] = min(str(state.get("first_key", first_key)), first_key)
+        state["last_key"] = max(str(state.get("last_key", "")), last_key)
+        state["updated_at"] = now
+        state["message_count"] = int(state.get("message_count", 0)) + added
+        return {
+            "key": self._chat_prefix + self._chat_id,
+            "value": dict(state),
+            "tags": ["chat", self.session_id, self._chat_id],
+            "source": "KVChatMessageHistory",
+        }
+
+    def chats(self) -> List[Dict[str, Any]]:
+        """This thread's chat records, oldest first."""
+        records = [
+            rec["value"]
+            for _, rec in self._store.all_records(prefix=self._chat_prefix)
+            if isinstance(rec["value"], dict)
+        ]
+        records.sort(key=lambda state: state.get("started_at", 0.0))
+        return records
+
+    def messages_in_chat(self, chat_id: str) -> List[BaseMessage]:
+        """The messages written under *chat_id*, in order.
+
+        Reads the chat's key range directly rather than through the append
+        cache: this is an introspection path, and the range is the record's
+        ``first_key``/``last_key`` — messages another chat interleaved on the
+        same thread inside that range would be included, so a chat is only a
+        clean unit for consumers that do not interleave (one pipeline
+        instance at a time on a thread, which is how the pipeline runs).
+        """
+        state = self._store.get(self._chat_prefix + chat_id)
+        if not isinstance(state, dict):
+            logger.warning(
+                f"messages_in_chat: thread '{self.session_id}' has no chat "
+                f"'{chat_id}'"
+            )
+            return []
+        first, last = state.get("first_key", ""), state.get("last_key", "")
+        pairs = [
+            (key, rec)
+            for key, rec in self._store.all_records(prefix=self._msg_prefix)
+            if first <= key <= last
+        ]
+        pairs.sort(key=lambda kv: kv[0][len(self._msg_prefix) :])
+        return [self._decode_message(rec["value"]) for _, rec in pairs]
+
     def clear(self) -> None:
         self._store.clear_prefix(self._msg_prefix)
+        self._store.clear_prefix(self._chat_prefix)  # index of what just went
         self._store.delete(self._idx_key)  # legacy counter, if present
+        self._chat_state = None
         self._invalidate_cache()
 
     def has_messages(self) -> bool:
@@ -975,7 +1107,19 @@ class ThreadMemoryManager:
         self._max_messages = max_messages
         self._threads: Dict[str, KVChatMessageHistory] = {}
 
-    def get_thread(self, thread_id: str) -> KVChatMessageHistory:
+    def get_thread(
+        self,
+        thread_id: str,
+        *,
+        chat_id: Optional[str] = None,
+        chat_label: Optional[str] = None,
+    ) -> KVChatMessageHistory:
+        """The thread's history, optionally stamped with the active chat.
+
+        *chat_id* is re-stamped on every call rather than fixed at creation:
+        thread objects are cached per id, so two consumers sharing a manager
+        would otherwise inherit each other's chat.
+        """
         if thread_id not in self._threads:
             self._threads[thread_id] = KVChatMessageHistory(
                 thread_id,
@@ -983,7 +1127,15 @@ class ThreadMemoryManager:
                 max_age_s=self._max_age_s,
                 max_messages=self._max_messages,
             )
-        return self._threads[thread_id]
+        thread = self._threads[thread_id]
+        if chat_id is not None:
+            thread.set_chat(chat_id, label=chat_label)
+        return thread
+
+    def chats(self, thread_id: str) -> List[Dict[str, Any]]:
+        """*thread_id*'s chat records, oldest first (see
+        :meth:`KVChatMessageHistory.chats`)."""
+        return self.get_thread(thread_id).chats()
 
     def fork_thread(
         self,
@@ -1039,12 +1191,61 @@ class ThreadMemoryManager:
             }
             for key, rec in records
         ]
-        self._store.set_many(entries)
+        chat_entries = self._forked_chat_entries(
+            src_thread_id, dst_thread_id, [key for key, _ in records]
+        )
+        self._store.set_many([*entries, *chat_entries])
         logger.info(
-            f"fork_thread: copied {len(entries)} message(s) "
+            f"fork_thread: copied {len(entries)} message(s) and "
+            f"{len(chat_entries)} chat record(s) "
             f"'{src_thread_id}' -> '{dst_thread_id}'"
         )
         return len(entries)
+
+    def _forked_chat_entries(
+        self, src_thread_id: str, dst_thread_id: str, copied_keys: List[str]
+    ) -> List[Dict[str, Any]]:
+        """Chat index rows for the copied slice of a forked thread.
+
+        A fork copies a *prefix* of the messages, so chats are clamped to it:
+        one that starts past the fork point is dropped, one that straddles it
+        keeps only the copied part (``last_key`` and ``message_count``
+        recomputed). Without this the branch's index would claim messages
+        that were never copied.
+        """
+        if not copied_keys:
+            return []
+        src_prefix = f"msg::{src_thread_id}::"
+        dst_prefix = f"msg::{dst_thread_id}::"
+        last_copied = copied_keys[-1]
+        forked: List[Dict[str, Any]] = []
+        for _, rec in self._store.all_records(prefix=f"chat::{src_thread_id}::"):
+            state = rec["value"]
+            if not isinstance(state, dict) or not state.get("chat_id"):
+                continue
+            first = str(state.get("first_key", ""))
+            last = min(str(state.get("last_key", "")), last_copied)
+            if not first or first > last:
+                continue
+            count = sum(1 for key in copied_keys if first <= key <= last)
+            if not count:
+                continue
+            chat_id = str(state["chat_id"])
+            forked.append(
+                {
+                    "key": f"chat::{dst_thread_id}::{chat_id}",
+                    "value": {
+                        **state,
+                        "thread_id": dst_thread_id,
+                        "first_key": dst_prefix + first[len(src_prefix) :],
+                        "last_key": dst_prefix + last[len(src_prefix) :],
+                        "message_count": count,
+                    },
+                    "tags": ["chat", dst_thread_id, chat_id],
+                    "source": rec["source"],
+                }
+            )
+        return forked
 
     def list_threads(self) -> List[str]:
         """Thread ids with at least one stored message.
@@ -1295,8 +1496,34 @@ class MemoryHub:
         )
         self.kv = KVMemoryStore(store=self._store, namespace="kv", ranker=ranker)
 
-    def get_thread(self, thread_id: str) -> KVChatMessageHistory:
-        return self.threads.get_thread(thread_id)
+    def get_thread(
+        self,
+        thread_id: str,
+        *,
+        chat_id: Optional[str] = None,
+        chat_label: Optional[str] = None,
+    ) -> KVChatMessageHistory:
+        return self.threads.get_thread(
+            thread_id, chat_id=chat_id, chat_label=chat_label
+        )
+
+    def chats(self, thread_id: str) -> List[Dict[str, Any]]:
+        """The chats recorded on *thread_id*, oldest first.
+
+        One chat = one consumer's span of the thread (Task → Thread → Chat →
+        Message); ``SasLLMPipeline`` opens one per pipeline instance.
+        """
+        return self.threads.chats(thread_id)
+
+    def delete_thread(self, thread_id: str) -> None:
+        """Drop *thread_id*'s messages and chat index.
+
+        Thread-scoped **notes** (``memory.thread_mem``) and the rolling
+        summary are not touched here: both live behind duck-typed stores this
+        façade does not own, and both are cleared through the object that
+        wrote them (``ThreadMemory.clear`` / ``RollingSummarizer.reset``).
+        """
+        self.threads.delete_thread(thread_id)
 
     def fork_thread(
         self,

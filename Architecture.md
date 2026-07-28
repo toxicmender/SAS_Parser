@@ -144,10 +144,28 @@ memory/
   store.py              KVStore façade over two backends
                         (_InMemoryBackend dict / _DeltaBackend Spark+Delta),
                         KVChatMessageHistory (BaseChatMessageHistory, with
-                        optional after-write retention), ThreadMemoryManager
+                        optional after-write retention and the chat:: index
+                        that gives Thread -> Chat -> Message), ThreadMemoryManager
                         (incl. fork_thread), KVMemoryStore (optional injected
                         HybridRanker upgrades kv.search to hybrid retrieval),
                         and the MemoryHub entry-point façade.
+  policy.py             TaskPolicy: long-term, task-scoped standing
+                        instructions (policy::{task_id}), each flagged
+                        overridable or fixed, with a content fingerprint.
+                        Rendered into the cacheable system prompt. Store is
+                        duck-typed; imports nothing from memory.
+  thread_mem.py         ThreadMemory: short-term, thread-scoped notes and
+                        exceptions (tmem::{thread_id}) with TTL expiry and a
+                        fork() that follows memory.store's thread fork.
+                        Prompted, never persisted. Store is duck-typed.
+  context.py            MemoryContext.assemble(): resolves both instruction
+                        channels for one turn — policy -> system suffix,
+                        notes -> ephemeral messages — and states their
+                        precedence. Duck-typed on both; imports neither.
+  extractor.py          MemoryExtractor: classifies a kept turn into
+                        permanent (a policy proposal held for approval) or
+                        temporary (a thread note, applied), behind an offline
+                        cue gate. Never raises; model and store duck-typed.
 
 prompt_builder/
   models.py             Pydantic models: InstructionChunk, DocSection,
@@ -415,6 +433,30 @@ budget, transient-error retry that honors a gateway `Retry-After` /
 `retry-after-ms` header when present, else capped exponential backoff); an
 injected `llm` still gets the retry/budget layers.
 
+### Instruction memory: task policy and thread notes
+
+Beside the conversation itself, a run carries two instruction memories
+(`memory/`), on the Task → Thread → Chat → Message model:
+
+- **Long-term** (`task_id` / `task_policy`): a `TaskPolicy` of standing
+  instructions for the task, each marked overridable or fixed. Loaded once,
+  rendered into the system prompt inside the cache breakpoint, fingerprinted
+  for the run record.
+- **Short-term** (`thread_memory`): per-thread notes, exceptions and
+  overrides, prompted through the ephemeral `instructions` channel with the
+  precedence rule (a note beats an overridable instruction, never a fixed
+  one) and expiring on a TTL. They travel with `fork_run`.
+- **Writes** (`memory_extractor`): each accepted turn is classified into a
+  temporary note (applied) or a permanent policy proposal (held for
+  `approve()`), behind an offline cue gate so ordinary items cost no extra
+  call.
+
+A **chat** is one pipeline instance's span of a thread, recorded as a
+`chat::` index row and readable via `get_chats(thread_id)`; a resumed or
+forked run is a second chat on the same thread. `validation.memory_metrics`
+scores all of this after the fact (policy adherence, override compliance,
+extraction quality, note leakage across threads).
+
 ### Structured output and the notebook deliverable
 
 With `structured_output` on (constructor argument, else config.json
@@ -556,10 +598,36 @@ any of these silently changes behavior.
    is set, its SystemMessage is prepended after trimming/selection and its
    state lives under the KV `summary::` key. Both are re-derivable, would
    bloat the O(n) history, and must stay out of
-   `RelevantHistorySelector`'s scoring — *stored = the item message;
-   prompted = summary + selected history + guidance + item message*.
+   `RelevantHistorySelector`'s scoring. A third kind joins them: (c)
+   short-term **thread notes** — when a `thread_memory` is set, its live
+   notes for the thread are appended to the same `instructions` list — so
+   *stored = the item message; prompted = policy (in the system block) +
+   summary + selected history + guidance + thread notes + item message*.
 
-6. **In-memory mode must stay Spark-free.** `_InMemoryBackend` (and
+6. **Instruction memory splits on the cache breakpoint.** The long-term task
+   policy (`memory.policy`) is folded into the system prompt at pipeline
+   construction, *inside* the `cache_control` block: it is identical for
+   every thread and item, so it costs one cache write and is then served
+   from cache. Short-term thread notes must **not** go there — they differ
+   per thread, and folding them into the cached prefix would miss the cache
+   on every one — which is why they are ephemeral context (invariant 5c)
+   rather than part of the prompt template. Corollary: the policy is a
+   *snapshot*. `SasLLMPipeline.policy_fingerprint` is fixed at construction
+   along with the prompt text it describes, and editing the `TaskPolicy`
+   object afterwards changes neither — a new pipeline (a new chat) is what
+   picks an edit up.
+
+7. **The chat id is not part of the message key.** `chat::{thread}::{id}`
+   is an index record, written in the *same batch* as the messages it covers
+   (so it can never describe a write that did not land). Thread ids are
+   recovered from `msg::{thread}::{tick}` keys by splitting off the last
+   segment (`list_threads`), `fork_thread` copies a key-prefix range, and
+   the incremental read frontier is a key comparison — a third key segment
+   would break all three at once, plus every legacy row. One pipeline
+   instance opens one chat on every thread it writes; a fork clamps each
+   copied chat to the slice that was actually copied.
+
+8. **In-memory mode must stay Spark-free.** `_InMemoryBackend` (and
    therefore `MemoryHub()` with no arguments) must import and run
    without pyspark installed; the pyspark requirement lives inside
    `_DeltaBackend.__init__` only. The pipeline never boots a SparkSession
@@ -567,10 +635,10 @@ any of these silently changes behavior.
    optional `spark` extra in pyproject.toml, never a core dependency —
    CI installs the extra in the test and pyright jobs.
 
-7. **`SasBatch.reason` strings and item ordering are pinned by tests.**
+9. **`SasBatch.reason` strings and item ordering are pinned by tests.**
    Edge-emission order is observable output, not an implementation detail.
 
-8. **`_RESERVED_WORDS` is Appendix 1 verbatim (94 words).** Genuine macro
+10. **`_RESERVED_WORDS` is Appendix 1 verbatim (94 words).** Genuine macro
    functions missing from Appendix 1 go in
    `_ADDITIONAL_MACRO_FUNCTION_WORDS`, and SAS-provided autocall macros in
    `_STANDARD_AUTOCALL_MACROS` — the three sets have distinct, citable

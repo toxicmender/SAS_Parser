@@ -59,7 +59,12 @@ agentic_metrics.py
                  prompt_alignment, plan_adherence, task_completion.
 summarization.py summarization (the rolling thread summary) and
                  analysis_summarization (each item's ## Analysis).
-                 All ten are opt-in via metrics.judged_metrics().
+                 All twelve judged metrics are opt-in via
+                 metrics.judged_metrics().
+memory_metrics.py
+                 policy_adherence, override_compliance (judged) and
+                 memory_extraction, memory_leakage (deterministic) — the
+                 memory layers' metrics, built by memory_metrics().
 evaluator.py     Evaluator — the scoring core: one EvaluationRun in, one
                  CaseResult out. Everything funnels through here.
 runner.py        ValidationRunner: cases -> pipeline -> Evaluator -> report.
@@ -83,18 +88,22 @@ cases/           Sample cases.
 
 ## Judged metrics
 
-Ten opt-in metrics implementing deepeval's published definitions
+Twelve opt-in metrics — ten implementing deepeval's published definitions
 (deepeval.com/docs/metrics-*) natively, on top of `JudgedMetric`. They cover
 what the deterministic suite structurally cannot: whether the model followed
 the system prompt's contract, whether the translation is grounded in the
 reference guidance `prompt_builder` retrieved (until now the retrieval layer
 had no end-to-end measurement at all), whether the `## Analysis` reasoning
 matches the code that follows it, and whether the rolling summary keeps the
-identifiers `memory.summarize` promises to keep.
+identifiers `memory.summarize` promises to keep. The other two
+(`policy_adherence`, `override_compliance`, in `memory_metrics.py`) score the
+instruction memories — see [Memory metrics](#memory-metrics).
 
 | metric | scores | against | scope | default |
 |---|---|---|---|---|
 | `prompt_alignment` | instructions followed / total | the declared instruction list | item | 0.80 |
+| `policy_adherence` | policy instructions followed / total | the run's long-term `TaskPolicy` | item | 0.80 |
+| `override_compliance` | overrides honoured + fixed rules respected / total | the thread's short-term notes and the policy's fixed rules | item | 0.90 |
 | `answer_relevancy` | relevant statements / total | the item's prompt | item | 0.70 |
 | `faithfulness` | truthful claims / total | the retrieved guidance | item | 0.70 |
 | `hallucination` | 1 − contradicted contexts / total | the item's SAS source (+ golden translation) | item | 0.80 |
@@ -131,7 +140,7 @@ from validation import ValidationRunner, default_metrics, judged_metrics
 judge = LLMClient(LLMClientConfig(model="claude-sonnet-4-5"))
 runner = ValidationRunner(
     pipeline,
-    metrics=[*default_metrics(), *judged_metrics(judge)],          # all ten
+    metrics=[*default_metrics(), *judged_metrics(judge)],       # all twelve
 )
 # or a subset:
 judged_metrics(judge, include=["faithfulness", "contextual_relevancy"])
@@ -146,7 +155,7 @@ python -m validation validation/cases --judge-model claude-sonnet-4-5 \
     --judge-metrics faithfulness,contextual_precision
 ```
 
-**Cost.** The full suite is roughly **15 judge calls per item plus 5 per run**,
+**Cost.** The full suite is roughly **17 judge calls per item plus 5 per run**,
 against `llm_judge`'s one — enable a subset unless you mean it. The spend lands
 in `ValidationReport.judge_token_usage`, separate from the pipeline's own, with
 no extra wiring: `ValidationRunner.judge_token_usage` sums `token_usage` across
@@ -171,6 +180,53 @@ explicit constructor argument > config.json `validation.<name>_threshold` >
 the metric's class default. Metrics that a run carries no signal for
 (no reference translation, no required terms, no datasets) report
 `skipped` — they pass and are excluded from the case score.
+
+## Memory metrics
+
+Four metrics over the memory layers (`memory.policy`, `memory.thread_mem`,
+`memory.extractor`). Two are judged and already sit in the full judged suite;
+two are deterministic and need no model at all.
+
+| metric | scores | needs on the run | judged | default |
+|---|---|---|---|---|
+| `policy_adherence` | policy instructions followed / total | `task_policy` | yes | 0.80 |
+| `override_compliance` | overrides honoured **and** fixed rules respected / total | `thread_notes` (+ fixed rules from `task_policy`) | yes | 0.90 |
+| `memory_extraction` | F1 of extracted vs expected memories | `expected_memories`, `extracted_memories` | no | 0.70 |
+| `memory_leakage` | 1 − foreign notes that surfaced / total | `foreign_notes` | no | 1.00 |
+
+```python
+from validation import memory_metrics, validate_thread
+
+validate_thread(pipeline, thread_id, metrics=memory_metrics(judge))
+```
+
+`validation.conversation.run_from_thread` fills the first three fields
+automatically — the policy from the pipeline that ran the thread, the thread's
+own notes, and every *other* thread's notes as the leakage corpus — so
+auditing a finished conversation needs no extra bookkeeping. A run that
+carries none of them skips all four.
+
+Two things worth knowing about what they mean:
+
+- **`override_compliance` scores both directions.** A model that ignores an
+  approved exception and a model that lets an exception talk it past a fixed
+  guardrail are both failures, and only the first looks like disobedience.
+  That symmetry is what makes short-term memory safe to enable.
+- **`memory_leakage` is deliberately narrow.** It catches a foreign note
+  quoted verbatim or near-verbatim (word overlap inside a note-sized window
+  of the answer). Leakage visible only as changed *behaviour* is not
+  detectable from text — that is `override_compliance`'s job.
+
+`memory_metrics()` is kept out of `default_metrics()`: the deterministic pair
+is cheap but scores nothing unless a run declares memory expectations, and
+always-skipped rows only make a report harder to read.
+
+The policy in force is identified by `SasLLMPipeline.policy_fingerprint`
+(fixed at construction, alongside the prompt text it describes). It reaches
+the run history as its own `policy_fingerprint` column — see
+[Run history](#run-history) for the schema change that implies — and is
+repeated in `policy_adherence`'s `details` when the metric is given an
+explicit policy object.
 
 ## Usage
 
@@ -203,6 +259,39 @@ pipeline = SasLLMPipeline(llm=FakeListChatModel(responses=["..."]))
 report = ValidationRunner(pipeline).run(load_cases("validation/cases"))
 print(report.to_markdown())
 ```
+
+## Run history
+
+`log_report()` appends one row per (run, case, metric); run- and case-level
+values repeat on each row so any slice of the table is self-describing.
+`tracking._COLUMNS` **is** the schema — the DDL is generated from it and the
+row builder is checked against it by a test, so a column cannot be added to
+one and forgotten in the other.
+
+| group | columns |
+|---|---|
+| run | `run_id`, `logged_at`, `model`, `instructions_fingerprint`, `policy_fingerprint`, `run_score`, `run_passed`, `case_count` |
+| case | `case_id`, `case_score`, `case_passed`, `item_count` |
+| metric | `metric`, `score`, `threshold`, `passed`, `skipped`, `details` |
+
+The two fingerprints are the "was this comparable?" columns: runs prompted
+under different reference-guidance instructions
+(`instructions_fingerprint`, `prompt_builder`) or a different long-term task
+policy (`policy_fingerprint`, `memory.policy`) are not equals, and a trend
+query should group by them:
+
+```python
+(load_runs()
+    .groupBy("policy_fingerprint", "metric")
+    .avg("score"))
+```
+
+> **⚠️ BREAKING — `policy_fingerprint` was added to the schema.** No migration
+> is provided. Appending to a history written before this column existed fails
+> on the mismatch (a parquet directory raises on read/append, a saved table on
+> `saveAsTable`). Point `validation.path` / `validation.table` at a **fresh
+> target**, or drop the old one. Old history stays readable where it is; it
+> just cannot be appended to or unioned with new rows.
 
 ## Markdown report
 
@@ -273,6 +362,7 @@ report = report_from_thread(
     pipeline._memory.kv, "run::job1.sas",
     model="claude-sonnet-4-5",
     instructions_fingerprint=pipeline.instructions_fingerprint,
+    policy_fingerprint=pipeline.policy_fingerprint,
 )
 open("inline_report.pdf", "wb").write(report_to_pdf(report))   # local, or
 publish_report_pdf(report, "Reports/Validation")               # SharePoint

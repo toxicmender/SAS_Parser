@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 import warnings
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -41,9 +42,13 @@ with warnings.catch_warnings():
     from langgraph.graph import START, MessagesState, StateGraph
 
 from llm_client import LLMClient, LLMClientConfig, TokenUsage
+from memory.context import MemoryContext
+from memory.extractor import MemoryExtractor
+from memory.policy import TaskPolicy
 from memory.relevance import RelevantHistorySelector
 from memory.store import MemoryHub
 from memory.summarize import RollingSummarizer
+from memory.thread_mem import ThreadMemory
 from prompt_builder import ConstructKey, PromptBuilder, UserInstructionSet
 
 from .batcher import (
@@ -554,6 +559,38 @@ class SasLLMPipeline:
     memory : MemoryHub | None
         Pre-built memory.store facade. If omitted, one is constructed from
         ``spark``/``delta_table``.
+    task_id : str | None
+        Names the *task* whose long-term policy this run works under
+        (``memory.policy``). A :class:`~memory.policy.TaskPolicy` is loaded
+        from the KV store for it and its instructions are folded into the
+        (cached) system prompt. ``None`` (default) disables long-term memory.
+        Ignored when ``task_policy`` is passed — that policy's own task id
+        wins.
+    task_policy : TaskPolicy | None
+        A pre-built policy, for callers that seeded or edited one before the
+        run. A store-less policy is bound to this pipeline's ``memory.kv``
+        and reloaded. The policy text is **snapshotted at construction**:
+        editing it later does not change this pipeline (which is what keeps
+        the cached prompt prefix stable) — build a new pipeline to pick it up.
+    thread_memory : ThreadMemory | None
+        Short-term, conversation-scoped notes (``memory.thread_mem``): each
+        turn's prompt carries the live notes of its thread through the same
+        ephemeral channel as reference guidance — prompted, never persisted,
+        never scored by the relevance selector. ``None`` (default) disables
+        short-term memory, unless a ``memory_extractor`` is given (which
+        implies one). Notes travel with :meth:`fork_run`.
+    memory_extractor : MemoryExtractor | None
+        Classifies each *accepted* turn into permanent (a policy proposal,
+        held for approval) or temporary (a thread note, applied) memory —
+        see ``memory.extractor``. Gated on instruction-shaped cues, so
+        ordinary translation turns cost no extra LLM call. ``None`` (default)
+        disables memory writes entirely.
+    chat_id : str | None
+        Identifies this pipeline instance's span of every thread it writes
+        (Task → Thread → Chat → Message); recorded as a ``chat::`` index row
+        and readable through :meth:`get_chats`. ``None`` (default) generates
+        one per instance, which is the intended granularity: a resumed or
+        forked run opens a new chat on the same thread.
     spark : SparkSession | None
         Forwarded to :class:`MemoryHub` if ``memory`` is omitted.
         Only needed when ``delta_table`` is set; if omitted then, a local
@@ -644,6 +681,11 @@ class SasLLMPipeline:
         databricks_mapping: dict[str, str] | None = None,
         databricks_mapping_sharepoint: str | None = None,
         memory: MemoryHub | None = None,
+        task_id: str | None = None,
+        task_policy: TaskPolicy | None = None,
+        thread_memory: ThreadMemory | None = None,
+        memory_extractor: MemoryExtractor | None = None,
+        chat_id: str | None = None,
         spark: "SparkSession | None" = None,
         delta_table: str | None = None,
         llm: Any | None = None,
@@ -758,6 +800,45 @@ class SasLLMPipeline:
             # snapshot()/restore() carry them along with the history.
             summarizer.store = self._memory.kv
 
+        # ---- Memory: long-term policy, short-term notes, extraction ------
+        # One pipeline instance is one *chat*: the span of a thread this
+        # object writes (Task -> Thread -> Chat -> Message). The id is
+        # per-instance, so resuming a thread from a new pipeline opens a new
+        # chat on the same thread — which is exactly the boundary the policy
+        # snapshot below is taken at.
+        self.chat_id = chat_id or uuid.uuid4().hex[:12]
+        self.task_id = task_id
+        if task_policy is None and task_id is not None:
+            task_policy = TaskPolicy(task_id, store=self._memory.kv)
+        elif task_policy is not None:
+            self.task_id = task_policy.task_id
+            if task_policy.store is None:
+                task_policy.store = self._memory.kv
+                task_policy.reload()
+        # An extractor needs somewhere to put temporary memories, so it
+        # implies a ThreadMemory even when the caller passed none.
+        if thread_memory is None and memory_extractor is not None:
+            thread_memory = memory_extractor.thread_memory or ThreadMemory()
+        if thread_memory is not None and thread_memory.store is None:
+            thread_memory.store = self._memory.kv
+        self._task_policy = task_policy
+        self._thread_memory = thread_memory
+        self._memory_context = MemoryContext(
+            policy=task_policy, thread_memory=thread_memory
+        )
+        self._memory_extractor = memory_extractor
+        if memory_extractor is not None:
+            # Wire the extractor to this pipeline's stores unless it was
+            # built with its own (an extractor sharing a policy/thread memory
+            # with the pipeline is the point — otherwise it would write
+            # memories nothing reads).
+            if memory_extractor.store is None:
+                memory_extractor.store = self._memory.kv
+            if memory_extractor.policy is None:
+                memory_extractor.policy = task_policy
+            if memory_extractor.thread_memory is None:
+                memory_extractor.thread_memory = thread_memory
+
         # llm_client owns construction (temperature, endpoint overrides,
         # output cap, rate limiter) and invocation (transient-error retry,
         # input-token budget). An injected chat model replaces only the
@@ -806,6 +887,27 @@ class SasLLMPipeline:
         self._system_prompt = system_prompt or template.format(
             output_language=output_language
         )
+        # The long-term task policy rides INSIDE the cached system block: it
+        # is the same text for every thread and every item of the run, so it
+        # costs one cache write and is then served from cache. Short-term
+        # thread notes deliberately do not (they change per thread and would
+        # miss the cache on each one) — they are prompted after the
+        # breakpoint, through the ephemeral `instructions` channel.
+        # Snapshotted here, at construction: a policy edited mid-run would
+        # invalidate the cached prefix on the next item.
+        policy_block = self._memory_context.system_suffix
+        # Snapshotted with the text, not read live: the fingerprint has to
+        # describe what this pipeline actually prompted, and the policy object
+        # may be edited afterwards (by an operator, or by an approved
+        # extraction) without this run's prompts changing.
+        self._policy_fingerprint = self._memory_context.policy_fingerprint
+        if policy_block:
+            self._system_prompt = f"{self._system_prompt}\n\n{policy_block}"
+            logger.info(
+                f"SasLLMPipeline: task policy folded into the system prompt  "
+                f"task='{self.task_id}'  "
+                f"fingerprint={self._memory_context.policy_fingerprint}"
+            )
         # With prompt caching on, the system prompt travels as a content
         # block with a cache_control breakpoint (a concrete SystemMessage,
         # exempt from template interpolation); Anthropic then serves the
@@ -897,7 +999,16 @@ class SasLLMPipeline:
             configurable = config.get("configurable", {})
             thread_id = configurable["thread_id"]
             instructions = configurable.get("instructions", [])
-            history = self._memory.get_thread(thread_id)
+            # Short-term thread notes join the same ephemeral channel as the
+            # reference guidance: prompted after the cache breakpoint, never
+            # persisted to the msg:: history, never scored by the relevance
+            # selector. They go last so they read as the most local
+            # instruction the model was given.
+            instructions = [
+                *instructions,
+                *self._memory_context.thread_messages(thread_id),
+            ]
+            history = self._memory.get_thread(thread_id, chat_id=self.chat_id)
             input_message = state["messages"][-1]
             history_messages = history.messages
             # The rolling summary is ephemeral like the guidance: prompted
@@ -1113,9 +1224,20 @@ class SasLLMPipeline:
                 continue
             value = {k: v for k, v in fact.items() if k != "item_id"}
             self._record_validation_fact(dst_thread_id, fact["item_id"], value)
+        # Short-term notes travel with the branch: an exception the source
+        # conversation was granted still holds on a rewind of it, and losing
+        # it would silently change what the fork is allowed to do. (The
+        # rolling summary is not copied — it is re-derivable, and
+        # RollingSummarizer rebuilds it for the shortened thread.)
+        notes_copied = (
+            self._thread_memory.fork(src_thread_id, dst_thread_id)
+            if self._thread_memory is not None
+            else 0
+        )
         logger.info(
             f"fork_run: '{src_thread_id}' -> '{dst_thread_id}'  "
-            f"upto_items={upto_items}  messages_copied={copied}"
+            f"upto_items={upto_items}  messages_copied={copied}  "
+            f"notes_copied={notes_copied}"
         )
         return copied
 
@@ -1127,6 +1249,74 @@ class SasLLMPipeline:
             f"get_thread_messages: thread_id='{thread_id}'  messages={len(msgs)}"
         )
         return msgs
+
+    # ---- Memory surfaces ---------------------------------------------------
+
+    def get_chats(self, thread_id: str) -> list[dict[str, Any]]:
+        """The chats recorded on *thread_id*, oldest first.
+
+        One chat is one pipeline instance's span of the thread, so this is
+        the run-level view of a resumed or forked conversation: which
+        instance wrote which stretch of messages, and when.
+        """
+        return self._memory.chats(thread_id)
+
+    def remember(
+        self,
+        thread_id: str,
+        text: str,
+        *,
+        kind: str = "note",
+        source: str | None = None,
+        ttl_s: float | None = None,
+    ) -> Any:
+        """Add a short-term note to *thread_id* (see ``memory.thread_mem``).
+
+        Raises ``RuntimeError`` when the pipeline was built without a
+        ``thread_memory`` — silently dropping an instruction an operator
+        just gave is the worse failure.
+        """
+        if self._thread_memory is None:
+            raise RuntimeError(
+                "SasLLMPipeline has no thread_memory; construct it with "
+                "thread_memory=ThreadMemory() to record conversation-scoped "
+                "instructions"
+            )
+        return self._thread_memory.add(
+            thread_id, text, kind=kind, source=source, ttl_s=ttl_s
+        )
+
+    @property
+    def task_policy(self) -> TaskPolicy | None:
+        """The long-term policy this pipeline prompted, if any.
+
+        Editing it does **not** change the running pipeline: the policy text
+        is snapshotted into the (cached) system prompt at construction. Build
+        a new pipeline — a new chat — to pick up an edit.
+        """
+        return self._task_policy
+
+    @property
+    def thread_memory(self) -> ThreadMemory | None:
+        """The short-term note store this pipeline reads each turn, if any."""
+        return self._thread_memory
+
+    @property
+    def memory_extractor(self) -> MemoryExtractor | None:
+        """The extractor observing accepted turns, if any."""
+        return self._memory_extractor
+
+    @property
+    def policy_fingerprint(self) -> str | None:
+        """Content hash of the prompted task policy, ``None`` without one.
+
+        The policy counterpart of :meth:`instructions_fingerprint`: recorded
+        alongside validation results so runs under different standing
+        instructions are never compared as equals. Fixed at construction
+        along with the prompt it describes — a policy edited mid-life does
+        not change it, because it did not change what was prompted.
+        """
+        return self._policy_fingerprint or None
 
     def snapshot(self) -> dict[str, Any]:
         """
@@ -1493,6 +1683,7 @@ class SasLLMPipeline:
                         f"{attempt} attempt(s); accepting last answer  "
                         f"thread={thread_id}"
                     )
+                self._extract_memories(thread_id, user_msg, str(ai_text))
                 return ai_text, document, result, attempt
 
             logger.info(
@@ -1503,6 +1694,26 @@ class SasLLMPipeline:
             # Drop this attempt's turn pair so the retry replaces it in place.
             history.truncate_to(len_before)
             feedback = [self._validation_feedback_message(result)]
+
+    def _extract_memories(
+        self, thread_id: str, user_msg: str, response_text: str
+    ) -> None:
+        """Route one accepted turn through the memory extractor, if any.
+
+        Called on the attempt that is *kept*, never on one inline validation
+        rolled back — a discarded answer must not leave a memory behind.
+        Swallows everything: a memory write cannot be allowed to fail a
+        translation run.
+        """
+        if self._memory_extractor is None:
+            return
+        try:
+            self._memory_extractor.observe(thread_id, user_msg, response_text)
+        except Exception:
+            logger.warning(
+                f"_extract_memories: extraction failed  thread='{thread_id}'",
+                exc_info=True,
+            )
 
     def _resume_state(
         self, items: Sequence[SasBatch | SasChunk], thread_id: str
