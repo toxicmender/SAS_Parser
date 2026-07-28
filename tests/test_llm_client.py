@@ -732,7 +732,7 @@ def test_timeout_errors_are_retried():
 
 def _cached_system_message() -> SystemMessage:
     """A system prompt carrying an Anthropic-style cache breakpoint, the shape
-    chunker.pipeline builds when prompt_caching is on."""
+    pipeline.engine builds when prompt_caching is on."""
     return SystemMessage(
         content=[
             {
@@ -1100,7 +1100,7 @@ def test_pipeline_enforces_input_token_budget():
     # the formatted chunk prompt (hundreds of chars) blows a 1-token budget
     # under any counter, so the call must fail before reaching the fake LLM.
     from chunker.models import SasChunk, SasChunkKind, SasChunkMetadata
-    from chunker.pipeline import SasLLMPipeline
+    from pipeline import SasLLMPipeline
     from memory.store import MemoryHub
 
     pipeline = SasLLMPipeline(

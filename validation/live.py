@@ -201,7 +201,7 @@ def report_from_verdicts(
     Each verdict is one item's :class:`~validation.models.CaseResult` as a dict
     — an ``out["validation"]`` value from a pipeline run, or a record from
     :func:`validations_for_thread` /
-    :meth:`~chunker.pipeline.SasLLMPipeline.get_validation_facts`. The extra
+    :meth:`~pipeline.engine.SasLLMPipeline.get_validation_facts`. The extra
     ``item_id`` / ``index`` / ``total`` / ``ts`` keys those readers add are
     ignored (``CaseResult`` drops unknown fields), and the per-item order is
     taken as given — pass already-ordered verdicts.

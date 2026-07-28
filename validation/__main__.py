@@ -41,7 +41,7 @@ import logging
 import sys
 from pathlib import Path
 
-from chunker import SasLLMPipeline
+from pipeline import SasLLMPipeline
 from llm_client import LLMClient, LLMClientConfig, TokenUsage
 
 from .conversation import validate_thread

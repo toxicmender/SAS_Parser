@@ -22,7 +22,7 @@ from typing import Sequence
 from uuid import uuid4
 
 from chunker.models import SasBatch
-from chunker.pipeline import SasLLMPipeline
+from pipeline import SasLLMPipeline
 from llm_client import TokenUsage
 
 from .evaluator import Evaluator

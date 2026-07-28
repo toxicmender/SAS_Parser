@@ -17,8 +17,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from langchain_core.messages import AIMessage
 
 from chunker.models import SasBatch, SasChunk, SasChunkKind, SasChunkMetadata
-from chunker.pipeline import (
-    SasLLMPipeline,
+from pipeline import SasLLMPipeline
+from pipeline.prompting import (
     _constructs_for_item,
     _kinds_for_item,
     _meta_flags_for_item,

@@ -368,7 +368,7 @@ class _RecordingChatModel:
 
 def test_pipeline_prompts_relevant_pair_not_recency_window():
     from chunker.models import SasBatch, SasChunk, SasChunkKind, SasChunkMetadata
-    from chunker.pipeline import SasLLMPipeline
+    from pipeline import SasLLMPipeline
     from memory.store import MemoryHub
 
     def _mk_chunk(chunk_id: str, text: str) -> SasChunk:

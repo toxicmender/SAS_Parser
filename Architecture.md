@@ -14,7 +14,7 @@ layers, each usable on its own:
    production). Every LLM call is made per `SasBatch`: the batcher's ordered
    items are coalesced first, so dependency batches and merged runs of
    independent singletons are the only units prompted. The deliverable is a
-   **notebook** — one `.ipynb` per SAS source file (`chunker.notebook`) —
+   **notebook** — one `.ipynb` per SAS source file (`pipeline.notebook`) —
    because the output is code and code should be runnable; the two report
    surfaces, validation and complexity, are **Markdown**.
 
@@ -89,10 +89,21 @@ chunker/
                         resolution, context absorption, batch construction.
                         SasChunkBatcher is a one-file convenience over
                         MultiFileBatcher.
-  pipeline.py           SasLLMPipeline: formatting of chunk/batch prompts,
-                        the LangGraph StateGraph wiring, and opt-in Anthropic
-                        prompt caching on the system prompt.
-  pipeline_constants.py Prompt templates — the Markdown-sections system
+  _repl.py              print_iterable REPL helper (also used by demo_run.py
+                        to render per-item summary lines into its logs).
+  pipeline.py           Deprecated shims re-exporting from the top-level
+  pipeline_constants.py `pipeline` package (below), where these modules now
+  response_models.py    live. Emit a DeprecationWarning on import; removed in
+  notebook.py           a future release.
+
+pipeline/
+  engine.py             SasLLMPipeline: the LangGraph StateGraph wiring,
+                        memory/validation integration, resume and fork, and
+                        opt-in Anthropic prompt caching on the system prompt.
+  prompting.py          Item -> retrieval query / construct keys / scope
+                        tokens (the sole SAS-metadata -> prompt_builder
+                        mapping) and chunk/batch prompt formatting.
+  constants.py          Prompt templates — the Markdown-sections system
                         prompt and its structured-output counterpart.
   response_models.py    Pydantic models for the structured answer the pipeline
                         asks for: TranslationDocument (analysis, mapping,
@@ -103,8 +114,6 @@ chunker/
                         one .ipynb per SAS source file plus _cross_file.ipynb —
                         from a TranslationDocument, or by parsing the Markdown
                         response when there is none.
-  _repl.py              print_iterable REPL helper (also used by demo_run.py
-                        to render per-item summary lines into its logs).
 
 llm_client/
   client.py             LLMClient / LLMClientConfig: chat-model construction
@@ -316,14 +325,17 @@ complexity/
 ```
 
 Import direction is strictly downward: `keywords` and `models` import
-nothing from the package; `scanner` and `metadata` import from them;
-`chunker.py` imports from all four; `batcher` imports from `keywords`,
-`metadata`, `models`; `pipeline` sits on top and is the **only** module that
-imports `memory.store`, `memory.relevance`, `memory.summarize`,
-`llm_client`, and `prompt_builder`. `memory`, `llm_client`, and `prompt_builder` never import
-`chunker` (or each other) — `prompt_builder` reuses `memory.relevance` for
-retrieval, and the SAS-metadata → `(query, constructs)` mapping that feeds it
-lives in `pipeline`, precisely so `prompt_builder` needs no `chunker` import.
+nothing from the `chunker` package; `scanner` and `metadata` import from
+them; `chunker.py` imports from all four; `batcher` imports from `keywords`,
+`metadata`, `models`. The top-level `pipeline` package sits above the whole
+stack and is the **only** package that imports `chunker` together with
+`memory.store`, `memory.relevance`, `memory.summarize`, `llm_client`, and
+`prompt_builder` (`pipeline.engine` orchestrates; `pipeline.prompting` holds
+the SAS-metadata → `(query, constructs)` mapping). `memory`, `llm_client`,
+and `prompt_builder` never import `chunker` or `pipeline` (or each other) —
+`prompt_builder` reuses `memory.relevance` for retrieval, and the metadata
+mapping that feeds it lives in `pipeline.prompting`, precisely so
+`prompt_builder` needs no `chunker` import.
 `app_config` is a leaf every package may import (like `chunker.keywords`, it
 imports nothing from this repo outside itself): `chunker`, `llm_client`, and
 `prompt_builder` read their word/token-limit defaults through it. Its
@@ -331,7 +343,7 @@ credential submodules — `vault`, `azure`, `databricks` — import only the
 `app_config` loader and, in `databricks`'s case, `azure`; each defers its
 third-party client to a lazy import inside the call that needs it, so the
 package stays dependency-free to import. `validation` sits *above* the whole
-stack, beside the CLI entry points: it drives `chunker.pipeline` and may
+stack, beside the CLI entry points: it drives `pipeline.engine` and may
 import anything, and nothing imports it back. `complexity` sits above
 `chunker` on the same footing — it reads `chunker.models` (plus
 `chunker.scanner._sanitise`, `chunker.keywords._STANDARD_AUTOCALL_MACROS`, and
@@ -475,7 +487,7 @@ deliberate. Storing the raw content would store an empty turn whenever the
 gateway answers by tool call, breaking resume (`_recovered_response`),
 relevance-based history selection, and every validation metric; rendering
 instead means conversation memory, `validation`, and the resume path never
-learn that structured output exists. The document is what `chunker.notebook`
+learn that structured output exists. The document is what `pipeline.notebook`
 uses to build cells it knows are runnable, rather than guessing from fences.
 
 Degradation is two-stage and never fails a run: a model whose integration has
@@ -651,9 +663,9 @@ any of these silently changes behavior.
   `if logger.isEnabledFor(logging.DEBUG):` so the f-string is never built
   when DEBUG is off; per-call entry/exit and LLM-paced logs are unguarded.
   Logger names follow modules: `chunker.chunker`, `chunker.scanner`,
-  `chunker.metadata`, `chunker.batcher`, `chunker.pipeline`,
-  `memory.store`, `memory.relevance`, `memory.summarize`,
-  `llm_client.client`.
+  `chunker.metadata`, `chunker.batcher`, `pipeline.engine`,
+  `pipeline.prompting`, `pipeline.notebook`, `memory.store`,
+  `memory.relevance`, `memory.summarize`, `llm_client.client`.
 - **Names:** dataset/macro/libref names are lowercased at extraction;
   quoted physical paths keep a leading `'` so they can never collide with
   identifiers.

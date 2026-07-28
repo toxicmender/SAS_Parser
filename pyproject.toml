@@ -33,7 +33,7 @@ databricks = ["databricks-sdk>=0.30", "databricks-sql-connector>=3.0"]
 # app_config.azure (which mints the Graph token); msgraph-sdk pulls in
 # azure-identity, the kiota runtime, and httpx itself.
 sharepoint = ["msgraph-sdk>=1.5", "msal>=1.28"]
-# nbformat is a *test* dependency only: chunker.notebook writes the v4.5 JSON
+# nbformat is a *test* dependency only: pipeline.notebook writes the v4.5 JSON
 # itself (the schema is small and stable, and the runtime should not grow a
 # jupyter dependency to emit JSON), and tests/test_notebook.py validates what
 # it emits against the real published schema.
@@ -41,13 +41,14 @@ dev        = ["pytest>=8", "pytest-cov", "ruff", "nbformat>=5.10"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-# chunker/pipeline.py imports memory.store, llm_client, and prompt_builder,
-# so all four packages must ship — a wheel with chunker alone breaks
-# `from chunker import SasLLMPipeline`. app_config is the dependency-free
-# config loader they all read defaults through. complexity reads chunker's
-# output and adds no dependencies of its own, so it ships too (unlike
-# validation, whose Spark/MLflow tracking is dev-only tooling).
+# pipeline/engine.py imports chunker, memory.store, llm_client, and
+# prompt_builder, so all five packages must ship — a wheel with pipeline
+# alone breaks `from pipeline import SasLLMPipeline`. app_config is the
+# dependency-free config loader they all read defaults through. complexity
+# reads chunker's output and adds no dependencies of its own, so it ships
+# too (unlike validation, whose Spark/MLflow tracking is dev-only tooling).
 include = [
+    "pipeline*",
     "chunker*",
     "memory*",
     "llm_client*",
@@ -65,6 +66,7 @@ complexity = ["profiles/*.json"]
 # Bare `--cov` (as CI passes it) measures exactly these packages; without this
 # it would measure everything imported, tests included, inflating the total.
 source = [
+    "pipeline",
     "chunker",
     "memory",
     "llm_client",
@@ -82,7 +84,7 @@ filterwarnings = [
     # langgraph-internal deserialisation with the default `allowed_objects`
     # (pending-deprecated by langchain-core >= 1.3.3); no call site in this
     # repo can pass the explicit value. Mirrors the import-time filter in
-    # chunker/pipeline.py for occurrences at run time under other versions.
+    # pipeline/engine.py for occurrences at run time under other versions.
     "ignore:.*allowed_objects.*:PendingDeprecationWarning",
 ]
 
@@ -93,6 +95,7 @@ include = [
     "app_config",
     "chunker",
     "complexity",
+    "pipeline",
     "memory",
     "llm_client",
     "prompt_builder",

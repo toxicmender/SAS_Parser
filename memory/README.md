@@ -180,7 +180,7 @@ which both speak in the same Delta-schema column order:
 supported API in LangChain v1. It is the durable backing store behind a
 LangGraph `StateGraph`: the graph's model node loads `history.messages` before
 each LLM call and persists the new turn with `add_messages` (see
-`chunker.pipeline` for the wiring). The legacy `BaseMemory` / `ConversationChain`
+`pipeline.engine` for the wiring). The legacy `BaseMemory` / `ConversationChain`
 layer was removed from LangChain in v1, and `RunnableWithMessageHistory` is
 deprecated in favour of LangGraph persistence, so this module ships neither
 adapter.

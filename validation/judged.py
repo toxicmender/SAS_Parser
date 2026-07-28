@@ -96,11 +96,11 @@ def markdown_section(text: str, heading: str) -> str:
     """The body of the ``## {heading}`` section of *text*, or ``""``.
 
     Used to recover the four sections
-    (:mod:`chunker.pipeline_constants`'s contract) from a response that was
+    (:mod:`pipeline.constants`'s contract) from a response that was
     *not* produced through structured output, so the judged metrics score an
     unstructured run the same way they score a structured one. Matches only
     level-2 headings, so the ``### {comment}`` headings
-    :meth:`~chunker.response_models.TranslationDocument.to_markdown` writes
+    :meth:`~pipeline.response_models.TranslationDocument.to_markdown` writes
     inside a section do not end it.
     """
     match = re.search(

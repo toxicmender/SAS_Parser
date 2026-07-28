@@ -21,7 +21,7 @@ from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from memory.store import MemoryHub
 
 from chunker.models import SasBatch, SasChunk, SasChunkKind, SasChunkMetadata
-from chunker.pipeline import SasLLMPipeline
+from pipeline import SasLLMPipeline
 from validation import (
     DatasetFidelityMetric,
     Evaluator,

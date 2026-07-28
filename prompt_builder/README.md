@@ -6,7 +6,7 @@ guidance relevant to *each* batch/singleton it sends the LLM — targeted per
 item instead of one bloated static system prompt.
 
 The package imports nothing from `chunker` or `llm_client`; it reuses
-`memory.relevance.HybridRanker` for retrieval. `chunker.pipeline` remains the
+`memory.relevance.HybridRanker` for retrieval. `pipeline.engine` remains the
 sole integration point.
 
 > **Status:** complete. The pipeline injects per-item reference guidance when a
@@ -29,7 +29,7 @@ user_instructions.py UserInstructionSet — operator rules (str) -> scoped chunk
 ## Quick start
 
 ```python
-from chunker.pipeline import SasLLMPipeline
+from pipeline import SasLLMPipeline
 from prompt_builder import PromptBuilder
 
 # Load + chunk + index the reference corpus once (cached on disk after run 1).
@@ -337,7 +337,7 @@ so any single reference section always fits — the budget then limits only the
 *number* of chunks, dropping whole chunks at the tail, never a lone construct
 hit; `from_specs` logs a WARNING when the budget is misconfigured below the
 window size. The pipeline builds the `(query, constructs)` for each item from
-its SAS metadata (`chunker.pipeline._query_for_item` / `_constructs_for_item`)
+its SAS metadata (`pipeline.prompting._query_for_item` / `_constructs_for_item`)
 — that mapping lives in the pipeline, not here, so this package imports no
 `chunker`.
 

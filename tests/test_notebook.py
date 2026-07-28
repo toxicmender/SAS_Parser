@@ -1,5 +1,5 @@
 """
-test_notebook.py — unit tests for chunker.notebook and chunker.response_models
+test_notebook.py — unit tests for pipeline.notebook and pipeline.response_models
 (zero LLM, zero network).
 
 The notebooks are written by hand against the nbformat v4.5 spec, so the
@@ -19,7 +19,7 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from chunker.notebook import (
+from pipeline.notebook import (
     CROSS_FILE_NOTEBOOK,
     build_notebook,
     document_to_cells,
@@ -29,7 +29,7 @@ from chunker.notebook import (
     notebooks_from_outputs,
     write_notebooks,
 )
-from chunker.response_models import (
+from pipeline.response_models import (
     MappingEntry,
     RiskNote,
     TranslationCell,

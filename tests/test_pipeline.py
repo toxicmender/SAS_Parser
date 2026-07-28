@@ -31,8 +31,8 @@ from chunker.models import (
     SasChunkKind,
     SasChunkMetadata,
 )
-from chunker.pipeline import (
-    SasLLMPipeline,
+from pipeline import SasLLMPipeline
+from pipeline.prompting import (
     _format_batch_message,
     _format_chunk_message,
 )
@@ -661,7 +661,7 @@ class _StructuredFakeChatModel(FakeListChatModel):
 
 
 def _translation_document(code: str = 'df = spark.table("a")'):
-    from chunker.response_models import (
+    from pipeline.response_models import (
         MappingEntry,
         RiskNote,
         TranslationCell,

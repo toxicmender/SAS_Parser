@@ -16,7 +16,7 @@ gates or retries a run):
   *other* thread's notes — which is what lets ``validation.memory_metrics``
   audit instruction-following and note leakage after the fact.
 - :func:`validate_transcript` — score any (prompt, response) transcript,
-  even one not produced by :class:`~chunker.pipeline.SasLLMPipeline`.
+  even one not produced by :class:`~pipeline.engine.SasLLMPipeline`.
 
 Both build a case-free :class:`~validation.models.EvaluationRun` and score
 it with :class:`~validation.evaluator.Evaluator`; results are ordinary

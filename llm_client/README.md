@@ -1,7 +1,7 @@
 # llm_client
 
 OpenAI-compatible chat-model construction and invocation. Owns everything about
-*how* the LLM is called, so callers (currently only `chunker.pipeline`) never
+*how* the LLM is called, so callers (currently only `pipeline.engine`) never
 touch the chat-model class or provider error types directly.
 
 **One transport, many models.** The AI Gateway speaks the OpenAI
@@ -88,11 +88,11 @@ chain = prompt | client.as_runnable()
   (attempt *n* waits `min(base * 2**(n-1), max)` scaled by 0.5–1.5×). Every
   other exception propagates unchanged on the first occurrence, and exhausted
   retries are logged at ERROR before the last exception propagates. Callers
-  that persist progress (e.g. `chunker.pipeline`'s per-item run facts +
+  that persist progress (e.g. `pipeline.engine`'s per-item run facts +
   `resume=True`) therefore only ever see failures that survived the retry
   budget.
 - **Prompt-cache compatibility**: a `cache_control` breakpoint (the
-  Anthropic-native content-part key `chunker.pipeline` sets on the system
+  Anthropic-native content-part key `pipeline.engine` sets on the system
   block when `prompt_caching` is on) is not something every OpenAI-compatible
   gateway forwards — LiteLLM- and OpenRouter-style proxies pass it through to
   Anthropic, a strict OpenAI schema rejects unknown content-part keys with a

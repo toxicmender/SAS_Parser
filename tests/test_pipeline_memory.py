@@ -29,7 +29,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, SystemMessage
 
-from chunker.pipeline import SasLLMPipeline
+from pipeline import SasLLMPipeline
 from memory.extractor import MemoryExtractor
 from memory.policy import TaskPolicy
 from memory.store import MemoryHub

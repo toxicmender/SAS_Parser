@@ -345,7 +345,7 @@ def _is_transient_error(exc: BaseException) -> bool:
 
 
 # Prompt-cache breakpoints are an Anthropic-native content-part key that
-# callers (chunker.pipeline) set on the system block. Whether it survives the
+# callers (pipeline.engine) set on the system block. Whether it survives the
 # trip through an OpenAI-compatible gateway is a property of the *gateway*,
 # not the model: LiteLLM- and OpenRouter-style proxies forward it to Anthropic,
 # while a strict OpenAI schema rejects unknown content-part keys outright. So
