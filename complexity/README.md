@@ -63,7 +63,9 @@ dataset/macro edges resolve into shared batches — and scores the *batched*
 units, the same work items the pipeline would translate, so an estimate lines
 up with the run it is estimating. `--no-cross-file` scores every file as if it
 were alone; `--size-anchor` recalibrates the T-shirt scale (lowering it rates
-every file larger). Nothing here calls an LLM or touches the network.
+every file larger); `--min-story-points` / `--max-story-points` report the
+points on your own scale instead of the Fibonacci 2-8. Nothing here calls an
+LLM or touches the network.
 
 Score against a different output language by naming its profile:
 
@@ -223,31 +225,39 @@ anchor**, which keeps the anchor the single knob that moves everything:
 
 ```json
 "bounds": {
-  "effort":      {"min": 0.30, "max": 1.60},
-  "complexity":  {"min": 0.33, "max": 1.40},
+  "effort":      {"min": 0.35, "max": 2.40},
+  "complexity":  {"min": 0.35, "max": 1.40},
   "uncertainty": {"min": 0.00, "max": 0.50}
 },
-"dimension_weights": {"effort": 0.60, "complexity": 0.35, "uncertainty": 0.05}
+"dimension_weights": {"effort": 0.88, "complexity": 0.50, "uncertainty": 0.20}
 ```
 
 Rescaling makes the mix explicit where a raw sum left it to chance, so the
 weights have to be stated too. They blend the three normalised dimensions into
-one `0…1` number (`FileComplexity.blend`) by weighted mean. Effort leads
-because it is most of what a size is answering; uncertainty trails because it
-asks for an investigation rather than for translation hands — and it is
-reported separately precisely so that a small weight never means "ignored".
+one `0…1` number (`FileComplexity.blend`) — a weighted **sum, clamped at 1**,
+not a mean. The weights therefore say how far each dimension reaches *on its
+own*, which is why they add up to more than 1:
+
+- a mean would cap a file that is nothing but volume at the effort weight, so
+  no amount of bulk could ever ask to be broken down. An enormous file needs
+  splitting however plain its contents are, so effort's reach (`0.88`) clears
+  the `Extra Large` boundary (`0.85`) by itself;
+- a mean would also dock every file that has nothing unresolved in it, since
+  the unused uncertainty share would be lost. Summing means uncertainty only
+  ever *adds*: having no unknowns costs a file nothing.
+
+Effort reaches furthest because it is most of what a size is answering;
+uncertainty reaches least, because it asks for an investigation rather than for
+translation hands — and it is reported separately precisely so that a small
+reach never means "ignored".
 
 `FileComplexity` carries each dimension twice — `effort_raw` and `effort_norm`
 — because they answer different questions. The raw number is the measurement;
 the normalised one is how much of the scale that measurement actually claimed.
 A dimension at `1.00` has saturated, and more of the same will not move the
-size again.
-
-One consequence worth stating plainly: **volume alone tops out at `Large`.**
-Past the top of the effort window a longer file of the same trivial steps is
-not telling you anything new — 50 plain DATA steps and 200 of them both rate
-`Large` — so `Extra Large`, which is an instruction to split, is reserved for
-files that are bulky *and* hard (or bulky and full of unknowns).
+size again: 200 plain DATA steps and 400 of them score identically, because
+past the top of the window a longer file of the same trivial steps is not
+telling you anything new.
 
 ### The anchor
 
@@ -322,10 +332,10 @@ than the gap between Large and Extra Large:
 
 Bands sit at the geometric midpoints of the rungs. The blend becomes points by
 the same move as the dimensions themselves — a min-max rescale, applied **in
-log space**, between the lowest and highest rungs:
+log space**, between the ends of the scale:
 
 ```
-points = scale[SMALL] × (scale[EXTRA_LARGE] / scale[SMALL]) ^ blend
+points = min_story_points × (max_story_points / min_story_points) ^ blend
 ```
 
 so a blend of `0` is exactly `Small`'s 2 points, a blend of `1` exactly
@@ -340,6 +350,30 @@ own nominal value is not a scale. Because points are continuous they still
 **sum**: `report.total_points` is a backlog estimate for the whole migration,
 which a purely qualitative label could never give you — read as "n files at
 2-8 points each", not as an absolute quantity of days.
+
+#### Estimating on your own scale
+
+Not every team estimates on 2-8. Both ends are configurable — in the profile,
+in `config.json`, or per analyzer:
+
+```json
+"sizes": {"story_points": {"min": 1, "max": 13}}
+```
+
+```python
+ComplexityAnalyzer(min_story_points=1, max_story_points=13)
+```
+
+```bash
+python -m complexity path/to/sas_dir --min-story-points 1 --max-story-points 13
+```
+
+This **re-denominates the numbers and moves nothing else**. The bands are read
+as fractions of the scale's log span (`SizeModel.band_blends`), not as absolute
+point values, so the same file gets the same `blend` and the same `TShirtSize`
+whichever scale is reporting it — the reference file lands mid-`Medium` on 1-13
+exactly as it does on 2-8. `min` must be greater than zero: points are rescaled
+geometrically, so the smallest size cannot be worth nothing.
 
 ### Extra Large means *split this*
 
@@ -381,21 +415,20 @@ dimension shown as `raw (normalised)`:
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | Config only: 3 `%LET` + 1 `LIBNAME` | 2.0 (0.00) | 2.5 (0.00) | 0.0 (0.00) | 0.00 | 2.00 | Small |
 | Thin macro wrapper, 1 step, 2 params | 2.5 (0.00) | 21.0 (0.00) | 0.0 (0.00) | 0.00 | 2.00 | Medium *(floored)* |
-| 12 plain DATA steps | 42.1 (0.28) | 0.0 (0.00) | 0.0 (0.00) | 0.17 | 2.52 | Medium |
-| **The reference file** (see the anchor) | 50.0 (0.38) | 37.5 (0.18) | 0.0 (0.00) | 0.29 | 3.00 | **Medium** |
-| Macro-heavy: array, DO, 12 merges | 57.3 (0.46) | 49.0 (0.36) | 0.0 (0.00) | 0.41 | 3.50 | Medium |
-| 50 plain DATA steps | 175.5 (1.00) | 0.0 (0.00) | 0.0 (0.00) | 0.60 | 4.59 | Large |
-| 200 plain DATA steps | 702.0 (1.00) | 0.0 (0.00) | 0.0 (0.00) | 0.60 | 4.59 | Large |
-| Bulk **and** hard: 45 merge steps behind a macro of arrays, DO forms, `LAG`, `CALL EXECUTE` | 212.9 (1.00) | 175.5 (1.00) | 0.0 (0.00) | 0.95 | 7.46 | Extra Large |
+| 12 plain DATA steps | 42.1 (0.16) | 0.0 (0.00) | 0.0 (0.00) | 0.14 | 2.44 | Small |
+| **The reference file** (see the anchor) | 50.0 (0.25) | 37.5 (0.14) | 0.0 (0.00) | 0.29 | 3.01 | **Medium** |
+| Macro-heavy: array, DO, 12 merges | 57.3 (0.32) | 49.0 (0.34) | 0.0 (0.00) | 0.45 | 3.74 | Medium |
+| 50 plain DATA steps | 175.5 (0.91) | 0.0 (0.00) | 0.0 (0.00) | 0.80 | 6.04 | Large |
+| 80 plain DATA steps | 280.8 (1.00) | 0.0 (0.00) | 0.0 (0.00) | 0.88 | 6.77 | Extra Large |
+| Bulk **and** hard: 45 merge steps behind a macro of arrays, DO forms, `LAG`, `CALL EXECUTE` | 212.9 (1.00) | 175.5 (1.00) | 0.0 (0.00) | 1.00 | 8.00 | Extra Large |
 
-Four things worth reading off that table. The reference file lands exactly on
-3.0 points, which is what "anchored at Medium" means. The 50-step file rates
-`Large` on **volume alone** — its complexity term is `0.0`, because nothing in
-it is individually notable — which is precisely the case a tier cannot express,
-and the reason sizing exists. The 200-step file rates the same as the 50-step
-one, because effort saturated at `1.00` and quadrupling a number the scale has
-stopped reading changes nothing. And only the last row is `Extra Large`: it is
-the one file that is bulky *and* hard.
+Three things worth reading off that table. The reference file lands on 3.0
+points, which is what "anchored at Medium" means. The 50- and 80-step files
+rate `Large` and `Extra Large` on **volume alone** — their complexity term is
+`0.0`, because nothing in them is individually notable — which is precisely the
+case a tier cannot express, and the reason sizing exists. And the last row
+reaches the ceiling from both directions at once, which is what a file nobody
+should start without splitting looks like.
 
 ### References
 
@@ -633,6 +666,8 @@ invented classification. A test asserts every detector name has an entry.
   "weight_medium": null,
   "weight_high": null,
   "size_anchor": null,
+  "min_story_points": null,
+  "max_story_points": null,
   "use_cross_file": null
 }
 ```
@@ -645,10 +680,13 @@ a tier. To retune **which construct means what**, edit a profile JSON, not the
 config.
 
 `size_anchor` overrides the profile's reference-Medium raw score; lowering it
-makes every file rate larger. The bands, the min-max `bounds`, and the
-per-dimension weights stay in the profile, because they are calibrated relative
-to the anchor and only make sense alongside it — the bounds are literally
-stated as multiples of it, so overriding the anchor moves every window with it.
+makes every file rate larger. `min_story_points` / `max_story_points`
+re-denominate the reported points (see
+[Estimating on your own scale](#estimating-on-your-own-scale)) and cannot move
+a size. The bands, the min-max `bounds`, and the per-dimension weights stay in
+the profile, because they are calibrated relative to the anchor and only make
+sense alongside it — the bounds are literally stated as multiples of it, so
+overriding the anchor moves every window with it.
 
 `ComplexityAnalyzer(use_detectors=False)` restricts the analysis to what the
 chunker's own metadata reports, dropping the supplementary scans.
@@ -677,7 +715,7 @@ batched run.
 
 ## Tests
 
-`tests/test_complexity.py` — 147 tests, no LLM and (apart from the rule-set
+`tests/test_complexity.py` — 156 tests, no LLM and (apart from the rule-set
 loader's own tests, which write temp profiles) no disk I/O. Covers each tier
 against the constructs the brief names, the max-tier/worst-parity aggregation
 rules, detector precision (comments, string literals, `%DO` vs `DO`,
@@ -689,9 +727,13 @@ The log + min-max rescale is covered in its own right: clamping at both ends of
 each window, monotonicity, the two halves of the log property (equal increments
 buy less the further up you are; equal *ratios* are equal steps), the points
 scale spanning exactly `Small`…`Extra Large` and rescaling geometrically,
-weights deciding the mix, volume saturating below `Extra Large`, windows moving
-with the anchor, and the profile validation for `bounds`, `dimension_weights`,
-and an `anchor.dimensions` split that does not sum to `anchor.raw`.
+weights reading as reaches rather than shares (volume alone reaching `Extra
+Large`, uncertainty only ever adding), volume saturating at the top of its
+window, windows moving with the anchor, and the profile validation for
+`bounds`, `dimension_weights`, and an `anchor.dimensions` split that does not
+sum to `anchor.raw`. A story-point range set in the profile, in `config.json`,
+or per analyzer is asserted to re-denominate `points` while leaving every
+`blend` and every `TShirtSize` untouched.
 
 The sizing and cross-file additions bring: Fibonacci banding and monotonicity,
 anchor rescaling in both directions, the chunk-kind floors (including a forced

@@ -108,7 +108,10 @@ class TShirtSize(StrEnum):
         The bridge from a qualitative size to a summable quantity. A profile's
         ``sizes.scale`` may restate these; this is the default the bands are
         calibrated against, and :attr:`FileComplexity.points` carries the
-        *computed* continuous value rather than the rung's nominal one.
+        *computed* continuous value rather than the rung's nominal one — on
+        whatever range ``sizes.story_points`` (or ``complexity.min_story_points``
+        / ``max_story_points``) asks for, which re-denominates the numbers
+        without moving a size.
         """
         return _SIZE_POINTS[self]
 
@@ -385,10 +388,11 @@ class FileComplexity(_ComplexityBase):
 
     source_id: str
     size: TShirtSize = TShirtSize.SMALL
-    # Computed position on the Fibonacci scale — continuous, so it both ranks
+    # Computed position on the story-point scale — continuous, so it both ranks
     # files within a size and sums across a corpus into a backlog estimate.
-    # Bounded by the scale's own rungs: a file cannot score below SMALL's 2
-    # points or above EXTRA_LARGE's 8, because points are a min-max rescale.
+    # Bounded by the scale's ends (the Fibonacci 2 and 8 unless a profile or
+    # config says otherwise), because points are a min-max rescale. Changing
+    # those ends re-denominates this number and never changes `size`.
     points: float = 0.0
     # The three declared dimensions, in raw (pre-normalisation) units.
     effort_raw: float = 0.0

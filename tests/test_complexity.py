@@ -613,23 +613,33 @@ class TestTShirtSize(unittest.TestCase):
         self.assertGreater(f.effort_raw, 20)
         self.assertIn(f.size, (TShirtSize.LARGE, TShirtSize.EXTRA_LARGE))
 
-    def test_volume_alone_tops_out_below_extra_large(self):
-        """Bulk saturates; Extra Large needs difficulty or unknowns as well.
+    def test_volume_alone_can_reach_extra_large(self):
+        """Bulk on its own must be able to ask to be broken down.
 
-        A consequence of rescaling each dimension against a window: past the
-        top of the effort window a longer file of the same trivial steps tells
-        you nothing new, so "split this before starting" is reserved for files
-        that are also hard.
+        The effort weight reaches past the Extra Large boundary by itself, so
+        a file of nothing but trivial steps still rates XL once there are
+        enough of them — an enormous file needs splitting however plain its
+        contents are. This is why the dimension weights are reaches summed and
+        clamped, not shares averaged.
         """
-        long = _analyze(
-            "".join(f"data out{i}; set in{i}; run;\n" for i in range(40))
+        f = _analyze(
+            "".join(f"data out{i}; set in{i}; run;\n" for i in range(80))
         ).files[0]
-        longer = _analyze(
+        self.assertEqual(f.tier, ComplexityTier.LOW)
+        self.assertEqual(f.complexity_raw, 0.0)
+        self.assertEqual(f.size, TShirtSize.EXTRA_LARGE)
+
+    def test_volume_saturates_at_the_top_of_its_window(self):
+        """Past the ceiling, more of the same stops moving the number."""
+        big = _analyze(
             "".join(f"data out{i}; set in{i}; run;\n" for i in range(200))
         ).files[0]
-        self.assertEqual(long.effort_norm, 1.0)
-        self.assertEqual(longer.points, long.points)
-        self.assertEqual(longer.size, TShirtSize.LARGE)
+        bigger = _analyze(
+            "".join(f"data out{i}; set in{i}; run;\n" for i in range(400))
+        ).files[0]
+        self.assertEqual(big.effort_norm, 1.0)
+        self.assertGreater(bigger.effort_raw, big.effort_raw)
+        self.assertEqual(bigger.points, big.points)
 
 
 def _reference_file_source() -> str:
@@ -696,19 +706,37 @@ class TestDimensionRescale(unittest.TestCase):
         20th. Under a plain rescale these two gaps would be identical.
         """
         n = lambda raw: self.sizes.normalize("effort", raw)  # noqa: E731
-        low_gap = n(60) - n(30)
-        high_gap = n(120) - n(90)
+        low_gap = n(80) - n(50)
+        high_gap = n(140) - n(110)
         self.assertGreater(low_gap, high_gap)
 
     def test_equal_ratios_are_equal_steps(self):
         """...and the flip side: a doubling is a doubling wherever it happens."""
         n = lambda raw: self.sizes.normalize("effort", raw)  # noqa: E731
-        self.assertAlmostEqual(n(60) - n(30), n(120) - n(60), places=2)
+        self.assertAlmostEqual(n(80) - n(40), n(160) - n(80), places=2)
 
     def test_points_span_the_scale_ends(self):
         """A min-max rescale bottoms out at SMALL and tops out at EXTRA_LARGE."""
         self.assertEqual(self.sizes.points_for(0.0, 0.0, 0.0), 2.0)
         self.assertEqual(self.sizes.points_for(1e6, 1e6, 1e6), 8.0)
+
+    def test_weights_are_reaches_not_shares(self):
+        """Each dimension pushes on its own; the blend clamps rather than dilutes.
+
+        A weighted mean would cap a volume-only file at the effort weight and
+        would dock every file that has no unknowns in it.
+        """
+        weights = self.sizes.dimension_weights
+        self.assertGreater(sum(weights.values()), 1.0)
+        self.assertGreaterEqual(
+            weights["effort"], self.sizes.band_blends()[TShirtSize.LARGE]
+        )
+        self.assertEqual(self.sizes.points_for(1e6, 1e6, 1e6), 8.0)
+
+    def test_uncertainty_adds_rather_than_taking_a_share(self):
+        clean = self.sizes.points_for(50.0, 37.5, 0.0)
+        troubled = self.sizes.points_for(50.0, 37.5, 20.0)
+        self.assertGreater(troubled, clean)
 
     def test_points_rescale_geometrically(self):
         """Log space, so the rungs stay Fibonacci-shaped rather than even."""
@@ -717,10 +745,15 @@ class TestDimensionRescale(unittest.TestCase):
 
     def _raw_for_blend(self, blend: float) -> tuple[float, float, float]:
         """Raw dimensions whose blend is *blend*, via effort alone."""
-        weights = self.sizes.dimension_weights
-        share = blend * sum(weights.values()) / weights["effort"]
+        share = blend / self.sizes.dimension_weights["effort"]
         lo, hi = self.sizes.window_for("effort")
-        return (math.expm1(math.log1p(lo) + share * (math.log1p(hi) - math.log1p(lo))), 0.0, 0.0)
+        return (
+            math.expm1(
+                math.log1p(lo) + share * (math.log1p(hi) - math.log1p(lo))
+            ),
+            0.0,
+            0.0,
+        )
 
     def test_dimension_weights_decide_the_mix(self):
         """A dimension weighted to zero cannot move a size."""
@@ -738,7 +771,7 @@ class TestDimensionRescale(unittest.TestCase):
 
     def test_file_reports_both_raw_and_normalised_dimensions(self):
         f = _analyze(
-            "".join(f"data out{i}; set in{i}; run;\n" for i in range(40))
+            "".join(f"data out{i}; set in{i}; run;\n" for i in range(200))
         ).files[0]
         self.assertGreater(f.effort_raw, 100)
         self.assertEqual(f.effort_norm, 1.0)
@@ -756,6 +789,72 @@ class TestDimensionRescale(unittest.TestCase):
     def test_markdown_shows_the_normalised_share(self):
         md = _analyze("data a; set b; run;\n").to_markdown()
         self.assertIn("| Blend |", md)
+
+
+class TestStoryPointRange(unittest.TestCase):
+    """`min_story_points` / `max_story_points` re-denominate, never re-rate."""
+
+    SOURCES = (
+        "%let a = 1;\n",
+        "".join(f"data out{i}; set in{i}; run;\n" for i in range(12)),
+        _reference_file_source(),
+        "".join(f"data out{i}; set in{i}; run;\n" for i in range(50)),
+        "".join(f"data out{i}; set in{i}; run;\n" for i in range(80)),
+    )
+
+    def test_defaults_to_the_profiles_scale(self):
+        sizes = rules.load_ruleset("sparksql").sizes
+        self.assertEqual(sizes.story_point_range, (2.0, 8.0))
+
+    def test_range_moves_the_reported_points(self):
+        for source in self.SOURCES:
+            wide = _analyze(source, min_story_points=1, max_story_points=13).files[0]
+            self.assertGreaterEqual(wide.points, 1.0)
+            self.assertLessEqual(wide.points, 13.0)
+
+    def test_range_does_not_move_a_single_size(self):
+        """The bands are fractions of the span, so the verdicts are identical."""
+        for source in self.SOURCES:
+            default = _analyze(source).files[0]
+            wide = _analyze(source, min_story_points=1, max_story_points=13).files[0]
+            self.assertEqual(wide.size, default.size, source[:30])
+            self.assertEqual(wide.blend, default.blend, source[:30])
+
+    def test_either_end_can_be_set_alone(self):
+        f = _analyze(self.SOURCES[2], max_story_points=100).files[0]
+        self.assertEqual(rules.load_ruleset("sparksql").sizes.story_point_range[0], 2.0)
+        self.assertGreater(f.points, 3.0)
+        self.assertEqual(f.size, TShirtSize.MEDIUM)
+
+    def test_range_is_read_from_the_profile(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        doc = json.loads(
+            rules.profile_path("sparksql").read_text(encoding="utf-8")
+        )
+        doc["sizes"]["story_points"] = {"min": 1, "max": 13}
+        path = pathlib.Path(tmp) / "wide.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        sizes = rules.load_ruleset(path=str(path), use_cache=False).sizes
+        self.assertEqual(sizes.story_point_range, (1.0, 13.0))
+        self.assertEqual(sizes.points_for(0.0, 0.0, 0.0), 1.0)
+        self.assertEqual(sizes.points_for(1e6, 1e6, 1e6), 13.0)
+        self.assertEqual(
+            sizes.band_for(sizes.points_for(*sizes.anchor_dimensions)),
+            TShirtSize.MEDIUM,
+        )
+
+    def test_a_zero_minimum_is_rejected(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        doc = json.loads(
+            rules.profile_path("sparksql").read_text(encoding="utf-8")
+        )
+        doc["sizes"]["story_points"] = {"min": 0, "max": 8}
+        path = pathlib.Path(tmp) / "zero.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        with self.assertRaises(rules.RuleSetError):
+            rules.load_ruleset(path=str(path), use_cache=False)
 
 
 def _extra_large_source() -> str:

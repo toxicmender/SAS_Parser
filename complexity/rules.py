@@ -144,21 +144,42 @@ DIMENSIONS: tuple[str, ...] = ("effort", "complexity", "uncertainty")
 # where it saturates. Both floors and ceilings are the point of a min-max: the
 # scale spends its resolution on the range real files actually occupy.
 _DEFAULT_DIMENSION_BOUNDS: dict[str, tuple[float, float]] = {
-    "effort": (0.30, 1.60),
-    "complexity": (0.33, 1.40),
+    "effort": (0.35, 2.40),
+    "complexity": (0.35, 1.40),
     "uncertainty": (0.00, 0.50),
 }
 
-# How the three normalised dimensions combine into the blend that becomes
-# points. Normalisation puts them on one 0-1 scale, so the mix that used to be
-# implicit in their raw magnitudes has to be stated: effort leads because it is
-# what a size is mostly answering, and uncertainty trails because it asks for
-# an investigation rather than for translation hands.
+# How far each normalised dimension can push the blend **on its own**. These
+# deliberately sum to more than 1 and the blend is clamped there, so they are
+# reaches rather than shares: a file that is nothing but volume still has to be
+# able to reach the top of the scale, because an enormous file needs breaking
+# up however plain its contents are. Effort reaches furthest for that reason;
+# uncertainty reaches least, because it asks for an investigation rather than
+# for translation hands — but being additive, it never *costs* a file anything
+# to have no unknowns in it.
 _DEFAULT_DIMENSION_WEIGHTS: dict[str, float] = {
-    "effort": 0.60,
-    "complexity": 0.35,
-    "uncertainty": 0.05,
+    "effort": 0.88,
+    "complexity": 0.50,
+    "uncertainty": 0.20,
 }
+
+# Ends of the story-point scale, when a profile states neither `sizes.scale`
+# ends nor a `sizes.story_points` range: the Fibonacci rungs the bands are
+# calibrated on.
+DEFAULT_MIN_STORY_POINTS = 2.0
+DEFAULT_MAX_STORY_POINTS = 8.0
+
+
+def _log_fraction(value: float, low: float, high: float) -> float:
+    """Where *value* sits between *low* and *high*, measured in log space.
+
+    The inverse of the geometric rescale :meth:`SizeModel.points_for` applies,
+    and the reason a band and a points value can be compared however the scale
+    is denominated. Degenerate ranges fall back to a linear fraction.
+    """
+    if low <= 0 or high <= low or value <= 0:
+        return (value - low) / (high - low) if high > low else 0.0
+    return math.log(value / low) / math.log(high / low)
 
 
 @dataclass(frozen=True)
@@ -202,13 +223,20 @@ class SizeModel:
         Prose description of that reference file, so the calibration can be
         argued with instead of merely obeyed.
     scale
-        Nominal points per rung (Fibonacci by default). Its lowest and highest
-        rungs are also the ends of the points scale: a file cannot score below
-        SMALL or above EXTRA_LARGE, which is what makes the rescale a min-max
-        rather than an open-ended ratio.
+        Nominal points per rung (Fibonacci by default). Together with *bands*
+        it is the **calibration**: the two decide where each size begins, as a
+        fraction of the scale's log span.
+    min_story_points, max_story_points
+        Ends of the reported story-point range. ``None`` (default) takes them
+        from *scale*'s lowest and highest rungs. A file cannot score outside
+        them, which is what makes the rescale a min-max rather than an
+        open-ended ratio. Changing them re-denominates every ``points`` value
+        without moving a single size boundary: the bands are read as fractions
+        of the span, so a team that estimates on 1-13 gets its own numbers and
+        the same verdicts.
     bands
-        Inclusive upper bound in points for SMALL, MEDIUM, and LARGE; above the
-        LARGE bound is EXTRA_LARGE.
+        Inclusive upper bound in points for SMALL, MEDIUM, and LARGE, stated
+        against *scale*; above the LARGE bound is EXTRA_LARGE.
     bounds
         ``{dimension: (min, max)}`` in multiples of the anchor — the min-max
         window each dimension is rescaled against, after the log.
@@ -230,6 +258,8 @@ class SizeModel:
     anchor_raw: float = DEFAULT_ANCHOR_RAW
     anchor_describes: str = ""
     anchor_dimensions: tuple[float, float, float] | None = None
+    min_story_points: float | None = None
+    max_story_points: float | None = None
     scale: dict[TShirtSize, float] = field(
         default_factory=lambda: dict(_DEFAULT_SIZE_SCALE)
     )
@@ -290,51 +320,92 @@ class SizeModel:
     ) -> float:
         """The three normalised dimensions as one 0-1 value.
 
-        A weighted mean, not a sum, so the blend keeps the 0-1 range the
-        dimensions were rescaled onto and the weights read as shares.
+        A weighted **sum**, clamped at 1, rather than a weighted mean. The
+        weights therefore say how far each dimension reaches on its own, and
+        they sum past 1 on purpose: a mean would cap a file that is nothing but
+        volume at the effort weight, so no amount of bulk could ever ask to be
+        broken down, and every file with nothing unresolved in it would forfeit
+        the uncertainty share for having no problems.
         """
         raws = {
             "effort": effort,
             "complexity": complexity,
             "uncertainty": uncertainty,
         }
-        weights = {
-            d: max(
-                self.dimension_weights.get(d, _DEFAULT_DIMENSION_WEIGHTS[d]), 0.0
-            )
+        total = sum(
+            self.normalize(d, raws[d])
+            * max(self.dimension_weights.get(d, _DEFAULT_DIMENSION_WEIGHTS[d]), 0.0)
             for d in DIMENSIONS
-        }
-        total = sum(weights.values())
-        if total <= 0:
-            return 0.0
-        return sum(self.normalize(d, raws[d]) * w for d, w in weights.items()) / total
+        )
+        return min(1.0, total)
+
+    @property
+    def story_point_range(self) -> tuple[float, float]:
+        """The ``(min, max)`` story points a file can be reported as.
+
+        Falls back to the scale's own end rungs, so a profile that says nothing
+        about story points still reports the Fibonacci 2-8 the bands were
+        calibrated on.
+        """
+        low = self.min_story_points
+        high = self.max_story_points
+        return (
+            self.scale.get(TShirtSize.SMALL, DEFAULT_MIN_STORY_POINTS)
+            if low is None
+            else low,
+            self.scale.get(TShirtSize.EXTRA_LARGE, DEFAULT_MAX_STORY_POINTS)
+            if high is None
+            else high,
+        )
 
     def points_for(
         self, effort: float, complexity: float = 0.0, uncertainty: float = 0.0
     ) -> float:
-        """Convert the three raw dimensions to points on the Fibonacci scale.
+        """Convert the three raw dimensions to points on the story-point scale.
 
         The blend is min-max rescaled **in log space** — geometrically between
-        the lowest and highest rungs — for the same reason the rungs are
-        Fibonacci in the first place: the gap between Small and Medium is
-        genuinely smaller than the gap between Large and Extra Large, so equal
-        steps of evidence should be equal *ratios* of points, not equal
-        differences. A blend of 0 is exactly SMALL, a blend of 1 exactly
-        EXTRA_LARGE, and the reference file lands on MEDIUM by calibration.
+        the ends of :attr:`story_point_range` — for the same reason the default
+        rungs are Fibonacci: the gap between Small and Medium is genuinely
+        smaller than the gap between Large and Extra Large, so equal steps of
+        evidence should be equal *ratios* of points, not equal differences. A
+        blend of 0 is exactly the minimum, a blend of 1 exactly the maximum,
+        and the reference file lands on MEDIUM by calibration.
         """
-        low = self.scale.get(TShirtSize.SMALL, 2.0)
-        high = self.scale.get(TShirtSize.EXTRA_LARGE, 8.0)
+        low, high = self.story_point_range
         blend = self.blend_for(effort, complexity, uncertainty)
         if low <= 0 or high <= low:
-            # A profile may flatten or invert the scale; fall back to a linear
+            # A profile may flatten or invert the range; fall back to a linear
             # rescale rather than raising on a log of a non-positive number.
             return round(low + blend * (high - low), 2)
         return round(low * (high / low) ** blend, 2)
 
+    def band_blends(self) -> dict[TShirtSize, float]:
+        """Where each band's upper bound sits, as a fraction of the log span.
+
+        Read off ``scale`` and ``bands`` — the calibration — rather than off
+        the reported range, which is why re-denominating story points cannot
+        move a size boundary.
+        """
+        low = self.scale.get(TShirtSize.SMALL, DEFAULT_MIN_STORY_POINTS)
+        high = self.scale.get(TShirtSize.EXTRA_LARGE, DEFAULT_MAX_STORY_POINTS)
+        return {
+            size: _log_fraction(
+                self.bands.get(size, _DEFAULT_SIZE_BANDS[size]), low, high
+            )
+            for size in (TShirtSize.SMALL, TShirtSize.MEDIUM, TShirtSize.LARGE)
+        }
+
     def band_for(self, points: float) -> TShirtSize:
-        """The size *points* falls in, before any floor is applied."""
+        """The size *points* falls in, before any floor is applied.
+
+        Compares in blend space, so a profile reporting on 1-13 bands at the
+        same evidence as one reporting on 2-8.
+        """
+        low, high = self.story_point_range
+        position = _log_fraction(points, low, high)
+        bounds = self.band_blends()
         for size in (TShirtSize.SMALL, TShirtSize.MEDIUM, TShirtSize.LARGE):
-            if points <= self.bands.get(size, _DEFAULT_SIZE_BANDS[size]):
+            if position <= bounds[size]:
                 return size
         return TShirtSize.EXTRA_LARGE
 
@@ -544,6 +615,36 @@ def _anchor_dimensions(
     return values  # type: ignore[return-value]
 
 
+def _story_points(raw: Any, where: str) -> tuple[float | None, float | None]:
+    """Parse the optional ``sizes.story_points`` block.
+
+    Either end may be stated alone; the one left out falls back to the scale's
+    own rung, so a team that only wants a different ceiling says only that.
+    """
+    if raw is None:
+        return None, None
+    if not isinstance(raw, dict):
+        raise RuleSetError(f"{where}: expected an object with min/max")
+    unknown = set(raw) - {"min", "max"}
+    if unknown:
+        raise RuleSetError(
+            f"{where}: unknown key(s) {', '.join(sorted(unknown))} "
+            f"(expected min, max)"
+        )
+    low = _number(raw["min"], f"{where}.min") if "min" in raw else None
+    high = _number(raw["max"], f"{where}.max") if "max" in raw else None
+    if low is not None and low <= 0:
+        raise RuleSetError(
+            f"{where}.min: must be greater than 0 — points are rescaled "
+            f"geometrically, so the smallest size cannot be worth nothing"
+        )
+    if low is not None and high is not None and high <= low:
+        raise RuleSetError(
+            f"{where}: max ({high}) must be greater than min ({low})"
+        )
+    return low, high
+
+
 def _bounds(raw: Any, where: str) -> dict[str, tuple[float, float]]:
     """Parse the optional ``sizes.bounds`` block (anchor-relative min-max windows)."""
     out = dict(_DEFAULT_DIMENSION_BOUNDS)
@@ -626,6 +727,10 @@ def _size_model(raw: Any, where: str) -> SizeModel:
         size = _enum(key, TShirtSize, f"{where}.scale key")
         scale[size] = _number(value, f"{where}.scale.{key}")
 
+    min_points, max_points = _story_points(
+        raw.get("story_points"), f"{where}.story_points"
+    )
+
     bands = dict(_DEFAULT_SIZE_BANDS)
     for key, value in (raw.get("bands") or {}).items():
         size = _enum(key, TShirtSize, f"{where}.bands key")
@@ -662,6 +767,8 @@ def _size_model(raw: Any, where: str) -> SizeModel:
         anchor_raw=anchor_raw,
         anchor_describes=describes,
         anchor_dimensions=anchor_dims,
+        min_story_points=min_points,
+        max_story_points=max_points,
         scale=scale,
         bands=bands,
         bounds=_bounds(raw.get("bounds"), f"{where}.bounds"),

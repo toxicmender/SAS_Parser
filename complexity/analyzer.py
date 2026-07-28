@@ -131,6 +131,13 @@ class ComplexityAnalyzer:
         Raw score of the reference MEDIUM file. ``None`` (default) reads
         ``complexity.size_anchor`` from config.json, then the profile's own
         ``sizes.anchor.raw``. Lowering it makes every file rate larger.
+    min_story_points, max_story_points : float | None
+        Ends of the story-point scale a file's ``points`` is reported on.
+        ``None`` (default) reads ``complexity.min_story_points`` /
+        ``complexity.max_story_points`` from config.json, then the profile's
+        ``sizes.story_points``, then its scale's end rungs (2 and 8). These
+        re-denominate the numbers only — a team that estimates on 1-13 gets
+        its own scale and the identical set of sizes.
     """
 
     def __init__(
@@ -145,6 +152,8 @@ class ComplexityAnalyzer:
         use_detectors: bool = True,
         use_cross_file: bool | None = None,
         size_anchor: float | None = None,
+        min_story_points: float | None = None,
+        max_story_points: float | None = None,
     ) -> None:
         self._rules = ruleset or load_ruleset(target, path=rules_path)
         # Weight precedence: explicit argument > config.json > the profile's
@@ -178,30 +187,46 @@ class ComplexityAnalyzer:
         anchor = _resolve_weight(
             size_anchor, "size_anchor", self._rules.sizes.anchor_raw
         )
-        self._sizes: SizeModel = (
-            self._rules.sizes
-            if anchor == self._rules.sizes.anchor_raw
-            else replace(
-                self._rules.sizes,
+        points_low = _resolve_optional_number(
+            min_story_points, "min_story_points", self._rules.sizes.min_story_points
+        )
+        points_high = _resolve_optional_number(
+            max_story_points, "max_story_points", self._rules.sizes.max_story_points
+        )
+        sizes = self._rules.sizes
+        if anchor != sizes.anchor_raw:
+            sizes = replace(
+                sizes,
                 anchor_raw=anchor,
                 # The anchor's dimension split is the same measurement as its
                 # total, so it moves with it — leaving it behind would leave
                 # the profile self-contradictory the moment anyone retunes.
                 anchor_dimensions=_scaled_dimensions(
-                    self._rules.sizes.anchor_dimensions,
+                    sizes.anchor_dimensions,
                     anchor / self._rules.sizes.anchor_raw
                     if self._rules.sizes.anchor_raw > 0
                     else 1.0,
                 ),
             )
-        )
+        if (points_low, points_high) != (
+            sizes.min_story_points,
+            sizes.max_story_points,
+        ):
+            sizes = replace(
+                sizes,
+                min_story_points=points_low,
+                max_story_points=points_high,
+            )
+        self._sizes: SizeModel = sizes
+        story_low, story_high = self._sizes.story_point_range
         logger.info(
             f"ComplexityAnalyzer  target={self._rules.target}  "
             f"constructs={self._rules.construct_count}  "
             f"weights={ {t.value: w for t, w in self._weights.items()} }  "
             f"detectors={'on' if use_detectors else 'off'}  "
             f"cross_file={'on' if self._use_cross_file else 'off'}  "
-            f"size_anchor={self._sizes.anchor_raw}"
+            f"size_anchor={self._sizes.anchor_raw}  "
+            f"story_points={story_low}-{story_high}"
         )
 
     @property
@@ -658,6 +683,20 @@ def _resolve_weight(explicit: float | None, key: str, default: float) -> float:
         return float(explicit)
     value = app_config.get_typed_value(_CONFIG_SECTION, key, (int, float), default)
     return float(value)
+
+
+def _resolve_optional_number(
+    explicit: float | None, key: str, default: float | None
+) -> float | None:
+    """The same precedence, for a setting whose default is "unset".
+
+    Distinct from :func:`_resolve_weight` because ``None`` here is a real
+    answer — it means "take the profile's scale" — rather than a missing one.
+    """
+    if explicit is not None:
+        return float(explicit)
+    value = app_config.get_typed_value(_CONFIG_SECTION, key, (int, float))
+    return float(value) if value is not None else default
 
 
 def _signal(
