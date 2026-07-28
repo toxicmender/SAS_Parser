@@ -252,7 +252,7 @@ def test_malformed_llm_client_section_degrades_gracefully(_isolated_config):
         },
     )
     cfg = LLMClientConfig()  # must not raise: bad entries -> hard defaults
-    assert cfg.model == "claude-sonnet-4-5"
+    assert cfg.model == "gpt-5.4"
     assert cfg.timeout is None
     assert cfg.temperature is None
     assert cfg.url_headers is None
@@ -301,5 +301,5 @@ def test_defaults_without_config(_isolated_config):
     assert InstructionChunker().max_words == 900
     assert PromptBuilder([]).max_instruction_words == 1500
     assert LLMClientConfig().max_input_tokens is None
-    assert LLMClientConfig().model == "claude-sonnet-4-5"
+    assert LLMClientConfig().model == "gpt-5.4"
     assert LLMClientConfig().max_retries == 3

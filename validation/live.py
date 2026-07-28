@@ -20,7 +20,7 @@ One record per item in the conversation KV store, keyed::
     validation::{thread_id}::item::{item_id}
 
 deliberately mirroring the run facts the pipeline writes at
-``run::{thread_id}::item::*`` (see ``SasLLMPipeline._record_run_fact``): the
+``run::{thread_id}::item::*`` (see ``pipeline.run_ledger.RunLedger.record_run_fact``): the
 same thread, the same per-item granularity, the small-facts-only rule (the
 full response already lives in the ``msg::`` history and is never duplicated
 here). The stored value is the item's :class:`~validation.models.CaseResult`
@@ -201,7 +201,7 @@ def report_from_verdicts(
     Each verdict is one item's :class:`~validation.models.CaseResult` as a dict
     — an ``out["validation"]`` value from a pipeline run, or a record from
     :func:`validations_for_thread` /
-    :meth:`~chunker.pipeline.SasLLMPipeline.get_validation_facts`. The extra
+    :meth:`~pipeline.engine.SasLLMPipeline.get_validation_facts`. The extra
     ``item_id`` / ``index`` / ``total`` / ``ts`` keys those readers add are
     ignored (``CaseResult`` drops unknown fields), and the per-item order is
     taken as given — pass already-ordered verdicts.

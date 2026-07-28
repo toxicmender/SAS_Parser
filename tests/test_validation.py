@@ -21,7 +21,7 @@ from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from memory.store import MemoryHub
 
 from chunker.models import SasBatch, SasChunk, SasChunkKind, SasChunkMetadata
-from chunker.pipeline import SasLLMPipeline
+from pipeline import SasLLMPipeline
 from validation import (
     DatasetFidelityMetric,
     Evaluator,
@@ -60,6 +60,16 @@ def _mk_chunk(chunk_id: str, text: str = "data a; run;", **meta_kwargs) -> SasCh
         start_char=0,
         end_char=len(text),
         metadata=SasChunkMetadata(**meta_kwargs),
+    )
+
+
+def _wrap(chunk: SasChunk) -> SasBatch:
+    """One-member batch under the chunk's own id — the SasBatch-only shape
+    _process takes, as coalesce_into_batches would wrap a lone singleton."""
+    return SasBatch(
+        batch_id=chunk.chunk_id,
+        chunks=[chunk],
+        source_files=[chunk.source_id or "unknown"],
     )
 
 
@@ -811,11 +821,11 @@ def test_resume_recovers_stored_validation_verdicts():
     thread_id = "run::resume-val"
 
     # First attempt "crashes" after item 1: only c1 processed and scored.
-    pipeline._process(items=[c1], diagnostics=[], thread_id=thread_id)
+    pipeline._process(items=[_wrap(c1)], diagnostics=[], thread_id=thread_id)
     assert len(pipeline.get_validation_facts(thread_id)) == 1
 
     outputs = pipeline._process(
-        items=[c1, c2], diagnostics=[], thread_id=thread_id, resume=True
+        items=[_wrap(c1), _wrap(c2)], diagnostics=[], thread_id=thread_id, resume=True
     )
 
     assert outputs[0]["skipped"] is True
@@ -834,7 +844,7 @@ def test_resume_without_stored_verdict_leaves_validation_none():
     # resuming must not invent one for the skipped item.
     first = _pipeline([GOOD_RESPONSE])  # no validator
     thread_id = "run::resume-noverdict"
-    first._process(items=[_mk_chunk("c1")], diagnostics=[], thread_id=thread_id)
+    first._process(items=[_wrap(_mk_chunk("c1"))], diagnostics=[], thread_id=thread_id)
 
     # Same store, now with a validator attached, resumes the thread.
     resumed = SasLLMPipeline(
@@ -843,7 +853,7 @@ def test_resume_without_stored_verdict_leaves_validation_none():
         validator=LiveValidator(),
     )
     outputs = resumed._process(
-        items=[_mk_chunk("c1"), _mk_chunk("c2")],
+        items=[_wrap(_mk_chunk("c1")), _wrap(_mk_chunk("c2"))],
         diagnostics=[],
         thread_id=thread_id,
         resume=True,
@@ -924,7 +934,7 @@ def test_resume_redoes_stored_failing_item_when_retries_enabled():
         memory=mem,
         validator=LiveValidator(),
     )
-    first._process(items=[c1], diagnostics=[], thread_id="run::redo")
+    first._process(items=[_wrap(c1)], diagnostics=[], thread_id="run::redo")
     assert first.get_validation_facts("run::redo")[0]["passed"] is False
 
     # Resume on the same store: item 1's stored verdict failed, so it is not
@@ -936,7 +946,7 @@ def test_resume_redoes_stored_failing_item_when_retries_enabled():
         validation_retries=1,
     )
     outputs = resumed._process(
-        items=[c1, c2], diagnostics=[], thread_id="run::redo", resume=True
+        items=[_wrap(c1), _wrap(c2)], diagnostics=[], thread_id="run::redo", resume=True
     )
 
     assert outputs[0]["skipped"] is False  # redone, not skipped
@@ -963,7 +973,7 @@ def test_resume_keeps_passing_prefix_and_redoes_from_first_failure():
         memory=mem,
         validator=LiveValidator(),
     )
-    first._process(items=[c1, c2], diagnostics=[], thread_id="run::prefix")
+    first._process(items=[_wrap(c1), _wrap(c2)], diagnostics=[], thread_id="run::prefix")
     assert first.get_validation_facts("run::prefix")[0]["passed"] is True
     assert first.get_validation_facts("run::prefix")[1]["passed"] is False
     c1_answer = first.get_thread_messages("run::prefix")[1].content
@@ -975,7 +985,7 @@ def test_resume_keeps_passing_prefix_and_redoes_from_first_failure():
         validation_retries=1,
     )
     outputs = resumed._process(
-        items=[c1, c2], diagnostics=[], thread_id="run::prefix", resume=True
+        items=[_wrap(c1), _wrap(c2)], diagnostics=[], thread_id="run::prefix", resume=True
     )
 
     assert outputs[0]["skipped"] is True  # passing prefix item kept
@@ -993,7 +1003,7 @@ def test_fork_run_copies_validation_verdicts_onto_the_branch():
         "c1", input_datasets=["work.sales_raw"], output_datasets=["work.sales_clean"]
     )
     c2 = _mk_chunk("c2")
-    pipeline._process(items=[c1, c2], diagnostics=[], thread_id="run::v1")
+    pipeline._process(items=[_wrap(c1), _wrap(c2)], diagnostics=[], thread_id="run::v1")
     assert len(pipeline.get_validation_facts("run::v1")) == 2
 
     pipeline.fork_run("run::v1", "run::v2", upto_items=1)
@@ -1003,7 +1013,7 @@ def test_fork_run_copies_validation_verdicts_onto_the_branch():
 
     # Resuming the branch recovers the copied verdict for the skipped item.
     outputs = pipeline._process(
-        items=[c1, c2], diagnostics=[], thread_id="run::v2", resume=True
+        items=[_wrap(c1), _wrap(c2)], diagnostics=[], thread_id="run::v2", resume=True
     )
     assert outputs[0]["skipped"] is True
     assert outputs[0]["validation"]["passed"] is True
@@ -1170,13 +1180,13 @@ def test_skipped_resumed_item_still_carries_prompt_and_retrieval_context():
     c1, c2 = _mk_chunk("c1"), _mk_chunk("c2")
     thread_id = "run::resume-ctx"
 
-    pipeline._process(items=[c1], diagnostics=[], thread_id=thread_id)
+    pipeline._process(items=[_wrap(c1)], diagnostics=[], thread_id=thread_id)
     outputs = pipeline._process(
-        items=[c1, c2], diagnostics=[], thread_id=thread_id, resume=True
+        items=[_wrap(c1), _wrap(c2)], diagnostics=[], thread_id=thread_id, resume=True
     )
 
     assert outputs[0]["skipped"] is True
-    assert outputs[0]["prompt"] and "## Chunk source" in outputs[0]["prompt"]
+    assert outputs[0]["prompt"] and "## Batch members" in outputs[0]["prompt"]
     assert outputs[0]["retrieval_context"] == []  # no prompt builder attached
     # Shaped identically to the freshly-processed item.
     assert set(outputs[0]) == set(outputs[1])
@@ -1239,7 +1249,7 @@ def test_run_from_thread_picks_up_a_rolling_summary():
     pipeline = _pipeline([GOOD_RESPONSE, GOOD_RESPONSE], memory=hub)
     thread_id = "run::summarised"
     pipeline._process(
-        items=[_mk_chunk("c1"), _mk_chunk("c2")],
+        items=[_wrap(_mk_chunk("c1")), _wrap(_mk_chunk("c2"))],
         diagnostics=[],
         thread_id=thread_id,
     )
@@ -1261,6 +1271,6 @@ def test_run_from_thread_picks_up_a_rolling_summary():
 def test_run_from_thread_without_a_summary_leaves_both_none():
     pipeline = _pipeline([GOOD_RESPONSE])
     thread_id = "run::unsummarised"
-    pipeline._process(items=[_mk_chunk("c1")], diagnostics=[], thread_id=thread_id)
+    pipeline._process(items=[_wrap(_mk_chunk("c1"))], diagnostics=[], thread_id=thread_id)
     run = run_from_thread(pipeline, thread_id)
     assert run.summary is None and run.summary_source is None

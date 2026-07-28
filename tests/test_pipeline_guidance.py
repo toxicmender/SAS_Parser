@@ -17,8 +17,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from langchain_core.messages import AIMessage
 
 from chunker.models import SasBatch, SasChunk, SasChunkKind, SasChunkMetadata
-from chunker.pipeline import (
-    SasLLMPipeline,
+from pipeline import SasLLMPipeline
+from pipeline.prompting import (
     _constructs_for_item,
     _kinds_for_item,
     _meta_flags_for_item,
@@ -92,13 +92,13 @@ def _pipeline(llm, prompt_builder):
 def test_constructs_for_item_maps_functions_and_hazards():
     chunk = _intnx_chunk()
     chunk.metadata.symput_scope_hazard = True
-    keys = _constructs_for_item(chunk)
+    keys = _constructs_for_item(_batch(chunk))
     assert ConstructKey(kind="function", name="intnx") in keys
     assert ConstructKey(kind="call_routine", name="symput") in keys  # hazard added
 
 
 def test_query_for_item_uses_constructs_not_dataset_names():
-    query = _query_for_item(_intnx_chunk())
+    query = _query_for_item(_batch(_intnx_chunk()))
     assert "intnx" in query
     assert "out" not in query.split()  # dataset name is not a query token
 
@@ -118,9 +118,9 @@ def test_component_objects_map_to_constructs_and_query():
         metadata=SasChunkMetadata(component_objects=["hash"]),
     )
     assert ConstructKey(kind="component_object", name="hash") in _constructs_for_item(
-        chunk
+        _batch(chunk)
     )
-    assert "hash object" in _query_for_item(chunk)
+    assert "hash object" in _query_for_item(_batch(chunk))
 
 
 # ---------------------------------------------------------------------------
@@ -143,8 +143,8 @@ def _meta_chunk(chunk_id: str, **meta) -> SasChunk:
     )
 
 
-def _batch(*chunks: SasChunk) -> SasBatch:
-    return SasBatch(batch_id="batch-001", chunks=list(chunks))
+def _batch(*chunks: SasChunk, batch_id: str = "batch-001") -> SasBatch:
+    return SasBatch(batch_id=batch_id, chunks=list(chunks))
 
 
 def test_sasbatch_aggregates_member_metadata_as_sets():
@@ -217,7 +217,7 @@ def test_kinds_for_item_unions_member_kinds():
         _meta_chunk("c2", kind=SasChunkKind.PROC_STEP, proc_name="sql"),
     )
     assert _kinds_for_item(batch) == {"DATA_STEP", "PROC_STEP"}
-    assert _kinds_for_item(_intnx_chunk()) == {"DATA_STEP"}
+    assert _kinds_for_item(_batch(_intnx_chunk())) == {"DATA_STEP"}
 
 
 def test_meta_flags_for_item_maps_metadata_predicates():
@@ -270,7 +270,7 @@ def test_kind_and_meta_gate_instruction_injection_end_to_end():
 def test_guidance_is_prompted():
     llm = _RecordingChatModel()
     pipeline = _pipeline(llm, PromptBuilder(_guidance_corpus()))
-    pipeline._process(items=[_intnx_chunk()], diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(items=[_batch(_intnx_chunk())], diagnostics=[], thread_id="run::etl.sas")
 
     prompted = "\n".join(str(m.content) for m in llm.prompts[0])
     assert GUIDANCE_MARKER in prompted  # guidance reached the LLM
@@ -279,7 +279,7 @@ def test_guidance_is_prompted():
 def test_guidance_is_not_persisted_to_history():
     llm = _RecordingChatModel()
     pipeline = _pipeline(llm, PromptBuilder(_guidance_corpus()))
-    pipeline._process(items=[_intnx_chunk()], diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(items=[_batch(_intnx_chunk())], diagnostics=[], thread_id="run::etl.sas")
 
     stored = pipeline.get_thread_messages("run::etl.sas")
     stored_text = "\n".join(str(m.content) for m in stored)
@@ -290,7 +290,7 @@ def test_guidance_is_not_persisted_to_history():
 def test_no_prompt_builder_means_no_guidance_message():
     llm = _RecordingChatModel()
     pipeline = _pipeline(llm, None)
-    pipeline._process(items=[_intnx_chunk()], diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(items=[_batch(_intnx_chunk())], diagnostics=[], thread_id="run::etl.sas")
 
     # system + (empty history) + (empty instructions) + human == 2 messages.
     assert len(llm.prompts[0]) == 2
@@ -314,7 +314,7 @@ def test_user_instructions_without_builder_prompted_not_persisted():
         llm=llm,
         user_instructions=f"## Output rules\n{USER_MARKER}.",
     )
-    pipeline._process(items=[_intnx_chunk()], diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(items=[_batch(_intnx_chunk())], diagnostics=[], thread_id="run::etl.sas")
 
     # Prompted: system + instructions + human.
     assert len(llm.prompts[0]) == 3
@@ -336,7 +336,7 @@ def test_user_instructions_fold_into_given_builder():
         prompt_builder=PromptBuilder(_guidance_corpus()),
         user_instructions=f"## Output rules\n{USER_MARKER}.",
     )
-    pipeline._process(items=[_intnx_chunk()], diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(items=[_batch(_intnx_chunk())], diagnostics=[], thread_id="run::etl.sas")
 
     instructions_msg = str(llm.prompts[0][1].content)
     assert USER_MARKER in instructions_msg  # operator rules present...
@@ -359,7 +359,7 @@ def test_pipeline_level_instructions_replace_builders_own():
         prompt_builder=builder,
         user_instructions=f"## New\n{USER_MARKER}.",
     )
-    pipeline._process(items=[_intnx_chunk()], diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(items=[_batch(_intnx_chunk())], diagnostics=[], thread_id="run::etl.sas")
 
     prompted = "\n".join(str(m.content) for m in llm.prompts[0])
     assert USER_MARKER in prompted
@@ -393,7 +393,12 @@ def test_conditional_rule_scoped_end_to_end():
         metadata=SasChunkMetadata(proc_name="print"),
     )
     pipeline._process(
-        items=[intnx, print_chunk], diagnostics=[], thread_id="run::etl.sas"
+        items=[
+            _batch(intnx, batch_id="b1"),
+            _batch(print_chunk, batch_id="b2"),
+        ],
+        diagnostics=[],
+        thread_id="run::etl.sas",
     )
 
     assert USER_MARKER in "\n".join(str(m.content) for m in llm.prompts[0])
@@ -426,7 +431,7 @@ def test_standing_instructions_file_from_config(monkeypatch, tmp_path):
             llm=llm,
         )
         pipeline._process(
-            items=[_intnx_chunk()], diagnostics=[], thread_id="run::etl.sas"
+            items=[_batch(_intnx_chunk())], diagnostics=[], thread_id="run::etl.sas"
         )
         prompted = "\n".join(str(m.content) for m in llm.prompts[0])
         assert USER_MARKER in prompted
@@ -466,7 +471,7 @@ def test_irrelevant_item_injects_no_guidance():
         end_char=len(text),
         metadata=SasChunkMetadata(proc_name="print"),
     )
-    pipeline._process(items=[chunk], diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(items=[_batch(chunk)], diagnostics=[], thread_id="run::etl.sas")
     assert len(llm.prompts[0]) == 2  # no guidance system message added
 
 
@@ -480,19 +485,19 @@ def test_outputs_carry_the_prompt_and_the_retrieved_chunks():
     dict, so validation scores exactly the context the model was given."""
     pipeline = _pipeline(_RecordingChatModel(), PromptBuilder(_guidance_corpus()))
     (out,) = pipeline._process(
-        items=[_intnx_chunk()], diagnostics=[], thread_id="run::etl.sas"
+        items=[_batch(_intnx_chunk())], diagnostics=[], thread_id="run::etl.sas"
     )
     assert out["retrieval_context"] == [_guidance_corpus()[0].text]
     assert GUIDANCE_MARKER in out["retrieval_context"][0]
     # The prompt is the item message the model actually answered.
     assert "intnx" in out["prompt"]
-    assert "## Chunk source" in out["prompt"]
+    assert "## Batch members" in out["prompt"]
 
 
 def test_outputs_carry_empty_retrieval_context_without_a_prompt_builder():
     pipeline = _pipeline(_RecordingChatModel(), None)
     (out,) = pipeline._process(
-        items=[_intnx_chunk()], diagnostics=[], thread_id="run::etl.sas"
+        items=[_batch(_intnx_chunk())], diagnostics=[], thread_id="run::etl.sas"
     )
     assert out["retrieval_context"] == []
     assert out["prompt"]
@@ -517,16 +522,16 @@ def test_irrelevant_item_still_reports_what_was_retrieved():
         metadata=SasChunkMetadata(proc_name="print"),
     )
     (out,) = pipeline._process(
-        items=[chunk], diagnostics=[], thread_id="run::etl.sas"
+        items=[_batch(chunk)], diagnostics=[], thread_id="run::etl.sas"
     )
     assert out["retrieval_context"] == []
 
 
 def test_select_then_build_from_picks_reproduces_build():
     builder = PromptBuilder(_guidance_corpus())
-    chunk = _intnx_chunk()
-    constructs = _constructs_for_item(chunk)
-    query = _query_for_item(chunk)
+    item = _batch(_intnx_chunk())
+    constructs = _constructs_for_item(item)
+    query = _query_for_item(item)
     picks = builder.select(query, constructs)
     assert [p.chunk.chunk_id for p in picks] == ["functions::c0"]
     assert builder.build_from_picks(picks, constructs) == builder.build(

@@ -1,7 +1,7 @@
 # llm_client
 
 OpenAI-compatible chat-model construction and invocation. Owns everything about
-*how* the LLM is called, so callers (currently only `chunker.pipeline`) never
+*how* the LLM is called, so callers (currently only `pipeline.engine`) never
 touch the chat-model class or provider error types directly.
 
 **One transport, many models.** The AI Gateway speaks the OpenAI
@@ -88,11 +88,11 @@ chain = prompt | client.as_runnable()
   (attempt *n* waits `min(base * 2**(n-1), max)` scaled by 0.5–1.5×). Every
   other exception propagates unchanged on the first occurrence, and exhausted
   retries are logged at ERROR before the last exception propagates. Callers
-  that persist progress (e.g. `chunker.pipeline`'s per-item run facts +
+  that persist progress (e.g. `pipeline.engine`'s per-item run facts +
   `resume=True`) therefore only ever see failures that survived the retry
   budget.
 - **Prompt-cache compatibility**: a `cache_control` breakpoint (the
-  Anthropic-native content-part key `chunker.pipeline` sets on the system
+  Anthropic-native content-part key `pipeline.engine` sets on the system
   block when `prompt_caching` is on) is not something every OpenAI-compatible
   gateway forwards — LiteLLM- and OpenRouter-style proxies pass it through to
   Anthropic, a strict OpenAI schema rejects unknown content-part keys with a
@@ -127,15 +127,17 @@ chain = prompt | client.as_runnable()
   injected `llm`.
 - **Input-token budget**: when `max_input_tokens` is set, the prompt is counted
   before the call and `InputTokenLimitError` is raised instead of sending an
-  over-budget request. Counting uses the model's own
-  `get_num_tokens_from_messages` — tiktoken, for `ChatOpenAI`. That counter is
-  implemented only for the GPT families and raises for anything else, so for a
-  Claude or Gemini model the client sets `tiktoken_model_name="gpt-5"`: the
-  budget is then enforced against a real tokenizer run under a stand-in
-  vocabulary — an *estimate*, not that provider's own tokenization, but far
-  closer than the alternative. Pass `token_counter` when it must be exact.
-  Anything that raises (no tiktoken cache and offline, a fake model without a
-  tokenizer) degrades to a `chars // 4` approximation with a one-time WARNING.
+  over-budget request. Counting is client-owned, via the shared tiktoken
+  counter in `llm_client.tokens`: the encoding resolves from the model id by
+  an explicit prefix map — `o200k_base` for the modern GPT families **and**
+  for every non-OpenAI id (Claude, Gemini: a real tokenizer run under a
+  stand-in vocabulary — an *estimate*, not that provider's own tokenization,
+  but far closer than a guess), `cl100k_base` for the older GPT families —
+  never a bare `tiktoken.encoding_for_model` lookup that can raise on an
+  unknown name (`"gpt-5.4"` included). An injected `llm` needs no tokenizer
+  of its own. Pass `token_counter` when the budget must be exact. When
+  tiktoken cannot load its encoding data (offline, a blocking proxy),
+  counting degrades to a `chars // 4` approximation with a one-time WARNING.
 - **Sync and async invocation**: `invoke` / `ainvoke` share the same budget and
   retry semantics (`ainvoke` backs off with `asyncio.sleep` and counts tokens in
   a worker thread, since model-native counters may call a sync HTTP endpoint);

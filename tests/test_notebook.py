@@ -1,5 +1,5 @@
 """
-test_notebook.py — unit tests for chunker.notebook and chunker.response_models
+test_notebook.py — unit tests for pipeline.notebook and pipeline.response_models
 (zero LLM, zero network).
 
 The notebooks are written by hand against the nbformat v4.5 spec, so the
@@ -19,7 +19,7 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from chunker.notebook import (
+from pipeline.notebook import (
     CROSS_FILE_NOTEBOOK,
     build_notebook,
     document_to_cells,
@@ -29,7 +29,7 @@ from chunker.notebook import (
     notebooks_from_outputs,
     write_notebooks,
 )
-from chunker.response_models import (
+from pipeline.response_models import (
     MappingEntry,
     RiskNote,
     TranslationCell,
@@ -372,6 +372,109 @@ class TestGrouping(unittest.TestCase):
             pointer = "\n".join(c["source"] for c in notebooks[name]["cells"])
             self.assertIn(f"{CROSS_FILE_NOTEBOOK}.ipynb", pointer)
             self.assertNotIn("spark.table", pointer)
+
+    # ---- Per-source split of tagged cross-file documents (Phase 5) -------
+
+    @staticmethod
+    def _tagged_document():
+        return TranslationDocument(
+            analysis="Two steps across two files.",
+            mapping=[MappingEntry(sas_construct="DATA step", equivalent="DataFrame")],
+            cells=[
+                TranslationCell(
+                    kind="code",
+                    language="python",
+                    source='df_a = spark.table("a")',
+                    chunk_id="a-chunk-1",
+                ),
+                TranslationCell(kind="markdown", source="Shared note."),
+                TranslationCell(
+                    kind="code",
+                    language="python",
+                    source='df_b = df_a.filter("x = 1")',
+                    chunk_id="b-chunk-1",
+                ),
+            ],
+            risks=[RiskNote(severity="P1", note="Check the filter.")],
+        )
+
+    def _tagged_output(self, document=None, chunk_sources=None):
+        return _output(
+            "i1",
+            ("a.sas", "b.sas"),
+            document=(document or self._tagged_document()).model_dump(),
+            chunk_sources=(
+                {"a-chunk-1": "a.sas", "b-chunk-1": "b.sas"}
+                if chunk_sources is None
+                else chunk_sources
+            ),
+        )
+
+    def test_tagged_cross_file_document_splits_per_source(self):
+        notebooks = notebooks_from_outputs([self._tagged_output()])
+        # Every source gets its own complete notebook; no shared one at all.
+        self.assertNotIn(CROSS_FILE_NOTEBOOK, notebooks)
+        a = "\n".join(c["source"] for c in notebooks["a"]["cells"])
+        b = "\n".join(c["source"] for c in notebooks["b"]["cells"])
+        # Code cells route by chunk_id...
+        self.assertIn("df_a = spark.table", a)
+        self.assertNotIn("df_b", a)
+        self.assertIn("df_b = df_a.filter", b)
+        self.assertNotIn("spark.table", b)
+        # ...while the header, Analysis/Mapping, untagged prose, and Risks are
+        # duplicated so each notebook stands alone.
+        for body in (a, b):
+            self.assertIn("## i1", body)
+            self.assertIn("Split: translation cells are routed", body)
+            self.assertIn("Two steps across two files.", body)
+            self.assertIn("Shared note.", body)
+            self.assertIn("Check the filter.", body)
+
+    def test_untagged_code_cell_falls_back_whole_item(self):
+        doc = self._tagged_document()
+        doc.cells[2].chunk_id = None  # one code cell loses its tag
+        notebooks = notebooks_from_outputs([self._tagged_output(document=doc)])
+        # All-or-nothing: the WHOLE item keeps the shared-notebook treatment.
+        self.assertIn(CROSS_FILE_NOTEBOOK, notebooks)
+        shared = "\n".join(
+            c["source"] for c in notebooks[CROSS_FILE_NOTEBOOK]["cells"]
+        )
+        self.assertIn("df_a = spark.table", shared)
+        self.assertIn("df_b = df_a.filter", shared)
+        for name in ("a", "b"):
+            pointer = "\n".join(c["source"] for c in notebooks[name]["cells"])
+            self.assertIn(f"{CROSS_FILE_NOTEBOOK}.ipynb", pointer)
+            self.assertNotIn("df_a", pointer)
+
+    def test_tag_resolving_outside_the_item_falls_back(self):
+        notebooks = notebooks_from_outputs(
+            [
+                self._tagged_output(
+                    chunk_sources={"a-chunk-1": "a.sas", "b-chunk-1": "elsewhere.sas"}
+                )
+            ]
+        )
+        self.assertIn(CROSS_FILE_NOTEBOOK, notebooks)
+
+    def test_missing_chunk_sources_falls_back(self):
+        out = self._tagged_output()
+        del out["chunk_sources"]  # an output produced before Phase 5
+        notebooks = notebooks_from_outputs([out])
+        self.assertIn(CROSS_FILE_NOTEBOOK, notebooks)
+
+    def test_markdown_fallback_path_keeps_the_shared_notebook(self):
+        # No structured document at all: the pre-split behavior, untouched.
+        notebooks = notebooks_from_outputs(
+            [_output("i1", ("a.sas", "b.sas"), chunk_sources={"c1": "a.sas"})]
+        )
+        self.assertIn(CROSS_FILE_NOTEBOOK, notebooks)
+
+    def test_split_notebooks_validate_against_the_nbformat_schema(self):
+        import nbformat
+
+        for notebook in notebooks_from_outputs([self._tagged_output()]).values():
+            parsed = nbformat.reads(notebook_to_json(notebook), as_version=4)
+            nbformat.validate(parsed)
 
     def test_same_basename_in_different_directories_does_not_collide(self):
         notebooks = notebooks_from_outputs(

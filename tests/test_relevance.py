@@ -368,7 +368,7 @@ class _RecordingChatModel:
 
 def test_pipeline_prompts_relevant_pair_not_recency_window():
     from chunker.models import SasBatch, SasChunk, SasChunkKind, SasChunkMetadata
-    from chunker.pipeline import SasLLMPipeline
+    from pipeline import SasLLMPipeline
     from memory.store import MemoryHub
 
     def _mk_chunk(chunk_id: str, text: str) -> SasChunk:
@@ -385,6 +385,13 @@ def test_pipeline_prompts_relevant_pair_not_recency_window():
             metadata=SasChunkMetadata(),
         )
 
+    def _wrap_batch(chunk: SasChunk) -> SasBatch:
+        # _process takes SasBatch only; a lone chunk rides as a one-member
+        # batch under its own id, as coalesce_into_batches would wrap it.
+        return SasBatch(
+            batch_id=chunk.chunk_id, chunks=[chunk], source_files=["etl.sas"]
+        )
+
     llm = _RecordingChatModel()
     pipeline = SasLLMPipeline(
         model="unused-because-llm-injected",
@@ -399,7 +406,7 @@ def test_pipeline_prompts_relevant_pair_not_recency_window():
         _mk_chunk("c3", "proc freq data=work.midstream_b; run;"),
         _mk_chunk("c4", "proc print data=work.zzunique_first_xq; run;"),
     ]
-    pipeline._process(items=chunks, diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(items=[_wrap_batch(c) for c in chunks], diagnostics=[], thread_id="run::etl.sas")
 
     # 4th call: system + 2 selected pairs (4 msgs) + current human = 6.
     final_prompt = llm.prompts[3]

@@ -2461,6 +2461,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pymupdf" },
     { name = "python-dotenv" },
+    { name = "tiktoken" },
 ]
 
 [package.optional-dependencies]
@@ -2510,6 +2511,7 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'" },
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "ruff", marker = "extra == 'dev'" },
+    { name = "tiktoken", specifier = ">=0.7" },
 ]
 provides-extras = ["spark", "vault", "azure", "databricks", "sharepoint", "dev"]
 

@@ -93,8 +93,18 @@ def test_shrunken_thread_resets_stale_summary():
     kv = MemoryHub().kv
     model = RecordingModel()
     # Trigger sized so the full 3-turn thread folds but a single leftover
-    # turn stays under threshold after the reset.
-    s = RollingSummarizer(model, store=kv, trigger_tokens=5, keep_last_turns=0)
+    # turn stays under threshold after the reset. The counter is pinned to
+    # the offline approximation: the default is tiktoken when its data is
+    # loadable, and this threshold must not straddle the two encodings.
+    from memory.turns import approx_token_count
+
+    s = RollingSummarizer(
+        model,
+        store=kv,
+        trigger_tokens=5,
+        keep_last_turns=0,
+        token_counter=approx_token_count,
+    )
     s.refresh("t1", _mk_history("a", "b", "c"))
 
     # Thread now has fewer turns than the summary covered (cleared/forked).

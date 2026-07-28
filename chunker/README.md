@@ -1,21 +1,18 @@
 # chunker
 
-SAS semantic chunker, dependency batcher, and LangChain pipeline — the three
-layers that turn Base SAS source into LLM-ready work items. Each layer is
-usable on its own.
+SAS semantic chunker and dependency batcher — the two layers that turn Base
+SAS source into LLM-ready work items. Each layer is usable on its own.
 
 1. **Chunker** — splits SAS source into source-preserving semantic chunks
    (DATA steps, PROC steps, macro definitions, …) with extracted metadata.
 2. **Batcher** — discovers dataset / macro / macro-variable dependencies
    between chunks (within and across files) and groups inter-dependent chunks
    into batches that must be translated together.
-3. **Pipeline** — feeds work items, in dependency order, through a
-   LangChain/LangGraph chat model with per-run conversational memory. Every LLM
-   call is made per `SasBatch`: before a run the batcher's ordered items are
-   coalesced (`coalesce_into_batches`) so each dependency batch is one call and
-   consecutive independent singletons are packed into synthetic `merged-NNN`
-   batches (≤ `max_merged_chunks` members) — fewer, larger requests.
 
+The LLM orchestration layer that consumes these work items lives in the
+top-level [`pipeline` package](../pipeline/README.md) (it moved out of this
+package; the old `chunker.pipeline` / `chunker.notebook` /
+`chunker.response_models` import paths still work with a DeprecationWarning).
 For the whole-system view (including `llm_client` and `memory`), see the
 repository [Architecture.md](../Architecture.md).
 
@@ -79,29 +76,16 @@ stored in a macro variable (`%let ds = mylib.orders;`, including the
 *text*, since a `%let` value never appears in the metadata dataset lists.
 
 The mapping can also come from a two-column CSV (`sas_name,databricks_name` —
-librefs or exact `libref.member` names) via `parse_databricks_mapping_csv`;
-`SasLLMPipeline` accepts `databricks_mapping` directly, or
-`databricks_mapping_sharepoint="path/in/library.csv"` to load that CSV from
-the configured SharePoint document library (see `app_config.sharepoint`) at
-construction, with the explicit dict winning per key when both are given.
+librefs or exact `libref.member` names) via `parse_databricks_mapping_csv`,
+or straight from the configured SharePoint document library (see
+`app_config.sharepoint`) via `load_databricks_mapping_sharepoint(path)` —
+the SharePoint client is imported lazily inside that call. Pass the resulting
+dict to either batcher or to `pipeline.SasLLMPipeline(databricks_mapping=...)`;
+merging a loaded CSV under explicit overrides is the caller's one-liner
+(`{**loaded, **overrides}`).
 
-End-to-end through an LLM (`SasLLMPipeline` is imported lazily so `langchain`
-is only needed when you use it):
-
-```python
-from chunker import SasLLMPipeline
-
-pipeline = SasLLMPipeline(model="claude-sonnet-4-5")
-outputs  = pipeline.run_files(["macros.sas", "etl.sas", "reports.sas"])
-
-# what the run cost, as the gateway reported it
-print(pipeline.token_usage.summary())
-```
-
-`token_usage` is cumulative over the pipeline's lifetime, not per `run_*` call:
-a caller attributing one run's spend snapshots it before and subtracts after
-(`llm_client.TokenUsage` supports `-`). It stays at zero when the gateway
-reports no usage block.
+For running the work items end-to-end through an LLM, see the
+[`pipeline` README](../pipeline/README.md).
 
 ## Package layout
 
@@ -113,17 +97,14 @@ reports no usage block.
 | `metadata.py` | Per-chunk semantic extraction: `_metadata_for`, `_io_for` (directed dataset I/O), `_macro_body_io` (literal vs parameterised body refs), symput / SQL-INTO / CALL EXECUTE extractors, `_merge_meta`, and the extraction regex catalogue. |
 | `chunker.py` | `SasSemanticChunker` orchestration (scan → group → build chunks, oversized-split with overlap). |
 | `batcher.py` | `_EdgeDiscovery` + Union-Find grouping, weak-edge resolution, context absorption, batch construction. `SasChunkBatcher` is a one-file convenience over `MultiFileBatcher`. |
-| `pipeline.py` | `SasLLMPipeline`: chunk/batch prompt formatting and the LangGraph `StateGraph` wiring. |
-| `pipeline_constants.py` | Prompt templates — the Markdown-sections system prompt and its structured-output counterpart (importable without langchain installed). |
-| `response_models.py` | `TranslationDocument` (+ `TranslationCell`, `MappingEntry`, `RiskNote`): the structured answer the pipeline asks for, and `to_markdown()`, which renders it back to the four `##` sections that get persisted and scored. Pydantic only. |
-| `notebook.py` | Renders pipeline outputs as nbformat v4.5 notebooks — one `.ipynb` per SAS source file plus `_cross_file.ipynb` — from a `TranslationDocument`, or by parsing the Markdown response when there is none. Stdlib + `response_models`. |
 | `_repl.py` | `print_iterable` REPL helper (imported by nothing). |
+| `pipeline.py`, `pipeline_constants.py`, `response_models.py`, `notebook.py` | **Deprecated shims** re-exporting from the top-level `pipeline` package, where these modules now live. |
 
 **Import direction is strictly downward:** `keywords` and `models` import
 nothing from the package; `scanner` and `metadata` import from them; `chunker.py`
-imports from all four; `batcher` imports from `keywords`, `metadata`, `models`;
-`pipeline` sits on top and is the **only** module that imports `memory.store`,
-`memory.relevance`, and `llm_client`.
+imports from all four; `batcher` imports from `keywords`, `metadata`, `models`.
+The package imports nothing from `memory`, `llm_client`, `prompt_builder`, or
+`pipeline` — it is a leaf the `pipeline` package builds on.
 
 ## Chunking model
 
@@ -198,52 +179,6 @@ rewrite is inexact). Consumers link to the **nearest preceding producer** in
 corpus order — the state a sequential SAS session would actually read — so
 unrelated jobs reusing `work.tmp` stay separate.
 
-## Pipeline and memory
-
-`SasLLMPipeline` compiles a one-node LangGraph `StateGraph(MessagesState)`. The
-model node loads the thread's history from `KVChatMessageHistory`, runs
-`_trim | prompt | LLMClient`, and persists exactly the prompted message plus the
-response in one bulk `add_messages` write (trimming only limits what is
-*prompted*; storage keeps every turn).
-
-Prompted-history trimming has two modes: the default `window_k` recency window,
-or — when a `memory.relevance.RelevantHistorySelector` is passed as
-`history_selector` — relevance-based selection (see the [memory README](../memory/README.md)).
-All items of one `run_file` / `run_text` / `run_files` call share one thread
-(`thread_id = "run::<source ids>"`), so the LLM sees the run's accumulated
-context batch by batch. Those calls send `SasBatch` objects only:
-`coalesce_into_batches` first merges the run's standalone singleton chunks into
-`merged-NNN` batches (capped at `max_merged_chunks`), so the model is never
-prompted with a bare `SasChunk`. The mapping is deterministic, so resume and
-`fork_run` reproduce the same batch ids. `llm_client.LLMClient` owns model
-construction (temperature, output-token cap, an optional proactive rate
-limiter — on for the `from_ai_gateway` credential path) and invocation
-(input-token budget, transient-error retry that honors a gateway
-`Retry-After`); an injected `llm` still gets the retry / budget layers.
-
-### Structured output → notebooks
-
-With `structured_output` on (constructor argument, else config.json
-`pipeline.structured_output`, default on) the model is asked for a
-`TranslationDocument` rather than free-form Markdown, so `notebook.py` knows
-which cells are runnable code instead of inferring it from fences. The turn
-*persisted* to memory is still `to_markdown()` — the same four sections, code
-in fenced blocks — with the document carried on the AI message's
-`additional_kwargs["translation_document"]` and surfaced as `document` in each
-output dict. That keeps conversation memory, resume, and every `validation`
-metric unchanged; storing the raw content instead would store an empty turn
-whenever the answer rides in a tool call. A model or gateway that cannot honour
-the schema degrades to prose (detected at construction, or demoted once
-mid-run) and the notebook is built by parsing the Markdown.
-
-```python
-from chunker.notebook import write_notebooks
-
-outputs = pipeline.run_files(sas_files)
-write_notebooks(outputs, "out", output_language="PySpark")
-# out/<source>.ipynb per file, out/_cross_file.ipynb for cross-file batches
-```
-
 ## Load-bearing invariants
 
 Things that look like implementation details but are contracts. Breaking any of
@@ -269,16 +204,9 @@ these silently changes behavior.
    raises `TypeError` for anything else. The default-instance test in
    `tests/test_chunker.py` trips the guard for every stored field, so a new field
    shape cannot ship without a conscious decision.
-5. **The LangGraph graph is compiled *without* a checkpointer, on purpose.**
-   Durable per-thread persistence lives in the KV `msg::` row schema that
-   `snapshot()`, `prune_before()`, and `list_threads()` depend on. A
-   `BaseCheckpointSaver` would store full state blobs per turn (O(n²) growth in
-   the Delta table) and duplicate the canonical store. One graph invocation is
-   one conversational turn — the node prompts with, and persists, exactly the
-   last state message.
-6. **`SasBatch.reason` strings and item ordering are pinned by tests.**
+5. **`SasBatch.reason` strings and item ordering are pinned by tests.**
    Edge-emission order is observable output, not an implementation detail.
-7. **`_RESERVED_WORDS` is Appendix 1 verbatim (94 words).** Genuine macro
+6. **`_RESERVED_WORDS` is Appendix 1 verbatim (94 words).** Genuine macro
    functions missing from Appendix 1 go in `_ADDITIONAL_MACRO_FUNCTION_WORDS`,
    and SAS-provided autocall macros in `_STANDARD_AUTOCALL_MACROS` — the three
    sets have distinct, citable identities and distinct consumers; do not fold
@@ -288,6 +216,6 @@ these silently changes behavior.
 
 f-string messages everywhere (never lazy `%`-style). Per-iteration debug logs
 inside parse/batch loops are guarded with `if logger.isEnabledFor(logging.DEBUG):`
-so the f-string is never built when DEBUG is off; per-call entry/exit and
-LLM-paced logs are unguarded. Logger names follow modules: `chunker.chunker`,
-`chunker.scanner`, `chunker.metadata`, `chunker.batcher`, `chunker.pipeline`.
+so the f-string is never built when DEBUG is off; per-call entry/exit logs
+are unguarded. Logger names follow modules:
+`chunker.chunker`, `chunker.scanner`, `chunker.metadata`, `chunker.batcher`.

@@ -252,7 +252,7 @@ Programmatic, fully offline (this is what tests/test_validation.py does):
 
 ```python
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
-from chunker import SasLLMPipeline
+from pipeline import SasLLMPipeline
 from validation import ValidationRunner, load_cases
 
 pipeline = SasLLMPipeline(llm=FakeListChatModel(responses=["..."]))
@@ -338,7 +338,7 @@ conversation memory the run uses — no post-hoc pass, no separate history.
 Opt in by handing the pipeline a `LiveValidator`:
 
 ```python
-from chunker import SasLLMPipeline
+from pipeline import SasLLMPipeline
 from validation import LiveValidator, validations_for_thread
 
 pipeline = SasLLMPipeline(model="claude-sonnet-4-5", validator=LiveValidator())

@@ -43,7 +43,7 @@ Output formats
 --------------
 The pipeline's deliverable is code, so it ships as **notebooks**: one
 ``<source>.ipynb`` per SAS file (plus ``_cross_file.ipynb`` for batches spanning
-several files), rendered by `chunker.notebook` from the structured
+several files), rendered by `pipeline.notebook` from the structured
 `TranslationDocument` the pipeline asks for — or, when structured output is off
 or unavailable, by parsing the Markdown response. ``local`` mode writes them
 under ``--out-dir``; ``sharepoint`` mode uploads them to
@@ -155,14 +155,14 @@ from dataclasses import replace
 from pathlib import Path
 
 import app_config
-from chunker import SasLLMPipeline
+from pipeline import SasLLMPipeline
 from chunker._repl import print_iterable
 from prompt_builder import PromptBuilder
 from validation import LiveValidator
 
 logger = logging.getLogger("demo_run")
 
-_DEFAULT_MODEL = "claude-sonnet-4-5"
+_DEFAULT_MODEL = "gpt-5.4"
 
 
 def _discover_sas_files(sas_dir: Path, pattern: str) -> list[str]:
@@ -656,7 +656,7 @@ def _run_local(args: argparse.Namespace) -> int:
         print(out["response"])
 
     if args.out_dir:
-        from chunker.notebook import write_notebooks
+        from pipeline.notebook import write_notebooks
 
         written = write_notebooks(
             outputs, args.out_dir, output_language=args.output_language
@@ -793,10 +793,10 @@ def _upload_outputs(
     report as ``report.pdf`` beside it). Returns the output folder.
 
     *token_usage* is the run's LLM spend
-    (:attr:`~chunker.pipeline.SasLLMPipeline.token_usage`), carried into the
+    (:attr:`~pipeline.engine.SasLLMPipeline.token_usage`), carried into the
     summary JSON and the report header.
     """
-    from chunker.notebook import notebook_to_json, notebooks_from_outputs
+    from pipeline.notebook import notebook_to_json, notebooks_from_outputs
 
     out_dir = f"{req.application_name}/output/{req.timestamp}"
     validation_dir = f"{out_dir}/validation"

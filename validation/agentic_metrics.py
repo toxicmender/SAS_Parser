@@ -14,7 +14,7 @@ have the equivalent artefacts, and they are already on the run:
 * the **plan** is the item's ``analysis`` — the system prompt requires the model
   to reason through execution order, PDV vs DAG semantics, macro expansion
   timing and the item's hazard flags *before writing any code*
-  (:mod:`chunker.pipeline_constants`), so ``analysis`` is exactly deepeval's
+  (:mod:`pipeline.constants`), so ``analysis`` is exactly deepeval's
   "plan extracted from the agent's thinking or reasoning";
 * the **execution steps** are the ``mapping`` entries and the ordered ``cells``
   that follow it;
@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 
 # The standing instructions every run carries, transcribed from the system
-# prompt in chunker/pipeline_constants.py. Used when neither the run nor
+# prompt in pipeline/constants.py. Used when neither the run nor
 # config.json declares its own, so `prompt_alignment` measures the contract the
 # pipeline actually imposes rather than skipping.
 DEFAULT_PROMPT_INSTRUCTIONS = [

@@ -1470,7 +1470,7 @@ class MemoryHub:
         thread.add_user_message("Hello!")
 
         # Chat-history threads back a LangGraph model node (see
-        # chunker.pipeline): the node reads mem.get_thread(thread_id).messages
+        # pipeline.engine): the node reads mem.get_thread(thread_id).messages
         # before each LLM call and persists the new turn via add_messages.
 
         mem.kv.set("goal", "Build a RAG pipeline", tags=["project"])

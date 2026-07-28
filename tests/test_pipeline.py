@@ -17,6 +17,7 @@ Requires: langchain-core (FakeListChatModel).
 from __future__ import annotations
 
 import pathlib
+import pytest
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -31,11 +32,8 @@ from chunker.models import (
     SasChunkKind,
     SasChunkMetadata,
 )
-from chunker.pipeline import (
-    SasLLMPipeline,
-    _format_batch_message,
-    _format_chunk_message,
-)
+from pipeline import SasLLMPipeline
+from pipeline.prompting import _format_batch_message
 
 
 def _mk_chunk(chunk_id: str, source_id: str, text: str, **meta_kwargs) -> SasChunk:
@@ -57,12 +55,25 @@ def _mk_batch(batch_id: str, chunks: list[SasChunk], **kwargs) -> SasBatch:
     return SasBatch(batch_id=batch_id, chunks=chunks, **kwargs)
 
 
+def _wrap(chunk: SasChunk) -> SasBatch:
+    """A one-member batch carrying the chunk's own id — the shape _process
+    takes now that items are SasBatch only (coalesce_into_batches wraps every
+    singleton before anything is prompted)."""
+    return SasBatch(
+        batch_id=chunk.chunk_id,
+        chunks=[chunk],
+        source_files=[chunk.source_id or "unknown"],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pure formatting functions — no Spark/LLM required
 # ---------------------------------------------------------------------------
 
 
-def test_format_chunk_message_includes_key_fields():
+def test_format_batch_message_covers_the_single_member_case():
+    # There is no per-chunk formatter any more: a lone chunk is prompted as a
+    # one-member batch, and its key fields must all surface there.
     chunk = _mk_chunk(
         "f1-chunk-0001",
         "etl.sas",
@@ -72,11 +83,18 @@ def test_format_chunk_message_includes_key_fields():
         symput_scope_hazard=True,
         symput_hazard_vars=["cutoff"],
     )
-    msg = _format_chunk_message(chunk, index=1, total=1, diagnostics=[])
+    batch = _mk_batch(
+        "merged-001",
+        [chunk],
+        source_files=["etl.sas"],
+        input_datasets=["work.in"],
+        output_datasets=["work.out"],
+    )
+    msg = _format_batch_message(batch, index=1, total=1, diagnostics=[])
 
     assert "work.in" in msg
     assert "work.out" in msg
-    assert "yes (cutoff)" in msg  # symput hazard line
+    assert "yes" in msg  # symput hazard aggregate line
     assert "data work.out; set work.in; run;" in msg
 
 
@@ -173,8 +191,9 @@ def test_pipeline_accumulates_history_across_batches():
         output_datasets=["work.a"],
     )
 
+    singleton = _mk_batch("merged-001", [c1], source_files=["etl.sas"])
     results = pipeline._process(
-        items=[batch, c1],  # a batch, then an unrelated singleton
+        items=[batch, singleton],  # a real batch, then a one-member merge
         diagnostics=[],
         thread_id="run::etl.sas",
     )
@@ -183,7 +202,7 @@ def test_pipeline_accumulates_history_across_batches():
     assert results[0]["is_batch"] is True
     assert results[0]["item_id"] == "batch-001"
     assert results[0]["response"] == "translation for item 1"
-    assert results[1]["is_batch"] is False
+    assert results[1]["item_id"] == "merged-001"
     assert results[1]["response"] == "translation for item 2"
 
     # Both turns landed in the SAME thread, in order: human/ai x2
@@ -199,7 +218,8 @@ def test_pipeline_accumulates_history_across_batches():
 
 def test_run_text_invokes_llm_only_per_batch():
     # Every unit sent to the LLM is a SasBatch: the run's singletons are
-    # coalesced so no standalone SasChunk is ever prompted.
+    # coalesced so no standalone SasChunk is ever prompted. Packing is on by
+    # default, so the three independent steps share one packed call.
     fake_llm = FakeListChatModel(responses=[f"r{i}" for i in range(10)])
     pipeline = SasLLMPipeline(model="unused", memory=MemoryHub(), llm=fake_llm)
 
@@ -212,9 +232,10 @@ def test_run_text_invokes_llm_only_per_batch():
 
     assert outputs
     assert all(o["is_batch"] for o in outputs)
-    # Three independent steps merge into a single batch (default cap is 8).
+    # Three independent steps pack into a single batch under the default
+    # token budget (well over three tiny DATA steps).
     assert len(outputs) == 1
-    assert outputs[0]["item_id"] == "merged-001"
+    assert outputs[0]["item_id"] == "packed-001"
 
 
 def test_max_merged_chunks_caps_calls_per_batch():
@@ -235,6 +256,92 @@ def test_max_merged_chunks_caps_calls_per_batch():
     assert all(o["is_batch"] for o in outputs)
 
 
+def test_max_merged_tokens_packs_adjacent_items_into_one_call():
+    # Token-budgeted packing (Phase 4): with a generous budget the whole
+    # run — independent singletons AND the dependency batch — shares one
+    # LLM call, as a packed-NNN batch.
+    fake_llm = FakeListChatModel(responses=[f"r{i}" for i in range(10)])
+    pipeline = SasLLMPipeline(
+        model="unused",
+        memory=MemoryHub(),
+        llm=fake_llm,
+        max_merged_tokens=100_000,
+    )
+
+    src = (
+        "data work.x; p=1; run;\n"
+        "data work.dep; q=1; run;\n"
+        "proc print data=work.dep; run;\n"
+        "data work.y; r=1; run;\n"
+    )
+    outputs = pipeline.run_text(src, source_id="etl.sas")
+
+    assert [o["item_id"] for o in outputs] == ["packed-001"]
+    assert len(outputs[0]["chunk_ids"]) == 4
+    # Every output maps its member chunks to their source files, so the
+    # notebook renderer can split multi-source items per file (Phase 5).
+    assert outputs[0]["chunk_sources"] == {
+        cid: "etl.sas" for cid in outputs[0]["chunk_ids"]
+    }
+
+
+def test_max_merged_tokens_zero_disables_packing():
+    # max_merged_tokens=0 turns packing off: the dependency batch is its
+    # own call and flushes the singleton runs around it (3 calls, not 1).
+    fake_llm = FakeListChatModel(responses=[f"r{i}" for i in range(10)])
+    pipeline = SasLLMPipeline(
+        model="unused",
+        memory=MemoryHub(),
+        llm=fake_llm,
+        max_merged_tokens=0,
+    )
+
+    src = (
+        "data work.x; p=1; run;\n"
+        "data work.dep; q=1; run;\n"
+        "proc print data=work.dep; run;\n"
+        "data work.y; r=1; run;\n"
+    )
+    outputs = pipeline.run_text(src, source_id="etl.sas")
+
+    assert len(outputs) == 3
+    assert [o["item_id"] for o in outputs][0] == "merged-001"
+
+
+def test_max_merged_tokens_validates():
+    with pytest.raises(ValueError, match="max_merged_tokens"):
+        SasLLMPipeline(
+            model="unused",
+            memory=MemoryHub(),
+            llm=FakeListChatModel(responses=["ok"]),
+            max_merged_tokens=-1,
+        )
+
+
+def test_packing_budget_defaults_and_derivation():
+    from pipeline.engine import _DEFAULT_MAX_MERGED_TOKENS
+
+    def _mk(**kwargs):
+        return SasLLMPipeline(
+            model="unused",
+            memory=MemoryHub(),
+            llm=FakeListChatModel(responses=["ok"]),
+            **kwargs,
+        )
+
+    # No input budget: the conservative hard default applies.
+    assert _mk()._max_merged_tokens == _DEFAULT_MAX_MERGED_TOKENS
+    # With an input budget, the packing budget derives from its headroom and
+    # scales with it.
+    derived = _mk(max_input_tokens=100_000)._max_merged_tokens
+    assert derived is not None and derived > _DEFAULT_MAX_MERGED_TOKENS
+    assert derived < 100_000
+    # A budget too small to pack under disables packing outright.
+    assert _mk(max_input_tokens=2_000)._max_merged_tokens is None
+    # An explicit budget wins over derivation.
+    assert _mk(max_merged_tokens=1_234)._max_merged_tokens == 1_234
+
+
 def test_pipeline_window_trimming_limits_injected_history():
     fake_llm = FakeListChatModel(responses=[f"resp {i}" for i in range(6)])
     mem = MemoryHub()
@@ -249,7 +356,7 @@ def test_pipeline_window_trimming_limits_injected_history():
         _mk_chunk(f"f1-chunk-000{i}", "etl.sas", f"data work.t{i}; run;")
         for i in range(3)
     ]
-    pipeline._process(items=chunks, diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(items=[_wrap(c) for c in chunks], diagnostics=[], thread_id="run::etl.sas")
 
     # Full history is still persisted (trimming only affects the prompt)...
     full_history = pipeline.get_thread_messages("run::etl.sas")
@@ -262,7 +369,7 @@ def test_snapshot_delegates_to_memory():
     pipeline = SasLLMPipeline(model="unused", memory=mem, llm=fake_llm)
 
     c1 = _mk_chunk("f1-chunk-0001", "etl.sas", "data work.a; run;")
-    pipeline._process(items=[c1], diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(items=[_wrap(c1)], diagnostics=[], thread_id="run::etl.sas")
 
     snap = pipeline.snapshot()
     assert snap == mem.snapshot()
@@ -283,7 +390,7 @@ def test_run_facts_recorded_per_item():
         _mk_chunk("f1-chunk-0001", "etl.sas", "data work.a; run;"),
         _mk_chunk("f1-chunk-0002", "etl.sas", "proc print data=work.a; run;"),
     ]
-    pipeline._process(items=chunks, diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(items=[_wrap(c) for c in chunks], diagnostics=[], thread_id="run::etl.sas")
 
     facts = pipeline.get_run_facts("run::etl.sas")
     assert [f["item_id"] for f in facts] == ["f1-chunk-0001", "f1-chunk-0002"]
@@ -298,12 +405,12 @@ def test_run_facts_isolated_per_thread():
     fake_llm = FakeListChatModel(responses=["a", "b"])
     pipeline = SasLLMPipeline(model="unused", memory=MemoryHub(), llm=fake_llm)
     pipeline._process(
-        items=[_mk_chunk("c1", "a.sas", "data work.a; run;")],
+        items=[_wrap(_mk_chunk("c1", "a.sas", "data work.a; run;"))],
         diagnostics=[],
         thread_id="run::a.sas",
     )
     pipeline._process(
-        items=[_mk_chunk("c2", "b.sas", "data work.b; run;")],
+        items=[_wrap(_mk_chunk("c2", "b.sas", "data work.b; run;"))],
         diagnostics=[],
         thread_id="run::b.sas",
     )
@@ -325,10 +432,10 @@ def test_resume_skips_completed_items_and_recovers_responses():
     c2 = _mk_chunk("f1-chunk-0002", "etl.sas", "proc print data=work.a; run;")
 
     # First run "crashed" after item 1: only c1 was processed.
-    pipeline._process(items=[c1], diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(items=[_wrap(c1)], diagnostics=[], thread_id="run::etl.sas")
 
     outputs = pipeline._process(
-        items=[c1, c2], diagnostics=[], thread_id="run::etl.sas", resume=True
+        items=[_wrap(c1), _wrap(c2)], diagnostics=[], thread_id="run::etl.sas", resume=True
     )
 
     assert outputs[0]["skipped"] is True
@@ -345,7 +452,7 @@ def test_resume_reprocesses_items_with_error_facts():
     pipeline = SasLLMPipeline(model="unused", memory=mem, llm=fake_llm)
 
     c1 = _mk_chunk("f1-chunk-0001", "etl.sas", "data work.a; run;")
-    pipeline._process(items=[c1], diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(items=[_wrap(c1)], diagnostics=[], thread_id="run::etl.sas")
     c2 = _mk_chunk("f1-chunk-0002", "etl.sas", "proc print data=work.a; run;")
     # Simulate a crashed second item: an error fact, no persisted turn.
     mem.kv.set(
@@ -354,7 +461,7 @@ def test_resume_reprocesses_items_with_error_facts():
     )
 
     outputs = pipeline._process(
-        items=[c1, c2], diagnostics=[], thread_id="run::etl.sas", resume=True
+        items=[_wrap(c1), _wrap(c2)], diagnostics=[], thread_id="run::etl.sas", resume=True
     )
 
     assert outputs[1]["skipped"] is False  # error fact does not skip
@@ -370,14 +477,14 @@ def test_fork_run_then_resume_continues_from_the_fork():
 
     c1 = _mk_chunk("f1-chunk-0001", "etl.sas", "data work.a; run;")
     c2 = _mk_chunk("f1-chunk-0002", "etl.sas", "proc print data=work.a; run;")
-    pipeline._process(items=[c1, c2], diagnostics=[], thread_id="run::v1")
+    pipeline._process(items=[_wrap(c1), _wrap(c2)], diagnostics=[], thread_id="run::v1")
 
     # Rewind to after item 1 and redo item 2 on a fresh branch.
     copied = pipeline.fork_run("run::v1", "run::v2", upto_items=1)
     assert copied == 2  # one (human, AI) pair
 
     outputs = pipeline._process(
-        items=[c1, c2], diagnostics=[], thread_id="run::v2", resume=True
+        items=[_wrap(c1), _wrap(c2)], diagnostics=[], thread_id="run::v2", resume=True
     )
 
     assert outputs[0]["skipped"] is True
@@ -419,7 +526,7 @@ def test_summarizer_gets_pipeline_store_and_summary_never_persisted():
         _mk_chunk(f"f1-chunk-000{i}", "etl.sas", f"data work.t{i}; run;")
         for i in range(3)
     ]
-    pipeline._process(items=chunks, diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(items=[_wrap(c) for c in chunks], diagnostics=[], thread_id="run::etl.sas")
 
     # The summary state lives in the KV layer and covered the folded turns…
     state = mem.kv.get("summary::run::etl.sas")
@@ -497,7 +604,7 @@ def test_prompt_caching_marks_system_block_for_anthropic_models():
 
     # End-to-end: the block-shaped system message flows through the graph.
     c1 = _mk_chunk("f1-chunk-0001", "etl.sas", "data work.a; run;")
-    out = pipeline._process(items=[c1], diagnostics=[], thread_id="run::cache")
+    out = pipeline._process(items=[_wrap(c1)], diagnostics=[], thread_id="run::cache")
     assert out[0]["response"] == "ok"
 
 
@@ -523,6 +630,83 @@ def test_prompt_caching_off_by_default():
         llm=FakeListChatModel(responses=["ok"]),
     )
     assert not isinstance(pipeline._prompt.messages[0], SystemMessage)
+
+
+# ---------------------------------------------------------------------------
+# Grouped constructor configs (llm_config / memory_setup)
+# ---------------------------------------------------------------------------
+
+
+def test_llm_config_is_the_canonical_transport_form():
+    from llm_client import LLMClientConfig
+
+    config = LLMClientConfig(model="claude-sonnet-4-5", max_retries=7)
+    pipeline = SasLLMPipeline(
+        llm_config=config,
+        memory=MemoryHub(),
+        llm=FakeListChatModel(responses=["ok"]),
+    )
+    # The config's model becomes the pipeline's model...
+    assert pipeline.model == "claude-sonnet-4-5"
+    # ...and the client uses the config object as-is.
+    assert pipeline._llm_client.config is config
+
+
+def test_llm_config_conflicts_with_transport_kwargs():
+    from llm_client import LLMClientConfig
+
+    with pytest.raises(ValueError, match="base_url"):
+        SasLLMPipeline(
+            llm_config=LLMClientConfig(model="m"),
+            base_url="https://gw.example/v1",
+            memory=MemoryHub(),
+            llm=FakeListChatModel(responses=["ok"]),
+        )
+    with pytest.raises(ValueError, match="model"):
+        SasLLMPipeline(
+            model="claude-sonnet-4-5",
+            llm_config=LLMClientConfig(model="m"),
+            memory=MemoryHub(),
+            llm=FakeListChatModel(responses=["ok"]),
+        )
+
+
+def test_memory_setup_is_the_canonical_memory_form():
+    from pipeline import MemorySetup
+
+    hub = MemoryHub()
+    pipeline = SasLLMPipeline(
+        memory_setup=MemorySetup(memory=hub, chat_id="chat-42"),
+        llm=FakeListChatModel(responses=["ok"]),
+    )
+    assert pipeline._memory is hub
+    assert pipeline.chat_id == "chat-42"
+
+
+def test_memory_setup_conflicts_with_memory_kwargs():
+    from pipeline import MemorySetup
+
+    with pytest.raises(ValueError, match="chat_id"):
+        SasLLMPipeline(
+            memory_setup=MemorySetup(memory=MemoryHub()),
+            chat_id="also-given",
+            llm=FakeListChatModel(responses=["ok"]),
+        )
+
+
+def test_memory_setup_extractor_implies_thread_memory():
+    from memory.extractor import MemoryExtractor
+    from pipeline import MemorySetup
+
+    hub = MemoryHub()
+    built = MemorySetup(
+        memory=hub, memory_extractor=MemoryExtractor(model=None)
+    ).build()
+    # The extractor needs somewhere to put temporary memories, so a thread
+    # memory is implied, bound to the hub, and shared with the extractor.
+    assert built.thread_memory is not None
+    assert built.thread_memory.store is hub.kv
+    assert built.extractor.thread_memory is built.thread_memory
 
 
 # ---------------------------------------------------------------------------
@@ -558,18 +742,22 @@ def _patch_sharepoint(monkeypatch, files: dict[str, bytes]) -> _FakeSharePointCl
 
 
 def test_databricks_mapping_loaded_from_sharepoint_csv(monkeypatch):
+    from chunker.batcher import load_databricks_mapping_sharepoint
+
     fake = _patch_sharepoint(monkeypatch, {"maps/sas_to_databricks.csv": _MAPPING_CSV})
+    mapping = load_databricks_mapping_sharepoint("maps/sas_to_databricks.csv")
+    assert fake.read_paths == ["maps/sas_to_databricks.csv"]
+    assert mapping == {
+        "work": "dev.staging",
+        "mylib": "prod.sales",
+    }
     pipeline = SasLLMPipeline(
         model="unused",
         memory=MemoryHub(),
         llm=FakeListChatModel(responses=["ok"]),
-        databricks_mapping_sharepoint="maps/sas_to_databricks.csv",
+        databricks_mapping=mapping,
     )
-    assert fake.read_paths == ["maps/sas_to_databricks.csv"]
-    assert pipeline.databricks_mapping == {
-        "work": "dev.staging",
-        "mylib": "prod.sales",
-    }
+    assert pipeline.databricks_mapping == mapping
     # The mapping reaches both batchers and rewrites batched dataset names.
     src = (
         "data work.clean;\n set mylib.raw;\n run;\n"
@@ -589,15 +777,15 @@ def test_databricks_mapping_loaded_from_sharepoint_csv(monkeypatch):
 
 
 def test_explicit_databricks_mapping_overrides_sharepoint_csv(monkeypatch):
+    # The merge is the caller's one-liner now: loaded CSV under explicit dict.
+    from chunker.batcher import load_databricks_mapping_sharepoint
+
     _patch_sharepoint(monkeypatch, {"m.csv": _MAPPING_CSV})
-    pipeline = SasLLMPipeline(
-        model="unused",
-        memory=MemoryHub(),
-        llm=FakeListChatModel(responses=["ok"]),
-        databricks_mapping={"work": "override.schema"},
-        databricks_mapping_sharepoint="m.csv",
-    )
-    assert pipeline.databricks_mapping == {
+    mapping = {
+        **load_databricks_mapping_sharepoint("m.csv"),
+        **{"work": "override.schema"},
+    }
+    assert mapping == {
         "work": "override.schema",  # explicit dict wins per key
         "mylib": "prod.sales",  # CSV-only entries survive the merge
     }
@@ -606,14 +794,11 @@ def test_explicit_databricks_mapping_overrides_sharepoint_csv(monkeypatch):
 def test_empty_sharepoint_mapping_csv_raises(monkeypatch):
     import pytest
 
+    from chunker.batcher import load_databricks_mapping_sharepoint
+
     _patch_sharepoint(monkeypatch, {"m.csv": b"sas_name,databricks_name\n"})
     with pytest.raises(ValueError, match="zero entries"):
-        SasLLMPipeline(
-            model="unused",
-            memory=MemoryHub(),
-            llm=FakeListChatModel(responses=["ok"]),
-            databricks_mapping_sharepoint="m.csv",
-        )
+        load_databricks_mapping_sharepoint("m.csv")
 
 
 def test_no_mapping_keeps_batchers_unmapped():
@@ -661,7 +846,7 @@ class _StructuredFakeChatModel(FakeListChatModel):
 
 
 def _translation_document(code: str = 'df = spark.table("a")'):
-    from chunker.response_models import (
+    from pipeline.response_models import (
         MappingEntry,
         RiskNote,
         TranslationCell,
