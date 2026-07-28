@@ -20,7 +20,7 @@ One record per item in the conversation KV store, keyed::
     validation::{thread_id}::item::{item_id}
 
 deliberately mirroring the run facts the pipeline writes at
-``run::{thread_id}::item::*`` (see ``SasLLMPipeline._record_run_fact``): the
+``run::{thread_id}::item::*`` (see ``pipeline.run_ledger.RunLedger.record_run_fact``): the
 same thread, the same per-item granularity, the small-facts-only rule (the
 full response already lives in the ``msg::`` history and is never duplicated
 here). The stored value is the item's :class:`~validation.models.CaseResult`

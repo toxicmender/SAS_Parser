@@ -102,6 +102,10 @@ pipeline/
                         extractor, chat identity) with the cross-injection
                         logic in build(). LLM transport groups under
                         llm_client.LLMClientConfig the same way.
+  run_ledger.py         RunLedger: KV-side run bookkeeping — per-item
+                        run/validation facts, resume (skip/redo resolution
+                        and the rewind), and the fact-copying half of fork.
+                        Never calls an LLM.
   engine.py             SasLLMPipeline: the LangGraph StateGraph wiring,
                         memory/validation integration, resume and fork, and
                         opt-in Anthropic prompt caching on the system prompt.
