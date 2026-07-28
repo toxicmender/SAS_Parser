@@ -79,7 +79,7 @@ included — share one LLM call as `packed-NNN` batches while the estimated
 prompt cost (counted with the pipeline's tokenizer, the same encoding as
 `max_input_tokens`) stays under `max_merged_tokens` (constructor argument,
 else config.json `pipeline.max_merged_tokens`, else a derived default —
-0.8 × the input-token headroom when `max_input_tokens` is set, ~6k tokens
+0.8 × the input-token headroom when `max_input_tokens` is set, ~64k tokens
 otherwise; pass `0` to disable). The global-context batch never packs. The mapping is deterministic in the
 budgets, so resume and `fork_run` reproduce the same batch ids — but packed
 ids differ from unpacked ones, so resume only matches runs made under the

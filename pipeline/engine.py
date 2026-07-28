@@ -84,11 +84,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Token-budgeted call packing defaults (see _resolve_packing_budget). The
-# hard default keeps today's 8-member merges of typical chunks forming while
-# holding per-call answer quality; the headrooms mirror what shares the
-# request with the item text — retrieved guidance (prompt_builder's
-# max_instruction_words default, ~1.3 tokens/word) and the window_k history.
-_DEFAULT_MAX_MERGED_TOKENS = 6_000
+# hard default assumes a modern long-context model (the gpt-5.4 default) and
+# packs aggressively; tighten it via pipeline.max_merged_tokens if per-item
+# answer quality drops. The headrooms mirror what shares the request with
+# the item text — retrieved guidance (prompt_builder's max_instruction_words
+# default, ~1.3 tokens/word) and the window_k history.
+_DEFAULT_MAX_MERGED_TOKENS = 64_000
 _PACKING_GUIDANCE_HEADROOM_TOKENS = 2_000
 _PACKING_HISTORY_HEADROOM_TOKENS = 4_000
 
@@ -279,7 +280,7 @@ class SasLLMPipeline:
         is on by default**: with ``max_input_tokens`` set,
         ``0.8 × (max_input_tokens − system prompt − guidance/history
         headroom)`` (a budget too small to pack disables it); otherwise
-        ~6,000 tokens. Pass ``0`` (or set the config key to ``0``) to turn
+        ~64,000 tokens. Pass ``0`` (or set the config key to ``0``) to turn
         packing off and keep the original count-capped singleton merging
         only. Must be ``>= 1``, or ``0`` for off.
     databricks_mapping : dict[str, str] | None
@@ -1124,7 +1125,7 @@ class SasLLMPipeline:
         history headroom)`` so a packed prompt plus its fixed companions
         stays inside the input budget (derived ≤ 0 disables packing: a tiny
         input budget leaves no room to pack); without one, a conservative
-        ~6k-token default.
+        ~64k-token default.
         """
         if requested is not None:
             return requested or None  # 0 = packing off
