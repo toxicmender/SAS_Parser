@@ -192,6 +192,7 @@ def report_from_verdicts(
     *,
     model: str = "live-validation",
     instructions_fingerprint: str | None = None,
+    policy_fingerprint: str | None = None,
     token_usage: TokenUsage | None = None,
     judge_token_usage: TokenUsage | None = None,
 ) -> ValidationReport:
@@ -218,6 +219,10 @@ def report_from_verdicts(
         The active user-instruction fingerprint
         (:attr:`SasLLMPipeline.instructions_fingerprint`), so an inline report
         is never compared as equal to one scored under different instructions.
+    policy_fingerprint : str | None
+        The same, for the long-term task policy the run was prompted under
+        (:attr:`SasLLMPipeline.policy_fingerprint`). Both reach the run
+        history as their own columns.
     token_usage : TokenUsage | None
         What the run cost — pass :attr:`SasLLMPipeline.token_usage`. Verdicts
         do not carry token counts (they are per item, usage is per run), so
@@ -232,6 +237,7 @@ def report_from_verdicts(
     return ValidationReport(
         model=model,
         instructions_fingerprint=instructions_fingerprint,
+        policy_fingerprint=policy_fingerprint,
         results=results,
         token_usage=token_usage,
         judge_token_usage=judge_token_usage,
@@ -259,6 +265,7 @@ def report_from_thread(
     *,
     model: str = "live-validation",
     instructions_fingerprint: str | None = None,
+    policy_fingerprint: str | None = None,
 ) -> ValidationReport:
     """A :class:`ValidationReport` over *thread_id*'s stored inline verdicts.
 
@@ -270,4 +277,5 @@ def report_from_thread(
         validations_for_thread(kv, thread_id),
         model=model,
         instructions_fingerprint=instructions_fingerprint,
+        policy_fingerprint=policy_fingerprint,
     )

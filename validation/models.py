@@ -93,6 +93,25 @@ class EvaluationRun(BaseModel):
         :class:`~validation.summarization.SummarizationMetric`. Populated for
         thread runs from the rolling summary the conversation carries (see
         ``validation.conversation.run_from_thread``); ``None`` skips.
+    task_policy
+        The long-term instructions in force, as ``memory.policy``'s dicts
+        (``{"text", "overridable", ...}``) — what ``policy_adherence`` scores
+        against, and where ``override_compliance`` finds the fixed rules a
+        thread note may not override. Empty skips both.
+    thread_notes
+        The short-term, conversation-scoped instructions in force
+        (``memory.thread_mem``). Empty skips ``override_compliance``.
+    foreign_notes
+        Notes belonging to *other* threads — what ``memory_leakage`` checks
+        did not surface here. Empty skips it.
+    expected_memories, extracted_memories
+        A labelled turn set and what ``memory.extractor`` actually wrote for
+        it, scored by ``memory_extraction``. Both empty skips it.
+
+    The five memory fields are populated for thread runs by
+    ``validation.conversation.run_from_thread`` when it is given the policy /
+    thread memory the conversation ran under; an offline case declares them
+    itself, or leaves them empty and the memory metrics skip.
     """
 
     run_id: str
@@ -105,6 +124,11 @@ class EvaluationRun(BaseModel):
     retrieval_contexts: list[list[str]] | None = None
     summary: str | None = None
     summary_source: str | None = None
+    task_policy: list[dict[str, Any]] = Field(default_factory=list)
+    thread_notes: list[str] = Field(default_factory=list)
+    foreign_notes: list[str] = Field(default_factory=list)
+    expected_memories: list[str] = Field(default_factory=list)
+    extracted_memories: list[str] = Field(default_factory=list)
 
     @property
     def responses(self) -> list[str]:
@@ -283,6 +307,12 @@ class ValidationReport(BaseModel):
     # Fingerprint of the user-instruction set active during the run (None
     # when none) — runs under different instructions are not comparable.
     instructions_fingerprint: str | None = None
+    # Fingerprint of the long-term task policy (memory.policy) the run was
+    # prompted under, None without one. Kept apart from the instruction
+    # fingerprint above because the two are different inputs with different
+    # lifetimes: reference guidance is a file the operator edits, the policy
+    # is durable per-task memory that an approved extraction can also change.
+    policy_fingerprint: str | None = None
     results: list[CaseResult] = Field(default_factory=list)
     token_usage: TokenUsage | None = None
     judge_token_usage: TokenUsage | None = None

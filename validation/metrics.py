@@ -305,6 +305,8 @@ def default_metrics() -> list[ValidationMetric]:
 JUDGED_METRIC_NAMES = (
     "llm_judge",
     "prompt_alignment",
+    "policy_adherence",
+    "override_compliance",
     "answer_relevancy",
     "faithfulness",
     "hallucination",
@@ -326,7 +328,7 @@ def judged_metrics(
     """The LLM-judged suite, built against one judge model.
 
     Opt-in and never part of :func:`default_metrics`: these metrics cost
-    roughly **15 judge calls per item plus 5 per run** with everything
+    roughly **17 judge calls per item plus 5 per run** with everything
     enabled, against ``llm_judge``'s one. Pass *include* to enable a subset
     (any of :data:`JUDGED_METRIC_NAMES`); ``None`` builds them all.
 
@@ -352,6 +354,7 @@ def judged_metrics(
         TaskCompletionMetric,
     )
     from .judge import LLMJudgeMetric
+    from .memory_metrics import OverrideComplianceMetric, PolicyAdherenceMetric
     from .rag_metrics import (
         AnswerRelevancyMetric,
         ContextualPrecisionMetric,
@@ -366,6 +369,8 @@ def judged_metrics(
             llm=llm, output_language=output_language
         ),
         "prompt_alignment": lambda: PromptAlignmentMetric(llm),
+        "policy_adherence": lambda: PolicyAdherenceMetric(llm),
+        "override_compliance": lambda: OverrideComplianceMetric(llm),
         "answer_relevancy": lambda: AnswerRelevancyMetric(llm),
         "faithfulness": lambda: FaithfulnessMetric(llm),
         "hallucination": lambda: HallucinationMetric(llm),

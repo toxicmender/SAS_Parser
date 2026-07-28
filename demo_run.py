@@ -553,6 +553,7 @@ def _validation_report(
     *,
     model: str,
     instructions_fingerprint: str | None = None,
+    policy_fingerprint: str | None = None,
     token_usage=None,
 ):
     """A ValidationReport reconstructed from the run's inline verdicts.
@@ -571,6 +572,7 @@ def _validation_report(
         verdicts,
         model=model,
         instructions_fingerprint=instructions_fingerprint,
+        policy_fingerprint=policy_fingerprint,
         token_usage=token_usage,
     )
 
@@ -669,6 +671,7 @@ def _run_local(args: argparse.Namespace) -> int:
                 outputs,
                 model=model,
                 instructions_fingerprint=pipeline.instructions_fingerprint,
+                policy_fingerprint=pipeline.policy_fingerprint,
                 token_usage=pipeline.token_usage,
             )
             if args.md:
@@ -776,6 +779,7 @@ def _upload_outputs(
     *,
     validating: bool,
     instructions_fingerprint: str | None = None,
+    policy_fingerprint: str | None = None,
     token_usage=None,
     output_language: str | None = None,
 ) -> str:
@@ -825,6 +829,7 @@ def _upload_outputs(
             outputs,
             model=req.model,
             instructions_fingerprint=instructions_fingerprint,
+            policy_fingerprint=policy_fingerprint,
             token_usage=token_usage,
         )
         client.write_file(f"{validation_dir}/report.md", report.to_markdown())
@@ -923,6 +928,7 @@ def _run_sharepoint(args: argparse.Namespace) -> int:
             outputs,
             validating=validator is not None,
             instructions_fingerprint=pipeline.instructions_fingerprint,
+            policy_fingerprint=pipeline.policy_fingerprint,
             token_usage=pipeline.token_usage,
             output_language=args.output_language,
         )

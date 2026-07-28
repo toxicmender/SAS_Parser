@@ -21,11 +21,15 @@ Public API:
   same report surface (``to_markdown()``, PDF, run history) as an offline run.
 - :func:`default_metrics` and the deterministic metric classes.
 - :class:`LLMJudgeMetric` — optional LLM-as-judge metric (needs a model).
-- :func:`judged_metrics` and the ten LLM-judged metric classes implementing
+- :func:`judged_metrics` and the twelve LLM-judged metric classes implementing
   deepeval's definitions natively (prompt alignment, faithfulness, answer
   relevancy, hallucination, contextual precision/relevancy, plan adherence,
-  task completion, summarization) — all opt-in, all built on
+  task completion, summarization) plus the two memory-layer ones (policy
+  adherence, override compliance) — all opt-in, all built on
   :class:`JudgedMetric`.
+- :func:`memory_metrics` and the four metrics over the memory layers:
+  ``policy_adherence`` / ``override_compliance`` (judged) and
+  ``memory_extraction`` / ``memory_leakage`` (deterministic).
 - :func:`load_cases` — JSON case files -> cases.
 - :func:`log_report` / :func:`load_runs` — Spark-backed run history
   (local parquet directory by default, Delta table on Databricks).
@@ -68,6 +72,13 @@ from .metrics import (
     default_metrics,
     judged_metrics,
 )
+from .memory_metrics import (
+    MemoryExtractionMetric,
+    MemoryLeakageMetric,
+    OverrideComplianceMetric,
+    PolicyAdherenceMetric,
+    memory_metrics,
+)
 from .models import (
     CaseResult,
     CaseRun,
@@ -105,8 +116,12 @@ __all__ = [
     "JudgedMetric",
     "LLMJudgeMetric",
     "LiveValidator",
+    "MemoryExtractionMetric",
+    "MemoryLeakageMetric",
     "MetricResult",
+    "OverrideComplianceMetric",
     "PlanAdherenceMetric",
+    "PolicyAdherenceMetric",
     "PromptAlignmentMetric",
     "PythonSyntaxMetric",
     "ReferenceSimilarityMetric",
@@ -123,6 +138,7 @@ __all__ = [
     "load_cases",
     "load_runs",
     "log_report",
+    "memory_metrics",
     "publish_report_pdf",
     "report_from_thread",
     "report_from_verdicts",
