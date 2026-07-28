@@ -103,12 +103,24 @@ whenever the answer rides in a tool call. A model or gateway that cannot honour
 the schema degrades to prose (detected at construction, or demoted once
 mid-run) and the notebook is built by parsing the Markdown.
 
+Multi-source batches are **split back per source file** when the document's
+cells are cleanly attributed: the structured prompt asks the model to tag
+every cell with the `chunk_id` of the batch member it implements, and each
+output dict carries a `chunk_sources` map (`chunk_id` → source file) the
+renderer routes by. The split is all-or-nothing per item — any untagged or
+unresolvable *code* cell (or a Markdown-fallback item, which has no
+attribution) sends the whole item to the shared `_cross_file.ipynb` with
+pointer cells in each participating notebook, the pre-split behavior. The
+per-item header, Analysis/Mapping, untagged prose, and Risks are duplicated
+into every participating notebook so each one stands alone.
+
 ```python
 from pipeline.notebook import write_notebooks
 
 outputs = pipe.run_files(sas_files)
 write_notebooks(outputs, "out", output_language="PySpark")
-# out/<source>.ipynb per file, out/_cross_file.ipynb for cross-file batches
+# out/<source>.ipynb per file; out/_cross_file.ipynb only for items whose
+# cells could not be attributed per source
 ```
 
 ## Load-bearing invariants

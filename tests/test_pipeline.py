@@ -276,6 +276,11 @@ def test_max_merged_tokens_packs_adjacent_items_into_one_call():
 
     assert [o["item_id"] for o in outputs] == ["packed-001"]
     assert len(outputs[0]["chunk_ids"]) == 4
+    # Every output maps its member chunks to their source files, so the
+    # notebook renderer can split multi-source items per file (Phase 5).
+    assert outputs[0]["chunk_sources"] == {
+        cid: "etl.sas" for cid in outputs[0]["chunk_ids"]
+    }
 
 
 def test_max_merged_tokens_off_keeps_merged_grouping():

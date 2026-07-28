@@ -84,6 +84,15 @@ class TranslationCell(BaseModel):
         description="Optional one-line heading for this cell, rendered above "
         "it. Use it to say what the cell does, e.g. 'Load the source table'.",
     )
+    chunk_id: str | None = Field(
+        default=None,
+        description="The id of the batch member this cell implements, exactly "
+        "as listed under '## Batch members' (e.g. 'f1-chunk-0001'). Set it on "
+        "every cell when the batch has several members — it routes the cell "
+        "into its source file's notebook; a cell serving several members "
+        "carries the id of the one whose step it completes. May be null for "
+        "a single-member batch.",
+    )
 
 
 class TranslationDocument(BaseModel):

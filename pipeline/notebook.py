@@ -3,9 +3,23 @@
 The pipeline's deliverable is code, so it ships as something a person can open
 and run. This module turns the list of output dicts ``SasLLMPipeline._process``
 returns into ``.ipynb`` files — **one per SAS source file**, in the dependency
-order the batcher established, plus a shared ``_cross_file.ipynb`` for batches
-whose members span several files (those cannot belong to any single program's
-notebook, and duplicating them would run them twice).
+order the batcher established.
+
+A batch whose members span several files is **split back per source file**
+when its structured document allows it: every code cell tagged with the
+``chunk_id`` it implements (the model is asked to tag them; see
+``pipeline.constants``) routes to that chunk's source-file notebook via the
+output's ``chunk_sources`` map. The split is all-or-nothing per item — if any
+code cell is untagged or unresolvable, or the item has no structured document
+at all (the Markdown-fallback path), the **whole item** falls back to the
+shared ``_cross_file.ipynb`` with a pointer cell in each participating
+notebook, exactly the pre-split behavior; scattering one item's translation
+across both worlds would be worse than either. Ordering caveat: each
+notebook's cells respect the corpus order (producers precede consumers
+across the whole run), but when two files' steps interleave through shared
+batches, running one notebook end to end before the other is only safe if
+its steps do not depend on the other's later outputs — the per-item header
+names the sibling files, so the coupling stays visible.
 
 Two paths produce the cells, in order of preference:
 
@@ -144,6 +158,16 @@ def document_to_cells(doc: TranslationDocument) -> list[dict[str, Any]]:
     kind, in order, so the notebook runs the translation as the model sequenced
     it.
     """
+    cells = _document_prelude_cells(doc)
+    for cell in doc.cells:
+        cells.extend(_translation_cell_to_cells(cell))
+    cells.extend(_document_risks_cells(doc))
+    return cells
+
+
+def _document_prelude_cells(doc: TranslationDocument) -> list[dict[str, Any]]:
+    """The Analysis + Mapping markdown cells (0–2), shared by the whole-item
+    and per-source-split rendering paths."""
     cells: list[dict[str, Any]] = []
     if doc.analysis.strip():
         cells.append(markdown_cell(f"### Analysis\n\n{doc.analysis.strip()}"))
@@ -155,17 +179,18 @@ def document_to_cells(doc: TranslationDocument) -> list[dict[str, Any]]:
                 text += f" — {entry.difference.strip()}"
             lines.append(text)
         cells.append(markdown_cell("\n".join(lines)))
-
-    for cell in doc.cells:
-        cells.extend(_translation_cell_to_cells(cell))
-
-    if doc.risks:
-        lines = ["### Risks", ""]
-        for risk in doc.risks:
-            marker = "⚠️ " if risk.severity == "P0" else ""
-            lines.append(f"- {marker}**{risk.severity}** — {risk.note.strip()}")
-        cells.append(markdown_cell("\n".join(lines)))
     return cells
+
+
+def _document_risks_cells(doc: TranslationDocument) -> list[dict[str, Any]]:
+    """The Risks markdown cell (0–1) — counterpart of the prelude."""
+    if not doc.risks:
+        return []
+    lines = ["### Risks", ""]
+    for risk in doc.risks:
+        marker = "⚠️ " if risk.severity == "P0" else ""
+        lines.append(f"- {marker}**{risk.severity}** — {risk.note.strip()}")
+    return [markdown_cell("\n".join(lines))]
 
 
 def _translation_cell_to_cells(cell: TranslationCell) -> list[dict[str, Any]]:
@@ -372,6 +397,71 @@ def _notebook_key(out: dict[str, Any]) -> str:
     return CROSS_FILE_NOTEBOOK
 
 
+def _split_item_by_source(
+    out: dict[str, Any]
+) -> dict[str, list[dict[str, Any]]] | None:
+    """Route one multi-source item's cells per source file, or ``None``.
+
+    ``None`` means "cannot split cleanly" and the caller falls back to the
+    shared ``_cross_file`` notebook for the **whole item** — the split is
+    all-or-nothing: every *code* cell must carry a ``chunk_id`` that resolves
+    through the output's ``chunk_sources`` map to one of the item's source
+    files. Prose is forgiving: an untagged (or unresolvable) markdown cell is
+    duplicated into every participating notebook, like the document-level
+    Analysis / Mapping / Risks cells, so each file's notebook stands alone.
+    """
+    document = out.get("document")
+    chunk_sources = out.get("chunk_sources")
+    if not document or not isinstance(chunk_sources, dict) or not chunk_sources:
+        return None
+    try:
+        doc = TranslationDocument.model_validate(document)
+    except Exception:
+        logger.warning(
+            f"_split_item_by_source: item={out.get('item_id')!r} has an "
+            "unreadable document; falling back to the shared notebook",
+            exc_info=True,
+        )
+        return None
+    sources = [s for s in (out.get("source_files") or []) if s]
+
+    # Resolve every cell first (all-or-nothing), then render.
+    routed: list[tuple[Any, str | None]] = []
+    for cell in doc.cells:
+        source = chunk_sources.get(cell.chunk_id) if cell.chunk_id else None
+        if source is not None and source not in sources:
+            source = None  # a tag pointing outside the item resolves nowhere
+        if cell.kind == "code" and source is None:
+            logger.info(
+                f"_split_item_by_source: item={out.get('item_id')!r} has a "
+                f"code cell with no resolvable chunk_id "
+                f"({cell.chunk_id!r}); keeping the whole item in "
+                f"'{CROSS_FILE_NOTEBOOK}'"
+            )
+            return None
+        routed.append((cell, source))
+
+    header = markdown_cell(
+        _item_header_markdown(out)
+        + "\n- Split: translation cells are routed into each source file's "
+        "notebook by their `chunk_id`"
+    )
+    shared_prelude = [header, *_document_prelude_cells(doc)]
+    per_source: dict[str, list[dict[str, Any]]] = {
+        source: list(shared_prelude) for source in sources
+    }
+    for cell, source in routed:
+        rendered = _translation_cell_to_cells(cell)
+        if source is None:  # untagged prose: every participating notebook
+            for cells in per_source.values():
+                cells.extend(rendered)
+        else:
+            per_source[source].extend(rendered)
+    for cells in per_source.values():
+        cells.extend(_document_risks_cells(doc))
+    return per_source
+
+
 def _filename_for(key: str, taken: dict[str, str]) -> str:
     """A unique, filesystem-safe ``.ipynb`` stem for source id *key*.
 
@@ -406,29 +496,40 @@ def notebooks_from_outputs(
 
     *outputs* is consumed in order — the batcher's dependency order — so each
     notebook's cells run in an order that respects the dependencies discovered
-    across the corpus. A cross-file batch goes into ``_cross_file`` once, and
-    every participating file's notebook gets a pointer to it in its place, so a
-    reader following one program never silently skips a step.
+    across the corpus. A multi-source batch is **split per source file** when
+    its document's cells are cleanly attributed (see
+    :func:`_split_item_by_source`); otherwise it goes into ``_cross_file``
+    once, and every participating file's notebook gets a pointer to it in its
+    place, so a reader following one program never silently skips a step.
     """
     grouped: dict[str, list[dict[str, Any]]] = {}
     names: dict[str, str] = {}
     for out in outputs:
         key = _notebook_key(out)
+        if key != CROSS_FILE_NOTEBOOK:
+            name = _filename_for(key, names)
+            grouped.setdefault(name, []).extend(item_cells(out))
+            continue
+        per_source = _split_item_by_source(out)
+        if per_source is not None:
+            for source, cells in per_source.items():
+                name = _filename_for(source, names)
+                grouped.setdefault(name, []).extend(cells)
+            continue
         name = _filename_for(key, names)
         grouped.setdefault(name, []).extend(item_cells(out))
-        if key == CROSS_FILE_NOTEBOOK:
-            item_id = out.get("item_id", "batch")
-            for source in out.get("source_files") or []:
-                pointer = _filename_for(source, names)
-                grouped.setdefault(pointer, []).append(
-                    markdown_cell(
-                        f"## {item_id} (cross-file)\n\n"
-                        f"This step spans {len(out.get('source_files') or [])} "
-                        f"source files and is translated once in "
-                        f"`{CROSS_FILE_NOTEBOOK}.ipynb`. Run it there, at this "
-                        "point in the sequence."
-                    )
+        item_id = out.get("item_id", "batch")
+        for source in out.get("source_files") or []:
+            pointer = _filename_for(source, names)
+            grouped.setdefault(pointer, []).append(
+                markdown_cell(
+                    f"## {item_id} (cross-file)\n\n"
+                    f"This step spans {len(out.get('source_files') or [])} "
+                    f"source files and is translated once in "
+                    f"`{CROSS_FILE_NOTEBOOK}.ipynb`. Run it there, at this "
+                    "point in the sequence."
                 )
+            )
 
     notebooks = {
         name: build_notebook(cells, output_language=output_language)

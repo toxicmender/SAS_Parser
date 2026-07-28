@@ -1380,6 +1380,10 @@ class SasLLMPipeline:
                         "item_id": item_id,
                         "is_batch": True,
                         "chunk_ids": item.chunk_ids,
+                        "chunk_sources": {
+                            c.chunk_id: c.source_id or "<inline>"
+                            for c in item.chunks
+                        },
                         "source_files": item.source_files,
                         "kind": None,
                         "prompt": user_msg,
@@ -1453,6 +1457,10 @@ class SasLLMPipeline:
                     "item_id": item_id,
                     "is_batch": True,
                     "chunk_ids": item.chunk_ids,
+                    "chunk_sources": {
+                        c.chunk_id: c.source_id or "<inline>"
+                        for c in item.chunks
+                    },
                     "source_files": item.source_files,
                     "kind": None,
                     "prompt": user_msg,

@@ -17,8 +17,11 @@ layers, each usable on its own:
    token-budgeted packing on (`max_merged_tokens`), adjacent small items
    share a call as `packed-NNN` batches under a prompt-cost budget. The deliverable is a
    **notebook** — one `.ipynb` per SAS source file (`pipeline.notebook`) —
-   because the output is code and code should be runnable; the two report
-   surfaces, validation and complexity, are **Markdown**.
+   because the output is code and code should be runnable. Multi-source
+   batches split back per file via per-cell `chunk_id` attribution (the
+   structured prompt asks for it; all-or-nothing per item, falling back to
+   a shared `_cross_file.ipynb` when attribution is incomplete); the two
+   report surfaces, validation and complexity, are **Markdown**.
 
 An optional fourth component, **prompt_builder**, reads reference PDFs (SAS
 manuals, target-platform guides) into retrieval-ready instruction chunks and,
@@ -122,9 +125,11 @@ pipeline/
                         back to the four Markdown sections that get persisted
                         and scored. Pydantic only; no langchain import.
   notebook.py           Renders pipeline outputs as nbformat v4.5 notebooks —
-                        one .ipynb per SAS source file plus _cross_file.ipynb —
-                        from a TranslationDocument, or by parsing the Markdown
-                        response when there is none.
+                        one .ipynb per SAS source file — from a
+                        TranslationDocument (multi-source items split per
+                        file by each cell's chunk_id; unattributed items land
+                        in _cross_file.ipynb with pointers), or by parsing
+                        the Markdown response when there is none.
 
 llm_client/
   tokens.py             Shared tiktoken-backed token estimation: model id ->

@@ -63,7 +63,10 @@ every field:
   never a Markdown fence, never a prose paragraph; put prose in a markdown cell
   or in the cell's `comment`. When translating a batch, preserve execution order
   across member chunks/files and make cross-file/cross-chunk dependencies
-  explicit.
+  explicit. When the batch has several members, set every cell's `chunk_id` to
+  the member id it implements, exactly as listed under '## Batch members' — it
+  routes the cell into its source file's notebook (a cell serving several
+  members carries the id of the one whose step it completes).
 - `risks`: every risk worth flagging, worst first, P0 for a silent-error risk.
   If a translation is ambiguous or unsafe, say so explicitly rather than
   guessing.
