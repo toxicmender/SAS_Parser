@@ -327,6 +327,71 @@ real batches off, singleton merging token-aware only" for one commit, then
 flip the derived default on in a separate commit — so a regression bisects to
 the flip, not the mechanism.
 
+### Phase 5 — one complete notebook per SAS source file
+
+**Current state.** `chunker.notebook` already writes one `.ipynb` per source
+file *for single-source batches*. The gap is multi-file batches: their whole
+output lands in a shared `_cross_file.ipynb`, and each participating file's
+notebook gets only a pointer cell ("run it there"). So a source file whose
+steps were pulled into cross-file batches has an incomplete notebook. Phase 4
+makes this worse: packed batches span files more often, so ever more of the
+translation would drain into `_cross_file.ipynb`. The requirement — a
+corresponding, complete notebook for every converted SAS source — needs the
+batch output to be split back per source file.
+
+**Why splitting is currently impossible.** The unit of attribution exists on
+the *input* side — every member chunk carries `chunk_id` + `source_id`, and
+the batch prompt template already shows both per member — but not on the
+*output* side: `TranslationCell` has `kind/source/language/comment` and no
+link to the chunk it translates. A cross-file document's cells therefore
+cannot be routed to files without guessing.
+
+**Plan: per-cell chunk attribution through the structured schema.**
+
+1. `response_models.TranslationCell` gains `chunk_id: str | None = None`
+   (optional — old stored documents and lenient models keep validating), and
+   `_STRUCTURED_SYSTEM_PROMPT_TEMPLATE` instructs the model to stamp every
+   cell with the member `chunk_id` it implements (the ids are already in the
+   batch context block it reads). Single-member batches need no tag.
+2. The pipeline output dict gains `chunk_sources: {chunk_id: source_id}`
+   (additive; built from the batch members) so the renderer can map a cell's
+   `chunk_id` to a notebook without re-deriving anything.
+3. `notebooks_from_outputs` routing changes for multi-source items:
+   - Cells whose `chunk_id` resolves to a source file go to **that file's
+     notebook**, in output order (outputs are already consumed in dependency
+     order, so per-file cell order stays dependency-respecting).
+   - The item header cell is emitted into every participating notebook
+     (annotated with the sibling files), so each reader still sees the
+     step's provenance and validation verdict.
+   - Document-level Analysis/Mapping/Risks cells go to every participating
+     notebook — they are markdown, cheap, and each file's notebook should
+     stand alone.
+   - **Degradation**: cells with a missing or unresolvable `chunk_id` — and
+     the entire markdown-fallback path, which has no attribution — fall back
+     to today's behavior (`_cross_file.ipynb` + pointer cells). Nothing gets
+     worse than the status quo; `_cross_file.ipynb` becomes the exception
+     path rather than the rule, and disappears entirely on a run where every
+     cross-file document tags cleanly.
+4. Ordering caveat, stated in the notebook docstring: when file A's and
+   file B's steps interleave through shared batches, running notebook A top
+   to bottom before notebook B is only safe if A's steps don't depend on B's
+   later outputs; the existing corpus-order guarantee (producers precede
+   consumers *across* the run) is preserved per notebook, and genuinely
+   interleaved dependencies keep their pointer/`_cross_file` treatment if
+   untagged. The per-file header annotations make the cross-file coupling
+   visible either way.
+
+**Verification.** `tests/test_notebook.py` gains: tagged cross-file document
+splits per file; untagged falls back to `_cross_file`; mixed tagging routes
+what it can; nbformat schema still validates. Prompt-side, the validation
+suite gates that asking for `chunk_id` tags doesn't degrade translation
+quality; if a target model tags unreliably, the feature degrades per item,
+not per run.
+
+Dependency: none on Phases 1–3 (works against today's layout); strongly
+recommended to land with or before Phase 4's default flip, so packing does
+not visibly regress the per-file deliverable.
+
 Invariants that must survive every phase (Architecture.md §Load-bearing):
 no LangGraph checkpointer; ephemeral guidance/summary/notes never persisted;
 `chat::` key schema untouched; in-memory mode stays Spark-free; batch reason
@@ -340,4 +405,5 @@ strings and item ordering unchanged (phases here touch none of the batcher).
 4. `refactor(pipeline): grouped constructor configs; SharePoint mapping load moves to demo_run` (Phase 3.2–3.3)
 5. `refactor(pipeline): extract RunLedger` (Phase 3.4)
 6. `feat(chunker): token-budgeted coalescing of singletons and adjacent small batches` (Phase 4, mechanism)
-7. `feat(pipeline): enable token-budgeted call packing by default` (Phase 4, flip)
+7. `feat(notebook): route cross-file batch cells to per-source notebooks via chunk_id attribution` (Phase 5)
+8. `feat(pipeline): enable token-budgeted call packing by default` (Phase 4, flip — after Phase 5)
