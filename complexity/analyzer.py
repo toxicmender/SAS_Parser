@@ -31,11 +31,21 @@ file** is scored on three declared dimensions:
 - **uncertainty** — unresolved cross-file references, unclosed blocks,
   ``UNKNOWN_*`` chunks, and parser diagnostics.
 
-Their sum is divided by the profile's anchor (the raw score of a documented
-reference *Medium* file) and banded on the Fibonacci rungs, then floored by
-chunk kind. Sizing against a fixed anchor rather than the corpus percentile is
-deliberate: a relative scheme would re-rate the same file differently depending
-on which files it was analysed alongside. See complexity/README.md.
+Each is then **log-transformed and min-max rescaled** onto 0-1 against a window
+declared in multiples of the profile's anchor (the raw score of a documented
+reference *Medium* file), blended by declared weights, and the blend is min-max
+rescaled in log space onto the Fibonacci points range — then banded and floored
+by chunk kind. The rescale lives in :class:`~complexity.rules.SizeModel`; this
+module only decides what goes into each dimension.
+
+Two properties are worth stating here because they are what the transform buys:
+the three dimensions are counted in incomparable units, so rescaling them onto
+one range makes their mix an explicit weight rather than an accident of
+magnitude; and within a dimension the returns diminish, so the 200th step of a
+file moves a size less than the 20th. Sizing against a fixed anchor rather than
+the corpus percentile stays deliberate — the windows are anchor-relative, so a
+file's size still never depends on which files it was analysed alongside. See
+complexity/README.md.
 
 Logger name: ``complexity.analyzer``.
 """
@@ -171,7 +181,19 @@ class ComplexityAnalyzer:
         self._sizes: SizeModel = (
             self._rules.sizes
             if anchor == self._rules.sizes.anchor_raw
-            else replace(self._rules.sizes, anchor_raw=anchor)
+            else replace(
+                self._rules.sizes,
+                anchor_raw=anchor,
+                # The anchor's dimension split is the same measurement as its
+                # total, so it moves with it — leaving it behind would leave
+                # the profile self-contradictory the moment anyone retunes.
+                anchor_dimensions=_scaled_dimensions(
+                    self._rules.sizes.anchor_dimensions,
+                    anchor / self._rules.sizes.anchor_raw
+                    if self._rules.sizes.anchor_raw > 0
+                    else 1.0,
+                ),
+            )
         )
         logger.info(
             f"ComplexityAnalyzer  target={self._rules.target}  "
@@ -451,17 +473,27 @@ class ComplexityAnalyzer:
                 source_chunks, signals, diags_by_source.get(source_id, 0)
             )
             size, floored_by = self._size_for(
-                effort + complexity + uncertainty, source_chunks
+                effort, complexity, uncertainty, source_chunks
             )
 
             files.append(
                 FileComplexity(
                     source_id=source_id,
                     size=size,
-                    points=self._sizes.points_for(effort + complexity + uncertainty),
+                    points=self._sizes.points_for(effort, complexity, uncertainty),
                     effort_raw=round(effort, 3),
                     complexity_raw=round(complexity, 3),
                     uncertainty_raw=round(uncertainty, 3),
+                    effort_norm=round(self._sizes.normalize("effort", effort), 3),
+                    complexity_norm=round(
+                        self._sizes.normalize("complexity", complexity), 3
+                    ),
+                    uncertainty_norm=round(
+                        self._sizes.normalize("uncertainty", uncertainty), 3
+                    ),
+                    blend=round(
+                        self._sizes.blend_for(effort, complexity, uncertainty), 3
+                    ),
                     chunk_count=len(source_chunks),
                     line_count=_line_span(source_chunks),
                     chunks=scored,
@@ -548,16 +580,20 @@ class ComplexityAnalyzer:
         )
 
     def _size_for(
-        self, raw: float, chunks: list[SasChunk]
+        self,
+        effort: float,
+        complexity: float,
+        uncertainty: float,
+        chunks: list[SasChunk],
     ) -> tuple[TShirtSize, str]:
-        """Band *raw* into a size, then apply the per-chunk-kind floors.
+        """Band the three dimensions into a size, then apply the kind floors.
 
         Returns the size and the chunk kind that forced a floor (empty when
         the banding stood on its own), so a size that the numbers alone do not
         explain still says why.
         """
         sizes = self._sizes
-        banded = sizes.band_for(sizes.points_for(raw))
+        banded = sizes.band_for(sizes.points_for(effort, complexity, uncertainty))
         floor = TShirtSize.SMALL
         floored_by = ""
         for chunk in chunks:
@@ -605,6 +641,15 @@ def _line_span(chunks: list[SasChunk]) -> int:
     for chunk in chunks:
         covered.update(range(chunk.start_line, chunk.end_line + 1))
     return len(covered)
+
+
+def _scaled_dimensions(
+    dims: tuple[float, float, float] | None, factor: float
+) -> tuple[float, float, float] | None:
+    """The anchor's dimension split, rescaled by *factor* (``None`` stays None)."""
+    if dims is None:
+        return None
+    return (dims[0] * factor, dims[1] * factor, dims[2] * factor)
 
 
 def _resolve_weight(explicit: float | None, key: str, default: float) -> float:

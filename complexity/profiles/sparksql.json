@@ -10,7 +10,12 @@
   "sizes": {
     "anchor": {
       "raw": 87.5,
-      "describes": "The reference MEDIUM file: ~200 lines and 16 chunks, comprising a %MACRO wrapping two DATA steps, nine further DATA steps, a match-merge (MERGE with BY), a PROC SORT, a PROC SUMMARY, and two LIBNAME assignments it uses throughout. 87.5 is that file's MEASURED raw score against this profile, not an estimate -- it is what makes the scale relative estimation against a known reference rather than a table of invented cutoffs. Every size is measured against it, so retuning it moves every verdict at once: argue with this description, not with the individual thresholds."
+      "dimensions": {
+        "effort": 50.0,
+        "complexity": 37.5,
+        "uncertainty": 0.0
+      },
+      "describes": "The reference MEDIUM file: ~200 lines and 16 chunks, comprising a %MACRO wrapping two DATA steps, nine further DATA steps, a match-merge (MERGE with BY), a PROC SORT, a PROC SUMMARY, and two LIBNAME assignments it uses throughout. 87.5 is that file's MEASURED raw score against this profile, not an estimate -- it is what makes the scale relative estimation against a known reference rather than a table of invented cutoffs. Every size is measured against it, so retuning it moves every verdict at once: argue with this description, not with the individual thresholds. 'dimensions' is the same measurement split three ways; it must sum to raw, and it matters because each dimension is rescaled against its own window, so a file's composition changes its size and not just its total."
     },
     "scale": {
       "SMALL": 2,
@@ -22,6 +27,25 @@
       "SMALL": 2.5,
       "MEDIUM": 4.0,
       "LARGE": 6.5
+    },
+    "bounds": {
+      "effort": {
+        "min": 0.3,
+        "max": 1.6
+      },
+      "complexity": {
+        "min": 0.33,
+        "max": 1.4
+      },
+      "uncertainty": {
+        "min": 0.0,
+        "max": 0.5
+      }
+    },
+    "dimension_weights": {
+      "effort": 0.6,
+      "complexity": 0.35,
+      "uncertainty": 0.05
     },
     "volume": {
       "chunk": 0.5,

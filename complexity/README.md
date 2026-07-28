@@ -181,11 +181,11 @@ A size is not one number. The method requires stating up front what a size
 *means* and then holding to it, so this one is declared as three terms,
 reported separately on `FileComplexity`:
 
-| Dimension | Field | Measures | Fed by |
+| Dimension | Fields | Measures | Fed by |
 | --- | --- | --- | --- |
-| **Effort** | `effort_raw` | how much there is | chunks, lines, contained DATA/PROC steps, dataset I/O, macro parameters |
-| **Complexity** | `complexity_raw` | how hard it is | each distinct signal's tier weight **plus** its parity weight |
-| **Uncertainty** | `uncertainty_raw` | what we could not pin down | unresolved cross-file refs, unclosed blocks, `UNKNOWN_*` chunks, parser diagnostics |
+| **Effort** | `effort_raw` / `effort_norm` | how much there is | chunks, lines, contained DATA/PROC steps, dataset I/O, macro parameters |
+| **Complexity** | `complexity_raw` / `complexity_norm` | how hard it is | each distinct signal's tier weight **plus** its parity weight |
+| **Uncertainty** | `uncertainty_raw` / `uncertainty_norm` | what we could not pin down | unresolved cross-file refs, unclosed blocks, `UNKNOWN_*` chunks, parser diagnostics |
 
 Keeping them apart is the point: a `Large` file that is large on *uncertainty*
 needs someone to go and find the missing pieces, while one large on *effort*
@@ -196,6 +196,58 @@ target-dependent. Unlike a tier, the same file is genuinely less work against
 PySpark than against Spark SQL, because a Python host language absorbs macros
 and loops that pure SQL cannot express. That is why the sizing model lives in
 the profile.
+
+### Rescaling: log, then min-max
+
+The three dimensions are counted in incomparable units — effort runs to the
+hundreds on line and step counts, while uncertainty rarely passes ten — so
+adding them up would weight them by magnitude rather than by intent. Each is
+therefore **log-transformed and min-max rescaled** onto `0…1` before they are
+combined:
+
+```
+norm = clamp01( (log1p(raw) − log1p(min)) / (log1p(max) − log1p(min)) )
+```
+
+`log1p` rather than `log` because every dimension legitimately reaches zero —
+a file with nothing unresolved has no uncertainty at all.
+
+The **log** says that returns diminish: the 200th step of a file tells you far
+less than the 20th, and equal *ratios* rather than equal *counts* are what move
+a size. The **min-max** says where the scale spends its resolution: below `min`
+a dimension has stopped discriminating (a file with less effort than a third of
+an anchor is small however you count it), above `max` it has saturated.
+
+Both bounds are declared per dimension in the profile, as **multiples of the
+anchor**, which keeps the anchor the single knob that moves everything:
+
+```json
+"bounds": {
+  "effort":      {"min": 0.30, "max": 1.60},
+  "complexity":  {"min": 0.33, "max": 1.40},
+  "uncertainty": {"min": 0.00, "max": 0.50}
+},
+"dimension_weights": {"effort": 0.60, "complexity": 0.35, "uncertainty": 0.05}
+```
+
+Rescaling makes the mix explicit where a raw sum left it to chance, so the
+weights have to be stated too. They blend the three normalised dimensions into
+one `0…1` number (`FileComplexity.blend`) by weighted mean. Effort leads
+because it is most of what a size is answering; uncertainty trails because it
+asks for an investigation rather than for translation hands — and it is
+reported separately precisely so that a small weight never means "ignored".
+
+`FileComplexity` carries each dimension twice — `effort_raw` and `effort_norm`
+— because they answer different questions. The raw number is the measurement;
+the normalised one is how much of the scale that measurement actually claimed.
+A dimension at `1.00` has saturated, and more of the same will not move the
+size again.
+
+One consequence worth stating plainly: **volume alone tops out at `Large`.**
+Past the top of the effort window a longer file of the same trivial steps is
+not telling you anything new — 50 plain DATA steps and 200 of them both rate
+`Large` — so `Extra Large`, which is an instruction to split, is reserved for
+files that are bulky *and* hard (or bulky and full of unknowns).
 
 ### The anchor
 
@@ -208,24 +260,30 @@ The reference lives in the profile:
 ```json
 "sizes": {
   "anchor": {
-    "raw": 18.0,
-    "describes": "The reference MEDIUM file. Roughly 250 lines: 8-10 steps, one match-merge, a PROC SORT and a PROC SUMMARY, one %MACRO wrapping two of the steps, reading two librefs it does not assign itself."
+    "raw": 87.5,
+    "dimensions": {"effort": 50.0, "complexity": 37.5, "uncertainty": 0.0},
+    "describes": "The reference MEDIUM file: ~200 lines and 16 chunks, comprising a %MACRO wrapping two DATA steps, nine further DATA steps, a match-merge, a PROC SORT, a PROC SUMMARY, and two LIBNAME assignments it uses throughout."
   }
 }
 ```
 
-`points = raw / anchor.raw × scale[MEDIUM]`, then banded. **Lowering the anchor
-makes every file rate larger.** It is deliberately the one knob exposed in
+Every window above is a multiple of `anchor.raw`, so **lowering the anchor makes
+every file rate larger.** It is deliberately the one knob exposed in
 `config.json` (`complexity.size_anchor`), because it moves every verdict
 coherently, where editing a single band would just skew one rung.
 
 `87.5` is that reference file's **measured** raw score, not a guess: the file
-described above was written out and run through the analyzer. Each profile
-anchors to its *own* measurement of the same reference (PySpark reads `81.5`),
-which keeps that file Medium against every target — as the definition of Medium
-requires — so what stays target-dependent is the *relative* construct mix. A
-macro-heavy file rates larger against Spark SQL than against PySpark; a file of
-plain DATA steps rates identically against both.
+described above was written out and run through the analyzer. `dimensions` is
+the same measurement split three ways, and it must sum to `raw` — a profile
+where it does not is rejected on load. It is stated because the dimensions are
+normalised *separately*, so a file's composition changes its size and not just
+its total: 87.5 spent entirely on effort does not land where 50 + 37.5 does.
+
+Each profile anchors to its *own* measurement of the same reference (PySpark
+reads `81.5`), which keeps that file Medium against every target — as the
+definition of Medium requires — so what stays target-dependent is the *relative*
+construct mix. A macro-heavy file rates larger against Spark SQL than against
+PySpark; a file of plain DATA steps rates identically against both.
 
 The anchor is *fixed data*, not recomputed per run. A corpus-relative
 (percentile) scheme would re-rate the same file differently depending on which
@@ -236,8 +294,18 @@ subset by subset.
 The reference file is synthetic — there is no SAS corpus in this repo to
 calibrate against — so treat the anchor as a defensible starting point, and
 argue with `anchor.describes` rather than with the individual thresholds. If
-you have a real file your team would call a textbook Medium, measure it
-(`analyze_result(...).files[0].raw_total`) and put that number in the profile.
+you have a real file your team would call a textbook Medium, measure it and put
+both numbers in the profile:
+
+```python
+f = ComplexityAnalyzer().analyze_result(result).files[0]
+f.raw_total                                        # -> anchor.raw
+f.effort_raw, f.complexity_raw, f.uncertainty_raw  # -> anchor.dimensions
+```
+
+A test asserts the shipped anchors still measure what they claim, in both
+profiles, so a drifted calibration fails rather than silently re-rating a
+corpus.
 
 ### Scale and bands
 
@@ -252,9 +320,26 @@ than the gap between Large and Extra Large:
 | `Large` | 5 | ≤ 6.5 |
 | `Extra Large` | 8 | above 6.5 |
 
-Bands sit at the geometric midpoints of the rungs. Because points are
-continuous they also **sum**: `report.total_points` is a backlog estimate for
-the whole migration, which a purely qualitative label could never give you.
+Bands sit at the geometric midpoints of the rungs. The blend becomes points by
+the same move as the dimensions themselves — a min-max rescale, applied **in
+log space**, between the lowest and highest rungs:
+
+```
+points = scale[SMALL] × (scale[EXTRA_LARGE] / scale[SMALL]) ^ blend
+```
+
+so a blend of `0` is exactly `Small`'s 2 points, a blend of `1` exactly
+`Extra Large`'s 8, and the reference file lands on `3.0` by calibration. Log
+space for the same reason the rungs are Fibonacci: equal steps of evidence
+should be equal *ratios* of points, not equal differences.
+
+Points are therefore **bounded by the scale** — no file scores 0.2 points or
+14. That is a change from an open-ended ratio, and a deliberate one: a size of
+`Small` means 2 points, and a scale whose bottom rung reports a tenth of its
+own nominal value is not a scale. Because points are continuous they still
+**sum**: `report.total_points` is a backlog estimate for the whole migration,
+which a purely qualitative label could never give you — read as "n files at
+2-8 points each", not as an absolute quantity of days.
 
 ### Extra Large means *split this*
 
@@ -289,22 +374,28 @@ the floor actually changed the answer.
 
 ### Worked examples
 
-Measured, not estimated — these are real outputs at the shipped anchor:
+Measured, not estimated — these are real outputs at the shipped anchor, each
+dimension shown as `raw (normalised)`:
 
-| File | Effort | Cplx | Uncert | Raw | Points | Size |
+| File | Effort | Cplx | Uncert | Blend | Points | Size |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Config only: 3 `%LET` + 1 `LIBNAME` | 2.0 | 2.5 | 0.0 | 4.5 | 0.2 | Small |
-| Thin macro wrapper, 1 step, 2 params | 2.5 | 21.0 | 0.0 | 23.5 | 0.8 | Medium *(floored)* |
-| 12 plain DATA steps | 42.1 | 0.0 | 0.0 | 42.1 | 1.4 | Small |
-| **The reference file** (see the anchor) | 50.0 | 37.5 | 0.0 | 87.5 | 3.0 | **Medium** |
-| Macro-heavy: arrays, DO, merges, 12 steps | 58.7 | 54.5 | 0.0 | 113.2 | 3.9 | Medium |
-| 50 plain DATA steps | 175.5 | 0.0 | 0.0 | 175.5 | 6.0 | Large |
+| Config only: 3 `%LET` + 1 `LIBNAME` | 2.0 (0.00) | 2.5 (0.00) | 0.0 (0.00) | 0.00 | 2.00 | Small |
+| Thin macro wrapper, 1 step, 2 params | 2.5 (0.00) | 21.0 (0.00) | 0.0 (0.00) | 0.00 | 2.00 | Medium *(floored)* |
+| 12 plain DATA steps | 42.1 (0.28) | 0.0 (0.00) | 0.0 (0.00) | 0.17 | 2.52 | Medium |
+| **The reference file** (see the anchor) | 50.0 (0.38) | 37.5 (0.18) | 0.0 (0.00) | 0.29 | 3.00 | **Medium** |
+| Macro-heavy: array, DO, 12 merges | 57.3 (0.46) | 49.0 (0.36) | 0.0 (0.00) | 0.41 | 3.50 | Medium |
+| 50 plain DATA steps | 175.5 (1.00) | 0.0 (0.00) | 0.0 (0.00) | 0.60 | 4.59 | Large |
+| 200 plain DATA steps | 702.0 (1.00) | 0.0 (0.00) | 0.0 (0.00) | 0.60 | 4.59 | Large |
+| Bulk **and** hard: 45 merge steps behind a macro of arrays, DO forms, `LAG`, `CALL EXECUTE` | 212.9 (1.00) | 175.5 (1.00) | 0.0 (0.00) | 0.95 | 7.46 | Extra Large |
 
-Two things worth reading off that table. The reference file lands exactly on
-3.0 points, which is what "anchored at Medium" means. And the 50-step file
-rates `Large` on **volume alone** — its complexity term is `0.0`, because
-nothing in it is individually notable. That is precisely the case a tier cannot
-express, and the reason sizing exists.
+Four things worth reading off that table. The reference file lands exactly on
+3.0 points, which is what "anchored at Medium" means. The 50-step file rates
+`Large` on **volume alone** — its complexity term is `0.0`, because nothing in
+it is individually notable — which is precisely the case a tier cannot express,
+and the reason sizing exists. The 200-step file rates the same as the 50-step
+one, because effort saturated at `1.00` and quadrupling a number the scale has
+stopped reading changes nothing. And only the last row is `Extra Large`: it is
+the one file that is bulky *and* hard.
 
 ### References
 
@@ -554,9 +645,10 @@ a tier. To retune **which construct means what**, edit a profile JSON, not the
 config.
 
 `size_anchor` overrides the profile's reference-Medium raw score; lowering it
-makes every file rate larger. The bands and per-dimension weights stay in the
-profile, because they are calibrated relative to the anchor and only make sense
-alongside it.
+makes every file rate larger. The bands, the min-max `bounds`, and the
+per-dimension weights stay in the profile, because they are calibrated relative
+to the anchor and only make sense alongside it — the bounds are literally
+stated as multiples of it, so overriding the anchor moves every window with it.
 
 `ComplexityAnalyzer(use_detectors=False)` restricts the analysis to what the
 chunker's own metadata reports, dropping the supplementary scans.
@@ -585,13 +677,21 @@ batched run.
 
 ## Tests
 
-`tests/test_complexity.py` — 120 tests, no LLM and (apart from the rule-set
+`tests/test_complexity.py` — 147 tests, no LLM and (apart from the rule-set
 loader's own tests, which write temp profiles) no disk I/O. Covers each tier
 against the constructs the brief names, the max-tier/worst-parity aggregation
 rules, detector precision (comments, string literals, `%DO` vs `DO`,
 `if…then do;` blocks, MERGE with vs without BY), batch aggregation, report
 rendering, the config and `use_detectors` switches, retargeting between
 profiles, profile inheritance, and rule-set validation failures.
+
+The log + min-max rescale is covered in its own right: clamping at both ends of
+each window, monotonicity, the two halves of the log property (equal increments
+buy less the further up you are; equal *ratios* are equal steps), the points
+scale spanning exactly `Small`…`Extra Large` and rescaling geometrically,
+weights deciding the mix, volume saturating below `Extra Large`, windows moving
+with the anchor, and the profile validation for `bounds`, `dimension_weights`,
+and an `anchor.dimensions` split that does not sum to `anchor.raw`.
 
 The sizing and cross-file additions bring: Fibonacci banding and monotonicity,
 anchor rescaling in both directions, the chunk-kind floors (including a forced

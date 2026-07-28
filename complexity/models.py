@@ -376,18 +376,34 @@ class FileComplexity(_ComplexityBase):
 
     The three dimensions behind :attr:`size` are reported separately: a LARGE
     file that is large on ``uncertainty_raw`` needs its parse errors
-    investigated, while one large on ``effort_raw`` just needs more hands.
+    investigated, while one large on ``effort_raw`` just needs more hands. Each
+    is carried twice — raw as counted, and ``*_norm`` after the log + min-max
+    rescale that :attr:`points` is derived from — because the two answer
+    different questions: the raw number is the measurement, the normalised one
+    is how much of the scale that measurement actually claimed.
     """
 
     source_id: str
     size: TShirtSize = TShirtSize.SMALL
     # Computed position on the Fibonacci scale — continuous, so it both ranks
     # files within a size and sums across a corpus into a backlog estimate.
+    # Bounded by the scale's own rungs: a file cannot score below SMALL's 2
+    # points or above EXTRA_LARGE's 8, because points are a min-max rescale.
     points: float = 0.0
     # The three declared dimensions, in raw (pre-normalisation) units.
     effort_raw: float = 0.0
     complexity_raw: float = 0.0
     uncertainty_raw: float = 0.0
+    # The same three after the log + min-max rescale that produced `points`,
+    # each on 0-1. Reported because the raw numbers alone no longer explain the
+    # size: a dimension at 1.0 has saturated its window, and one at 0.0 is
+    # below the level where it discriminates at all.
+    effort_norm: float = 0.0
+    complexity_norm: float = 0.0
+    uncertainty_norm: float = 0.0
+    # The weighted mean of the three normalised dimensions, on 0-1 — the single
+    # number `points` is a log-space rescale of.
+    blend: float = 0.0
     chunk_count: int = 0
     line_count: int = 0
     chunks: list[ChunkComplexity] = Field(default_factory=list)
@@ -406,7 +422,12 @@ class FileComplexity(_ComplexityBase):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def raw_total(self) -> float:
-        """Sum of the three dimensions, before scaling to points."""
+        """Sum of the three dimensions, as counted — before any normalisation.
+
+        Not what :attr:`points` scales: each dimension is rescaled separately
+        (see :attr:`effort_norm`). This is the measurement a profile's anchor
+        is stated in, which is what keeps ``anchor.raw`` re-measurable.
+        """
         return round(self.effort_raw + self.complexity_raw + self.uncertainty_raw, 3)
 
     @computed_field  # type: ignore[prop-decorator]
@@ -560,15 +581,20 @@ class CorpusComplexityReport(BaseModel):
                 "",
                 "## File sizes",
                 "",
-                "| File | Size | Points | Tier | Parity | Effort | Cplx | Uncert |",
-                "| --- | --- | ---: | --- | --- | ---: | ---: | ---: |",
+                "| File | Size | Points | Tier | Parity | Effort | Cplx | Uncert "
+                "| Blend |",
+                "| --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: |",
             ]
+            # Raw dimensions with their normalised share alongside, since the
+            # size follows from the second pair of numbers, not the first.
             for f in sorted(self.files, key=lambda x: x.points, reverse=True):
                 lines.append(
                     f"| {f.source_id} | {f.size.label} | {f.points:.1f} "
                     f"| {f.tier} | {f.translation_difficulty} "
-                    f"| {f.effort_raw:.1f} | {f.complexity_raw:.1f} "
-                    f"| {f.uncertainty_raw:.1f} |"
+                    f"| {f.effort_raw:.1f} ({f.effort_norm:.2f}) "
+                    f"| {f.complexity_raw:.1f} ({f.complexity_norm:.2f}) "
+                    f"| {f.uncertainty_raw:.1f} ({f.uncertainty_norm:.2f}) "
+                    f"| {f.blend:.2f} |"
                 )
             lines += [
                 "",
