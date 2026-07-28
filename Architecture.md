@@ -116,19 +116,27 @@ pipeline/
                         response when there is none.
 
 llm_client/
+  tokens.py             Shared tiktoken-backed token estimation: model id ->
+                        encoding by explicit prefix map (o200k_base for the
+                        modern GPT families and every non-OpenAI id,
+                        cl100k_base for older GPTs), ChatML-style message
+                        counting, chars//4 degradation when the encoding
+                        data cannot load. A leaf module.
   client.py             LLMClient / LLMClientConfig: chat-model construction
                         via ChatOpenAI — every model, Claude and Gemini
                         included, is reached over the AI Gateway's
                         OpenAI-compatible API (temperature, max output tokens,
                         endpoint overrides — base_url / api_key / headers /
                         timeout / model_kwargs, proactive InMemoryRateLimiter)
-                        and sync + async invocation (input-token budget ->
-                        InputTokenLimitError, transient-error retry with
-                        exponential backoff). Imports nothing from chunker
-                        or memory.
+                        and sync + async invocation (input-token budget via
+                        llm_client.tokens -> InputTokenLimitError,
+                        transient-error retry with exponential backoff).
+                        Imports nothing from chunker or memory.
 
 memory/
-  turns.py              Dependency-light turn grouping + approx token count,
+  turns.py              Dependency-light turn grouping + the package's
+                        default token counter (tiktoken o200k_base when its
+                        data is loadable, else the ~4-chars/token estimate),
                         shared by relevance and summarize (so summarize never
                         imports the bm25s/faiss stack). A leaf module.
   relevance.py          HybridRanker: shared BM25 (bm25s) + optional dense

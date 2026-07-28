@@ -19,7 +19,7 @@ from langchain_core.messages import BaseMessage
 # faiss is imported lazily inside HybridRanker.index() — the only remaining
 # consumer — so BM25-only pipelines never pay its import cost.
 
-from .turns import approx_token_count, group_turns, turn_text
+from .turns import group_turns, token_count, turn_text
 
 logger = logging.getLogger(__name__)
 
@@ -386,8 +386,8 @@ class RelevantHistorySelector:
         histories that ``top_k`` alone would have passed through whole.
     token_counter : Callable[[str], int] | None
         Counts tokens for the ``max_tokens`` budget. ``None`` (default)
-        uses the offline ~4-chars/token estimate
-        (:func:`memory.turns.approx_token_count`).
+        uses :func:`memory.turns.token_count` — tiktoken ``o200k_base``
+        when available, else the offline ~4-chars/token estimate.
     embeddings : Any | None
         LangChain ``Embeddings`` instance, or a provider string forwarded
         to ``langchain.embeddings.init_embeddings`` (e.g.
@@ -423,7 +423,7 @@ class RelevantHistorySelector:
         self.always_keep_last = always_keep_last
         self.rrf_k = rrf_k
         self.max_tokens = max_tokens
-        self._count_tokens = token_counter or approx_token_count
+        self._count_tokens = token_counter or token_count
         self._ranker = HybridRanker(
             embeddings=embeddings, rrf_k=rrf_k, reranker=reranker
         )

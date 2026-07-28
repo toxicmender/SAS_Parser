@@ -24,7 +24,7 @@ from typing import Any, Callable
 
 from langchain_core.messages import BaseMessage, SystemMessage
 
-from .turns import approx_token_count, group_turns, turn_text
+from .turns import group_turns, token_count, turn_text
 
 logger = logging.getLogger(__name__)
 
@@ -75,8 +75,9 @@ class RollingSummarizer:
     max_summary_words : int
         Word budget given to the summarization prompt.
     token_counter : Callable[[str], int] | None
-        Counter for the trigger threshold. ``None`` (default) uses the
-        offline ~4-chars/token estimate.
+        Counter for the trigger threshold. ``None`` (default) uses
+        :func:`memory.turns.token_count` — tiktoken ``o200k_base`` when
+        available, else the offline ~4-chars/token estimate.
     prompt_template : str | None
         Override the summarization prompt; must accept ``{summary}``,
         ``{turns}``, and ``{max_words}`` placeholders.
@@ -102,7 +103,7 @@ class RollingSummarizer:
         self.trigger_tokens = trigger_tokens
         self.keep_last_turns = keep_last_turns
         self.max_summary_words = max_summary_words
-        self._count_tokens = token_counter or approx_token_count
+        self._count_tokens = token_counter or token_count
         self._prompt_template = prompt_template or _DEFAULT_PROMPT
         self._local: dict[str, dict[str, Any]] = {}
         logger.info(

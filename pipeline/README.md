@@ -15,7 +15,7 @@ the [chunker README](../chunker/README.md).
 ```python
 from pipeline import SasLLMPipeline
 
-pipe    = SasLLMPipeline(model="claude-sonnet-4-5")
+pipe    = SasLLMPipeline()  # model="gpt-5.4" by default
 outputs = pipe.run_files(["macros.sas", "etl.sas", "reports.sas"])
 
 # what the run cost, as the gateway reported it

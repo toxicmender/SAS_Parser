@@ -32,6 +32,8 @@ from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 from langchain_openai import ChatOpenAI
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, SecretStr
 
+from . import tokens
+
 logger = logging.getLogger(__name__)
 
 
@@ -63,8 +65,8 @@ class LLMClientConfig(BaseModel):
     Parameters
     ----------
     model : str
-        Model id as the gateway names it, e.g. ``"claude-sonnet-4-5"``,
-        ``"gpt-5.4"`` or ``"gemini-3.1-pro"`` — it is sent verbatim in the
+        Model id as the gateway names it, e.g. ``"gpt-5.4"`` (the default),
+        ``"claude-sonnet-4-5"`` or ``"gemini-3.1-pro"`` — it is sent verbatim in the
         request body, so an Anthropic- or Google-served model is named
         exactly like an OpenAI one. A leftover LangChain provider prefix
         (``"anthropic:claude-opus-4-6"``) is stripped, since routing is the
@@ -160,17 +162,17 @@ class LLMClientConfig(BaseModel):
         jitter, replacing the backoff) but never waited longer than this, so
         a pathological header value cannot hang the run. Default 300s.
     token_counter : Callable[[list[BaseMessage]], int] | None
-        Custom counter for the input-token budget. ``None`` uses the
-        model's own ``get_num_tokens_from_messages`` — tiktoken, for
-        ``ChatOpenAI``. That counter is only implemented for the GPT
-        families, so for a Claude or Gemini model the client points it at
-        a stand-in vocabulary (``tiktoken_model_name="gpt-5"``): the
-        count is then a real tokenizer run under the wrong vocabulary —
-        an estimate, not that provider's own tokenization, though far
-        closer than the alternative. Pass a counter here when the budget
-        has to be exact. Anything that raises (no tiktoken cache and
-        offline, a fake model without a tokenizer) degrades to a chars//4
-        approximation with a one-time WARNING.
+        Custom counter for the input-token budget. ``None`` (default) uses
+        the shared tiktoken counter (:mod:`llm_client.tokens`), which
+        resolves the encoding from the model id by explicit prefix map:
+        ``o200k_base`` for the modern GPT families **and** for every
+        non-OpenAI id (Claude, Gemini — a real tokenizer run under a
+        stand-in vocabulary; an estimate, though far closer than a guess),
+        ``cl100k_base`` for the older GPT families. Pass a counter here
+        when the budget has to be exact under the provider's own
+        tokenization. When tiktoken cannot load its encoding data (offline,
+        a blocking proxy) counting degrades to a chars//4 approximation
+        with a one-time WARNING.
     model_kwargs : dict[str, Any] | None
         Request-body extras forwarded as ``model_kwargs`` (e.g.
         ``{"top_k": 40}``). These ride along in the ``/chat/completions``
@@ -190,7 +192,7 @@ class LLMClientConfig(BaseModel):
     # wrong-typed entry to the hard default with a WARNING.
     model: str = Field(
         default_factory=lambda: app_config.llm_client_value(
-            "model", "claude-sonnet-4-5"
+            "model", "gpt-5.4"
         ),
         validation_alias=AliasChoices("model", "model_name"),
     )
@@ -605,28 +607,6 @@ def _gateway_model_name(model: str) -> str:
     return bare
 
 
-# langchain-openai's message-level token counter is only implemented for the
-# gpt-3.5-turbo / gpt-4 / gpt-5 families; for any other model name it raises
-# NotImplementedError. Since the gateway serves Claude and Gemini under this
-# same API, counting for those would otherwise always fall through to the
-# chars//4 approximation — much worse than a real tokenizer run under a
-# stand-in vocabulary. So point tiktoken at one.
-_TIKTOKEN_COUNTED_PREFIXES = ("gpt-3.5-turbo", "gpt-4", "gpt-5")
-_TIKTOKEN_PROXY_MODEL = "gpt-5"  # o200k_base, 3 tokens per message
-
-
-def _tiktoken_model_name(model: str) -> str | None:
-    """Stand-in name for token counting, or ``None`` when *model* counts itself.
-
-    The result is an estimate for a non-OpenAI model — vocabularies differ —
-    but a defensible one for enforcing an input-token budget. Callers needing
-    the provider's own tokenization pass ``LLMClientConfig.token_counter``.
-    """
-    if model.startswith(_TIKTOKEN_COUNTED_PREFIXES):
-        return None
-    return _TIKTOKEN_PROXY_MODEL
-
-
 def _as_messages(input: LanguageModelInput) -> list[BaseMessage]:
     if isinstance(input, PromptValue):
         return input.to_messages()
@@ -670,7 +650,6 @@ class LLMClient:
         self, config: LLMClientConfig | None = None, *, llm: Any | None = None
     ) -> None:
         self.config = config or LLMClientConfig()
-        self._warned_approx_counter = False
         self._warned_no_usage = False
         # Tri-state: None = not yet known, True = a cache hit was reported,
         # False = the gateway rejected the breakpoint (strip it from now on).
@@ -755,9 +734,6 @@ class LLMClient:
                     f"against '{cert_path}' ({exc!r}); falling back to the "
                     f"SSL_CERT_FILE export alone"
                 )
-        tiktoken_model = _tiktoken_model_name(model)
-        if tiktoken_model is not None:
-            kwargs["tiktoken_model_name"] = tiktoken_model
         if config.temperature is not None:
             kwargs["temperature"] = config.temperature
         if config.max_output_tokens is not None:
@@ -800,7 +776,7 @@ class LLMClient:
             f"base_url={base_url}  "
             f"timeout={config.timeout}  "
             f"cert_file={config.cert_file}  "
-            f"tiktoken_model={tiktoken_model}  "
+            f"token_encoding={tokens.encoding_name_for_model(model)}  "
             f"api_key={'set' if config.api_key else 'unset'}  "
             f"url_headers={sorted(config.url_headers) if config.url_headers else None}  "
             f"model_kwargs={config.model_kwargs}  "
@@ -815,19 +791,15 @@ class LLMClient:
     # ------------------------------------------------------------------
 
     def count_tokens(self, messages: list[BaseMessage]) -> int:
-        """Count prompt tokens using the configured or model-native counter."""
+        """Count prompt tokens with the configured counter, else the shared
+        tiktoken counter (:mod:`llm_client.tokens`) under this model's
+        encoding — client-owned, so an injected chat model needs no
+        tokenizer of its own. Degrades to chars//4 when tiktoken cannot
+        load its encoding data (one-time WARNING, in ``llm_client.tokens``).
+        """
         if self.config.token_counter is not None:
             return self.config.token_counter(messages)
-        try:
-            return self._model.get_num_tokens_from_messages(messages)
-        except Exception as exc:
-            if not self._warned_approx_counter:
-                logger.warning(
-                    f"count_tokens: model token counter unavailable ({exc!r}); "
-                    f"falling back to chars//4 approximation"
-                )
-                self._warned_approx_counter = True
-            return sum(len(str(m.content)) for m in messages) // 4
+        return tokens.count_messages(messages, model=self.config.model)
 
     def _enforce_input_limit(self, messages: list[BaseMessage]) -> None:
         limit = self.config.max_input_tokens

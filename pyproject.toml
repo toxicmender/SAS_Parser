@@ -19,6 +19,9 @@ dependencies = [
     "pydantic>=2.13.4",
     "pymupdf>=1.28.0",
     "python-dotenv>=1.0",
+    # llm_client.tokens and memory.turns count tokens with it directly (it
+    # already arrives via langchain-openai; declared so that stays true).
+    "tiktoken>=0.7",
 ]
 
 [project.optional-dependencies]

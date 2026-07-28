@@ -127,7 +127,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default="claude-sonnet-4-5",
+        default="gpt-5.4",
         help="Model id (as the AI Gateway names it) for the pipeline under test.",
     )
     parser.add_argument(

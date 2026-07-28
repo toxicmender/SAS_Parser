@@ -121,7 +121,8 @@ class SasLLMPipeline:
     Parameters
     ----------
     model : str
-        Model id as the AI Gateway names it, e.g. ``"claude-sonnet-4-5"``.
+        Model id as the AI Gateway names it, e.g. ``"gpt-5.4"`` (the
+        default) or ``"claude-sonnet-4-5"``.
         Every model reaches the gateway over its OpenAI-compatible API,
         so the name selects the model, not the transport.
     temperature : float | None
@@ -352,7 +353,7 @@ class SasLLMPipeline:
 
     def __init__(
         self,
-        model: str = "claude-sonnet-4-5",
+        model: str = "gpt-5.4",
         *,
         temperature: float | None = None,
         max_input_tokens: int | None = None,

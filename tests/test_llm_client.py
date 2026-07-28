@@ -159,30 +159,36 @@ def test_responses_api_is_pinned_off(monkeypatch):
     assert captured["use_responses_api"] is False
 
 
-@pytest.mark.parametrize(
-    "model, expected",
-    [
-        # langchain-openai counts the GPT families natively...
-        ("gpt-5.4", None),
-        ("gpt-4o", None),
-        # ...and raises NotImplementedError for everything else, so the
-        # gateway's Claude/Gemini models need a stand-in vocabulary or the
-        # budget would be enforced against a chars//4 guess.
-        ("claude-sonnet-4-5", "gpt-5"),
-        ("gemini-3.1-pro", "gpt-5"),
-    ],
-)
-def test_tiktoken_stand_in_for_non_gpt_models(monkeypatch, model, expected):
+@pytest.mark.parametrize("model", ["gpt-5.4", "gpt-4o", "claude-sonnet-4-5"])
+def test_no_tiktoken_model_name_stand_in_is_passed(monkeypatch, model):
+    # Counting is client-owned (llm_client.tokens) since the model-native
+    # counter mis-resolved names like "gpt-5.4"; the stand-in kwarg is gone.
     captured = _capture_init(monkeypatch)
     LLMClient(LLMClientConfig(model=model))
 
-    assert captured.get("tiktoken_model_name") == expected
+    assert "tiktoken_model_name" not in captured
 
 
+def _o200k_base_available() -> bool:
+    """Whether tiktoken can load its encoding data here (cache or network)."""
+    try:
+        import tiktoken
+
+        tiktoken.get_encoding("o200k_base")
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(
+    not _o200k_base_available(),
+    reason="tiktoken o200k_base encoding data unavailable (offline sandbox)",
+)
 def test_non_gpt_model_counts_tokens_without_the_chars_fallback(caplog):
-    # Regression guard for the whole point of the stand-in: a real ChatOpenAI
-    # named after a Claude model must still produce a tokenizer-backed count,
-    # not trip count_tokens' approximation warning.
+    # Regression guard: a client named after a Claude model must produce a
+    # tokenizer-backed count (o200k_base stand-in vocabulary), not trip the
+    # approximation warning. Skips itself where the encoding data cannot be
+    # loaded at all — CI, with network, always runs it.
     client = LLMClient(
         LLMClientConfig(
             model="claude-sonnet-4-5",
@@ -536,22 +542,24 @@ def test_no_budget_means_counter_never_runs():
     assert client.invoke("anything").content == "fine"
 
 
-def test_counter_failure_falls_back_to_chars_over_four():
-    class _NoTokenizerModel:
-        def get_num_tokens_from_messages(self, messages):
-            raise ImportError("no tokenizer installed")
+def test_counter_failure_falls_back_to_chars_over_four(monkeypatch):
+    # An unloadable encoding (offline, blocking proxy) degrades to chars//4
+    # plus the per-message framing constants, and the call still goes out.
+    from llm_client import tokens as tokens_mod
 
-        def invoke(self, messages, config=None):
-            return AIMessage("ok")
-
-    client = LLMClient(LLMClientConfig(max_input_tokens=1_000), llm=_NoTokenizerModel())
-    assert client.count_tokens([HumanMessage("x" * 400)]) == 100  # 400 chars // 4
+    monkeypatch.setattr(tokens_mod, "_encoding", lambda name: None)
+    client = LLMClient(
+        LLMClientConfig(max_input_tokens=1_000),
+        llm=FakeListChatModel(responses=["ok"]),
+    )
+    # 400 chars // 4 + 3 message framing + 3 reply primer
+    assert client.count_tokens([HumanMessage("x" * 400)]) == 106
     assert client.invoke("hello").content == "ok"
 
 
-def test_default_counter_falls_back_to_approximation():
-    # FakeListChatModel's native counter needs the optional ``transformers``
-    # GPT-2 tokenizer; whether or not it is installed, counting must succeed.
+def test_default_counter_needs_no_model_tokenizer():
+    # Counting is client-owned: an injected fake model without a tokenizer
+    # of its own (FakeListChatModel) must still count and invoke fine.
     client = LLMClient(
         LLMClientConfig(max_input_tokens=1_000_000),
         llm=FakeListChatModel(responses=["fine"]),

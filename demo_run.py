@@ -162,7 +162,7 @@ from validation import LiveValidator
 
 logger = logging.getLogger("demo_run")
 
-_DEFAULT_MODEL = "claude-sonnet-4-5"
+_DEFAULT_MODEL = "gpt-5.4"
 
 
 def _discover_sas_files(sas_dir: Path, pattern: str) -> list[str]:
