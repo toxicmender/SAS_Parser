@@ -29,6 +29,15 @@ Public API:
   :class:`CrossFileProfile`, :class:`CorpusComplexityReport`,
   :class:`ComplexitySignal` — result models.
   ``CorpusComplexityReport.to_markdown()`` renders a summary table.
+- :func:`write_reports` / :func:`render_file_report` /
+  :func:`render_overall_report` / :func:`chunk_texts` — the two-level
+  deliverable: one corpus report plus one report per source SAS script, each
+  printing the SAS source behind every verdict it states.
+- :func:`build_evaluation_prompt` / :func:`evaluate_report` /
+  :class:`ComplexityEvaluation` — the optional LLM second opinion, asking a
+  model where the rules are wrong or incomplete. Off unless called, and
+  duck-typed on the client, so this package still depends on nothing but
+  ``chunker`` and ``app_config``.
 - :class:`ComplexityTier`, :class:`TranslationParity`, :class:`TShirtSize` —
   the three scales, plus the :func:`max_tier` / :func:`worst_parity` /
   :func:`max_size` aggregation helpers.
@@ -60,6 +69,16 @@ from .crossfile import (
     CrossFileRef,
 )
 from .detectors import DetectedConstruct, detect_constructs
+from .llm_eval import (
+    ComplexityEvaluation,
+    EvaluationFinding,
+    FileEvaluation,
+    FileEvaluationResult,
+    build_evaluation_prompt,
+    evaluate_file,
+    evaluate_report,
+    evaluation_prompts,
+)
 from .models import (
     BatchComplexity,
     ChunkComplexity,
@@ -76,6 +95,16 @@ from .models import (
     size_rank,
     tier_rank,
     worst_parity,
+)
+from .report import (
+    ChunkTextIndex,
+    WrittenReports,
+    chunk_texts,
+    file_report_paths,
+    render_file_report,
+    render_overall_report,
+    source_stems,
+    write_reports,
 )
 from .rules import (
     DEFAULT_TARGET,
@@ -106,6 +135,24 @@ __all__ = [
     "CorpusComplexityReport",
     "CrossFileProfile",
     "FileComplexity",
+    # Markdown rendering — overall + per source file
+    "ChunkTextIndex",
+    "WrittenReports",
+    "chunk_texts",
+    "file_report_paths",
+    "render_file_report",
+    "render_overall_report",
+    "source_stems",
+    "write_reports",
+    # optional LLM evaluation
+    "ComplexityEvaluation",
+    "EvaluationFinding",
+    "FileEvaluation",
+    "FileEvaluationResult",
+    "build_evaluation_prompt",
+    "evaluate_file",
+    "evaluate_report",
+    "evaluation_prompts",
     # scales + helpers
     "ComplexityTier",
     "TranslationParity",

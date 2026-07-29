@@ -35,18 +35,23 @@ print(report.overall_tier)        # HIGH
 print(report.overall_difficulty)  # MANUAL
 print(report.tier_counts)         # {'LOW': 2, 'MEDIUM': 5, 'HIGH': 2}
 print(report.overall_size)        # EXTRA_LARGE
-print(report.total_points)        # 12.4  — the backlog estimate
+print(report.total_points)        # 13.0  — the backlog estimate
 print(report.to_markdown())       # summary + sizes + hardest-units table
 
 for item in report.hardest(5):
     print(item.tier, item.translation_difficulty, item.rationale)
 
 for f in report.files:
-    print(f.source_id, f.size.label, f.points)
+    print(f.source_id, f.size.label, f.points)   # points are 2 / 3 / 5 / 8
 
 for f in report.files_needing_breakdown:      # the Extra Large ones
     print(f.source_id, "→ split at", f.suggested_split)
 ```
+
+The delivery format is two levels of Markdown — one corpus report plus one per
+source script, each printing the SAS behind every verdict — see
+[Two reports, not one](#two-reports-not-one). An optional LLM pass adds what the
+rules cannot see; see [The LLM evaluation](#the-llm-evaluation).
 
 ## CLI
 
@@ -54,18 +59,124 @@ The report's delivery format is Markdown:
 
 ```bash
 python -m complexity path/to/sas_dir --out complexity-report.md
+python -m complexity path/to/sas_dir --out-dir reports/
 python -m complexity path/to/sas_dir --target pyspark --top 25
 ```
 
-Without `--out` the Markdown goes to stdout. The CLI chunks every matching
-file, batches the whole corpus with `MultiFileBatcher` — so cross-file
+Without `--out` or `--out-dir` the Markdown goes to stdout. The CLI chunks every
+matching file, batches the whole corpus with `MultiFileBatcher` — so cross-file
 dataset/macro edges resolve into shared batches — and scores the *batched*
 units, the same work items the pipeline would translate, so an estimate lines
 up with the run it is estimating. `--no-cross-file` scores every file as if it
 were alone; `--size-anchor` recalibrates the T-shirt scale (lowering it rates
 every file larger); `--min-story-points` / `--max-story-points` report the
 points on your own scale instead of the Fibonacci 2-8. Nothing here calls an
-LLM or touches the network.
+LLM or touches the network unless you ask for
+[the LLM evaluation](#the-llm-evaluation).
+
+## Two reports, not one
+
+`--out-dir` writes the whole deliverable:
+
+```
+reports/
+  complexity-report.md      the corpus: sizes, backlog total, hardest units
+  files/
+    load.md                 one report per source SAS script
+    report.md
+```
+
+The corpus report is `CorpusComplexityReport.to_markdown()` with an index of the
+individual ones appended. Each **individual** report answers the question the
+corpus one cannot — *what is in this file, and why did it score that?* — so it
+carries the file's dimensions, its cross-file coupling, its drivers table, and
+then every chunk with its verdict **and its SAS source**:
+
+````markdown
+### `f1-chunk-0001` — MACRO_DEFINITION (lines 1–9)
+
+- Tier **HIGH** · parity **MANUAL** · score 21.00
+- HIGH tier driven by kind:MACRO_DEFINITION, array, do_loop; …
+
+Signals:
+
+- array [HIGH/HARD]: ARRAY array x — aliases a group of columns, not a Spark
+  ArrayType; needs wide-to-long restructuring, not explode()
+
+```sas
+%macro load(lib=raw);
+  data work.a;
+    array x{3} v1-v3;
+```
+````
+
+Printing the source is the point: a verdict a reader has to go and look up in
+another file is a verdict they will not check. `--no-source-text` drops it and
+`--max-chunk-lines N` caps each snippet.
+
+The text is **passed in**, not read off the verdict — a `ChunkComplexity`
+carries no `text` field, because a verdict model that embedded its own source
+would double the size of every serialised report and duplicate what the chunker
+already holds. `chunk_texts()` builds the lookup:
+
+```python
+from complexity import ComplexityAnalyzer, chunk_texts, write_reports
+
+batch_result = MultiFileBatcher().batch(corpus)
+report = ComplexityAnalyzer().analyze_items(batch_result.all_ordered_items)
+write_reports(report, "reports/", texts=chunk_texts(batch_result.all_ordered_items))
+```
+
+Build the lookup from **the same items you scored**. `MultiFileBatcher` re-ids
+every chunk per file (`f1-chunk-0001`), so one built from the unbatched corpus
+would match nothing. It is keyed `(source_id, chunk_id)` rather than on the id
+alone for the same reason `crossfile.py` is: files are chunked independently, so
+two files' first chunks share an id.
+
+## The LLM evaluation
+
+Everything above is rule-driven, which is both its strength and its ceiling. It
+counts constructs, not intent, so it cannot see business rules packed into one
+arithmetic-heavy DATA step (which scores `0.0`), a `DO` loop that is really a
+join, hard-coded environment assumptions, or a step whose output nothing
+consumes.
+
+`--llm-eval` asks a model for exactly that, one call per file:
+
+```bash
+python -m complexity path/to/sas_dir --out-dir reports/ --llm-eval
+python -m complexity path/to/sas_dir --out-dir reports/ --llm-eval --eval-top 5
+python -m complexity path/to/sas_dir --out-dir reports/ --prompt-only
+```
+
+The prompt hands the model the file's measured verdict, its drivers, its
+coupling, and its full SAS source, and asks where the static numbers are wrong
+or incomplete: a purpose, a size verdict (`agree` / `larger` / `smaller`) with a
+justification, P0/P1/P2 findings the construct rules missed, manual steps, split
+points, and open questions. The static analysis is the ground the prompt stands
+on, not something the model is asked to reproduce — *"Do not re-derive the
+numbers below and do not restate the drivers table. Argue with it."*
+
+The result lands in `reports/llm-evaluation.md`. `--eval-top N` evaluates only
+the N largest files, since every file is a paid call. `--prompt-only` writes the
+prompts to `reports/prompts/` and calls nothing, so the prompt can be read and
+tuned for free.
+
+```python
+from complexity import build_evaluation_prompt, evaluate_report
+
+print(build_evaluation_prompt(report.files[0], texts=texts))   # offline
+evaluation = evaluate_report(llm, report, texts=texts)         # one call per file
+print(evaluation.to_markdown())
+```
+
+`llm` is anything with a LangChain-style `invoke(input) -> message` — an
+`llm_client.LLMClient` (which additionally gets a typed answer, since
+`invoke_structured` is used when offered), a raw chat model, or a fake in tests.
+So this package still depends on nothing but `chunker` and `app_config`, and on
+`pipeline` not at all. A reply that will not parse is kept as prose with the
+reason, and the other files still get their evaluations: one bad reply must not
+cost a corpus its run.
 
 Score against a different output language by naming its profile:
 
@@ -330,26 +441,42 @@ than the gap between Large and Extra Large:
 | `Large` | 5 | ≤ 6.5 |
 | `Extra Large` | 8 | above 6.5 |
 
-Bands sit at the geometric midpoints of the rungs. The blend becomes points by
-the same move as the dimensions themselves — a min-max rescale, applied **in
-log space**, between the ends of the scale:
+Bands sit at the geometric midpoints of the rungs. The blend reaches those
+bands by the same move as the dimensions themselves — a min-max rescale,
+applied **in log space**, between the ends of the scale:
 
 ```
-points = min_story_points × (max_story_points / min_story_points) ^ blend
+position = min_story_points × (max_story_points / min_story_points) ^ blend
 ```
 
-so a blend of `0` is exactly `Small`'s 2 points, a blend of `1` exactly
-`Extra Large`'s 8, and the reference file lands on `3.0` by calibration. Log
-space for the same reason the rungs are Fibonacci: equal steps of evidence
-should be equal *ratios* of points, not equal differences.
+so a blend of `0` is exactly `Small`'s 2, a blend of `1` exactly `Extra
+Large`'s 8, and the reference file lands on `3.01` by calibration. Log space
+for the same reason the rungs are Fibonacci: equal steps of evidence should be
+equal *ratios*, not equal differences.
 
-Points are therefore **bounded by the scale** — no file scores 0.2 points or
-14. That is a change from an open-ended ratio, and a deliberate one: a size of
-`Small` means 2 points, and a scale whose bottom rung reports a tenth of its
-own nominal value is not a scale. Because points are continuous they still
-**sum**: `report.total_points` is a backlog estimate for the whole migration,
-which a purely qualitative label could never give you — read as "n files at
-2-8 points each", not as an absolute quantity of days.
+That `position` is what the **banding** reads. It is not what a file
+**reports**. `FileComplexity.points` is its size's rung — always 2, 3, 5, or 8
+— and the un-snapped position is kept alongside as `continuous_points`.
+
+Reporting the rung rather than the position is the point of a Fibonacci scale,
+not a rounding convenience. The gaps widen with the number precisely so that
+nobody is asked to defend an 8 against a 9; a file reported at `6.77` has
+quietly reintroduced the precision the method exists to refuse, and invites a
+reader to compare two files that no team could tell apart. It also removes a
+contradiction the continuous number could not avoid: a short `%MACRO` floors at
+`Medium` (see [Floors](#floors)) while its position stays at `2.00`, so the old
+scheme labelled a file `Medium` and printed `Small`'s number next to it. Points
+now follow the **final** size, floors included.
+
+`continuous_points` keeps what the rung gives up. A rung cannot rank two files
+*inside* one size, and an anchor is calibrated against the position rather than
+the rung it lands on, so both are reported — every table here orders on
+`(points, continuous_points)`, since most files tie on the first.
+
+Points still **sum**: `report.total_points` is a backlog estimate for the whole
+migration, which a purely qualitative label could never give you — read as "n
+files at 2-8 points each", not as an absolute quantity of days. Summing deck
+entries is exactly how a sprint backlog is totalled.
 
 #### Estimating on your own scale
 
@@ -374,6 +501,22 @@ point values, so the same file gets the same `blend` and the same `TShirtSize`
 whichever scale is reporting it — the reference file lands mid-`Medium` on 1-13
 exactly as it does on 2-8. `min` must be greater than zero: points are rescaled
 geometrically, so the smallest size cannot be worth nothing.
+
+The re-denominated rungs stay on the deck. Both **ends are kept exactly** as
+asked for, and the two interior rungs are re-derived at their geometric
+positions and snapped back to the nearest Fibonacci number — measured in log
+space, so `4` snaps to `5` rather than `3`. On 1-13 the rungs are therefore
+`1 / 2 / 5 / 13`, not `1 / 2.11 / 5.42 / 13`:
+
+```python
+ComplexityAnalyzer(min_story_points=1, max_story_points=13)
+# Small 1, Medium 2, Large 5, Extra Large 13
+```
+
+Where a range is too narrow to hold four distinct deck entries the un-snapped
+value stands for that rung, with a DEBUG line saying so. Monotonicity wins over
+Fibonacci there: the progression is worth having, but not at the price of two
+sizes reporting the same number.
 
 ### Extra Large means *split this*
 
@@ -411,24 +554,29 @@ the floor actually changed the answer.
 Measured, not estimated — these are real outputs at the shipped anchor, each
 dimension shown as `raw (normalised)`:
 
-| File | Effort | Cplx | Uncert | Blend | Points | Size |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Config only: 3 `%LET` + 1 `LIBNAME` | 2.0 (0.00) | 2.5 (0.00) | 0.0 (0.00) | 0.00 | 2.00 | Small |
-| Thin macro wrapper, 1 step, 2 params | 2.5 (0.00) | 21.0 (0.00) | 0.0 (0.00) | 0.00 | 2.00 | Medium *(floored)* |
-| 12 plain DATA steps | 42.1 (0.16) | 0.0 (0.00) | 0.0 (0.00) | 0.14 | 2.44 | Small |
-| **The reference file** (see the anchor) | 50.0 (0.25) | 37.5 (0.14) | 0.0 (0.00) | 0.29 | 3.01 | **Medium** |
-| Macro-heavy: array, DO, 12 merges | 57.3 (0.32) | 49.0 (0.34) | 0.0 (0.00) | 0.45 | 3.74 | Medium |
-| 50 plain DATA steps | 175.5 (0.91) | 0.0 (0.00) | 0.0 (0.00) | 0.80 | 6.04 | Large |
-| 80 plain DATA steps | 280.8 (1.00) | 0.0 (0.00) | 0.0 (0.00) | 0.88 | 6.77 | Extra Large |
-| Bulk **and** hard: 45 merge steps behind a macro of arrays, DO forms, `LAG`, `CALL EXECUTE` | 212.9 (1.00) | 175.5 (1.00) | 0.0 (0.00) | 1.00 | 8.00 | Extra Large |
+`Position` is the continuous `continuous_points`, which the banding read;
+`Points` is the reported estimate, always a deck entry.
 
-Three things worth reading off that table. The reference file lands on 3.0
-points, which is what "anchored at Medium" means. The 50- and 80-step files
-rate `Large` and `Extra Large` on **volume alone** — their complexity term is
-`0.0`, because nothing in them is individually notable — which is precisely the
-case a tier cannot express, and the reason sizing exists. And the last row
+| File | Effort | Cplx | Uncert | Blend | Position | Size | Points |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| Config only: 3 `%LET` + 1 `LIBNAME` | 2.0 (0.00) | 2.5 (0.00) | 0.0 (0.00) | 0.00 | 2.00 | Small | 2 |
+| Thin macro wrapper, 1 step, 2 params | 2.5 (0.00) | 21.0 (0.00) | 0.0 (0.00) | 0.00 | 2.00 | Medium *(floored)* | 3 |
+| 12 plain DATA steps | 42.1 (0.16) | 0.0 (0.00) | 0.0 (0.00) | 0.14 | 2.44 | Small | 2 |
+| **The reference file** (see the anchor) | 50.0 (0.25) | 37.5 (0.14) | 0.0 (0.00) | 0.29 | 3.01 | **Medium** | **3** |
+| Macro-heavy: array, DO, 12 merges | 57.3 (0.32) | 49.0 (0.34) | 0.0 (0.00) | 0.45 | 3.74 | Medium | 3 |
+| 50 plain DATA steps | 175.5 (0.91) | 0.0 (0.00) | 0.0 (0.00) | 0.80 | 6.04 | Large | 5 |
+| 80 plain DATA steps | 280.8 (1.00) | 0.0 (0.00) | 0.0 (0.00) | 0.88 | 6.77 | Extra Large | 8 |
+| Bulk **and** hard: 45 merge steps behind a macro of arrays, DO forms, `LAG`, `CALL EXECUTE` | 212.9 (1.00) | 175.5 (1.00) | 0.0 (0.00) | 1.00 | 8.00 | Extra Large | 8 |
+
+Four things worth reading off that table. The reference file lands mid-`Medium`
+and reports `3`, which is what "anchored at Medium" means. The 50- and 80-step
+files rate `Large` and `Extra Large` on **volume alone** — their complexity term
+is `0.0`, because nothing in them is individually notable — which is precisely
+the case a tier cannot express, and the reason sizing exists. The last row
 reaches the ceiling from both directions at once, which is what a file nobody
-should start without splitting looks like.
+should start without splitting looks like. And row two is why points follow the
+size rather than the position: its position is `2.00`, but the `%MACRO` floor
+makes it a `Medium`, so it is estimated at `3`.
 
 ### References
 
@@ -619,6 +767,12 @@ crossfile.py   CrossFileIndex — resolves macro/dataset/macro-var/libref
                references across the corpus into import / export / unresolved.
 analyzer.py    ComplexityAnalyzer — aggregation and sizing only; owns no tier
                of its own.
+report.py      Markdown rendering: the corpus report plus one report per source
+               SAS script, each printing the source behind every verdict.
+               Rendering only — scores nothing, calls nothing.
+llm_eval.py    The optional second opinion: the evaluation prompt, the shape
+               asked back, and the invocation. Duck-typed on the client, so the
+               package gains no LLM dependency.
 ```
 
 ## Where signals come from
@@ -715,8 +869,9 @@ batched run.
 
 ## Tests
 
-`tests/test_complexity.py` — 156 tests, no LLM and (apart from the rule-set
-loader's own tests, which write temp profiles) no disk I/O. Covers each tier
+`tests/test_complexity.py` — 189 tests, no LLM (the evaluation is exercised
+through fakes) and no disk I/O apart from the tests that are about disk: the
+rule-set loader's, and the report writer's and CLI's. Covers each tier
 against the constructs the brief names, the max-tier/worst-parity aggregation
 rules, detector precision (comments, string literals, `%DO` vs `DO`,
 `if…then do;` blocks, MERGE with vs without BY), batch aggregation, report
@@ -735,6 +890,16 @@ sum to `anchor.raw`. A story-point range set in the profile, in `config.json`,
 or per analyzer is asserted to re-denominate `points` while leaving every
 `blend` and every `TShirtSize` untouched.
 
+The Fibonacci reporting has its own set: every file's `points` is a deck entry
+and equals its size's rung (over a corpus spanning at least three sizes, so the
+assertion is not vacuous); `continuous_points` still separates two files that
+tie on the rung; the floored `%MACRO` case reports `Medium`'s 3 while its
+position stays below 2.5, which is the contradiction the snap removes; the
+nearest-entry search is geometric (`4 → 5`, not `3`) and idempotent on the deck;
+re-denominating to 1-13 keeps both ends and snaps the interior to `1/2/5/13`;
+and a range too narrow for four entries falls back to un-snapped rungs rather
+than emitting two sizes with the same number.
+
 The sizing and cross-file additions bring: Fibonacci banding and monotonicity,
 anchor rescaling in both directions, the chunk-kind floors (including a forced
 case where the `MACRO_DEFINITION` floor actually binds), `Extra Large` implying
@@ -746,6 +911,17 @@ flagged, librefs assigned in another chunk of the same file, chunk-id collision
 across independently chunked files, a batch spanning two files still yielding
 two file rollups, and catalogue coverage in both directions — every construct
 `crossfile.py` can emit has a profile entry, and every entry is reachable.
+
+The reporting and evaluation additions bring: the text lookup keyed by source
+*and* chunk id (so two files sharing a chunk id do not collide, and a lookup
+built from batched items carries the re-ided keys), every mentioned chunk's SAS
+appearing in its file's report, `--no-source-text` and `--max-chunk-lines`,
+a missing snippet rendering a placeholder rather than vanishing, two scripts
+sharing a basename getting distinct report files, the corpus report gaining an
+index without otherwise changing, the prompt carrying verdict and source and
+being built with nothing called, and the three replies an evaluation has to
+survive — a structured one, JSON recovered from prose, and an unusable one kept
+as prose — plus a client that raises failing only its own file.
 
 ```
 python -m pytest tests/test_complexity.py -v

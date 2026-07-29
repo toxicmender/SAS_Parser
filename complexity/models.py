@@ -103,15 +103,19 @@ class TShirtSize(StrEnum):
 
     @property
     def points(self) -> int:
-        """Nominal story points for this rung (Fibonacci: 2, 3, 5, 8).
+        """Story points for this rung (Fibonacci: 2, 3, 5, 8).
 
-        The bridge from a qualitative size to a summable quantity. A profile's
-        ``sizes.scale`` may restate these; this is the default the bands are
-        calibrated against, and :attr:`FileComplexity.points` carries the
-        *computed* continuous value rather than the rung's nominal one — on
-        whatever range ``sizes.story_points`` (or ``complexity.min_story_points``
-        / ``max_story_points``) asks for, which re-denominates the numbers
-        without moving a size.
+        The bridge from a qualitative size to a summable quantity, and what a
+        file actually reports: :attr:`FileComplexity.points` is its size's
+        rung, so every estimate in a report is a planning-poker deck entry
+        rather than a point somewhere between two of them.
+
+        A profile's ``sizes.scale`` may restate these, and
+        ``sizes.story_points`` (or ``complexity.min_story_points`` /
+        ``max_story_points``) re-denominates them onto another range without
+        moving a size — see :meth:`complexity.rules.SizeModel.rung_points`,
+        which is the authority once a profile or config is in play. This table
+        is the default the bands are calibrated against.
         """
         return _SIZE_POINTS[self]
 
@@ -388,12 +392,19 @@ class FileComplexity(_ComplexityBase):
 
     source_id: str
     size: TShirtSize = TShirtSize.SMALL
-    # Computed position on the story-point scale — continuous, so it both ranks
-    # files within a size and sums across a corpus into a backlog estimate.
-    # Bounded by the scale's ends (the Fibonacci 2 and 8 unless a profile or
-    # config says otherwise), because points are a min-max rescale. Changing
-    # those ends re-denominates this number and never changes `size`.
+    # The estimate, and always a Fibonacci number: this file's size's rung on
+    # the planning-poker deck (2 / 3 / 5 / 8 unless a profile or config
+    # re-denominates the scale). Reported rather than the continuous position
+    # below because estimation is deliberately coarse — the rungs widen so that
+    # nobody has to defend an 8 against a 9 — and because a floored size whose
+    # points came from the un-floored banding contradicts its own label.
+    # Summable, so `CorpusComplexityReport.total_points` is a backlog estimate.
     points: float = 0.0
+    # The un-snapped position on that scale, which is what the banding read.
+    # Kept because the rung alone cannot rank two files inside one size, and
+    # because a profile's anchor is calibrated against this number, not the
+    # rung it lands on.
+    continuous_points: float = 0.0
     # The three declared dimensions, in raw (pre-normalisation) units.
     effort_raw: float = 0.0
     complexity_raw: float = 0.0
@@ -526,10 +537,15 @@ class CorpusComplexityReport(BaseModel):
 
     @property
     def files_needing_breakdown(self) -> list[FileComplexity]:
-        """Files rated EXTRA_LARGE, largest first — split these before starting."""
+        """Files rated EXTRA_LARGE, largest first — split these before starting.
+
+        Every one of them reports the same points (they are all on the top
+        rung), so the continuous position breaks the tie — that is what it is
+        for.
+        """
         return sorted(
             (f for f in self.files if f.needs_breakdown),
-            key=lambda f: f.points,
+            key=lambda f: (f.points, f.continuous_points),
             reverse=True,
         )
 
@@ -591,7 +607,13 @@ class CorpusComplexityReport(BaseModel):
             ]
             # Raw dimensions with their normalised share alongside, since the
             # size follows from the second pair of numbers, not the first.
-            for f in sorted(self.files, key=lambda x: x.points, reverse=True):
+            # Ordered on the continuous position too: points are deck entries,
+            # so most files tie on them.
+            for f in sorted(
+                self.files,
+                key=lambda x: (x.points, x.continuous_points),
+                reverse=True,
+            ):
                 lines.append(
                     f"| {f.source_id} | {f.size.label} | {f.points:.1f} "
                     f"| {f.tier} | {f.translation_difficulty} "
