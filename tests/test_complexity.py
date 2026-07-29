@@ -589,8 +589,13 @@ class TestTShirtSize(unittest.TestCase):
         f = _analyze("%macro noop;\n%mend noop;\n").files[0]
         self.assertEqual(f.size, TShirtSize.MEDIUM)
         self.assertEqual(f.floored_by, "MACRO_DEFINITION")
-        # The floor is what did it, not the banding.
-        self.assertLess(f.points, 2.5)
+        # The floor is what did it, not the banding: the un-snapped position
+        # is still below the Small/Medium boundary.
+        self.assertLess(f.continuous_points, 2.5)
+        # The reported estimate follows the *floored* size, so the label and
+        # the number agree. Reporting the banding's 2.x under a Medium label
+        # is exactly what a rung-valued estimate exists to prevent.
+        self.assertEqual(f.points, 3.0)
 
     def test_config_only_file_stays_small(self):
         f = _analyze("%let a = 1;\n%let b = 2;\n%let c = 3;\n").files[0]
@@ -796,6 +801,94 @@ class TestDimensionRescale(unittest.TestCase):
     def test_markdown_shows_the_normalised_share(self):
         md = _analyze("data a; set b; run;\n").to_markdown()
         self.assertIn("| Blend |", md)
+
+
+class TestFibonacciStoryPoints(unittest.TestCase):
+    """A reported estimate is always a planning-poker deck entry."""
+
+    SOURCES = (
+        "%let a = 1;\n",
+        "%macro noop;\n%mend noop;\n",
+        "".join(f"data out{i}; set in{i}; run;\n" for i in range(12)),
+        _reference_file_source(),
+        "".join(f"data out{i}; set in{i}; run;\n" for i in range(50)),
+        "".join(f"data out{i}; set in{i}; run;\n" for i in range(80)),
+    )
+
+    def test_every_file_reports_a_fibonacci_number(self):
+        for source in self.SOURCES:
+            f = _analyze(source).files[0]
+            self.assertIn(f.points, (2.0, 3.0, 5.0, 8.0), source[:30])
+
+    def test_points_are_the_size_rung(self):
+        """The number and the label always agree, floors included."""
+        expected = {
+            TShirtSize.SMALL: 2.0,
+            TShirtSize.MEDIUM: 3.0,
+            TShirtSize.LARGE: 5.0,
+            TShirtSize.EXTRA_LARGE: 8.0,
+        }
+        seen = set()
+        for source in self.SOURCES:
+            f = _analyze(source).files[0]
+            self.assertEqual(f.points, expected[f.size], source[:30])
+            seen.add(f.size)
+        # The corpus above spans the scale, so this is not vacuous.
+        self.assertGreaterEqual(len(seen), 3, seen)
+
+    def test_the_continuous_position_is_kept_alongside(self):
+        """It still ranks two files inside one rung, which points cannot."""
+        small = _analyze(self.SOURCES[0]).files[0]
+        busier = _analyze(self.SOURCES[2]).files[0]
+        self.assertEqual(small.points, busier.points)
+        self.assertLess(small.continuous_points, busier.continuous_points)
+
+    def test_total_points_sums_deck_entries(self):
+        report = ComplexityAnalyzer().analyze_corpus(
+            _corpus(a=self.SOURCES[0], b=self.SOURCES[3], c=self.SOURCES[5])
+        )
+        self.assertEqual(
+            report.total_points, round(sum(f.points for f in report.files), 1)
+        )
+        for f in report.files:
+            self.assertIn(f.points, rules.FIBONACCI_POINTS)
+
+    def test_nearest_deck_entry_is_geometric(self):
+        """4 sits nearer 5 than 3 on a scale whose steps are ratios."""
+        self.assertEqual(rules._nearest_fibonacci(4.0), 5.0)
+        self.assertEqual(rules._nearest_fibonacci(3.4), 3.0)
+        self.assertEqual(rules._nearest_fibonacci(0.1), 1.0)
+        self.assertEqual(rules._nearest_fibonacci(10_000.0), 377.0)
+        for entry in rules.FIBONACCI_POINTS:
+            self.assertEqual(rules._nearest_fibonacci(entry), entry)
+
+    def test_default_rungs_are_the_profiles_own(self):
+        sizes = rules.load_ruleset("sparksql").sizes
+        self.assertEqual(
+            [sizes.points_for_size(s) for s in TShirtSize], [2.0, 3.0, 5.0, 8.0]
+        )
+
+    def test_a_redenominated_scale_keeps_its_ends_and_snaps_the_middle(self):
+        sizes = replace(
+            rules.load_ruleset("sparksql").sizes,
+            min_story_points=1.0,
+            max_story_points=13.0,
+        )
+        self.assertEqual(
+            [sizes.points_for_size(s) for s in TShirtSize], [1.0, 2.0, 5.0, 13.0]
+        )
+
+    def test_rungs_stay_strictly_increasing_on_a_narrow_scale(self):
+        """Too narrow for four deck entries: monotonicity wins over Fibonacci."""
+        sizes = replace(
+            rules.load_ruleset("sparksql").sizes,
+            min_story_points=1.0,
+            max_story_points=2.0,
+        )
+        rungs = [sizes.points_for_size(s) for s in TShirtSize]
+        self.assertEqual(rungs, sorted(rungs))
+        self.assertEqual(len(set(rungs)), 4, rungs)
+        self.assertEqual((rungs[0], rungs[-1]), (1.0, 2.0))
 
 
 class TestStoryPointRange(unittest.TestCase):
@@ -1667,6 +1760,27 @@ _LOAD_SAS = (
 _REPORT_SAS = "proc sql;\n  create table work.b as select * from work.a;\nquit;\n"
 
 
+def _evaluated(evaluation, source_id: str):
+    """The FileEvaluationResult for *source_id*, failing loudly if absent."""
+    result = evaluation.for_source(source_id)
+    if result is None:
+        raise AssertionError(
+            f"no evaluation for {source_id!r}; have "
+            f"{[f.source_id for f in evaluation.files]}"
+        )
+    return result
+
+
+def _assessment(evaluation, source_id: str):
+    """The parsed FileEvaluation for *source_id*, failing loudly if absent."""
+    result = _evaluated(evaluation, source_id)
+    if result.evaluation is None:
+        raise AssertionError(
+            f"{source_id!r} was not parsed: {result.error} / {result.prose[:80]!r}"
+        )
+    return result.evaluation
+
+
 def _batched(**files: str):
     """Chunk, batch, and score *files*; return ``(report, texts)``.
 
@@ -1932,10 +2046,11 @@ class TestLLMEvaluation(unittest.TestCase):
         self.assertEqual(len(evaluation.files), len(self.report.files))
         self.assertEqual(evaluation.failures, [])
         self.assertEqual(evaluation.model, "fake-structured")
-        result = evaluation.for_source("load.sas")
-        self.assertIsNotNone(result)
-        self.assertEqual(result.evaluation.size_verdict, "larger")
-        self.assertEqual(result.static_size, _file(self.report, "load.sas").size.label)
+        self.assertEqual(_assessment(evaluation, "load.sas").size_verdict, "larger")
+        self.assertEqual(
+            _evaluated(evaluation, "load.sas").static_size,
+            _file(self.report, "load.sas").size.label,
+        )
         # One call per file, each carrying that file's source.
         self.assertEqual(len(llm.prompts), len(self.report.files))
         self.assertIn("array x{3} v1-v3;", llm.prompts[0] + llm.prompts[1])
@@ -1948,16 +2063,14 @@ class TestLLMEvaluation(unittest.TestCase):
     def test_json_in_a_prose_reply_is_recovered(self):
         evaluation = evaluate_report(_ProseFake(), self.report, texts=self.texts)
         self.assertEqual(evaluation.failures, [])
-        self.assertEqual(
-            evaluation.for_source("load.sas").evaluation.size_verdict, "larger"
-        )
+        self.assertEqual(_assessment(evaluation, "load.sas").size_verdict, "larger")
 
     def test_an_unusable_reply_is_kept_as_prose_rather_than_raising(self):
         evaluation = evaluate_report(
             _ProseFake(reply="I could not do that."), self.report, texts=self.texts
         )
         self.assertEqual(len(evaluation.failures), len(self.report.files))
-        result = evaluation.for_source("load.sas")
+        result = _evaluated(evaluation, "load.sas")
         self.assertFalse(result.ok)
         self.assertIn("I could not do that.", result.prose)
         self.assertTrue(result.error)

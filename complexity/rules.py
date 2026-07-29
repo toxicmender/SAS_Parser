@@ -169,6 +169,29 @@ _DEFAULT_DIMENSION_WEIGHTS: dict[str, float] = {
 DEFAULT_MIN_STORY_POINTS = 2.0
 DEFAULT_MAX_STORY_POINTS = 8.0
 
+# The planning-poker deck. A reported estimate is always one of these, because
+# that is what makes the progression Fibonacci rather than merely
+# Fibonacci-inspired: the gaps widen with the number precisely so that nobody
+# is asked to distinguish an 8 from a 9, and a scale that reports 6.77 has
+# quietly reintroduced the precision the method exists to refuse.
+FIBONACCI_POINTS: tuple[float, ...] = (
+    1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0, 55.0, 89.0, 144.0, 233.0, 377.0,
+)
+
+
+def _nearest_fibonacci(value: float) -> float:
+    """The deck entry closest to *value*, measured **geometrically**.
+
+    Log distance, not linear, for the same reason the rungs are Fibonacci at
+    all: on a geometric scale 4 is nearer to 5 than to 3, even though the
+    arithmetic gaps are equal. Values outside the deck clamp to its ends.
+    """
+    if value <= FIBONACCI_POINTS[0]:
+        return FIBONACCI_POINTS[0]
+    if value >= FIBONACCI_POINTS[-1]:
+        return FIBONACCI_POINTS[-1]
+    return min(FIBONACCI_POINTS, key=lambda f: abs(math.log(f / value)))
+
 
 def _log_fraction(value: float, low: float, high: float) -> float:
     """Where *value* sits between *low* and *high*, measured in log space.
@@ -358,10 +381,70 @@ class SizeModel:
             else high,
         )
 
+    def rung_points(self) -> dict[TShirtSize, float]:
+        """The story points each size is **reported** as — one deck entry each.
+
+        This is what a file's ``points`` is, and it is always a Fibonacci
+        number: an estimate of 2, 3, 5, or 8, never the 6.77 a continuous
+        rescale would land on. Estimation is deliberately coarse — the rungs
+        widen so that nobody has to defend an 8 against a 9 — so reporting the
+        un-snapped position would claim a precision the method disclaims, and
+        would let two files a team cannot tell apart carry different numbers.
+
+        On the profile's own scale these are the profile's rungs verbatim
+        (Fibonacci 2/3/5/8 by default), so a stated calibration is never
+        silently overridden. Re-denominating onto another range
+        (``min_story_points`` / ``max_story_points``) keeps **both ends
+        exactly** as asked for and re-derives the two interior rungs at their
+        geometric positions, snapped back onto the deck: 1-13 reports
+        1/2/5/13. Where a range is too narrow for four distinct deck entries
+        the un-snapped value stands for that rung, because a scale whose rungs
+        collide has stopped being a scale — Fibonacci is worth having, but not
+        at the cost of two sizes reporting the same number.
+        """
+        scale_low = self.scale.get(TShirtSize.SMALL, DEFAULT_MIN_STORY_POINTS)
+        scale_high = self.scale.get(
+            TShirtSize.EXTRA_LARGE, DEFAULT_MAX_STORY_POINTS
+        )
+        low, high = self.story_point_range
+        if (low, high) == (scale_low, scale_high):
+            return dict(self.scale)
+
+        rungs = {TShirtSize.SMALL: low, TShirtSize.EXTRA_LARGE: high}
+        previous = low
+        for size in (TShirtSize.MEDIUM, TShirtSize.LARGE):
+            nominal = self.scale.get(size, _DEFAULT_SIZE_SCALE[size])
+            position = _log_fraction(nominal, scale_low, scale_high)
+            exact = (
+                low * (high / low) ** position
+                if low > 0 and high > low
+                else low + position * (high - low)
+            )
+            snapped = _nearest_fibonacci(exact)
+            if not previous < snapped < high:
+                logger.debug(
+                    f"rung_points: {size.value} snaps to {snapped} on the "
+                    f"{low}-{high} scale, which would collide; keeping "
+                    f"{exact:.2f}"
+                )
+                snapped = exact
+            rungs[size] = round(snapped, 2)
+            previous = rungs[size]
+        return rungs
+
+    def points_for_size(self, size: TShirtSize) -> float:
+        """The story points *size* is reported as (see :meth:`rung_points`)."""
+        return self.rung_points()[size]
+
     def points_for(
         self, effort: float, complexity: float = 0.0, uncertainty: float = 0.0
     ) -> float:
-        """Convert the three raw dimensions to points on the story-point scale.
+        """The continuous position on the scale, which the banding reads.
+
+        Not what a file reports — :meth:`points_for_size` is, and it snaps to
+        the deck. This is the un-rounded number behind that verdict: it is what
+        :meth:`band_for` bands, what ranks two files *within* one size, and
+        what a profile's anchor is re-measured against.
 
         The blend is min-max rescaled **in log space** — geometrically between
         the ends of :attr:`story_point_range` — for the same reason the default

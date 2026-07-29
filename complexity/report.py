@@ -238,7 +238,8 @@ def render_file_report(
         f"# Complexity report — {file.source_id}",
         "",
         f"- Target: **{target_display or file.target or 'unknown'}**",
-        f"- Size: **{file.size.label}** ({file.points:.1f} story points)",
+        f"- Size: **{file.size.label}** — **{file.points:g}** story points "
+        f"(continuous position {file.continuous_points:.2f})",
         f"- Tier: **{file.tier}** — parity **{file.translation_difficulty}**",
         f"- Chunks: {file.chunk_count} across {file.line_count} line(s)",
         f"- Effort: {file.effort_raw:.1f} ({file.effort_norm:.2f}) · "
@@ -368,7 +369,13 @@ def render_overall_report(
         "| File | Size | Points | Report |",
         "| --- | --- | ---: | --- |",
     ]
-    by_points = sorted(report.files, key=lambda f: f.points, reverse=True)
+    # Points are deck entries, so files tie on them constantly; the continuous
+    # position orders them within a rung.
+    by_points = sorted(
+        report.files,
+        key=lambda f: (f.points, f.continuous_points),
+        reverse=True,
+    )
     for f in by_points:
         link = file_links.get(f.source_id)
         cell = f"[{link}]({link})" if link else "—"

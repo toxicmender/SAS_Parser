@@ -344,7 +344,11 @@ complexity/
                         banded on the Fibonacci rungs, then floored by chunk
                         kind. Files, not batches, are the sized unit: a batch
                         may span several files while every chunk belongs to
-                        exactly one.
+                        exactly one. Reported points are the *rung* the final
+                        size lands on — always a planning-poker entry (2/3/5/8),
+                        floors included, so the number and the label can never
+                        disagree; the continuous position the banding read is
+                        kept alongside for ranking within a rung.
   report.py             Markdown rendering, and nothing else: the corpus report
                         (to_markdown() plus an index) and one report per source
                         SAS script, each printing the chunk text behind every

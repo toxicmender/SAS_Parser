@@ -270,7 +270,11 @@ def _run_evaluation(
     """
     from .llm_eval import evaluate_report, evaluation_prompts
 
-    files = sorted(report.files, key=lambda f: f.points, reverse=True)
+    files = sorted(
+        report.files,
+        key=lambda f: (f.points, f.continuous_points),
+        reverse=True,
+    )
     wanted = (
         [f.source_id for f in files[: args.eval_top]] if args.eval_top > 0 else None
     )

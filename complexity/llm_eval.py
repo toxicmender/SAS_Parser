@@ -135,7 +135,7 @@ class FileEvaluationResult(BaseModel):
             f"## {self.source_id}",
             "",
             f"Static verdict: **{self.static_size or 'unknown'}**, "
-            f"{self.static_points:.1f} points.",
+            f"{self.static_points:g} points.",
             "",
         )
         if self.evaluation is None:
@@ -263,7 +263,7 @@ with it.
 
 # Static verdict — {source_id}
 
-- Size: {size} ({points:.1f} story points), tier {tier}, parity {parity}
+- Size: {size} ({points:g} story points), tier {tier}, parity {parity}
 - Effort {effort_raw:.1f} ({effort_norm:.2f}), complexity {complexity_raw:.1f} \
 ({complexity_norm:.2f}), uncertainty {uncertainty_raw:.1f} \
 ({uncertainty_norm:.2f}); blend {blend:.2f}
@@ -505,7 +505,14 @@ def evaluate_report(
     of them), because every file is a paid call and the largest are where a
     second opinion is worth most.
     """
-    files = sorted(report.files, key=lambda f: f.points, reverse=True)
+    # Points are deck entries, so the continuous position decides which of two
+    # files on the same rung is the larger — otherwise `limit` would cut
+    # arbitrarily among a corpus of ties.
+    files = sorted(
+        report.files,
+        key=lambda f: (f.points, f.continuous_points),
+        reverse=True,
+    )
     if limit > 0:
         files = files[:limit]
     logger.info(

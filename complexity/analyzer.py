@@ -505,7 +505,13 @@ class ComplexityAnalyzer:
                 FileComplexity(
                     source_id=source_id,
                     size=size,
-                    points=self._sizes.points_for(effort, complexity, uncertainty),
+                    # Read off the *final* size, floors included, so a file
+                    # labelled Medium never reports Small's points — which is
+                    # what an un-snapped position did whenever a floor bound.
+                    points=self._sizes.points_for_size(size),
+                    continuous_points=self._sizes.points_for(
+                        effort, complexity, uncertainty
+                    ),
                     effort_raw=round(effort, 3),
                     complexity_raw=round(complexity, 3),
                     uncertainty_raw=round(uncertainty, 3),
