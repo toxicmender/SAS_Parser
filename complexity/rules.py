@@ -14,7 +14,9 @@ Profile resolution, highest precedence first:
 2. an explicit ``target`` argument (a name under ``profiles/``);
 3. ``complexity.rules_path`` in config.json;
 4. ``complexity.target`` in config.json;
-5. :data:`DEFAULT_TARGET`.
+5. the profile belonging to the run's ``pipeline.output_language`` — so a
+   PySpark run rates its files against PySpark without a second knob to set;
+6. :data:`DEFAULT_TARGET` (what step 5 resolves to when nothing is configured).
 
 A profile may ``extends`` another by name; the child's entries are deep-merged
 over the parent's, so a derived target states only its differences.
@@ -44,6 +46,7 @@ from pathlib import Path
 from typing import Any
 
 import app_config
+from target_language import resolve_target_language
 
 from .models import ComplexityTier, TShirtSize, TranslationParity
 
@@ -1119,8 +1122,20 @@ def load_ruleset(
             raise RuleSetError(f"rule-set profile not found: {resolved}")
     else:
         if target is None:
-            target = app_config.get_typed_value(
-                _CONFIG_SECTION, "target", str, DEFAULT_TARGET
+            target = app_config.get_typed_value(_CONFIG_SECTION, "target", str)
+        if target is None:
+            # Nothing said which target to rate against, so follow the one the
+            # run translates into: scoring a file's difficulty against Spark
+            # SQL while the pipeline emits PySpark rates constructs the
+            # translation never has to attempt. Unknown names degrade rather
+            # than raise — complexity analysis does not need the pipeline to
+            # be runnable.
+            target = resolve_target_language(
+                None, allow_unknown=True
+            ).complexity_profile
+            logger.debug(
+                f"load_ruleset: no complexity.target set; following the run's "
+                f"output language to profile {target!r}"
             )
         resolved = profile_path(str(target))
         key = f"target:{target}"

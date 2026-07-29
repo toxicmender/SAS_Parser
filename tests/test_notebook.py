@@ -179,6 +179,40 @@ class TestKernelSelection(unittest.TestCase):
         nb = build_notebook([], output_language="PySpark")
         self.assertEqual(nb["metadata"]["sas_parser"]["output_language"], "PySpark")
 
+    def test_recorded_output_language_is_canonical_not_the_callers_spelling(self):
+        for spelling in ("SparkSQL", "spark sql", "spark_sql"):
+            nb = build_notebook([], output_language=spelling)
+            self.assertEqual(
+                nb["metadata"]["sas_parser"]["output_language"], "Spark SQL"
+            )
+
+    def test_untagged_code_cells_take_the_run_target_not_python(self):
+        doc = TranslationDocument(
+            analysis="x",
+            cells=[TranslationCell(kind="code", source="SELECT 1")],
+        )
+        cells = document_to_cells(doc, output_language="SparkSQL")
+        code = [c for c in cells if c["cell_type"] == "code"]
+        self.assertEqual(code[0]["metadata"]["language"], "sql")
+
+    def test_untagged_markdown_fences_take_the_run_target(self):
+        cells = markdown_to_cells(
+            "## Translation\n```\nSELECT 1\n```\n", output_language="SparkSQL"
+        )
+        code = [c for c in cells if c["cell_type"] == "code"]
+        self.assertEqual(code[0]["metadata"]["language"], "sql")
+
+    def test_off_target_code_still_ships_tagged_as_what_it_is(self):
+        # The deliverable is already paid for: an off-target block becomes a
+        # cell labelled with its real language rather than being dropped.
+        # language_compliance is what fails the item.
+        cells = markdown_to_cells(
+            "## Translation\n```python\ndf = 1\n```\n", output_language="SparkSQL"
+        )
+        code = [c for c in cells if c["cell_type"] == "code"]
+        self.assertEqual(len(code), 1)
+        self.assertEqual(code[0]["metadata"]["language"], "python")
+
     def test_code_cells_carry_their_own_language(self):
         cells = document_to_cells(_document())
         code = [c for c in cells if c["cell_type"] == "code"]
@@ -222,9 +256,12 @@ class TestToMarkdown(unittest.TestCase):
             self.assertIn(heading, md)
 
     def test_code_cells_are_fenced_so_the_syntax_metric_finds_them(self):
-        from validation.metrics import _python_blocks
+        from target_language import PYSPARK
+        from validation.metrics import _target_blocks
 
-        blocks = [b.strip() for b in _python_blocks(_document().to_markdown())]
+        blocks = [
+            b.strip() for b in _target_blocks(_document().to_markdown(), PYSPARK)
+        ]
         self.assertEqual(blocks, ['df = spark.table("a")', 'df.filter("status = 1")'])
 
     def test_untagged_language_defaults_to_python(self):
@@ -232,6 +269,14 @@ class TestToMarkdown(unittest.TestCase):
             analysis="x", cells=[TranslationCell(kind="code", source="print(1)")]
         )
         self.assertIn("```python", doc.to_markdown())
+
+    def test_untagged_language_can_be_rendered_for_another_target(self):
+        # What the pipeline does: pass the run's fence so a Spark SQL
+        # translation is not rendered as ```python and then failed for it.
+        doc = TranslationDocument(
+            analysis="x", cells=[TranslationCell(kind="code", source="SELECT 1")]
+        )
+        self.assertIn("```sql", doc.to_markdown("sql"))
 
     def test_p0_risks_are_marked(self):
         self.assertIn("⚠️", _document().to_markdown())

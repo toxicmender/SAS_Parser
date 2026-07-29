@@ -43,6 +43,7 @@ from pathlib import Path
 
 from pipeline import SasLLMPipeline
 from llm_client import LLMClient, LLMClientConfig, TokenUsage
+from target_language import resolve_target_language
 
 from .conversation import validate_thread
 from .dataset import load_cases
@@ -132,8 +133,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-language",
-        default="PySpark",
-        help="Target language named in the system prompt (default: PySpark).",
+        default=None,
+        help=(
+            "Target language the pipeline under test translates into, and "
+            "the one the deterministic metrics score its code against. Omit "
+            "to use config.json pipeline.output_language, then the code "
+            "default."
+        ),
     )
     parser.add_argument(
         "--judge-model",
@@ -223,7 +229,10 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
 
-    metrics = default_metrics()
+    # One resolution for the whole invocation: the deterministic suite, the
+    # judged suite, and the pipeline under test must all mean the same target.
+    target = resolve_target_language(args.output_language)
+    metrics = default_metrics(target)
     if args.judge_model:
         # No --judge-metrics keeps the historical meaning of --judge-model:
         # the single llm_judge grade, one call per item.
@@ -236,7 +245,7 @@ def main(argv: list[str] | None = None) -> int:
         metrics.extend(
             judged_metrics(
                 LLMClient(LLMClientConfig(model=args.judge_model)),
-                output_language=args.output_language,
+                output_language=target.display_name,
                 include=include,
             )
         )
@@ -246,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         cases = load_cases(args.cases)
         pipeline = SasLLMPipeline(
-            model=args.model, output_language=args.output_language
+            model=args.model, output_language=target.display_name
         )
         report = ValidationRunner(pipeline, metrics=metrics).run(cases)
     print(report.to_markdown())

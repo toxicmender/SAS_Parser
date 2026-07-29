@@ -384,7 +384,9 @@ on that axis:
 - **`[lang: sparksql, pyspark]`** — the run's `output_language` must be one of
   the listed targets. Matching is case/space/underscore-insensitive
   (`normalize_language` folds `"SparkSQL"`, `"Spark SQL"`, `"spark_sql"` to one
-  key). Applied at **selection time**: the pipeline passes
+  key — re-exported from `target_language`, so a directive token and a
+  resolved target can never disagree about what a name folds to). Applied at
+  **selection time**: the pipeline passes its resolved
   `SasLLMPipeline(output_language=...)` into `build()`. With
   `output_language=None` this axis is off (language-scoped sections are all
   kept), so a builder used without a language over-includes rather than

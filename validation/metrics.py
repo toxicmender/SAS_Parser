@@ -16,7 +16,6 @@ Logger name: ``validation.metrics``.
 
 from __future__ import annotations
 
-import ast
 import logging
 import re
 from abc import ABC, abstractmethod
@@ -26,6 +25,12 @@ from typing import Any, Callable, Iterable
 import app_config
 
 from chunker.models import SasBatch, SasChunk
+from target_language import (
+    PROSE_FENCE_INFOS,
+    TargetLanguage,
+    normalize_language,
+    resolve_target_language,
+)
 
 from .models import EvaluationRun, MetricResult
 
@@ -40,20 +45,55 @@ logger = logging.getLogger(__name__)
 # multiple blocks in one response are matched individually.
 _FENCE_RE = re.compile(r"```([^\n`]*)\n(.*?)```", re.DOTALL)
 
-# Info strings treated as Python for syntax checking. An untagged fence in a
-# PySpark translation is overwhelmingly Python, so "" is included.
-_PYTHON_INFO_STRINGS = {"", "python", "python3", "py", "pyspark"}
+# A "## " section heading at the start of a line, matching pipeline.notebook's
+# — the translation region is scored, not the whole response.
+_SECTION_RE = re.compile(r"^## +(.+?) *$", re.MULTILINE)
 
 _TOKEN_RE = re.compile(r"[a-z0-9_.]+")
 
 
-def _python_blocks(text: str) -> list[str]:
-    """Bodies of fenced blocks whose info string marks them as Python."""
+def _fenced_blocks(text: str) -> list[tuple[str, str]]:
+    """``(info, body)`` for every fenced block in *text*, info lower-cased."""
+    return [(info.strip().lower(), body) for info, body in _FENCE_RE.findall(text)]
+
+
+def _translation_region(response: str) -> str:
+    """The ``## Translation`` section of *response*, or all of it.
+
+    Language and syntax are judged on the translation only: a ```sas``` echo
+    under ``## Analysis`` is illustration, and a response that never emitted
+    the heading (the model deviated) is scored whole — the same fallback
+    ``pipeline.notebook.markdown_to_cells`` makes, so the metrics see the
+    blocks the notebook would actually run.
+    """
+    matches = list(_SECTION_RE.finditer(response))
+    for i, match in enumerate(matches):
+        if not match.group(1).strip().lower().startswith("translation"):
+            continue
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(response)
+        return response[match.end() : end]
+    return response
+
+
+def _target_blocks(text: str, target: TargetLanguage) -> list[str]:
+    """Bodies of the translation-region blocks that are *target* code."""
     return [
         body
-        for info, body in _FENCE_RE.findall(text)
-        if info.strip().lower() in _PYTHON_INFO_STRINGS
+        for info, body in _fenced_blocks(_translation_region(text))
+        if target.owns_fence(info)
     ]
+
+
+def _as_target(value: str | TargetLanguage | None) -> TargetLanguage:
+    """Accept a target, a language name, or ``None`` (the configured default).
+
+    Metrics are constructed by callers that hold either — the pipeline has a
+    resolved :class:`TargetLanguage`, a CLI or config-driven runner has a
+    string — and neither should have to convert.
+    """
+    if isinstance(value, TargetLanguage):
+        return value
+    return resolve_target_language(value)
 
 
 def _tokens(text: str) -> list[str]:
@@ -209,36 +249,117 @@ class DatasetFidelityMetric(ValidationMetric):
 
 
 class PythonSyntaxMetric(ValidationMetric):
-    """Fenced Python/PySpark code in the responses must actually parse.
+    """Translated code in the responses must actually parse as the target.
 
-    Extracts fenced code blocks whose info string is empty or Python-ish and
-    runs ``ast.parse`` on each. Scores ``valid blocks / blocks``; a case
-    whose responses contain no code blocks at all scores 0 — a translation
-    run that emits only prose is a failure, not a skip.
+    Despite the name — kept because it is the stable key in config.json
+    (``validation.python_syntax_threshold``), in stored verdicts, and in the
+    report tables — this checks the run's **target** language, not Python. It
+    used to check Python unconditionally, which scored a correct Spark SQL
+    run 0.0 ("no fenced Python code blocks") and, with
+    ``validation_retries`` on, drove retries that could never pass. The
+    ``details`` string names the target and the checker that ran, so a report
+    is unambiguous about what was verified.
+
+    Extracts the target's fenced blocks from each response's ``## Translation``
+    section and runs the target's checker over each. Scores
+    ``valid blocks / blocks``; a case whose responses contain no target code
+    at all scores 0 — a translation run that emits only prose is a failure,
+    not a skip. Targets with no checker (Spark Scala) skip.
     """
 
     name = "python_syntax"
     default_threshold = 1.0
 
+    def __init__(
+        self,
+        threshold: float | None = None,
+        *,
+        output_language: str | TargetLanguage | None = None,
+    ) -> None:
+        super().__init__(threshold)
+        self.target = _as_target(output_language)
+
     def evaluate(self, run: EvaluationRun) -> MetricResult:
         blocks: list[str] = []
         for response in run.responses:
-            blocks.extend(_python_blocks(response))
+            blocks.extend(_target_blocks(response, self.target))
+        lang = self.target.display_name
         if not blocks:
-            return self._result(0.0, "no fenced Python code blocks in responses")
+            return self._result(0.0, f"no fenced {lang} code blocks in responses")
+        if not self.target.checks_syntax:
+            return self._result(
+                1.0,
+                f"{len(blocks)} {lang} block(s) found; no syntax checker for "
+                f"{lang}",
+                skipped=True,
+            )
         ok = 0
         first_error = ""
         for body in blocks:
-            try:
-                ast.parse(body)
+            error = self.target.check_syntax(body)
+            if error is None:
                 ok += 1
-            except SyntaxError as exc:
-                if not first_error:
-                    first_error = f"; first error: {exc.msg} (line {exc.lineno})"
+            elif not first_error:
+                first_error = f"; first error: {error}"
         return self._result(
             ok / len(blocks),
-            f"{ok}/{len(blocks)} code block(s) parse{first_error}",
+            f"{ok}/{len(blocks)} {lang} block(s) parse "
+            f"({self.target.checker_name}){first_error}",
         )
+
+
+class LanguageComplianceMetric(ValidationMetric):
+    """The translated code must be in the target language and no other.
+
+    Scores ``target blocks / code blocks`` over each response's
+    ``## Translation`` section: a block tagged for a *different* target — a
+    ```python``` fence in a Spark SQL run — is the failure this catches, and
+    ``details`` names the offending tags so the corrective note the pipeline
+    injects before a retry (``SasLLMPipeline._validation_feedback_message``)
+    tells the model exactly what to change.
+
+    Prose and source-echo fences (```sas```, ```text```, ...) are not code and
+    are ignored rather than counted against the score. A translation section
+    with no code block at all scores 0, matching ``python_syntax``: prose is
+    not a translation.
+    """
+
+    name = "language_compliance"
+    default_threshold = 1.0
+
+    def __init__(
+        self,
+        threshold: float | None = None,
+        *,
+        output_language: str | TargetLanguage | None = None,
+    ) -> None:
+        super().__init__(threshold)
+        self.target = _as_target(output_language)
+
+    def evaluate(self, run: EvaluationRun) -> MetricResult:
+        on_target = 0
+        off_target: Counter[str] = Counter()
+        for response in run.responses:
+            for info, _ in _fenced_blocks(_translation_region(response)):
+                if normalize_language(info) in PROSE_FENCE_INFOS:
+                    continue
+                if self.target.owns_fence(info):
+                    on_target += 1
+                else:
+                    off_target[info] += 1
+        total = on_target + sum(off_target.values())
+        lang = self.target.display_name
+        if not total:
+            return self._result(0.0, f"no code blocks to check against {lang}")
+        details = f"{on_target}/{total} code block(s) are {lang}"
+        if off_target:
+            # An untagged fence is never off-target (TargetLanguage.owns_fence
+            # claims it), so every tag named here is a real one.
+            named = ", ".join(
+                f"```{info} x{count}" for info, count in sorted(off_target.items())
+            )
+            details += f"; off-target: {named}"
+        return self._result(on_target / total, details)
 
 
 class RequiredTermsMetric(ValidationMetric):
@@ -284,16 +405,25 @@ class ReferenceSimilarityMetric(ValidationMetric):
         return self._result(score, f"token F1 vs reference = {score:.3f}")
 
 
-def default_metrics() -> list[ValidationMetric]:
+def default_metrics(
+    output_language: str | TargetLanguage | None = None,
+) -> list[ValidationMetric]:
     """The deterministic suite the runner uses when none is passed.
+
+    *output_language* is the target the two language-aware metrics score
+    against; ``None`` resolves the configured default. Pass the pipeline's
+    own :attr:`~pipeline.engine.SasLLMPipeline.target_language` so scoring and
+    prompting cannot disagree about what the run was asked to emit.
 
     The LLM-judged metrics are *not* included — they need a judge model and
     are opted into explicitly (see :func:`judged_metrics`).
     """
+    target = _as_target(output_language)
     return [
         ResponseCoverageMetric(),
         DatasetFidelityMetric(),
-        PythonSyntaxMetric(),
+        LanguageComplianceMetric(output_language=target),
+        PythonSyntaxMetric(output_language=target),
         RequiredTermsMetric(),
         ReferenceSimilarityMetric(),
     ]

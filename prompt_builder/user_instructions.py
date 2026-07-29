@@ -64,6 +64,7 @@ from typing import Callable, Iterable, NamedTuple
 
 import app_config
 from pydantic import BaseModel, Field
+from target_language import normalize_language as _normalize_language
 
 from .models import ConstructKey, DocRole, InstructionChunk, InstructionDiagnostic
 
@@ -92,14 +93,11 @@ _META_TAG_PREFIX = "meta:"
 _PREAMBLE_TITLE = "General"
 
 
-def normalize_language(name: str) -> str:
-    """Fold an output-language name to a comparison key.
-
-    Case-, space-, hyphen-, and underscore-insensitive, so ``"SparkSQL"``,
-    ``"Spark SQL"``, and ``"spark_sql"`` all match the same ``[lang: ...]``
-    directive token.
-    """
-    return re.sub(r"[\s_-]+", "", name.lower())
+# The run's target language is folded to a comparison key by the same rule
+# that resolves it (``target_language.normalize_language``) — re-exported, not
+# reimplemented, so a ``[lang: ...]`` token and a resolved target can never
+# disagree about what "Spark SQL" folds to.
+normalize_language = _normalize_language
 
 
 def normalize_kind(name: str) -> str:

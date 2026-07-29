@@ -34,6 +34,11 @@ from chunker.models import (
 )
 from pipeline import SasLLMPipeline
 from pipeline.prompting import _format_batch_message
+from target_language import resolve_target_language
+
+# What an output_language-less pipeline resolves to, so the prompt assertions
+# below stay true if the configured default changes.
+DEFAULT_OUTPUT_LANGUAGE_DISPLAY = resolve_target_language(None).display_name
 
 
 def _mk_chunk(chunk_id: str, source_id: str, text: str, **meta_kwargs) -> SasChunk:
@@ -600,7 +605,8 @@ def test_prompt_caching_marks_system_block_for_anthropic_models():
     (block,) = system_msg.content
     assert block["type"] == "text"
     assert block["cache_control"] == {"type": "ephemeral"}
-    assert "PySpark" in block["text"]  # the real system prompt rides in the block
+    # The real system prompt rides in the block — and names the run's target.
+    assert DEFAULT_OUTPUT_LANGUAGE_DISPLAY in block["text"]
 
     # End-to-end: the block-shaped system message flows through the graph.
     c1 = _mk_chunk("f1-chunk-0001", "etl.sas", "data work.a; run;")
@@ -952,3 +958,89 @@ def test_structured_output_can_be_turned_off():
 
     assert outputs[0]["document"] is None
     assert outputs[0]["response"] == "plain answer"
+
+
+# ---------------------------------------------------------------------------
+# Target output language
+# ---------------------------------------------------------------------------
+
+
+def _language_pipeline(**kwargs) -> SasLLMPipeline:
+    return SasLLMPipeline(
+        model="unused",
+        memory=MemoryHub(),
+        llm=FakeListChatModel(responses=["ok"]),
+        **kwargs,
+    )
+
+
+def test_output_language_is_resolved_and_canonicalised_once():
+    pipeline = _language_pipeline(output_language="spark sql")
+    assert pipeline.output_language == "Spark SQL"
+    assert pipeline.target_language.default_fence == "sql"
+    # The canonical name, not the caller's spelling, is what gets prompted.
+    assert "SAS-to-Spark SQL" in pipeline._system_prompt
+
+
+def test_unknown_output_language_is_rejected_at_construction():
+    from target_language import UnknownTargetLanguage
+
+    with pytest.raises(UnknownTargetLanguage):
+        _language_pipeline(output_language="Cobol")
+
+
+def test_system_prompt_names_the_fence_the_translation_must_carry():
+    pipeline = _language_pipeline(output_language="SparkSQL")
+    prompt = pipeline._system_prompt
+    assert "```sql" in prompt
+    assert "Translate into Spark SQL and nothing else" in prompt
+
+
+def test_structured_prompt_names_the_cell_language_instead_of_a_fence():
+    doc = _translation_document()
+    fake = _StructuredFakeChatModel(responses=["ok"], documents=[doc])
+    pipeline = SasLLMPipeline(
+        model="unused",
+        memory=MemoryHub(),
+        llm=fake,
+        structured_output=True,
+        output_language="SparkSQL",
+    )
+    prompt = pipeline._system_prompt
+    assert pipeline._structured_output is True
+    assert "'sql'" in prompt
+    # The structured path forbids fences, so it must not ask for one.
+    assert "```sql" not in prompt
+
+
+def test_output_language_falls_back_to_config(monkeypatch):
+    # Stands in for config.json pipeline.output_language, which is what
+    # _configured_default reads.
+    import target_language
+
+    monkeypatch.setattr(target_language, "_configured_default", lambda: "PySpark")
+    assert _language_pipeline().output_language == "PySpark"
+
+
+def test_structured_document_renders_with_the_target_fence():
+    from pipeline.response_models import TranslationCell, TranslationDocument
+
+    doc = TranslationDocument(
+        analysis="a",
+        cells=[TranslationCell(kind="code", source="SELECT 1")],
+    )
+    fake = _StructuredFakeChatModel(responses=["ok"], documents=[doc])
+    pipeline = SasLLMPipeline(
+        model="unused",
+        memory=MemoryHub(),
+        llm=fake,
+        structured_output=True,
+        output_language="SparkSQL",
+    )
+
+    outputs = pipeline.run_text("data work.a; x=1; run;", source_id="etl.sas")
+
+    # Untagged cell + Spark SQL run must not render as ```python: the
+    # validation suite reads exactly this text.
+    assert "```sql" in outputs[0]["response"]
+    assert "```python" not in outputs[0]["response"]

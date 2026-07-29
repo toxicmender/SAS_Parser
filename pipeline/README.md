@@ -10,6 +10,33 @@ For the whole-system view see the repository
 [Architecture.md](../Architecture.md); for the parsing/batching layers see
 the [chunker README](../chunker/README.md).
 
+## Target output language
+
+`output_language` is resolved once, at construction, through the
+[`target_language`](../target_language/__init__.py) registry, and the resolved
+object drives every stage that has an opinion about the language: the system
+prompt (which names the target, the fence tag its code must carry, and forbids
+any other), the `[lang: ...]` instruction axis, the notebook kernel and cell
+tags, and what `validation` checks the emitted code parses as.
+
+```python
+pipe = SasLLMPipeline(output_language="spark sql")
+pipe.output_language        # "Spark SQL" — canonical, whatever you typed
+pipe.target_language        # the resolved TargetLanguage; pass it downstream
+```
+
+Known targets are **PySpark**, **Spark SQL**, and **Spark Scala**; spelling is
+folded (`SparkSQL`, `spark sql`, `spark_sql`, and `sql` are one target). An
+unrecognised name raises `UnknownTargetLanguage` instead of silently behaving
+like a Python run. Omit the argument to take config.json
+`pipeline.output_language`, then the code default.
+
+Asking for a language is not the same as getting one, so the request is
+enforced on the way back: `validation`'s `language_compliance` scores the
+fraction of translated blocks actually in the target, and with
+`validation_retries > 0` an off-target answer is rolled back and re-prompted
+with a note naming the offending fence tag.
+
 ## Quick start
 
 ```python
@@ -119,7 +146,7 @@ into every participating notebook so each one stands alone.
 from pipeline.notebook import write_notebooks
 
 outputs = pipe.run_files(sas_files)
-write_notebooks(outputs, "out", output_language="PySpark")
+write_notebooks(outputs, "out", output_language=pipe.target_language)
 # out/<source>.ipynb per file; out/_cross_file.ipynb only for items whose
 # cells could not be attributed per source
 ```

@@ -16,6 +16,8 @@ from __future__ import annotations
 import logging
 from typing import Sequence
 
+from target_language import TargetLanguage
+
 from .metrics import ValidationMetric, default_metrics
 from .models import CaseResult, EvaluationRun
 
@@ -32,12 +34,23 @@ class Evaluator:
         Metric suite; ``None`` (default) uses :func:`default_metrics` — the
         deterministic, offline suite. Append an
         :class:`~validation.judge.LLMJudgeMetric` for judged runs.
+    output_language : str | TargetLanguage | None
+        Target language the default suite scores emitted code against;
+        ``None`` resolves the configured default. Ignored when *metrics* is
+        given (an explicit suite carries its own).
     """
 
     def __init__(
-        self, *, metrics: Sequence[ValidationMetric] | None = None
+        self,
+        *,
+        metrics: Sequence[ValidationMetric] | None = None,
+        output_language: "str | TargetLanguage | None" = None,
     ) -> None:
-        self.metrics = list(metrics) if metrics is not None else default_metrics()
+        self.metrics = (
+            list(metrics)
+            if metrics is not None
+            else default_metrics(output_language)
+        )
 
     def evaluate(self, run: EvaluationRun) -> CaseResult:
         """Run every metric over *run* and assemble the result."""

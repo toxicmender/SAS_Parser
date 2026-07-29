@@ -41,6 +41,10 @@ sharepoint = ["msgraph-sdk>=1.5", "msal>=1.28"]
 # jupyter dependency to emit JSON), and tests/test_notebook.py validates what
 # it emits against the real published schema.
 dev        = ["pytest>=8", "pytest-cov", "ruff", "nbformat>=5.10"]
+# Real SQL parsing for target_language's Spark SQL syntax check (which the
+# validation suite scores a SQL run with). Optional: without it the check
+# degrades to a conservative structural one — see target_language._check_sql.
+sql        = ["sqlglot>=25"]
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -50,6 +54,8 @@ where = ["."]
 # dependency-free config loader they all read defaults through. complexity
 # reads chunker's output and adds no dependencies of its own, so it ships
 # too (unlike validation, whose Spark/MLflow tracking is dev-only tooling).
+# target_language is the leaf every one of them resolves the run's target
+# through, so it ships with all of them.
 include = [
     "pipeline*",
     "chunker*",
@@ -58,6 +64,7 @@ include = [
     "prompt_builder*",
     "app_config*",
     "complexity*",
+    "target_language*",
 ]
 
 [tool.setuptools.package-data]
@@ -77,6 +84,7 @@ source = [
     "app_config",
     "validation",
     "complexity",
+    "target_language",
 ]
 
 [tool.pytest.ini_options]
@@ -102,6 +110,7 @@ include = [
     "memory",
     "llm_client",
     "prompt_builder",
+    "target_language",
     "validation",
     "main.py",
     "demo_run.py",

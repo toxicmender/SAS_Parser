@@ -26,6 +26,7 @@ from validation import (
     DatasetFidelityMetric,
     Evaluator,
     EvaluationRun,
+    LanguageComplianceMetric,
     LiveValidator,
     LLMJudgeMetric,
     PythonSyntaxMetric,
@@ -159,7 +160,7 @@ def test_dataset_fidelity_skipped_without_datasets():
 def test_python_syntax_scores_parse_ratio():
     good = "```python\nx = 1\n```"
     bad = "```python\ndef broken(:\n```"
-    result = PythonSyntaxMetric().evaluate(
+    result = PythonSyntaxMetric(output_language="PySpark").evaluate(
         _mk_run([_mk_chunk("c1"), _mk_chunk("c2")], [good, bad])
     )
     assert result.score == pytest.approx(0.5)
@@ -168,16 +169,123 @@ def test_python_syntax_scores_parse_ratio():
 
 def test_python_syntax_ignores_non_python_fences():
     response = "```sql\nSELECT 1;\n```\n```python\nx = 1\n```"
-    result = PythonSyntaxMetric().evaluate(_mk_run([_mk_chunk("c1")], [response]))
+    result = PythonSyntaxMetric(output_language="PySpark").evaluate(
+        _mk_run([_mk_chunk("c1")], [response])
+    )
     assert result.score == 1.0
 
 
 def test_python_syntax_no_code_blocks_scores_zero():
-    result = PythonSyntaxMetric().evaluate(
+    result = PythonSyntaxMetric(output_language="PySpark").evaluate(
         _mk_run([_mk_chunk("c1")], ["prose only, no code"])
     )
     assert result.score == 0.0
     assert not result.skipped
+
+
+def test_syntax_metric_checks_the_target_not_python():
+    """The regression: a correct Spark SQL run used to score 0.0 here.
+
+    ``python_syntax`` only ever looked for Python-ish fences, so a Spark SQL
+    translation — the default target — scored "no fenced Python code blocks"
+    and, with validation_retries on, drove retries that could never pass.
+    """
+    response = "## Translation\n```sql\nSELECT a FROM t WHERE b = 1\n```"
+    result = PythonSyntaxMetric(output_language="SparkSQL").evaluate(
+        _mk_run([_mk_chunk("c1")], [response])
+    )
+    assert result.score == 1.0
+    assert result.passed
+    assert "Spark SQL" in result.details
+
+
+def test_syntax_metric_skips_a_target_with_no_checker():
+    response = "## Translation\n```scala\nval df = spark.table(\"x\")\n```"
+    result = PythonSyntaxMetric(output_language="Spark Scala").evaluate(
+        _mk_run([_mk_chunk("c1")], [response])
+    )
+    assert result.skipped
+    assert result.passed
+
+
+def test_syntax_metric_ignores_a_sas_echo_outside_the_translation():
+    response = (
+        "## Analysis\n```sas\ndata work.a; x=1; run;\n```\n"
+        "## Translation\n```sql\nSELECT 1 AS x\n```\n"
+    )
+    result = PythonSyntaxMetric(output_language="SparkSQL").evaluate(
+        _mk_run([_mk_chunk("c1")], [response])
+    )
+    assert result.score == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Language compliance
+# ---------------------------------------------------------------------------
+
+
+def test_language_compliance_passes_an_on_target_translation():
+    response = "## Translation\n```sql\nSELECT 1\n```"
+    result = LanguageComplianceMetric(output_language="SparkSQL").evaluate(
+        _mk_run([_mk_chunk("c1")], [response])
+    )
+    assert result.score == 1.0
+    assert result.passed
+
+
+def test_language_compliance_fails_and_names_the_wrong_language():
+    response = "## Translation\n```python\ndf = spark.table('t')\n```"
+    result = LanguageComplianceMetric(output_language="SparkSQL").evaluate(
+        _mk_run([_mk_chunk("c1")], [response])
+    )
+    assert result.score == 0.0
+    assert not result.passed
+    # The details drive the corrective note injected before a retry, so the
+    # offending tag has to be in there.
+    assert "```python" in result.details
+    assert "Spark SQL" in result.details
+
+
+def test_language_compliance_scores_a_mixed_translation_partially():
+    response = (
+        "## Translation\n"
+        "```sql\nSELECT 1\n```\n"
+        "```python\ndf = 1\n```\n"
+    )
+    result = LanguageComplianceMetric(output_language="SparkSQL").evaluate(
+        _mk_run([_mk_chunk("c1")], [response])
+    )
+    assert result.score == pytest.approx(0.5)
+
+
+def test_language_compliance_ignores_prose_and_sas_echo_fences():
+    response = (
+        "## Translation\n"
+        "Echoing the source:\n```sas\ndata a; run;\n```\n"
+        "```text\nsome log output\n```\n"
+        "```sql\nSELECT 1\n```\n"
+    )
+    result = LanguageComplianceMetric(output_language="SparkSQL").evaluate(
+        _mk_run([_mk_chunk("c1")], [response])
+    )
+    assert result.score == 1.0
+
+
+def test_language_compliance_counts_an_untagged_fence_as_on_target():
+    # An untagged fence in a translation IS the translation — the notebook
+    # renderer treats it that way, so scoring must agree.
+    response = "## Translation\n```\nSELECT 1\n```"
+    result = LanguageComplianceMetric(output_language="SparkSQL").evaluate(
+        _mk_run([_mk_chunk("c1")], [response])
+    )
+    assert result.score == 1.0
+
+
+def test_language_compliance_fails_a_prose_only_answer():
+    result = LanguageComplianceMetric(output_language="SparkSQL").evaluate(
+        _mk_run([_mk_chunk("c1")], ["I would translate this to a table."])
+    )
+    assert result.score == 0.0
 
 
 def test_required_terms_partial_and_skipped():
@@ -299,6 +407,11 @@ def test_bundled_sample_cases_load():
 
 
 def _pipeline(responses: list[str], **kwargs) -> SasLLMPipeline:
+    # Every canned response in this module is a PySpark translation, so the
+    # pipeline under test declares that target — the metrics take theirs from
+    # it (ValidationRunner) and would otherwise score against the config
+    # default.
+    kwargs.setdefault("output_language", "PySpark")
     return SasLLMPipeline(llm=FakeListChatModel(responses=responses), **kwargs)
 
 
@@ -515,7 +628,7 @@ def test_evaluator_scores_run_with_items():
         items=[chunk],
         outputs=[{"item_id": "c1", "response": GOOD_RESPONSE + " work.in work.out"}],
     )
-    result = Evaluator().evaluate(run)
+    result = Evaluator(output_language="PySpark").evaluate(run)
     assert result.case_id == "manual"
     assert result.item_count == 1
     by_name = {m.metric: m for m in result.metrics}
@@ -641,6 +754,7 @@ def test_validate_transcript_pairs_and_messages():
         [("translate step 1", GOOD_RESPONSE), ("translate step 2", GOOD_RESPONSE)],
         run_id="pairs",
         required_terms=["spark"],
+        output_language="PySpark",
     )
     assert result.case_id == "pairs"
     by_name = {m.metric: m for m in result.metrics}
@@ -653,6 +767,7 @@ def test_validate_transcript_pairs_and_messages():
     msg_result = validate_transcript(
         [HumanMessage("translate step 1"), AIMessage(GOOD_RESPONSE)],
         run_id="messages",
+        output_language="PySpark",
     )
     assert msg_result.case_id == "messages"
     by_name = {m.metric: m for m in msg_result.metrics}
@@ -713,7 +828,7 @@ def test_live_validator_scores_single_item_and_stores_in_kv():
     chunk = _mk_chunk(
         "c1", input_datasets=["work.sales_raw"], output_datasets=["work.sales_clean"]
     )
-    result = LiveValidator().validate_item(
+    result = LiveValidator(output_language="PySpark").validate_item(
         chunk, GOOD_RESPONSE, thread_id="t1", kv=kv, index=1, total=1
     )
     # One item carries its own metadata, so dataset_fidelity scores it
@@ -735,7 +850,7 @@ def test_live_validator_scores_single_item_and_stores_in_kv():
 def _validated_pipeline(responses, validator=None, **kwargs):
     return SasLLMPipeline(
         llm=FakeListChatModel(responses=responses),
-        validator=validator or LiveValidator(),
+        validator=validator or LiveValidator(output_language="PySpark"),
         **kwargs,
     )
 
@@ -850,7 +965,7 @@ def test_resume_without_stored_verdict_leaves_validation_none():
     resumed = SasLLMPipeline(
         llm=FakeListChatModel(responses=[GOOD_RESPONSE]),
         memory=first._memory,
-        validator=LiveValidator(),
+        validator=LiveValidator(output_language="PySpark"),
     )
     outputs = resumed._process(
         items=[_wrap(_mk_chunk("c1")), _wrap(_mk_chunk("c2"))],
@@ -866,11 +981,13 @@ def test_resume_without_stored_verdict_leaves_validation_none():
 PROSE_ONLY = "I would translate work.a into a DataFrame, mentioning work.a."
 
 
-def _retry_pipeline(responses, retries=1, validator=None):
+def _retry_pipeline(responses, retries=1, validator=None, **kwargs):
+    kwargs.setdefault("output_language", "PySpark")
     return SasLLMPipeline(
         llm=FakeListChatModel(responses=responses),
-        validator=validator or LiveValidator(),
+        validator=validator or LiveValidator(output_language=kwargs["output_language"]),
         validation_retries=retries,
+        **kwargs,
     )
 
 
@@ -894,6 +1011,68 @@ def test_validation_retries_regenerates_failing_item_until_it_passes():
     assert pipeline.get_thread_messages(thread_id)[-1].content == GOOD_RESPONSE
     # The run fact records how many attempts it took.
     assert pipeline.get_run_facts(thread_id)[0]["attempts"] == 2
+
+
+def test_wrong_output_language_is_retried_until_the_target_is_emitted():
+    """Enforcement end to end: the retry loop is what makes the target stick.
+
+    A Spark SQL run whose first answer comes back in Python fails
+    ``language_compliance``, gets rolled back, and is re-prompted; the second,
+    on-target answer is the one that persists.
+    """
+    python_answer = "## Translation\n```python\ndf = spark.table('work.a')\n```\n"
+    sql_answer = "## Translation\n```sql\nSELECT * FROM work.a\n```\n"
+    pipeline = _retry_pipeline(
+        [python_answer, sql_answer], retries=1, output_language="SparkSQL"
+    )
+    thread_id = "run::wrong-language"
+    outputs = pipeline.run_text(
+        "data work.b;\n  set work.a;\nrun;\n", source_id="w.sas", thread_id=thread_id
+    )
+
+    verdict = outputs[0]["validation"]
+    by_name = {m["metric"]: m for m in verdict["metrics"]}
+    assert by_name["language_compliance"]["passed"] is True
+    assert pipeline.get_run_facts(thread_id)[0]["attempts"] == 2
+    # Only the on-target answer survives on the thread.
+    assert pipeline.get_thread_messages(thread_id)[-1].content == sql_answer
+
+
+def test_the_retry_note_tells_the_model_which_language_was_wrong():
+    from validation.models import CaseResult, MetricResult
+
+    result = CaseResult(
+        case_id="c",
+        item_count=1,
+        metrics=[
+            MetricResult(
+                metric="language_compliance",
+                score=0.0,
+                threshold=1.0,
+                passed=False,
+                skipped=False,
+                details="0/1 code block(s) are Spark SQL; off-target: ```python x1",
+            )
+        ],
+    )
+    note = SasLLMPipeline._validation_feedback_message(result).content
+    assert "language_compliance" in note
+    assert "Spark SQL" in note
+    assert "```python" in note
+
+
+def test_a_validator_built_for_another_target_is_flagged_at_construction(caplog):
+    with caplog.at_level("WARNING"):
+        SasLLMPipeline(
+            llm=FakeListChatModel(responses=["ok"]),
+            output_language="SparkSQL",
+            validator=LiveValidator(output_language="PySpark"),
+        )
+    assert any(
+        "validator scores against PySpark" in record.message
+        and "Spark SQL" in record.message
+        for record in caplog.records
+    )
 
 
 def test_validation_retries_accepts_last_attempt_when_budget_exhausted():
@@ -932,7 +1111,7 @@ def test_resume_redoes_stored_failing_item_when_retries_enabled():
     first = SasLLMPipeline(
         llm=FakeListChatModel(responses=[PROSE_ONLY]),
         memory=mem,
-        validator=LiveValidator(),
+        validator=LiveValidator(output_language="PySpark"),
     )
     first._process(items=[_wrap(c1)], diagnostics=[], thread_id="run::redo")
     assert first.get_validation_facts("run::redo")[0]["passed"] is False
@@ -942,7 +1121,7 @@ def test_resume_redoes_stored_failing_item_when_retries_enabled():
     resumed = SasLLMPipeline(
         llm=FakeListChatModel(responses=[GOOD_RESPONSE, GOOD_RESPONSE]),
         memory=mem,
-        validator=LiveValidator(),
+        validator=LiveValidator(output_language="PySpark"),
         validation_retries=1,
     )
     outputs = resumed._process(
@@ -971,7 +1150,7 @@ def test_resume_keeps_passing_prefix_and_redoes_from_first_failure():
     first = SasLLMPipeline(
         llm=FakeListChatModel(responses=[GOOD_RESPONSE, PROSE_ONLY]),
         memory=mem,
-        validator=LiveValidator(),
+        validator=LiveValidator(output_language="PySpark"),
     )
     first._process(items=[_wrap(c1), _wrap(c2)], diagnostics=[], thread_id="run::prefix")
     assert first.get_validation_facts("run::prefix")[0]["passed"] is True
@@ -981,7 +1160,7 @@ def test_resume_keeps_passing_prefix_and_redoes_from_first_failure():
     resumed = SasLLMPipeline(
         llm=FakeListChatModel(responses=[GOOD_RESPONSE]),
         memory=mem,
-        validator=LiveValidator(),
+        validator=LiveValidator(output_language="PySpark"),
         validation_retries=1,
     )
     outputs = resumed._process(
