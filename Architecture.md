@@ -258,14 +258,31 @@ app_config/
                         Client secret from AZURE_CLIENT_SECRET only; msal
                         imported lazily (extra: azure).
 
+target_language/
+  __init__.py           The run's target output language as one resolved
+                        object: TargetLanguage (display name, fence tags,
+                        notebook kernel/cell language, complexity profile,
+                        syntax checker) + resolve_target_language(), which
+                        folds spelling ("SparkSQL"/"spark sql"/"sql" are one
+                        target) and raises UnknownTargetLanguage rather than
+                        degrading to a Python run. PySpark, Spark SQL, Spark
+                        Scala. A leaf package — stdlib only — imported by
+                        pipeline, prompt_builder, validation, and complexity,
+                        which is what keeps them agreeing on one target.
+                        sqlglot optional (extra: sql) for the SQL check.
+
 validation/
   models.py             Pydantic models: ValidationCase, CaseRun,
                         MetricResult, CaseResult, ValidationReport
                         (score/passed are computed fields; to_markdown()).
-  metrics.py            Deterministic metrics + default_metrics():
-                        response_coverage, dataset_fidelity, python_syntax,
-                        required_terms, reference_similarity. Thresholds
-                        resolve via app_config (validation.<name>_threshold).
+  metrics.py            Deterministic metrics + default_metrics(language):
+                        response_coverage, dataset_fidelity,
+                        language_compliance, python_syntax, required_terms,
+                        reference_similarity. The two language-aware ones
+                        score against the run's target (python_syntax keeps
+                        its historical name but parses the TARGET, not
+                        Python). Thresholds resolve via app_config
+                        (validation.<name>_threshold).
   judge.py              LLMJudgeMetric — opt-in LLM-as-judge (any
                         LangChain-style model / llm_client.LLMClient);
                         never part of default_metrics().
@@ -711,6 +728,17 @@ any of these silently changes behavior.
    `_STANDARD_AUTOCALL_MACROS` — the three sets have distinct, citable
    identities and distinct consumers; do not fold them together.
 
+11. **The target output language is resolved once and passed as an object.**
+   `SasLLMPipeline.__init__` calls `resolve_target_language` and every later
+   stage takes the resulting `TargetLanguage` from `.target_language` — the
+   prompt, the `[lang: ...]` axis, the notebook kernel and fence tags, the
+   validation suite. Re-deriving it from a string downstream is what let the
+   layers disagree: the syntax metric checked Python on a Spark SQL run and
+   scored a correct translation 0.0. Metric *names* are also part of this
+   contract — `python_syntax` is a stable key in config.json, in stored
+   verdicts, and in report tables, so it keeps its name while checking the
+   target.
+
 ## Conventions
 
 - **Logging:** f-string messages everywhere (never lazy `%`-style).
@@ -720,7 +748,8 @@ any of these silently changes behavior.
   Logger names follow modules: `chunker.chunker`, `chunker.scanner`,
   `chunker.metadata`, `chunker.batcher`, `pipeline.engine`,
   `pipeline.prompting`, `pipeline.notebook`, `memory.store`,
-  `memory.relevance`, `memory.summarize`, `llm_client.client`.
+  `memory.relevance`, `memory.summarize`, `llm_client.client`,
+  `target_language`.
 - **Names:** dataset/macro/libref names are lowercased at extraction;
   quoted physical paths keep a leading `'` so they can never collide with
   identifiers.

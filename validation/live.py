@@ -48,9 +48,10 @@ from typing import Any, Iterable, Sequence
 
 from chunker.models import SasBatch, SasChunk
 from llm_client import TokenUsage
+from target_language import TargetLanguage
 
 from .evaluator import Evaluator
-from .metrics import ValidationMetric
+from .metrics import ValidationMetric, _as_target, default_metrics
 from .models import CaseResult, EvaluationRun, MetricResult, ValidationReport
 
 logger = logging.getLogger(__name__)
@@ -79,16 +80,49 @@ class LiveValidator:
         validation never slows a run with an extra model call. Append an
         :class:`~validation.judge.LLMJudgeMetric` to grade each item with a
         judge model (that call *is* per-item, and blocking).
+    output_language : str | TargetLanguage | None
+        The target the default suite scores the emitted code against —
+        normally the pipeline's own
+        :attr:`~pipeline.engine.SasLLMPipeline.target_language`. ``None``
+        resolves the configured default. A validator scoring a different
+        target than the pipeline prompts for fails every item on
+        ``language_compliance``, so pass the pipeline's when you have it.
+        Ignored when *metrics* is given: an explicit suite carries its own
+        targets.
     """
 
     def __init__(
-        self, *, metrics: Sequence[ValidationMetric] | None = None
+        self,
+        *,
+        metrics: Sequence[ValidationMetric] | None = None,
+        output_language: "str | TargetLanguage | None" = None,
     ) -> None:
+        self._target: TargetLanguage | None = None
+        if metrics is None:
+            self._target = _as_target(output_language)
+            metrics = default_metrics(self._target)
+        elif output_language is not None:
+            logger.warning(
+                "LiveValidator: output_language is ignored when an explicit "
+                "metric suite is passed; build the suite with "
+                "default_metrics(output_language=...) instead"
+            )
         self._evaluator = Evaluator(metrics=metrics)
         logger.info(
             "LiveValidator: metrics="
             f"[{', '.join(m.name for m in self._evaluator.metrics)}]"
         )
+
+    @property
+    def target_language(self) -> TargetLanguage | None:
+        """The target the default suite was built for, or ``None``.
+
+        ``None`` means the caller supplied its own metrics, so this validator
+        has no single target to speak for. :class:`SasLLMPipeline` reads this
+        to warn when it is about to score a run against a language other than
+        the one it prompts for.
+        """
+        return self._target
 
     @property
     def metrics(self) -> list[ValidationMetric]:

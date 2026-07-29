@@ -26,7 +26,7 @@ from pipeline import SasLLMPipeline
 from llm_client import TokenUsage
 
 from .evaluator import Evaluator
-from .metrics import ValidationMetric
+from .metrics import ValidationMetric, default_metrics
 from .models import CaseResult, CaseRun, ValidationCase, ValidationReport
 
 logger = logging.getLogger(__name__)
@@ -41,8 +41,11 @@ class ValidationRunner:
     pipeline : SasLLMPipeline
         The pipeline under test, fully configured by the caller.
     metrics : Sequence[ValidationMetric] | None
-        Metric suite; ``None`` (default) uses :func:`default_metrics` — the
-        deterministic, offline suite. Append an
+        Metric suite; ``None`` (default) uses :func:`default_metrics` built
+        for *pipeline*'s own target language — the deterministic, offline
+        suite. Taking the target from the pipeline rather than the config
+        default is what keeps the run being scored against the language it
+        was actually prompted to emit. Append an
         :class:`~validation.judge.LLMJudgeMetric` for judged runs.
     """
 
@@ -53,6 +56,8 @@ class ValidationRunner:
         metrics: Sequence[ValidationMetric] | None = None,
     ) -> None:
         self.pipeline = pipeline
+        if metrics is None:
+            metrics = default_metrics(pipeline.target_language)
         self._evaluator = Evaluator(metrics=metrics)
         logger.info(
             f"ValidationRunner: model={pipeline.model}  "

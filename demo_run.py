@@ -158,6 +158,11 @@ import app_config
 from pipeline import SasLLMPipeline
 from chunker._repl import print_iterable
 from prompt_builder import PromptBuilder
+from target_language import (
+    DEFAULT_OUTPUT_LANGUAGE,
+    KNOWN_TARGETS,
+    resolve_target_language,
+)
 from validation import LiveValidator
 
 logger = logging.getLogger("demo_run")
@@ -325,8 +330,16 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--output-language",
-        default="SparkSQL",
-        help="Target language named in the system prompt (default: SparkSQL).",
+        default=None,
+        help=(
+            "Target language to translate into: "
+            f"{', '.join(t.display_name for t in KNOWN_TARGETS)} "
+            "(spelling is folded, so 'sparksql' and 'Spark SQL' are the same "
+            "target). Drives the system prompt, the notebook kernel, and what "
+            "validation checks the emitted code against. Omit to use "
+            "config.json pipeline.output_language, then "
+            f"{DEFAULT_OUTPUT_LANGUAGE}."
+        ),
     )
     parser.add_argument(
         "--vault-secret",
@@ -640,7 +653,16 @@ def _run_local(args: argparse.Namespace) -> int:
         logger.info(f"model from config.json/default: {model}")
 
     api_key, base_url = _resolve_llm_credentials(args)
-    validator = None if args.no_validate else LiveValidator()
+    # Resolved here, not inside the pipeline, because the validator is built
+    # first and has to score against the same target the pipeline prompts for
+    # — scoring a Spark SQL run's output as Python is exactly the mismatch
+    # this argument exists to prevent.
+    target = resolve_target_language(args.output_language)
+    validator = (
+        None
+        if args.no_validate
+        else LiveValidator(output_language=target.display_name)
+    )
     pipeline = _build_pipeline(
         args, model=model, api_key=api_key, base_url=base_url, validator=validator
     )
@@ -659,7 +681,7 @@ def _run_local(args: argparse.Namespace) -> int:
         from pipeline.notebook import write_notebooks
 
         written = write_notebooks(
-            outputs, args.out_dir, output_language=args.output_language
+            outputs, args.out_dir, output_language=pipeline.output_language
         )
         for path in written:
             print(f"wrote notebook: {path}")
@@ -892,7 +914,12 @@ def _run_sharepoint(args: argparse.Namespace) -> int:
         logger.info(f"  - {rel}")
 
     api_key, base_url = _resolve_llm_credentials(args)
-    validator = LiveValidator() if req.live_validation else None
+    target = resolve_target_language(args.output_language)
+    validator = (
+        LiveValidator(output_language=target.display_name)
+        if req.live_validation
+        else None
+    )
     pipeline = _build_pipeline(
         args, model=req.model, api_key=api_key, base_url=base_url, validator=validator
     )
@@ -930,7 +957,7 @@ def _run_sharepoint(args: argparse.Namespace) -> int:
             instructions_fingerprint=pipeline.instructions_fingerprint,
             policy_fingerprint=pipeline.policy_fingerprint,
             token_usage=pipeline.token_usage,
-            output_language=args.output_language,
+            output_language=pipeline.output_language,
         )
     except SharePointError as exc:
         logger.error(f"could not upload results to SharePoint: {exc}")

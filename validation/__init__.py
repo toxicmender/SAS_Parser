@@ -64,6 +64,7 @@ from .live import (
 from .metrics import (
     JUDGED_METRIC_NAMES,
     DatasetFidelityMetric,
+    LanguageComplianceMetric,
     PythonSyntaxMetric,
     ReferenceSimilarityMetric,
     RequiredTermsMetric,
@@ -115,6 +116,7 @@ __all__ = [
     "HallucinationMetric",
     "JudgedMetric",
     "LLMJudgeMetric",
+    "LanguageComplianceMetric",
     "LiveValidator",
     "MemoryExtractionMetric",
     "MemoryLeakageMetric",

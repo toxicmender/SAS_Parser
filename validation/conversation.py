@@ -34,6 +34,7 @@ from typing import Any, Sequence, cast
 
 from langchain_core.messages import BaseMessage
 from memory.turns import group_turns, turn_text
+from target_language import TargetLanguage
 
 from .evaluator import Evaluator
 from .metrics import ValidationMetric
@@ -273,16 +274,26 @@ def validate_thread(
     metrics: Sequence[ValidationMetric] | None = None,
     required_terms: Sequence[str] = (),
     reference_translation: str | None = None,
+    output_language: "str | TargetLanguage | None" = None,
 ) -> CaseResult:
     """Score an existing thread: :func:`run_from_thread` + the metric suite
-    (``None`` = the deterministic :func:`~validation.metrics.default_metrics`)."""
+    (``None`` = the deterministic :func:`~validation.metrics.default_metrics`).
+
+    *output_language* is the target the default suite checks the thread's code
+    against. When *source* is a :class:`SasLLMPipeline` and none is given, its
+    target is used — post-hoc scoring of a run then matches what that run was
+    prompted for. A bare memory hub carries no such record, so scoring one
+    falls back to the configured default.
+    """
     run = run_from_thread(
         source,
         thread_id,
         required_terms=required_terms,
         reference_translation=reference_translation,
     )
-    return Evaluator(metrics=metrics).evaluate(run)
+    if output_language is None:
+        output_language = getattr(source, "target_language", None)
+    return Evaluator(metrics=metrics, output_language=output_language).evaluate(run)
 
 
 def run_from_transcript(
@@ -327,13 +338,18 @@ def validate_transcript(
     metrics: Sequence[ValidationMetric] | None = None,
     required_terms: Sequence[str] = (),
     reference_translation: str | None = None,
+    output_language: "str | TargetLanguage | None" = None,
 ) -> CaseResult:
     """Score an arbitrary transcript: :func:`run_from_transcript` + the
-    metric suite (``None`` = the deterministic default suite)."""
+    metric suite (``None`` = the deterministic default suite).
+
+    A transcript records no target of its own, so pass *output_language* when
+    the translations in it are not the configured default's language.
+    """
     run = run_from_transcript(
         transcript,
         run_id=run_id,
         required_terms=required_terms,
         reference_translation=reference_translation,
     )
-    return Evaluator(metrics=metrics).evaluate(run)
+    return Evaluator(metrics=metrics, output_language=output_language).evaluate(run)

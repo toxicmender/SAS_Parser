@@ -199,6 +199,13 @@ change:
 | `sparksql.json` | Spark SQL | The default (`rules.DEFAULT_TARGET`). |
 | `pyspark.json` | PySpark | `extends` the Spark SQL profile and restates only what differs. |
 
+With no `target` argument and no `complexity.target` in config.json, the
+profile follows the **run's** output language (config.json
+`pipeline.output_language`, via `target_language`), so a PySpark run rates its
+files against PySpark without a second knob to keep in sync. Set
+`complexity.target` to score against a different target than the pipeline
+translates into.
+
 A profile may inherit with `"extends": "<name>"`; the child's entries deep-merge
 over the parent's per construct, so a derived target states **only its
 differences**. `pyspark.json` is ~15 entries against Spark SQL's ~130, because

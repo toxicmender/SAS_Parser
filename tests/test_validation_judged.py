@@ -566,6 +566,7 @@ def test_default_metrics_stays_deterministic_and_judge_free():
     assert names == [
         "response_coverage",
         "dataset_fidelity",
+        "language_compliance",
         "python_syntax",
         "required_terms",
         "reference_similarity",

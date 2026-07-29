@@ -40,11 +40,14 @@ pipeline's inputs/outputs, and Spark is only booted inside
 models.py        ValidationCase, EvaluationRun (case-free scoring unit),
                  CaseRun (case-derived subclass), MetricResult, CaseResult,
                  ValidationReport (with to_markdown()).
-metrics.py       Deterministic metrics + default_metrics():
+metrics.py       Deterministic metrics + default_metrics(output_language):
                    response_coverage    every unit answered            (>= 1.0)
                    dataset_fidelity     item's dataset names appear
                                         in its response                (>= 0.75)
-                   python_syntax        fenced Python blocks ast.parse (>= 1.0)
+                   language_compliance  translated blocks are in the
+                                        run's target language          (>= 1.0)
+                   python_syntax        those blocks parse as the
+                                        target (historical name)       (>= 1.0)
                    required_terms       declared substrings            (>= 1.0)
                    reference_similarity token-F1 vs golden reference   (>= 0.5)
 judge.py         LLMJudgeMetric — grades functional equivalence 1–5 with any
@@ -259,6 +262,24 @@ pipeline = SasLLMPipeline(llm=FakeListChatModel(responses=["..."]))
 report = ValidationRunner(pipeline).run(load_cases("validation/cases"))
 print(report.to_markdown())
 ```
+
+`ValidationRunner` takes the target language from the pipeline it is given, so
+the code is scored as the language it was prompted for. The entry points that
+have no pipeline to ask take it explicitly:
+
+```python
+from validation import Evaluator, LiveValidator, default_metrics
+
+LiveValidator(output_language="SparkSQL")          # inline, during a run
+Evaluator(output_language="SparkSQL")              # a prepared EvaluationRun
+default_metrics("SparkSQL")                        # to build a suite by hand
+```
+
+Omitting it resolves config.json `pipeline.output_language`, then the code
+default. Getting it wrong is loud rather than silent: a `LiveValidator` built
+for one target and handed to a pipeline prompting for another logs a WARNING at
+construction, because every item would otherwise fail `language_compliance` and
+— with `validation_retries` on — burn the whole retry budget.
 
 ## Run history
 

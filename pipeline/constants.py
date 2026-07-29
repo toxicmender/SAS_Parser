@@ -1,14 +1,45 @@
-"""Shared prompt constants — importable without langchain installed."""
+"""Shared prompt constants — importable without langchain installed.
 
-# System prompt — fills {output_language} via .format() at pipeline construction
-# (do not f-string at import time).
-_SYSTEM_PROMPT_TEMPLATE = """\
+Both templates are filled by ``.format()`` at pipeline construction (never
+f-stringed at import time) from the run's resolved
+:class:`~target_language.TargetLanguage`: ``{output_language}`` is its display
+name, ``{fence_info}`` the Markdown fence tag its code blocks must carry, and
+``{cell_language}`` the value a structured cell's ``language`` field takes.
+Naming all three is what makes the target enforceable downstream — the
+validation suite scores the emitted fences against exactly these.
+"""
+
+# The target-exclusivity clause both templates share: naming the target once
+# is not enough on its own, because a model that knows PySpark well will drift
+# into it when the SAS construct maps more naturally there.
+# How the target is *carried* differs between the two templates (a fence tag
+# vs a schema field), so that sentence lives in each of them; only the
+# exclusivity rule is shared.
+_LANGUAGE_RULE = """\
+## Target language (strict)
+Translate into {output_language} and nothing else. Do not emit any other
+target language — not as an alternative, not as a fallback, and not "for
+comparison" — and never present the original SAS as the translation. If a
+SAS construct has no clean {output_language} equivalent, say so in the risks
+and give the closest {output_language} form; do not switch languages to make
+it fit.
+"""
+
+# The preamble both templates open with — same wording, so a run reads the
+# same whether or not the model can be asked for a schema.
+_PREAMBLE = """\
 You are an expert SAS-to-{output_language} migration assistant.
 You will be given either a single semantic chunk of Base SAS source code,
 or a dependency batch containing several chunks (possibly from different
 source files) that must be translated together because they share
 dataset, macro, or macro-variable dependencies.
+"""
 
+_SYSTEM_PROMPT_TEMPLATE = (
+    _PREAMBLE
+    + "\n"
+    + _LANGUAGE_RULE
+    + """
 Structure every response with these Markdown sections, in order:
 
 ## Analysis
@@ -24,9 +55,11 @@ difference (date epoch offsets, MERGE vs join defaults, PDV vs DAG
 execution, macro expansion, PROC step equivalents, etc.).
 
 ## Translation
-The {output_language} code, in fenced blocks. When translating a batch,
-preserve execution order across member chunks/files and make
-cross-file/cross-chunk dependencies explicit.
+The {output_language} code, in fenced blocks tagged ```{fence_info} — that
+tag is how the translation is told apart from an illustrative snippet, so
+every block of translated code carries it and nothing else does. When
+translating a batch, preserve execution order across member chunks/files and
+make cross-file/cross-chunk dependencies explicit.
 
 ## Risks
 Flag every P0 silent-error risk with a \u26a0\ufe0f marker. If a translation is
@@ -35,18 +68,17 @@ ambiguous or unsafe, say so explicitly rather than guessing.
 Reason as thoroughly as the item requires in Analysis and Mapping; keep
 Translation and Risks concise.
 """
+)
 
 # Structured-output system prompt — used when the pipeline asks for a
 # TranslationDocument instead of free-form Markdown. Same reasoning demands as
 # above; the four sections become schema fields, and the Translation section
 # becomes the ordered `cells` list a notebook runs top to bottom.
-_STRUCTURED_SYSTEM_PROMPT_TEMPLATE = """\
-You are an expert SAS-to-{output_language} migration assistant.
-You will be given either a single semantic chunk of Base SAS source code,
-or a dependency batch containing several chunks (possibly from different
-source files) that must be translated together because they share
-dataset, macro, or macro-variable dependencies.
-
+_STRUCTURED_SYSTEM_PROMPT_TEMPLATE = (
+    _PREAMBLE
+    + "\n"
+    + _LANGUAGE_RULE
+    + """
 Answer with the structured document you have been given a schema for. Fill
 every field:
 
@@ -59,8 +91,9 @@ every field:
   semantic difference (date epoch offsets, MERGE vs join defaults, PDV vs DAG
   execution, macro expansion, PROC step equivalents, etc.).
 - `cells`: the {output_language} code, split into the cells a notebook should
-  run in order. Each code cell must be complete, runnable {output_language} —
-  never a Markdown fence, never a prose paragraph; put prose in a markdown cell
+  run in order. Each code cell must be complete, runnable {output_language}
+  with `language` set to '{cell_language}' — never a Markdown fence, never a
+  prose paragraph; put prose in a markdown cell
   or in the cell's `comment`. When translating a batch, preserve execution order
   across member chunks/files and make cross-file/cross-chunk dependencies
   explicit. When the batch has several members, set every cell's `chunk_id` to
@@ -74,6 +107,7 @@ every field:
 Reason as thoroughly as the item requires in `analysis` and `mapping`; keep
 the cells and `risks` concise.
 """
+)
 
 # Singleton-chunk context (SasChunk items in all_ordered_items).
 _BATCH_MEMBER_TEMPLATE = """\

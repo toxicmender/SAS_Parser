@@ -48,6 +48,13 @@ import re
 from pathlib import Path
 from typing import Any, Iterable
 
+from target_language import (
+    PROSE_FENCE_INFOS,
+    TargetLanguage,
+    normalize_language,
+    resolve_target_language,
+)
+
 from .response_models import TranslationCell, TranslationDocument
 
 logger = logging.getLogger(__name__)
@@ -67,57 +74,20 @@ _FENCE_RE = re.compile(r"```([^\n`]*)\n(.*?)```", re.DOTALL)
 # A "## " section heading at the start of a line.
 _SECTION_RE = re.compile(r"^## +(.+?) *$", re.MULTILINE)
 
-# Fence info strings that are NOT target-language code: the echoed SAS source
-# and plain prose/log blocks. Everything else in ## Translation (empty info
-# included — an untagged fence in a translation is the translation) is code.
-_NON_TARGET_INFO_STRINGS = {"sas", "text", "txt", "log", "output", "console"}
+def _target_for(output_language: str | TargetLanguage | None) -> TargetLanguage:
+    """The target these notebooks are being written for.
 
-# output_language -> (kernelspec, language_info). Keyed on a lowercased,
-# punctuation-stripped form of the name so "Spark SQL", "spark-sql", and
-# "SparkSQL" all land together.
-_PYTHON_KERNEL = (
-    {"name": "python3", "display_name": "Python 3", "language": "python"},
-    {"name": "python", "file_extension": ".py", "mimetype": "text/x-python"},
-)
-_SQL_KERNEL = (
-    {"name": "sql", "display_name": "SQL", "language": "sql"},
-    {"name": "sql", "file_extension": ".sql", "mimetype": "application/sql"},
-)
-_SCALA_KERNEL = (
-    {"name": "scala", "display_name": "Scala", "language": "scala"},
-    {"name": "scala", "file_extension": ".scala", "mimetype": "text/x-scala"},
-)
-_KERNELS = {
-    "pyspark": _PYTHON_KERNEL,
-    "python": _PYTHON_KERNEL,
-    "python3": _PYTHON_KERNEL,
-    "py": _PYTHON_KERNEL,
-    "sparksql": _SQL_KERNEL,
-    "sql": _SQL_KERNEL,
-    "sparkscala": _SCALA_KERNEL,
-    "scala": _SCALA_KERNEL,
-}
-_PUNCT_RE = re.compile(r"[^a-z0-9]+")
-
-
-def _normalise_language(name: str | None) -> str:
-    return _PUNCT_RE.sub("", (name or "").lower())
-
-
-def _kernel_for(output_language: str | None) -> tuple[dict, dict]:
-    """Kernelspec + language_info for *output_language*.
-
-    Unknown targets fall back to Python 3: a notebook that opens everywhere and
-    reports one wrong language beats one no front-end will start.
+    Callers hand over whatever they hold — the pipeline's resolved
+    :class:`TargetLanguage`, a name from a CLI, or nothing. An unrecognised
+    name does *not* raise here: by the time a notebook is being written the
+    translation has been paid for, so it is written with PySpark's kernel and
+    a warning rather than lost. (The pipeline itself rejects the name at
+    construction, long before any call is made — see
+    ``target_language.resolve_target_language``.)
     """
-    key = _normalise_language(output_language)
-    kernel = _KERNELS.get(key)
-    if kernel is None:
-        logger.debug(
-            f"_kernel_for: no kernel mapping for {output_language!r}; using python3"
-        )
-        return _PYTHON_KERNEL
-    return kernel
+    if isinstance(output_language, TargetLanguage):
+        return output_language
+    return resolve_target_language(output_language, allow_unknown=True)
 
 
 # ---------------------------------------------------------------------------
@@ -150,17 +120,26 @@ def code_cell(source: str, *, language: str | None = None) -> dict[str, Any]:
     }
 
 
-def document_to_cells(doc: TranslationDocument) -> list[dict[str, Any]]:
+def document_to_cells(
+    doc: TranslationDocument,
+    *,
+    output_language: str | TargetLanguage | None = None,
+) -> list[dict[str, Any]]:
     """Cells for one structured :class:`TranslationDocument`.
 
     Analysis, Mapping, and Risks become markdown cells; every
     :class:`~pipeline.response_models.TranslationCell` becomes a cell of its own
     kind, in order, so the notebook runs the translation as the model sequenced
     it.
+
+    *output_language* supplies the language a code cell is tagged with when
+    the model left ``TranslationCell.language`` unset — the run's target,
+    rather than the flat "python" assumption that predates it.
     """
+    target = _target_for(output_language)
     cells = _document_prelude_cells(doc)
     for cell in doc.cells:
-        cells.extend(_translation_cell_to_cells(cell))
+        cells.extend(_translation_cell_to_cells(cell, target))
     cells.extend(_document_risks_cells(doc))
     return cells
 
@@ -193,21 +172,41 @@ def _document_risks_cells(doc: TranslationDocument) -> list[dict[str, Any]]:
     return [markdown_cell("\n".join(lines))]
 
 
-def _translation_cell_to_cells(cell: TranslationCell) -> list[dict[str, Any]]:
-    """One :class:`TranslationCell` — plus its comment heading, if any."""
+def _translation_cell_to_cells(
+    cell: TranslationCell, target: TargetLanguage
+) -> list[dict[str, Any]]:
+    """One :class:`TranslationCell` — plus its comment heading, if any.
+
+    A code cell that names no language is tagged with *target*'s. One that
+    names a different language keeps its own tag — the cell is highlighted as
+    what it actually is, and the ``language_compliance`` metric is what fails
+    the item — but it is logged, because a notebook quietly mixing languages
+    is how an off-target translation used to ship unnoticed.
+    """
     out: list[dict[str, Any]] = []
     if cell.comment.strip():
         out.append(markdown_cell(f"#### {cell.comment.strip()}"))
     if not cell.source.strip():
         return out
     if cell.kind == "code":
-        out.append(code_cell(cell.source, language=cell.language))
+        language = cell.language or target.cell_language
+        if not target.owns_fence(language):
+            logger.warning(
+                f"_translation_cell_to_cells: cell declares language "
+                f"{cell.language!r}, but this run targets "
+                f"{target.display_name}; keeping the declared one"
+            )
+        out.append(code_cell(cell.source, language=language))
     else:
         out.append(markdown_cell(cell.source))
     return out
 
 
-def markdown_to_cells(response: str) -> list[dict[str, Any]]:
+def markdown_to_cells(
+    response: str,
+    *,
+    output_language: str | TargetLanguage | None = None,
+) -> list[dict[str, Any]]:
     """Cells for an unstructured Markdown *response* — the fallback path.
 
     Only the ``## Translation`` section yields code cells: a fenced block in
@@ -216,10 +215,14 @@ def markdown_to_cells(response: str) -> list[dict[str, Any]]:
     heading at all (the model deviated from the prompt) the whole response is
     treated as the translation region, which is the safer failure: the code is
     at least present and runnable.
+
+    *output_language* is the run's target: it decides which fences are code
+    and what an untagged one is tagged as.
     """
+    target = _target_for(output_language)
     sections = _split_sections(response)
     if not sections:
-        return _cells_from_translation_region(response)
+        return _cells_from_translation_region(response, target)
 
     cells: list[dict[str, Any]] = []
     saw_translation = False
@@ -228,7 +231,7 @@ def markdown_to_cells(response: str) -> list[dict[str, Any]]:
             saw_translation = True
             if heading.strip():
                 cells.append(markdown_cell(f"### {heading.strip()}"))
-            cells.extend(_cells_from_translation_region(body))
+            cells.extend(_cells_from_translation_region(body, target))
         elif body.strip() or heading.strip():
             title = f"### {heading.strip()}\n\n" if heading.strip() else ""
             cells.append(markdown_cell(f"{title}{body.strip()}"))
@@ -237,7 +240,7 @@ def markdown_to_cells(response: str) -> list[dict[str, Any]]:
             "markdown_to_cells: no '## Translation' section; treating the whole "
             "response as translation"
         )
-        return _cells_from_translation_region(response)
+        return _cells_from_translation_region(response, target)
     return cells
 
 
@@ -268,12 +271,20 @@ def _mask_fences(text: str) -> str:
     return _FENCE_RE.sub(lambda m: " " * len(m.group(0)), text)
 
 
-def _cells_from_translation_region(text: str) -> list[dict[str, Any]]:
-    """Walk *text*, turning fenced target-language blocks into code cells.
+def _cells_from_translation_region(
+    text: str, target: TargetLanguage
+) -> list[dict[str, Any]]:
+    """Walk *text*, turning fenced code blocks into code cells.
 
     Prose between the fences becomes markdown cells; blocks whose info string
     marks them as source echo (``sas``) or plain text stay inside their prose
     cell, fence and all.
+
+    A block in some *other* programming language still becomes a code cell,
+    tagged as what it is: the translation has already been paid for, and a
+    notebook that runs the wrong language is more useful — and more obviously
+    wrong — than one silently missing its translation. ``language_compliance``
+    is what fails the item; this only logs.
     """
     cells: list[dict[str, Any]] = []
     prose_start = 0
@@ -285,10 +296,16 @@ def _cells_from_translation_region(text: str) -> list[dict[str, Any]]:
 
     for match in _FENCE_RE.finditer(text):
         info = match.group(1).strip().lower()
-        if info in _NON_TARGET_INFO_STRINGS:
+        if normalize_language(info) in PROSE_FENCE_INFOS:
             continue  # leave it in the surrounding prose cell
+        if not target.owns_fence(info):
+            logger.warning(
+                f"_cells_from_translation_region: ```{info} block in a "
+                f"{target.display_name} translation; emitting it as a "
+                f"{info} cell"
+            )
         flush(match.start())
-        cells.append(code_cell(match.group(2), language=info or None))
+        cells.append(code_cell(match.group(2), language=info or target.cell_language))
         prose_start = match.end()
     flush(len(text))
     return cells
@@ -302,7 +319,7 @@ def _cells_from_translation_region(text: str) -> list[dict[str, Any]]:
 def build_notebook(
     cells: Iterable[dict[str, Any]],
     *,
-    output_language: str | None = None,
+    output_language: str | TargetLanguage | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Wrap *cells* into a complete nbformat v4.5 notebook.
@@ -313,16 +330,19 @@ def build_notebook(
     random so re-running the same pipeline output produces a byte-identical
     notebook and diffs stay readable.
     """
-    kernelspec, language_info = _kernel_for(output_language)
+    target = _target_for(output_language)
     stamped = []
     for index, cell in enumerate(cells):
         stamped.append({**cell, "id": f"cell-{index:04d}"})
     nb_metadata: dict[str, Any] = {
-        "kernelspec": dict(kernelspec),
-        "language_info": dict(language_info),
+        "kernelspec": dict(target.kernelspec),
+        "language_info": dict(target.language_info),
     }
     if output_language:
-        nb_metadata["sas_parser"] = {"output_language": output_language}
+        # The canonical name, not the caller's spelling: a notebook records
+        # which target it was written for, and "SparkSQL"/"spark sql" are the
+        # same one.
+        nb_metadata["sas_parser"] = {"output_language": target.display_name}
     if metadata:
         nb_metadata.update(metadata)
     return {
@@ -343,11 +363,16 @@ def notebook_to_json(notebook: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def item_cells(out: dict[str, Any]) -> list[dict[str, Any]]:
+def item_cells(
+    out: dict[str, Any],
+    *,
+    output_language: str | TargetLanguage | None = None,
+) -> list[dict[str, Any]]:
     """Header + body cells for one pipeline output dict.
 
     Prefers the structured ``document`` the pipeline attached; falls back to
-    parsing ``response`` when there is none.
+    parsing ``response`` when there is none. *output_language* is the run's
+    target, used to tag code cells the model left untagged.
     """
     cells = [markdown_cell(_item_header_markdown(out))]
     document = out.get("document")
@@ -361,8 +386,10 @@ def item_cells(out: dict[str, Any]) -> list[dict[str, Any]]:
                 exc_info=True,
             )
         else:
-            return cells + document_to_cells(doc)
-    return cells + markdown_to_cells(str(out.get("response", "")))
+            return cells + document_to_cells(doc, output_language=output_language)
+    return cells + markdown_to_cells(
+        str(out.get("response", "")), output_language=output_language
+    )
 
 
 def _item_header_markdown(out: dict[str, Any]) -> str:
@@ -398,7 +425,7 @@ def _notebook_key(out: dict[str, Any]) -> str:
 
 
 def _split_item_by_source(
-    out: dict[str, Any]
+    out: dict[str, Any], target: TargetLanguage
 ) -> dict[str, list[dict[str, Any]]] | None:
     """Route one multi-source item's cells per source file, or ``None``.
 
@@ -451,7 +478,7 @@ def _split_item_by_source(
         source: list(shared_prelude) for source in sources
     }
     for cell, source in routed:
-        rendered = _translation_cell_to_cells(cell)
+        rendered = _translation_cell_to_cells(cell, target)
         if source is None:  # untagged prose: every participating notebook
             for cells in per_source.values():
                 cells.extend(rendered)
@@ -490,7 +517,9 @@ def _filename_for(key: str, taken: dict[str, str]) -> str:
 
 
 def notebooks_from_outputs(
-    outputs: list[dict[str, Any]], *, output_language: str | None = None
+    outputs: list[dict[str, Any]],
+    *,
+    output_language: str | TargetLanguage | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Group *outputs* into ``{filename_stem: notebook}``.
 
@@ -502,22 +531,27 @@ def notebooks_from_outputs(
     once, and every participating file's notebook gets a pointer to it in its
     place, so a reader following one program never silently skips a step.
     """
+    # Resolved once for the whole set: every notebook in a run targets the
+    # same language, and re-resolving per item would re-log the same warning.
+    target = _target_for(output_language)
     grouped: dict[str, list[dict[str, Any]]] = {}
     names: dict[str, str] = {}
     for out in outputs:
         key = _notebook_key(out)
         if key != CROSS_FILE_NOTEBOOK:
             name = _filename_for(key, names)
-            grouped.setdefault(name, []).extend(item_cells(out))
+            grouped.setdefault(name, []).extend(
+                item_cells(out, output_language=target)
+            )
             continue
-        per_source = _split_item_by_source(out)
+        per_source = _split_item_by_source(out, target)
         if per_source is not None:
             for source, cells in per_source.items():
                 name = _filename_for(source, names)
                 grouped.setdefault(name, []).extend(cells)
             continue
         name = _filename_for(key, names)
-        grouped.setdefault(name, []).extend(item_cells(out))
+        grouped.setdefault(name, []).extend(item_cells(out, output_language=target))
         item_id = out.get("item_id", "batch")
         for source in out.get("source_files") or []:
             pointer = _filename_for(source, names)
@@ -532,7 +566,9 @@ def notebooks_from_outputs(
             )
 
     notebooks = {
-        name: build_notebook(cells, output_language=output_language)
+        name: build_notebook(
+            cells, output_language=target if output_language else None
+        )
         for name, cells in grouped.items()
     }
     logger.info(

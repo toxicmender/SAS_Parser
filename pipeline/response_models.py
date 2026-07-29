@@ -27,12 +27,6 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-# Fence info strings we consider "already Python" when rendering, mirroring
-# validation.metrics._PYTHON_INFO_STRINGS so a rendered document scores the
-# same as a hand-written Markdown one.
-_PYTHON_LANGUAGES = {"python", "python3", "py", "pyspark"}
-
-
 class MappingEntry(BaseModel):
     """One SAS construct and what it becomes in the target language."""
 
@@ -128,17 +122,28 @@ class TranslationDocument(BaseModel):
     def code_cells(self) -> list[TranslationCell]:
         return [c for c in self.cells if c.kind == "code"]
 
-    def fence_info(self, cell: TranslationCell) -> str:
-        """The info string for *cell*'s fence in the rendered Markdown."""
-        language = (cell.language or "").strip().lower()
-        return language if language else "python"
+    def fence_info(
+        self, cell: TranslationCell, default_fence: str = "python"
+    ) -> str:
+        """The info string for *cell*'s fence in the rendered Markdown.
 
-    def to_markdown(self) -> str:
+        *default_fence* is what an untagged code cell gets — the run's target
+        fence (``target_language.TargetLanguage.default_fence``). It defaults
+        to ``"python"`` only so a caller that has no target still renders
+        something; :meth:`to_markdown` is the one that supplies the real value.
+        """
+        language = (cell.language or "").strip().lower()
+        return language if language else default_fence
+
+    def to_markdown(self, default_fence: str = "python") -> str:
         """Render to the same four-section Markdown an unstructured run emits.
 
         This is what gets persisted as the AI turn and scored by the validation
         metrics, so the section headings and the fenced code blocks are part of
-        the contract — see the module docstring.
+        the contract — see the module docstring. *default_fence* tags a code
+        cell whose ``language`` the model left unset: pass the run's target
+        fence, or a Spark SQL translation renders as ```python and fails
+        ``language_compliance`` for a mistake it did not make.
         """
         lines: list[str] = ["## Analysis", "", self.analysis.strip(), ""]
 
@@ -160,7 +165,7 @@ class TranslationDocument(BaseModel):
                     lines += [f"### {cell.comment.strip()}", ""]
                 if cell.kind == "code":
                     lines += [
-                        f"```{self.fence_info(cell)}",
+                        f"```{self.fence_info(cell, default_fence)}",
                         cell.source.strip("\n"),
                         "```",
                         "",

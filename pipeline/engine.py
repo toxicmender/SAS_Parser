@@ -61,6 +61,7 @@ from memory.store import MemoryHub
 from memory.summarize import RollingSummarizer
 from memory.thread_mem import ThreadMemory
 from prompt_builder import PromptBuilder, UserInstructionSet
+from target_language import TargetLanguage, resolve_target_language
 
 from .constants import (
     _STRUCTURED_SYSTEM_PROMPT_TEMPLATE,
@@ -220,8 +221,18 @@ class SasLLMPipeline:
         Forwarded to :class:`SasSemanticChunker`. ``None`` (default) lets
         the chunker read ``sas_chunker.*`` from config.json (see the
         ``app_config`` package), falling back to 300/700.
-    output_language : str
-        Target language named in the system prompt (default ``"PySpark"``).
+    output_language : str | None
+        Target language to translate into. Resolved once, here, through the
+        ``target_language`` registry: the name is folded (``"spark sql"``,
+        ``"SparkSQL"``, and ``"Spark SQL"`` are one target) and canonicalised,
+        and the resolved :class:`~target_language.TargetLanguage` then drives
+        the system prompt, the ``[lang: ...]`` instruction axis, the notebook
+        kernel and fence tags, and what the validation suite checks the
+        emitted code against. An unrecognised name raises
+        :class:`~target_language.UnknownTargetLanguage` rather than degrading
+        into a Python run that only looks right. ``None`` (default) defers to
+        config.json ``pipeline.output_language``, then
+        ``target_language.DEFAULT_OUTPUT_LANGUAGE`` (``"SparkSQL"``).
     system_prompt : str | None
         Override the default prompt from ``pipeline.constants``.
     structured_output : bool | None
@@ -406,7 +417,7 @@ class SasLLMPipeline:
         prompt_caching: bool | None = None,
         min_words: int | None = None,
         max_words: int | None = None,
-        output_language: str = "PySpark",
+        output_language: str | None = None,
         system_prompt: str | None = None,
         window_k: int | None = 6,
         history_selector: RelevantHistorySelector | None = None,
@@ -435,6 +446,11 @@ class SasLLMPipeline:
             raise ValueError(
                 f"validation_retries must be >= 0, got {validation_retries}"
             )
+        # Resolved once, before anything reads it: the prompt, the guidance
+        # selector, the notebook writer, and the validator all take the target
+        # from here, so they cannot each interpret the caller's spelling
+        # differently (raises on an unknown name — see the argument docs).
+        target = resolve_target_language(output_language)
         # Grouped configs are the canonical form; the individual kwargs are
         # the legacy spelling. Mixing the two for the same concern would make
         # one of them silently lose, so it is rejected outright.
@@ -491,6 +507,19 @@ class SasLLMPipeline:
                 spark=spark,
                 delta_table=delta_table,
             )
+        # A validator built for another target fails every item on
+        # `language_compliance` — and with validation_retries on, burns the
+        # whole retry budget doing it. Cheap to detect, so say so up front
+        # rather than letting a run's verdicts explain it item by item.
+        validator_target = getattr(validator, "target_language", None)
+        if validator_target is not None and validator_target.key != target.key:
+            logger.warning(
+                f"SasLLMPipeline: the validator scores against "
+                f"{validator_target.display_name} but this run translates into "
+                f"{target.display_name}; build it with "
+                f"LiveValidator(output_language={target.display_name!r}) or "
+                f"every item will fail on language"
+            )
         if validation_retries and validator is None:
             logger.warning(
                 f"SasLLMPipeline: validation_retries={validation_retries} has no "
@@ -510,7 +539,7 @@ class SasLLMPipeline:
                 prompt_builder = PromptBuilder(
                     [],
                     user_instructions=user_instructions,
-                    output_language=output_language,
+                    output_language=target.display_name,
                 )
             else:
                 if prompt_builder.user_instructions is not None:
@@ -533,7 +562,8 @@ class SasLLMPipeline:
                 f"{model!r} is not an Anthropic model; caching stays off"
             )
         logger.info(
-            f"SasLLMPipeline.__init__  model={model}  output_language={output_language}  "
+            f"SasLLMPipeline.__init__  model={model}  "
+            f"output_language={target.display_name}  "
             f"window_k={window_k}  guidance={'on' if prompt_builder else 'off'}  "
             f"prompt_caching={'on' if self._prompt_caching else 'off'}"
         )
@@ -556,7 +586,8 @@ class SasLLMPipeline:
         # None here means "derive a default"; the budget is settled below,
         # once the system prompt exists to be measured (0 = packing off).
         self._requested_merged_tokens = max_merged_tokens
-        self._output_language = output_language
+        self._target_language = target
+        self._output_language = target.display_name
         self._history_selector = history_selector
         self._prompt_builder = prompt_builder
         self._validator = validator
@@ -663,8 +694,14 @@ class SasLLMPipeline:
             if self._structured_output
             else _SYSTEM_PROMPT_TEMPLATE
         )
+        # Both templates are filled with all three target facts; each uses the
+        # subset it needs (the Markdown one names the fence tag, the
+        # structured one the cell `language` value), and .format() ignores the
+        # rest.
         self._system_prompt = system_prompt or template.format(
-            output_language=output_language
+            output_language=target.display_name,
+            fence_info=target.default_fence,
+            cell_language=target.cell_language,
         )
         # The long-term task policy rides INSIDE the cached system block: it
         # is the same text for every thread and every item of the run, so it
@@ -1018,6 +1055,22 @@ class SasLLMPipeline:
         )
 
     @property
+    def target_language(self) -> TargetLanguage:
+        """The resolved target this run translates into.
+
+        Callers that need the target *after* construction — writing notebooks
+        (``pipeline.notebook``), building a validator, picking a complexity
+        profile — should read it from here rather than re-resolving the string
+        they passed in, so every stage agrees on one object.
+        """
+        return self._target_language
+
+    @property
+    def output_language(self) -> str:
+        """The resolved target's canonical name (``"Spark SQL"``, ...)."""
+        return self._output_language
+
+    @property
     def task_policy(self) -> TaskPolicy | None:
         """The long-term policy this pipeline prompted, if any.
 
@@ -1210,7 +1263,7 @@ class SasLLMPipeline:
 
         document: TranslationDocument = parsed
         message = AIMessage(
-            content=document.to_markdown(),
+            content=document.to_markdown(self._target_language.default_fence),
             additional_kwargs={DOCUMENT_KEY: document.model_dump()},
         )
         if isinstance(raw, AIMessage):
