@@ -48,24 +48,135 @@ for f in report.files_needing_breakdown:      # the Extra Large ones
     print(f.source_id, "→ split at", f.suggested_split)
 ```
 
+The delivery format is two levels of Markdown — one corpus report plus one per
+source script, each printing the SAS behind every verdict — see
+[Two reports, not one](#two-reports-not-one). An optional LLM pass adds what the
+rules cannot see; see [The LLM evaluation](#the-llm-evaluation).
+
 ## CLI
 
 The report's delivery format is Markdown:
 
 ```bash
 python -m complexity path/to/sas_dir --out complexity-report.md
+python -m complexity path/to/sas_dir --out-dir reports/
 python -m complexity path/to/sas_dir --target pyspark --top 25
 ```
 
-Without `--out` the Markdown goes to stdout. The CLI chunks every matching
-file, batches the whole corpus with `MultiFileBatcher` — so cross-file
+Without `--out` or `--out-dir` the Markdown goes to stdout. The CLI chunks every
+matching file, batches the whole corpus with `MultiFileBatcher` — so cross-file
 dataset/macro edges resolve into shared batches — and scores the *batched*
 units, the same work items the pipeline would translate, so an estimate lines
 up with the run it is estimating. `--no-cross-file` scores every file as if it
 were alone; `--size-anchor` recalibrates the T-shirt scale (lowering it rates
 every file larger); `--min-story-points` / `--max-story-points` report the
 points on your own scale instead of the Fibonacci 2-8. Nothing here calls an
-LLM or touches the network.
+LLM or touches the network unless you ask for
+[the LLM evaluation](#the-llm-evaluation).
+
+## Two reports, not one
+
+`--out-dir` writes the whole deliverable:
+
+```
+reports/
+  complexity-report.md      the corpus: sizes, backlog total, hardest units
+  files/
+    load.md                 one report per source SAS script
+    report.md
+```
+
+The corpus report is `CorpusComplexityReport.to_markdown()` with an index of the
+individual ones appended. Each **individual** report answers the question the
+corpus one cannot — *what is in this file, and why did it score that?* — so it
+carries the file's dimensions, its cross-file coupling, its drivers table, and
+then every chunk with its verdict **and its SAS source**:
+
+````markdown
+### `f1-chunk-0001` — MACRO_DEFINITION (lines 1–9)
+
+- Tier **HIGH** · parity **MANUAL** · score 21.00
+- HIGH tier driven by kind:MACRO_DEFINITION, array, do_loop; …
+
+Signals:
+
+- array [HIGH/HARD]: ARRAY array x — aliases a group of columns, not a Spark
+  ArrayType; needs wide-to-long restructuring, not explode()
+
+```sas
+%macro load(lib=raw);
+  data work.a;
+    array x{3} v1-v3;
+```
+````
+
+Printing the source is the point: a verdict a reader has to go and look up in
+another file is a verdict they will not check. `--no-source-text` drops it and
+`--max-chunk-lines N` caps each snippet.
+
+The text is **passed in**, not read off the verdict — a `ChunkComplexity`
+carries no `text` field, because a verdict model that embedded its own source
+would double the size of every serialised report and duplicate what the chunker
+already holds. `chunk_texts()` builds the lookup:
+
+```python
+from complexity import ComplexityAnalyzer, chunk_texts, write_reports
+
+batch_result = MultiFileBatcher().batch(corpus)
+report = ComplexityAnalyzer().analyze_items(batch_result.all_ordered_items)
+write_reports(report, "reports/", texts=chunk_texts(batch_result.all_ordered_items))
+```
+
+Build the lookup from **the same items you scored**. `MultiFileBatcher` re-ids
+every chunk per file (`f1-chunk-0001`), so one built from the unbatched corpus
+would match nothing. It is keyed `(source_id, chunk_id)` rather than on the id
+alone for the same reason `crossfile.py` is: files are chunked independently, so
+two files' first chunks share an id.
+
+## The LLM evaluation
+
+Everything above is rule-driven, which is both its strength and its ceiling. It
+counts constructs, not intent, so it cannot see business rules packed into one
+arithmetic-heavy DATA step (which scores `0.0`), a `DO` loop that is really a
+join, hard-coded environment assumptions, or a step whose output nothing
+consumes.
+
+`--llm-eval` asks a model for exactly that, one call per file:
+
+```bash
+python -m complexity path/to/sas_dir --out-dir reports/ --llm-eval
+python -m complexity path/to/sas_dir --out-dir reports/ --llm-eval --eval-top 5
+python -m complexity path/to/sas_dir --out-dir reports/ --prompt-only
+```
+
+The prompt hands the model the file's measured verdict, its drivers, its
+coupling, and its full SAS source, and asks where the static numbers are wrong
+or incomplete: a purpose, a size verdict (`agree` / `larger` / `smaller`) with a
+justification, P0/P1/P2 findings the construct rules missed, manual steps, split
+points, and open questions. The static analysis is the ground the prompt stands
+on, not something the model is asked to reproduce — *"Do not re-derive the
+numbers below and do not restate the drivers table. Argue with it."*
+
+The result lands in `reports/llm-evaluation.md`. `--eval-top N` evaluates only
+the N largest files, since every file is a paid call. `--prompt-only` writes the
+prompts to `reports/prompts/` and calls nothing, so the prompt can be read and
+tuned for free.
+
+```python
+from complexity import build_evaluation_prompt, evaluate_report
+
+print(build_evaluation_prompt(report.files[0], texts=texts))   # offline
+evaluation = evaluate_report(llm, report, texts=texts)         # one call per file
+print(evaluation.to_markdown())
+```
+
+`llm` is anything with a LangChain-style `invoke(input) -> message` — an
+`llm_client.LLMClient` (which additionally gets a typed answer, since
+`invoke_structured` is used when offered), a raw chat model, or a fake in tests.
+So this package still depends on nothing but `chunker` and `app_config`, and on
+`pipeline` not at all. A reply that will not parse is kept as prose with the
+reason, and the other files still get their evaluations: one bad reply must not
+cost a corpus its run.
 
 Score against a different output language by naming its profile:
 
@@ -619,6 +730,12 @@ crossfile.py   CrossFileIndex — resolves macro/dataset/macro-var/libref
                references across the corpus into import / export / unresolved.
 analyzer.py    ComplexityAnalyzer — aggregation and sizing only; owns no tier
                of its own.
+report.py      Markdown rendering: the corpus report plus one report per source
+               SAS script, each printing the source behind every verdict.
+               Rendering only — scores nothing, calls nothing.
+llm_eval.py    The optional second opinion: the evaluation prompt, the shape
+               asked back, and the invocation. Duck-typed on the client, so the
+               package gains no LLM dependency.
 ```
 
 ## Where signals come from
@@ -715,8 +832,9 @@ batched run.
 
 ## Tests
 
-`tests/test_complexity.py` — 156 tests, no LLM and (apart from the rule-set
-loader's own tests, which write temp profiles) no disk I/O. Covers each tier
+`tests/test_complexity.py` — 181 tests, no LLM (the evaluation is exercised
+through fakes) and no disk I/O apart from the tests that are about disk: the
+rule-set loader's, and the report writer's and CLI's. Covers each tier
 against the constructs the brief names, the max-tier/worst-parity aggregation
 rules, detector precision (comments, string literals, `%DO` vs `DO`,
 `if…then do;` blocks, MERGE with vs without BY), batch aggregation, report
@@ -746,6 +864,17 @@ flagged, librefs assigned in another chunk of the same file, chunk-id collision
 across independently chunked files, a batch spanning two files still yielding
 two file rollups, and catalogue coverage in both directions — every construct
 `crossfile.py` can emit has a profile entry, and every entry is reachable.
+
+The reporting and evaluation additions bring: the text lookup keyed by source
+*and* chunk id (so two files sharing a chunk id do not collide, and a lookup
+built from batched items carries the re-ided keys), every mentioned chunk's SAS
+appearing in its file's report, `--no-source-text` and `--max-chunk-lines`,
+a missing snippet rendering a placeholder rather than vanishing, two scripts
+sharing a basename getting distinct report files, the corpus report gaining an
+index without otherwise changing, the prompt carrying verdict and source and
+being built with nothing called, and the three replies an evaluation has to
+survive — a structured one, JSON recovered from prose, and an unusable one kept
+as prose — plus a client that raises failing only its own file.
 
 ```
 python -m pytest tests/test_complexity.py -v

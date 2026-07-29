@@ -25,11 +25,18 @@ from complexity import (
     CrossFileIndex,
     TranslationParity,
     TShirtSize,
+    build_evaluation_prompt,
+    chunk_texts,
     detect_constructs,
+    evaluate_report,
+    evaluation_prompts,
     max_size,
     max_tier,
+    render_file_report,
+    render_overall_report,
     sort_by_complexity,
     worst_parity,
+    write_reports,
 )
 from complexity import rules
 
@@ -1638,6 +1645,407 @@ class TestComplexityCLI(unittest.TestCase):
         with contextlib.redirect_stdout(buffer):
             self.assertEqual(self._run(), 0)
         self.assertIn("# SAS chunk complexity report", buffer.getvalue())
+
+
+# ---------------------------------------------------------------------------
+# Individual reports, source text, and the optional LLM evaluation
+# ---------------------------------------------------------------------------
+
+_LOAD_SAS = (
+    "%macro load(lib=raw);\n"
+    "  data work.a;\n"
+    "    set &lib..a;\n"
+    "    array x{3} v1-v3;\n"
+    "    do i = 1 to 3;\n"
+    "      x{i} = x{i} * 2;\n"
+    "    end;\n"
+    "  run;\n"
+    "%mend load;\n"
+    "%load;\n"
+)
+
+_REPORT_SAS = "proc sql;\n  create table work.b as select * from work.a;\nquit;\n"
+
+
+def _batched(**files: str):
+    """Chunk, batch, and score *files*; return ``(report, texts)``.
+
+    Batched rather than raw, because :class:`MultiFileBatcher` re-ids every
+    chunk per file — a text lookup built from the unbatched corpus would miss
+    every one, which is exactly the wiring this pair has to keep straight.
+    """
+    corpus = _corpus(**files)
+    batch_result = MultiFileBatcher().batch(corpus)
+    report = ComplexityAnalyzer().analyze_items(
+        batch_result.all_ordered_items,
+        source_ids=corpus.source_ids,
+        diagnostics=corpus.all_diagnostics,
+    )
+    return report, chunk_texts(batch_result.all_ordered_items)
+
+
+class TestChunkTexts(unittest.TestCase):
+    """The (source_id, chunk_id) -> text lookup the renderers take."""
+
+    def test_indexes_a_corpus_by_source_and_chunk_id(self):
+        corpus = _corpus(load=_LOAD_SAS)
+        texts = chunk_texts(corpus)
+        self.assertTrue(texts)
+        for (source_id, chunk_id), text in texts.items():
+            self.assertEqual(source_id, "load.sas")
+            self.assertTrue(chunk_id)
+            self.assertIn("%macro", "".join(texts.values()))
+            self.assertTrue(text.strip())
+
+    def test_accepts_a_batch_result_and_a_chunk_result(self):
+        corpus = _corpus(load=_LOAD_SAS)
+        from_result = chunk_texts(corpus.file_results[0])
+        from_batches = chunk_texts(MultiFileBatcher().batch(corpus))
+        self.assertTrue(from_result)
+        self.assertTrue(from_batches)
+        # The batcher re-ids chunks, so the two disagree on the keys and agree
+        # on the texts. That is the whole reason the key carries source_id.
+        self.assertEqual(
+            sorted(from_result.values()), sorted(from_batches.values())
+        )
+
+    def test_same_chunk_id_in_two_files_does_not_collide(self):
+        report, texts = _batched(load=_LOAD_SAS, other=_LOAD_SAS)
+        sources = {source_id for source_id, _ in texts}
+        self.assertEqual(sources, {"load.sas", "other.sas"})
+        # Two entries per file at least, none lost to a shared chunk id.
+        self.assertEqual(len(texts), sum(f.chunk_count for f in report.files))
+
+
+class TestFileReport(unittest.TestCase):
+    """Per-source-file reports print the SAS behind every verdict."""
+
+    def setUp(self):
+        self.report, self.texts = _batched(load=_LOAD_SAS, report=_REPORT_SAS)
+        self.file = _file(self.report, "load.sas")
+
+    def _render(self, **kwargs):
+        return render_file_report(
+            self.file,
+            texts=self.texts,
+            target_display=self.report.target_display,
+            **kwargs,
+        )
+
+    def test_prints_the_chunk_source_for_every_chunk_it_mentions(self):
+        text = self._render()
+        for chunk in self.file.chunks:
+            self.assertIn(f"`{chunk.chunk_id}`", text)
+        self.assertIn("```sas", text)
+        self.assertIn("array x{3} v1-v3;", text)
+        self.assertIn("%mend load;", text)
+
+    def test_states_the_size_tier_and_dimensions(self):
+        text = self._render()
+        self.assertIn(f"# Complexity report — {self.file.source_id}", text)
+        self.assertIn(self.file.size.label, text)
+        self.assertIn("## Drivers", text)
+        self.assertIn("## Chunks", text)
+        self.assertIn("array", text)
+
+    def test_no_source_text_keeps_the_verdicts_and_drops_the_sas(self):
+        text = self._render(include_source=False)
+        self.assertNotIn("```sas", text)
+        self.assertIn("## Chunks", text)
+        self.assertIn(self.file.chunks[0].chunk_id, text)
+
+    def test_max_source_lines_truncates_and_says_so(self):
+        text = self._render(max_source_lines=2)
+        self.assertIn("%macro load(lib=raw);", text)
+        self.assertNotIn("%mend load;", text)
+        self.assertIn("further line(s) not shown", text)
+
+    def test_a_missing_snippet_renders_a_placeholder(self):
+        text = render_file_report(self.file, texts={})
+        self.assertIn("Source text unavailable", text)
+        # The verdict still renders in full.
+        self.assertIn("## Drivers", text)
+
+    def test_a_floored_size_says_which_kind_floored_it(self):
+        self.assertEqual(self.file.floored_by, "MACRO_DEFINITION")
+        self.assertIn("floored", self._render())
+
+
+class TestOverallReport(unittest.TestCase):
+    """The corpus report, plus its index of the individual ones."""
+
+    def setUp(self):
+        self.report, self.texts = _batched(load=_LOAD_SAS, report=_REPORT_SAS)
+
+    def test_without_links_it_is_the_corpus_report_verbatim(self):
+        self.assertEqual(
+            render_overall_report(self.report, top=5),
+            self.report.to_markdown(top=5),
+        )
+
+    def test_links_are_appended_as_an_index(self):
+        text = render_overall_report(
+            self.report, file_links={"load.sas": "files/load.md"}
+        )
+        self.assertIn("## Individual reports", text)
+        self.assertIn("[files/load.md](files/load.md)", text)
+        # Every scored file appears, linked or not.
+        self.assertIn("report.sas", text)
+
+
+class TestWriteReports(unittest.TestCase):
+    """`write_reports` puts the overall report and the per-file ones on disk."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_writes_one_report_per_source_file_plus_the_overall_one(self):
+        report, texts = _batched(load=_LOAD_SAS, report=_REPORT_SAS)
+        written = write_reports(report, self.tmp, texts=texts)
+
+        self.assertTrue(written.overall.is_file())
+        self.assertEqual(written.overall.name, "complexity-report.md")
+        self.assertEqual(set(written.files), {"load.sas", "report.sas"})
+        for path in written.files.values():
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.parent.name, "files")
+
+        overall = written.overall.read_text(encoding="utf-8")
+        self.assertIn("## Individual reports", overall)
+        self.assertIn("files/load.md", overall)
+
+        individual = written.files["load.sas"].read_text(encoding="utf-8")
+        self.assertIn("array x{3} v1-v3;", individual)
+        self.assertIn("../complexity-report.md", individual)
+
+    def test_two_files_sharing_a_basename_get_distinct_reports(self):
+        corpus = SasCorpus(
+            file_results=[
+                SasSemanticChunker().chunk_text(_LOAD_SAS, source_id=sid)
+                for sid in ("a/job.sas", "b/job.sas")
+            ]
+        )
+        batch_result = MultiFileBatcher().batch(corpus)
+        report = ComplexityAnalyzer().analyze_items(
+            batch_result.all_ordered_items, source_ids=corpus.source_ids
+        )
+        written = write_reports(
+            report, self.tmp, texts=chunk_texts(batch_result.all_ordered_items)
+        )
+        stems = {path.stem for path in written.files.values()}
+        self.assertEqual(len(stems), 2, f"reports collided: {stems}")
+
+
+class TestEvaluationPrompt(unittest.TestCase):
+    """The LLM prompt is built offline and carries verdict plus source."""
+
+    def setUp(self):
+        self.report, self.texts = _batched(load=_LOAD_SAS, report=_REPORT_SAS)
+        self.file = _file(self.report, "load.sas")
+
+    def test_carries_the_static_verdict_and_the_sas_source(self):
+        prompt = build_evaluation_prompt(
+            self.file, texts=self.texts, target_display=self.report.target_display
+        )
+        self.assertIn("Spark SQL", prompt)
+        self.assertIn("load.sas", prompt)
+        self.assertIn(self.file.size.label, prompt)
+        self.assertIn("array x{3} v1-v3;", prompt)
+        self.assertIn("```sas", prompt)
+        # It asks for what the rules cannot answer, not for the rules again.
+        self.assertIn("Argue with it", prompt)
+        self.assertIn("Open questions", prompt)
+
+    def test_include_source_false_drops_the_sas(self):
+        prompt = build_evaluation_prompt(
+            self.file, texts=self.texts, include_source=False
+        )
+        self.assertNotIn("```sas", prompt)
+        self.assertIn(self.file.size.label, prompt)
+
+    def test_one_prompt_per_file_and_sources_narrows_it(self):
+        every = evaluation_prompts(self.report, texts=self.texts)
+        self.assertEqual(set(every), {"load.sas", "report.sas"})
+        one = evaluation_prompts(
+            self.report, texts=self.texts, sources=["load.sas"]
+        )
+        self.assertEqual(set(one), {"load.sas"})
+
+
+class _StructuredFake:
+    """A client offering structured output, like ``llm_client.LLMClient``."""
+
+    payload = {
+        "summary": "Loads raw.a into work.a, doubling three measures.",
+        "size_verdict": "larger",
+        "size_rationale": "The ARRAY/DO pair is a wide-to-long restructure.",
+        "findings": [{"severity": "P0", "note": "f1-chunk-0001: array aliases columns."}],
+        "manual_steps": ["Decide the target schema."],
+        "suggested_split": [],
+        "open_questions": ["Where does raw.a come from?"],
+    }
+
+    def __init__(self):
+        self.config = type("_C", (), {"model": "fake-structured"})()
+        self.prompts = []
+
+    def supports_structured_output(self, schema):
+        return True
+
+    def invoke_structured(self, schema, prompt):
+        self.prompts.append(prompt)
+        return {
+            "raw": None,
+            "parsed": schema.model_validate(self.payload),
+            "parsing_error": None,
+        }
+
+
+class _ProseFake:
+    """A plain chat model: no structured output, JSON in a fenced block."""
+
+    def __init__(self, reply=None):
+        self.model_name = "fake-prose"
+        self.reply = reply or (
+            "Sure:\n```json\n"
+            + json.dumps(_StructuredFake.payload)
+            + "\n```\nHope that helps."
+        )
+        self.prompts = []
+
+    def invoke(self, prompt):
+        self.prompts.append(prompt)
+        return self.reply
+
+
+class TestLLMEvaluation(unittest.TestCase):
+    """Evaluation degrades rather than raising, whatever the client does."""
+
+    def setUp(self):
+        self.report, self.texts = _batched(load=_LOAD_SAS, report=_REPORT_SAS)
+
+    def test_structured_client_yields_a_typed_evaluation_per_file(self):
+        llm = _StructuredFake()
+        evaluation = evaluate_report(llm, self.report, texts=self.texts)
+
+        self.assertEqual(len(evaluation.files), len(self.report.files))
+        self.assertEqual(evaluation.failures, [])
+        self.assertEqual(evaluation.model, "fake-structured")
+        result = evaluation.for_source("load.sas")
+        self.assertIsNotNone(result)
+        self.assertEqual(result.evaluation.size_verdict, "larger")
+        self.assertEqual(result.static_size, _file(self.report, "load.sas").size.label)
+        # One call per file, each carrying that file's source.
+        self.assertEqual(len(llm.prompts), len(self.report.files))
+        self.assertIn("array x{3} v1-v3;", llm.prompts[0] + llm.prompts[1])
+
+        markdown = evaluation.to_markdown()
+        self.assertIn("# LLM complexity evaluation", markdown)
+        self.assertIn("P0", markdown)
+        self.assertIn("Where does raw.a come from?", markdown)
+
+    def test_json_in_a_prose_reply_is_recovered(self):
+        evaluation = evaluate_report(_ProseFake(), self.report, texts=self.texts)
+        self.assertEqual(evaluation.failures, [])
+        self.assertEqual(
+            evaluation.for_source("load.sas").evaluation.size_verdict, "larger"
+        )
+
+    def test_an_unusable_reply_is_kept_as_prose_rather_than_raising(self):
+        evaluation = evaluate_report(
+            _ProseFake(reply="I could not do that."), self.report, texts=self.texts
+        )
+        self.assertEqual(len(evaluation.failures), len(self.report.files))
+        result = evaluation.for_source("load.sas")
+        self.assertFalse(result.ok)
+        self.assertIn("I could not do that.", result.prose)
+        self.assertTrue(result.error)
+        # The document still renders, carrying the unparsed reply.
+        self.assertIn("I could not do that.", evaluation.to_markdown())
+
+    def test_a_raising_client_fails_only_that_file(self):
+        class _Boom:
+            calls = 0
+
+            def invoke(self, prompt):
+                _Boom.calls += 1
+                if _Boom.calls == 1:
+                    raise RuntimeError("gateway down")
+                return "```json\n" + json.dumps(_StructuredFake.payload) + "\n```"
+
+        evaluation = evaluate_report(_Boom(), self.report, texts=self.texts)
+        self.assertEqual(len(evaluation.failures), 1)
+        self.assertIn("gateway down", evaluation.failures[0].error)
+        self.assertEqual(len(evaluation.files), len(self.report.files))
+
+    def test_limit_evaluates_only_the_largest_files(self):
+        llm = _StructuredFake()
+        evaluation = evaluate_report(llm, self.report, texts=self.texts, limit=1)
+        self.assertEqual(len(evaluation.files), 1)
+        largest = max(self.report.files, key=lambda f: f.points)
+        self.assertEqual(evaluation.files[0].source_id, largest.source_id)
+
+
+class TestComplexityReportCLI(unittest.TestCase):
+    """`--out-dir`, `--no-source-text`, and `--prompt-only`."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        (self.tmp / "load.sas").write_text(_LOAD_SAS, encoding="utf-8")
+        (self.tmp / "report.sas").write_text(_REPORT_SAS, encoding="utf-8")
+        self.out = self.tmp / "out"
+
+    def _run(self, *args):
+        from complexity.__main__ import main
+
+        return main([str(self.tmp), *args])
+
+    def test_out_dir_writes_the_overall_report_and_one_per_file(self):
+        self.assertEqual(self._run("--out-dir", str(self.out)), 0)
+        overall = self.out / "complexity-report.md"
+        self.assertTrue(overall.is_file())
+        self.assertIn("## Individual reports", overall.read_text(encoding="utf-8"))
+
+        individual = sorted((self.out / "files").glob("*.md"))
+        self.assertEqual([p.stem for p in individual], ["load", "report"])
+        load = (self.out / "files" / "load.md").read_text(encoding="utf-8")
+        self.assertIn("array x{3} v1-v3;", load)
+        self.assertIn("```sas", load)
+
+    def test_no_source_text_omits_the_sas(self):
+        self.assertEqual(
+            self._run("--out-dir", str(self.out), "--no-source-text"), 0
+        )
+        load = (self.out / "files" / "load.md").read_text(encoding="utf-8")
+        self.assertNotIn("```sas", load)
+        self.assertIn("## Drivers", load)
+
+    def test_prompt_only_writes_prompts_and_calls_nothing(self):
+        self.assertEqual(
+            self._run("--out-dir", str(self.out), "--llm-eval", "--prompt-only"), 0
+        )
+        prompts = sorted((self.out / "prompts").glob("*.md"))
+        self.assertEqual([p.stem for p in prompts], ["load", "report"])
+        text = (self.out / "prompts" / "load.md").read_text(encoding="utf-8")
+        self.assertIn("Static verdict", text)
+        self.assertIn("array x{3} v1-v3;", text)
+        # No evaluation was produced, because nothing was called.
+        self.assertFalse((self.out / "llm-evaluation.md").exists())
+
+    def test_eval_top_limits_the_prompts(self):
+        self.assertEqual(
+            self._run(
+                "--out-dir",
+                str(self.out),
+                "--prompt-only",
+                "--eval-top",
+                "1",
+            ),
+            0,
+        )
+        self.assertEqual(len(list((self.out / "prompts").glob("*.md"))), 1)
 
 
 if __name__ == "__main__":

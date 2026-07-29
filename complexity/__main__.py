@@ -1,8 +1,10 @@
-"""Score a directory of SAS files and write the complexity report as Markdown.
+"""Score a directory of SAS files and write the complexity reports as Markdown.
 
     python -m complexity path/to/sas_dir
+    python -m complexity path/to/sas_dir --out-dir reports/
     python -m complexity path/to/sas_dir --target pyspark --out report.md
     python -m complexity path/to/sas_dir --rules-path my_profile.json --top 25
+    python -m complexity path/to/sas_dir --out-dir reports/ --llm-eval
 
 Chunks every matching file, batches the whole corpus with
 :class:`~chunker.batcher.MultiFileBatcher` so cross-file dataset/macro edges
@@ -11,9 +13,17 @@ Scoring the *batched* units — rather than raw chunks — reports on the same w
 items the pipeline translates, so an estimate lines up with what a migration run
 will actually do.
 
-The report is :meth:`~complexity.models.CorpusComplexityReport.to_markdown`;
-without ``--out`` it goes to stdout. Nothing here calls an LLM: the analysis is
-entirely offline and never touches the network.
+Two kinds of report come out. ``--out`` (or stdout) writes the corpus-wide one,
+:meth:`~complexity.models.CorpusComplexityReport.to_markdown`. ``--out-dir``
+writes that *plus* one report per source SAS script under ``files/``, each
+printing the SAS source of every chunk it mentions, with the overall report
+indexing them.
+
+``--llm-eval`` adds an optional second opinion: each file's verdict and source
+are sent to a model with a prompt asking where the rules are wrong or
+incomplete (see :mod:`complexity.llm_eval`). It is the only thing here that
+touches the network — without it the analysis is entirely offline.
+``--prompt-only`` writes those prompts and calls nothing.
 
 Logger name: ``complexity.__main__``.
 """
@@ -28,9 +38,20 @@ from pathlib import Path
 from chunker import MultiFileBatcher, SasCorpus, SasSemanticChunker
 
 from .analyzer import ComplexityAnalyzer
+from .models import CorpusComplexityReport
+from .report import (
+    ChunkTextIndex,
+    chunk_texts,
+    render_overall_report,
+    source_stems,
+    write_reports,
+)
 from .rules import available_profiles
 
 logger = logging.getLogger(__name__)
+
+_EVALUATION_NAME = "llm-evaluation.md"
+_PROMPT_DIR = "prompts"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -101,7 +122,53 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--out",
         type=Path,
         default=None,
-        help="Write the Markdown report here instead of printing it.",
+        help="Write the overall Markdown report here instead of printing it.",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help="Write the overall report AND one report per source SAS script "
+        "under this directory (individual ones in files/). Each individual "
+        "report prints the SAS source behind every verdict.",
+    )
+    parser.add_argument(
+        "--no-source-text",
+        action="store_true",
+        help="Leave the SAS source out of the individual reports and of any "
+        "LLM prompt, reporting the verdicts alone.",
+    )
+    parser.add_argument(
+        "--max-chunk-lines",
+        type=int,
+        default=0,
+        help="Truncate each chunk's printed source to this many lines "
+        "(default: 0, print it whole).",
+    )
+    parser.add_argument(
+        "--llm-eval",
+        action="store_true",
+        help="Ask a model to evaluate each file against its static verdict — "
+        "the one option here that calls out to the network.",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default=None,
+        help="Model id for --llm-eval (default: config.json llm_client.model). "
+        "Implies --llm-eval.",
+    )
+    parser.add_argument(
+        "--eval-top",
+        type=int,
+        default=0,
+        help="Evaluate only the N largest files, since every file is a paid "
+        "call (default: 0, evaluate all of them).",
+    )
+    parser.add_argument(
+        "--prompt-only",
+        action="store_true",
+        help="Write the evaluation prompts instead of sending them — nothing "
+        "is called, so the prompt can be read and tuned for free.",
     )
     parser.add_argument(
         "--debug",
@@ -147,15 +214,121 @@ def main(argv: list[str] | None = None) -> int:
         source_ids=corpus.source_ids,
         diagnostics=corpus.all_diagnostics,
     )
-    markdown = report.to_markdown(top=args.top)
+    # Verdicts carry no source text by design, so the renderers are handed a
+    # lookup built from the same items that were scored. The batched items,
+    # not the corpus: MultiFileBatcher re-ids every chunk per file (f1-, f2-,
+    # ...), so a lookup built from the raw corpus would miss every one.
+    texts = chunk_texts(batch_result.all_ordered_items)
+    include_source = not args.no_source_text
 
-    if args.out is not None:
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(markdown, encoding="utf-8")
-        logger.info(f"wrote complexity report: {args.out}")
-        print(f"wrote complexity report: {args.out}")
+    if args.out_dir is not None:
+        written = write_reports(
+            report,
+            args.out_dir,
+            texts=texts,
+            top=args.top,
+            include_source=include_source,
+            max_source_lines=args.max_chunk_lines,
+        )
+        print(f"wrote overall complexity report: {written.overall}")
+        print(
+            f"wrote {len(written.files)} individual report(s): "
+            f"{args.out_dir / 'files'}"
+        )
+        if args.out is not None and args.out != written.overall:
+            _write(args.out, written.overall.read_text(encoding="utf-8"))
+            print(f"wrote complexity report: {args.out}")
+    else:
+        markdown = render_overall_report(report, top=args.top)
+        if args.out is not None:
+            _write(args.out, markdown)
+            print(f"wrote complexity report: {args.out}")
+        else:
+            print(markdown)
+
+    if args.llm_eval or args.llm_model or args.prompt_only:
+        return _run_evaluation(args, report, texts, include_source=include_source)
+    return 0
+
+
+def _write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _run_evaluation(
+    args: argparse.Namespace,
+    report: CorpusComplexityReport,
+    texts: ChunkTextIndex,
+    *,
+    include_source: bool,
+) -> int:
+    """The optional LLM pass: build the prompts, and send them unless asked not to.
+
+    Imported lazily and only on this path, so the offline analysis never pays
+    for — or depends on — the LLM stack.
+    """
+    from .llm_eval import evaluate_report, evaluation_prompts
+
+    files = sorted(report.files, key=lambda f: f.points, reverse=True)
+    wanted = (
+        [f.source_id for f in files[: args.eval_top]] if args.eval_top > 0 else None
+    )
+
+    if args.prompt_only:
+        prompts = evaluation_prompts(
+            report,
+            texts=texts,
+            include_source=include_source,
+            max_source_lines=args.max_chunk_lines,
+            sources=wanted,
+        )
+        if args.out_dir is None:
+            for source_id, prompt in prompts.items():
+                print(f"\n===== {source_id} =====\n")
+                print(prompt)
+            return 0
+        directory = Path(args.out_dir) / _PROMPT_DIR
+        directory.mkdir(parents=True, exist_ok=True)
+        stems = source_stems(prompts)
+        for source_id, prompt in prompts.items():
+            dest = directory / f"{stems[source_id]}.md"
+            dest.write_text(prompt, encoding="utf-8")
+        print(f"wrote {len(prompts)} evaluation prompt(s): {directory}")
+        return 0
+
+    try:
+        from llm_client import LLMClient, LLMClientConfig
+    except ImportError as exc:
+        logger.error(f"--llm-eval needs the llm_client package: {exc!r}")
+        print(f"--llm-eval is unavailable: {exc}", file=sys.stderr)
+        return 1
+
+    config = (
+        LLMClientConfig(model=args.llm_model)
+        if args.llm_model
+        else LLMClientConfig()
+    )
+    evaluation = evaluate_report(
+        LLMClient(config),
+        report,
+        texts=texts,
+        include_source=include_source,
+        max_source_lines=args.max_chunk_lines,
+        limit=args.eval_top,
+        model=config.model,
+    )
+    markdown = evaluation.to_markdown()
+    if args.out_dir is not None:
+        dest = Path(args.out_dir) / _EVALUATION_NAME
+        _write(dest, markdown)
+        print(f"wrote LLM complexity evaluation: {dest}")
     else:
         print(markdown)
+    # A model that answered nothing usable is a failed run, not a quiet one.
+    if evaluation.files and len(evaluation.failures) == len(evaluation.files):
+        logger.error("_run_evaluation: every reply was unparseable")
+        return 1
     return 0
 
 

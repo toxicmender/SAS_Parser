@@ -41,8 +41,11 @@ uncertainty — measured relative to a documented reference file, and accounts
 for what each file borrows from and lends to the rest of the corpus. The
 catalogue that assigns those ratings is JSON data under
 `complexity/profiles/`, one file per target, so the analysis retargets from
-Spark SQL to PySpark (or anything else) without a code change. It reads the
-chunker's output and is deliberately not wired into the pipeline.
+Spark SQL to PySpark (or anything else) without a code change. It delivers two
+levels of Markdown — one corpus report plus one per source SAS script, each
+printing the chunk text behind every verdict — and can optionally ask an LLM
+where its rules are wrong. It reads the chunker's output and is deliberately
+not wired into the pipeline.
 
 ```
                  +----------------------+
@@ -342,11 +345,30 @@ complexity/
                         kind. Files, not batches, are the sized unit: a batch
                         may span several files while every chunk belongs to
                         exactly one.
+  report.py             Markdown rendering, and nothing else: the corpus report
+                        (to_markdown() plus an index) and one report per source
+                        SAS script, each printing the chunk text behind every
+                        verdict it states. That text is passed in through
+                        chunk_texts(), keyed (source_id, chunk_id) — a
+                        ChunkComplexity carries no source of its own, and the
+                        batcher re-ids chunks per file, so the lookup must be
+                        built from the same items that were scored.
+  llm_eval.py           The optional second opinion: the evaluation prompt
+                        (static verdict + drivers + coupling + full source,
+                        asking where the rules are wrong rather than for the
+                        rules again), the FileEvaluation shape asked back, and
+                        the invocation. Duck-typed on the client (anything with
+                        invoke(); invoke_structured() used when offered), so
+                        the package gains no LLM dependency. An unparseable
+                        reply is kept as prose and costs only its own file.
   __main__.py           CLI: python -m complexity <sas_dir> [--target ...]
-                        [--top N] [--out report.md]. Chunks, batches with
+                        [--top N] [--out report.md] [--out-dir reports/]
+                        [--llm-eval | --prompt-only]. Chunks, batches with
                         MultiFileBatcher, and scores the *batched* units — the
                         same work items the pipeline translates — then writes
-                        to_markdown(). Offline; never calls an LLM.
+                        the corpus report, and with --out-dir the per-file ones
+                        too. Offline unless --llm-eval is passed, which is the
+                        only path here that reaches the network.
 ```
 
 Import direction is strictly downward: `keywords` and `models` import
@@ -376,7 +398,11 @@ import anything, and nothing imports it back. `complexity` sits above
 re-implementing SAS comment and quote rules or re-listing sets that would
 drift) and `app_config`, and nothing imports it back. It is
 never wired into the pipeline: scoring a corpus for complexity must not change
-what the LLM is asked to translate.
+what the LLM is asked to translate. Its own optional LLM pass
+(`complexity.llm_eval`) does not change that — the client is duck-typed on
+`invoke()` and supplied by the caller, so the package still imports neither
+`llm_client` nor `pipeline`, and `complexity/__main__.py` is the one place that
+constructs a real client, lazily and only when `--llm-eval` is passed.
 
 ## Chunking model
 
