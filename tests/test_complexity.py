@@ -5,6 +5,7 @@ test_complexity.py — unit tests for the complexity analysis package
 Run:  python -m pytest tests/test_complexity.py -v
 """
 
+import importlib.util
 import json
 import math
 import pathlib
@@ -12,6 +13,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from dataclasses import replace
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -23,6 +25,7 @@ from complexity import (
     ComplexityAnalyzer,
     ComplexityTier,
     CrossFileIndex,
+    DependencyGraph,
     TranslationParity,
     TShirtSize,
     build_evaluation_prompt,
@@ -34,6 +37,7 @@ from complexity import (
     max_tier,
     render_file_report,
     render_overall_report,
+    render_png,
     sort_by_complexity,
     worst_parity,
     write_reports,
@@ -2159,6 +2163,404 @@ class TestComplexityReportCLI(unittest.TestCase):
             0,
         )
         self.assertEqual(len(list((self.out / "prompts").glob("*.md"))), 1)
+
+
+class TestCommentBlocks(unittest.TestCase):
+    """COMMENT_BLOCK chunks are excluded from the analysis, and counted."""
+
+    BARE = "data work.a;\n  set work.b;\nrun;\n"
+    COMMENTED = (
+        "/* A header comment.\n"
+        "   Several lines of documentation that are not migration work.\n"
+        "   More of the same, at length. */\n"
+        "data work.a;\n"
+        "  set work.b;\n"
+        "run;\n"
+    )
+
+    def test_the_chunker_really_does_emit_one(self):
+        """Guards the premise: without a COMMENT_BLOCK the rest proves nothing."""
+        result = SasSemanticChunker().chunk_text(self.COMMENTED, source_id="t.sas")
+        kinds = [c.kind.value for c in result.chunks]
+        self.assertIn("COMMENT_BLOCK", kinds)
+
+    def test_no_comment_chunk_reaches_the_verdicts(self):
+        report = _analyze(self.COMMENTED)
+        self.assertNotIn(
+            "COMMENT_BLOCK", {c.kind for c in _file(report, "t.sas").chunks}
+        )
+        self.assertNotIn("COMMENT_BLOCK", {c.kind for c in report.chunks})
+
+    def test_counts_exclude_it_and_report_it(self):
+        file = _file(_analyze(self.COMMENTED), "t.sas")
+        self.assertEqual(file.chunk_count, 1)
+        self.assertEqual(file.comment_chunk_count, 1)
+        # The three comment lines are not in the span either.
+        self.assertEqual(file.line_count, 3)
+
+    def test_documentation_does_not_make_a_file_bigger(self):
+        """The point of the exclusion: same code, same size, comments or not."""
+        bare = _file(_analyze(self.BARE), "t.sas")
+        commented = _file(_analyze(self.COMMENTED), "t.sas")
+        self.assertEqual(bare.effort_raw, commented.effort_raw)
+        self.assertEqual(bare.raw_total, commented.raw_total)
+        self.assertEqual(bare.points, commented.points)
+
+    def test_a_comment_only_file_still_gets_a_rollup(self):
+        """It must not vanish from the corpus just because nothing scored."""
+        report = _analyze("/* nothing but a note. */\n")
+        file = _file(report, "t.sas")
+        self.assertEqual(file.chunk_count, 0)
+        self.assertEqual(file.comment_chunk_count, 1)
+        self.assertEqual(file.chunks, [])
+        self.assertEqual(file.size, TShirtSize.SMALL)
+
+    def test_batch_members_exclude_it_too(self):
+        """Filtering only the file rollup would leave batch scores inflated.
+
+        ``include_comment_chunks`` is what puts a COMMENT_BLOCK *inside* a
+        batch rather than beside it as a singleton — the path that reaches
+        ``analyze_batch`` rather than ``analyze_items``.
+        """
+        corpus = _corpus(
+            a="/* Header comment\n   over several lines. */\n"
+            "data work.a;\n  set work.b;\nrun;\n"
+            "data work.c;\n  set work.a;\nrun;\n"
+        )
+        batch_result = MultiFileBatcher(include_comment_chunks=True).batch(corpus)
+        batched_kinds = {
+            c.kind.value
+            for item in batch_result.all_ordered_items
+            for c in getattr(item, "chunks", [])
+        }
+        self.assertIn("COMMENT_BLOCK", batched_kinds)  # the premise
+
+        report = ComplexityAnalyzer().analyze_items(
+            batch_result.all_ordered_items, source_ids=corpus.source_ids
+        )
+        self.assertTrue(report.batches)
+        for batch in report.batches:
+            self.assertNotIn("COMMENT_BLOCK", {m.kind for m in batch.members})
+
+    def test_the_report_says_how_many_were_excluded(self):
+        text = render_file_report(_file(_analyze(self.COMMENTED), "t.sas"))
+        self.assertIn("1 comment block(s) excluded", text)
+
+    def test_a_file_without_comments_says_nothing_about_them(self):
+        text = render_file_report(_file(_analyze(self.BARE), "t.sas"))
+        self.assertNotIn("comment block(s) excluded", text)
+
+
+class TestDatasets(unittest.TestCase):
+    """The file's data interface: inputs, outputs, and internal intermediates."""
+
+    # Reads edw.raw, writes work.stg, reads it back, writes mart.out.
+    PIPELINE = (
+        "data work.stg;\n"
+        "  set edw.raw;\n"
+        "run;\n"
+        "data mart.out;\n"
+        "  set work.stg;\n"
+        "run;\n"
+    )
+
+    def setUp(self):
+        self.file = _file(_analyze(self.PIPELINE), "t.sas")
+
+    def test_a_dataset_written_then_read_here_is_an_intermediate(self):
+        self.assertIn("work.stg", self.file.intermediate_datasets)
+        # And so is not something anyone outside has to provide.
+        self.assertNotIn("work.stg", self.file.input_datasets)
+
+    def test_inputs_are_what_the_file_does_not_write_itself(self):
+        self.assertEqual(self.file.input_datasets, ["edw.raw"])
+
+    def test_outputs_are_everything_written(self):
+        self.assertEqual(
+            sorted(self.file.output_datasets), ["mart.out", "work.stg"]
+        )
+
+    def test_chunks_carry_their_own_reads_and_writes(self):
+        first = min(self.file.chunks, key=lambda c: c.start_line)
+        self.assertEqual(first.input_datasets, ["edw.raw"])
+        self.assertEqual(first.output_datasets, ["work.stg"])
+
+    def test_case_differences_are_one_dataset(self):
+        file = _file(
+            _analyze("data work.a;\n  set EDW.Raw;\nrun;\ndata b; set edw.raw; run;\n"),
+            "t.sas",
+        )
+        self.assertEqual(len(file.input_datasets), 1)
+
+    def test_the_report_renders_the_three_way_split(self):
+        text = render_file_report(self.file)
+        self.assertIn("## Datasets", text)
+        self.assertIn("Inputs (read here, written elsewhere): edw.raw", text)
+        self.assertIn("Intermediates (written and read here): work.stg", text)
+
+    def test_a_file_touching_no_dataset_gets_no_section(self):
+        text = render_file_report(_file(_analyze("%let x = 1;\n"), "t.sas"))
+        self.assertNotIn("## Datasets", text)
+
+    def test_the_rollup_agrees_with_cross_file_coupling(self):
+        """An imported dataset must not also be claimed as locally produced."""
+        report = ComplexityAnalyzer().analyze_corpus(
+            _corpus(
+                load="data raw.customers;\n  set edw.extract;\nrun;\n",
+                use="data mart.agg;\n  set raw.customers;\nrun;\n",
+            )
+        )
+        use = _file(report, "use.sas")
+        self.assertIn("raw.customers", use.input_datasets)
+        assert use.cross_file is not None
+        self.assertEqual(use.cross_file.depends_on, ["load.sas"])
+
+
+def _graph_corpus() -> SasCorpus:
+    """load -> transform -> {report_a, report_b}: a fan-out with one root.
+
+    The fan-out is the point: two files reading one dataset is the case a
+    single-peer edge record silently loses.
+    """
+    return _corpus(
+        load="data raw.customers;\n  set edw.extract;\nrun;\n",
+        transform="data mart.agg;\n  set raw.customers;\nrun;\n",
+        report_a="proc print data=mart.agg;\nrun;\n",
+        report_b="proc means data=mart.agg;\nrun;\n",
+    )
+
+
+class TestDependencyGraph(unittest.TestCase):
+    """Corpus-level dependency structure, built from the resolved references."""
+
+    def setUp(self):
+        self.report = ComplexityAnalyzer().analyze_corpus(_graph_corpus())
+        self.graph = self.report.graph
+        assert self.graph is not None
+
+    def _edge(self, upstream: str, downstream: str):
+        for edge in self.graph.edges:
+            if (edge.upstream, edge.downstream) == (upstream, downstream):
+                return edge
+        raise AssertionError(
+            f"no {upstream} -> {downstream} edge; have "
+            f"{[(e.upstream, e.downstream) for e in self.graph.edges]}"
+        )
+
+    def test_every_dependant_gets_an_edge(self):
+        """The lossy case: both readers of mart.agg, not just the first."""
+        self._edge("transform.sas", "report_a.sas")
+        self._edge("transform.sas", "report_b.sas")
+
+    def test_every_dependant_is_recorded_on_the_producer_profile(self):
+        transform = _file(self.report, "transform.sas").cross_file
+        assert transform is not None
+        self.assertEqual(
+            transform.depended_on_by, ["report_a.sas", "report_b.sas"]
+        )
+
+    def test_an_edge_names_what_caused_it(self):
+        self.assertEqual(self._edge("load.sas", "transform.sas").datasets,
+                         ["raw.customers"])
+        self.assertIn("dataset raw.customers",
+                      self._edge("load.sas", "transform.sas").label)
+
+    def test_import_and_export_fold_into_one_edge(self):
+        """Both files report the same dependency; it is one edge, not two."""
+        pairs = [(e.upstream, e.downstream) for e in self.graph.edges]
+        self.assertEqual(len(pairs), len(set(pairs)))
+
+    def test_nodes_include_every_analysed_file(self):
+        self.assertEqual(
+            self.graph.nodes,
+            ["load.sas", "report_a.sas", "report_b.sas", "transform.sas"],
+        )
+
+    def test_layers_are_migration_waves(self):
+        self.assertEqual(
+            self.graph.layers,
+            [["load.sas"], ["transform.sas"], ["report_a.sas", "report_b.sas"]],
+        )
+
+    def test_roots_and_leaves(self):
+        self.assertEqual(self.graph.roots, ["load.sas"])
+        self.assertEqual(self.graph.leaves, ["report_a.sas", "report_b.sas"])
+
+    def test_a_clean_corpus_is_acyclic(self):
+        self.assertTrue(self.graph.is_acyclic)
+        self.assertEqual(self.graph.cycles, [])
+
+    def test_macro_dependencies_are_edges_too(self):
+        report = ComplexityAnalyzer().analyze_corpus(
+            _corpus(
+                lib="%macro build(ds=);\n  data out; set &ds; run;\n%mend build;\n",
+                job="%build(ds=work.raw);\n",
+            )
+        )
+        graph = report.graph
+        assert graph is not None
+        edge = next(e for e in graph.edges if e.upstream == "lib.sas")
+        self.assertEqual(edge.downstream, "job.sas")
+        self.assertEqual(edge.macros, ["build"])
+        self.assertIn("macro build", edge.label)
+
+    def test_a_cycle_is_reported_and_not_silently_ordered(self):
+        """Two jobs each reading what the other writes cannot be a DAG."""
+        report = ComplexityAnalyzer().analyze_corpus(
+            _corpus(
+                a="data lib.one;\n  set lib.two;\nrun;\n",
+                b="data lib.two;\n  set lib.one;\nrun;\n",
+            )
+        )
+        graph = report.graph
+        assert graph is not None
+        self.assertFalse(graph.is_acyclic)
+        self.assertEqual(graph.cycles, [["a.sas", "b.sas"]])
+        # Neither is given a wave it cannot be given; both land in the
+        # trailing unordered layer.
+        self.assertEqual(graph.layers, [["a.sas", "b.sas"]])
+
+    def test_no_cross_file_analysis_means_no_graph(self):
+        report = ComplexityAnalyzer(use_cross_file=False).analyze_corpus(
+            _graph_corpus()
+        )
+        self.assertIsNone(report.graph)
+
+    def test_a_file_depends_on_itself_is_not_an_edge(self):
+        report = _analyze("data work.a;\n  set work.b;\nrun;\ndata c; set work.a; run;\n")
+        graph = report.graph
+        assert graph is not None
+        self.assertEqual(graph.edges, [])
+
+
+class TestDependencyGraphRendering(unittest.TestCase):
+    """The Markdown section, and the optional image beside it."""
+
+    def setUp(self):
+        self.report = ComplexityAnalyzer().analyze_corpus(_graph_corpus())
+        self.graph = self.report.graph
+        assert self.graph is not None
+
+    def test_the_overall_report_carries_the_edge_table(self):
+        text = self.report.to_markdown()
+        self.assertIn("## Dependency graph", text)
+        self.assertIn("| Upstream (migrate first) | Downstream | Via |", text)
+        self.assertIn("| load.sas | transform.sas | dataset raw.customers |", text)
+
+    def test_the_overall_report_carries_the_migration_order(self):
+        text = self.report.to_markdown()
+        self.assertIn("### Migration order", text)
+        self.assertIn("**Wave 1**: load.sas", text)
+        self.assertIn("**Wave 3**: report_a.sas, report_b.sas", text)
+
+    def test_an_image_is_linked_only_when_one_was_drawn(self):
+        self.assertNotIn("![Dependency graph]", self.report.to_markdown())
+        self.assertIn(
+            "![Dependency graph](dependency-graph.png)",
+            self.report.to_markdown(graph_image="dependency-graph.png"),
+        )
+
+    def test_an_uncoupled_corpus_gets_no_section(self):
+        report = ComplexityAnalyzer().analyze_corpus(
+            _corpus(a="%let x = 1;\n", b="%let y = 2;\n")
+        )
+        self.assertNotIn("## Dependency graph", report.to_markdown())
+
+    def test_a_cycle_is_called_out_in_the_prose(self):
+        report = ComplexityAnalyzer().analyze_corpus(
+            _corpus(
+                a="data lib.one;\n  set lib.two;\nrun;\n",
+                b="data lib.two;\n  set lib.one;\nrun;\n",
+            )
+        )
+        text = report.to_markdown()
+        self.assertIn("not acyclic", text)
+        self.assertIn("### Cycles (1)", text)
+        self.assertIn("**Unordered** (in a cycle): a.sas, b.sas", text)
+
+    def test_without_links_the_overall_report_is_still_verbatim(self):
+        """The graph belongs to `to_markdown`, so this equality must hold."""
+        self.assertEqual(
+            render_overall_report(self.report, top=5),
+            self.report.to_markdown(top=5),
+        )
+
+
+class TestDependencyGraphImage(unittest.TestCase):
+    """`render_png` — optional, and never fatal when it cannot run."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        report = ComplexityAnalyzer().analyze_corpus(_graph_corpus())
+        assert report.graph is not None
+        self.graph = report.graph
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("matplotlib"), "matplotlib is not installed"
+    )
+    def test_it_writes_a_png(self):
+        dest = render_png(self.graph, self.tmp / "graph.png")
+        self.assertIsNotNone(dest)
+        assert dest is not None
+        self.assertTrue(dest.is_file())
+        self.assertGreater(dest.stat().st_size, 0)
+        # A real PNG, not an empty file with the right name.
+        self.assertEqual(dest.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+
+    def test_a_graph_with_no_edges_draws_nothing(self):
+        empty = DependencyGraph(nodes=["a.sas"], edges=[])
+        self.assertIsNone(render_png(empty, self.tmp / "none.png"))
+        self.assertFalse((self.tmp / "none.png").exists())
+
+    def test_too_many_files_falls_back_to_the_table(self):
+        self.assertIsNone(
+            render_png(self.graph, self.tmp / "big.png", max_nodes=2)
+        )
+
+    def test_a_missing_matplotlib_is_a_log_line_not_a_failure(self):
+        with unittest.mock.patch.dict(sys.modules, {"matplotlib": None}):
+            self.assertIsNone(render_png(self.graph, self.tmp / "absent.png"))
+        self.assertFalse((self.tmp / "absent.png").exists())
+
+
+class TestWriteReportsGraph(unittest.TestCase):
+    """The image lands beside the overall report and is linked from it."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        corpus = _graph_corpus()
+        batch_result = MultiFileBatcher().batch(corpus)
+        self.report = ComplexityAnalyzer().analyze_items(
+            batch_result.all_ordered_items,
+            source_ids=corpus.source_ids,
+            diagnostics=corpus.all_diagnostics,
+        )
+        self.texts = chunk_texts(batch_result.all_ordered_items)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("matplotlib"), "matplotlib is not installed"
+    )
+    def test_the_image_is_written_and_linked(self):
+        written = write_reports(self.report, self.tmp, texts=self.texts)
+        self.assertIsNotNone(written.graph)
+        assert written.graph is not None
+        self.assertEqual(written.graph.name, "dependency-graph.png")
+        self.assertIn(written.graph, written.paths)
+        overall = written.overall.read_text(encoding="utf-8")
+        self.assertIn("![Dependency graph](dependency-graph.png)", overall)
+
+    def test_it_can_be_switched_off(self):
+        written = write_reports(
+            self.report, self.tmp, texts=self.texts, graph_image=False
+        )
+        self.assertIsNone(written.graph)
+        self.assertFalse((self.tmp / "dependency-graph.png").exists())
+        # The edges are still reported, which is the point of the table.
+        self.assertIn(
+            "## Dependency graph", written.overall.read_text(encoding="utf-8")
+        )
 
 
 if __name__ == "__main__":

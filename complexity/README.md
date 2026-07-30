@@ -70,8 +70,9 @@ units, the same work items the pipeline would translate, so an estimate lines
 up with the run it is estimating. `--no-cross-file` scores every file as if it
 were alone; `--size-anchor` recalibrates the T-shirt scale (lowering it rates
 every file larger); `--min-story-points` / `--max-story-points` report the
-points on your own scale instead of the Fibonacci 2-8. Nothing here calls an
-LLM or touches the network unless you ask for
+points on your own scale instead of the Fibonacci 2-8; `--no-graph-image` skips
+drawing [the dependency graph](#the-image). Nothing here calls an LLM or
+touches the network unless you ask for
 [the LLM evaluation](#the-llm-evaluation).
 
 ## Two reports, not one
@@ -81,6 +82,7 @@ LLM or touches the network unless you ask for
 ```
 reports/
   complexity-report.md      the corpus: sizes, backlog total, hardest units
+  dependency-graph.png      the corpus dependency graph (optional, see below)
   files/
     load.md                 one report per source SAS script
     report.md
@@ -89,8 +91,9 @@ reports/
 The corpus report is `CorpusComplexityReport.to_markdown()` with an index of the
 individual ones appended. Each **individual** report answers the question the
 corpus one cannot — *what is in this file, and why did it score that?* — so it
-carries the file's dimensions, its cross-file coupling, its drivers table, and
-then every chunk with its verdict **and its SAS source**:
+carries the file's dimensions, its [datasets](#the-datasets-section), its
+cross-file coupling, its drivers table, and then every chunk with its verdict
+**and its SAS source**:
 
 ````markdown
 ### `f1-chunk-0001` — MACRO_DEFINITION (lines 1–9)
@@ -310,6 +313,17 @@ reported separately on `FileComplexity`:
 Keeping them apart is the point: a `Large` file that is large on *uncertainty*
 needs someone to go and find the missing pieces, while one large on *effort*
 just needs more hands. A single blended number hides that distinction.
+
+**Comment blocks are excluded from all three.** A `COMMENT_BLOCK` chunk raises
+no signal in any profile — there is nothing in it to translate — yet it would
+still count as chunk and line volume, which would make a file's size partly a
+measure of how well it was documented. The exclusion is at the *analysis*
+layer, not the rendering one (`analyzer.EXCLUDED_KINDS`): comment chunks never
+become a `ChunkComplexity` at all, so the numbers change and not just the
+prose, and a well-commented file scores exactly what its bare equivalent does.
+`FileComplexity.comment_chunk_count` reports how many were dropped, and each
+individual report says so, so a `chunk_count` can always be reconciled against
+the chunker's own — a gap with nothing explaining it reads as a bug.
 
 Including **parity** in the complexity term is what makes a size
 target-dependent. Unlike a tier, the same file is genuinely less work against
@@ -687,6 +701,87 @@ Tiers are unchanged, as everywhere else.
 called *without* an index raises no cross-file signals either: a lone chunk has
 no corpus to resolve against, and inventing one would be a guess.
 
+### The datasets section
+
+Each individual report states the file's **data interface** before it states
+its coupling — the second only means something once you know the first:
+
+```markdown
+## Datasets
+
+- Inputs (read here, written elsewhere): edw.raw
+- Outputs (written here): work.stg, mart.out
+- Intermediates (written and read here): work.stg
+```
+
+The three-way split is the useful part. **Inputs** must already exist when this
+file runs; **outputs** are what downstream files are waiting on; and
+**intermediates** — written *and* read inside this file — are its own business,
+so nobody has to provide them. A dataset the file writes is therefore never
+reported as an input, which is the same rule `crossfile.py` applies when
+deciding whether a read is a cross-file import. The two sections cannot
+contradict each other by construction.
+
+Every chunk that touches a dataset prints its own `Reads:` / `Writes:` line, so
+a reader who doubts a rollup can find the chunk that put each name in it.
+
+## The dependency graph
+
+`crossfile.py` answers "what does *this* file depend on?" one file at a time.
+That is the right shape for a file report and the wrong shape for planning: a
+migration is ordered work, and the order is a property of the whole corpus.
+`graph.py` folds every resolved reference into file-to-file edges, and the
+corpus report gains a section reading the structure off them:
+
+```markdown
+## Dependency graph
+
+| Upstream (migrate first) | Downstream | Via |
+| --- | --- | --- |
+| load.sas | transform.sas | dataset raw.customers |
+| transform.sas | report_a.sas | dataset mart.agg |
+| transform.sas | report_b.sas | dataset mart.agg |
+
+### Migration order
+
+- **Wave 1**: load.sas
+- **Wave 2**: transform.sas
+- **Wave 3**: report_a.sas, report_b.sas
+```
+
+Imports and exports are one dependency seen from both ends — an import in B
+naming A and an export in A naming B both mean "A before B" — so they fold into
+a single edge carrying every name that caused it. Edges come from all four
+reference kinds, labelled, because they do not carry the same weight: a shared
+dataset is an ordering problem, while a shared macro means two files cannot be
+translated independently without agreeing on the macro first.
+
+**A "DAG" is an aspiration, not a guarantee.** Two SAS jobs can each read a
+dataset the other writes; such a corpus is unusual but not invalid, and
+emitting a topological order for one would be a confident lie. So
+`DependencyGraph.cycles` is reported explicitly, `is_acyclic` says which case
+you are looking at, and files caught in a cycle are parked in a trailing
+*Unordered* layer rather than given a wave the graph does not support.
+
+### The image
+
+With `--out-dir`, the graph is also drawn to `reports/dependency-graph.png` and
+linked from the corpus report — waves left to right, cycles in red.
+
+The image needs matplotlib, which is the **optional `graph` extra**:
+
+```bash
+uv pip install -e ".[graph]"
+```
+
+Without it `render_png` returns `None` and logs a line; the run still produces
+every other artefact. That is deliberate: the Markdown edge table is the
+primary form, not a fallback. It renders in every viewer, in a terminal, and on
+the stdout path where there is nowhere to put a file — so the edges are never
+only in the picture. `--no-graph-image` skips the drawing outright, and a
+corpus of more than `MAX_GRAPH_NODES` (60) files skips it too, since past that
+the picture is a hairball and the table is strictly more legible.
+
 ## Tiers
 
 Tiers are target-independent. The parity column below is the **Spark SQL**
@@ -762,7 +857,8 @@ evidence that Spark lacks it, and no rating below was lowered on that basis.
 models.py      ComplexityTier, TranslationParity, TShirtSize (ordered scales)
                + max_tier / worst_parity / max_size helpers; ComplexitySignal;
                ChunkComplexity, BatchComplexity, FileComplexity,
-               CrossFileProfile, CorpusComplexityReport (with to_markdown()).
+               CrossFileProfile, DependencyEdge / DependencyGraph (layers,
+               cycles), CorpusComplexityReport (with to_markdown()).
 rules.py       RuleSet + SizeModel + the JSON profile loader (inheritance,
                validation, caching). Holds no ratings of its own.
 profiles/      The catalogues themselves, one JSON file per target language.
@@ -772,8 +868,11 @@ detectors.py   Regex scans for what SasChunkMetadata does not extract:
                FILENAME access methods, INFILE/FILE, LINK, DATA step GOTO.
 crossfile.py   CrossFileIndex — resolves macro/dataset/macro-var/libref
                references across the corpus into import / export / unresolved.
+graph.py       build_graph — folds those references into the corpus dependency
+               graph; renders it as a Markdown edge table, and as a PNG when
+               the optional `graph` extra (matplotlib) is installed.
 analyzer.py    ComplexityAnalyzer — aggregation and sizing only; owns no tier
-               of its own.
+               of its own. EXCLUDED_KINDS drops COMMENT_BLOCK before scoring.
 report.py      Markdown rendering: the corpus report plus one report per source
                SAS script, each printing the source behind every verdict.
                Rendering only — scores nothing, calls nothing.
@@ -929,6 +1028,21 @@ index without otherwise changing, the prompt carrying verdict and source and
 being built with nothing called, and the three replies an evaluation has to
 survive — a structured one, JSON recovered from prose, and an unusable one kept
 as prose — plus a client that raises failing only its own file.
+
+The comment exclusion, datasets, and dependency graph bring: that the chunker
+really does emit a `COMMENT_BLOCK` for the fixture (without which the rest
+proves nothing), that none reaches a verdict by either the singleton or the
+batched path, that a commented file scores *identically* to its bare
+equivalent, and that a comment-only file still gets a rollup instead of
+vanishing; the input/output/intermediate split, that a dataset written then
+read stays out of the inputs, case-insensitive dataset identity, and that the
+rollup cannot contradict the cross-file coupling; and for the graph, that
+**both** readers of one dataset get an edge (the case a single-peer record
+loses), that import and export fold into one edge, the wave levelling, macro
+edges and their labels, a two-file cycle being reported rather than silently
+ordered, and `render_png` writing real PNG bytes when matplotlib is present
+while returning `None` — not raising — when it is absent, when there are no
+edges, or when the node cap is exceeded.
 
 ```
 python -m pytest tests/test_complexity.py -v

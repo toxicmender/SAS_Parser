@@ -69,6 +69,7 @@ from .crossfile import (
     CrossFileRef,
 )
 from .detectors import DetectedConstruct, detect_constructs
+from .graph import MAX_GRAPH_NODES, build_graph, render_markdown, render_png
 from .llm_eval import (
     ComplexityEvaluation,
     EvaluationFinding,
@@ -86,6 +87,8 @@ from .models import (
     ComplexityTier,
     CorpusComplexityReport,
     CrossFileProfile,
+    DependencyEdge,
+    DependencyGraph,
     FileComplexity,
     TShirtSize,
     TranslationParity,
@@ -128,6 +131,13 @@ __all__ = [
     "CrossFileRef",
     "CROSS_FILE_CONSTRUCTS",
     "UNRESOLVED_CONSTRUCTS",
+    # corpus dependency graph
+    "DependencyEdge",
+    "DependencyGraph",
+    "build_graph",
+    "render_markdown",
+    "render_png",
+    "MAX_GRAPH_NODES",
     # result models
     "BatchComplexity",
     "ChunkComplexity",

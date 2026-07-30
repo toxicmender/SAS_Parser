@@ -61,6 +61,8 @@ _INLINE = "<inline>"
 # bury it.
 OVERALL_REPORT_NAME = "complexity-report.md"
 FILE_REPORT_DIR = "files"
+# The dependency graph image, beside the overall report that links it.
+GRAPH_IMAGE_NAME = "dependency-graph.png"
 
 #: ``(source_id, chunk_id) -> SAS source text``.
 ChunkTextIndex = Mapping[tuple[str, str], str]
@@ -72,11 +74,15 @@ class WrittenReports(NamedTuple):
     overall: Path
     #: ``source_id -> path``, in the order the files were rendered.
     files: dict[str, Path]
+    #: The dependency graph image, or None when none was drawn — no edges, no
+    #: matplotlib, or too many files to be legible. Never a failure on its own.
+    graph: Path | None = None
 
     @property
     def paths(self) -> list[Path]:
         """Every written path, overall report first."""
-        return [self.overall, *self.files.values()]
+        image = [self.graph] if self.graph else []
+        return [self.overall, *self.files.values(), *image]
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +177,32 @@ def _signal_rows(signals: list[ComplexitySignal]) -> list[str]:
     return rows
 
 
+def _dataset_lines(file: FileComplexity) -> list[str]:
+    """The file's data interface: what it needs, what it makes, what stays inside.
+
+    Split three ways because the three carry different instructions. Inputs
+    must exist before this file runs; outputs are what downstream files wait
+    on; intermediates are the file's own business and nobody has to provide
+    them. A file that touches no dataset at all gets no section — an empty one
+    would say nothing the absence does not.
+    """
+    if not (file.input_datasets or file.output_datasets or file.intermediate_datasets):
+        return []
+    lines = [
+        "",
+        "## Datasets",
+        "",
+        f"- Inputs (read here, written elsewhere): {_fmt_list(file.input_datasets)}",
+        f"- Outputs (written here): {_fmt_list(file.output_datasets)}",
+    ]
+    if file.intermediate_datasets:
+        lines.append(
+            f"- Intermediates (written and read here): "
+            f"{_fmt_list(file.intermediate_datasets)}"
+        )
+    return lines
+
+
 def _cross_file_lines(file: FileComplexity) -> list[str]:
     """The file's coupling to the rest of the corpus, or nothing when absent."""
     profile = file.cross_file
@@ -241,7 +273,13 @@ def render_file_report(
         f"- Size: **{file.size.label}** — **{file.points:g}** story points "
         f"(continuous position {file.continuous_points:.2f})",
         f"- Tier: **{file.tier}** — parity **{file.translation_difficulty}**",
-        f"- Chunks: {file.chunk_count} across {file.line_count} line(s)",
+        f"- Chunks: {file.chunk_count} across {file.line_count} line(s)"
+        + (
+            f", plus {file.comment_chunk_count} comment block(s) excluded from "
+            f"the analysis"
+            if file.comment_chunk_count
+            else ""
+        ),
         f"- Effort: {file.effort_raw:.1f} ({file.effort_norm:.2f}) · "
         f"Complexity: {file.complexity_raw:.1f} ({file.complexity_norm:.2f}) · "
         f"Uncertainty: {file.uncertainty_raw:.1f} ({file.uncertainty_norm:.2f})",
@@ -278,6 +316,10 @@ def render_file_report(
             f"Suggested cut points: {cuts}",
         ]
 
+    # The file's own interface first, then how it couples to the corpus: the
+    # second only makes sense once the reader knows what the file reads and
+    # writes.
+    lines += _dataset_lines(file)
     lines += _cross_file_lines(file)
 
     lines += ["", f"## Drivers ({len(file.signals)})", ""]
@@ -319,6 +361,13 @@ def _chunk_section(
         f"· score {chunk.score:.2f}",
         f"- {chunk.rationale or 'No signals fired.'}",
     ]
+    if chunk.input_datasets or chunk.output_datasets:
+        # What makes the file's Datasets section auditable: a reader who
+        # doubts a rollup can find the chunk that put each name in it.
+        lines.append(
+            f"- Reads: {_fmt_list(chunk.input_datasets)} · "
+            f"Writes: {_fmt_list(chunk.output_datasets)}"
+        )
     if chunk.signals:
         # Labelled and set apart, so the verdict bullets above and the
         # evidence bullets below do not read as one undifferentiated list.
@@ -347,14 +396,18 @@ def render_overall_report(
     *,
     top: int = 10,
     file_links: Mapping[str, str] | None = None,
+    graph_image: str | None = None,
 ) -> str:
     """The corpus report, with an index of the individual reports appended.
 
     The body is :meth:`CorpusComplexityReport.to_markdown` unchanged — this
     adds the index, so the overall report and the per-file ones are navigable
     as one deliverable. Without *file_links* it is the corpus report verbatim.
+
+    *graph_image* is passed straight through: a path to a rendered dependency
+    graph, relative to where this Markdown will be written.
     """
-    body = report.to_markdown(top=top)
+    body = report.to_markdown(top=top, graph_image=graph_image)
     if not file_links:
         return body
 
@@ -453,11 +506,17 @@ def write_reports(
     include_source: bool = True,
     max_source_lines: int = 0,
     overall_name: str = OVERALL_REPORT_NAME,
+    graph_image: bool = True,
 ) -> WrittenReports:
     """Write the overall report and one report per source file under *out_dir*.
 
     The overall report lands at ``out_dir/complexity-report.md`` and links to
     each individual report under ``out_dir/files/``. Returns the paths.
+
+    With *graph_image* (the default) the dependency graph is also drawn to
+    ``out_dir/dependency-graph.png`` and linked from the overall report — when
+    matplotlib is installed and there is a graph to draw. The report's edge
+    table is written either way.
     """
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=True)
@@ -485,12 +544,30 @@ def write_reports(
         source_id: dest.relative_to(directory).as_posix()
         for source_id, dest in written.items()
     }
+
+    drawn: Path | None = None
+    if graph_image and report.graph is not None:
+        # Imported here rather than at module scope so that a report run
+        # without the optional matplotlib dependency never even reaches the
+        # import — and so this module stays renderer-only for Markdown.
+        from .graph import render_png
+
+        drawn = render_png(report.graph, directory / GRAPH_IMAGE_NAME)
+
     overall = directory / overall_name
     overall.write_text(
-        render_overall_report(report, top=top, file_links=links), encoding="utf-8"
+        render_overall_report(
+            report,
+            top=top,
+            file_links=links,
+            graph_image=(
+                drawn.relative_to(directory).as_posix() if drawn else None
+            ),
+        ),
+        encoding="utf-8",
     )
     logger.info(
         f"write_reports: wrote {overall} and {len(written)} individual "
         f"report(s) under {directory / FILE_REPORT_DIR}"
     )
-    return WrittenReports(overall=overall, files=written)
+    return WrittenReports(overall=overall, files=written, graph=drawn)

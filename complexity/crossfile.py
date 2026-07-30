@@ -87,12 +87,25 @@ class CrossFileRef(NamedTuple):
 
     ``name`` is the catalogue key looked up under a profile's ``cross_file``
     namespace; ``evidence`` names what was referenced and where it was found;
-    ``peer`` is the other file involved, or ``""`` when unresolved.
+    ``subject`` is the referenced thing itself (a dataset, macro, macro
+    variable, or libref name) as opposed to the construct classifying it; and
+    ``peers`` are the other files involved, empty when unresolved.
+
+    ``peers`` is a tuple rather than a single file because a dataset written
+    here can be read by any number of others. Recording only the first would
+    lose every dependant after it — which is precisely the edge a dependency
+    graph needs.
     """
 
     name: str
     evidence: str
-    peer: str = ""
+    peers: tuple[str, ...] = ()
+    subject: str = ""
+
+    @property
+    def peer(self) -> str:
+        """The first peer, or ``""`` — the single-peer view kept for callers."""
+        return self.peers[0] if self.peers else ""
 
 
 def _libref_of(dataset: str) -> str | None:
@@ -132,6 +145,10 @@ class CrossFileIndex:
         # start at "chunk-001" and would otherwise collide, silently serving
         # one file's references for another's.
         self._refs: dict[tuple[str, str], list[CrossFileRef]] = {}
+        # The same references regrouped per file — what :mod:`complexity.graph`
+        # folds into corpus-level edges. Kept rather than recomputed from
+        # ``_refs``, which is keyed per chunk and would need regrouping anyway.
+        self._by_source: dict[str, list[CrossFileRef]] = {}
         self._profiles: dict[str, CrossFileProfile] = {}
 
     # ------------------------------------------------------------------
@@ -202,6 +219,7 @@ class CrossFileIndex:
                 index._refs[(source, chunk.chunk_id)] = refs
                 by_source[source].extend(refs)
 
+        index._by_source = by_source
         index._profiles = {
             source: _build_profile(source, by_source[source], index.corpus_files)
             for source in sources
@@ -245,7 +263,8 @@ class CrossFileIndex:
                     CrossFileRef(
                         "macro_import",
                         f"%{macro} defined in {', '.join(peers)}",
-                        peers[0],
+                        tuple(peers),
+                        macro,
                     )
                 )
             elif multi:
@@ -254,6 +273,7 @@ class CrossFileIndex:
                         "macro_unresolved",
                         f"%{macro} — no %MACRO definition in any of the "
                         f"{self.corpus_files} files analysed",
+                        subject=macro,
                     )
                 )
             else:
@@ -262,6 +282,7 @@ class CrossFileIndex:
                         "macro_external",
                         f"%{macro} defined outside this file "
                         f"(no other files were in scope to search)",
+                        subject=macro,
                     )
                 )
 
@@ -273,7 +294,8 @@ class CrossFileIndex:
                     CrossFileRef(
                         "macro_export",
                         f"%{macro} used by {', '.join(users)}",
-                        users[0],
+                        tuple(users),
+                        macro,
                     )
                 )
 
@@ -288,7 +310,8 @@ class CrossFileIndex:
                     CrossFileRef(
                         "dataset_import",
                         f"{dataset} written by {', '.join(peers)}",
-                        peers[0],
+                        tuple(peers),
+                        dataset,
                     )
                 )
             elif multi:
@@ -297,6 +320,7 @@ class CrossFileIndex:
                         "dataset_unresolved",
                         f"{dataset} not written by any analysed file — "
                         f"assumed to be an existing source table",
+                        subject=dataset,
                     )
                 )
 
@@ -308,7 +332,8 @@ class CrossFileIndex:
                     CrossFileRef(
                         "dataset_export",
                         f"{dataset} read by {', '.join(users)}",
-                        users[0],
+                        tuple(users),
+                        dataset,
                     )
                 )
 
@@ -323,7 +348,8 @@ class CrossFileIndex:
                     CrossFileRef(
                         "macrovar_import",
                         f"&{var} set in {', '.join(peers)}",
-                        peers[0],
+                        tuple(peers),
+                        var,
                     )
                 )
 
@@ -339,7 +365,8 @@ class CrossFileIndex:
                     CrossFileRef(
                         "macrovar_export",
                         f"&{var} read by {', '.join(users)}",
-                        users[0],
+                        tuple(users),
+                        var,
                     )
                 )
 
@@ -372,7 +399,8 @@ class CrossFileIndex:
                     CrossFileRef(
                         "libref_import",
                         f"libref {libref} assigned in {', '.join(peers)}",
-                        peers[0],
+                        tuple(peers),
+                        libref,
                     )
                 )
             else:
@@ -381,6 +409,7 @@ class CrossFileIndex:
                         "libref_unresolved",
                         f"libref {libref} has no LIBNAME in any analysed file — "
                         f"physical location unknown",
+                        subject=libref,
                     )
                 )
 
@@ -408,6 +437,21 @@ class CrossFileIndex:
     def profiles(self) -> dict[str, CrossFileProfile]:
         """Every file's coupling profile, keyed by source id."""
         return dict(self._profiles)
+
+    @property
+    def sources(self) -> list[str]:
+        """Every source file in the index, in first-seen order."""
+        return list(self._by_source)
+
+    def refs_by_source(self) -> dict[str, list[CrossFileRef]]:
+        """Every resolved reference, grouped by the file that makes it.
+
+        The per-file view of :meth:`refs_for`. :mod:`complexity.graph` folds it
+        into corpus-level dependency edges; a profile cannot serve that purpose
+        because it keeps only the peer file names, having dropped which dataset
+        or macro put each one there.
+        """
+        return {source: list(refs) for source, refs in self._by_source.items()}
 
     def __str__(self) -> str:
         return (
@@ -451,13 +495,17 @@ def _build_profile(
         if ref.name.endswith("_export"):
             if ref.evidence not in exports:
                 exports.append(ref.evidence)
-            if ref.peer and ref.peer not in depended_on_by:
-                depended_on_by.append(ref.peer)
+            # Every peer, not just the first: a dataset written here can be
+            # read by any number of files, and each of them depends on this one.
+            for peer in ref.peers:
+                if peer not in depended_on_by:
+                    depended_on_by.append(peer)
         elif ref.name.endswith("_import"):
             if ref.evidence not in imports:
                 imports.append(ref.evidence)
-            if ref.peer and ref.peer not in depends_on:
-                depends_on.append(ref.peer)
+            for peer in ref.peers:
+                if peer not in depends_on:
+                    depends_on.append(peer)
 
     return CrossFileProfile(
         source_id=source,
