@@ -63,6 +63,7 @@ from chunker.models import (
     SasBatch,
     SasBatchResult,
     SasChunk,
+    SasChunkKind,
     SasChunkMetadata,
     SasChunkResult,
     SasCorpus,
@@ -72,6 +73,7 @@ from chunker.scanner import _sanitise
 
 from .crossfile import UNRESOLVED_CONSTRUCTS, CrossFileIndex
 from .detectors import detect_constructs
+from .graph import build_graph
 from .models import (
     BatchComplexity,
     ChunkComplexity,
@@ -91,6 +93,19 @@ from .rules import RuleSet, SignalSpec, SizeModel, load_ruleset
 logger = logging.getLogger(__name__)
 
 _CONFIG_SECTION = "complexity"
+
+# Chunk kinds excluded from the analysis outright. A COMMENT_BLOCK carries no
+# construct and no data flow — it raises no signal in any profile — yet it
+# still counts as chunk and line volume, so scoring it makes a file's size
+# partly a measure of how well it was documented. Excluded before scoring
+# rather than before rendering, so the numbers change too and not just the
+# prose: a well-commented file is not more work than a bare one.
+EXCLUDED_KINDS: frozenset[SasChunkKind] = frozenset({SasChunkKind.COMMENT_BLOCK})
+
+
+def _analysable(chunks: Iterable[SasChunk]) -> list[SasChunk]:
+    """*chunks* with the excluded kinds dropped."""
+    return [c for c in chunks if c.kind not in EXCLUDED_KINDS]
 
 
 class ComplexityAnalyzer:
@@ -261,6 +276,8 @@ class ComplexityAnalyzer:
             kind=chunk.kind.value,
             start_line=chunk.start_line,
             end_line=chunk.end_line,
+            input_datasets=_chunk_inputs(chunk.metadata),
+            output_datasets=_chunk_outputs(chunk.metadata),
             tier=tier,
             score=score,
             translation_difficulty=difficulty,
@@ -281,7 +298,9 @@ class ComplexityAnalyzer:
         genuinely are more work than one — while its tier and difficulty are
         the worst any single member reaches.
         """
-        members = [self.analyze_chunk(c, index=index) for c in batch.chunks]
+        members = [
+            self.analyze_chunk(c, index=index) for c in _analysable(batch.chunks)
+        ]
         tier = max_tier([m.tier for m in members])
         difficulty = worst_parity([m.translation_difficulty for m in members])
         score = round(sum(m.score for m in members), 3)
@@ -324,11 +343,11 @@ class ComplexityAnalyzer:
         item_list = list(items)
         # The index needs every chunk in the corpus before any single one can
         # be resolved, so it is built up front from a flattened view.
-        all_chunks = [
+        all_chunks = _analysable(
             c
             for item in item_list
             for c in (item.chunks if isinstance(item, SasBatch) else [item])
-        ]
+        )
         index = CrossFileIndex.build(all_chunks) if self._use_cross_file else None
 
         batches: list[BatchComplexity] = []
@@ -343,6 +362,11 @@ class ComplexityAnalyzer:
                 candidates = scored_batch.source_files
                 for sid in candidates:
                     batches_by_source.setdefault(sid, []).append(item.batch_id)
+            elif item.kind in EXCLUDED_KINDS:
+                # Not scored, but its file still exists and must keep its place
+                # in the corpus — a file of nothing but comments would
+                # otherwise vanish from the report entirely.
+                candidates = [item.source_id or "<inline>"]
             else:
                 scored_chunk = self.analyze_chunk(item, index=index)
                 chunks.append(scored_chunk)
@@ -363,6 +387,14 @@ class ComplexityAnalyzer:
             chunks=chunks,
             batches=batches,
             files=files,
+            # Nodes come from the files that were actually rolled up, not from
+            # the index alone, so a file with no resolvable reference still
+            # appears in the graph as an isolated one rather than going missing.
+            graph=(
+                build_graph(index, nodes=[f.source_id for f in files])
+                if index is not None
+                else None
+            ),
             target=self._rules.target,
             target_display=self._rules.display_name,
         )
@@ -475,9 +507,22 @@ class ComplexityAnalyzer:
         is unambiguous however the corpus was batched.
         """
         by_source: dict[str, list[SasChunk]] = {}
+        # Excluded chunks per file, counted rather than dropped silently: a
+        # `chunk_count` that disagrees with the chunker's, with nothing saying
+        # why, reads as a bug in one of the two.
+        comments_by_source: dict[str, int] = {}
         for item in items:
             for chunk in item.chunks if isinstance(item, SasBatch) else [item]:
-                by_source.setdefault(chunk.source_id or "<inline>", []).append(chunk)
+                source_id = chunk.source_id or "<inline>"
+                # setdefault before the kind test, so a file whose every chunk
+                # is excluded still gets a (zero-chunk) rollup.
+                bucket = by_source.setdefault(source_id, [])
+                if chunk.kind in EXCLUDED_KINDS:
+                    comments_by_source[source_id] = (
+                        comments_by_source.get(source_id, 0) + 1
+                    )
+                    continue
+                bucket.append(chunk)
 
         diags_by_source: dict[str, int] = {}
         if diagnostics is not None:
@@ -500,6 +545,7 @@ class ComplexityAnalyzer:
             size, floored_by = self._size_for(
                 effort, complexity, uncertainty, source_chunks
             )
+            reads, writes, intermediates = _file_datasets(scored)
 
             files.append(
                 FileComplexity(
@@ -527,6 +573,10 @@ class ComplexityAnalyzer:
                     ),
                     chunk_count=len(source_chunks),
                     line_count=_line_span(source_chunks),
+                    comment_chunk_count=comments_by_source.get(source_id, 0),
+                    input_datasets=reads,
+                    output_datasets=writes,
+                    intermediate_datasets=intermediates,
                     chunks=scored,
                     cross_file=index.profile_for(source_id) if index else None,
                     suggested_split=(
@@ -659,6 +709,59 @@ def _contained_steps(text: str) -> int:
     never inflates the count — the same guarantee ``detectors`` relies on.
     """
     return len(_STEP_HEADER_RE.findall(_sanitise(text)))
+
+
+def _dedupe(names: Iterable[str]) -> list[str]:
+    """*names* with case-insensitive duplicates dropped, first spelling kept.
+
+    SAS is case-insensitive about dataset names, so ``WORK.P`` and ``work.p``
+    are one table; listing both would make a file look like it touched more
+    data than it did.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in names:
+        key = name.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(name)
+    return out
+
+
+def _chunk_inputs(meta: SasChunkMetadata) -> list[str]:
+    """Datasets a chunk reads, its macro body's literal reads included.
+
+    The body reads count because a macro definition is where the SAS lives even
+    though the read happens at call time — the same union
+    :mod:`complexity.crossfile` resolves against.
+    """
+    return _dedupe([*meta.input_datasets, *meta.body_literal_inputs])
+
+
+def _chunk_outputs(meta: SasChunkMetadata) -> list[str]:
+    """Datasets a chunk writes, its macro body's literal writes included."""
+    return _dedupe([*meta.output_datasets, *meta.body_literal_outputs])
+
+
+def _file_datasets(
+    scored: list[ChunkComplexity],
+) -> tuple[list[str], list[str], list[str]]:
+    """One file's ``(inputs, outputs, intermediates)`` rolled up from its chunks.
+
+    A dataset this file writes and then reads back is an **intermediate**, not
+    an input: nothing outside the file has to provide it. That is the same rule
+    :mod:`complexity.crossfile` applies when deciding whether a read is a
+    cross-file import, so the datasets section and the coupling section of a
+    report can never contradict each other.
+    """
+    reads = _dedupe(d for c in scored for d in c.input_datasets)
+    writes = _dedupe(d for c in scored for d in c.output_datasets)
+    written = {d.lower() for d in writes}
+    return (
+        [d for d in reads if d.lower() not in written],
+        writes,
+        [d for d in reads if d.lower() in written],
+    )
 
 
 def _line_span(chunks: list[SasChunk]) -> int:

@@ -40,7 +40,12 @@ sharepoint = ["msgraph-sdk>=1.5", "msal>=1.28"]
 # itself (the schema is small and stable, and the runtime should not grow a
 # jupyter dependency to emit JSON), and tests/test_notebook.py validates what
 # it emits against the real published schema.
-dev        = ["pytest>=8", "pytest-cov", "ruff", "nbformat>=5.10"]
+dev        = ["pytest>=8", "pytest-cov", "ruff", "nbformat>=5.10", "matplotlib>=3.8"]
+# Draws complexity's corpus dependency graph as a PNG beside the Markdown
+# report. Optional: complexity.graph always renders the same edges as a
+# Markdown table, and render_png returns None (with a log line) when matplotlib
+# is absent — the picture is a supplement, never the only copy.
+graph      = ["matplotlib>=3.8"]
 # Real SQL parsing for target_language's Spark SQL syntax check (which the
 # validation suite scores a SQL run with). Optional: without it the check
 # degrades to a conservative structural one — see target_language._check_sql.
@@ -52,8 +57,10 @@ where = ["."]
 # prompt_builder, so all five packages must ship — a wheel with pipeline
 # alone breaks `from pipeline import SasLLMPipeline`. app_config is the
 # dependency-free config loader they all read defaults through. complexity
-# reads chunker's output and adds no dependencies of its own, so it ships
-# too (unlike validation, whose Spark/MLflow tracking is dev-only tooling).
+# reads chunker's output and adds no *required* dependency of its own (its
+# dependency-graph image is the optional `graph` extra, and degrades to a
+# Markdown table without it), so it ships too — unlike validation, whose
+# Spark/MLflow tracking is dev-only tooling.
 # target_language is the leaf every one of them resolves the run's target
 # through, so it ships with all of them.
 include = [

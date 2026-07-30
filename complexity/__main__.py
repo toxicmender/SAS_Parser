@@ -146,6 +146,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "(default: 0, print it whole).",
     )
     parser.add_argument(
+        "--no-graph-image",
+        action="store_true",
+        help="Skip drawing dependency-graph.png with --out-dir. The overall "
+        "report's dependency edge table is written either way; the image "
+        "needs the optional 'graph' extra (matplotlib) and is silently "
+        "skipped without it.",
+    )
+    parser.add_argument(
         "--llm-eval",
         action="store_true",
         help="Ask a model to evaluate each file against its static verdict — "
@@ -229,12 +237,15 @@ def main(argv: list[str] | None = None) -> int:
             top=args.top,
             include_source=include_source,
             max_source_lines=args.max_chunk_lines,
+            graph_image=not args.no_graph_image,
         )
         print(f"wrote overall complexity report: {written.overall}")
         print(
             f"wrote {len(written.files)} individual report(s): "
             f"{args.out_dir / 'files'}"
         )
+        if written.graph is not None:
+            print(f"wrote dependency graph: {written.graph}")
         if args.out is not None and args.out != written.overall:
             _write(args.out, written.overall.read_text(encoding="utf-8"))
             print(f"wrote complexity report: {args.out}")
