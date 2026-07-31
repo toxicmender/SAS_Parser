@@ -1,0 +1,9 @@
+# Files that are executed inside Linux containers must keep LF endings.
+# With core.autocrlf=true (the Windows default) a checkout would otherwise
+# hand the container `#!/usr/bin/env bash\r`, which fails as
+# "bad interpreter: no such file or directory". The docker build COPYs the
+# working copy, so this is a checkout-time concern, not a commit-time one.
+*.sh            text eol=lf
+*.Dockerfile    text eol=lf
+docker-compose.yml text eol=lf
+docker/**/*.py  text eol=lf
