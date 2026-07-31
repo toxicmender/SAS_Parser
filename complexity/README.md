@@ -61,6 +61,7 @@ The report's delivery format is Markdown:
 python -m complexity path/to/sas_dir --out complexity-report.md
 python -m complexity path/to/sas_dir --out-dir reports/
 python -m complexity path/to/sas_dir --target pyspark --top 25
+python -m complexity path/to/sas_dir --out-dir reports/ --pdf
 ```
 
 Without `--out` or `--out-dir` the Markdown goes to stdout. The CLI chunks every
@@ -71,9 +72,9 @@ up with the run it is estimating. `--no-cross-file` scores every file as if it
 were alone; `--size-anchor` recalibrates the T-shirt scale (lowering it rates
 every file larger); `--min-story-points` / `--max-story-points` report the
 points on your own scale instead of the Fibonacci 2-8; `--no-graph-image` skips
-drawing [the dependency graph](#the-image). Nothing here calls an LLM or
-touches the network unless you ask for
-[the LLM evaluation](#the-llm-evaluation).
+drawing [the dependency graph](#the-image); `--pdf` renders [the corpus report
+as a PDF](#the-pdf) as well. Nothing here calls an LLM or touches the network
+unless you ask for [the LLM evaluation](#the-llm-evaluation).
 
 ## Two reports, not one
 
@@ -82,6 +83,7 @@ touches the network unless you ask for
 ```
 reports/
   complexity-report.md      the corpus: sizes, backlog total, hardest units
+  complexity-report.pdf     the same, as a PDF (--pdf only, see below)
   dependency-graph.png      the corpus dependency graph (optional, see below)
   files/
     load.md                 one report per source SAS script
@@ -135,6 +137,36 @@ every chunk per file (`f1-chunk-0001`), so one built from the unbatched corpus
 would match nothing. It is keyed `(source_id, chunk_id)` rather than on the id
 alone for the same reason `crossfile.py` is: files are chunked independently, so
 two files' first chunks share an id.
+
+### Files are named, not pathed
+
+A `source_id` is a path, usually absolute — the CLI hands the chunker
+`str(path)` for whatever directory you pointed it at. That is the right
+identity and the wrong label: twenty rows of
+`D:\corp\migration\sas\etl\load_customers.sas` are a column of shared prefix
+with the informative part pushed off the edge. So every rendered report — the
+corpus tables, the dependency edges and waves, the graph image, the per-file
+titles, the cross-file evidence, the LLM prompts — prints the **name**, while
+the model keeps the path.
+
+`naming.display_names()` decides what the name is, and it is not simply the
+basename: two `load.sas` scripts in different directories are two different
+files with two different scores, and printing both as `load.sas` would make the
+report a puzzle. Each id is shortened to its last segment, then widened one
+parent at a time **only if it would otherwise be ambiguous**:
+
+```
+/corp/sas/etl/load.sas     ->  etl/load.sas
+/corp/sas/adhoc/load.sas   ->  adhoc/load.sas
+/corp/sas/report.sas       ->  report.sas      (nothing collides, so nothing widens)
+```
+
+One collision does not lengthen every other label. The full path is still
+printed exactly once, in the `- Path:` bullet of the file's own report — the
+reader looking at a single file's verdict is the one who may need to go open
+it. Nothing keys off a name: every lookup and every model field still uses the
+`source_id`. This is the display counterpart of `source_stems()`, which solves
+the same collision for output *filenames* (`files/load.md`, `files/load_2.md`).
 
 ## The LLM evaluation
 
@@ -766,7 +798,23 @@ you are looking at, and files caught in a cycle are parked in a trailing
 ### The image
 
 With `--out-dir`, the graph is also drawn to `reports/dependency-graph.png` and
-linked from the corpus report — waves left to right, cycles in red.
+linked from the corpus report — waves left to right, arrows coloured by what
+causes the dependency:
+
+| Colour | Edge |
+| --- | --- |
+| Red | macro |
+| Yellow | macro variable |
+| Violet | dataset |
+| Green | other (libref) |
+
+An edge can carry several kinds at once — one file may share both a macro and a
+dataset with the next — so it takes the colour of the hardest one present, in
+the order of that table: the macro coupling has to be agreed before either file
+can be translated, while the dataset is only an ordering constraint that the
+left-to-right layout already shows. The legend lists only the kinds actually
+drawn. Colour is therefore the dependency kind and never anything else, so a
+cycle is shown as a **dashed** arrow and a dashed node border instead.
 
 The image needs matplotlib, which is the **optional `graph` extra**:
 
@@ -781,6 +829,43 @@ the stdout path where there is nowhere to put a file — so the edges are never
 only in the picture. `--no-graph-image` skips the drawing outright, and a
 corpus of more than `MAX_GRAPH_NODES` (60) files skips it too, since past that
 the picture is a hairball and the table is strictly more legible.
+
+## The PDF
+
+The Markdown is the primary artefact and stays it — it diffs, it renders in
+every viewer, and it is what everything else here produces. The PDF is for the
+other audience: the estimate goes to someone who does not have the repository
+checked out, and "here is a link to a `.md` file" is not an answer for them.
+
+```bash
+python -m complexity path/to/sas_dir --out-dir reports/ --pdf
+python -m complexity path/to/sas_dir --out estimate.md --pdf
+```
+
+`--pdf` converts the **overall** report, never replacing it: with `--out-dir`
+the PDF lands at `reports/complexity-report.pdf`, and with `--out` it takes
+that file's name with a `.pdf` suffix. It needs one of the two — stdout has
+nowhere to put a file, and asking for a PDF without a destination exits 1 before
+the corpus is even scored. Rendering from the written report (rather than from
+the Markdown in memory) is what lets `dependency-graph.png` resolve, so the
+graph lands in the document.
+
+No new dependency and no external converter: `markdown-it-py` parses and
+PyMuPDF's `Story` lays the HTML out, and both are already core to this project.
+Two details `complexity/pdf.py` handles for the layout engine:
+
+- **Code blocks are folded first.** `Story` clips a long `<pre>` line at the
+  frame edge instead of wrapping it, and the individual reports print whole SAS
+  statements — routinely wider than a page. Lines are soft-wrapped to
+  `CODE_WIDTH` columns, keeping their indentation, before becoming HTML.
+- **Images resolve through an archive.** The report links its graph relative to
+  itself, so the Markdown's own directory is handed to `Story` as a
+  `pymupdf.Archive`.
+
+Unlike the graph image — a supplement that degrades to `None` when matplotlib is
+absent — a PDF only ever exists because someone asked for one, so a failure
+`raise`s `PdfRenderError` rather than being logged and swallowed. The CLI
+reports it and exits 1; the Markdown is already on disk either way.
 
 ## Tiers
 
@@ -975,7 +1060,7 @@ batched run.
 
 ## Tests
 
-`tests/test_complexity.py` — 189 tests, no LLM (the evaluation is exercised
+`tests/test_complexity.py` — 258 tests, no LLM (the evaluation is exercised
 through fakes) and no disk I/O apart from the tests that are about disk: the
 rule-set loader's, and the report writer's and CLI's. Covers each tier
 against the constructs the brief names, the max-tier/worst-parity aggregation
@@ -1043,6 +1128,17 @@ edges and their labels, a two-file cycle being reported rather than silently
 ordered, and `render_png` writing real PNG bytes when matplotlib is present
 while returning `None` — not raising — when it is absent, when there are no
 edges, or when the node cap is exceeded.
+
+Naming and the PDF bring: that a unique basename is the whole name, that a
+collision widens only the files that collide (and widens as far as it must),
+that both separators split, and that a corpus of absolute ids renders reports
+with no directory prefix anywhere — tables, edges, waves, cross-file evidence,
+and prompts — while the models still hold the paths and the file's own report
+prints its path exactly once; and for the PDF, real `%PDF-` bytes beside an
+untouched Markdown, text surviving the conversion, code folded rather than
+clipped, SAS angle brackets escaped rather than opening an element, the graph
+image landing in the document, a missing source raising `PdfRenderError`, and
+`--pdf` without `--out`/`--out-dir` exiting 1 having written nothing.
 
 ```
 python -m pytest tests/test_complexity.py -v

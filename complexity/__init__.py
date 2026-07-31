@@ -32,7 +32,12 @@ Public API:
 - :func:`write_reports` / :func:`render_file_report` /
   :func:`render_overall_report` / :func:`chunk_texts` — the two-level
   deliverable: one corpus report plus one report per source SAS script, each
-  printing the SAS source behind every verdict it states.
+  printing the SAS source behind every verdict it states. Files are *named* in
+  those reports by :func:`display_names` — the file name, widened to a parent
+  directory only where two files would otherwise read alike — while the full
+  path stays the identity on the model.
+- :func:`render_pdf` — the same written Markdown as a PDF, for a reader who is
+  being sent the estimate rather than the repository (``--pdf``).
 - :func:`build_evaluation_prompt` / :func:`evaluate_report` /
   :class:`ComplexityEvaluation` — the optional LLM second opinion, asking a
   model where the rules are wrong or incomplete. Off unless called, and
@@ -99,6 +104,8 @@ from .models import (
     tier_rank,
     worst_parity,
 )
+from .naming import display_name, display_names, resolve_name
+from .pdf import PdfRenderError, render_markdown_pdf, render_pdf
 from .report import (
     ChunkTextIndex,
     WrittenReports,
@@ -154,6 +161,14 @@ __all__ = [
     "render_overall_report",
     "source_stems",
     "write_reports",
+    # how a source file is named in a report, as opposed to identified
+    "display_name",
+    "display_names",
+    "resolve_name",
+    # optional PDF of a written Markdown report
+    "PdfRenderError",
+    "render_pdf",
+    "render_markdown_pdf",
     # optional LLM evaluation
     "ComplexityEvaluation",
     "EvaluationFinding",

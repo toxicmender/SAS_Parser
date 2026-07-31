@@ -27,9 +27,10 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Iterable, Mapping
 
 from .models import DependencyEdge, DependencyGraph
+from .naming import display_names, resolve_name
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, and avoids an import cycle
     from .crossfile import CrossFileIndex
@@ -51,6 +52,33 @@ _EDGE_KINDS: dict[str, str] = {
     "macrovar": "macrovars",
     "libref": "librefs",
 }
+
+#: :class:`~complexity.models.DependencyEdge` field -> ``(colour, legend
+#: label)`` for the drawn edge. Iteration order is precedence: one edge can
+#: carry several kinds at once, and it is drawn in the colour of the first kind
+#: present here, hardest-to-migrate first. A shared macro is a coupling two
+#: translators have to agree on before either can start; a shared dataset is
+#: only an ordering constraint, which the left-to-right layout already shows.
+_EDGE_STYLES: dict[str, tuple[str, str]] = {
+    "macros": ("#c1121f", "macro"),
+    "macrovars": ("#d4a017", "macro variable"),
+    "datasets": ("#8e44ad", "dataset"),
+    "librefs": ("#2e8b57", "other"),
+}
+
+#: For an edge carrying no named subject at all — every kind bucket empty,
+#: which :func:`build_graph` allows when a construct has no entry in
+#: :data:`_EDGE_KINDS`. It is still a real dependency, so it is still drawn.
+_UNLABELLED_STYLE = ("#2e8b57", "other")
+
+# Layout spacing, in data units. The node box is ~0.6 of a column and ~0.4 of a
+# row, so neither the arrows between columns nor the labels down one have to
+# fight for the space; `render_png` scales the figure by these, so widening one
+# widens the picture rather than crowding the rest of it.
+_COLUMN_SPACING = 2.4
+_ROW_SPACING = 1.0
+_NODE_WIDTH = 1.5
+_NODE_HEIGHT = 0.4
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +143,10 @@ def build_graph(
 
 
 def render_markdown(
-    graph: DependencyGraph, *, image: str | None = None
+    graph: DependencyGraph,
+    *,
+    image: str | None = None,
+    names: Mapping[str, str] | None = None,
 ) -> list[str]:
     """The ``## Dependency graph`` section, as Markdown lines.
 
@@ -123,9 +154,20 @@ def render_markdown(
     written; when given it is linked above the table. Returns ``[]`` for a
     corpus whose files are all independent — a section asserting "no edges" adds
     nothing that the absent section does not already say.
+
+    *names* is the corpus-wide ``source_id -> display name`` mapping (see
+    :mod:`complexity.naming`); passing the report's own keeps this section's
+    file names identical to the tables above it. Without one the graph's own
+    nodes are named, which is the same answer whenever the graph covers the
+    whole corpus.
     """
     if graph.is_empty:
         return []
+
+    names = names or display_names(graph.nodes)
+
+    def name(source_id: str) -> str:
+        return resolve_name(source_id, names)
 
     lines = ["", "## Dependency graph", ""]
     if graph.is_acyclic:
@@ -153,17 +195,18 @@ def render_markdown(
     for edge in graph.edges:
         # Pipes inside a dataset name would split the row into extra columns.
         via = edge.label.replace("|", "\\|")
-        lines.append(f"| {edge.upstream} | {edge.downstream} | {via} |")
+        lines.append(f"| {name(edge.upstream)} | {name(edge.downstream)} | {via} |")
 
     layers = graph.layers
     if layers:
         lines += ["", "### Migration order", ""]
         trailing_cycle = not graph.is_acyclic
         for position, layer in enumerate(layers, start=1):
+            members = ", ".join(name(node) for node in layer)
             if trailing_cycle and position == len(layers):
-                lines.append(f"- **Unordered** (in a cycle): {', '.join(layer)}")
+                lines.append(f"- **Unordered** (in a cycle): {members}")
             else:
-                lines.append(f"- **Wave {position}**: {', '.join(layer)}")
+                lines.append(f"- **Wave {position}**: {members}")
 
     if graph.cycles:
         lines += ["", f"### Cycles ({len(graph.cycles)})", ""]
@@ -174,7 +217,8 @@ def render_markdown(
         )
         lines.append("")
         for cycle in graph.cycles:
-            lines.append(f"- {' → '.join(cycle)} → {cycle[0]}")
+            loop = [name(node) for node in cycle]
+            lines.append(f"- {' → '.join(loop)} → {loop[0]}")
 
     return lines
 
@@ -210,13 +254,29 @@ def _box_edge(
     return origin[0] + dx * reach, origin[1] + dy * reach
 
 
+def _edge_style(edge: DependencyEdge) -> tuple[str, str]:
+    """``(colour, legend label)`` for *edge*, by its hardest dependency kind.
+
+    See :data:`_EDGE_STYLES` for why an edge carrying both a macro and a
+    dataset is drawn as a macro one.
+    """
+    for field, style in _EDGE_STYLES.items():
+        if getattr(edge, field):
+            return style
+    return _UNLABELLED_STYLE
+
+
 def render_png(
     graph: DependencyGraph,
     path: Path | str,
     *,
     max_nodes: int = MAX_GRAPH_NODES,
+    names: Mapping[str, str] | None = None,
 ) -> Path | None:
     """Draw *graph* left-to-right by migration wave and write a PNG to *path*.
+
+    Nodes are labelled by *names* (see :func:`render_markdown`), so a box in the
+    picture carries the same name as its row in the report's edge table.
 
     Returns the path written, or ``None`` when the image was not produced — no
     edges to draw, matplotlib not installed (it is the optional ``graph``
@@ -241,6 +301,7 @@ def render_png(
         # default backend would try to find a display.
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
         from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
     except ImportError:
         logger.info(
@@ -253,6 +314,7 @@ def render_png(
     destination = Path(path)
     layers = graph.layers
     cycle_nodes = {n for cycle in graph.cycles for n in cycle}
+    names = names or display_names(graph.nodes)
 
     # Position: one column per wave, nodes spread evenly down each column.
     positions: dict[str, tuple[float, float]] = {}
@@ -263,19 +325,29 @@ def render_png(
             # two-node wave sits beside the middle of a six-node wave rather
             # than at its top.
             offset = (tallest - len(layer)) / 2
-            positions[node] = (float(column), float(row) + offset)
+            positions[node] = (
+                column * _COLUMN_SPACING,
+                (row + offset) * _ROW_SPACING,
+            )
 
-    node_width, node_height = 0.78, 0.34
-    figure_width = max(6.0, len(layers) * 3.0)
-    figure_height = max(3.0, tallest * 0.85)
+    node_width, node_height = _NODE_WIDTH, _NODE_HEIGHT
+    # Inches per data unit, kept roughly equal on both axes so the boxes and the
+    # gaps between them come out in the proportions the spacing constants set.
+    figure_width = max(7.0, (len(layers) - 1) * _COLUMN_SPACING * 1.3 + 3.0)
+    # The constant covers what is not rows: the top and bottom margins, plus the
+    # legend strip and title above the drawing.
+    figure_height = max(4.0, (tallest - 1) * _ROW_SPACING * 0.95 + 2.2)
 
     try:
         figure, axes = plt.subplots(figsize=(figure_width, figure_height))
+        drawn_kinds: dict[str, str] = {}  # legend label -> colour, in draw order
         for edge in graph.edges:
             if edge.upstream not in positions or edge.downstream not in positions:
                 continue
             start, end = positions[edge.upstream], positions[edge.downstream]
             in_cycle = edge.upstream in cycle_nodes and edge.downstream in cycle_nodes
+            colour, kind_label = _edge_style(edge)
+            drawn_kinds.setdefault(kind_label, colour)
             axes.add_patch(
                 FancyArrowPatch(
                     _box_edge(start, end, node_width / 2, node_height / 2),
@@ -285,8 +357,11 @@ def render_png(
                     # Curved, so two edges between the same columns stay apart
                     # and an arrow never runs straight through a third node.
                     connectionstyle="arc3,rad=0.12",
-                    color="#c1121f" if in_cycle else "#8d99ae",
-                    linewidth=1.5 if in_cycle else 1.1,
+                    color=colour,
+                    # Colour is the dependency kind, so a cycle cannot also be
+                    # colour — it is the dashed, heavier line instead.
+                    linestyle=(0, (4, 2)) if in_cycle else "solid",
+                    linewidth=2.0 if in_cycle else 1.3,
                     zorder=1,
                 )
             )
@@ -298,32 +373,72 @@ def render_png(
                     node_width,
                     node_height,
                     boxstyle="round,pad=0.02,rounding_size=0.06",
-                    facecolor="#fdd5d5" if in_cycle else "#e8eef7",
-                    edgecolor="#c1121f" if in_cycle else "#4a6fa5",
-                    linewidth=1.4,
+                    facecolor="#f2f4f7" if in_cycle else "#e8eef7",
+                    edgecolor="#2b2d42" if in_cycle else "#4a6fa5",
+                    linestyle=(0, (4, 2)) if in_cycle else "solid",
+                    linewidth=1.6 if in_cycle else 1.4,
                     zorder=2,
                 )
             )
             axes.text(
                 x,
                 y,
-                Path(node).name,
+                resolve_name(node, names),
                 ha="center",
                 va="center",
                 fontsize=8,
                 zorder=3,
             )
 
-        axes.set_xlim(-0.8, len(layers) - 1 + 0.8)
-        axes.set_ylim(-0.8, tallest - 1 + 0.8)
+        x_margin = _COLUMN_SPACING * 0.55
+        y_margin = _ROW_SPACING * 0.7
+        axes.set_xlim(-x_margin, (len(layers) - 1) * _COLUMN_SPACING + x_margin)
+        axes.set_ylim(-y_margin, (tallest - 1) * _ROW_SPACING + y_margin)
         # Waves read left to right; matplotlib's y axis runs the wrong way for
         # a top-down reading of each column.
         axes.invert_yaxis()
         axes.set_axis_off()
-        title = "SAS file dependencies — migrate left to right"
+
+        # Only the kinds actually drawn: a legend entry for a colour that is
+        # nowhere in the picture is a question the reader cannot answer.
+        # `dict.fromkeys` because a libref edge and an unclassified one are both
+        # "other", and one green legend entry is the honest count.
+        legend_order = list(
+            dict.fromkeys(
+                [label for _, label in _EDGE_STYLES.values()]
+                + [_UNLABELLED_STYLE[1]]
+            )
+        )
+        handles = [
+            Line2D([], [], color=drawn_kinds[label], linewidth=2.0, label=label)
+            for label in legend_order
+            if label in drawn_kinds
+        ]
         if not graph.is_acyclic:
-            title += "  (red: cycle)"
-        axes.set_title(title, fontsize=10)
+            handles.append(
+                Line2D(
+                    [],
+                    [],
+                    color="#2b2d42",
+                    linewidth=2.0,
+                    linestyle=(0, (4, 2)),
+                    label="in a cycle",
+                )
+            )
+        if handles:
+            axes.legend(
+                handles=handles,
+                loc="lower center",
+                bbox_to_anchor=(0.5, 1.0),
+                ncol=min(len(handles), 5),
+                frameon=False,
+                fontsize=8,
+            )
+        axes.set_title(
+            "SAS file dependencies — migrate left to right",
+            fontsize=10,
+            pad=26 if handles else 10,
+        )
         figure.tight_layout()
 
         destination.parent.mkdir(parents=True, exist_ok=True)

@@ -49,6 +49,7 @@ from .models import (
     CorpusComplexityReport,
     FileComplexity,
 )
+from .naming import resolve_name
 
 logger = logging.getLogger(__name__)
 
@@ -203,8 +204,15 @@ def _dataset_lines(file: FileComplexity) -> list[str]:
     return lines
 
 
-def _cross_file_lines(file: FileComplexity) -> list[str]:
-    """The file's coupling to the rest of the corpus, or nothing when absent."""
+def _cross_file_lines(
+    file: FileComplexity, names: Mapping[str, str] | None = None
+) -> list[str]:
+    """The file's coupling to the rest of the corpus, or nothing when absent.
+
+    ``depends_on`` / ``depended_on_by`` hold peer ``source_id``s, so they are
+    named through *names*; imports, exports, and unresolved references are
+    construct names and print as they are.
+    """
     profile = file.cross_file
     if profile is None:
         return []
@@ -224,8 +232,10 @@ def _cross_file_lines(file: FileComplexity) -> list[str]:
         "",
         "## Cross-file coupling",
         "",
-        f"- Depends on: {_fmt_list(profile.depends_on)}",
-        f"- Depended on by: {_fmt_list(profile.depended_on_by)}",
+        "- Depends on: "
+        + _fmt_list(resolve_name(p, names) for p in profile.depends_on),
+        "- Depended on by: "
+        + _fmt_list(resolve_name(p, names) for p in profile.depended_on_by),
         f"- Imports: {_fmt_list(profile.imports)}",
         f"- Exports: {_fmt_list(profile.exports)}",
         f"- Unresolved: {_fmt_list(profile.unresolved)}",
@@ -255,6 +265,7 @@ def render_file_report(
     include_source: bool = True,
     max_source_lines: int = 0,
     overall_link: str | None = None,
+    names: Mapping[str, str] | None = None,
 ) -> str:
     """Render one source file's own complexity report as Markdown.
 
@@ -265,10 +276,22 @@ def render_file_report(
 
     *max_source_lines* caps each printed chunk (0, the default, prints it
     whole). *overall_link* is a relative path back to the corpus report.
+
+    *names* is the corpus-wide ``source_id -> display name`` mapping (see
+    :mod:`complexity.naming`), used for this file's title and for the peers it
+    is coupled to; without one each falls back to its own file name. The full
+    path is still printed once, under the title, since this report is the one
+    place a reader may want to know where the file actually lives.
     """
     lines = [
-        f"# Complexity report — {file.source_id}",
+        f"# Complexity report — {resolve_name(file.source_id, names)}",
         "",
+    ]
+    if resolve_name(file.source_id, names) != file.source_id:
+        # The one place the full path is still printed: a reader looking at a
+        # single file's verdict is the reader who may need to go open it.
+        lines.append(f"- Path: `{file.source_id}`")
+    lines += [
         f"- Target: **{target_display or file.target or 'unknown'}**",
         f"- Size: **{file.size.label}** — **{file.points:g}** story points "
         f"(continuous position {file.continuous_points:.2f})",
@@ -320,7 +343,7 @@ def render_file_report(
     # second only makes sense once the reader knows what the file reads and
     # writes.
     lines += _dataset_lines(file)
-    lines += _cross_file_lines(file)
+    lines += _cross_file_lines(file, names)
 
     lines += ["", f"## Drivers ({len(file.signals)})", ""]
     if file.signals:
@@ -411,6 +434,8 @@ def render_overall_report(
     if not file_links:
         return body
 
+    names = report.names
+
     lines = [
         body,
         "",
@@ -433,13 +458,16 @@ def render_overall_report(
         link = file_links.get(f.source_id)
         cell = f"[{link}]({link})" if link else "—"
         lines.append(
-            f"| {f.source_id} | {f.size.label} | {f.points:.1f} | {cell} |"
+            f"| {resolve_name(f.source_id, names)} | {f.size.label} "
+            f"| {f.points:.1f} | {cell} |"
         )
     # A link with no matching FileComplexity would otherwise vanish silently.
     scored = {f.source_id for f in report.files}
     for source_id, link in file_links.items():
         if source_id not in scored:
-            lines.append(f"| {source_id} | — | — | [{link}]({link}) |")
+            lines.append(
+                f"| {resolve_name(source_id, names)} | — | — | [{link}]({link}) |"
+            )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -521,6 +549,10 @@ def write_reports(
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=True)
     destinations = file_report_paths(report, directory)
+    # Once, from the whole corpus, and handed to every renderer below: a file
+    # named `etl/load.sas` in the overall table must not be `load.sas` in its
+    # own report or in the graph image.
+    names = report.names
 
     written: dict[str, Path] = {}
     for file in report.files:
@@ -534,6 +566,7 @@ def write_reports(
                 include_source=include_source,
                 max_source_lines=max_source_lines,
                 overall_link=f"../{overall_name}",
+                names=names,
             ),
             encoding="utf-8",
         )
@@ -552,7 +585,9 @@ def write_reports(
         # import — and so this module stays renderer-only for Markdown.
         from .graph import render_png
 
-        drawn = render_png(report.graph, directory / GRAPH_IMAGE_NAME)
+        drawn = render_png(
+            report.graph, directory / GRAPH_IMAGE_NAME, names=names
+        )
 
     overall = directory / overall_name
     overall.write_text(
