@@ -37,11 +37,12 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Iterable, Literal
+from typing import Any, Iterable, Literal, Mapping
 
 from pydantic import BaseModel, Field
 
 from .models import CorpusComplexityReport, FileComplexity
+from .naming import display_names, resolve_name
 from .report import ChunkTextIndex, _fence, _fmt_list, _source_block
 
 logger = logging.getLogger(__name__)
@@ -129,10 +130,14 @@ class FileEvaluationResult(BaseModel):
         """Whether a structured evaluation came back."""
         return self.evaluation is not None
 
-    def to_markdown(self) -> str:
-        """This file's evaluation as a Markdown section."""
+    def to_markdown(self, names: Mapping[str, str] | None = None) -> str:
+        """This file's evaluation as a Markdown section.
+
+        *names* is the corpus-wide ``source_id -> display name`` mapping (see
+        :mod:`complexity.naming`); without one the file's own name is used.
+        """
         head = (
-            f"## {self.source_id}",
+            f"## {resolve_name(self.source_id, names)}",
             "",
             f"Static verdict: **{self.static_size or 'unknown'}**, "
             f"{self.static_points:g} points.",
@@ -199,6 +204,7 @@ class ComplexityEvaluation(BaseModel):
 
     def to_markdown(self) -> str:
         """The whole evaluation as one Markdown document."""
+        names = display_names(f.source_id for f in self.files)
         lines = [
             "# LLM complexity evaluation",
             "",
@@ -209,7 +215,7 @@ class ComplexityEvaluation(BaseModel):
         if self.failures:
             lines.append(
                 f"- Unparseable replies: {len(self.failures)} "
-                f"({_fmt_list(f.source_id for f in self.failures)})"
+                f"({_fmt_list(resolve_name(f.source_id, names) for f in self.failures)})"
             )
         lines += [
             "",
@@ -221,7 +227,7 @@ class ComplexityEvaluation(BaseModel):
             "",
         ]
         for file in self.files:
-            lines += [file.to_markdown(), ""]
+            lines += [file.to_markdown(names), ""]
         return "\n".join(lines).rstrip() + "\n"
 
     def __str__(self) -> str:
@@ -311,6 +317,7 @@ def build_evaluation_prompt(
     target_display: str = "",
     include_source: bool = True,
     max_source_lines: int = 0,
+    names: Mapping[str, str] | None = None,
 ) -> str:
     """The evaluation prompt for one source file.
 
@@ -318,6 +325,11 @@ def build_evaluation_prompt(
     own so the prompt can be inspected, diffed, and tuned (``--prompt-only``)
     without spending a call, and so a caller can send it through its own
     client.
+
+    *names* names this file and its peers as the reports do (see
+    :mod:`complexity.naming`). The model is being asked about one file's source,
+    not about where it sits on disk, so a directory of shared prefix in the
+    prompt is tokens spent on nothing.
     """
     extra: list[str] = []
     if file.floored_by:
@@ -353,8 +365,12 @@ def build_evaluation_prompt(
     elif profile.imports or profile.exports or profile.unresolved:
         cross_file = "\n".join(
             [
-                f"- Depends on: {_fmt_list(profile.depends_on)}",
-                f"- Depended on by: {_fmt_list(profile.depended_on_by)}",
+                "- Depends on: "
+                + _fmt_list(resolve_name(p, names) for p in profile.depends_on),
+                "- Depended on by: "
+                + _fmt_list(
+                    resolve_name(p, names) for p in profile.depended_on_by
+                ),
                 f"- Imports: {_fmt_list(profile.imports)}",
                 f"- Exports: {_fmt_list(profile.exports)}",
                 f"- Unresolved: {_fmt_list(profile.unresolved)}",
@@ -388,7 +404,7 @@ def build_evaluation_prompt(
 
     prompt = _PROMPT_TEMPLATE.format(
         target=target_display or file.target or "the target language",
-        source_id=file.source_id,
+        source_id=resolve_name(file.source_id, names),
         size=file.size.label,
         points=file.points,
         tier=file.tier,
@@ -425,6 +441,7 @@ def evaluation_prompts(
 ) -> dict[str, str]:
     """``source_id -> prompt`` for every file in *report* (or just *sources*)."""
     wanted = set(sources) if sources is not None else None
+    names = report.names
     return {
         f.source_id: build_evaluation_prompt(
             f,
@@ -432,6 +449,7 @@ def evaluation_prompts(
             target_display=report.target_display,
             include_source=include_source,
             max_source_lines=max_source_lines,
+            names=names,
         )
         for f in report.files
         if wanted is None or f.source_id in wanted
@@ -451,6 +469,7 @@ def evaluate_file(
     target_display: str = "",
     include_source: bool = True,
     max_source_lines: int = 0,
+    names: Mapping[str, str] | None = None,
 ) -> FileEvaluationResult:
     """Ask *llm* to evaluate one file; never raises on a bad reply.
 
@@ -465,6 +484,7 @@ def evaluate_file(
         target_display=target_display,
         include_source=include_source,
         max_source_lines=max_source_lines,
+        names=names,
     )
     result = FileEvaluationResult(
         source_id=file.source_id,
@@ -519,6 +539,7 @@ def evaluate_report(
         f"evaluate_report: evaluating {len(files)} of {len(report.files)} "
         f"file(s) against {report.target!r}"
     )
+    names = report.names
     results = [
         evaluate_file(
             llm,
@@ -527,6 +548,7 @@ def evaluate_report(
             target_display=report.target_display,
             include_source=include_source,
             max_source_lines=max_source_lines,
+            names=names,
         )
         for file in files
     ]

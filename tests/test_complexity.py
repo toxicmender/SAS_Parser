@@ -26,22 +26,28 @@ from complexity import (
     ComplexityTier,
     CrossFileIndex,
     DependencyGraph,
+    PdfRenderError,
     TranslationParity,
     TShirtSize,
     build_evaluation_prompt,
     chunk_texts,
     detect_constructs,
+    display_name,
+    display_names,
     evaluate_report,
     evaluation_prompts,
     max_size,
     max_tier,
     render_file_report,
     render_overall_report,
+    render_pdf,
     render_png,
+    resolve_name,
     sort_by_complexity,
     worst_parity,
     write_reports,
 )
+from complexity.pdf import markdown_to_html, wrap_code
 from complexity import rules
 
 
@@ -2561,6 +2567,293 @@ class TestWriteReportsGraph(unittest.TestCase):
         self.assertIn(
             "## Dependency graph", written.overall.read_text(encoding="utf-8")
         )
+
+
+# ---------------------------------------------------------------------------
+# Naming: reports print file names, models keep paths
+# ---------------------------------------------------------------------------
+
+
+def _pathed_corpus() -> SasCorpus:
+    """Two `load.sas` scripts in different directories, plus an unambiguous one.
+
+    The collision is the point: absolute source ids are what the CLI actually
+    hands the chunker, and two scripts sharing a basename are common in a real
+    SAS estate.
+    """
+    chunker = SasSemanticChunker()
+    sources = {
+        "/corp/sas/etl/load.sas": "data raw.customers;\n  set edw.extract;\nrun;\n",
+        "/corp/sas/adhoc/load.sas": "data work.scratch;\n  set raw.customers;\nrun;\n",
+        "/corp/sas/report.sas": "proc print data=work.scratch;\nrun;\n",
+    }
+    return SasCorpus(
+        file_results=[
+            chunker.chunk_text(src, source_id=sid) for sid, src in sources.items()
+        ]
+    )
+
+
+class TestDisplayNames(unittest.TestCase):
+    """`display_names` — the shortest tail of each path that stays unique."""
+
+    def test_a_unique_basename_is_the_whole_name(self):
+        self.assertEqual(
+            display_names(["/a/b/load.sas", "/a/b/report.sas"]),
+            {"/a/b/load.sas": "load.sas", "/a/b/report.sas": "report.sas"},
+        )
+
+    def test_a_collision_widens_only_the_files_that_collide(self):
+        names = display_names(
+            ["/s/etl/load.sas", "/s/adhoc/load.sas", "/s/deep/nest/report.sas"]
+        )
+        self.assertEqual(names["/s/etl/load.sas"], "etl/load.sas")
+        self.assertEqual(names["/s/adhoc/load.sas"], "adhoc/load.sas")
+        # The uncollided file keeps its short name rather than being widened
+        # along with them.
+        self.assertEqual(names["/s/deep/nest/report.sas"], "report.sas")
+
+    def test_windows_separators_split_too(self):
+        names = display_names(["D:\\corp\\etl\\load.sas", "D:\\corp\\qa\\load.sas"])
+        self.assertEqual(
+            sorted(names.values()), ["etl/load.sas", "qa/load.sas"]
+        )
+
+    def test_it_widens_as_far_as_it_must(self):
+        names = display_names(["/a/x/one/f.sas", "/b/y/one/f.sas"])
+        self.assertEqual(names["/a/x/one/f.sas"], "x/one/f.sas")
+        self.assertEqual(names["/b/y/one/f.sas"], "y/one/f.sas")
+
+    def test_duplicates_collapse_rather_than_colliding(self):
+        self.assertEqual(display_names(["a.sas", "a.sas"]), {"a.sas": "a.sas"})
+
+    def test_display_name_is_the_context_free_basename(self):
+        self.assertEqual(display_name("/a/b/load.sas"), "load.sas")
+        self.assertEqual(display_name("load.sas"), "load.sas")
+        self.assertEqual(display_name(""), "")
+
+    def test_resolve_name_falls_back_to_the_basename(self):
+        self.assertEqual(resolve_name("/a/b/c.sas", None), "c.sas")
+        self.assertEqual(resolve_name("/a/b/c.sas", {}), "c.sas")
+        self.assertEqual(resolve_name("/a/b/c.sas", {"/a/b/c.sas": "b/c.sas"}),
+                         "b/c.sas")
+
+
+class TestReportsPrintNames(unittest.TestCase):
+    """Every rendered report names files; only the model keeps the path."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        corpus = _pathed_corpus()
+        batch_result = MultiFileBatcher().batch(corpus)
+        self.report = ComplexityAnalyzer().analyze_items(
+            batch_result.all_ordered_items,
+            source_ids=corpus.source_ids,
+            diagnostics=corpus.all_diagnostics,
+        )
+        self.texts = chunk_texts(batch_result.all_ordered_items)
+
+    def test_the_model_still_holds_the_full_path(self):
+        self.assertEqual(
+            sorted(f.source_id for f in self.report.files),
+            ["/corp/sas/adhoc/load.sas", "/corp/sas/etl/load.sas",
+             "/corp/sas/report.sas"],
+        )
+
+    def test_the_corpus_report_prints_no_directory_prefix(self):
+        text = self.report.to_markdown()
+        self.assertNotIn("/corp/sas", text)
+        self.assertIn("etl/load.sas", text)
+        self.assertIn("adhoc/load.sas", text)
+        self.assertIn("report.sas", text)
+
+    def test_the_dependency_section_names_both_ends_of_an_edge(self):
+        text = self.report.to_markdown()
+        self.assertIn("| etl/load.sas | adhoc/load.sas |", text)
+        self.assertIn("**Wave 1**: etl/load.sas", text)
+
+    def test_cross_file_evidence_names_its_peers(self):
+        scratch = _file(self.report, "/corp/sas/adhoc/load.sas")
+        assert scratch.cross_file is not None
+        joined = " ".join(scratch.cross_file.imports)
+        self.assertIn("etl/load.sas", joined)
+        self.assertNotIn("/corp/sas", joined)
+
+    def test_an_individual_report_names_the_file_and_prints_its_path_once(self):
+        markdown = render_file_report(
+            _file(self.report, "/corp/sas/adhoc/load.sas"),
+            texts=self.texts,
+            names=self.report.names,
+        )
+        self.assertTrue(
+            markdown.startswith("# Complexity report — adhoc/load.sas")
+        )
+        # Once, in the Path bullet — this is the report of the file a reader
+        # might need to go open.
+        self.assertEqual(markdown.count("/corp/sas/adhoc/load.sas"), 1)
+        self.assertIn("- Path: `/corp/sas/adhoc/load.sas`", markdown)
+        self.assertIn("- Depends on: etl/load.sas", markdown)
+
+    def test_the_index_table_names_files(self):
+        written = write_reports(self.report, self.tmp, texts=self.texts)
+        overall = written.overall.read_text(encoding="utf-8")
+        self.assertNotIn("/corp/sas", overall)
+        self.assertIn("| etl/load.sas |", overall)
+
+    def test_the_evaluation_prompt_names_the_file(self):
+        prompts = evaluation_prompts(self.report, texts=self.texts)
+        prompt = prompts["/corp/sas/adhoc/load.sas"]
+        self.assertIn("# Static verdict — adhoc/load.sas", prompt)
+        self.assertNotIn("/corp/sas/adhoc", prompt)
+
+
+# ---------------------------------------------------------------------------
+# PDF rendering
+# ---------------------------------------------------------------------------
+
+
+class TestMarkdownToHtml(unittest.TestCase):
+    """The HTML handed to the layout engine."""
+
+    def test_tables_are_rendered(self):
+        html = markdown_to_html("| a | b |\n| --- | --- |\n| 1 | 2 |\n")
+        self.assertIn("<table>", html)
+        self.assertIn("<td>1</td>", html)
+
+    def test_raw_html_in_the_source_is_escaped_not_executed(self):
+        html = markdown_to_html("```sas\nif a<b and c>d then x=1;\n```\n")
+        self.assertIn("&lt;b and c&gt;", html)
+
+    def test_long_code_lines_are_folded(self):
+        line = "data x; set y; where " + " and ".join(f"col{i} = {i}" for i in range(40))
+        html = markdown_to_html(f"```sas\n{line}\n```\n", code_width=60)
+        body = html.split("<code>")[1].split("</code>")[0]
+        self.assertTrue(all(len(part) <= 60 for part in body.split("\n")))
+        # Folded, not truncated: every token survives.
+        self.assertIn("col39", body)
+
+
+class TestWrapCode(unittest.TestCase):
+    """Soft-wrapping, since the layout engine clips instead of folding."""
+
+    def test_short_lines_are_untouched(self):
+        self.assertEqual(wrap_code("run;\nquit;", 40), "run;\nquit;")
+
+    def test_continuations_keep_the_original_indentation(self):
+        folded = wrap_code("    set " + "a" * 30 + " " + "b" * 30 + ";", 40)
+        lines = folded.split("\n")
+        self.assertGreater(len(lines), 1)
+        self.assertTrue(lines[1].startswith("    "))
+
+    def test_a_single_over_long_token_is_broken(self):
+        folded = wrap_code("x" * 100, 20)
+        self.assertTrue(all(len(line) <= 20 for line in folded.split("\n")))
+        self.assertEqual(folded.replace("\n", ""), "x" * 100)
+
+
+class TestRenderPdf(unittest.TestCase):
+    """`render_pdf` — the Markdown, converted, never replaced."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_it_writes_a_real_pdf_beside_the_markdown(self):
+        source = self.tmp / "complexity-report.md"
+        source.write_text(
+            "# SAS chunk complexity report\n\n"
+            "| File | Size |\n| --- | --- |\n| etl/load.sas | Small |\n\n"
+            "```sas\ndata work.a; set raw.b; run;\n```\n",
+            encoding="utf-8",
+        )
+        written = render_pdf(source)
+        self.assertEqual(written, self.tmp / "complexity-report.pdf")
+        self.assertEqual(written.read_bytes()[:5], b"%PDF-")
+        # The Markdown is untouched: this converts, it does not replace.
+        self.assertTrue(source.is_file())
+
+    def test_the_text_survives_the_conversion(self):
+        import pymupdf
+
+        source = self.tmp / "r.md"
+        source.write_text("# Heading\n\nA sentence about etl/load.sas.\n", "utf-8")
+        with pymupdf.open(render_pdf(source)) as doc:
+            text = doc[0].get_text()
+        self.assertIn("Heading", text)
+        self.assertIn("etl/load.sas", text)
+
+    def test_a_named_destination_is_honoured(self):
+        source = self.tmp / "r.md"
+        source.write_text("# Heading\n", encoding="utf-8")
+        dest = self.tmp / "nested" / "elsewhere.pdf"
+        self.assertEqual(render_pdf(source, dest), dest)
+        self.assertTrue(dest.is_file())
+
+    def test_a_missing_markdown_file_raises(self):
+        with self.assertRaises(PdfRenderError):
+            render_pdf(self.tmp / "absent.md")
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("matplotlib"), "matplotlib is not installed"
+    )
+    def test_the_dependency_graph_image_lands_in_the_pdf(self):
+        import pymupdf
+
+        corpus = _graph_corpus()
+        batch_result = MultiFileBatcher().batch(corpus)
+        report = ComplexityAnalyzer().analyze_items(
+            batch_result.all_ordered_items,
+            source_ids=corpus.source_ids,
+            diagnostics=corpus.all_diagnostics,
+        )
+        written = write_reports(
+            report, self.tmp, texts=chunk_texts(batch_result.all_ordered_items)
+        )
+        self.assertIsNotNone(written.graph)
+        with pymupdf.open(render_pdf(written.overall)) as doc:
+            images = sum(len(page.get_images()) for page in doc)
+        self.assertEqual(images, 1)
+
+
+class TestPdfCLI(unittest.TestCase):
+    """`--pdf` — the flag, and what it refuses to do without a destination."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        (self.tmp / "load.sas").write_text(
+            "data work.a;\n  set raw.a;\nrun;\n", encoding="utf-8"
+        )
+
+    def _run(self, *args):
+        from complexity.__main__ import main
+
+        return main([str(self.tmp), *args])
+
+    def test_out_dir_gets_a_pdf_beside_the_overall_report(self):
+        out = self.tmp / "reports"
+        self.assertEqual(self._run("--out-dir", str(out), "--pdf"), 0)
+        self.assertTrue((out / "complexity-report.md").is_file())
+        self.assertEqual(
+            (out / "complexity-report.pdf").read_bytes()[:5], b"%PDF-"
+        )
+
+    def test_out_gets_a_pdf_of_the_same_name(self):
+        out = self.tmp / "estimate.md"
+        self.assertEqual(self._run("--out", str(out), "--pdf"), 0)
+        self.assertEqual(
+            (self.tmp / "estimate.pdf").read_bytes()[:5], b"%PDF-"
+        )
+
+    def test_without_a_destination_it_is_an_error_exit(self):
+        self.assertEqual(self._run("--pdf"), 1)
+        self.assertEqual(list(self.tmp.glob("*.pdf")), [])
+
+    def test_no_pdf_without_the_flag(self):
+        out = self.tmp / "reports"
+        self.assertEqual(self._run("--out-dir", str(out)), 0)
+        self.assertEqual(list(out.glob("*.pdf")), [])
 
 
 if __name__ == "__main__":

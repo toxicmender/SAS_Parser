@@ -5,6 +5,7 @@
     python -m complexity path/to/sas_dir --target pyspark --out report.md
     python -m complexity path/to/sas_dir --rules-path my_profile.json --top 25
     python -m complexity path/to/sas_dir --out-dir reports/ --llm-eval
+    python -m complexity path/to/sas_dir --out-dir reports/ --pdf
 
 Chunks every matching file, batches the whole corpus with
 :class:`~chunker.batcher.MultiFileBatcher` so cross-file dataset/macro edges
@@ -17,7 +18,8 @@ Two kinds of report come out. ``--out`` (or stdout) writes the corpus-wide one,
 :meth:`~complexity.models.CorpusComplexityReport.to_markdown`. ``--out-dir``
 writes that *plus* one report per source SAS script under ``files/``, each
 printing the SAS source of every chunk it mentions, with the overall report
-indexing them.
+indexing them. ``--pdf`` renders the overall report a second time as a PDF, for
+the reader who is being sent the estimate rather than the repository.
 
 ``--llm-eval`` adds an optional second opinion: each file's verdict and source
 are sent to a model with a prompt asking where the rules are wrong or
@@ -146,6 +148,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "(default: 0, print it whole).",
     )
     parser.add_argument(
+        "--pdf",
+        action="store_true",
+        help="Also render the overall Markdown report as a PDF beside it "
+        "(complexity-report.pdf under --out-dir, or --out's name with a .pdf "
+        "suffix). Needs one of those two, since stdout has nowhere to put a "
+        "file. The Markdown is written either way.",
+    )
+    parser.add_argument(
         "--no-graph-image",
         action="store_true",
         help="Skip drawing dependency-graph.png with --out-dir. The overall "
@@ -193,6 +203,14 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
 
+    # Checked before the corpus is scored: a run that cannot deliver what was
+    # asked for should say so in a second, not after the analysis.
+    if args.pdf and args.out is None and args.out_dir is None:
+        logger.error("--pdf needs --out or --out-dir; stdout has nowhere to "
+                     "put a file")
+        print("--pdf needs --out or --out-dir.", file=sys.stderr)
+        return 1
+
     sas_files = sorted(args.sas_dir.rglob(args.pattern))
     if not sas_files:
         logger.error(f"no files matching {args.pattern!r} under {args.sas_dir}")
@@ -229,6 +247,7 @@ def main(argv: list[str] | None = None) -> int:
     texts = chunk_texts(batch_result.all_ordered_items)
     include_source = not args.no_source_text
 
+    pdf_ok = True
     if args.out_dir is not None:
         written = write_reports(
             report,
@@ -249,22 +268,50 @@ def main(argv: list[str] | None = None) -> int:
         if args.out is not None and args.out != written.overall:
             _write(args.out, written.overall.read_text(encoding="utf-8"))
             print(f"wrote complexity report: {args.out}")
+        if args.pdf:
+            # From the written overall report, not from `args.out`: the PDF is
+            # rendered beside dependency-graph.png so the image it links lands
+            # in the document rather than resolving to nothing.
+            pdf_ok = _write_pdf(written.overall)
     else:
         markdown = render_overall_report(report, top=args.top)
         if args.out is not None:
             _write(args.out, markdown)
             print(f"wrote complexity report: {args.out}")
+            if args.pdf:
+                pdf_ok = _write_pdf(args.out)
         else:
             print(markdown)
 
     if args.llm_eval or args.llm_model or args.prompt_only:
-        return _run_evaluation(args, report, texts, include_source=include_source)
-    return 0
+        status = _run_evaluation(args, report, texts, include_source=include_source)
+        return status or (0 if pdf_ok else 1)
+    return 0 if pdf_ok else 1
 
 
 def _write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+def _write_pdf(markdown_path: Path) -> bool:
+    """Render *markdown_path* to a PDF beside it. False if it could not be.
+
+    Imported lazily and only on this path, like every other optional artefact
+    here. A failure is reported rather than raised — the Markdown is already on
+    disk and the rest of the run is still worth finishing — but it does decide
+    the exit status: the PDF was asked for by name.
+    """
+    from .pdf import PdfRenderError, render_pdf
+
+    try:
+        destination = render_pdf(markdown_path)
+    except PdfRenderError as exc:
+        logger.error(f"--pdf: {exc}")
+        print(f"could not render the PDF: {exc}", file=sys.stderr)
+        return False
+    print(f"wrote complexity report PDF: {destination}")
+    return True
 
 
 def _run_evaluation(

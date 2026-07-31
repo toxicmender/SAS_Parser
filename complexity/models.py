@@ -780,8 +780,32 @@ class CorpusComplexityReport(BaseModel):
             reverse=True,
         )[:limit]
 
+    @property
+    def names(self) -> dict[str, str]:
+        """``source_id -> the short name reports print for it``.
+
+        Built across everything this report can mention — its sources, its
+        scored files, and its graph's nodes — so one file reads the same in the
+        file table, the dependency edges, and the per-file reports. A plain
+        property rather than a ``computed_field``: it is display, derived, and
+        has no business in the serialised model.
+        """
+        # Local import for the same reason as `render_markdown` below: this
+        # module is the pure-data layer (see its docstring), and naming is a
+        # rendering concern that carries a logger.
+        from .naming import display_names
+
+        known = [*self.source_ids, *(f.source_id for f in self.files)]
+        if self.graph is not None:
+            known += self.graph.nodes
+        return display_names(known)
+
     def to_markdown(self, *, top: int = 10, graph_image: str | None = None) -> str:
         """Render the report as a Markdown summary plus a hardest-items table.
+
+        Files are printed by :attr:`names` — the file name, widened to a parent
+        directory only where two files would otherwise read alike. The full
+        path stays on the model.
 
         *graph_image* is a path to a rendered dependency-graph PNG, relative to
         wherever this Markdown will be written; when given it is linked above
@@ -789,11 +813,13 @@ class CorpusComplexityReport(BaseModel):
         image — the table carries the same edges either way.
         """
         counts = self.tier_counts
+        names = self.names
         lines = [
             "# SAS chunk complexity report",
             "",
             f"- Target: **{self.target_display or self.target or 'unknown'}**",
-            f"- Sources: {', '.join(self.source_ids) or 'none'}",
+            "- Sources: "
+            + (", ".join(names.get(s, s) for s in self.source_ids) or "none"),
             f"- Scored units: {len(self.items)} "
             f"({len(self.batches)} batch(es), {len(self.chunks)} chunk(s))",
             f"- Overall tier: **{self.overall_tier}**",
@@ -836,7 +862,8 @@ class CorpusComplexityReport(BaseModel):
                 reverse=True,
             ):
                 lines.append(
-                    f"| {f.source_id} | {f.size.label} | {f.points:.1f} "
+                    f"| {names.get(f.source_id, f.source_id)} "
+                    f"| {f.size.label} | {f.points:.1f} "
                     f"| {f.tier} | {f.translation_difficulty} "
                     f"| {f.effort_raw:.1f} ({f.effort_norm:.2f}) "
                     f"| {f.complexity_raw:.1f} ({f.complexity_norm:.2f}) "
@@ -858,7 +885,7 @@ class CorpusComplexityReport(BaseModel):
             # would be a cycle.
             from .graph import render_markdown
 
-            lines += render_markdown(self.graph, image=graph_image)
+            lines += render_markdown(self.graph, image=graph_image, names=names)
 
         breakdown = self.files_needing_breakdown
         if breakdown:
@@ -877,7 +904,8 @@ class CorpusComplexityReport(BaseModel):
                     else "no batch boundaries available — split by step"
                 )
                 lines.append(
-                    f"- **{f.source_id}** ({f.points:.1f} pts, "
+                    f"- **{names.get(f.source_id, f.source_id)}** "
+                    f"({f.points:.1f} pts, "
                     f"{f.chunk_count} chunks, {f.line_count} lines) — "
                     f"suggested cut points: {cuts}"
                 )

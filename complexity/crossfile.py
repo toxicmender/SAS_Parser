@@ -42,13 +42,14 @@ Logger name: ``complexity.crossfile``.
 from __future__ import annotations
 
 import logging
-from typing import Iterable, NamedTuple
+from typing import Iterable, Mapping, NamedTuple
 
 from chunker.batcher import _DEFAULT_LIBREFS
 from chunker.keywords import _STANDARD_AUTOCALL_MACROS
 from chunker.models import SasChunk
 
 from .models import CrossFileProfile
+from .naming import display_names, resolve_name
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,17 @@ def _owners(index: dict[str, set[str]], name: str, exclude: str) -> list[str]:
     return sorted(index.get(name.lower(), set()) - {exclude})
 
 
+def _named(files: Iterable[str], names: Mapping[str, str]) -> str:
+    """*files* as a comma-separated list of display names.
+
+    Evidence is prose a human reads — "written by etl/load.sas" — so it carries
+    names, not the absolute ``source_id``s that would push the informative part
+    of every sentence off the line. The identity stays in ``peers``, which is
+    what :mod:`complexity.graph` builds its edges from.
+    """
+    return ", ".join(resolve_name(f, names) for f in files)
+
+
 class CrossFileIndex:
     """Producer/consumer index over a whole corpus of chunks.
 
@@ -140,6 +152,9 @@ class CrossFileIndex:
 
     def __init__(self) -> None:
         self.corpus_files: int = 0
+        #: ``source_id -> display name`` across the corpus, for the evidence
+        #: strings built below (see :mod:`complexity.naming`).
+        self.names: dict[str, str] = {}
         # Keyed on (source_id, chunk_id), never chunk_id alone: the chunker
         # numbers chunks per file, so two files independently chunked both
         # start at "chunk-001" and would otherwise collide, silently serving
@@ -205,6 +220,9 @@ class CrossFileIndex:
         index.corpus_files = len(sources)
         multi = index.corpus_files > 1
         by_source: dict[str, list[CrossFileRef]] = {s: [] for s in sources}
+        # Resolved once for the whole corpus, because that is the only scope in
+        # which "is this name ambiguous?" has an answer.
+        index.names = display_names(sources)
 
         for chunk in chunk_list:
             source = chunk.source_id or _INLINE
@@ -214,6 +232,7 @@ class CrossFileIndex:
                 producers=_Producers(macros, datasets, macrovars, librefs),
                 consumers=_Consumers(macro_users, dataset_users, macrovar_users),
                 multi=multi,
+                names=index.names,
             )
             if refs:
                 index._refs[(source, chunk.chunk_id)] = refs
@@ -241,8 +260,14 @@ class CrossFileIndex:
         producers: "_Producers",
         consumers: "_Consumers",
         multi: bool,
+        names: Mapping[str, str] | None = None,
     ) -> list[CrossFileRef]:
-        """Every cross-file reference *chunk* makes, in a stable order."""
+        """Every cross-file reference *chunk* makes, in a stable order.
+
+        *names* names the peer files each piece of evidence points at; see
+        :func:`_named`.
+        """
+        names = names or {}
         meta = chunk.metadata
         refs: list[CrossFileRef] = []
         macros = producers.macros
@@ -262,7 +287,7 @@ class CrossFileIndex:
                 refs.append(
                     CrossFileRef(
                         "macro_import",
-                        f"%{macro} defined in {', '.join(peers)}",
+                        f"%{macro} defined in {_named(peers, names)}",
                         tuple(peers),
                         macro,
                     )
@@ -293,7 +318,7 @@ class CrossFileIndex:
                 refs.append(
                     CrossFileRef(
                         "macro_export",
-                        f"%{macro} used by {', '.join(users)}",
+                        f"%{macro} used by {_named(users, names)}",
                         tuple(users),
                         macro,
                     )
@@ -309,7 +334,7 @@ class CrossFileIndex:
                 refs.append(
                     CrossFileRef(
                         "dataset_import",
-                        f"{dataset} written by {', '.join(peers)}",
+                        f"{dataset} written by {_named(peers, names)}",
                         tuple(peers),
                         dataset,
                     )
@@ -331,7 +356,7 @@ class CrossFileIndex:
                 refs.append(
                     CrossFileRef(
                         "dataset_export",
-                        f"{dataset} read by {', '.join(users)}",
+                        f"{dataset} read by {_named(users, names)}",
                         tuple(users),
                         dataset,
                     )
@@ -347,7 +372,7 @@ class CrossFileIndex:
                 refs.append(
                     CrossFileRef(
                         "macrovar_import",
-                        f"&{var} set in {', '.join(peers)}",
+                        f"&{var} set in {_named(peers, names)}",
                         tuple(peers),
                         var,
                     )
@@ -364,7 +389,7 @@ class CrossFileIndex:
                 refs.append(
                     CrossFileRef(
                         "macrovar_export",
-                        f"&{var} read by {', '.join(users)}",
+                        f"&{var} read by {_named(users, names)}",
                         tuple(users),
                         var,
                     )
@@ -398,7 +423,7 @@ class CrossFileIndex:
                 refs.append(
                     CrossFileRef(
                         "libref_import",
-                        f"libref {libref} assigned in {', '.join(peers)}",
+                        f"libref {libref} assigned in {_named(peers, names)}",
                         tuple(peers),
                         libref,
                     )
