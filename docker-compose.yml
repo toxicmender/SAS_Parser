@@ -1,0 +1,183 @@
+# Local development stack for SAS_Parser.
+#
+#   vault        HashiCorp Vault (dev mode) — the credential source
+#                app_config.vault reads
+#   vault-init   one-shot: enables kv-v2 + AppRole, seeds the secrets, hands
+#                the app its AppRole credentials
+#   spark-master
+#   spark-worker standalone Spark cluster — the local stand-in for a
+#                Databricks cluster (Databricks itself cannot be self-hosted;
+#                see docker/README.md)
+#   app          the repo, with every extra installed, driving both
+#
+#   docker compose up -d --build
+#   docker compose exec app python demo_run.py local sas_scripts --out-dir out
+#
+# Full walkthrough, and what changes for a real Vault / a real Databricks
+# workspace: docker/README.md.
+
+name: sas-parser
+
+x-spark-build: &spark-build
+  context: .
+  dockerfile: docker/spark.Dockerfile
+  args:
+    PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
+    # Must match uv.lock's pyspark, which the app image installs.
+    PYSPARK_VERSION: ${PYSPARK_VERSION:-4.1.2}
+    WITH_DELTA: ${WITH_DELTA:-1}
+    DELTA_SPARK_VERSION: ${DELTA_SPARK_VERSION:-}
+
+services:
+  vault:
+    build:
+      context: .
+      dockerfile: docker/vault.Dockerfile
+      args:
+        VAULT_VERSION: ${VAULT_VERSION:-1.18}
+    image: sas-parser/vault:${VAULT_VERSION:-1.18}
+    # DEV MODE: in-memory storage, auto-unsealed, a known root token, HTTP.
+    # Everything vanishes on restart — which is fine, because vault-init
+    # re-seeds it. Never run this configuration anywhere real.
+    #
+    # No `command:` — the image's default entrypoint starts a dev server from
+    # these two variables. Passing `server -dev ...` explicitly would duplicate
+    # the flags the entrypoint already adds.
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_DEV_ROOT_TOKEN_ID:-root}
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+      # For the CLI inside the container (the healthcheck below).
+      VAULT_ADDR: http://127.0.0.1:8200
+      VAULT_API_ADDR: http://vault:8200
+    # mlock keeps Vault's memory off disk; harmless in dev, expected by the
+    # image's own startup check.
+    cap_add:
+      - IPC_LOCK
+    ports:
+      - "${VAULT_PORT:-8200}:8200"
+    healthcheck:
+      # exit 0 = unsealed and active. `vault status` is in the image, so no
+      # curl/jq dependency in the check itself.
+      test: ["CMD", "vault", "status"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  vault-init:
+    build:
+      context: .
+      dockerfile: docker/vault.Dockerfile
+      args:
+        VAULT_VERSION: ${VAULT_VERSION:-1.18}
+    image: sas-parser/vault:${VAULT_VERSION:-1.18}
+    depends_on:
+      vault:
+        condition: service_healthy
+    entrypoint: ["/usr/local/bin/vault-init.sh"]
+    environment:
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: ${VAULT_DEV_ROOT_TOKEN_ID:-root}
+      # Seeded into secret/appsvc/ai_gateway and secret/llm/anthropic. Leave
+      # unset and the secrets carry an obvious placeholder instead.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      # The AppRole credentials to pin, so the app can be handed the same pair
+      # as plain environment. Fixed dev constants, not secrets — see init.sh.
+      DEV_VAULT_ROLE_ID: ${DEV_VAULT_ROLE_ID:-11111111-1111-1111-1111-111111111111}
+      DEV_VAULT_SECRET_ID: ${DEV_VAULT_SECRET_ID:-22222222-2222-2222-2222-222222222222}
+    restart: "no"
+
+  spark-master:
+    build: *spark-build
+    image: sas-parser/spark:${PYSPARK_VERSION:-4.1.2}
+    command: ["master"]
+    environment:
+      SPARK_MASTER_HOST: spark-master
+    ports:
+      - "${SPARK_MASTER_PORT:-7077}:7077"
+      - "${SPARK_MASTER_UI_PORT:-8080}:8080"
+    volumes:
+      - spark-warehouse:/data/warehouse
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  spark-worker:
+    build: *spark-build
+    image: sas-parser/spark:${PYSPARK_VERSION:-4.1.2}
+    command: ["worker"]
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    environment:
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-2g}
+      SPARK_WORKER_DIR: /opt/spark-work
+    # No `ports:` — scale it (`docker compose up -d --scale spark-worker=3`)
+    # and a fixed host port would collide. Reach a worker UI through the
+    # master UI at :8080.
+    volumes:
+      - spark-warehouse:/data/warehouse
+
+  app:
+    build:
+      context: .
+      dockerfile: docker/app.Dockerfile
+      args:
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
+        WITH_DELTA: ${WITH_DELTA:-1}
+        DELTA_SPARK_VERSION: ${DELTA_SPARK_VERSION:-}
+    image: sas-parser/app:${APP_IMAGE_TAG:-dev}
+    depends_on:
+      vault-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_healthy
+    # Read first, overridden by `environment:` below — so a .env written for
+    # bare-metal runs (VAULT_ADDR=https://vault.example:8200, ...) does not
+    # point the container off the compose network.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # --- Vault -----------------------------------------------------------
+      # The AppRole identity vault-init pinned. Passed as environment (not via
+      # a shared file) so that `docker compose exec app ...` — which bypasses
+      # the entrypoint — has the credentials too.
+      VAULT_ADDR: http://vault:8200
+      VAULT_ROLE_ID: ${DEV_VAULT_ROLE_ID:-11111111-1111-1111-1111-111111111111}
+      VAULT_SECRET_ID: ${DEV_VAULT_SECRET_ID:-22222222-2222-2222-2222-222222222222}
+      VAULT_SKIP_VERIFY: "true"   # dev Vault speaks plain HTTP
+      # --- Spark -----------------------------------------------------------
+      SPARK_MASTER_URL: spark://spark-master:7077
+      # What the driver advertises to executors. `app` is the compose service
+      # name, i.e. the DNS alias containers started by `up`/`exec` carry; a
+      # bare `docker compose run` needs --use-aliases for this to resolve.
+      SPARK_LOCAL_HOSTNAME: app
+      # --- Databricks (a real workspace; nothing local to point at) ---------
+      DATABRICKS_HOST: ${DATABRICKS_HOST:-}
+      DATABRICKS_TOKEN: ${DATABRICKS_TOKEN:-}
+      DATABRICKS_HTTP_PATH: ${DATABRICKS_HTTP_PATH:-}
+      # --- LLM -------------------------------------------------------------
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      # The project is installed editable, so the mount makes host edits live
+      # inside the container — and puts notebooks, reports, and the
+      # .prompt_builder_cache back on the host where they are wanted.
+      - .:/app
+      - spark-warehouse:/data/warehouse
+    working_dir: /app
+    # Idle by default: this is a CLI, not a server. Drive it with
+    # `docker compose exec app ...`.
+    command: ["sleep", "infinity"]
+    init: true
+
+volumes:
+  spark-warehouse:

@@ -1,0 +1,45 @@
+# Build context for docker/app.Dockerfile (context = repo root).
+#
+# The app service bind-mounts the repo over /app, so anything excluded here is
+# still visible at run time under compose — this list only keeps the *image*
+# small and reproducible.
+
+# Virtual environments (host-platform binaries; the image builds its own)
+.venv/
+venv/
+
+# VCS & CI metadata
+.git/
+.github/
+.claude/
+
+# Python build & cache artefacts
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+junit.xml
+htmlcov/
+pyright.json
+
+# Local secrets — never bake these into a layer
+.env
+
+# User-provided, copyrighted reference PDFs (gitignored too). Mounted at
+# run time from the host instead; see docker/README.md.
+reference_docs/
+
+# prompt_builder on-disk extraction cache
+.prompt_builder_cache/
+
+# Docker's own prose (changing it must not bust the app layers). The scripts
+# under docker/ stay in the context — both Dockerfiles COPY from there.
+docker-compose.yml
+docker/README.md
