@@ -10,9 +10,8 @@ SAS source into LLM-ready work items. Each layer is usable on its own.
    into batches that must be translated together.
 
 The LLM orchestration layer that consumes these work items lives in the
-top-level [`pipeline` package](../pipeline/README.md) (it moved out of this
-package; the old `chunker.pipeline` / `chunker.notebook` /
-`chunker.response_models` import paths still work with a DeprecationWarning).
+top-level [`pipeline` package](../pipeline/README.md), which is where it moved
+out of this package to.
 For the whole-system view (including `llm_client` and `memory`), see the
 repository [Architecture.md](../Architecture.md).
 

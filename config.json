@@ -15,8 +15,12 @@
     "focus_hints": null,
     "reasoning_directives": null
   },
+  "_llm_client_comment": "The AI Gateway. 'gateway_version' is sent as the 'ai-gateway-version' header on every request ('v2' for the current gateway); an explicit url_headers entry of the same name wins. 'model_provider' names the family the gateway routes to ('anthropic', 'openai', ...) and is also filled in from a 'provider: model' prefix on 'model'. 'provider_client' picks how the chat model is built: 'openai_compatible' (default) is the LangChain ChatOpenAI everything here is written around -- retry with Retry-After, the input-token budget, prompt-cache breakpoints, structured output; 'native' wraps the raw openai SDK for a gateway that will not take the LangChain payload, and gives up every construction-time feature (rate limiter, model_kwargs, structured output). 'roles' holds SPARSE overlays: a key a role does not mention resolves from this section, so 'validator' and 'complexity' differ only where they say they do.",
   "llm_client": {
     "model": null,
+    "model_provider": null,
+    "gateway_version": null,
+    "provider_client": null,
     "base_url": null,
     "url_headers": null,
     "timeout": null,
@@ -28,7 +32,17 @@
     "max_output_tokens": null,
     "prompt_caching": null,
     "requests_per_second": null,
-    "max_bucket_size": null
+    "max_bucket_size": null,
+    "roles": {
+      "validator": {
+        "timeout": null,
+        "model": null
+      },
+      "complexity": {
+        "timeout": null,
+        "model": null
+      }
+    }
   },
   "_pipeline_comment": "Pipeline behaviour. 'structured_output' asks the model for a typed TranslationDocument (analysis / mapping / ordered notebook cells / risks) instead of free-form Markdown, so pipeline.notebook knows which cells are runnable code rather than guessing from fences. The turn persisted to memory and the item's 'response' stay Markdown either way, so conversation memory, resume, and validation are unaffected; a gateway that will not honour the schema degrades to the model's prose with a warning. Set false to prompt for plain Markdown. 'max_merged_tokens' bounds token-budgeted call packing: adjacent work items (independent singletons AND small dependency batches) share one LLM call while the estimated prompt cost stays under this many tokens, cutting per-call overhead. null derives a default (packing is ON by default: 0.8 x the input-token headroom when llm_client.max_input_tokens is set, else ~64000); set 0 to turn packing off (count-capped singleton merging only). Item ids change under packing (packed-NNN), so resume only matches runs made under the same budget.",
   "_pipeline_language_comment": "'output_language' is the target every stage of a run resolves against: it names the language in the system prompt, selects '[lang: ...]'-scoped user instructions, picks the notebook kernel and the fence tag translated code must carry, and tells the validation suite which language to check the emitted code parses as. Known targets are PySpark, Spark SQL, and Spark Scala; spelling is folded, so 'SparkSQL', 'spark sql', and 'spark_sql' are one target, as are 'sql' and 'Spark SQL'. An unknown name is an error, not a silent Python run. null uses the code default (SparkSQL); an explicit SasLLMPipeline(output_language=...) or demo_run --output-language wins over this file.",
@@ -78,20 +92,21 @@
     "table": null,
     "path": null
   },
-  "_vault_comment": "Non-secret Vault connection settings only. Secrets (VAULT_TOKEN, VAULT_ROLE_ID, VAULT_SECRET_ID) come from the environment, never this file. address/namespace/auth_path/oidc_role/azure_scopes also read from VAULT_ADDR/VAULT_NAMESPACE/VAULT_AUTH_PATH/VAULT_OIDC_ROLE/VAULT_AZURE_SCOPES, which win over these. Setting oidc_role enables 'azuread' login: an Entra ID JWT (see 'azure' and databricks.secret_scope) is presented to the jwt auth method at auth/<auth_path>/login. ai_gateway_key names the field holding the token in the appsvc/ai_gateway secret; null tries token/api_key/apikey/ai_gateway_token/value in order.",
+  "_vault_comment": "Non-secret Vault connection settings only. Secrets (VAULT_TOKEN, VAULT_ROLE_ID, VAULT_SECRET_ID) come from the environment, never this file. address/namespace/auth_path/app_name/azure_scopes also read from VAULT_ADDR/VAULT_NAMESPACE/VAULT_AUTH_PATH/VAULT_APP_NAME/VAULT_AZURE_SCOPES, which win over these. app_name is ONE value playing three parts, exactly as the reference deployment uses it: the Vault role name, the KV secret-path prefix, and the application's own name. Setting it enables 'azuread' login: an Entra ID JWT (see 'azure' and databricks.secret_scope) is presented to the jwt auth method at auth/<auth_path>/login. azure_scopes is the audience that JWT is minted for; null requests Azure Resource Manager (https://management.azure.com//.default -- the doubled slash is ARM's documented form), which is what a role bound to the ARM audience expects. ai_gateway_path defaults to '<app_name>/ai_gateway'; ai_gateway_key names the field holding the token in it, and null tries token/api_key/apikey/ai_gateway_token/value in order.",
   "vault": {
     "address": null,
     "namespace": null,
+    "app_name": null,
     "mount_point": null,
     "kv_version": null,
     "timeout": null,
     "verify": null,
     "auth_path": null,
-    "oidc_role": null,
     "azure_scopes": null,
+    "ai_gateway_path": null,
     "ai_gateway_key": null
   },
-  "_databricks_comment": "Non-secret Databricks workspace settings only. The token (DATABRICKS_TOKEN) and the service-principal secret (ARM_CLIENT_SECRET) come from the environment, never this file; on a cluster no credential is needed, and off-cluster an Entra ID service principal is preferred over a PAT. Every key here is also read from its standard env var, which wins over this file: DATABRICKS_* for the workspace ones, ARM_TENANT_ID/ARM_CLIENT_ID for the service principal (the names Databricks documents), DATABRICKS_AZURE_RESOURCE_ID for azure_workspace_resource_id, DATABRICKS_SECRET_SCOPE for secret_scope. Set azure_workspace_resource_id only when the service principal is NOT assigned to the workspace. secret_scope names a Databricks secret scope holding the service principal under sp-hsv-tenantid/sp-hsv-appid/sp-hsv-secret; reading it needs a credential of its own (a cluster runtime or a PAT).",
+  "_databricks_comment": "Non-secret Databricks workspace settings only. The token (DATABRICKS_TOKEN) and the service-principal secret (ARM_CLIENT_SECRET) come from the environment, never this file; on a cluster no credential is needed, and off-cluster an Entra ID service principal is preferred over a PAT. Every key here is also read from its standard env var, which wins over this file: DATABRICKS_* for the workspace ones, ARM_TENANT_ID/ARM_CLIENT_ID for the service principal (the names Databricks documents), DATABRICKS_AZURE_RESOURCE_ID for azure_workspace_resource_id, DATABRICKS_SECRET_SCOPE for secret_scope. Set azure_workspace_resource_id only when the service principal is NOT assigned to the workspace. secret_scope names a Databricks secret scope holding the service principal under sp-hsv-tenantid/sp-hsv-appid/sp-hsv-secret; reading it needs a credential of its own (a cluster runtime or a PAT). The SAME scope also holds the SharePoint principal, under different keys -- see sharepoint.tenant_id_key. dbfs_root_path and workspace_output_folder are schema only for now: nothing publishes to the workspace yet (generated notebooks are written to local disk), so setting workspace_output_folder does not make validation output land in /Workspace.",
   "databricks": {
     "host": null,
     "http_path": null,
@@ -103,9 +118,11 @@
     "azure_tenant_id": null,
     "azure_client_id": null,
     "azure_workspace_resource_id": null,
-    "secret_scope": null
+    "secret_scope": null,
+    "dbfs_root_path": null,
+    "workspace_output_folder": null
   },
-  "_azure_comment": "Non-secret Microsoft Entra ID (Azure AD) settings only. The client secret (AZURE_CLIENT_SECRET) comes from the environment, never this file. tenant_id/client_id/authority_host/scopes/certificate_* also read from AZURE_TENANT_ID/AZURE_CLIENT_ID/AZURE_AUTHORITY_HOST/AZURE_SCOPES/AZURE_CLIENT_CERTIFICATE_PATH/AZURE_CLIENT_CERTIFICATE_THUMBPRINT, which win over these. flow: 'client_credentials' (service principal) or 'device_code' (interactive user login); null infers it from the credentials present.",
+  "_azure_comment": "Non-secret Microsoft Entra ID (Azure AD) settings only. The client secret (AZURE_CLIENT_SECRET) comes from the environment, never this file. tenant_id/client_id/authority_host/scopes/certificate_* also read from AZURE_TENANT_ID/AZURE_CLIENT_ID/AZURE_AUTHORITY_HOST/AZURE_SCOPES/AZURE_CLIENT_CERTIFICATE_PATH/AZURE_CLIENT_CERTIFICATE_THUMBPRINT, which win over these. flow: 'client_credentials' (service principal) or 'device_code' (interactive user login); null infers it from the credentials present. 'verify' is TLS verification for the Entra ID call itself (true, false, or a path to a CA bundle) and matters on a TLS-intercepting network, where the token request fails before Vault is ever contacted; null inherits vault.verify, since one bundle normally covers both legs. 'proxies' is an optional {scheme: url} mapping handed straight to MSAL. Also read from AZURE_VERIFY.",
   "azure": {
     "tenant_id": null,
     "client_id": null,
@@ -114,24 +131,55 @@
     "flow": null,
     "timeout": null,
     "certificate_path": null,
-    "certificate_thumbprint": null
+    "certificate_thumbprint": null,
+    "verify": null,
+    "proxies": null
   },
-  "_sharepoint_comment": "Non-secret SharePoint (Microsoft Graph) settings only. There is no secret here: authentication is delegated to the 'azure' Entra ID service principal, which mints a Graph token. Identify the site with site_id, or site_hostname + site_path; drive_id targets a specific document library (default: the site's). Every key is also read from its SHAREPOINT_* env var, which wins over this file.",
+  "_sharepoint_comment": "Non-secret SharePoint (Microsoft Graph) settings only. There is no secret here. Identify the site with site_id, or site_hostname + site_path; drive_id targets a specific document library (default: the site's). Every key is also read from its SHAREPOINT_* env var, which wins over this file.",
+  "_sharepoint_auth_comment": "SharePoint authenticates as its OWN service principal, not the 'azure' one that reaches Vault: same Databricks secret scope, different keys. secret_scope defaults to databricks.secret_scope, and tenant_id_key/client_id_key/client_secret_key default to saact-hsv-tenantid/saact-hsv-appid/saact-hsv-secret. Leave all four null unless the deployment files that principal somewhere else. When no scope is configured at all, the 'azure' identity is used instead, which is the local/dev path.",
+  "_sharepoint_paths_comment": "file_server_base_path is the applications root, DRIVE-relative: a leading 'Shared Documents/' is stripped on load, because Graph addresses items inside the library and a literal folder of that name does not exist. The four list ids drive the run -- requests, conversions, the XREF table, and complexity requests. A flow that needs an id which is not set fails naming the key rather than sending null to Graph.",
   "sharepoint": {
     "site_hostname": null,
     "site_path": null,
     "site_id": null,
     "drive_id": null,
     "scopes": null,
-    "timeout": null
+    "timeout": null,
+    "file_server_base_path": null,
+    "secret_scope": null,
+    "tenant_id_key": null,
+    "client_id_key": null,
+    "client_secret_key": null,
+    "list_id_sas_requests": null,
+    "list_id_sas_conversions": null,
+    "list_id_xref": null,
+    "list_id_sas_complexity": null
   },
-  "_powerapps_comment": "Which SharePoint list the Power Apps conversion requests live in, and the *internal* names of its columns (which often differ from the display names). Used by 'demo_run.py sharepoint'. list_name is required at run time. Column names default to RequestId/ApplicationName/LiveValidation/Model/Timestamp when null. Every key is also read from its POWERAPPS_* env var (POWERAPPS_LIST_NAME, POWERAPPS_<NAME>_FIELD), which wins over this file.",
-  "powerapps": {
-    "list_name": null,
-    "request_id_field": null,
-    "application_name_field": null,
-    "live_validation_field": null,
-    "model_field": null,
-    "timestamp_field": null
+  "_xref_comment": "Dataset-name cross-reference: the SharePoint XREF list maps 'schema.table' to 'catalog.schema.table'. 'apply' picks when the substitution happens -- 'pre' (default) rewrites SAS dataset names in the chunk metadata and source before conversion, which is where the parser already knows what a dataset reference is; 'post' rewrites the GENERATED code by parsing it (sqlglot for Spark SQL, the ast module for PySpark); 'both' does the two and reports names only one of them reached, which is how you find out whether 'pre' is missing anything. 'dialect' is the sqlglot dialect for the post rewriter. 'on_parse_failure' governs unparseable generated code: 'warn' (default) leaves the output exactly as the model wrote it, 'error' raises -- a rewriter that corrupts generated code is worse than one that no-ops. The post mode needs the 'sql' extra installed.",
+  "xref": {
+    "apply": null,
+    "dialect": null,
+    "on_parse_failure": null
+  },
+  "_adls_comment": "Azure Data Lake Storage coordinates. Schema only: nothing in this repo reads them yet, and no ADLS client exists. Declared here so adopting one later is not a second breaking config change.",
+  "adls": {
+    "storage_account": null,
+    "container": null,
+    "workspace_host": null,
+    "root_path": null,
+    "applications_path": null,
+    "main_path": null,
+    "archive_path": null,
+    "external_table_path": null
+  },
+  "_sftp_comment": "SFTP source coordinates, including a file-based XREF alternative to the SharePoint list. Schema only: no SFTP client exists here yet.",
+  "sftp": {
+    "source_path": null,
+    "cred_path": null,
+    "xref_file_path": null
+  },
+  "_sas_comment": "SAS source handling. 'inlining' asks for %include targets to be inlined into the file that includes them before chunking. Schema only: the key is read, but no inlining behaviour is implemented yet.",
+  "sas": {
+    "inlining": null
   }
 }

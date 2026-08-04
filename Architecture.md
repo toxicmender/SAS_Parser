@@ -100,11 +100,6 @@ chunker/
                         MultiFileBatcher.
   _repl.py              print_iterable REPL helper (also used by demo_run.py
                         to render per-item summary lines into its logs).
-  pipeline.py           Deprecated shims re-exporting from the top-level
-  pipeline_constants.py `pipeline` package (below), where these modules now
-  response_models.py    live. Emit a DeprecationWarning on import; removed in
-  notebook.py           a future release.
-
 pipeline/
   setup.py              MemorySetup: grouped memory wiring for the pipeline
                         constructor (store hub, task policy, thread memory,
@@ -256,7 +251,53 @@ app_config/
                         via client_credentials (secret or certificate) or
                         device_code, with per-scope expiry-aware caching.
                         Client secret from AZURE_CLIENT_SECRET only; msal
-                        imported lazily (extra: azure).
+                        imported lazily (extra: azure). `verify` / `proxies`
+                        reach MSAL's own session, which is what makes the
+                        login work on a TLS-intercepting network.
+  sharepoint.py         Microsoft Graph transport: folders, files, and list
+                        items, addressed drive-relative (SharePointConfig
+                        .drive_path owns the joining, and strips the
+                        "Shared Documents/" prefix a SharePoint URL shows).
+                        Authenticates as SharePoint's OWN service principal
+                        from the Databricks secret scope (saact-hsv-*), or the
+                        shared azure.py identity when no scope is configured.
+                        Domain-free: what a folder or a column MEANS belongs
+                        to conversion/, xref/, and complexity/sharepoint.py.
+                        msgraph-sdk imported lazily (extra: sharepoint).
+
+conversion/
+  paths.py              The folder conventions one application's scripts live
+                        under: scripts_original, scripts_converted,
+                        scripts_converted/validation, and the run's own
+                        {model}/{timestamp} upload target.
+  requests.py           The requests and conversions lists: the SharePoint
+                        INTERNAL column names (transcribed, encoded characters
+                        and trailing spaces included), row projection, and the
+                        one write this repo makes to a list --
+                        update_request_status.
+  sources.py            Discovering and loading an application's SAS sources
+                        (.sas + .txt). No temporary files: the text goes
+                        straight to chunk_text with the library path as its
+                        source_id.
+  upload.py             Writing converted scripts and validation artefacts
+                        back, delegating notebook rendering to
+                        pipeline/notebook.py rather than reimplementing it.
+
+xref/
+  sourcing.py           XREF rows for one application, classified into exact /
+                        by_libref / by_path. Title carries an optional type
+                        marker; unmarked rows are table mappings, so existing
+                        rows need no backfill. by_path is populated but not
+                        yet consumed.
+  apply.py              WHEN the substitution happens: "pre" (default, over
+                        the SAS-side metadata via chunker.batcher
+                        .replace_dataset_names), "post" (over generated code),
+                        or "both" (each, reporting what only post reached).
+  rewrite.py            The post-conversion rewriter: sqlglot for Spark SQL,
+                        the ast module + source-span substitution for PySpark
+                        (so comments and formatting survive). Unparseable
+                        input is returned BYTE-IDENTICAL -- a rewriter that
+                        corrupts generated code is worse than one that no-ops.
 
 target_language/
   __init__.py           The run's target output language as one resolved
@@ -302,25 +343,44 @@ validation/
                         in the wheel.
 
 complexity/
-  models.py             Pydantic models: ComplexityTier (LOW/MEDIUM/HIGH),
-                        TranslationParity (DIRECT..MANUAL), and TShirtSize
-                        (SMALL..EXTRA_LARGE, carrying Fibonacci points and the
-                        needs_breakdown flag) — ordered scales with max_tier()
-                        / worst_parity() / max_size() helpers —
-                        ComplexitySignal (evidence vs catalogue note),
-                        ChunkComplexity, BatchComplexity, FileComplexity (the
-                        sized unit, reporting effort/complexity/uncertainty
-                        separately), CrossFileProfile,
-                        CorpusComplexityReport (computed tier_counts /
-                        overall_tier / overall_difficulty / overall_size /
-                        total_points; to_markdown()).
+  tiers.py              The verdict vocabulary: ComplexityTier (LOW/MEDIUM/
+                        HIGH), TranslationParity (DIRECT..MANUAL), and
+                        TShirtSize (SMALL..EXTRA_LARGE, carrying Fibonacci
+                        points and the needs_breakdown flag) — ordered scales
+                        with max_tier() / worst_parity() / max_size().
+  models.py             The scored units: ComplexitySignal (evidence vs
+                        catalogue note), ChunkComplexity, BatchComplexity,
+                        FileComplexity (the sized unit, reporting
+                        effort/complexity/uncertainty separately),
+                        CrossFileProfile, CorpusComplexityReport (computed
+                        tier_counts / overall_tier / overall_difficulty /
+                        overall_size / total_points; to_markdown()).
                         Every result records the target it was scored against.
-  rules.py              RuleSet + SizeModel + the JSON profile loader:
-                        resolution (explicit path > target > config >
-                        default), "extends" inheritance with per-construct
-                        deep merge, construct_groups shorthand, schema
-                        validation (RuleSetError names the offending key), and
-                        caching. Holds no ratings of its own.
+                        Re-exports tiers.py and dependencies.py, so this stays
+                        the one import site.
+  dependencies.py       DependencyEdge + DependencyGraph: which file must be
+                        migrated before which. The only models here describing
+                        relationships BETWEEN files rather than scoring one.
+  rules.py              RuleSet + the JSON profile loader: resolution
+                        (explicit path > target > config > default), "extends"
+                        inheritance with per-construct deep merge,
+                        construct_groups shorthand, schema validation
+                        (RuleSetError names the offending key), and caching.
+                        Holds no ratings of its own.
+  sizing.py             SizeModel and its calibration constants: how counted
+                        work becomes a T-shirt size and a story-point number.
+                        The other half of what a profile declares — the
+                        catalogue says what a construct means, this says how
+                        the counting scales.
+  scoring.py            The measurement behind the analyzer's rules: counting
+                        contained steps, deduping datasets, spanning lines,
+                        turning a rule match into a ComplexitySignal, merging
+                        signals, and writing a verdict's rationale.
+  sharepoint.py         The complexity request list (Application /
+                        Output_Language / Preferred_LLM) and where a run's
+                        reports go. READ-ONLY: no status write-back, no
+                        pending concept, timestamped folders for idempotence,
+                        and a run-summary.md standing in for a Status column.
   crossfile.py          CrossFileIndex: resolves each chunk's macro, dataset,
                         macro-variable, and libref references against the rest
                         of the corpus into internal / import / export /

@@ -12,7 +12,8 @@ Split of concerns
   scopes, flow, and request timeout — resolve through
   :meth:`AzureAuthConfig.from_env`, which reads the standard Azure environment
   variables first (``AZURE_TENANT_ID``, ``AZURE_CLIENT_ID``,
-  ``AZURE_AUTHORITY_HOST``, ``AZURE_CLIENT_CERTIFICATE_PATH``) and falls back
+  ``AZURE_AUTHORITY_HOST``, ``AZURE_CLIENT_CERTIFICATE_PATH``,
+  ``AZURE_VERIFY``) and falls back
   to the optional ``azure`` section of ``config.json`` (via
   :func:`app_config.get_value` / :func:`app_config.get_typed_value`, so a
   wrong-typed entry degrades to the hard default with a WARNING rather than
@@ -70,10 +71,10 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import get_typed_value, get_value
+from . import _verify_setting, get_typed_value, get_value
 
 if TYPE_CHECKING:  # real types without a module-scope import cycle
-    from .databricks import AzureServicePrincipal
+    from .databricks import AzureServicePrincipal, SecretKeySet
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,47 @@ def _resolve_scopes() -> tuple[str, ...]:
         )
         return ()
     return tuple(configured)
+
+
+def _resolve_verify() -> bool | str:
+    """
+    TLS verification for the Entra ID call itself, resolved as ``AZURE_VERIFY``
+    > ``config.json`` ``azure.verify`` > whatever Vault resolved
+    (:func:`app_config.vault._resolve_verify`).
+
+    The inheritance is the point: on a TLS-intercepting network one corporate
+    CA bundle covers both legs of the credential chain, and the reference
+    deployment configures a single ``verify`` for exactly that reason. Without
+    it the Entra token request fails before Vault is ever contacted.
+    """
+    configured = _verify_setting(
+        os.environ.get("AZURE_VERIFY") or get_value("azure", "verify")
+    )
+    if configured is not None:
+        return configured
+    # Lazily, and only when azure has nothing of its own: vault imports this
+    # module for the JWT, so a module-scope import would cycle.
+    from .vault import _resolve_verify as _vault_verify
+
+    return _vault_verify()
+
+
+def _resolve_proxies() -> dict[str, str] | None:
+    """
+    The ``{scheme: url}`` proxy mapping handed to MSAL, from
+    ``azure.proxies``. A wrong-typed or non-string-valued entry degrades to
+    ``None`` with a WARNING, the same rule as elsewhere in the package.
+    """
+    configured = get_typed_value("azure", "proxies", dict)
+    if configured is None:
+        return None
+    if not all(isinstance(v, str) for v in configured.values()):
+        logger.warning(
+            "azure: config.json azure.proxies must map schemes to URL strings; "
+            "ignoring it (no proxies apply)"
+        )
+        return None
+    return dict(configured)
 
 
 def _resolve_flow() -> str | None:
@@ -184,6 +226,16 @@ class AzureAuthConfig:
         the app registration. ``AZURE_CLIENT_CERTIFICATE_THUMBPRINT`` /
         ``azure.certificate_thumbprint``. Required alongside
         :attr:`certificate_path`.
+    verify : bool | str
+        TLS verification for the login call: ``True`` (system CAs), ``False``
+        (disable — dev only), or a path to a CA bundle, forwarded to MSAL.
+        ``AZURE_VERIFY`` / ``azure.verify``, defaulting to whatever Vault
+        resolved — see :func:`_resolve_verify`. This knob exists because the
+        network in front of Entra ID may be TLS-intercepted, in which case the
+        token request fails before Vault is ever reached.
+    proxies : dict[str, str] | None
+        Optional ``{scheme: url}`` proxy mapping, forwarded to MSAL.
+        ``azure.proxies``.
     """
 
     tenant_id: str | None = None
@@ -195,6 +247,8 @@ class AzureAuthConfig:
     client_secret: str | None = field(default=None, repr=False)
     certificate_path: str | None = None
     certificate_thumbprint: str | None = None
+    verify: bool | str = True
+    proxies: dict[str, str] | None = None
 
     @classmethod
     def from_env(cls) -> "AzureAuthConfig":
@@ -226,6 +280,8 @@ class AzureAuthConfig:
                 os.environ.get("AZURE_CLIENT_CERTIFICATE_THUMBPRINT")
                 or get_value("azure", "certificate_thumbprint")
             ),
+            verify=_resolve_verify(),
+            proxies=_resolve_proxies(),
         )
 
     @classmethod
@@ -237,11 +293,13 @@ class AzureAuthConfig:
         principal.
 
         The environment still supplies the authority host (so sovereign clouds
-        keep working), the default scopes, and the timeout; only the identity
-        is pinned. The certificate fields are cleared so *client_secret* is
-        unambiguously the credential, and the flow is pinned to
-        ``client_credentials`` — a service principal never logs in
-        interactively.
+        keep working), the default scopes, the timeout, and the transport
+        settings :attr:`verify` / :attr:`proxies` — the Databricks-service-
+        principal path goes through here, and it faces the same intercepted
+        network as any other. Only the identity is pinned. The certificate
+        fields are cleared so *client_secret* is unambiguously the credential,
+        and the flow is pinned to ``client_credentials`` — a service principal
+        never logs in interactively.
         """
         return replace(
             cls.from_env(),
@@ -368,18 +426,32 @@ class AzureAuthClient:
                 "msal is required for Entra ID authentication; install it "
                 "with 'pip install \"sas-parser[azure]\"'"
             ) from exc
+        # verify and proxies reach MSAL's own requests session: on a
+        # TLS-intercepting network the login fails here, before any downstream
+        # service (Vault, Graph) is contacted, unless the corporate CA bundle
+        # is passed in.
         if flow == FLOW_CLIENT_CREDENTIALS:
             app = msal.ConfidentialClientApplication(
                 client_id=config.client_id,
                 authority=config.authority,
                 client_credential=_client_credential(config),
                 timeout=config.timeout,
+                # msal's stubs type verify as bool, but it reaches requests,
+                # which also takes a CA-bundle path — which is the whole point
+                # of the knob on an intercepted network.
+                verify=config.verify,  # pyright: ignore[reportArgumentType]
+                proxies=config.proxies,
             )
         else:
             app = msal.PublicClientApplication(
                 client_id=config.client_id,
                 authority=config.authority,
                 timeout=config.timeout,
+                # msal's stubs type verify as bool, but it reaches requests,
+                # which also takes a CA-bundle path — which is the whole point
+                # of the knob on an intercepted network.
+                verify=config.verify,  # pyright: ignore[reportArgumentType]
+                proxies=config.proxies,
             )
         credential = (
             "certificate"
@@ -390,7 +462,9 @@ class AzureAuthClient:
         )
         logger.info(
             f"AzureAuthClient: built {flow} app for client "
-            f"{config.client_id} on {config.authority} (credential={credential})"
+            f"{config.client_id} on {config.authority} "
+            f"(credential={credential}, verify={config.verify}, "
+            f"proxies={sorted(config.proxies) if config.proxies else None})"
         )
         return app
 
@@ -506,15 +580,18 @@ def get_client_for_principal(
 
 def databricks_service_principal(
     secret_scope: str | None = None,
+    keys: "SecretKeySet | None" = None,
 ) -> "AzureServicePrincipal":
     """
-    The Entra ID service principal stored in a Databricks secret scope, as an
+    An Entra ID service principal stored in a Databricks secret scope, as an
     :class:`~app_config.databricks.AzureServicePrincipal`.
 
     Delegates to :meth:`app_config.databricks.DatabricksConfig.service_principal`
     — that module owns the scope read (and the workspace credential it needs);
     this one owns what to do with the result. *secret_scope* overrides the
-    configured ``DATABRICKS_SECRET_SCOPE`` for this lookup.
+    configured ``DATABRICKS_SECRET_SCOPE`` for this lookup, and *keys* names
+    which principal in it (one scope holds several — SharePoint's is filed
+    under different keys than the workspace's).
 
     Raises
     ------
@@ -530,20 +607,27 @@ def databricks_service_principal(
     if secret_scope is not None and secret_scope != config.secret_scope:
         config = replace(config, secret_scope=secret_scope)
     try:
-        return config.service_principal()
+        return config.service_principal(keys)
     except databricks.DatabricksError as exc:
         raise AzureAuthError(
             f"could not read the Entra ID service principal from Databricks: {exc}"
         ) from exc
 
 
-def get_databricks_client(secret_scope: str | None = None) -> AzureAuthClient:
+def get_databricks_client(
+    secret_scope: str | None = None, keys: "SecretKeySet | None" = None
+) -> AzureAuthClient:
     """
-    An :class:`AzureAuthClient` for the service principal in the Databricks
+    An :class:`AzureAuthClient` for a service principal in the Databricks
     secret scope — the msal login whose JWT authenticates onward services
-    (Vault's ``jwt`` auth method, in this package).
+    (Vault's ``jwt`` auth method and Microsoft Graph, in this package).
+
+    *keys* selects which principal in the scope; the default set is the
+    workspace/Vault one. Because :func:`get_client_for_principal` caches on
+    ``(tenant_id, client_id)``, two distinct principals coexist without
+    interfering.
     """
-    principal = databricks_service_principal(secret_scope)
+    principal = databricks_service_principal(secret_scope, keys)
     return get_client_for_principal(
         principal.tenant_id, principal.client_id, principal.client_secret
     )

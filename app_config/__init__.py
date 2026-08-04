@@ -14,7 +14,9 @@ Two access levels: :func:`get_value` returns raw JSON values, while
 :func:`get_typed_value` also checks the JSON type and degrades a wrong-typed
 entry to the default with a WARNING. The ``llm_client`` section is parsed
 through a schema (:func:`llm_client_value`) so every LLM knob read from the
-file is type-checked in one place.
+file is type-checked in one place; :func:`role_value` layers a named role's
+sparse overrides (``llm_client.roles.<role>``) on top of it, which is how the
+validator and complexity runs get their own timeouts and models.
 
 The file is searched in order: the ``SAS_PARSER_CONFIG`` environment variable
 (explicit path), ``config.json`` in the current working directory, then
@@ -80,6 +82,38 @@ def load_config() -> dict[str, Any]:
     return _cache
 
 
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_FALSEY = frozenset({"0", "false", "no", "off"})
+
+
+def _verify_setting(value: Any) -> bool | str | None:
+    """
+    A TLS-verification setting in the shape ``requests``, ``hvac`` and ``msal``
+    all take: ``True`` (verify against the system CAs), ``False`` (verification
+    off — dev only), or a path to a CA bundle. ``None`` when *value* is unset.
+
+    Booleans pass through. A string naming a truth value (``true``/``1``/
+    ``yes``/``on``, or their negatives) becomes that boolean, since an
+    environment variable can only carry text; any other non-empty string is a
+    bundle path. Shared by :mod:`app_config.vault` and :mod:`app_config.azure`,
+    which must agree on what ``verify`` means — the reference deployment uses
+    one setting for both legs of the credential chain.
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    low = text.lower()
+    if low in _TRUTHY:
+        return True
+    if low in _FALSEY:
+        return False
+    return text
+
+
 def get_value(section: str, key: str, default: Any = None) -> Any:
     """
     ``config[section][key]``, or *default* when the file, section, or key is
@@ -99,6 +133,33 @@ def resolve(explicit: Any, section: str, key: str, default: Any) -> Any:
     return get_value(section, key, default)
 
 
+def _typed(
+    value: Any,
+    expected: type | tuple[type, ...],
+    label: str,
+    default: Any,
+) -> Any:
+    """
+    *value* when it matches *expected*, else *default* with a WARNING naming
+    *label* (the ``section.key`` path the value came from).
+
+    ``bool`` is rejected where ``int``/``float`` is expected unless ``bool``
+    itself is listed (JSON ``true`` is not a number).
+    """
+    types = expected if isinstance(expected, tuple) else (expected,)
+    ok = isinstance(value, types) and not (
+        isinstance(value, bool) and bool not in types
+    )
+    if ok:
+        return value
+    expected_names = "/".join(t.__name__ for t in types)
+    logger.warning(
+        f"config.json {label} is {type(value).__name__} ({value!r}), expected "
+        f"{expected_names}; ignoring it (default {default!r} applies)"
+    )
+    return default
+
+
 def get_typed_value(
     section: str,
     key: str,
@@ -116,19 +177,7 @@ def get_typed_value(
     value = get_value(section, key, _MISSING)
     if value is _MISSING:
         return default
-    types = expected if isinstance(expected, tuple) else (expected,)
-    ok = isinstance(value, types) and not (
-        isinstance(value, bool) and bool not in types
-    )
-    if not ok:
-        expected_names = "/".join(t.__name__ for t in types)
-        logger.warning(
-            f"get_typed_value: config.json {section}.{key} is "
-            f"{type(value).__name__} ({value!r}), expected {expected_names}; "
-            f"ignoring it (default {default!r} applies)"
-        )
-        return default
-    return value
+    return _typed(value, expected, f"{section}.{key}", default)
 
 
 # Chat-model identifiers this deployment can actually reach. An
@@ -164,6 +213,9 @@ def is_accessible_model(model: str) -> bool:
 # secrets are not read from config.json.
 _LLM_CLIENT_TYPES: dict[str, type | tuple[type, ...]] = {
     "model": str,
+    "model_provider": str,
+    "gateway_version": str,
+    "provider_client": str,
     "base_url": str,
     "url_headers": dict,
     "timeout": (int, float),
@@ -176,7 +228,68 @@ _LLM_CLIENT_TYPES: dict[str, type | tuple[type, ...]] = {
     "prompt_caching": bool,
     "requests_per_second": (int, float),
     "max_bucket_size": int,
+    "roles": dict,
 }
+
+# How the chat model is constructed. "openai_compatible" builds the
+# LangChain ChatOpenAI the whole client is written around; "native" wraps a
+# raw provider SDK client for a gateway that will not take the LangChain
+# payload. See llm_client.client for what the native path gives up.
+PROVIDER_CLIENT_OPENAI_COMPATIBLE = "openai_compatible"
+PROVIDER_CLIENT_NATIVE = "native"
+PROVIDER_CLIENTS: tuple[str, ...] = (
+    PROVIDER_CLIENT_OPENAI_COMPATIBLE,
+    PROVIDER_CLIENT_NATIVE,
+)
+
+# llm_client keys that describe the *section* rather than one model, so a
+# per-role overlay may not carry them.
+_ROLE_EXCLUDED_KEYS = frozenset({"roles"})
+
+
+def _validate_llm_value(key: str, value: Any, default: Any, label: str) -> Any:
+    """
+    The value-level (not type-level) rules for an ``llm_client`` entry:
+    ``model`` must be accessible, ``provider_client`` must name a known
+    strategy, and ``url_headers`` must map to strings. A violation is
+    ignored with a WARNING and *default* applies, the same degrade-don't-crash
+    rule as a wrong-typed entry. *label* names the config path in the message.
+    """
+    if (
+        key == "model"
+        and isinstance(value, str)
+        and value != default
+        and not is_accessible_model(value)
+    ):
+        logger.warning(
+            f"llm_client_value: config.json {label} {value!r} is not an "
+            f"accessible model (accessible: {', '.join(ACCESSIBLE_MODELS)}); "
+            f"ignoring it (default {default!r} applies)"
+        )
+        return default
+    if (
+        key == "provider_client"
+        and isinstance(value, str)
+        and value != default
+        and value not in PROVIDER_CLIENTS
+    ):
+        logger.warning(
+            f"llm_client_value: config.json {label} {value!r} is not one of "
+            f"{'/'.join(PROVIDER_CLIENTS)}; ignoring it "
+            f"(default {default!r} applies)"
+        )
+        return default
+    if (
+        key == "url_headers"
+        and isinstance(value, dict)
+        and not all(isinstance(v, str) for v in value.values())
+    ):
+        logger.warning(
+            f"llm_client_value: config.json {label} must map header names to "
+            f"string values; ignoring it (default {default!r} applies)"
+        )
+        return default
+    return value
 
 
 def llm_client_value(key: str, default: Any = None) -> Any:
@@ -187,36 +300,64 @@ def llm_client_value(key: str, default: Any = None) -> Any:
     an unknown key raises ``KeyError`` — that is a programming error, not a
     config error. Wrong-typed file values are ignored with a WARNING and
     *default* applies. ``url_headers`` must additionally map to string
-    values (JSON object keys are always strings) or the whole mapping is
-    ignored, and ``model`` must name one of :data:`ACCESSIBLE_MODELS` or the
-    entry is likewise ignored.
+    values (JSON object keys are always strings), ``model`` must name one of
+    :data:`ACCESSIBLE_MODELS`, and ``provider_client`` one of
+    :data:`PROVIDER_CLIENTS`, or the entry is likewise ignored.
     """
     expected = _LLM_CLIENT_TYPES[key]
     value = get_typed_value("llm_client", key, expected, default)
-    if (
-        key == "model"
-        and isinstance(value, str)
-        and value != default
-        and not is_accessible_model(value)
-    ):
+    return _validate_llm_value(key, value, default, f"llm_client.{key}")
+
+
+def role_value(role: str | None, key: str, default: Any = None) -> Any:
+    """
+    An ``llm_client`` value with a per-role overlay applied:
+
+        ``llm_client.roles.<role>.<key>``  >  ``llm_client.<key>``  >  *default*
+
+    The reference deployment configures one gateway per *role* — its
+    ``ai_gateway_details`` (timeout 6000) and ``ai_validator_config``
+    (timeout 12000) are siblings differing in a couple of keys — so a role is
+    a **sparse overlay** on the base section, not a section of its own: a key
+    the role does not mention resolves exactly as it would without one.
+
+    *role* may be ``None`` (no overlay), and an unknown role name, a
+    wrong-typed ``roles`` entry, or a wrong-typed/invalid overlay value all
+    fall through to the base section with a WARNING where one is warranted.
+    ``roles`` itself cannot be overlaid.
+
+    Parameters
+    ----------
+    role : str | None
+        Role name, e.g. ``"validator"`` or ``"complexity"``.
+    key : str
+        An ``llm_client`` schema key (:data:`_LLM_CLIENT_TYPES`).
+    default : Any
+        Applied when neither the overlay nor the base section has a usable
+        value.
+    """
+    base = llm_client_value(key, default)
+    if not role or key in _ROLE_EXCLUDED_KEYS:
+        return base
+    roles = llm_client_value("roles")
+    if not isinstance(roles, dict):
+        return base
+    overlay = roles.get(role)
+    if overlay is None:
+        return base
+    if not isinstance(overlay, dict):
         logger.warning(
-            f"llm_client_value: config.json llm_client.model {value!r} is not "
-            f"an accessible model (accessible: {', '.join(ACCESSIBLE_MODELS)}); "
-            f"ignoring it (default {default!r} applies)"
+            f"role_value: config.json llm_client.roles.{role} is "
+            f"{type(overlay).__name__}, expected object; ignoring it (the "
+            f"llm_client section applies)"
         )
-        return default
-    if (
-        key == "url_headers"
-        and isinstance(value, dict)
-        and not all(isinstance(v, str) for v in value.values())
-    ):
-        logger.warning(
-            f"llm_client_value: config.json llm_client.url_headers must map "
-            f"header names to string values; ignoring it "
-            f"(default {default!r} applies)"
-        )
-        return default
-    return value
+        return base
+    value = overlay.get(key, _MISSING)
+    if value is _MISSING or value is None:
+        return base
+    label = f"llm_client.roles.{role}.{key}"
+    value = _typed(value, _LLM_CLIENT_TYPES[key], label, base)
+    return _validate_llm_value(key, value, base, label)
 
 
 def clear_cache() -> None:

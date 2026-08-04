@@ -139,8 +139,8 @@ class SasLLMPipeline:
         becomes the pipeline's model). Passing it together with any of the
         individual transport kwargs (``model``, ``temperature``,
         ``max_input_tokens``, ``requests_per_second``, ``max_retries``,
-        ``base_url``, ``api_key``, ``url_headers``, ``timeout``,
-        ``model_kwargs``, ``llm_kwargs``) raises ``ValueError`` — grouped
+        ``base_url``, ``api_key``, ``url_headers``, ``gateway_version``,
+        ``timeout``, ``model_kwargs``, ``llm_kwargs``) raises ``ValueError`` — grouped
         and legacy spellings of the same concern do not mix. ``None``
         (default) builds one from those kwargs exactly as before.
     memory_setup : MemorySetup | None
@@ -180,6 +180,12 @@ class SasLLMPipeline:
         Extra HTTP headers sent with every LLM request (forwarded as
         ``default_headers`` — gateway auth, tracing, ...). ``None``
         (default) defers to config.json ``llm_client.url_headers``.
+        Ignored when ``llm`` is injected.
+    gateway_version : str | None
+        The AI Gateway's protocol version, sent as the
+        ``ai-gateway-version`` header on every LLM request. ``None``
+        (default) defers to ``LLM_GATEWAY_VERSION`` / config.json
+        ``llm_client.gateway_version`` / the Vault gateway secret.
         Ignored when ``llm`` is injected.
     timeout : float | None
         Per-request LLM timeout in seconds. ``None`` (default) defers to
@@ -352,8 +358,9 @@ class SasLLMPipeline:
         injecting a fake or pre-configured client (e.g. in tests).  The
         retry and input-token-budget layers still wrap an injected model;
         the construction-time knobs (``temperature``, ``base_url``,
-        ``api_key``, ``url_headers``, ``timeout``, ``model_kwargs``,
-        ``llm_kwargs``, ``requests_per_second``) do not apply to it.
+        ``api_key``, ``url_headers``, ``gateway_version``, ``timeout``,
+        ``model_kwargs``, ``llm_kwargs``, ``requests_per_second``) do not
+        apply to it.
     prompt_builder : PromptBuilder | None
         Reference-PDF guidance source. When set, each item's prompt gains a
         block of instruction chunks relevant to that item's constructs
@@ -411,6 +418,7 @@ class SasLLMPipeline:
         base_url: str | None = None,
         api_key: str | None = None,
         url_headers: dict[str, str] | None = None,
+        gateway_version: str | None = None,
         timeout: float | None = None,
         model_kwargs: dict[str, Any] | None = None,
         llm_kwargs: dict[str, Any] | None = None,
@@ -462,6 +470,7 @@ class SasLLMPipeline:
                 "base_url": base_url,
                 "api_key": api_key,
                 "url_headers": url_headers,
+                "gateway_version": gateway_version,
                 "timeout": timeout,
                 "model_kwargs": model_kwargs,
                 "llm_kwargs": llm_kwargs,
@@ -666,6 +675,7 @@ class SasLLMPipeline:
                 ("base_url", base_url),
                 ("api_key", api_key),
                 ("url_headers", url_headers),
+                ("gateway_version", gateway_version),
                 ("timeout", timeout),
                 ("model_kwargs", model_kwargs),
                 ("kwargs", llm_kwargs),
@@ -1421,9 +1431,13 @@ class SasLLMPipeline:
                 self._extract_memories(thread_id, user_msg, str(ai_text))
                 return ai_text, document, result, attempt
 
+            # Reached only when `passed` is False, which needs a validator to
+            # have produced a verdict — so `result` is set here. Spelled out
+            # rather than asserted because the guard is two branches away.
+            score = f"{result.score:.3f}" if result is not None else "n/a"
             logger.info(
                 f"_answer_item: item={item_id} failed validation "
-                f"(score={result.score:.3f}) on attempt {attempt}/{max_attempts}; "
+                f"(score={score}) on attempt {attempt}/{max_attempts}; "
                 f"rolling back and retrying  thread={thread_id}"
             )
             # Drop this attempt's turn pair so the retry replaces it in place.

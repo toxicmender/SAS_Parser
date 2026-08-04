@@ -3,10 +3,19 @@ llm_client/README.md.
 
 Every model is reached through the AI Gateway's OpenAI-compatible
 ``/chat/completions`` API — including the Anthropic- and Google-served ones,
-which the gateway exposes under the same protocol. So there is exactly one
-chat-model class here (``langchain_openai.ChatOpenAI``, a thin LangChain
-wrapper over the ``openai`` SDK) rather than a provider lookup: the model name
-selects the model, not the transport.
+which the gateway exposes under the same protocol. So the default transport is
+one chat-model class (``langchain_openai.ChatOpenAI``, a thin LangChain wrapper
+over the ``openai`` SDK) rather than a provider lookup: the model name selects
+the model, not the transport. A provider prefix on the model id
+(``"anthropic: claude-sonnet-4-5"``) is recorded, not routed on.
+
+``LLMClientConfig.provider_client="native"`` is the escape hatch for a gateway
+that will not accept the payload LangChain builds: it swaps in a raw
+``openai.OpenAI`` call and forfeits everything that attaches at construction
+time (rate limiter, ``model_kwargs``, structured output). It is not the
+default, because the surrounding machinery — retry with ``Retry-After``, the
+token budget, prompt-cache breakpoints, usage accounting — is worth more than
+the payload difference until a gateway proves otherwise.
 
 Logger name: ``llm_client.client``.
 """
@@ -25,7 +34,12 @@ from typing import Any, Callable
 
 import app_config
 from langchain_core.language_models import LanguageModelInput
-from langchain_core.messages import BaseMessage, HumanMessage, convert_to_messages
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    convert_to_messages,
+)
 from langchain_core.prompt_values import PromptValue
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
@@ -49,6 +63,28 @@ class InputTokenLimitError(ValueError):
         )
 
 
+# The llm_client keys a role overlay may carry — every schema key that names
+# a field on LLMClientConfig. "roles" is structural and "prompt_caching"
+# belongs to the pipeline, not to this config.
+_ROLE_OVERLAY_KEYS: tuple[str, ...] = (
+    "model",
+    "model_provider",
+    "gateway_version",
+    "provider_client",
+    "base_url",
+    "url_headers",
+    "timeout",
+    "cert_file",
+    "temperature",
+    "max_retries",
+    "model_kwargs",
+    "max_input_tokens",
+    "max_output_tokens",
+    "requests_per_second",
+    "max_bucket_size",
+)
+
+
 class LLMClientConfig(BaseModel):
     """
     Declarative knobs for :class:`LLMClient`.
@@ -68,10 +104,44 @@ class LLMClientConfig(BaseModel):
         Model id as the gateway names it, e.g. ``"gpt-5.4"`` (the default),
         ``"claude-sonnet-4-5"`` or ``"gemini-3.1-pro"`` — it is sent verbatim in the
         request body, so an Anthropic- or Google-served model is named
-        exactly like an OpenAI one. A leftover LangChain provider prefix
-        (``"anthropic:claude-opus-4-6"``) is stripped, since routing is the
-        gateway's job now. Also accepted under the alias ``model_name``.
+        exactly like an OpenAI one. A ``"provider: model"`` prefix
+        (``"anthropic: claude-opus-4-6"``) is split off into
+        :attr:`model_provider` and the remainder lowercased, matching how
+        the reference gateway's own client parses the value it reads from
+        SharePoint. Also accepted under the alias ``model_name``.
         Config key: ``llm_client.model``.
+    model_provider : str | None
+        The family the gateway routes to (``"anthropic"``, ``"openai"``,
+        ...). Filled in from a ``"provider: model"`` prefix on
+        :attr:`model` when unset. Informational for the default transport —
+        the gateway routes on the model id — and the reason a deployment
+        might pin :attr:`provider_client`. Config key:
+        ``llm_client.model_provider``.
+    gateway_version : str | None
+        The gateway's protocol version, sent as the ``ai-gateway-version``
+        request header on every call (the reference sends ``"v2"``). An
+        ``ai-gateway-version`` supplied through :attr:`url_headers` wins.
+        ``None`` (default) sends no such header. ``LLM_GATEWAY_VERSION`` /
+        config key ``llm_client.gateway_version``;
+        :meth:`from_ai_gateway` also picks it up from the Vault secret.
+    provider_client : str | None
+        How the chat model is built:
+
+        ``"openai_compatible"``
+            The default — ``langchain_openai.ChatOpenAI``, which is what
+            this whole class is written around.
+        ``"native"``
+            A raw ``openai.OpenAI`` client wrapped to the minimal surface
+            :class:`LLMClient` invokes, for a gateway that will not accept
+            the LangChain payload. **Everything that attaches at
+            construction time is forfeited**: the rate limiter
+            (:attr:`requests_per_second`), :attr:`model_kwargs`, and
+            structured output. Retry with ``Retry-After``, the input-token
+            budget, and usage accounting still apply, since those live in
+            :class:`LLMClient` rather than in the model. Configuring a
+            forfeited knob alongside it is logged at WARNING.
+
+        Config key: ``llm_client.provider_client``.
     base_url : str | None
         Gateway endpoint (the OpenAI-compatible root, e.g.
         ``https://llm-gateway.example/v1``), forwarded as ``base_url``.
@@ -196,6 +266,18 @@ class LLMClientConfig(BaseModel):
         ),
         validation_alias=AliasChoices("model", "model_name"),
     )
+    model_provider: str | None = Field(
+        default_factory=lambda: app_config.llm_client_value("model_provider")
+    )
+    gateway_version: str | None = Field(
+        default_factory=lambda: (
+            os.environ.get("LLM_GATEWAY_VERSION")
+            or app_config.llm_client_value("gateway_version")
+        )
+    )
+    provider_client: str | None = Field(
+        default_factory=lambda: app_config.llm_client_value("provider_client")
+    )
     base_url: str | None = Field(
         default_factory=lambda: app_config.llm_client_value("base_url")
     )
@@ -244,10 +326,53 @@ class LLMClientConfig(BaseModel):
     kwargs: dict[str, Any] | None = None
 
     @classmethod
+    def for_role(cls, role: str, **overrides: Any) -> "LLMClientConfig":
+        """
+        A config resolved through the per-role overlay
+        ``llm_client.roles.<role>`` in config.json.
+
+        The reference deployment configures one gateway block per role — its
+        validator gets a 12000-second timeout where the converter gets 6000 —
+        and a role here is that same idea as a **sparse** overlay: a key the
+        role does not mention resolves exactly as it would for
+        ``LLMClientConfig()``. Roles in use: ``"validator"`` and
+        ``"complexity"``. An unknown role name is not an error; it simply has
+        no overrides.
+
+        Parameters
+        ----------
+        role : str
+            The overlay to apply.
+        **overrides
+            Ordinary constructor arguments, applied last — so an explicit
+            ``model=`` from a CLI flag still beats the row, the role, and the
+            base section, keeping the repo-wide precedence rule intact.
+        """
+        # Only keys the role actually *changes* are passed explicitly; every
+        # other one falls through to the field's own default factory, which
+        # stays the single source of truth for the hard defaults.
+        values: dict[str, Any] = {}
+        for key in _ROLE_OVERLAY_KEYS:
+            if key in overrides:
+                continue  # an explicit argument wins; do not read the file
+            overlaid = app_config.role_value(role, key)
+            if overlaid is not None and overlaid != app_config.llm_client_value(key):
+                values[key] = overlaid
+        applied = sorted(values)
+        values.update(overrides)
+        logger.info(
+            f"LLMClientConfig.for_role: role={role!r} overrides from the file: "
+            f"{applied or None} (explicit: {sorted(overrides) or None})"
+        )
+        return cls(**values)
+
+    @classmethod
     def from_ai_gateway(cls, **overrides: Any) -> "LLMClientConfig":
         """
         A config whose :attr:`api_key` is the AI Gateway token fetched from
-        Vault at :data:`app_config.vault.AI_GATEWAY_PATH`.
+        Vault at :attr:`~app_config.vault.VaultConfig.resolved_ai_gateway_path`
+        (``<app_name>/ai_gateway`` unless ``vault.ai_gateway_path`` says
+        otherwise).
 
         Completes the credential chain: the Entra ID service principal (from
         the Databricks secret scope, or ``AZURE_*``) mints a JWT via ``msal``,
@@ -256,8 +381,11 @@ class LLMClientConfig(BaseModel):
         disk and no key is read from ``config.json``.
 
         If the secret also carries an endpoint (``base_url`` / ``endpoint`` /
-        ``url``), it is used as :attr:`base_url`; otherwise the configured
-        ``llm_client.base_url`` stands. This path also turns the proactive
+        ``url``), it is used as :attr:`base_url`; likewise a
+        ``gateway_version`` / ``ai_gateway_version`` / ``version`` becomes
+        :attr:`gateway_version`. Otherwise the configured
+        ``llm_client.base_url`` / ``llm_client.gateway_version`` stand.
+        This path also turns the proactive
         throttle on by default (:attr:`requests_per_second` = ``2.0``), since
         the gateway enforces a rate limit — unless ``config.json`` or an
         explicit override already set it. Every other knob resolves exactly as
@@ -290,6 +418,9 @@ class LLMClientConfig(BaseModel):
         base_url = vault.ai_gateway_base_url(secret)
         if base_url is not None:
             values["base_url"] = base_url
+        gateway_version = vault.ai_gateway_version(secret)
+        if gateway_version is not None:
+            values["gateway_version"] = gateway_version
         # The gateway enforces a rate limit, so pace request starts by default
         # on this path — unless the operator already set it via config.json or
         # an explicit override (both of which must keep winning).
@@ -587,24 +718,78 @@ def _token_usage(response: Any) -> TokenUsage | None:
     )
 
 
-def _gateway_model_name(model: str) -> str:
-    """The bare model id to send to the gateway.
+def _split_model(model: str) -> tuple[str | None, str]:
+    """A ``"provider: model"`` string as ``(provider, model_id)``.
 
-    Model strings written for ``init_chat_model`` may carry a LangChain
-    provider prefix (``"anthropic:claude-opus-4-6"``) that selected the client
-    class. The gateway routes on the model id alone, so the prefix would just
-    be an unknown model — strip it. Mirrors the prefix tolerance in
-    :func:`app_config.is_accessible_model`.
+    Model strings may carry a provider prefix — a LangChain
+    ``init_chat_model`` spelling (``"anthropic:claude-opus-4-6"``), or the
+    reference gateway's own, read from a SharePoint ``Model`` column with a
+    space after the colon. Either way the prefix names the *family*, which is
+    what a deployment pins ``provider_client`` on, while the gateway itself
+    routes on the model id alone — so the two are separated here rather than
+    one being thrown away.
+
+    The id is lowercased and both halves stripped, matching the reference's
+    ``parse_preferred_llm``. An unprefixed string yields ``(None, model)``
+    unchanged in case, since that is the id an operator wrote by hand.
     """
     prefix, sep, bare = model.partition(":")
-    if not sep or not bare:
-        return model
-    logger.info(
-        f"_gateway_model_name: dropping LangChain provider prefix "
-        f"'{prefix}:' from model '{model}'; the gateway routes on the "
-        f"model id alone"
-    )
-    return bare
+    if not sep or not bare.strip():
+        return None, model
+    return prefix.strip(), bare.strip().lower()
+
+
+# LangChain message types -> the OpenAI chat roles the wire format uses.
+_OPENAI_ROLES = {"system": "system", "ai": "assistant", "human": "user"}
+
+
+def _message_text(content: Any) -> str:
+    """A message's content as plain text.
+
+    Multi-part content (the list form a ``cache_control`` breakpoint rides on)
+    is flattened to its text blocks: the native path speaks the plain
+    ``{"role", "content"}`` shape, so anything richer has to be reduced to it.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+    parts: list[str] = []
+    for part in content:
+        if isinstance(part, str):
+            parts.append(part)
+        elif isinstance(part, dict) and isinstance(part.get("text"), str):
+            parts.append(part["text"])
+    return "".join(parts)
+
+
+def _to_openai_message(message: BaseMessage) -> dict[str, str]:
+    """One LangChain message as an OpenAI ``{"role", "content"}`` dict.
+
+    Unknown types map to ``user``, which is the safe default: a message the
+    gateway cannot place is still the caller talking.
+    """
+    return {
+        "role": _OPENAI_ROLES.get(message.type, "user"),
+        "content": _message_text(message.content),
+    }
+
+
+def _native_usage(response: Any) -> dict[str, int] | None:
+    """A raw OpenAI response's usage block in LangChain's normalized shape,
+    so token accounting works the same on the native path as on the LangChain
+    one. ``None`` when the gateway reported no usage."""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+    input_tokens = _int_field({"v": getattr(usage, "prompt_tokens", 0)}, "v")
+    output_tokens = _int_field({"v": getattr(usage, "completion_tokens", 0)}, "v")
+    total = _int_field({"v": getattr(usage, "total_tokens", 0)}, "v")
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total or input_tokens + output_tokens,
+    }
 
 
 def _as_messages(input: LanguageModelInput) -> list[BaseMessage]:
@@ -693,7 +878,10 @@ class LLMClient:
 
     @staticmethod
     def _build_model(config: LLMClientConfig) -> Any:
-        model = _gateway_model_name(config.model)
+        provider, model = _split_model(config.model)
+        provider = config.model_provider or provider
+        if config.provider_client == app_config.PROVIDER_CLIENT_NATIVE:
+            return LLMClient._build_native_model(config, provider, model)
         cert_path = (
             LLMClient._apply_cert_file(config.cert_file)
             if config.cert_file is not None
@@ -755,6 +943,12 @@ class LLMClient:
             # goes out both ways. setdefault, not assignment: an operator who
             # set this header explicitly meant it.
             headers.setdefault("api-key", key)
+        if config.gateway_version:
+            # The gateway rejects (or silently mis-routes) a request that does
+            # not declare which protocol version it speaks. setdefault, the
+            # same rule as api-key above: an operator who set this header
+            # through url_headers meant it.
+            headers.setdefault("ai-gateway-version", config.gateway_version)
         if headers:
             kwargs["default_headers"] = headers
         if config.timeout is not None:
@@ -771,6 +965,8 @@ class LLMClient:
         # Header VALUES may carry gateway credentials — log key names only.
         logger.info(
             f"LLMClient: building ChatOpenAI model '{model}'  "
+            f"provider={provider}  "
+            f"gateway_version={'set' if config.gateway_version else 'unset'}  "
             f"temperature={config.temperature}  "
             f"max_output_tokens={config.max_output_tokens}  "
             f"base_url={base_url}  "
@@ -785,6 +981,102 @@ class LLMClient:
             f"max_retries={config.max_retries}"
         )
         return ChatOpenAI(model=model, **kwargs)
+
+    @staticmethod
+    def _build_native_model(
+        config: LLMClientConfig, provider: str | None, model: str
+    ) -> Any:
+        """A raw ``openai.OpenAI`` client wrapped to the surface
+        :class:`LLMClient` invokes, for ``provider_client="native"``.
+
+        The escape hatch for a gateway that will not take the payload
+        ``ChatOpenAI`` builds. It is a ``RunnableLambda`` over one
+        ``chat.completions.create`` call rather than a second model class, so
+        nothing here has to be kept in step with the LangChain integration.
+
+        What it costs, all of which attaches at construction time and so
+        cannot survive the swap: the rate limiter, ``model_kwargs``, and
+        structured output (``with_structured_output``, which
+        :meth:`supports_structured_output` will now answer ``False`` for).
+        Retry, the input-token budget and usage accounting are unaffected —
+        they live in :class:`LLMClient`, above the model.
+        """
+        forfeited = [
+            name
+            for name, value in (
+                ("requests_per_second", config.requests_per_second),
+                ("model_kwargs", config.model_kwargs),
+            )
+            if value
+        ]
+        if forfeited:
+            logger.warning(
+                f"_build_native_model: provider_client='native' cannot apply "
+                f"{', '.join(forfeited)} — they attach when a LangChain chat "
+                f"model is constructed, and this path builds none. Structured "
+                f"output is unavailable on it too. Drop provider_client to go "
+                f"back to the openai_compatible transport"
+            )
+        if config.cert_file is not None:
+            LLMClient._apply_cert_file(config.cert_file)
+        try:
+            import openai
+        except ImportError as exc:  # pragma: no cover - openai is a hard dep
+            raise RuntimeError(
+                "provider_client='native' needs the openai SDK installed"
+            ) from exc
+        kwargs: dict[str, Any] = {"max_retries": 0}  # this class owns retries
+        base_url = config.base_url
+        if base_url is not None:
+            if base_url.endswith("/"):
+                base_url += model  # per-deployment route; see _build_model
+            kwargs["base_url"] = base_url
+        headers: dict[str, str] = dict(config.url_headers) if config.url_headers else {}
+        if config.api_key is not None:
+            key = config.api_key.get_secret_value()
+            kwargs["api_key"] = key
+            headers.setdefault("api-key", key)
+        if config.gateway_version:
+            headers.setdefault("ai-gateway-version", config.gateway_version)
+        if headers:
+            kwargs["default_headers"] = headers
+        if config.timeout is not None:
+            kwargs["timeout"] = config.timeout
+        client = openai.OpenAI(**kwargs)
+
+        body: dict[str, Any] = {"model": model}
+        if config.max_output_tokens is not None:
+            body["max_tokens"] = config.max_output_tokens
+        if config.temperature is not None:
+            body["temperature"] = config.temperature
+
+        def _call(messages: list[BaseMessage]) -> BaseMessage:
+            response = client.chat.completions.create(
+                messages=[_to_openai_message(m) for m in messages],  # type: ignore[arg-type]
+                **body,
+            )
+            return AIMessage(
+                content=response.choices[0].message.content or "",
+                # Carried through so LLMClient.usage keeps accumulating on this
+                # path; _token_usage reads exactly these three names.
+                usage_metadata=_native_usage(response),
+            )
+
+        # Header VALUES may carry gateway credentials — log key names only.
+        logger.info(
+            f"LLMClient: building native openai client for model '{model}'  "
+            f"provider={provider}  "
+            f"gateway_version={'set' if config.gateway_version else 'unset'}  "
+            f"temperature={config.temperature}  "
+            f"max_output_tokens={config.max_output_tokens}  "
+            f"base_url={base_url}  "
+            f"timeout={config.timeout}  "
+            f"cert_file={config.cert_file}  "
+            f"api_key={'set' if config.api_key else 'unset'}  "
+            f"url_headers={sorted(headers) or None}  "
+            f"max_retries={config.max_retries}"
+        )
+        return RunnableLambda(_call)
 
     # ------------------------------------------------------------------
     # Input-token budget

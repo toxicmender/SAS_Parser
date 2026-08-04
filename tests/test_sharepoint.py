@@ -41,6 +41,17 @@ _SHAREPOINT_ENV = (
     "SHAREPOINT_SITE_ID",
     "SHAREPOINT_DRIVE_ID",
     "SHAREPOINT_SCOPES",
+    "SHAREPOINT_FILE_SERVER_BASE_PATH",
+    "SHAREPOINT_SECRET_SCOPE",
+    "SHAREPOINT_TENANT_ID_KEY",
+    "SHAREPOINT_CLIENT_ID_KEY",
+    "SHAREPOINT_CLIENT_SECRET_KEY",
+    "SHAREPOINT_LIST_ID_SAS_REQUESTS",
+    "SHAREPOINT_LIST_ID_SAS_CONVERSIONS",
+    "SHAREPOINT_LIST_ID_XREF",
+    "SHAREPOINT_LIST_ID_SAS_COMPLEXITY",
+    # The SharePoint secret scope defaults across from the workspace's.
+    "DATABRICKS_SECRET_SCOPE",
 )
 
 _AZURE_ENV = (
@@ -198,11 +209,48 @@ class _DrivesBuilder:
         return self.drive_builder
 
 
+class _ListItem:
+    """One list item as the SDK returns it, with a patchable `fields`."""
+
+    def __init__(self, item_id, values):
+        self.id = item_id
+        self.web_url = f"https://sp.example/items/{item_id}"
+        fields: Any = type("Fields", (), {})()
+        fields.additional_data = dict(values)
+        self.fields = fields
+
+
+class _ItemFieldsBuilder:
+    def __init__(self, item):
+        self._item = item
+        self.patched: list[dict] = []
+
+    def patch(self, body):
+        self.patched.append(dict(body.additional_data))
+        self._item.fields.additional_data.update(body.additional_data)
+        result: Any = type("Fields", (), {})()
+        result.additional_data = dict(self._item.fields.additional_data)
+        return _Awaitable(result)
+
+
+class _SingleItemBuilder:
+    def __init__(self, item):
+        self._item = item
+        self.fields = _ItemFieldsBuilder(item)
+
+    def get(self, config=None):
+        return _Awaitable(self._item)
+
+
 class _ListItemsBuilder:
-    def __init__(self, pages):
+    def __init__(self, pages, by_id=None):
         self._pages = list(pages)
         self._i = 0
         self.configs: list[Any] = []
+        # item id -> _ListItem, for by_list_item_id()
+        self._by_id = dict(by_id or {})
+        self.item_builders: dict[str, _SingleItemBuilder] = {}
+        self.requested_item_ids: list[str] = []
 
     def get(self, config=None):
         self.configs.append(config)
@@ -211,6 +259,16 @@ class _ListItemsBuilder:
     def with_url(self, url):
         self._i += 1
         return self
+
+    def by_list_item_id(self, item_id):
+        self.requested_item_ids.append(item_id)
+        if item_id not in self._by_id:
+            raise RuntimeError(f"itemNotFound: {item_id}")
+        builder = self.item_builders.get(item_id)
+        if builder is None:
+            builder = _SingleItemBuilder(self._by_id[item_id])
+            self.item_builders[item_id] = builder
+        return builder
 
 
 class _ListBuilder:
@@ -743,3 +801,373 @@ def test_get_sharepoint_client_is_cached():
     assert sharepoint.get_sharepoint_client() is first
     sharepoint.clear_cache()
     assert sharepoint.get_sharepoint_client() is not first
+
+
+# ---------------------------------------------------------------------------
+# Base-path normalisation and drive_path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("Shared Documents/Kit/Applications", "Kit/Applications"),
+        ("/Shared Documents/Kit/Applications", "Kit/Applications"),
+        ("shared documents/Kit/Applications", "Kit/Applications"),
+        ("SHARED DOCUMENTS/Kit/Applications", "Kit/Applications"),
+        ("Kit/Applications", "Kit/Applications"),
+        ("/Kit/Applications/", "Kit/Applications"),
+        ("Shared Documents/", ""),
+        ("", ""),
+        (None, ""),
+    ],
+)
+def test_base_path_is_normalised_to_drive_relative(raw, expected, _isolated):
+    # Graph addresses items INSIDE the library, so the "Shared Documents/"
+    # prefix a SharePoint URL shows must not survive into a lookup.
+    _set(_isolated, {"sharepoint": {"file_server_base_path": raw}})
+    assert sharepoint.SharePointConfig.from_env().file_server_base_path == expected
+
+
+def test_base_path_from_env_beats_config(monkeypatch, _isolated):
+    _set(_isolated, {"sharepoint": {"file_server_base_path": "Cfg/Apps"}})
+    monkeypatch.setenv(
+        "SHAREPOINT_FILE_SERVER_BASE_PATH", "Shared Documents/Env/Apps"
+    )
+    assert sharepoint.SharePointConfig.from_env().file_server_base_path == "Env/Apps"
+
+
+def test_drive_path_joins_onto_the_base():
+    cfg = sharepoint.SharePointConfig(file_server_base_path="Kit/Applications")
+    assert cfg.drive_path("MyApp", "scripts_original") == (
+        "Kit/Applications/MyApp/scripts_original"
+    )
+    # Stray slashes on either side are absorbed, so callers need not care.
+    assert cfg.drive_path("/MyApp/", "/scripts_original/") == (
+        "Kit/Applications/MyApp/scripts_original"
+    )
+    assert cfg.drive_path("MyApp/scripts_original") == (
+        "Kit/Applications/MyApp/scripts_original"
+    )
+
+
+def test_drive_path_with_no_base_is_library_relative():
+    cfg = sharepoint.SharePointConfig()
+    assert cfg.drive_path("MyApp") == "MyApp"
+    assert cfg.drive_path() == ""
+
+
+# ---------------------------------------------------------------------------
+# List ids
+# ---------------------------------------------------------------------------
+
+
+def test_list_ids_read_from_config(_isolated):
+    _set(
+        _isolated,
+        {
+            "sharepoint": {
+                "list_id_sas_requests": "L-req",
+                "list_id_sas_conversions": "L-conv",
+                "list_id_xref": "L-xref",
+                "list_id_sas_complexity": "L-cx",
+            }
+        },
+    )
+    cfg = sharepoint.SharePointConfig.from_env()
+    assert cfg.list_id("requests") == "L-req"
+    assert cfg.list_id("conversions") == "L-conv"
+    assert cfg.list_id("xref") == "L-xref"
+    assert cfg.list_id("complexity") == "L-cx"
+
+
+def test_list_id_env_beats_config(monkeypatch, _isolated):
+    _set(_isolated, {"sharepoint": {"list_id_xref": "cfg"}})
+    monkeypatch.setenv("SHAREPOINT_LIST_ID_XREF", "env")
+    assert sharepoint.SharePointConfig.from_env().list_id("xref") == "env"
+
+
+def test_missing_list_id_names_the_config_key():
+    # Better than Graph reporting that None is not a list.
+    cfg = sharepoint.SharePointConfig()
+    with pytest.raises(sharepoint.SharePointError, match="sharepoint.list_id_xref"):
+        cfg.list_id("xref")
+
+
+def test_unknown_list_kind_raises():
+    with pytest.raises(sharepoint.SharePointError, match="unknown SharePoint list"):
+        sharepoint.SharePointConfig().list_id("nope")
+
+
+# ---------------------------------------------------------------------------
+# SharePoint's own service principal
+# ---------------------------------------------------------------------------
+
+
+def test_secret_keys_default_to_the_sharepoint_principal(_isolated):
+    cfg = sharepoint.SharePointConfig.from_env()
+    assert cfg.secret_keys.tenant_id_key == "saact-hsv-tenantid"
+    assert cfg.secret_keys.client_id_key == "saact-hsv-appid"
+    assert cfg.secret_keys.client_secret_key == "saact-hsv-secret"
+
+
+def test_secret_scope_defaults_across_from_databricks(monkeypatch, _isolated):
+    # Both principals live in one scope, under different keys.
+    monkeypatch.setenv("DATABRICKS_SECRET_SCOPE", "workspace-scope")
+    assert sharepoint.SharePointConfig.from_env().secret_scope == "workspace-scope"
+
+
+def test_sharepoint_secret_scope_beats_the_databricks_one(monkeypatch, _isolated):
+    monkeypatch.setenv("DATABRICKS_SECRET_SCOPE", "workspace-scope")
+    monkeypatch.setenv("SHAREPOINT_SECRET_SCOPE", "sharepoint-scope")
+    assert sharepoint.SharePointConfig.from_env().secret_scope == "sharepoint-scope"
+
+
+def test_token_is_minted_as_the_sharepoint_principal(monkeypatch, _isolated):
+    calls: list[tuple] = []
+
+    class _FakeClient:
+        def get_token(self, scopes):
+            calls.append(("token", tuple(scopes)))
+            return "graph-token"
+
+    def _fake_get_databricks_client(secret_scope=None, keys=None):
+        calls.append(("client", secret_scope, keys))
+        return _FakeClient()
+
+    monkeypatch.setattr(azure, "get_databricks_client", _fake_get_databricks_client)
+    cfg = sharepoint.SharePointConfig(secret_scope="kv")
+    client = sharepoint.SharePointClient(cfg, client=_FakeGraphClient())
+
+    assert client.get_token() == "graph-token"
+    # The saact-hsv-* key set reaches the secret read — not the sp-hsv-* one
+    # that authenticates Vault.
+    assert calls[0][1] == "kv"
+    assert calls[0][2].client_id_key == "saact-hsv-appid"
+    assert calls[1] == ("token", (sharepoint.GRAPH_DEFAULT_SCOPE,))
+
+
+def test_token_falls_back_to_the_shared_identity(monkeypatch, _isolated):
+    seen: list[tuple] = []
+    monkeypatch.setattr(
+        azure, "get_token", lambda scopes=None: seen.append(scopes) or "shared-token"
+    )
+    client = sharepoint.SharePointClient(
+        sharepoint.SharePointConfig(), client=_FakeGraphClient()
+    )
+
+    assert client.get_token() == "shared-token"
+    assert seen == [(sharepoint.GRAPH_DEFAULT_SCOPE,)]
+
+
+# ---------------------------------------------------------------------------
+# File primitives: list_files, download_file_as_text, read_json_text,
+# upload_file, create_folder
+# ---------------------------------------------------------------------------
+
+
+def _folder_listing(*entries):
+    """A children builder serving one page of (name, is_folder) entries."""
+    items = [
+        _DriveItem(name=name, id=name, folder=_Folder() if is_folder else None)
+        for name, is_folder in entries
+    ]
+    return _ChildrenBuilder([_Collection(items)])
+
+
+def test_list_files_drops_folders():
+    children = _folder_listing(("etl.sas", False), ("archive", True))
+    client, _ = _client(item=_ItemBuilder(children=children))
+
+    names = [entry["name"] for entry in client.list_files("MyApp")]
+    assert names == ["etl.sas"]
+
+
+def test_list_files_filters_by_extension():
+    children = _folder_listing(
+        ("etl.sas", False),
+        ("notes.TXT", False),
+        ("report.pdf", False),
+        ("no_extension", False),
+    )
+    client, _ = _client(item=_ItemBuilder(children=children))
+
+    # Case-insensitive, and a leading dot is optional.
+    found = [entry["name"] for entry in client.list_files("MyApp", ("sas", ".txt"))]
+    assert found == ["etl.sas", "notes.TXT"]
+
+
+def test_list_files_without_a_filter_keeps_every_file():
+    children = _folder_listing(("a.sas", False), ("b.pdf", False), ("sub", True))
+    client, _ = _client(item=_ItemBuilder(children=children))
+
+    assert len(client.list_files("MyApp")) == 2
+
+
+def test_list_files_carries_the_drive_relative_path():
+    children = _folder_listing(("etl.sas", False))
+    client, _ = _client(item=_ItemBuilder(children=children))
+
+    assert client.list_files("Kit/MyApp")[0]["path"] == "Kit/MyApp/etl.sas"
+    # At the library root there is no prefix to add.
+    assert client.list_files("")[0]["path"] == "etl.sas"
+
+
+def test_download_file_as_text_decodes():
+    content = _ContentBuilder(get_value="data a; run;".encode("utf-8"))
+    client, _ = _client(item=_ItemBuilder(content=content))
+
+    assert client.download_file_as_text("a.sas") == "data a; run;"
+
+
+def test_download_file_as_text_strips_a_bom():
+    # Windows editors add one, and a leading ﻿ would break the first
+    # statement of every file that has it.
+    content = _ContentBuilder(get_value="﻿data a; run;".encode("utf-8"))
+    client, _ = _client(item=_ItemBuilder(content=content))
+
+    assert client.download_file_as_text("a.sas") == "data a; run;"
+
+
+def test_download_file_as_text_survives_undecodable_bytes():
+    # One stray byte in a decades-old SAS file must not lose the whole file.
+    content = _ContentBuilder(get_value=b"data a; \xff run;")
+    client, _ = _client(item=_ItemBuilder(content=content))
+
+    assert client.download_file_as_text("a.sas").startswith("data a; ")
+
+
+def test_read_json_text_parses():
+    content = _ContentBuilder(get_value=b'{"a": [1, 2]}')
+    client, _ = _client(item=_ItemBuilder(content=content))
+
+    assert client.read_json_text("x.json") == {"a": [1, 2]}
+
+
+def test_read_json_text_names_the_file_on_bad_json():
+    content = _ContentBuilder(get_value=b"not json")
+    client, _ = _client(item=_ItemBuilder(content=content))
+
+    with pytest.raises(sharepoint.SharePointError, match="x.json"):
+        client.read_json_text("x.json")
+
+
+def test_upload_file_composes_the_same_path_as_write_file():
+    item = _ItemBuilder(content=_ContentBuilder(put_value=_DriveItem(name="a.sas")))
+    client, fake = _client(item=item)
+
+    client.upload_file("Kit/MyApp", "a.sas", "data a; run;")
+    by_folder = list(fake.drives.drive_builder.items.requested_ids)
+
+    client2, fake2 = _client(item=item)
+    client2.write_file("Kit/MyApp/a.sas", "data a; run;")
+    assert by_folder == list(fake2.drives.drive_builder.items.requested_ids)
+    assert by_folder == ["root:/Kit/MyApp/a.sas:"]
+
+
+def test_upload_file_at_the_library_root():
+    item = _ItemBuilder(content=_ContentBuilder(put_value=_DriveItem(name="a.sas")))
+    client, fake = _client(item=item)
+
+    client.upload_file("", "a.sas", "x")
+    assert fake.drives.drive_builder.items.requested_ids == ["root:/a.sas:"]
+
+
+def test_upload_file_needs_a_name():
+    client, _ = _client()
+    with pytest.raises(sharepoint.SharePointError, match="needs a file name"):
+        client.upload_file("Kit", "  ", "x")
+
+
+@requires_msgraph
+def test_create_folder_is_idempotent():
+    # The upload flows call it unconditionally before every upload, so an
+    # existing folder is a success, not a conflict.
+    children = _ChildrenBuilder([_Collection([])])
+    client, _ = _client(item=_ItemBuilder(children=children))
+
+    client.create_folder("MyApp/complexity")
+    client.create_folder("MyApp/complexity")
+
+    behaviours = [
+        body.additional_data["@microsoft.graph.conflictBehavior"]
+        for body in children.posted
+    ]
+    assert behaviours and set(behaviours) == {"replace"}
+
+
+@requires_msgraph
+def test_create_folder_creates_missing_parents():
+    children = _ChildrenBuilder([_Collection([])])
+    client, _ = _client(item=_ItemBuilder(children=children))
+
+    client.create_folder("MyApp/complexity/2026-08-04")
+
+    assert [body.name for body in children.posted] == [
+        "MyApp",
+        "complexity",
+        "2026-08-04",
+    ]
+
+
+def test_create_folder_refuses_the_library_root():
+    client, _ = _client()
+    with pytest.raises(sharepoint.SharePointError, match="not the library root"):
+        client.create_folder("/")
+
+
+# ---------------------------------------------------------------------------
+# List-item primitives: get_list_item, update_list_item
+# ---------------------------------------------------------------------------
+
+
+def _list_client(items):
+    """A client over a site whose one list serves *items* ({id: fields})."""
+    by_id = {str(k): _ListItem(str(k), v) for k, v in items.items()}
+    items_builder = _ListItemsBuilder(
+        [_Collection(list(by_id.values()))], by_id=by_id
+    )
+    site = _SiteBuilder(list_items_builder=items_builder)
+    cfg = sharepoint.SharePointConfig(site_id="SITE", drive_id="DRV")
+    client = sharepoint.SharePointClient(cfg, client=_FakeGraphClient(site=site))
+    return client, items_builder
+
+
+def test_list_items_is_read_list_items():
+    client, _ = _list_client({1: {"Title": "one"}, 2: {"Title": "two"}})
+    rows = client.list_items("L-xref")
+
+    assert [row["fields"]["Title"] for row in rows] == ["one", "two"]
+
+
+def test_get_list_item_returns_one_row():
+    client, builder = _list_client({7: {"Application": "MyApp", "Status": "New"}})
+    row = client.get_list_item("L-req", 7)
+
+    assert row["id"] == "7"
+    assert row["fields"] == {"Application": "MyApp", "Status": "New"}
+    assert builder.requested_item_ids == ["7"]
+
+
+def test_get_list_item_missing_raises():
+    client, _ = _list_client({1: {"Title": "one"}})
+    with pytest.raises(sharepoint.SharePointError, match="could not read item"):
+        client.get_list_item("L-req", 99)
+
+
+@requires_msgraph
+def test_update_list_item_round_trips():
+    client, builder = _list_client({7: {"Application": "MyApp", "Status": "New"}})
+    written = client.update_list_item("L-req", 7, {"Status": "Completed"})
+
+    assert builder.item_builders["7"].fields.patched == [{"Status": "Completed"}]
+    assert written["Status"] == "Completed"
+    # A partial mapping is a partial update: untouched columns survive.
+    assert written["Application"] == "MyApp"
+    assert client.get_list_item("L-req", 7)["fields"]["Status"] == "Completed"
+
+
+def test_update_list_item_refuses_an_empty_write():
+    client, _ = _list_client({7: {"Status": "New"}})
+    with pytest.raises(sharepoint.SharePointError, match="no fields to write"):
+        client.update_list_item("L-req", 7, {})

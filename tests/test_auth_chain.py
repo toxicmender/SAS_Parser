@@ -7,7 +7,7 @@ The links, in order:
    (``app_config.databricks``), bootstrapped by a PAT or the cluster runtime.
 2. ``msal`` mints a JWT for that principal (``app_config.azure``).
 3. That JWT logs in to Vault's ``jwt`` auth method (``app_config.vault``).
-4. The Vault session reads the AI Gateway secret at ``<oidc_role>/ai_gateway``.
+4. The Vault session reads the AI Gateway secret at ``<app_name>/ai_gateway``.
 5. The gateway token lands on ``llm_client.LLMClientConfig.api_key``.
 
 The unit tests for each module cover the branches within it; what is checked
@@ -39,11 +39,11 @@ SPN_CLIENT = "chain-client"
 SPN_SECRET = "chain-secret"
 GATEWAY_TOKEN = "gw-token-from-vault"
 MINTED_JWT = "jwt-signed-for-the-spn"
-VAULT_ROLE = "sas-parser"
+VAULT_APP_NAME = "sas-parser"
 # Where get_ai_gateway_secret looks with no vault.ai_gateway_path configured:
-# the secret sits beside the Vault role that unlocked it. See
-# test_vault.py for the full precedence.
-GATEWAY_SECRET_PATH = f"{VAULT_ROLE}/ai_gateway"
+# under the application's own prefix, which is also the Vault role that
+# unlocked it. See test_vault.py for the full precedence.
+GATEWAY_SECRET_PATH = f"{VAULT_APP_NAME}/ai_gateway"
 
 _ENV = (
     "DATABRICKS_HOST",
@@ -61,7 +61,7 @@ _ENV = (
     "VAULT_TOKEN",
     "VAULT_ROLE_ID",
     "VAULT_SECRET_ID",
-    "VAULT_OIDC_ROLE",
+    "VAULT_APP_NAME",
     "VAULT_AUTH_PATH",
     "VAULT_AZURE_SCOPES",
 )
@@ -194,7 +194,7 @@ def chain(monkeypatch):
 
     # 3. Vault, reached with the jwt auth method.
     monkeypatch.setenv("VAULT_ADDR", "https://vault.example:8200")
-    monkeypatch.setenv("VAULT_OIDC_ROLE", VAULT_ROLE)
+    monkeypatch.setenv("VAULT_APP_NAME", VAULT_APP_NAME)
     hvac = pytest.importorskip("hvac", reason="hvac is not installed")
     monkeypatch.setattr(hvac, "Client", _FakeVault)
 
@@ -235,18 +235,18 @@ def test_vault_receives_the_minted_jwt(chain):
     logins = _FakeVault.instances[0].logins
     assert len(logins) == 1
     assert logins[0] == {
-        "role": VAULT_ROLE,
+        "role": VAULT_APP_NAME,
         "jwt": MINTED_JWT,
         "path": vault.DEFAULT_AUTH_PATH,
     }
 
 
-def test_jwt_audience_is_the_principals_own_app_id(chain):
+def test_jwt_audience_is_azure_resource_manager(chain):
     LLMClientConfig.from_ai_gateway()
-    # With no scopes configured anywhere, the login JWT is requested for
-    # "<client_id>/.default" — the audience a Vault role with
-    # bound_audiences=<app id> expects.
-    assert azure.get_azure_client().app.scopes == [[f"{SPN_CLIENT}/.default"]]
+    # With no scopes configured anywhere, the login JWT is requested for Azure
+    # Resource Manager — the audience the deployment's Vault role is bound to.
+    # The principal having a client id must not divert it to <client_id>/.default.
+    assert azure.get_azure_client().app.scopes == [[vault._ARM_DEFAULT_SCOPE]]
 
 
 def test_the_chain_runs_once_across_repeated_use(chain):
@@ -256,7 +256,7 @@ def test_the_chain_runs_once_across_repeated_use(chain):
     assert len(_FakeDatabricks.instances) == 1
     assert len(_FakeVault.instances) == 1
     assert len(_FakeVault.instances[0].logins) == 1
-    assert azure.get_azure_client().app.scopes == [[f"{SPN_CLIENT}/.default"]]
+    assert azure.get_azure_client().app.scopes == [[vault._ARM_DEFAULT_SCOPE]]
 
 
 def test_rotated_gateway_token_is_picked_up_without_a_restart(chain, monkeypatch):

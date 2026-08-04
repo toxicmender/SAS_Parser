@@ -11,6 +11,7 @@ cache and the azure client cache around itself.
 from __future__ import annotations
 
 import json
+import logging
 import pathlib
 import sys
 from typing import Any
@@ -30,7 +31,12 @@ _AZURE_ENV = (
     "AZURE_SCOPES",
     "AZURE_CLIENT_CERTIFICATE_PATH",
     "AZURE_CLIENT_CERTIFICATE_THUMBPRINT",
+    "AZURE_VERIFY",
 )
+
+# azure.verify falls through to whatever Vault resolved, so the Vault TLS
+# variables have to be isolated here too.
+_VAULT_ENV = ("VAULT_CACERT", "VAULT_SKIP_VERIFY")
 
 # get_azure_client falls back to the service principal in the Databricks
 # secret scope, so the Databricks env has to be isolated here too.
@@ -53,7 +59,7 @@ def _isolated(monkeypatch, tmp_path):
     cfg = tmp_path / "config.json"
     cfg.write_text("{}", encoding="utf-8")
     monkeypatch.setenv(app_config.ENV_VAR, str(cfg))
-    for var in _AZURE_ENV + _DATABRICKS_ENV:
+    for var in _AZURE_ENV + _DATABRICKS_ENV + _VAULT_ENV:
         monkeypatch.delenv(var, raising=False)
     app_config.clear_cache()
     azure.clear_cache()
@@ -167,6 +173,8 @@ def test_defaults_without_env_or_config(_isolated):
     assert cfg.scopes == ()
     assert cfg.flow is None
     assert cfg.timeout == azure.DEFAULT_TIMEOUT
+    assert cfg.verify is True
+    assert cfg.proxies is None
     assert cfg.auth_flow is None
 
 
@@ -211,6 +219,118 @@ def test_wrong_typed_scopes_degrade(_isolated):
 def test_non_string_scope_entries_degrade(_isolated):
     _set(_isolated, {"azure": {"scopes": ["api://x/.default", 7]}})
     assert azure.AzureAuthConfig.from_env().scopes == ()
+
+
+# ---------------------------------------------------------------------------
+# TLS verification and proxies (the MSAL transport knobs)
+# ---------------------------------------------------------------------------
+
+
+def test_verify_from_env(monkeypatch, _isolated):
+    monkeypatch.setenv("AZURE_VERIFY", "/etc/ssl/corp-ca.pem")
+    assert azure.AzureAuthConfig.from_env().verify == "/etc/ssl/corp-ca.pem"
+
+
+def test_verify_env_accepts_a_boolean_spelling(monkeypatch, _isolated):
+    # An env var can only carry text, so "false" has to mean False rather than
+    # a CA bundle at the path "false".
+    monkeypatch.setenv("AZURE_VERIFY", "false")
+    assert azure.AzureAuthConfig.from_env().verify is False
+    monkeypatch.setenv("AZURE_VERIFY", "true")
+    assert azure.AzureAuthConfig.from_env().verify is True
+
+
+def test_verify_from_config_json(_isolated):
+    _set(_isolated, {"azure": {"verify": "/cfg/ca.pem"}})
+    assert azure.AzureAuthConfig.from_env().verify == "/cfg/ca.pem"
+    _set(_isolated, {"azure": {"verify": False}})
+    assert azure.AzureAuthConfig.from_env().verify is False
+
+
+def test_verify_env_beats_config(monkeypatch, _isolated):
+    _set(_isolated, {"azure": {"verify": "/cfg/ca.pem"}})
+    monkeypatch.setenv("AZURE_VERIFY", "/env/ca.pem")
+    assert azure.AzureAuthConfig.from_env().verify == "/env/ca.pem"
+
+
+def test_verify_inherits_the_vault_setting(_isolated):
+    # One bundle covers both legs of the credential chain, and the reference
+    # deployment configures a single `verify` for exactly that reason.
+    _set(_isolated, {"vault": {"verify": "/etc/vault-ca.pem"}})
+    assert azure.AzureAuthConfig.from_env().verify == "/etc/vault-ca.pem"
+
+
+def test_verify_inherits_vault_skip_verify(monkeypatch, _isolated):
+    monkeypatch.setenv("VAULT_SKIP_VERIFY", "true")
+    assert azure.AzureAuthConfig.from_env().verify is False
+
+
+def test_azure_verify_beats_the_inherited_vault_one(_isolated):
+    _set(
+        _isolated,
+        {"vault": {"verify": "/etc/vault-ca.pem"}, "azure": {"verify": "/own-ca.pem"}},
+    )
+    assert azure.AzureAuthConfig.from_env().verify == "/own-ca.pem"
+
+
+def test_proxies_from_config_json(_isolated):
+    _set(_isolated, {"azure": {"proxies": {"https": "http://proxy:8080"}}})
+    assert azure.AzureAuthConfig.from_env().proxies == {"https": "http://proxy:8080"}
+
+
+def test_wrong_typed_proxies_degrade(_isolated, caplog):
+    _set(_isolated, {"azure": {"proxies": {"https": 8080}}})
+    with caplog.at_level(logging.WARNING, logger="app_config.azure"):
+        assert azure.AzureAuthConfig.from_env().proxies is None
+    assert "proxies" in caplog.text
+
+
+class _FakeMsalModule:
+    """Records the keyword arguments each application class is built with."""
+
+    def __init__(self):
+        self.confidential: dict | None = None
+        self.public: dict | None = None
+
+    def ConfidentialClientApplication(self, **kwargs):  # noqa: N802 — msal's name
+        self.confidential = kwargs
+        return object()
+
+    def PublicClientApplication(self, **kwargs):  # noqa: N802 — msal's name
+        self.public = kwargs
+        return object()
+
+
+def _build_with_fake_msal(monkeypatch, config):
+    fake = _FakeMsalModule()
+    monkeypatch.setitem(sys.modules, "msal", fake)
+    azure.AzureAuthClient(config).app
+    return fake
+
+
+def test_verify_and_proxies_reach_the_confidential_app(monkeypatch, _isolated):
+    proxies = {"https": "http://proxy:8080"}
+    cfg = azure.AzureAuthConfig(
+        tenant_id="t",
+        client_id="c",
+        client_secret="s",
+        verify="/etc/ssl/corp-ca.pem",
+        proxies=proxies,
+    )
+    fake = _build_with_fake_msal(monkeypatch, cfg)
+    assert fake.confidential is not None
+    assert fake.confidential["verify"] == "/etc/ssl/corp-ca.pem"
+    assert fake.confidential["proxies"] == proxies
+
+
+def test_verify_and_proxies_reach_the_public_app(monkeypatch, _isolated):
+    cfg = azure.AzureAuthConfig(
+        tenant_id="t", client_id="c", flow=azure.FLOW_DEVICE_CODE, verify=False
+    )
+    fake = _build_with_fake_msal(monkeypatch, cfg)
+    assert fake.public is not None
+    assert fake.public["verify"] is False
+    assert fake.public["proxies"] is None
 
 
 def test_flow_can_be_pinned(_isolated):
@@ -502,6 +622,16 @@ def test_for_principal_pins_the_identity(monkeypatch, _isolated):
     )
     assert cfg.authority_host == "https://login.microsoftonline.us"
     assert cfg.auth_flow == azure.FLOW_CLIENT_CREDENTIALS
+
+
+def test_for_principal_preserves_the_transport_settings(monkeypatch, _isolated):
+    # The Databricks-service-principal path goes through here and faces the
+    # same intercepted network, so verify/proxies must survive the pinning.
+    monkeypatch.setenv("AZURE_VERIFY", "/etc/ssl/corp-ca.pem")
+    _set(_isolated, {"azure": {"proxies": {"https": "http://proxy:8080"}}})
+    cfg = azure.AzureAuthConfig.for_principal("t-pin", "c-pin", "s-pin")
+    assert cfg.verify == "/etc/ssl/corp-ca.pem"
+    assert cfg.proxies == {"https": "http://proxy:8080"}
 
 
 def test_for_principal_clears_certificate_fields(monkeypatch, _isolated):

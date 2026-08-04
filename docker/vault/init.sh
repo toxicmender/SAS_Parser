@@ -7,9 +7,10 @@
 # What it creates
 # ---------------
 #   secret/            KV v2 (dev mode mounts this already; enabled if not)
-#   secret/appsvc/ai_gateway   api_key [+ base_url]  <- the DEFAULT path
-#                              (app_config.vault.AI_GATEWAY_PATH); read by
-#                              demo_run.py when no --vault-secret is passed
+#   secret/appsvc/ai_gateway   api_key [+ base_url]  <- the DEFAULT path,
+#                              "<app_name>/ai_gateway" with the compose file's
+#                              VAULT_APP_NAME=appsvc; read by demo_run.py when
+#                              no --vault-secret is passed
 #   secret/llm/anthropic       api_key               <- the explicit path used
 #                              by `demo_run.py ... --vault-secret llm/anthropic`
 #   auth/approle       with role `sas-parser`, policy-scoped to read the two

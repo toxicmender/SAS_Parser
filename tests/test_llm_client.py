@@ -16,6 +16,7 @@ import os
 import pathlib
 import sys
 import time
+from typing import Any
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -1133,3 +1134,325 @@ def test_pipeline_enforces_input_token_budget():
 
     with pytest.raises(InputTokenLimitError):
         pipeline._process(items=[batch], diagnostics=[], thread_id="run::etl.sas")
+
+
+# ---------------------------------------------------------------------------
+# AI Gateway conformance: the ai-gateway-version header and provider splitting
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _isolated_config(monkeypatch, tmp_path):
+    """An empty config.json, so role overlays are only what a test sets."""
+    import app_config
+
+    cfg = tmp_path / "config.json"
+    cfg.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv(app_config.ENV_VAR, str(cfg))
+    monkeypatch.delenv("LLM_GATEWAY_VERSION", raising=False)
+    app_config.clear_cache()
+    yield cfg
+    app_config.clear_cache()
+
+
+def _write_config(cfg_path, mapping) -> None:
+    import json
+
+    import app_config
+
+    cfg_path.write_text(json.dumps(mapping), encoding="utf-8")
+    app_config.clear_cache()
+
+
+def test_gateway_version_is_sent_as_a_header(monkeypatch):
+    captured = _capture_init(monkeypatch)
+    LLMClient(LLMClientConfig(model="some-model", gateway_version="v2"))
+
+    assert captured["default_headers"]["ai-gateway-version"] == "v2"
+
+
+def test_no_gateway_version_header_when_unset(monkeypatch, _isolated_config):
+    captured = _capture_init(monkeypatch)
+    LLMClient(LLMClientConfig(model="some-model", url_headers={"X-Team": "sas"}))
+
+    assert captured["default_headers"] == {"X-Team": "sas"}
+
+
+def test_explicit_gateway_version_header_wins(monkeypatch):
+    # setdefault, the same rule as api-key: an operator who set the header
+    # through url_headers meant it.
+    captured = _capture_init(monkeypatch)
+    LLMClient(
+        LLMClientConfig(
+            model="some-model",
+            gateway_version="v2",
+            url_headers={"ai-gateway-version": "v1"},
+        )
+    )
+
+    assert captured["default_headers"]["ai-gateway-version"] == "v1"
+
+
+def test_gateway_version_read_from_config_json(_isolated_config):
+    _write_config(_isolated_config, {"llm_client": {"gateway_version": "v2"}})
+    assert LLMClientConfig().gateway_version == "v2"
+
+
+def test_gateway_version_env_beats_config_json(monkeypatch, _isolated_config):
+    _write_config(_isolated_config, {"llm_client": {"gateway_version": "v2"}})
+    monkeypatch.setenv("LLM_GATEWAY_VERSION", "v3")
+    assert LLMClientConfig().gateway_version == "v3"
+
+
+def test_split_model_separates_provider_and_lowercases():
+    assert client_mod._split_model("anthropic:claude-sonnet-4-5") == (
+        "anthropic",
+        "claude-sonnet-4-5",
+    )
+    # The reference reads "provider: model" out of a SharePoint column, spaces
+    # and mixed case included.
+    assert client_mod._split_model("Anthropic: Claude-Sonnet-4-5") == (
+        "Anthropic",
+        "claude-sonnet-4-5",
+    )
+
+
+def test_split_model_leaves_an_unprefixed_id_alone():
+    # No prefix means the id was written by hand; its case is the operator's.
+    assert client_mod._split_model("GPT-5.4") == (None, "GPT-5.4")
+
+
+def test_prefixed_model_sends_only_the_id_to_the_gateway(monkeypatch):
+    captured = _capture_init(monkeypatch)
+    LLMClient(LLMClientConfig(model="anthropic:claude-sonnet-4-5"))
+
+    assert captured["model"] == "claude-sonnet-4-5"
+
+
+def test_model_provider_is_recorded_not_dropped(monkeypatch, caplog):
+    _capture_init(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="llm_client.client"):
+        LLMClient(LLMClientConfig(model="anthropic:claude-sonnet-4-5"))
+
+    assert "provider=anthropic" in caplog.text
+
+
+def test_explicit_model_provider_beats_the_prefix(monkeypatch, caplog):
+    _capture_init(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="llm_client.client"):
+        LLMClient(
+            LLMClientConfig(
+                model="anthropic:claude-sonnet-4-5", model_provider="pinned"
+            )
+        )
+
+    assert "provider=pinned" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# provider_client="native"
+# ---------------------------------------------------------------------------
+
+
+class _FakeUsage:
+    prompt_tokens = 11
+    completion_tokens = 7
+    total_tokens = 18
+
+
+class _FakeCompletion:
+    def __init__(self, content):
+        message: Any = type("M", (), {})()
+        message.content = content
+        choice: Any = type("Choice", (), {})()
+        choice.message = message
+        self.choices = [choice]
+        self.usage = _FakeUsage()
+
+
+class _FakeOpenAI:
+    """Records construction kwargs and every create() body."""
+
+    instances: list["_FakeOpenAI"] = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.calls: list[dict] = []
+        _FakeOpenAI.instances.append(self)
+        completions: Any = type("Completions", (), {})()
+        completions.create = self._create
+        chat: Any = type("Chat", (), {})()
+        chat.completions = completions
+        self.chat = chat
+
+    def _create(self, **body):
+        self.calls.append(body)
+        return _FakeCompletion("native answer")
+
+
+@pytest.fixture
+def _fake_openai(monkeypatch):
+    import openai
+
+    _FakeOpenAI.instances.clear()
+    monkeypatch.setattr(openai, "OpenAI", _FakeOpenAI)
+    return _FakeOpenAI
+
+
+def _native_config(**overrides):
+    values: dict[str, Any] = {
+        "model": "anthropic:claude-sonnet-4-5",
+        "provider_client": "native",
+        "base_url": "https://gw.example/chat/",
+        "gateway_version": "v2",
+        "api_key": "sk-secret",
+        "temperature": 0.0,
+        "max_output_tokens": 64000,
+    }
+    values.update(overrides)
+    return LLMClientConfig(**values)
+
+
+def test_native_client_is_built_instead_of_chat_openai(monkeypatch, _fake_openai):
+    def _explode(**kwargs):
+        raise AssertionError("ChatOpenAI must not be built on the native path")
+
+    monkeypatch.setattr(client_mod, "ChatOpenAI", _explode)
+    LLMClient(_native_config())
+
+    assert len(_fake_openai.instances) == 1
+    built = _fake_openai.instances[0].kwargs
+    # Trailing slash => per-deployment route, model as the last path segment.
+    assert built["base_url"] == "https://gw.example/chat/claude-sonnet-4-5"
+    assert built["api_key"] == "sk-secret"
+    assert built["default_headers"]["ai-gateway-version"] == "v2"
+    assert built["default_headers"]["api-key"] == "sk-secret"
+    # This class owns retries; the SDK's own layer would hide Retry-After.
+    assert built["max_retries"] == 0
+
+
+def test_native_client_invokes_and_maps_the_roles(_fake_openai):
+    llm = LLMClient(_native_config())
+    reply = llm.invoke(
+        [SystemMessage("be brief"), HumanMessage("hi"), AIMessage("hello")]
+    )
+
+    assert reply.content == "native answer"
+    body = _fake_openai.instances[0].calls[0]
+    assert body["model"] == "claude-sonnet-4-5"
+    assert body["messages"] == [
+        {"role": "system", "content": "be brief"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+    ]
+    assert body["max_tokens"] == 64000
+    assert body["temperature"] == 0.0
+
+
+def test_native_client_still_accounts_for_tokens(_fake_openai):
+    llm = LLMClient(_native_config())
+    llm.invoke("hi")
+
+    # Usage accounting lives in LLMClient, above the model, so it survives the
+    # transport swap.
+    assert llm.usage.input_tokens == 11
+    assert llm.usage.output_tokens == 7
+    assert llm.usage.calls == 1
+
+
+def test_native_client_still_retries(_fake_openai):
+    llm = LLMClient(_native_config(retry_base_seconds=0.001))
+    calls = {"n": 0}
+
+    def _flaky(**body):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _FakeRateLimitError("429")
+        return _FakeCompletion("after retry")
+
+    _fake_openai.instances[0].chat.completions.create = _flaky
+    assert llm.invoke("hi").content == "after retry"
+    assert calls["n"] == 2
+
+
+def test_native_client_warns_about_what_it_forfeits(_fake_openai, caplog):
+    with caplog.at_level(logging.WARNING, logger="llm_client.client"):
+        LLMClient(_native_config(requests_per_second=2.0, model_kwargs={"top_k": 40}))
+
+    assert "requests_per_second" in caplog.text
+    assert "model_kwargs" in caplog.text
+
+
+def test_native_client_reports_no_structured_output(_fake_openai):
+    from pydantic import BaseModel as _PydanticModel
+
+    class _Schema(_PydanticModel):
+        answer: str
+
+    llm = LLMClient(_native_config())
+    # with_structured_output does not exist on the wrapped callable, and the
+    # caller must learn that by asking rather than by a mid-run AttributeError.
+    assert llm.supports_structured_output(_Schema) is False
+
+
+def test_flattens_multipart_content_for_the_native_wire_format(_fake_openai):
+    llm = LLMClient(_native_config())
+    llm.invoke(
+        [
+            HumanMessage(
+                content=[
+                    {"type": "text", "text": "part one "},
+                    {"type": "text", "text": "part two"},
+                ]
+            )
+        ]
+    )
+
+    body = _fake_openai.instances[0].calls[0]
+    assert body["messages"] == [{"role": "user", "content": "part one part two"}]
+
+
+# ---------------------------------------------------------------------------
+# Per-role overlays (LLMClientConfig.for_role)
+# ---------------------------------------------------------------------------
+
+
+_ROLES_FILE = {
+    "llm_client": {
+        "timeout": 6000,
+        "model": "claude-sonnet-4-5",
+        "roles": {
+            "validator": {"timeout": 12000},
+            "complexity": {"model": "claude-opus-4-6"},
+        },
+    }
+}
+
+
+def test_for_role_applies_the_overlay(_isolated_config):
+    _write_config(_isolated_config, _ROLES_FILE)
+    validator = LLMClientConfig.for_role("validator")
+
+    assert validator.timeout == 12000
+    # A key the role does not mention resolves from the base section.
+    assert validator.model == "claude-sonnet-4-5"
+
+
+def test_for_role_leaves_unmentioned_keys_at_their_defaults(_isolated_config):
+    _write_config(_isolated_config, _ROLES_FILE)
+    assert LLMClientConfig.for_role("complexity").model == "claude-opus-4-6"
+    assert LLMClientConfig.for_role("complexity").timeout == 6000
+    assert LLMClientConfig.for_role("complexity").max_retries == 3
+
+
+def test_explicit_argument_beats_the_role(_isolated_config):
+    _write_config(_isolated_config, _ROLES_FILE)
+    config = LLMClientConfig.for_role("validator", timeout=5.0)
+
+    assert config.timeout == 5.0
+
+
+def test_unknown_role_is_the_plain_config(_isolated_config):
+    _write_config(_isolated_config, _ROLES_FILE)
+    assert LLMClientConfig.for_role("no-such-role").timeout == 6000
+    assert LLMClientConfig.for_role("no-such-role").model == "claude-sonnet-4-5"

@@ -30,7 +30,7 @@ _VAULT_ENV = (
     "VAULT_TOKEN",
     "VAULT_ROLE_ID",
     "VAULT_SECRET_ID",
-    "VAULT_OIDC_ROLE",
+    "VAULT_APP_NAME",
     "VAULT_NAMESPACE",
 )
 
@@ -61,7 +61,7 @@ def _args(**overrides):
 def _vault_configured(monkeypatch) -> None:
     """The env of a workspace whose Vault does the azuread (JWT) login."""
     monkeypatch.setenv("VAULT_ADDR", "https://vault.example:8200")
-    monkeypatch.setenv("VAULT_OIDC_ROLE", "sas-parser")
+    monkeypatch.setenv("VAULT_APP_NAME", "sas-parser")
 
 
 def _gateway_secret(monkeypatch, data) -> None:
