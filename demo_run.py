@@ -161,8 +161,10 @@ from pathlib import Path
 from typing import Any
 
 import app_config
+from app_config.spark import describe_master, master_url
 from llm_client import LLMClientConfig
 from pipeline import SasLLMPipeline
+from pipeline.setup import MemorySetup
 from chunker._repl import print_iterable
 from prompt_builder import PromptBuilder
 from target_language import (
@@ -368,6 +370,15 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         "OPENAI_API_KEY from the environment instead.",
     )
     parser.add_argument(
+        "--delta-table",
+        default=None,
+        help="Persist conversation memory to this Delta table instead of the "
+        "in-memory store (e.g. default.sas_parser_memory). Boots a Spark "
+        "session against app_config.spark's master — SPARK_MASTER_URL, then "
+        "config.json spark.master, then a local in-process cluster. Omit to "
+        "keep everything in memory and start no JVM.",
+    )
+    parser.add_argument(
         "--validation-retries",
         type=int,
         default=1,
@@ -469,14 +480,20 @@ def _build_pipeline(
 ) -> SasLLMPipeline:
     """Load the reference corpus once and wire up the pipeline.
 
-    The message store is in-memory — ``MemorySetup()``'s default — so no
-    Spark/JVM is booted.
-    ``base_url`` is forwarded only when the AI Gateway secret named an
+    The message store is in-memory unless ``--delta-table`` names one, in
+    which case the pipeline builds a Spark session (see
+    :mod:`app_config.spark` for which master) and persists the conversation
+    there. ``base_url`` is forwarded only when the AI Gateway secret named an
     endpoint; ``None`` leaves config.json's ``llm_client.base_url`` in charge.
     """
     logger.info(f"building instruction corpus from {args.reference_dir}")
     builder = PromptBuilder.from_reference_dir(str(args.reference_dir))
-    # Transport and memory each arrive as one grouped config -- the pipeline
+    if args.delta_table:
+        logger.info(
+            f"persisting conversation memory to Delta table "
+            f"{args.delta_table} on {describe_master(master_url())}"
+        )
+    # Transport and memory each arrive as one grouped config — the pipeline
     # takes no individual spellings of either. base_url / api_key are
     # forwarded only when set, so an omitted one still defers to config.json
     # (passing an explicit None would override it).
@@ -485,8 +502,10 @@ def _build_pipeline(
         values["api_key"] = api_key
     if base_url is not None:
         values["base_url"] = base_url
+    llm_config = LLMClientConfig(**values)
     return SasLLMPipeline(
-        llm_config=LLMClientConfig(**values),
+        llm_config=llm_config,
+        memory_setup=MemorySetup(delta_table=args.delta_table),
         output_language=args.output_language,
         prompt_builder=builder,
         validator=validator,

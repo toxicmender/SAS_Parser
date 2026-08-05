@@ -18,6 +18,7 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
 
+from app_config.spark import describe_master, master_url
 from memory.context import MemoryContext
 from memory.extractor import MemoryExtractor
 from memory.policy import TaskPolicy
@@ -126,9 +127,13 @@ class MemorySetup:
         if spark is None:
             from pyspark.sql import SparkSession
 
-            logger.info("MemorySetup: no SparkSession provided, starting local one")
+            master = master_url()
+            logger.info(
+                f"MemorySetup: no SparkSession provided, building one against "
+                f"{describe_master(master)}"
+            )
             spark = (
-                SparkSession.builder.master("local[*]")
+                SparkSession.builder.master(master)
                 .appName("chunker_pipeline")
                 .getOrCreate()
             )

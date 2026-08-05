@@ -92,6 +92,10 @@
     "table": null,
     "path": null
   },
+  "_spark_comment": "Where the Spark cluster is. 'master' is the URL a SparkSession is built against when the caller does not pass one -- the Delta memory backend (memory.store) and validation tracking. Also read from SPARK_MASTER_URL, which wins over this file; the Docker stack sets it on the app service, so the compose cluster is used without changing anything here. null uses the code default, 'local[*]' (an in-process cluster), which is also what a bare-metal run gets when nothing is configured. Note that this value overrides spark.master in $SPARK_CONF_DIR/spark-defaults.conf, because an explicit builder.master() call outranks that file.",
+  "spark": {
+    "master": null
+  },
   "_vault_comment": "Non-secret Vault connection settings only. Secrets (VAULT_TOKEN, VAULT_ROLE_ID, VAULT_SECRET_ID) come from the environment, never this file. address/namespace/auth_path/app_name/azure_scopes also read from VAULT_ADDR/VAULT_NAMESPACE/VAULT_AUTH_PATH/VAULT_APP_NAME/VAULT_AZURE_SCOPES, which win over these. app_name is ONE value playing three parts, exactly as the reference deployment uses it: the Vault role name, the KV secret-path prefix, and the application's own name. Setting it enables 'azuread' login: an Entra ID JWT (see 'azure' and databricks.secret_scope) is presented to the jwt auth method at auth/<auth_path>/login. azure_scopes is the audience that JWT is minted for; null requests Azure Resource Manager (https://management.azure.com//.default -- the doubled slash is ARM's documented form), which is what a role bound to the ARM audience expects. ai_gateway_path defaults to '<app_name>/ai_gateway'; ai_gateway_key names the field holding the token in it, and null tries token/api_key/apikey/ai_gateway_token/value in order.",
   "vault": {
     "address": null,

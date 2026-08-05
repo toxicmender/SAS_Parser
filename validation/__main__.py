@@ -41,6 +41,7 @@ import logging
 import sys
 from pathlib import Path
 
+from app_config.spark import describe_master, master_url
 from pipeline import SasLLMPipeline
 from llm_client import LLMClient, LLMClientConfig, TokenUsage
 from target_language import resolve_target_language
@@ -67,8 +68,12 @@ def _validate_thread(
     from memory.store import MemoryHub
     from pyspark.sql import SparkSession
 
+    master = master_url()
+    logger.info(
+        f"_validate_thread: building a session against {describe_master(master)}"
+    )
     spark = (
-        SparkSession.builder.master("local[*]")
+        SparkSession.builder.master(master)
         .appName("validation_thread")
         .getOrCreate()
     )

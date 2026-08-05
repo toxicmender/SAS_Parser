@@ -80,27 +80,6 @@ def _jload(s: str) -> Any:
     return json.loads(s)
 
 
-# LIKE-pattern escape character.  All Delta-mode SQL passes values through
-# Spark's parameter markers (spark.sql(sql, args)), so there is no
-# string-literal layer to survive; '~' is simply the escape char declared in
-# the LIKE's ESCAPE clause.
-_LIKE_ESCAPE = "~"
-
-
-def _sql_like_prefix(prefix: str) -> str:
-    """Escape LIKE wildcards in *prefix* for a literal prefix match.
-
-    ``_`` matches any single character in LIKE and ``%`` any run, so a key
-    prefix like ``msg::thread_1::`` would otherwise also match
-    ``msg::threadX1::…``.  The result must be used with ``ESCAPE '~'``.
-    """
-    return (
-        prefix.replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2)
-        .replace("%", _LIKE_ESCAPE + "%")
-        .replace("_", _LIKE_ESCAPE + "_")
-    )
-
-
 # Schema for the Delta table (built lazily; Delta mode only)
 _KV_SCHEMA = None
 
@@ -359,33 +338,58 @@ class _DeltaBackend:
         # Stops at the first matching row instead of collecting every key.
         return bool(self._df(prefix).limit(1).count())
 
+    def _delete_keys(self, keys: List[str]) -> None:
+        """Delete exactly *keys*, staging them as data rather than as SQL.
+
+        Deletes go through MERGE rather than ``DELETE FROM ... WHERE`` because
+        neither obvious spelling of the WHERE clause works here:
+
+        * Spark's named parameter markers (``spark.sql(sql, args)``) are not
+          substituted inside Delta's ``DeltaDelete`` plan — the parameter stays
+          unbound and analysis fails with ``UNBOUND_SQL_PARAMETER``.
+        * The ``delta.tables.DeltaTable`` Python API, which would take a Column
+          expression, is not reachable from the py4j gateway in this
+          deployment (``io.delta.tables.DeltaTable does not exist in the JVM``)
+          even though Delta SQL itself works.
+
+        Staging the keys in a view is the spelling that works, and it is the
+        same mechanism :meth:`upsert` and :meth:`replace_all` already use: key
+        values travel as *data*, so nothing needs SQL quoting or LIKE
+        escaping, and a key containing quotes or wildcards is just a string.
+        """
+        view = f"_kv_delete_{uuid.uuid4().hex}"
+        self._spark.createDataFrame([(k,) for k in keys], "kv_key STRING") \
+            .createOrReplaceTempView(view)
+        try:
+            self._spark.sql(
+                f"MERGE INTO {self._table} tgt USING {view} src "
+                f"ON tgt.kv_key = src.kv_key WHEN MATCHED THEN DELETE"
+            )
+        finally:
+            self._spark.catalog.dropTempView(view)
+
     def delete_many(self, keys: List[str]) -> int:
         key_list = list(set(keys))
-        existing = self._df().filter(F.col("kv_key").isin(key_list)).count()
+        existing = [
+            row.kv_key
+            for row in self._df()
+            .filter(F.col("kv_key").isin(key_list))
+            .select("kv_key")
+            .collect()
+        ]
         if existing:
-            # Named parameter markers (Spark >= 3.4) — key values never
-            # touch the SQL text, so no quoting/escaping is needed.
-            markers = ", ".join(f":k{i}" for i in range(len(key_list)))
-            args = {f"k{i}": key for i, key in enumerate(key_list)}
-            self._spark.sql(
-                f"DELETE FROM {self._table} WHERE kv_key IN ({markers})", args
-            )
-        return existing
+            self._delete_keys(existing)
+        return len(existing)
 
     def clear_prefix(self, prefix: str) -> int:
-        count = self._df(prefix).count()
-        # LIKE wildcards in the prefix must be escaped: '_' matches any
-        # character, so "msg::thread_1::" would otherwise also delete
-        # "msg::threadX1::…" — unlike every read path, which matches
-        # the prefix literally via startswith. The pattern itself is passed
-        # as a parameter marker, never inlined into the SQL text.
-        pattern = _sql_like_prefix(prefix) + "%"
-        self._spark.sql(
-            f"DELETE FROM {self._table} "
-            f"WHERE kv_key LIKE :pattern ESCAPE '{_LIKE_ESCAPE}'",
-            {"pattern": pattern},
-        )
-        return count
+        # The matching keys are collected first, so the MERGE source is a
+        # fresh DataFrame rather than a view over the table being merged into.
+        # _df()'s startswith is a literal prefix match, so "msg::thread_1::"
+        # cannot also delete "msg::threadX1::…" — no wildcards to escape.
+        keys = self.keys(prefix)
+        if keys:
+            self._delete_keys(keys)
+        return len(keys)
 
     def clear(self) -> None:
         self._spark.sql(f"DELETE FROM {self._table}")

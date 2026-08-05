@@ -24,7 +24,6 @@ from memory.store import (
     KVMemoryStore,
     KVStore,
     ThreadMemoryManager,
-    _sql_like_prefix,
 )
 
 
@@ -213,18 +212,6 @@ class TestHybridKVSearch(unittest.TestCase):
         mem = MemoryHub()
         mem.kv.set("goal", "RAG pipeline")
         self.assertEqual(mem.kv.search("pipeline")[0][0], "goal")
-
-
-class TestSqlLikePrefix(unittest.TestCase):
-    def test_underscore_and_percent_escaped(self):
-        self.assertEqual(_sql_like_prefix("msg::thread_1::"), "msg::thread~_1::")
-        self.assertEqual(_sql_like_prefix("a%b"), "a~%b")
-
-    def test_escape_char_doubled(self):
-        self.assertEqual(_sql_like_prefix("a~b"), "a~~b")
-
-    def test_plain_prefix_unchanged(self):
-        self.assertEqual(_sql_like_prefix("kv::plain"), "kv::plain")
 
 
 class TestSetMany(unittest.TestCase):

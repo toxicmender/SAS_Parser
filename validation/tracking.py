@@ -43,6 +43,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import app_config
+from app_config.spark import describe_master, master_url
 
 from .models import ValidationReport
 
@@ -93,9 +94,13 @@ def _ensure_spark(spark: "SparkSession | None") -> "SparkSession":
         return spark
     from pyspark.sql import SparkSession
 
-    logger.info("_ensure_spark: no SparkSession provided, starting local one")
+    master = master_url()
+    logger.info(
+        f"_ensure_spark: no SparkSession provided, building one against "
+        f"{describe_master(master)}"
+    )
     return (
-        SparkSession.builder.master("local[*]")
+        SparkSession.builder.master(master)
         .appName("validation_tracking")
         .getOrCreate()
     )
