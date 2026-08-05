@@ -608,6 +608,30 @@ def _run_sharepoint(args: argparse.Namespace) -> int:
     return status
 
 
+def _profile_for(output_language: str | None) -> str | None:
+    """The rules profile a row's ``Output_Language`` names.
+
+    The row carries a *language* in whatever spelling an operator picked
+    ("SparkSQL", "Spark SQL", "spark_sql"), while ``--target`` and the
+    ``profiles/`` directory carry a *profile* name ("sparksql").
+    :mod:`target_language` owns the folding between the two, so routing the
+    row through it is what makes a display-cased value find its rule set —
+    on a case-sensitive filesystem as much as a forgiving one.
+
+    Raises
+    ------
+    target_language.UnknownTargetLanguage
+        The row names a language this repo cannot translate into. Reported
+        per row by :func:`_run_sharepoint`, which is the right blast radius:
+        one mistyped row must not stop the others.
+    """
+    if not output_language:
+        return None
+    from target_language import resolve_target_language
+
+    return resolve_target_language(output_language).complexity_profile
+
+
 def _run_request(args: argparse.Namespace, row: Any, *, client: Any) -> int:
     """Score one request row and upload its reports."""
     from . import sharepoint as sp
@@ -615,7 +639,8 @@ def _run_request(args: argparse.Namespace, row: Any, *, client: Any) -> int:
     started = time.monotonic()
     # Explicit flags beat the row, which beats config.json, which beats the
     # built-in default — the repo-wide precedence rule, extended by one step.
-    target = args.target or row.output_language
+    # --target already names a profile; the row names a language.
+    target = args.target or _profile_for(row.output_language)
     model = args.llm_model or row.preferred_llm
     run_llm_eval = bool(args.llm_eval or args.prompt_only or model)
 

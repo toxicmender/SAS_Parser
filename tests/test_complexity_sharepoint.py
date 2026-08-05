@@ -367,6 +367,7 @@ def test_label_is_the_rules_profile_without_llm_eval(_wired):
 
     # Output_Language from the row picks the profile, and the profile names
     # the folder when no model produced the estimate.
+    assert transport.uploaded  # not vacuous: the run has to have delivered
     assert all(
         folder.startswith(f"{BASE}/MyApp/complexity/pyspark/")
         for folder, _, _ in transport.uploaded
@@ -383,16 +384,44 @@ def test_label_is_the_model_when_llm_eval_ran(_wired, monkeypatch):
     )
     cli.main(["--sharepoint", "--app", "MyApp"])
 
+    assert transport.uploaded
     assert all(
         folder.startswith(f"{BASE}/MyApp/complexity/claude-sonnet-4-5/")
         for folder, _, _ in transport.uploaded
     )
 
 
+@pytest.mark.parametrize(
+    "spelling", ["SparkSQL", "Spark SQL", "spark_sql", "sql", "sparksql"]
+)
+def test_row_language_folds_onto_a_profile_name(spelling):
+    # The row carries a display-cased language; profiles/ carries lowercase
+    # file names. Folding through target_language is what keeps the two
+    # agreeing — on a case-sensitive filesystem as much as a forgiving one.
+    assert cli._profile_for(spelling) == "sparksql"
+
+
+def test_row_language_pyspark_folds_too():
+    assert cli._profile_for("PySpark") == "pyspark"
+
+
+def test_no_row_language_leaves_the_target_unset():
+    assert cli._profile_for(None) is None
+    assert cli._profile_for("") is None
+
+
+def test_an_unknown_row_language_is_reported_not_guessed():
+    from target_language import UnknownTargetLanguage
+
+    with pytest.raises(UnknownTargetLanguage):
+        cli._profile_for("COBOL")
+
+
 def test_explicit_target_beats_the_row(_wired):
     transport = _wired(_corpus_transport(rows=[_row(language="PySpark")]))
     cli.main(["--sharepoint", "--app", "MyApp", "--target", "sparksql"])
 
+    assert transport.uploaded
     assert all(
         folder.startswith(f"{BASE}/MyApp/complexity/sparksql/")
         for folder, _, _ in transport.uploaded
@@ -441,6 +470,7 @@ def test_sharepoint_out_overrides_the_convention(_wired):
     transport = _wired(_corpus_transport())
     cli.main(["--sharepoint", "--app", "MyApp", "--sharepoint-out", "Scratch/runs"])
 
+    assert transport.uploaded
     assert all(
         folder.startswith("Scratch/runs") for folder, _, _ in transport.uploaded
     )

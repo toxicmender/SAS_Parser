@@ -163,7 +163,6 @@ from typing import Any
 import app_config
 from llm_client import LLMClientConfig
 from pipeline import SasLLMPipeline
-from pipeline.setup import MemorySetup
 from chunker._repl import print_iterable
 from prompt_builder import PromptBuilder
 from target_language import (

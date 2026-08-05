@@ -1133,6 +1133,7 @@ def _list_client(items):
     return client, items_builder
 
 
+@requires_msgraph
 def test_list_items_is_read_list_items():
     client, _ = _list_client({1: {"Title": "one"}, 2: {"Title": "two"}})
     rows = client.list_items("L-xref")
