@@ -30,6 +30,14 @@ Then drive the CLI inside the app container:
 docker compose exec app python demo_run.py local sas_scripts --out-dir out --md out/report.md
 ```
 
+That run keeps its conversation memory in process. To persist it to a Delta
+table on the cluster instead, name one — the session is built against
+`SPARK_MASTER_URL`, which compose already sets on the `app` service:
+
+```bash
+docker compose exec app python demo_run.py local sas_scripts --out-dir out --delta-table default.sas_parser_memory
+```
+
 ```bash
 docker compose exec app python -m complexity sas_scripts --out complexity_report.md
 ```
@@ -56,11 +64,16 @@ docker compose exec app python -c "from app_config.vault import get_secret; prin
 ```
 
 ```bash
-docker compose exec app python -c "import os; from pyspark.sql import SparkSession; s = SparkSession.builder.master(os.environ['SPARK_MASTER_URL']).getOrCreate(); s.sql('CREATE TABLE IF NOT EXISTS smoke (id BIGINT) USING DELTA'); s.sql('INSERT INTO smoke VALUES (7)'); print('rows:', s.table('smoke').count()); s.stop()"
+docker compose exec app python -c "from app_config.spark import master_url; from pyspark.sql import SparkSession; s = SparkSession.builder.master(master_url()).getOrCreate(); s.sql('CREATE TABLE IF NOT EXISTS smoke (id BIGINT) USING DELTA'); s.sql('INSERT INTO smoke VALUES (7)'); print('rows:', s.table('smoke').count()); s.stop()"
 ```
 
 The first prints the seeded key (an AppRole login against the dev Vault); the
 second writes and reads a Delta table through the cluster's executors.
+
+Both go through the application's own configuration rather than reaching past
+it: `master_url()` is the same resolver the pipeline and the validation CLI
+use, so a smoke test that passes proves the paths those take are wired, not
+just that the cluster is up.
 
 ## What `vault-init` sets up
 
@@ -128,13 +141,35 @@ Delta backend and `validation.tracking` actually talk to. Code that works
 against this cluster is the same code that runs on a Databricks cluster; what
 you do *not* get locally is Unity Catalog, workspace APIs, or DBFS.
 
+### How the app finds the cluster
+
+Nothing in the application names a master. `app_config.spark.master_url()`
+resolves it — an explicit argument, then `SPARK_MASTER_URL`, then
+`config.json`'s `spark.master`, then `local[*]` — and the three places that
+build a session (`pipeline.setup`, `validation.tracking`,
+`validation.__main__`) all go through it. Compose sets `SPARK_MASTER_URL` on
+the `app` service, so inside the stack those paths reach the cluster, and
+outside it they fall back to a local in-process cluster exactly as before.
+This is the same rule the Vault half follows: change environment variables,
+change nothing else.
+
+Note that a hard-coded `SparkSession.builder.master(...)` would defeat this,
+and silently — an explicit `.master()` call outranks `spark.master` in
+`$SPARK_CONF_DIR/spark-defaults.conf`, which the image also writes. Pass
+`master_url()`, not a literal.
+
+### Version pinning
+
 Spark comes from the **pyspark wheel** — no separate distribution — pinned to
-the version `uv.lock` pins for the app (`PYSPARK_VERSION`, currently 4.1.2). A
+the version `uv.lock` pins for the app (`PYSPARK_VERSION`, currently 4.2.0). A
 driver and a cluster on different Spark versions fail at handshake, so both
-images take the version from the same variable. The pip wheel ships
-`bin/spark-class` but not `sbin/start-master.sh`, which is why
-[`spark/entrypoint.sh`](spark/entrypoint.sh) launches the daemon classes
-directly.
+images take the version from the same variable. The app image installs the
+*locked* version while the cluster images build the *compose* one, so the two
+can drift apart on any dependency bump;
+[`tests/test_docker_pins.py`](../tests/test_docker_pins.py) fails when they
+do. The pip wheel ships `bin/spark-class` but not `sbin/start-master.sh`,
+which is why [`spark/entrypoint.sh`](spark/entrypoint.sh) launches the daemon
+classes directly.
 
 Delta Lake is installed by [`spark/install_delta.sh`](spark/install_delta.sh),
 run identically in both images: it pip-installs `delta-spark` (pinning pyspark
@@ -148,7 +183,7 @@ actually runs, which is this image.
 Run something against the cluster:
 
 ```bash
-docker compose exec app python -c "from pyspark.sql import SparkSession; s = SparkSession.builder.master('spark://spark-master:7077').getOrCreate(); print(s.range(5).count()); s.stop()"
+docker compose exec app python -c "from app_config.spark import master_url; from pyspark.sql import SparkSession; s = SparkSession.builder.master(master_url()).getOrCreate(); print(s.range(5).count()); s.stop()"
 ```
 
 Anything the cluster touches must live on a path **all** the containers share —
@@ -162,7 +197,14 @@ fine.
 The Delta backend of the KV store, on the cluster:
 
 ```bash
-docker compose exec app python -c "from pyspark.sql import SparkSession; from memory.store import KVStore; s = SparkSession.builder.master('spark://spark-master:7077').getOrCreate(); kv = KVStore(spark=s, table='default.kv_demo'); kv.set('hello', 'world'); print(kv.get('hello')); s.stop()"
+docker compose exec app python -c "from app_config.spark import master_url; from pyspark.sql import SparkSession; from memory.store import KVStore; s = SparkSession.builder.master(master_url()).getOrCreate(); kv = KVStore(spark=s, table='default.kv_demo'); kv.set('hello', 'world'); print(kv.get('hello')); s.stop()"
+```
+
+Or without building a session by hand at all — the pipeline and the validation
+CLI resolve the master themselves:
+
+```bash
+docker compose exec app python -m validation --delta-table default.sas_parser_memory --thread <thread-id>
 ```
 
 More workers:
@@ -203,7 +245,8 @@ also loads it as an env-file (optional — no `.env`, no error). Service-level
 | `DEV_VAULT_SECRET_ID`    | `2222…` | AppRole secret_id, likewise (dev constant, not a secret) |
 | `VAULT_PORT`             | `8200`  | host port for Vault                           |
 | `VAULT_VERSION`          | `1.18`  | `hashicorp/vault` image tag                   |
-| `PYSPARK_VERSION`        | `4.1.2` | Spark version for the cluster image; keep equal to `uv.lock` |
+| `PYSPARK_VERSION`        | `4.2.0` | Spark version for the cluster image; must equal `uv.lock` (enforced by `tests/test_docker_pins.py`) |
+| `SPARK_MASTER_URL`       | set by compose | which cluster the app builds sessions against (`app_config.spark`) |
 | `PYTHON_VERSION`         | `3.12`  | base image Python                             |
 | `SPARK_WORKER_CORES`     | `2`     | per worker                                    |
 | `SPARK_WORKER_MEMORY`    | `2g`    | per worker                                    |

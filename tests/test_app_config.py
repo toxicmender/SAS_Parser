@@ -446,3 +446,73 @@ def test_defaults_without_config(_isolated_config):
     assert LLMClientConfig().max_input_tokens is None
     assert LLMClientConfig().model == "gpt-5.4"
     assert LLMClientConfig().max_retries == 3
+
+
+# ---------------------------------------------------------------------------
+# Spark master resolution (app_config.spark)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_spark_master_env(monkeypatch):
+    """A real SPARK_MASTER_URL (the Docker stack sets one) must not leak in."""
+    monkeypatch.delenv("SPARK_MASTER_URL", raising=False)
+
+
+def test_spark_master_defaults_to_local(_isolated_config):
+    from app_config.spark import DEFAULT_MASTER, master_url
+
+    assert master_url() == DEFAULT_MASTER == "local[*]"
+
+
+def test_spark_master_read_from_config(_isolated_config):
+    from app_config.spark import master_url
+
+    _set(_isolated_config, {"spark": {"master": "spark://from-file:7077"}})
+    assert master_url() == "spark://from-file:7077"
+
+
+def test_spark_master_env_beats_config(_isolated_config, monkeypatch):
+    from app_config.spark import master_url
+
+    _set(_isolated_config, {"spark": {"master": "spark://from-file:7077"}})
+    monkeypatch.setenv("SPARK_MASTER_URL", "spark://from-env:7077")
+    assert master_url() == "spark://from-env:7077"
+
+
+def test_spark_master_explicit_beats_everything(_isolated_config, monkeypatch):
+    from app_config.spark import master_url
+
+    _set(_isolated_config, {"spark": {"master": "spark://from-file:7077"}})
+    monkeypatch.setenv("SPARK_MASTER_URL", "spark://from-env:7077")
+    assert master_url("local[2]") == "local[2]"
+
+
+def test_spark_master_blank_env_is_unset(_isolated_config, monkeypatch):
+    """An empty value in a .env file means "not configured", not "no master"."""
+    from app_config.spark import master_url
+
+    monkeypatch.setenv("SPARK_MASTER_URL", "   ")
+    assert master_url() == "local[*]"
+
+
+def test_spark_master_wrong_type_degrades(_isolated_config, caplog):
+    """A non-string entry degrades to the default with a WARNING, as elsewhere."""
+    from app_config.spark import master_url
+
+    _set(_isolated_config, {"spark": {"master": 7077}})
+    with caplog.at_level(logging.WARNING):
+        assert master_url() == "local[*]"
+    assert "spark.master" in caplog.text
+
+
+def test_spark_module_does_not_import_pyspark():
+    """app_config stays the dependency-free leaf (Architecture.md invariant 8)."""
+    import subprocess
+
+    code = (
+        "import sys, app_config.spark; "
+        "sys.exit(1 if 'pyspark' in sys.modules else 0)"
+    )
+    completed = subprocess.run([sys.executable, "-c", code], check=False)
+    assert completed.returncode == 0, "importing app_config.spark pulled in pyspark"

@@ -6,8 +6,14 @@ KVStore backend.
 share (upsert/COALESCE semantics, literal prefix matching, delete counting,
 atomic restore, special characters in keys). ``TestInMemoryContract`` always
 runs; ``TestDeltaContract`` runs the identical tests against a real local
-Delta table and skips itself when pyspark / delta-spark / a JVM is not
-available (mirroring the Spark-backed tracking test in test_validation.py).
+Delta table and skips itself only when pyspark, delta-spark, or a JVM is
+genuinely absent.
+
+An *installed but incompatible* Delta is a failure, not a skip. The fixture
+deliberately does not catch session-construction errors: a delta-spark built
+against a different Spark minor than the installed pyspark serves path-based
+writes fine and fails every catalog statement, so treating that as "skipped"
+reports a green suite for a backend that cannot create a single table.
 
 To exercise the Delta side locally or in CI:
 
@@ -15,8 +21,10 @@ To exercise the Delta side locally or in CI:
 """
 
 import pathlib
+import shutil
 import sys
 import uuid
+from importlib import metadata
 
 import pytest
 
@@ -182,6 +190,24 @@ class TestInMemoryContract(KVStoreContract):
         return KVStore(spark=None, table=None)
 
 
+def _delta_broken(what: str) -> str:
+    """Failure text naming both versions — the pair is what's actually wrong."""
+    try:
+        versions = (
+            f"delta-spark {metadata.version('delta-spark')} / "
+            f"pyspark {metadata.version('pyspark')}"
+        )
+    except metadata.PackageNotFoundError:  # pragma: no cover - defensive
+        versions = "the installed delta-spark / pyspark"
+    return (
+        f"{versions}: {what}. The two are most likely built against different "
+        f"Spark versions — a mismatched delta-spark still serves path-based "
+        f"writes but fails every catalog statement. Pin a compatible pair "
+        f"(DELTA_SPARK_VERSION / PYSPARK_VERSION) or build with WITH_DELTA=0. "
+        f"This is deliberately a failure, not a skip."
+    )
+
+
 @pytest.fixture(scope="session")
 def delta_spark(tmp_path_factory):
     pytest.importorskip("pyspark")
@@ -191,25 +217,46 @@ def delta_spark(tmp_path_factory):
     from delta import configure_spark_with_delta_pip  # pyright: ignore[reportMissingImports]
     from pyspark.sql import SparkSession
 
+    # Only a genuinely absent JVM is a skip. Anything else — delta imports,
+    # java is here, and the session still will not build — is a real defect,
+    # and swallowing it into a skip is how an entirely broken Delta backend
+    # once sat behind a green suite: a delta-spark compiled against a
+    # different Spark minor fails every catalog statement with
+    # NoSuchMethodError while the suite reported only "skipped".
+    if shutil.which("java") is None:
+        pytest.skip("no JVM on PATH; Spark cannot start")
+
     warehouse = tmp_path_factory.mktemp("delta-warehouse")
-    try:
-        builder = (
-            SparkSession.builder.master("local[1]")
-            .appName("kv-backend-contract")
-            .config("spark.ui.enabled", "false")
-            .config("spark.sql.warehouse.dir", str(warehouse))
-            .config(
-                "spark.sql.extensions",
-                "io.delta.sql.DeltaSparkSessionExtension",
-            )
-            .config(
-                "spark.sql.catalog.spark_catalog",
-                "org.apache.spark.sql.delta.catalog.DeltaCatalog",
-            )
+    builder = (
+        SparkSession.builder.master("local[1]")
+        .appName("kv-backend-contract")
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.warehouse.dir", str(warehouse))
+        .config(
+            "spark.sql.extensions",
+            "io.delta.sql.DeltaSparkSessionExtension",
         )
+        .config(
+            "spark.sql.catalog.spark_catalog",
+            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
+        )
+    )
+    try:
         spark = configure_spark_with_delta_pip(builder).getOrCreate()
-    except Exception as exc:  # no JVM, incompatible delta jars, …
-        pytest.skip(f"local Delta Spark session unavailable: {exc}")
+    except Exception as exc:
+        raise AssertionError(_delta_broken("could not start a Delta session")) from exc
+
+    # The contract below drives KVStore, which creates its table through the
+    # session catalog. Probe that API here so an incompatible delta-spark is
+    # named plainly once, instead of surfacing as a wall of identical Py4J
+    # traces across every test in the class.
+    try:
+        spark.sql("CREATE TABLE IF NOT EXISTS _delta_probe (id BIGINT) USING DELTA")
+        spark.sql("DROP TABLE IF EXISTS _delta_probe")
+    except Exception as exc:
+        spark.stop()
+        raise AssertionError(_delta_broken("cannot create a Delta table")) from exc
+
     yield spark
     spark.stop()
 

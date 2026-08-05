@@ -6,14 +6,29 @@
 #
 # What it does:
 #   1. pip-installs delta-spark alongside the already-installed pyspark. The
-#      pin on pyspark is deliberate — delta-spark declares the Spark range it
-#      supports, so pinning pyspark makes the resolver pick a *compatible*
-#      delta-spark (or fail loudly) instead of silently downgrading Spark out
-#      from under uv.lock.
-#   2. writes $SPARK_CONF_DIR/spark-defaults.conf with the Delta extension,
+#      pin on pyspark keeps the locked Spark version fixed instead of letting
+#      the resolver silently downgrade Spark out from under uv.lock.
+#   2. checks the resolved delta-spark actually declares support for that
+#      pyspark, and fails the build if it does not.
+#   3. writes $SPARK_CONF_DIR/spark-defaults.conf with the Delta extension,
 #      catalog, and the exact maven coordinate of the installed delta-spark.
-#   3. warms the ivy cache at /opt/ivy by running a trivial local job, so the
-#      first real session starts instantly and works without Maven Central.
+#   4. warms the ivy cache at /opt/ivy by running warmup.py, which exercises
+#      BOTH the path-based and the catalog Delta APIs.
+#
+# Why steps 2 and 4 are both needed
+# ---------------------------------
+# The pyspark pin alone does NOT make the resolver pick a compatible Delta —
+# that only holds when delta-spark's metadata is honest, and it is not always.
+# delta-spark 4.1.0 declares `pyspark>=4.0.1` with no upper bound, so it
+# installs happily against pyspark 4.2.0 and then dies at runtime on
+# `NoSuchMethodError: CatalogStorageFormat.copy`, while 4.2.0 and 4.3.1 both
+# declare `pyspark<=4.1.1` — no published release supports 4.2.0 at all.
+#
+# Step 2 catches releases that state their limits truthfully; step 4 catches
+# the ones that do not. Step 2 is cheap but insufficient alone, and step 4
+# only works because warmup.py exercises the *catalog* API — a mismatched
+# Delta can serve path-based writes fine and fail every CREATE TABLE, which
+# is the API memory.store actually uses. Keep both.
 #
 # WITH_DELTA=0 skips all of it: the image still runs plain Spark, and only
 # memory.store's Delta backend (plus tests/test_backend_contract.py's Delta
@@ -59,6 +74,55 @@ delta_version="$("$VENV/bin/python" -c \
     'import importlib.metadata as m; print(m.version("delta-spark"))')"
 delta_package="io.delta:delta-spark_${SCALA_BINARY_VERSION}:${delta_version}"
 echo "install_delta.sh: resolved ${delta_package}"
+
+# Does the resolved delta-spark actually claim to support this pyspark? A
+# release that declares an upper bound and is installed outside it is an
+# unambiguous build error. A release that declares no bound proves nothing
+# either way, so that case passes here and is left to warmup.py.
+"$VENV/bin/python" - "$installed_pyspark" <<'PY'
+import importlib.metadata as meta
+import sys
+
+installed = sys.argv[1]
+try:
+    from packaging.requirements import Requirement
+    from packaging.version import Version
+except ModuleNotFoundError:
+    # packaging is not a declared dependency of this image; skipping the
+    # cheap check is fine because warmup.py still has to pass.
+    print("install_delta.sh: packaging unavailable, skipping metadata check")
+    sys.exit(0)
+
+specs = [
+    Requirement(req).specifier
+    for req in (meta.requires("delta-spark") or [])
+    if Requirement(req).name == "pyspark"
+]
+delta = meta.version("delta-spark")
+if not specs:
+    print(
+        f"install_delta.sh: delta-spark {delta} declares no pyspark constraint; "
+        f"compatibility with pyspark {installed} is unverified here (warmup.py decides)"
+    )
+    sys.exit(0)
+
+version = Version(installed)
+bad = [s for s in specs if not s.contains(version, prereleases=True)]
+if bad:
+    sys.exit(
+        f"install_delta.sh: INCOMPATIBLE — delta-spark {delta} declares "
+        f"pyspark{','.join(str(s) for s in bad)} but pyspark {installed} is "
+        f"installed.\n"
+        f"  No delta-spark release may support this Spark yet. Either pin a "
+        f"known-good pair with DELTA_SPARK_VERSION + PYSPARK_VERSION, hold "
+        f"pyspark back in uv.lock, or build without Delta (WITH_DELTA=0) — "
+        f"everything except memory.store's Delta backend still works."
+    )
+print(
+    f"install_delta.sh: delta-spark {delta} declares pyspark"
+    f"{','.join(str(s) for s in specs)}, satisfied by {installed}"
+)
+PY
 
 cat >> "$SPARK_CONF_DIR/spark-defaults.conf" <<CONF
 spark.jars.ivy ${IVY_DIR}

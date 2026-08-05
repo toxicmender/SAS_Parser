@@ -28,7 +28,16 @@ dependencies = [
 # Delta memory backend + validation tracking (Spark/JVM). The default
 # in-memory mode must import and run without pyspark (Architecture.md
 # invariant 8), so it is an extra, not a core dependency.
-spark      = ["pyspark>=4.1.2"]
+#
+# Upper bound is Delta Lake's, not ours: no published delta-spark supports
+# Spark 4.2 (4.2.0 and 4.3.1 both declare `pyspark<=4.1.1`, and 4.1.0 declares
+# no upper bound at all, so it installs against 4.2 and then dies at runtime
+# on `NoSuchMethodError: CatalogStorageFormat.copy` for every CREATE TABLE).
+# Without this bound a routine `uv lock --upgrade` silently breaks
+# memory.store's Delta backend and validation tracking. Raise it only once a
+# delta-spark release declares support for the newer Spark; the Docker build
+# verifies the pairing for real (docker/spark/warmup.py).
+spark      = ["pyspark>=4.1.2,<4.2"]
 vault      = ["hvac>=2.0"]
 azure      = ["msal>=1.28"]
 databricks = ["databricks-sdk>=0.30", "databricks-sql-connector>=3.0"]

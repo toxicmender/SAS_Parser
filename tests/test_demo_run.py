@@ -207,3 +207,57 @@ def test_out_dir_and_md_parse_as_paths():
 def test_report_flags_default_to_off():
     args = demo_run.parse_args(["local", "sas"])
     assert args.out_dir is None and args.md is None and args.pdf is None
+
+
+# ---------------------------------------------------------------------------
+# --delta-table plumbing
+# ---------------------------------------------------------------------------
+
+
+def _capture_pipeline(monkeypatch) -> dict:
+    """Stub SasLLMPipeline and the corpus load; return the captured kwargs."""
+    captured: dict = {}
+
+    def _fake_pipeline(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(demo_run, "SasLLMPipeline", _fake_pipeline)
+    monkeypatch.setattr(
+        demo_run.PromptBuilder, "from_reference_dir", staticmethod(lambda _d: None)
+    )
+    return captured
+
+
+def _build_args(**overrides):
+    import argparse
+    import pathlib as _p
+
+    defaults = {
+        "reference_dir": _p.Path("reference_docs"),
+        "output_language": None,
+        "validation_retries": 0,
+        "delta_table": None,
+    }
+    return argparse.Namespace(**{**defaults, **overrides})
+
+
+def test_delta_table_defaults_to_none_so_no_jvm_is_booted(monkeypatch):
+    """Without the flag the store stays in memory — the documented default."""
+    captured = _capture_pipeline(monkeypatch)
+    demo_run._build_pipeline(
+        _build_args(), model="gpt-5.4", api_key="k", validator=None
+    )
+    assert captured["memory_setup"].delta_table is None
+
+
+def test_delta_table_is_forwarded_to_the_pipeline(monkeypatch):
+    """The flag is what makes the compose Spark cluster reachable from the CLI."""
+    captured = _capture_pipeline(monkeypatch)
+    demo_run._build_pipeline(
+        _build_args(delta_table="default.sas_parser_memory"),
+        model="gpt-5.4",
+        api_key="k",
+        validator=None,
+    )
+    assert captured["memory_setup"].delta_table == "default.sas_parser_memory"
