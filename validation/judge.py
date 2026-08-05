@@ -7,8 +7,13 @@ runnable offline. Wire it in explicitly::
     from llm_client import LLMClient, LLMClientConfig
     from validation import LLMJudgeMetric, ValidationRunner, default_metrics
 
-    judge = LLMJudgeMetric(llm=LLMClient(LLMClientConfig(model="claude-sonnet-4-5")))
+    config = LLMClientConfig.for_role("validator", model="claude-sonnet-4-5")
+    judge = LLMJudgeMetric(llm=LLMClient(config))
     runner = ValidationRunner(pipeline, metrics=[*default_metrics(), judge])
+
+``for_role("validator")`` applies the ``llm_client.roles.validator`` overlay
+from config.json, which is where the judge's own (longer) gateway timeout
+lives; plain ``LLMClientConfig(...)`` works too and just uses the base section.
 
 Any object with a LangChain-style ``invoke(input) -> message`` works as the
 judge — an :class:`llm_client.LLMClient` (which adds the retry / token-budget

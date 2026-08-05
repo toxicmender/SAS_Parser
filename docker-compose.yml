@@ -153,6 +153,11 @@ services:
       VAULT_ROLE_ID: ${DEV_VAULT_ROLE_ID:-11111111-1111-1111-1111-111111111111}
       VAULT_SECRET_ID: ${DEV_VAULT_SECRET_ID:-22222222-2222-2222-2222-222222222222}
       VAULT_SKIP_VERIFY: "true"   # dev Vault speaks plain HTTP
+      # The application's name in Vault. With approle auth it is not a role
+      # here, but it is still the prefix the app's secrets live under, so this
+      # is what puts the gateway credential at secret/appsvc/ai_gateway —
+      # where vault-init writes it.
+      VAULT_APP_NAME: appsvc
       # --- Spark -----------------------------------------------------------
       SPARK_MASTER_URL: spark://spark-master:7077
       # What the driver advertises to executors. `app` is the compose service

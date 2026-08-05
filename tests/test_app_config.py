@@ -106,6 +106,9 @@ def test_repo_config_json_matches_code_defaults():
     }
     assert repo_cfg["llm_client"] == {
         "model": None,
+        "model_provider": None,
+        "gateway_version": None,  # null = unset -> no ai-gateway-version header
+        "provider_client": None,  # null = unset -> code default (ChatOpenAI)
         "base_url": None,
         "url_headers": None,
         "timeout": None,
@@ -118,12 +121,24 @@ def test_repo_config_json_matches_code_defaults():
         "prompt_caching": None,  # null = unset -> code default (False)
         "requests_per_second": None,  # null = unset -> code default (2.0)
         "max_bucket_size": None,  # null = unset -> code default (1)
+        # Sparse overlays: an all-null role changes nothing, so the template
+        # stays a no-op while showing the shape.
+        "roles": {
+            "validator": {"timeout": None, "model": None},
+            "complexity": {"timeout": None, "model": None},
+        },
     }
     assert repo_cfg["user_instructions"] == {
         "path": None,
         "dir": None,
         "max_words": None,
     }
+    # Every section the refactor added ships all-null too, so a fresh checkout
+    # behaves exactly as it did before any of them are filled in.
+    for section in ("vault", "azure", "databricks", "sharepoint", "xref",
+                    "adls", "sftp", "sas"):
+        assert all(value is None for value in repo_cfg[section].values()), section
+    assert "powerapps" not in repo_cfg
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +244,31 @@ def test_llm_client_model_rejects_inaccessible_with_warning(
     assert "not an accessible model" in caplog.text
 
 
+def test_llm_client_provider_client_rejects_unknown_strategy(
+    _isolated_config, caplog
+):
+    _set(_isolated_config, {"llm_client": {"provider_client": "carrier-pigeon"}})
+    with caplog.at_level(logging.WARNING, logger="app_config"):
+        assert app_config.llm_client_value("provider_client") is None
+    assert "carrier-pigeon" in caplog.text
+
+
+def test_llm_client_new_gateway_keys_read_config(_isolated_config):
+    _set(
+        _isolated_config,
+        {
+            "llm_client": {
+                "gateway_version": "v2",
+                "model_provider": "anthropic",
+                "provider_client": "native",
+            }
+        },
+    )
+    assert app_config.llm_client_value("gateway_version") == "v2"
+    assert app_config.llm_client_value("model_provider") == "anthropic"
+    assert app_config.llm_client_value("provider_client") == "native"
+
+
 def test_llm_client_value_rejects_unknown_key():
     # api_key is deliberately outside the schema: secrets never come from
     # config.json, and any other unknown key is a programming error.
@@ -289,6 +329,109 @@ def test_llm_client_endpoint_knobs_read_config(_isolated_config):
     # Explicit argument still beats the config value.
     assert LLMClientConfig(model="explicit").model == "explicit"
     assert LLMClientConfig(timeout=5.0).timeout == 5.0
+
+
+# ---------------------------------------------------------------------------
+# Per-role llm_client overlays (role_value)
+# ---------------------------------------------------------------------------
+
+
+_ROLES_CONFIG = {
+    "llm_client": {
+        "timeout": 6000,
+        "model": "claude-sonnet-4-5",
+        "max_retries": 4,
+        "roles": {
+            "validator": {"timeout": 12000},
+            "complexity": {"model": "claude-opus-4-6"},
+        },
+    }
+}
+
+
+def test_role_value_overlay_beats_base(_isolated_config):
+    _set(_isolated_config, _ROLES_CONFIG)
+    assert app_config.role_value("validator", "timeout") == 12000
+    assert app_config.role_value("complexity", "model") == "claude-opus-4-6"
+
+
+def test_role_value_falls_through_to_base_then_default(_isolated_config):
+    _set(_isolated_config, _ROLES_CONFIG)
+    # The role does not mention these, so the base section stands...
+    assert app_config.role_value("validator", "model") == "claude-sonnet-4-5"
+    assert app_config.role_value("complexity", "timeout") == 6000
+    # ...and a key neither one sets falls through to the hard default.
+    assert app_config.role_value("validator", "max_bucket_size", 1) == 1
+
+
+def test_role_value_unknown_role_uses_base(_isolated_config):
+    _set(_isolated_config, _ROLES_CONFIG)
+    assert app_config.role_value("no-such-role", "timeout") == 6000
+    assert app_config.role_value(None, "timeout") == 6000
+
+
+def test_role_value_without_roles_section(_isolated_config):
+    _set(_isolated_config, {"llm_client": {"timeout": 30}})
+    assert app_config.role_value("validator", "timeout") == 30
+
+
+def test_role_value_wrong_typed_overlay_degrades_to_base(_isolated_config, caplog):
+    _set(
+        _isolated_config,
+        {
+            "llm_client": {
+                "timeout": 6000,
+                "roles": {"validator": {"timeout": "twelve thousand"}},
+            }
+        },
+    )
+    with caplog.at_level(logging.WARNING, logger="app_config"):
+        assert app_config.role_value("validator", "timeout") == 6000
+    assert "llm_client.roles.validator.timeout" in caplog.text
+
+
+def test_role_value_non_object_role_degrades_to_base(_isolated_config, caplog):
+    _set(
+        _isolated_config,
+        {"llm_client": {"timeout": 6000, "roles": {"validator": "12000"}}},
+    )
+    with caplog.at_level(logging.WARNING, logger="app_config"):
+        assert app_config.role_value("validator", "timeout") == 6000
+    assert "llm_client.roles.validator" in caplog.text
+
+
+def test_role_value_null_overlay_entry_is_unset(_isolated_config):
+    # A template listing every role key as null must change nothing.
+    _set(
+        _isolated_config,
+        {"llm_client": {"timeout": 6000, "roles": {"validator": {"timeout": None}}}},
+    )
+    assert app_config.role_value("validator", "timeout") == 6000
+
+
+def test_role_value_overlay_model_must_be_accessible(_isolated_config, caplog):
+    _set(
+        _isolated_config,
+        {
+            "llm_client": {
+                "model": "claude-sonnet-4-5",
+                "roles": {"validator": {"model": "claude-2.1"}},
+            }
+        },
+    )
+    with caplog.at_level(logging.WARNING, logger="app_config"):
+        assert app_config.role_value("validator", "model") == "claude-sonnet-4-5"
+    assert "not an accessible model" in caplog.text
+
+
+def test_role_value_cannot_overlay_roles_itself(_isolated_config):
+    _set(
+        _isolated_config,
+        {"llm_client": {"roles": {"validator": {"roles": {"nested": {}}}}}},
+    )
+    assert app_config.role_value("validator", "roles") == {
+        "validator": {"roles": {"nested": {}}}
+    }
 
 
 def test_defaults_without_config(_isolated_config):

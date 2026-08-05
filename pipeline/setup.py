@@ -4,9 +4,9 @@
 the two instruction memories, the extractor, and the chat identity — and owns
 the cross-injection logic that used to live inline in the pipeline
 constructor: defaulting the hub, binding store-less components to it, and
-letting an extractor imply a thread memory. The pipeline accepts one of these
-(``memory_setup=``) as the canonical form; the individual legacy kwargs are
-still accepted and forwarded into one.
+letting an extractor imply a thread memory. The pipeline takes one of these
+(``memory_setup=``) and nothing else — the individual kwargs it replaced are
+gone, so there is one place a memory knob can be set.
 
 Logger name: ``pipeline.setup``.
 """

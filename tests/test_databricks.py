@@ -422,6 +422,62 @@ def test_service_principal_is_cached(monkeypatch, _isolated):
     assert len(calls) == 1  # resolved once, not once per access
 
 
+def test_a_second_key_set_reads_a_second_principal(monkeypatch, _isolated):
+    # One scope holds several principals: the workspace/Vault one under
+    # sp-hsv-*, SharePoint's under saact-hsv-*. Both must be reachable.
+    _patched_secrets(
+        monkeypatch,
+        {
+            ("kv", "sp-hsv-tenantid"): "vault-tenant",
+            ("kv", "sp-hsv-appid"): "vault-client",
+            ("kv", "sp-hsv-secret"): "vault-secret",
+            ("kv", "saact-hsv-tenantid"): "sp-tenant",
+            ("kv", "saact-hsv-appid"): "sp-client",
+            ("kv", "saact-hsv-secret"): "sp-secret",
+        },
+    )
+    cfg = databricks.DatabricksConfig(
+        host="https://adb-1.net", token="dapi-boot", secret_scope="kv"
+    )
+    sharepoint_keys = databricks.SecretKeySet(
+        tenant_id_key="saact-hsv-tenantid",
+        client_id_key="saact-hsv-appid",
+        client_secret_key="saact-hsv-secret",
+    )
+    assert cfg.service_principal().client_id == "vault-client"
+    assert cfg.service_principal(sharepoint_keys).client_id == "sp-client"
+    # Cached per key set, so neither overwrites the other.
+    assert cfg.service_principal().client_id == "vault-client"
+
+
+def test_a_non_default_key_set_ignores_the_local_arm_values(monkeypatch, _isolated):
+    # ARM_* names one specific principal; a caller asking for a different one
+    # must not be handed it.
+    _patched_secrets(
+        monkeypatch,
+        {
+            ("kv", "saact-hsv-tenantid"): "sp-tenant",
+            ("kv", "saact-hsv-appid"): "sp-client",
+            ("kv", "saact-hsv-secret"): "sp-secret",
+        },
+    )
+    cfg = databricks.DatabricksConfig(
+        host="https://adb-1.net",
+        token="dapi-boot",
+        secret_scope="kv",
+        azure_tenant_id="arm-tenant",
+        azure_client_id="arm-client",
+        azure_client_secret="arm-secret",
+    )
+    sharepoint_keys = databricks.SecretKeySet(
+        tenant_id_key="saact-hsv-tenantid",
+        client_id_key="saact-hsv-appid",
+        client_secret_key="saact-hsv-secret",
+    )
+    assert cfg.service_principal().client_id == "arm-client"
+    assert cfg.service_principal(sharepoint_keys).client_id == "sp-client"
+
+
 def test_secret_scope_read_on_a_cluster_needs_no_pat(monkeypatch, _isolated):
     monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "15.4")
     built = _patched_secrets(monkeypatch, {("kv", "sp-hsv-appid"): "kv-client"})

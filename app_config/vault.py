@@ -29,17 +29,31 @@ Three ways in, tried in this order (:attr:`VaultConfig.auth_method`):
 ``approle``
     ``VAULT_ROLE_ID`` + ``VAULT_SECRET_ID`` are set — AppRole login.
 ``azuread``
-    ``VAULT_OIDC_ROLE`` (or ``vault.oidc_role``) is set — OIDC login backed
+    ``VAULT_APP_NAME`` (or ``vault.app_name``) is set — OIDC login backed
     by Microsoft Entra ID (Azure AD). An Entra access token is acquired
     through the sibling :mod:`app_config.azure` module (service principal or
     device-code, per its own configuration) and presented as the JWT to
-    Vault's jwt/oidc auth method at ``auth/<vault.auth_path>/login`` (default
-    ``jwt``), per
+    Vault's jwt/oidc auth method at ``auth/<vault.auth_path>/login``, per
     https://developer.hashicorp.com/vault/docs/auth/jwt/oidc-providers/azuread.
-    The Vault role's ``bound_audiences`` must match the token's ``aud`` —
-    normally the app registration's client id, which is what the default
-    scope ``<client_id>/.default`` requests when neither
-    ``vault.azure_scopes`` nor the azure module's scopes are configured.
+    The Vault role's ``bound_audiences`` must match the token's ``aud``. The
+    default audience is Azure Resource Manager
+    (:data:`_ARM_DEFAULT_SCOPE`) — the reference deployment binds its role to
+    ARM — and ``vault.azure_scopes`` overrides it for a role bound to
+    something else.
+
+``app_name`` is one value playing three parts, exactly as the reference
+deployment uses it: the Vault *role* name for that login, the KV secret-path
+*prefix* (so the AI Gateway credential lives at ``<app_name>/ai_gateway``), and
+the application's own name.
+
+Token lifetime
+--------------
+The tokens Vault mints for ``approle`` and ``azuread`` logins are short-lived,
+so :class:`VaultClient` records the lease it was given and re-authenticates
+before a read once it has lapsed (:data:`_TOKEN_SKEW` seconds early). A read
+rejected with 403 is retried once behind a fresh login as well, since a
+revoked-early token is indistinguishable from an expired one. A ``VAULT_TOKEN``
+supplied by the operator is exempt from both — its lifetime is their business.
 
 Callers that want to bypass the environment entirely can construct
 :class:`VaultConfig` directly (an explicit argument always wins) or inject a
@@ -76,10 +90,11 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import get_typed_value, get_value
+from . import _TRUTHY, _verify_setting, get_typed_value, get_value
 
 logger = logging.getLogger(__name__)
 
@@ -87,17 +102,21 @@ DEFAULT_MOUNT_POINT = "secret"
 DEFAULT_KV_VERSION = 2
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_AUTH_PATH = "jwt/azuread/inspirewellness"
-# Last-resort audience for the Entra ID token presented to Vault, used only
-# when neither VaultConfig.azure_scopes nor the azure module's own scopes nor a
-# client id is available. The doubled slash is Azure Resource Manager's
-# documented `.default` form, not a typo.
+# Default audience for the Entra ID token presented to Vault, used whenever
+# neither VaultConfig.azure_scopes nor the azure module's own scopes are
+# configured. The deployment's Vault role is bound to the Azure Resource
+# Manager audience; the doubled slash is ARM's documented `.default` form, not
+# a typo.
 _ARM_DEFAULT_SCOPE = "https://management.azure.com//.default"
-_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
-# Path of the AI Gateway credential *relative to the KV mount*: with the
-# default mount ("secret") and KV v2, this is the API's
-# <vault_addr>/v1/secret/data/appsvc/ai_gateway.
-AI_GATEWAY_PATH = "appsvc/ai_gateway"
+# Re-authenticate this many seconds before the Vault token's lease actually
+# runs out, so a token used for a read stays valid for the length of it.
+# Mirrors app_config.azure._EXPIRY_SKEW.
+_TOKEN_SKEW = 60.0
+
+# Leaf name of the AI Gateway credential under the application's own prefix:
+# the reference reads /v1/secret/data/<app_name>/ai_gateway.
+AI_GATEWAY_LEAF = "ai_gateway"
 
 # Field names the gateway token is commonly filed under, tried in order when
 # no explicit key is given. Override with vault.ai_gateway_key when the secret
@@ -106,6 +125,9 @@ _AI_GATEWAY_TOKEN_KEYS = ("token", "api_key", "apikey", "ai_gateway_token", "val
 
 # Field names carrying the gateway's own endpoint, if the secret ships one.
 _AI_GATEWAY_URL_KEYS = ("base_url", "endpoint", "url")
+
+# Field names carrying the gateway's protocol version ("v2"), if it ships one.
+_AI_GATEWAY_VERSION_KEYS = ("gateway_version", "ai_gateway_version", "version")
 
 
 class VaultError(RuntimeError):
@@ -127,8 +149,8 @@ def _resolve_verify() -> bool | str:
     cacert = os.environ.get("VAULT_CACERT")
     if cacert:
         return cacert
-    configured = get_value("vault", "verify")
-    if isinstance(configured, (bool, str)):
+    configured = _verify_setting(get_value("vault", "verify"))
+    if configured is not None:
         return configured
     return True
 
@@ -139,7 +161,7 @@ def _resolve_azure_scopes() -> tuple[str, ...]:
     ``VAULT_AZURE_SCOPES`` (space- or comma-separated) or the
     ``vault.azure_scopes`` config list. Empty when unset — :func:`_azure_jwt`
     then falls back to the azure module's own scopes, and finally to
-    ``<client_id>/.default``.
+    :data:`_ARM_DEFAULT_SCOPE`.
     """
     env = os.environ.get("VAULT_AZURE_SCOPES")
     if env:
@@ -191,17 +213,27 @@ class VaultConfig:
     auth_path : str
         Mount path of the jwt/oidc auth method used by ``azuread`` login
         (``auth/<auth_path>/login``). ``VAULT_AUTH_PATH`` /
-        ``vault.auth_path``, default ``"jwt"``; set to ``"oidc"`` (or
-        wherever the method is mounted) to match the server.
-    oidc_role : str | None
-        Vault role name for ``azuread`` login. ``VAULT_OIDC_ROLE`` /
-        ``vault.oidc_role``. Setting it is what enables the method — it is
-        the role's name in Vault, not a credential.
+        ``vault.auth_path``, default
+        :data:`DEFAULT_AUTH_PATH`; set it to wherever the method is mounted
+        on your server.
+    app_name : str | None
+        The application's name in Vault: the *role* for ``azuread`` login,
+        and the KV secret-path *prefix* the application's own secrets live
+        under. ``VAULT_APP_NAME`` / ``vault.app_name``. Setting it is what
+        enables the ``azuread`` method — it is a name, not a credential.
     azure_scopes : tuple[str, ...]
         Entra ID scopes requested for the login JWT. ``VAULT_AZURE_SCOPES``
         / ``vault.azure_scopes``. Empty (default) falls back to the azure
-        module's configured scopes, then to ``<client_id>/.default`` so the
-        token's audience matches a Vault role bound to the app registration.
+        module's configured scopes, then to :data:`_ARM_DEFAULT_SCOPE`, whose
+        audience is what the deployment's Vault role is bound to.
+    ai_gateway_path : str | None
+        Where the AI Gateway credential is filed, *relative to the mount*.
+        ``vault.ai_gateway_path``; ``None`` (default) derives
+        ``<app_name>/ai_gateway`` — see :attr:`resolved_ai_gateway_path`.
+    ai_gateway_key : str | None
+        The field inside that secret holding the token.
+        ``vault.ai_gateway_key``; ``None`` tries
+        :data:`_AI_GATEWAY_TOKEN_KEYS` in order.
     token : str | None
         Vault token for token auth. ``VAULT_TOKEN`` only — never from
         ``config.json``.
@@ -217,8 +249,10 @@ class VaultConfig:
     timeout: float = DEFAULT_TIMEOUT
     verify: bool | str = True
     auth_path: str = DEFAULT_AUTH_PATH
-    oidc_role: str | None = None
+    app_name: str | None = None
     azure_scopes: tuple[str, ...] = ()
+    ai_gateway_path: str | None = None
+    ai_gateway_key: str | None = None
     token: str | None = field(default=None, repr=False)
     role_id: str | None = field(default=None, repr=False)
     secret_id: str | None = field(default=None, repr=False)
@@ -247,10 +281,12 @@ class VaultConfig:
                 os.environ.get("VAULT_AUTH_PATH")
                 or get_value("vault", "auth_path", DEFAULT_AUTH_PATH)
             ),
-            oidc_role=(
-                os.environ.get("VAULT_OIDC_ROLE") or get_value("vault", "oidc_role")
+            app_name=(
+                os.environ.get("VAULT_APP_NAME") or get_value("vault", "app_name")
             ),
             azure_scopes=_resolve_azure_scopes(),
+            ai_gateway_path=get_value("vault", "ai_gateway_path"),
+            ai_gateway_key=get_value("vault", "ai_gateway_key"),
             token=os.environ.get("VAULT_TOKEN"),
             role_id=os.environ.get("VAULT_ROLE_ID"),
             secret_id=os.environ.get("VAULT_SECRET_ID"),
@@ -261,15 +297,35 @@ class VaultConfig:
         """
         ``"token"`` when a token is set, else ``"approle"`` when both AppRole
         credentials are set, else ``"azuread"`` (Entra ID OIDC) when an
-        :attr:`oidc_role` is set, else ``None`` (no usable credentials).
+        :attr:`app_name` is set, else ``None`` (no usable credentials).
         """
         if self.token:
             return "token"
         if self.role_id and self.secret_id:
             return "approle"
-        if self.oidc_role:
+        if self.app_name:
             return "azuread"
         return None
+
+    @property
+    def resolved_ai_gateway_path(self) -> str | None:
+        """
+        Where the AI Gateway credential lives, relative to the mount: an
+        explicit :attr:`ai_gateway_path`, else ``<app_name>/ai_gateway``, else
+        ``None`` — there is no universal default, so a deployment that
+        configures neither is asked which it means rather than guessing.
+        """
+        if self.ai_gateway_path:
+            return self.ai_gateway_path
+        if self.app_name:
+            return f"{self.app_name}/{AI_GATEWAY_LEAF}"
+        return None
+
+
+_NO_CREDENTIALS = (
+    "no Vault credentials: set VAULT_TOKEN; VAULT_ROLE_ID and "
+    "VAULT_SECRET_ID; or VAULT_APP_NAME for Entra ID OIDC login"
+)
 
 
 def _azure_jwt(config: VaultConfig) -> str:
@@ -277,10 +333,11 @@ def _azure_jwt(config: VaultConfig) -> str:
     The Entra ID access token presented as the login JWT for the ``azuread``
     auth method, acquired through the shared :mod:`app_config.azure` client.
     Scopes resolve as :attr:`VaultConfig.azure_scopes` > the azure module's
-    configured scopes > ``<client_id>/.default`` (the app registration's own
-    audience — what a Vault role with ``bound_audiences=<client_id>`` expects)
-    > :data:`_ARM_DEFAULT_SCOPE`, for a principal with no client id to derive
-    an audience from.
+    configured scopes > :data:`_ARM_DEFAULT_SCOPE`.
+
+    The app registration's own audience (``<client_id>/.default``) is
+    deliberately *not* in that chain: a Vault role bound to it is the unusual
+    case, and an operator who wants it sets ``vault.azure_scopes`` explicitly.
     """
     from . import azure  # sibling module; msal stays a lazy import inside it
 
@@ -289,16 +346,9 @@ def _azure_jwt(config: VaultConfig) -> str:
     # secret scope), and a caller should still only have to except VaultError.
     try:
         azure_client = azure.get_azure_client()
-        scopes = config.azure_scopes or azure_client.config.scopes
-        if not scopes:
-            # Nothing configured: prefer the app registration's own audience,
-            # falling back to ARM. The `else` must stay inside this branch — an
-            # explicitly configured scope always wins (the repo-wide precedence
-            # rule), so it cannot be reached when `scopes` is already set.
-            if azure_client.config.client_id:
-                scopes = (f"{azure_client.config.client_id}/.default",)
-            else:
-                scopes = (_ARM_DEFAULT_SCOPE,)
+        scopes = config.azure_scopes or azure_client.config.scopes or (
+            _ARM_DEFAULT_SCOPE,
+        )
         return azure_client.get_token(scopes)
     except azure.AzureAuthError as exc:
         raise VaultError(
@@ -306,37 +356,68 @@ def _azure_jwt(config: VaultConfig) -> str:
         ) from exc
 
 
-def _authenticate(client: Any, config: VaultConfig) -> None:
+def _lease_duration(response: Any) -> float | None:
+    """
+    Seconds the Vault token in a login *response* is good for, or ``None`` when
+    the response carries no (or an unusable) ``auth.lease_duration``. A
+    root/periodic token reports ``0``, which also reads as "no expiry to track".
+    """
+    if not isinstance(response, dict):
+        return None
+    auth = response.get("auth")
+    if not isinstance(auth, dict):
+        return None
+    lease = auth.get("lease_duration")
+    if isinstance(lease, bool) or not isinstance(lease, (int, float)):
+        return None
+    return float(lease) if lease > 0 else None
+
+
+def _authenticate(client: Any, config: VaultConfig) -> float | None:
     """
     Log *client* in per :attr:`VaultConfig.auth_method`, then confirm the
     session is live. Raises :class:`VaultError` on unreachable server or a
     rejected credential.
+
+    Returns the lease duration of the token Vault issued, in seconds, or
+    ``None`` when there is none to track — an operator-supplied
+    ``VAULT_TOKEN``, or a login response without a usable
+    ``auth.lease_duration``.
     """
     method = config.auth_method
+    lease: float | None = None
     if method == "token":
         client.token = config.token
     elif method == "approle":
-        client.auth.approle.login(
-            role_id=config.role_id, secret_id=config.secret_id
-        )  # hvac stores the returned token on the client
+        try:
+            # hvac stores the returned token on the client.
+            lease = _lease_duration(
+                client.auth.approle.login(
+                    role_id=config.role_id, secret_id=config.secret_id
+                )
+            )
+        except VaultError:
+            raise
+        except Exception as exc:  # rejected credentials / bad mount
+            raise VaultError(f"Vault approle login failed: {exc}") from exc
     elif method == "azuread":
         jwt = _azure_jwt(config)
         try:
-            client.auth.jwt.jwt_login(
-                role=config.oidc_role, jwt=jwt, path=config.auth_path
-            )  # hvac stores the returned Vault token on the client
+            # hvac stores the returned Vault token on the client.
+            lease = _lease_duration(
+                client.auth.jwt.jwt_login(
+                    role=config.app_name, jwt=jwt, path=config.auth_path
+                )
+            )
         except VaultError:
             raise
         except Exception as exc:  # rejected JWT / unknown role / bad mount
             raise VaultError(
-                f"Vault azuread login failed for role '{config.oidc_role}' "
+                f"Vault azuread login failed for role '{config.app_name}' "
                 f"at auth path '{config.auth_path}': {exc}"
             ) from exc
     else:  # unreachable via _build_client, which checks first — defensive
-        raise VaultError(
-            "no Vault credentials: set VAULT_TOKEN; VAULT_ROLE_ID and "
-            "VAULT_SECRET_ID; or VAULT_OIDC_ROLE for Entra ID OIDC login"
-        )
+        raise VaultError(_NO_CREDENTIALS)
     try:
         authenticated = client.is_authenticated()
     except Exception as exc:  # network / TLS / bad URL surface here
@@ -350,8 +431,24 @@ def _authenticate(client: Any, config: VaultConfig) -> None:
     logger.info(
         f"VaultClient: authenticated to {config.address} via {method} "
         f"(namespace={config.namespace}, mount={config.mount_point}, "
-        f"kv_version={config.kv_version})"
+        f"kv_version={config.kv_version}, "
+        f"lease={f'{lease:.0f}s' if lease else 'untracked'})"
     )
+    return lease
+
+
+def _is_forbidden(exc: BaseException) -> bool:
+    """
+    True when *exc* is Vault's 403 — an expired, revoked, or under-privileged
+    token. ``hvac`` raises ``hvac.exceptions.Forbidden``, which carries the
+    status code; the class-name check covers a stand-in that does not.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status == 403:
+        return True
+    return type(exc).__name__ == "Forbidden"
 
 
 class VaultClient:
@@ -373,6 +470,12 @@ class VaultClient:
     The underlying client is built lazily on first :attr:`client` access, so
     constructing a :class:`VaultClient` never touches the network or requires
     ``hvac`` to be importable.
+
+    Once built, the session is kept alive: the lease Vault reported at login is
+    recorded and a read that arrives after it has lapsed re-authenticates
+    first, and a read rejected with 403 is retried once behind a fresh login.
+    Token auth is exempt (there is no lease to renew against). An injected
+    *client* starts with no known lease, so only the 403 rule applies to it.
     """
 
     def __init__(
@@ -380,16 +483,26 @@ class VaultClient:
     ) -> None:
         self.config = config if config is not None else VaultConfig.from_env()
         self._client = client
+        # Epoch seconds after which the Vault token is assumed dead; None means
+        # "no lease to track" (token auth, or a login that reported none).
+        self._expires_at: float | None = None
 
     @property
     def client(self) -> Any:
         """The underlying ``hvac.Client``, built and authenticated on demand."""
         if self._client is None:
-            self._client = self._build_client(self.config)
+            self._client, lease = self._build_client(self.config)
+            self._set_expiry(lease)
         return self._client
 
+    def _set_expiry(self, lease: float | None) -> None:
+        self._expires_at = (
+            time.time() + max(lease - _TOKEN_SKEW, 0.0) if lease else None
+        )
+
     @staticmethod
-    def _build_client(config: VaultConfig) -> Any:
+    def _build_client(config: VaultConfig) -> tuple[Any, float | None]:
+        """The authenticated ``hvac.Client`` and its token's lease duration."""
         # Validate config before importing hvac so a misconfiguration reports
         # the real problem instead of a missing-dependency error.
         if not config.address:
@@ -398,10 +511,7 @@ class VaultClient:
                 "vault.address in config.json"
             )
         if config.auth_method is None:
-            raise VaultError(
-                "no Vault credentials: set VAULT_TOKEN; VAULT_ROLE_ID and "
-                "VAULT_SECRET_ID; or VAULT_OIDC_ROLE for Entra ID OIDC login"
-            )
+            raise VaultError(_NO_CREDENTIALS)
         try:
             import hvac
         except ImportError as exc:
@@ -417,8 +527,12 @@ class VaultClient:
             # takes float seconds; casting would floor sub-second timeouts to 0.
             timeout=config.timeout,  # pyright: ignore[reportArgumentType]
         )
-        _authenticate(client, config)
-        return client
+        return client, _authenticate(client, config)
+
+    def _reauthenticate(self, why: str) -> None:
+        """Log the existing client in again, replacing its Vault token."""
+        logger.info(f"VaultClient: re-authenticating ({why})")
+        self._set_expiry(_authenticate(self.client, self.config))
 
     def get_secret(
         self, path: str, key: str | None = None, *, mount_point: str | None = None
@@ -458,21 +572,40 @@ class VaultClient:
             ) from None
 
     def _read(self, path: str, mount: str) -> dict[str, Any]:
-        client = self.client
+        client = self.client  # builds and authenticates on first use
+        if self._expires_at is not None and time.time() >= self._expires_at:
+            self._reauthenticate("the Vault token's lease has run out")
         try:
-            if self.config.kv_version == 2:
-                resp = client.secrets.kv.v2.read_secret_version(
-                    path=path,
-                    mount_point=mount,
-                    raise_on_deleted_version=True,
-                )
-                return resp["data"]["data"]
-            resp = client.secrets.kv.v1.read_secret(path=path, mount_point=mount)
-            return resp["data"]
+            return self._read_once(client, path, mount)
         except Exception as exc:
-            raise VaultError(
-                f"could not read Vault secret '{path}' (mount '{mount}'): {exc}"
-            ) from exc
+            # A 403 is the one failure worth a second attempt: a token revoked
+            # early is indistinguishable from one whose lease we mis-tracked,
+            # and re-authenticating is exactly the fix for both. Anything else
+            # (absent secret, network, bad mount) would fail identically twice.
+            if not (_is_forbidden(exc) and self.config.auth_method != "token"):
+                raise VaultError(
+                    f"could not read Vault secret '{path}' (mount '{mount}'): "
+                    f"{exc}"
+                ) from exc
+            self._reauthenticate(f"Vault refused the read of '{path}' with 403")
+            try:
+                return self._read_once(self.client, path, mount)
+            except Exception as retry_exc:
+                raise VaultError(
+                    f"could not read Vault secret '{path}' (mount '{mount}') "
+                    f"even after re-authenticating: {retry_exc}"
+                ) from retry_exc
+
+    def _read_once(self, client: Any, path: str, mount: str) -> dict[str, Any]:
+        if self.config.kv_version == 2:
+            resp = client.secrets.kv.v2.read_secret_version(
+                path=path,
+                mount_point=mount,
+                raise_on_deleted_version=True,
+            )
+            return resp["data"]["data"]
+        resp = client.secrets.kv.v1.read_secret(path=path, mount_point=mount)
+        return resp["data"]
 
 
 # One authenticated client per process, mirroring app_config's config cache.
@@ -496,9 +629,10 @@ def get_secret(
 
 def get_ai_gateway_secret(path: str | None = None) -> dict[str, Any]:
     """
-    The whole AI Gateway secret — by default the one at
-    :data:`AI_GATEWAY_PATH` (``<vault_addr>/v1/secret/data/appsvc/ai_gateway``
-    with the default mount and KV v2).
+    The whole AI Gateway secret — by default the one under the application's
+    own prefix, ``<app_name>/ai_gateway`` (the API's
+    ``<vault_addr>/v1/secret/data/<app_name>/ai_gateway`` with the default
+    mount and KV v2). ``vault.ai_gateway_path`` pins a different location.
 
     Read through the shared :func:`get_vault_client`, so the Vault login
     happens once per process. With ``azuread`` auth that login presents an
@@ -509,16 +643,19 @@ def get_ai_gateway_secret(path: str | None = None) -> dict[str, Any]:
     Raises
     ------
     VaultError
-        Vault is unreachable or unauthenticated, or the secret is absent.
+        No path can be resolved, or Vault is unreachable or unauthenticated,
+        or the secret is absent.
     """
+    client = get_vault_client()
     if path is None:
-        configured = get_value("vault", "ai_gateway_path")
-        if configured:
-            path = configured
-        else:
-            oidc_role = os.environ.get("VAULT_OIDC_ROLE") or get_value("vault", "oidc_role")
-            path = f"{oidc_role}/ai_gateway" if oidc_role else AI_GATEWAY_PATH
-    return get_secret(path or AI_GATEWAY_PATH)
+        path = client.config.resolved_ai_gateway_path
+    if not path:
+        raise VaultError(
+            "no AI Gateway secret path: set VAULT_APP_NAME (the path is then "
+            "'<app_name>/ai_gateway'), or vault.ai_gateway_path in "
+            "config.json to name it outright"
+        )
+    return client.get_secret(path)
 
 
 def ai_gateway_token(
@@ -547,7 +684,7 @@ def ai_gateway_token(
         which is what you need to pick the right one.
     """
     data = get_ai_gateway_secret() if secret is None else secret
-    wanted = key or get_value("vault", "ai_gateway_key")
+    wanted = key or get_vault_client().config.ai_gateway_key
     if wanted:
         try:
             return data[wanted]
@@ -576,6 +713,22 @@ def ai_gateway_base_url(secret: dict[str, Any] | None = None) -> str | None:
     for candidate in _AI_GATEWAY_URL_KEYS:
         if data.get(candidate):
             return data[candidate]
+    return None
+
+
+def ai_gateway_version(secret: dict[str, Any] | None = None) -> str | None:
+    """
+    The gateway's protocol version carried alongside the token
+    (``gateway_version`` / ``ai_gateway_version`` / ``version``), else ``None``
+    so the configured ``llm_client.gateway_version`` stands. It is sent as the
+    ``ai-gateway-version`` request header — see
+    :meth:`llm_client.LLMClientConfig.from_ai_gateway`.
+    """
+    data = get_ai_gateway_secret() if secret is None else secret
+    for candidate in _AI_GATEWAY_VERSION_KEYS:
+        value = data.get(candidate)
+        if value:
+            return str(value)
     return None
 
 

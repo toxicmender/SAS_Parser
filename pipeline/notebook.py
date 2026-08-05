@@ -394,8 +394,10 @@ def item_cells(
 
 def _item_header_markdown(out: dict[str, Any]) -> str:
     """The ``## <item_id>`` banner cell: what this item is and how it scored."""
-    kind = "batch" if out.get("is_batch") else (out.get("kind") or "chunk")
-    lines = [f"## {out.get('item_id', 'item')}", "", f"- Kind: `{kind}`"]
+    # Every item the pipeline emits is a batch (singletons arrive wrapped),
+    # so there is nothing to report here that the source list does not already
+    # say — the "Kind: batch" line it used to carry was a constant.
+    lines = [f"## {out.get('item_id', 'item')}", ""]
     sources = out.get("source_files") or []
     if sources:
         lines.append(f"- Source file(s): {', '.join(f'`{s}`' for s in sources)}")

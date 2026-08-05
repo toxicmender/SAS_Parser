@@ -331,7 +331,6 @@ class RunLedger:
             "status": "error",
             "index": index,
             "total": total,
-            "is_batch": True,
             "error": repr(exc),
             "ts": time.time(),
         }
@@ -345,7 +344,6 @@ class RunLedger:
             "status": "ok",
             "index": index,
             "total": total,
-            "is_batch": True,
             "elapsed_s": round(elapsed_s, 3),
             "response_chars": response_chars,
             "attempts": attempts,

@@ -17,7 +17,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from langchain_core.messages import AIMessage
 
 from chunker.models import SasBatch, SasChunk, SasChunkKind, SasChunkMetadata
+from llm_client import LLMClientConfig
 from pipeline import SasLLMPipeline
+from pipeline.setup import MemorySetup
 from pipeline.prompting import (
     _constructs_for_item,
     _kinds_for_item,
@@ -77,8 +79,8 @@ def _intnx_chunk() -> SasChunk:
 
 def _pipeline(llm, prompt_builder):
     return SasLLMPipeline(
-        model="unused-because-llm-injected",
-        memory=MemoryHub(),
+        llm_config=LLMClientConfig(model="unused-because-llm-injected"),
+        memory_setup=MemorySetup(memory=MemoryHub()),
         llm=llm,
         prompt_builder=prompt_builder,
     )
@@ -309,8 +311,8 @@ OLD_MARKER = "ZZOLDRULE previous project law"
 def test_user_instructions_without_builder_prompted_not_persisted():
     llm = _RecordingChatModel()
     pipeline = SasLLMPipeline(
-        model="unused-because-llm-injected",
-        memory=MemoryHub(),
+        llm_config=LLMClientConfig(model="unused-because-llm-injected"),
+        memory_setup=MemorySetup(memory=MemoryHub()),
         llm=llm,
         user_instructions=f"## Output rules\n{USER_MARKER}.",
     )
@@ -330,8 +332,8 @@ def test_user_instructions_without_builder_prompted_not_persisted():
 def test_user_instructions_fold_into_given_builder():
     llm = _RecordingChatModel()
     pipeline = SasLLMPipeline(
-        model="unused-because-llm-injected",
-        memory=MemoryHub(),
+        llm_config=LLMClientConfig(model="unused-because-llm-injected"),
+        memory_setup=MemorySetup(memory=MemoryHub()),
         llm=llm,
         prompt_builder=PromptBuilder(_guidance_corpus()),
         user_instructions=f"## Output rules\n{USER_MARKER}.",
@@ -353,8 +355,8 @@ def test_pipeline_level_instructions_replace_builders_own():
         _guidance_corpus(), user_instructions=f"## Old\n{OLD_MARKER}."
     )
     pipeline = SasLLMPipeline(
-        model="unused-because-llm-injected",
-        memory=MemoryHub(),
+        llm_config=LLMClientConfig(model="unused-because-llm-injected"),
+        memory_setup=MemorySetup(memory=MemoryHub()),
         llm=llm,
         prompt_builder=builder,
         user_instructions=f"## New\n{USER_MARKER}.",
@@ -373,8 +375,8 @@ def test_pipeline_level_instructions_replace_builders_own():
 def test_conditional_rule_scoped_end_to_end():
     llm = _RecordingChatModel()
     pipeline = SasLLMPipeline(
-        model="unused-because-llm-injected",
-        memory=MemoryHub(),
+        llm_config=LLMClientConfig(model="unused-because-llm-injected"),
+        memory_setup=MemorySetup(memory=MemoryHub()),
         llm=llm,
         user_instructions=f"## [when: function:intnx] Date rules\n{USER_MARKER}.",
     )
@@ -426,8 +428,8 @@ def test_standing_instructions_file_from_config(monkeypatch, tmp_path):
         llm = _RecordingChatModel()
         # No user_instructions argument: the configured standing file applies.
         pipeline = SasLLMPipeline(
-            model="unused-because-llm-injected",
-            memory=MemoryHub(),
+            llm_config=LLMClientConfig(model="unused-because-llm-injected"),
+            memory_setup=MemorySetup(memory=MemoryHub()),
             llm=llm,
         )
         pipeline._process(
@@ -444,8 +446,8 @@ def test_standing_instructions_file_from_config(monkeypatch, tmp_path):
 def test_instructions_fingerprint_property():
     llm = _RecordingChatModel()
     with_rules = SasLLMPipeline(
-        model="unused-because-llm-injected",
-        memory=MemoryHub(),
+        llm_config=LLMClientConfig(model="unused-because-llm-injected"),
+        memory_setup=MemorySetup(memory=MemoryHub()),
         llm=llm,
         user_instructions="## A\nrule body.",
     )

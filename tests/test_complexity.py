@@ -48,7 +48,7 @@ from complexity import (
     write_reports,
 )
 from complexity.pdf import markdown_to_html, wrap_code
-from complexity import rules
+from complexity import rules, sizing
 
 
 def _corpus(**files: str) -> SasCorpus:
@@ -861,16 +861,16 @@ class TestFibonacciStoryPoints(unittest.TestCase):
             report.total_points, round(sum(f.points for f in report.files), 1)
         )
         for f in report.files:
-            self.assertIn(f.points, rules.FIBONACCI_POINTS)
+            self.assertIn(f.points, sizing.FIBONACCI_POINTS)
 
     def test_nearest_deck_entry_is_geometric(self):
         """4 sits nearer 5 than 3 on a scale whose steps are ratios."""
-        self.assertEqual(rules._nearest_fibonacci(4.0), 5.0)
-        self.assertEqual(rules._nearest_fibonacci(3.4), 3.0)
-        self.assertEqual(rules._nearest_fibonacci(0.1), 1.0)
-        self.assertEqual(rules._nearest_fibonacci(10_000.0), 377.0)
-        for entry in rules.FIBONACCI_POINTS:
-            self.assertEqual(rules._nearest_fibonacci(entry), entry)
+        self.assertEqual(sizing._nearest_fibonacci(4.0), 5.0)
+        self.assertEqual(sizing._nearest_fibonacci(3.4), 3.0)
+        self.assertEqual(sizing._nearest_fibonacci(0.1), 1.0)
+        self.assertEqual(sizing._nearest_fibonacci(10_000.0), 377.0)
+        for entry in sizing.FIBONACCI_POINTS:
+            self.assertEqual(sizing._nearest_fibonacci(entry), entry)
 
     def test_default_rungs_are_the_profiles_own(self):
         sizes = rules.load_ruleset("sparksql").sizes

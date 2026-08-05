@@ -69,7 +69,7 @@ dev-mode Vault forgets everything when it restarts.
 
 | Path                        | Read by                                                       |
 | --------------------------- | ------------------------------------------------------------- |
-| `secret/appsvc/ai_gateway`  | the default credential chain (`app_config.vault.AI_GATEWAY_PATH`) |
+| `secret/appsvc/ai_gateway`  | the default credential chain (`<app_name>/ai_gateway`, with compose setting `VAULT_APP_NAME=appsvc`) |
 | `secret/llm/anthropic`      | `demo_run.py ... --vault-secret llm/anthropic` (explicit AppRole read) |
 
 Both carry `api_key` (and `base_url` on the gateway secret when
@@ -110,7 +110,7 @@ constant that lives in the compose file. In a real deployment the credentials ar
 delivered by the platform, or the `azuread` chain is used instead — an Entra ID
 service principal mints a JWT, Vault's `jwt` auth method trades it for a token,
 and nothing long-lived touches disk. That chain needs a real tenant, so it
-cannot be exercised locally; set `VAULT_OIDC_ROLE` and the `AZURE_*`/`ARM_*`
+cannot be exercised locally; set `VAULT_APP_NAME` and the `AZURE_*`/`ARM_*`
 variables to use it (see `app_config/vault.py`).
 
 To point the stack at a **real Vault** instead, drop the `vault` and

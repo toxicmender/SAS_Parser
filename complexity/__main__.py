@@ -1,4 +1,6 @@
-"""Score a directory of SAS files and write the complexity reports as Markdown.
+"""Score SAS files — local or SharePoint-hosted — and write complexity reports.
+
+Local::
 
     python -m complexity path/to/sas_dir
     python -m complexity path/to/sas_dir --out-dir reports/
@@ -6,6 +8,13 @@
     python -m complexity path/to/sas_dir --rules-path my_profile.json --top 25
     python -m complexity path/to/sas_dir --out-dir reports/ --llm-eval
     python -m complexity path/to/sas_dir --out-dir reports/ --pdf
+
+SharePoint::
+
+    python -m complexity --sharepoint                       # every request row
+    python -m complexity --sharepoint --app "MyApp" --pdf
+    python -m complexity --sharepoint --item-id 42
+    python -m complexity --sharepoint --app "MyApp" --no-upload --out-dir reports/
 
 Chunks every matching file, batches the whole corpus with
 :class:`~chunker.batcher.MultiFileBatcher` so cross-file dataset/macro edges
@@ -27,6 +36,31 @@ incomplete (see :mod:`complexity.llm_eval`). It is the only thing here that
 touches the network — without it the analysis is entirely offline.
 ``--prompt-only`` writes those prompts and calls nothing.
 
+The SharePoint flow
+-------------------
+``--sharepoint`` reads the complexity request list
+(:mod:`complexity.sharepoint`), takes each row's sources out of the document
+library, and uploads the reports to
+``{application}/complexity/{label}/{timestamp}``. The row supplies defaults:
+``Output_Language`` becomes ``--target`` and ``Preferred_LLM`` becomes
+``--llm-model`` and implies ``--llm-eval``. An explicit flag still wins over
+the row.
+
+Delivery is **stage then upload**: the reports are written to a temporary
+directory with the same unmodified ``write_reports`` / ``render_pdf`` the local
+flow uses, and the tree is uploaded from there. That is deliberate —
+``render_pdf`` needs the Markdown and ``dependency-graph.png`` co-located to
+resolve the image, and ``WrittenReports.paths`` already enumerates the upload
+set. The report layer is not made storage-agnostic. With ``--out-dir`` *and*
+``--sharepoint``, that directory is the staging area and the files are kept as
+well as uploaded.
+
+With more than one row selected, each is scored as **its own corpus** and
+uploaded to its own folder: cross-file resolution across unrelated applications
+would corrupt every verdict. One row failing does not abort the rest; the exit
+status is non-zero if any row failed, and each row's own outcome is in the
+``run-summary.md`` uploaded beside its reports.
+
 Logger name: ``complexity.__main__``.
 """
 
@@ -35,7 +69,11 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import tempfile
+import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from chunker import MultiFileBatcher, SasCorpus, SasSemanticChunker
 
@@ -64,7 +102,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "sas_dir",
         type=Path,
-        help="Directory containing .sas files (searched recursively).",
+        nargs="?",
+        default=None,
+        help="Directory containing .sas files (searched recursively). Omit it "
+        "and pass --sharepoint to score from the document library instead.",
     )
     parser.add_argument(
         "--pattern",
@@ -189,11 +230,96 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "is called, so the prompt can be read and tuned for free.",
     )
     parser.add_argument(
+        "--sharepoint",
+        action="store_true",
+        help="Score applications from the SharePoint complexity request list "
+        "instead of a local directory. With no narrowing flag, every row in "
+        "the list is processed.",
+    )
+    parser.add_argument(
+        "--app",
+        default=None,
+        help="With --sharepoint: score one application, filtering the request "
+        "rows on their Application column.",
+    )
+    parser.add_argument(
+        "--item-id",
+        default=None,
+        help="With --sharepoint: score exactly one request row, by its ID.",
+    )
+    parser.add_argument(
+        "--sharepoint-out",
+        default=None,
+        help="With --sharepoint: upload into this folder instead of "
+        "{application}/complexity/{label}/{timestamp}.",
+    )
+    parser.add_argument(
+        "--no-upload",
+        action="store_true",
+        help="With --sharepoint: analyse from the library but deliver locally "
+        "and upload nothing. The dry run.",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable DEBUG logging.",
     )
     return parser.parse_args(argv)
+
+
+def _argument_error(args: argparse.Namespace) -> str | None:
+    """What is wrong with this combination of flags, or ``None``.
+
+    Checked before anything is scored: a run that cannot deliver what was
+    asked for should say so in a second, not after the analysis.
+    """
+    if args.sas_dir is None and not args.sharepoint:
+        return (
+            "give a directory to score, or --sharepoint to read the request "
+            "list"
+        )
+    if args.sas_dir is not None and args.sharepoint:
+        return (
+            "--sharepoint reads its sources from the document library; do not "
+            "also give a local directory"
+        )
+    if not args.sharepoint:
+        for flag, value in (
+            ("--app", args.app),
+            ("--item-id", args.item_id),
+            ("--sharepoint-out", args.sharepoint_out),
+            ("--no-upload", args.no_upload),
+        ):
+            if value:
+                return f"{flag} needs --sharepoint"
+    if args.app and args.item_id:
+        return "--app and --item-id both narrow the row set; give one"
+    # --pdf needs somewhere to put a file. SharePoint mode always has one (it
+    # stages into a temporary directory), so the guard only binds locally.
+    if args.pdf and not args.sharepoint and args.out is None and args.out_dir is None:
+        return "--pdf needs --out or --out-dir; stdout has nowhere to put a file"
+    return None
+
+
+@dataclass
+class _Sources:
+    """What was loaded, and what could not be.
+
+    Attributes
+    ----------
+    file_results : list
+        One :class:`~chunker.models.SasChunkResult` per source file.
+    label : str
+        Where they came from, for the log line.
+    failures : list[str]
+        Sources that could not be read or chunked. Recorded rather than
+        raised: one unreadable file must not lose the estimate for the rest,
+        and the ``run-summary.md`` reports them.
+    """
+
+    file_results: list[Any]
+    label: str
+    failures: list[str]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -203,28 +329,94 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
 
-    # Checked before the corpus is scored: a run that cannot deliver what was
-    # asked for should say so in a second, not after the analysis.
-    if args.pdf and args.out is None and args.out_dir is None:
-        logger.error("--pdf needs --out or --out-dir; stdout has nowhere to "
-                     "put a file")
-        print("--pdf needs --out or --out-dir.", file=sys.stderr)
+    problem = _argument_error(args)
+    if problem is not None:
+        logger.error(problem)
+        print(problem, file=sys.stderr)
         return 1
 
+    if args.sharepoint:
+        return _run_sharepoint(args)
+    return _run_local(args)
+
+
+# ---------------------------------------------------------------------------
+# Sources — the seam between where the SAS came from and what is done with it
+# ---------------------------------------------------------------------------
+
+
+def _load_local_sources(args: argparse.Namespace) -> _Sources | None:
+    """Chunk every file matching ``--pattern`` under ``sas_dir``.
+
+    ``None`` when the directory holds no matching file, which is a failed run
+    rather than an empty report.
+    """
     sas_files = sorted(args.sas_dir.rglob(args.pattern))
     if not sas_files:
         logger.error(f"no files matching {args.pattern!r} under {args.sas_dir}")
-        return 1
+        return None
     logger.info(f"scoring {len(sas_files)} SAS file(s) under {args.sas_dir}")
 
     chunker = SasSemanticChunker()
-    corpus = SasCorpus(
-        file_results=[chunker.chunk_file(str(path)) for path in sas_files]
-    )
+    results: list[Any] = []
+    failures: list[str] = []
+    for path in sas_files:
+        try:
+            results.append(chunker.chunk_file(str(path)))
+        except Exception as exc:
+            logger.error(f"could not chunk {path}: {exc}")
+            failures.append(str(path))
+    if not results:
+        return None
+    return _Sources(results, str(args.sas_dir), failures)
+
+
+def _load_sharepoint_sources(
+    application: str, *, client: Any | None = None
+) -> _Sources | None:
+    """Download and chunk one application's scripts from the library.
+
+    No temporary files: ``chunk_text`` takes the source text with an explicit
+    ``source_id``, and the drive-relative path is exactly the id wanted — it
+    is what the per-file reports are named after (via ``source_stems``) and
+    what a reader needs to find the script again.
+    """
+    from . import sharepoint as sp
+
+    paths = sp.source_files(application, client=client)
+    if not paths:
+        logger.error(f"no source files under the {application!r} scripts folder")
+        return None
+    logger.info(f"scoring {len(paths)} SAS file(s) for {application!r}")
+
+    chunker = SasSemanticChunker()
+    results: list[Any] = []
+    failures: list[str] = []
+    for path in paths:
+        try:
+            results.append(chunker.chunk_text(sp.load(path, client=client), source_id=path))
+        except Exception as exc:
+            logger.error(f"could not chunk {path}: {exc}")
+            failures.append(path)
+    if not results:
+        return None
+    return _Sources(results, application, failures)
+
+
+# ---------------------------------------------------------------------------
+# Analysis — shared by both modes, untouched by either
+# ---------------------------------------------------------------------------
+
+
+def _analyse(
+    args: argparse.Namespace, sources: _Sources, *, target: str | None
+) -> tuple[CorpusComplexityReport, ChunkTextIndex, ComplexityAnalyzer]:
+    """Batch and score *sources*. The middle of the run, identical in both modes."""
+    corpus = SasCorpus(file_results=sources.file_results)
     batch_result = MultiFileBatcher().batch(corpus)
 
     analyzer = ComplexityAnalyzer(
-        args.target,
+        target,
         rules_path=args.rules_path,
         size_anchor=args.size_anchor,
         min_story_points=args.min_story_points,
@@ -245,23 +437,48 @@ def main(argv: list[str] | None = None) -> int:
     # not the corpus: MultiFileBatcher re-ids every chunk per file (f1-, f2-,
     # ...), so a lookup built from the raw corpus would miss every one.
     texts = chunk_texts(batch_result.all_ordered_items)
+    return report, texts, analyzer
+
+
+# ---------------------------------------------------------------------------
+# Delivery
+# ---------------------------------------------------------------------------
+
+
+def _deliver(
+    args: argparse.Namespace,
+    report: CorpusComplexityReport,
+    texts: ChunkTextIndex,
+    *,
+    out_dir: Path | None,
+    model: str | None = None,
+    run_llm_eval: bool | None = None,
+) -> tuple[int, list[Path]]:
+    """Write the reports, and return ``(exit status, written paths)``.
+
+    *out_dir* is an explicit parameter rather than a read of ``args.out_dir``
+    because the SharePoint flow stages into a temporary directory. The written
+    paths come back so the caller can upload them; locally they are ignored.
+    """
     include_source = not args.no_source_text
+    written_paths: list[Path] = []
 
     pdf_ok = True
-    if args.out_dir is not None:
+    if out_dir is not None:
         written = write_reports(
             report,
-            args.out_dir,
+            out_dir,
             texts=texts,
             top=args.top,
             include_source=include_source,
             max_source_lines=args.max_chunk_lines,
             graph_image=not args.no_graph_image,
         )
+        written_paths = list(written.paths)
         print(f"wrote overall complexity report: {written.overall}")
         print(
             f"wrote {len(written.files)} individual report(s): "
-            f"{args.out_dir / 'files'}"
+            f"{Path(out_dir) / 'files'}"
         )
         if written.graph is not None:
             print(f"wrote dependency graph: {written.graph}")
@@ -273,6 +490,8 @@ def main(argv: list[str] | None = None) -> int:
             # rendered beside dependency-graph.png so the image it links lands
             # in the document rather than resolving to nothing.
             pdf_ok = _write_pdf(written.overall)
+            if pdf_ok:
+                written_paths.append(written.overall.with_suffix(".pdf"))
     else:
         markdown = render_overall_report(report, top=args.top)
         if args.out is not None:
@@ -283,10 +502,257 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(markdown)
 
-    if args.llm_eval or args.llm_model or args.prompt_only:
-        status = _run_evaluation(args, report, texts, include_source=include_source)
-        return status or (0 if pdf_ok else 1)
-    return 0 if pdf_ok else 1
+    wanted = (
+        run_llm_eval
+        if run_llm_eval is not None
+        else bool(args.llm_eval or args.llm_model or args.prompt_only)
+    )
+    status = 0
+    if wanted:
+        status = _run_evaluation(
+            args,
+            report,
+            texts,
+            out_dir=out_dir,
+            include_source=include_source,
+            model=model,
+        )
+        written_paths.extend(_evaluation_paths(args, out_dir))
+    return (status or (0 if pdf_ok else 1)), written_paths
+
+
+def _evaluation_paths(args: argparse.Namespace, out_dir: Path | None) -> list[Path]:
+    """Whatever :func:`_run_evaluation` wrote under *out_dir*, for uploading."""
+    if out_dir is None:
+        return []
+    root = Path(out_dir)
+    found: list[Path] = []
+    evaluation = root / _EVALUATION_NAME
+    if evaluation.is_file():
+        found.append(evaluation)
+    prompts = root / _PROMPT_DIR
+    if prompts.is_dir():
+        found.extend(sorted(p for p in prompts.iterdir() if p.is_file()))
+    return found
+
+
+def _run_local(args: argparse.Namespace) -> int:
+    sources = _load_local_sources(args)
+    if sources is None:
+        return 1
+    report, texts, _ = _analyse(args, sources, target=args.target)
+    status, _ = _deliver(args, report, texts, out_dir=args.out_dir)
+    return status
+
+
+# ---------------------------------------------------------------------------
+# SharePoint mode
+# ---------------------------------------------------------------------------
+
+
+def _timestamp() -> str:
+    """A path-safe UTC stamp naming one run's upload folder."""
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _segment(value: str) -> str:
+    """*value* reduced to one safe path segment for a SharePoint folder."""
+    import re
+
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-")
+    return cleaned or "run"
+
+
+def _run_sharepoint(args: argparse.Namespace) -> int:
+    """Score every selected request row, each as its own corpus.
+
+    One row failing does not abort the rest — a request list is a queue, not a
+    transaction — but the exit status is non-zero if any did.
+    """
+    from app_config.sharepoint import SharePointError, get_sharepoint_client
+
+    from . import sharepoint as sp
+
+    client = get_sharepoint_client()
+    try:
+        if args.item_id:
+            rows = [sp.request(args.item_id, client=client)]
+        else:
+            rows = sp.requests(application=args.app, client=client)
+    except SharePointError as exc:
+        logger.error(f"could not read the complexity request list: {exc}")
+        print(f"could not read the complexity request list: {exc}", file=sys.stderr)
+        return 1
+
+    if not rows:
+        which = f" for application {args.app!r}" if args.app else ""
+        logger.error(f"no complexity request rows{which}")
+        print(f"no complexity request rows{which}.", file=sys.stderr)
+        return 1
+
+    logger.info(f"processing {len(rows)} complexity request row(s)")
+    status = 0
+    for row in rows:
+        try:
+            if _run_request(args, row, client=client) != 0:
+                status = 1
+        except Exception as exc:  # one row must not take the others down
+            logger.exception(
+                f"request {row.item_id} ({row.application}) failed: {exc}"
+            )
+            print(f"request {row.item_id} ({row.application}) failed: {exc}",
+                  file=sys.stderr)
+            status = 1
+    return status
+
+
+def _profile_for(output_language: str | None) -> str | None:
+    """The rules profile a row's ``Output_Language`` names.
+
+    The row carries a *language* in whatever spelling an operator picked
+    ("SparkSQL", "Spark SQL", "spark_sql"), while ``--target`` and the
+    ``profiles/`` directory carry a *profile* name ("sparksql").
+    :mod:`target_language` owns the folding between the two, so routing the
+    row through it is what makes a display-cased value find its rule set —
+    on a case-sensitive filesystem as much as a forgiving one.
+
+    Raises
+    ------
+    target_language.UnknownTargetLanguage
+        The row names a language this repo cannot translate into. Reported
+        per row by :func:`_run_sharepoint`, which is the right blast radius:
+        one mistyped row must not stop the others.
+    """
+    if not output_language:
+        return None
+    from target_language import resolve_target_language
+
+    return resolve_target_language(output_language).complexity_profile
+
+
+def _run_request(args: argparse.Namespace, row: Any, *, client: Any) -> int:
+    """Score one request row and upload its reports."""
+    from . import sharepoint as sp
+
+    started = time.monotonic()
+    # Explicit flags beat the row, which beats config.json, which beats the
+    # built-in default — the repo-wide precedence rule, extended by one step.
+    # --target already names a profile; the row names a language.
+    target = args.target or _profile_for(row.output_language)
+    model = args.llm_model or row.preferred_llm
+    run_llm_eval = bool(args.llm_eval or args.prompt_only or model)
+
+    sources = _load_sharepoint_sources(row.application, client=client)
+    if sources is None:
+        return 1
+    report, texts, analyzer = _analyse(args, sources, target=target)
+
+    # The label records what produced the estimate: the model when the LLM
+    # pass ran, else the rules profile that did — which still means something
+    # for an entirely offline run.
+    label = _segment(model if (run_llm_eval and model) else analyzer.ruleset.target)
+    timestamp = _timestamp()
+
+    with _staging(args.out_dir) as staging:
+        status, written = _deliver(
+            args,
+            report,
+            texts,
+            out_dir=staging,
+            model=model,
+            run_llm_eval=run_llm_eval,
+        )
+        summary = sp.render_run_summary(
+            row,
+            target=analyzer.ruleset.target,
+            model=model if run_llm_eval else None,
+            label=label,
+            timestamp=timestamp,
+            files_scored=len(report.files),
+            failures=sources.failures,
+            seconds=time.monotonic() - started,
+            exit_status=status,
+        )
+        summary_path = staging / sp.RUN_SUMMARY_NAME
+        summary_path.write_text(summary, encoding="utf-8")
+
+        if args.no_upload:
+            logger.info(
+                f"--no-upload: {len(written) + 1} file(s) left in {staging}"
+            )
+            return status
+        uploaded = _upload(
+            args, row, label, timestamp, [*written, summary_path], staging,
+            client=client,
+        )
+        print(f"uploaded {len(uploaded)} file(s) for {row.application}")
+    return status
+
+
+def _staging(out_dir: Path | None) -> Any:
+    """A context manager yielding the directory reports are written into.
+
+    With ``--out-dir`` that directory is used and kept — a caller who asked
+    for the files locally gets them as well as the upload. Without it, a
+    temporary directory is used and removed. Staging rather than streaming is
+    deliberate: ``render_pdf`` needs the Markdown and ``dependency-graph.png``
+    co-located to resolve the image.
+    """
+    import contextlib
+
+    if out_dir is not None:
+        @contextlib.contextmanager
+        def _kept():
+            Path(out_dir).mkdir(parents=True, exist_ok=True)
+            yield Path(out_dir)
+
+        return _kept()
+
+    @contextlib.contextmanager
+    def _temporary():
+        with tempfile.TemporaryDirectory(prefix="sas_complexity_") as name:
+            yield Path(name)
+
+    return _temporary()
+
+
+def _upload(
+    args: argparse.Namespace,
+    row: Any,
+    label: str,
+    timestamp: str,
+    paths: list[Path],
+    staging: Path,
+    *,
+    client: Any,
+) -> list[str]:
+    """Upload the staged tree, honouring ``--sharepoint-out``."""
+    from app_config.sharepoint import SharePointConfig
+
+    from . import sharepoint as sp
+
+    if args.sharepoint_out:
+        # An explicit destination replaces the whole convention, so it is used
+        # as the base with no application/label/timestamp beneath it.
+        from dataclasses import replace
+
+        override = replace(
+            SharePointConfig.from_env(),
+            file_server_base_path=args.sharepoint_out.strip().strip("/"),
+        )
+        return sp.upload_reports(
+            "", "", "", paths, staging_root=staging, client=client, config=override
+        )
+    return sp.upload_reports(
+        row.application,
+        label,
+        timestamp,
+        paths,
+        staging_root=staging,
+        client=client,
+    )
 
 
 def _write(path: Path, text: str) -> None:
@@ -319,12 +785,18 @@ def _run_evaluation(
     report: CorpusComplexityReport,
     texts: ChunkTextIndex,
     *,
+    out_dir: Path | None,
     include_source: bool,
+    model: str | None = None,
 ) -> int:
     """The optional LLM pass: build the prompts, and send them unless asked not to.
 
     Imported lazily and only on this path, so the offline analysis never pays
     for — or depends on — the LLM stack.
+
+    *out_dir* is passed in rather than read off *args* so the SharePoint flow's
+    staging directory collects ``prompts/`` and ``llm-evaluation.md`` too, and
+    they get uploaded with everything else.
     """
     from .llm_eval import evaluate_report, evaluation_prompts
 
@@ -345,12 +817,12 @@ def _run_evaluation(
             max_source_lines=args.max_chunk_lines,
             sources=wanted,
         )
-        if args.out_dir is None:
+        if out_dir is None:
             for source_id, prompt in prompts.items():
                 print(f"\n===== {source_id} =====\n")
                 print(prompt)
             return 0
-        directory = Path(args.out_dir) / _PROMPT_DIR
+        directory = Path(out_dir) / _PROMPT_DIR
         directory.mkdir(parents=True, exist_ok=True)
         stems = source_stems(prompts)
         for source_id, prompt in prompts.items():
@@ -366,10 +838,15 @@ def _run_evaluation(
         print(f"--llm-eval is unavailable: {exc}", file=sys.stderr)
         return 1
 
+    # The "complexity" role overlay lets this run carry its own model and
+    # timeout without disturbing the conversion pipeline's; an explicit
+    # --llm-model (or a SharePoint row's Preferred_LLM, passed as *model*)
+    # still wins over both.
+    wanted_model = model or args.llm_model
     config = (
-        LLMClientConfig(model=args.llm_model)
-        if args.llm_model
-        else LLMClientConfig()
+        LLMClientConfig.for_role("complexity", model=wanted_model)
+        if wanted_model
+        else LLMClientConfig.for_role("complexity")
     )
     evaluation = evaluate_report(
         LLMClient(config),
@@ -381,8 +858,8 @@ def _run_evaluation(
         model=config.model,
     )
     markdown = evaluation.to_markdown()
-    if args.out_dir is not None:
-        dest = Path(args.out_dir) / _EVALUATION_NAME
+    if out_dir is not None:
+        dest = Path(out_dir) / _EVALUATION_NAME
         _write(dest, markdown)
         print(f"wrote LLM complexity evaluation: {dest}")
     else:

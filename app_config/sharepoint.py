@@ -4,9 +4,15 @@ Submodule of :mod:`app_config`, and the first *consumer* of
 :mod:`app_config.azure` after :mod:`app_config.databricks`: where ``azure``
 turns an Entra ID identity into an access token, this module points that token
 at a SharePoint site's document library (a Graph *drive*) and its lists, and
-exposes the handful of operations a PowerApps-style integration needs —
-browsing folders, reading and writing files, creating folders, and reading list
-items.
+exposes the operations the conversion, xref and complexity flows need —
+browsing folders, reading and writing files, creating folders, and reading and
+updating list items.
+
+It stays free of domain knowledge: which folder holds a given application's
+scripts, and what the columns of the request list mean, belong to those flows,
+not here. What this module owns is the transport and the addressing —
+including :meth:`SharePointConfig.drive_path`, so nobody concatenates path
+segments by hand.
 
 Split of concerns
 -----------------
@@ -17,12 +23,15 @@ Split of concerns
   :func:`app_config.get_typed_value`, so a wrong-typed entry degrades to the
   hard default with a WARNING rather than crashing).
 * **Secrets** — there are none here. Authentication is delegated to
-  :mod:`app_config.azure`: a Graph token is minted from the configured Entra ID
-  service principal (``AZURE_TENANT_ID`` / ``AZURE_CLIENT_ID`` /
-  ``AZURE_CLIENT_SECRET`` or a certificate) against the Microsoft Graph
-  resource (:data:`GRAPH_DEFAULT_SCOPE`). Nothing long-lived is stored anywhere;
-  the app registration needs the application permissions ``Sites.ReadWrite.All``
-  (files and lists) granted with admin consent.
+  :mod:`app_config.azure`, which mints a Graph token
+  (:data:`GRAPH_DEFAULT_SCOPE`) for one of two identities. With a secret scope
+  configured, it is SharePoint's **own** service principal, read from that
+  scope under ``saact-hsv-tenantid`` / ``-appid`` / ``-secret`` — a different
+  principal from the one that reaches Vault, which is how the deployment is
+  set up. With no scope, it is the shared ``AZURE_TENANT_ID`` /
+  ``AZURE_CLIENT_ID`` / ``AZURE_CLIENT_SECRET`` identity. Nothing long-lived is
+  stored anywhere; either app registration needs the application permission
+  ``Sites.ReadWrite.All`` (files and lists) granted with admin consent.
 
 Addressing
 ----------
@@ -73,13 +82,17 @@ Logger name: ``app_config.sharepoint``.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from . import get_typed_value, get_value
+
+if TYPE_CHECKING:  # real types without importing the optional azure path
+    from .databricks import SecretKeySet
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +101,28 @@ logger = logging.getLogger(__name__)
 GRAPH_DEFAULT_SCOPE = "https://graph.microsoft.com/.default"
 
 DEFAULT_TIMEOUT = 60.0
+
+# Document-library prefix a SharePoint URL shows but Graph does not use: items
+# are addressed *inside* the library, so a base path pasted from the browser
+# has to have this stripped or every lookup goes hunting for a folder of that
+# literal name. Matched case-insensitively — the reference strips it exactly.
+DOC_LIBRARY_PREFIX = "shared documents/"
+
+# Where the SharePoint service principal is filed in the Databricks secret
+# scope. A different principal from the workspace/Vault one under `sp-hsv-*`,
+# in the same scope.
+DEFAULT_TENANT_ID_KEY = "saact-hsv-tenantid"
+DEFAULT_CLIENT_ID_KEY = "saact-hsv-appid"
+DEFAULT_CLIENT_SECRET_KEY = "saact-hsv-secret"
+
+# The lists a run is driven by, as `list_id(kind)` names them, mapped to the
+# config key each id is read from.
+LIST_KINDS: dict[str, str] = {
+    "requests": "list_id_sas_requests",
+    "conversions": "list_id_sas_conversions",
+    "xref": "list_id_xref",
+    "complexity": "list_id_sas_complexity",
+}
 
 # Lifetime stamped on the AccessToken handed to the Graph SDK. app_config.azure
 # holds the authoritative token cache (it re-acquires shortly before real
@@ -113,6 +148,28 @@ def _drive_item_id(path: str) -> str:
     """
     clean = path.strip().strip("/")
     return "root" if not clean else f"root:/{clean}:"
+
+
+def _normalise_base_path(raw: str | None) -> str:
+    """
+    A configured applications root as a **drive-relative** path: leading and
+    trailing slashes dropped, and a leading ``"Shared Documents/"`` stripped
+    (case-insensitively).
+
+    That prefix is what a SharePoint URL shows, so it is what gets pasted into
+    config, but Graph addresses items inside the library — leaving it on would
+    look for a folder literally named "Shared Documents". ``""`` when unset,
+    meaning the library root.
+    """
+    if not raw:
+        return ""
+    trimmed = raw.strip().strip("/")
+    lowered = trimmed.lower()
+    if lowered == DOC_LIBRARY_PREFIX.rstrip("/"):
+        return ""  # the library itself, i.e. the drive root
+    if lowered.startswith(DOC_LIBRARY_PREFIX):
+        trimmed = trimmed[len(DOC_LIBRARY_PREFIX):].strip("/")
+    return trimmed
 
 
 def _normalise_site_path(site_path: str | None) -> str | None:
@@ -159,6 +216,30 @@ class SharePointConfig:
         ``("https://graph.microsoft.com/.default",)``.
     timeout : float
         Per-request timeout in seconds. ``sharepoint.timeout``, default ``60``.
+    file_server_base_path : str
+        The applications root inside the library, drive-relative — a leading
+        ``"Shared Documents/"`` is stripped on resolution (see
+        :func:`_normalise_base_path`). ``SHAREPOINT_FILE_SERVER_BASE_PATH`` /
+        ``sharepoint.file_server_base_path``. ``""`` (default) is the library
+        root. Join onto it with :meth:`drive_path`, never by hand.
+    secret_scope : str | None
+        Databricks secret scope holding SharePoint's *own* service principal.
+        ``SHAREPOINT_SECRET_SCOPE`` / ``sharepoint.secret_scope``, defaulting
+        to the workspace's ``DATABRICKS_SECRET_SCOPE`` /
+        ``databricks.secret_scope`` — the reference keeps both principals in
+        one scope. ``None`` (nothing configured anywhere) falls back to the
+        shared :mod:`app_config.azure` identity, which is the local path.
+    tenant_id_key, client_id_key, client_secret_key : str
+        Which keys in that scope hold the principal.
+        ``SHAREPOINT_TENANT_ID_KEY`` / ``SHAREPOINT_CLIENT_ID_KEY`` /
+        ``SHAREPOINT_CLIENT_SECRET_KEY``, or the ``sharepoint.*`` equivalents;
+        defaulting to ``saact-hsv-tenantid`` / ``saact-hsv-appid`` /
+        ``saact-hsv-secret``.
+    list_id_sas_requests, list_id_sas_conversions, list_id_xref,
+    list_id_sas_complexity : str | None
+        The four lists a run is driven by. ``SHAREPOINT_LIST_ID_*`` /
+        ``sharepoint.list_id_*``. Read them through :meth:`list_id`, which
+        names the missing config key rather than passing ``None`` to Graph.
     """
 
     site_hostname: str | None = None
@@ -167,6 +248,15 @@ class SharePointConfig:
     drive_id: str | None = None
     scopes: tuple[str, ...] = (GRAPH_DEFAULT_SCOPE,)
     timeout: float = DEFAULT_TIMEOUT
+    file_server_base_path: str = ""
+    secret_scope: str | None = None
+    tenant_id_key: str = DEFAULT_TENANT_ID_KEY
+    client_id_key: str = DEFAULT_CLIENT_ID_KEY
+    client_secret_key: str = DEFAULT_CLIENT_SECRET_KEY
+    list_id_sas_requests: str | None = None
+    list_id_sas_conversions: str | None = None
+    list_id_xref: str | None = None
+    list_id_sas_complexity: str | None = None
 
     @classmethod
     def from_env(cls) -> "SharePointConfig":
@@ -196,6 +286,40 @@ class SharePointConfig:
             timeout=get_typed_value(
                 "sharepoint", "timeout", (int, float), DEFAULT_TIMEOUT
             ),
+            file_server_base_path=_normalise_base_path(
+                os.environ.get("SHAREPOINT_FILE_SERVER_BASE_PATH")
+                or get_value("sharepoint", "file_server_base_path")
+            ),
+            secret_scope=(
+                os.environ.get("SHAREPOINT_SECRET_SCOPE")
+                or get_value("sharepoint", "secret_scope")
+                # SharePoint's principal lives in the same scope as the
+                # workspace's, under different keys — so the scope defaults
+                # across rather than having to be configured twice.
+                or os.environ.get("DATABRICKS_SECRET_SCOPE")
+                or get_value("databricks", "secret_scope")
+            ),
+            tenant_id_key=(
+                os.environ.get("SHAREPOINT_TENANT_ID_KEY")
+                or get_value("sharepoint", "tenant_id_key", DEFAULT_TENANT_ID_KEY)
+            ),
+            client_id_key=(
+                os.environ.get("SHAREPOINT_CLIENT_ID_KEY")
+                or get_value("sharepoint", "client_id_key", DEFAULT_CLIENT_ID_KEY)
+            ),
+            client_secret_key=(
+                os.environ.get("SHAREPOINT_CLIENT_SECRET_KEY")
+                or get_value(
+                    "sharepoint", "client_secret_key", DEFAULT_CLIENT_SECRET_KEY
+                )
+            ),
+            **{
+                field_name: (
+                    os.environ.get(f"SHAREPOINT_{field_name.upper()}")
+                    or get_value("sharepoint", field_name)
+                )
+                for field_name in LIST_KINDS.values()
+            },
         )
 
     @property
@@ -211,6 +335,61 @@ class SharePointConfig:
         if self.site_hostname and self.site_path:
             return f"{self.site_hostname}:{self.site_path}"
         return None
+
+    @property
+    def secret_keys(self) -> "SecretKeySet":
+        """This config's key triple as a
+        :class:`~app_config.databricks.SecretKeySet`."""
+        from .databricks import SecretKeySet
+
+        return SecretKeySet(
+            tenant_id_key=self.tenant_id_key,
+            client_id_key=self.client_id_key,
+            client_secret_key=self.client_secret_key,
+        )
+
+    def drive_path(self, *parts: str) -> str:
+        """
+        :attr:`file_server_base_path` joined with *parts*, as one
+        drive-relative path.
+
+        The single place path segments are concatenated, so no caller has to
+        remember whether the base carries a trailing slash or the document
+        library prefix. Empty and ``None``-ish parts are skipped, and each
+        part's own leading/trailing slashes are absorbed, so
+        ``drive_path("MyApp", "/scripts_original/")`` and
+        ``drive_path("MyApp/scripts_original")`` agree.
+        """
+        segments = [self.file_server_base_path, *parts]
+        cleaned = [segment.strip().strip("/") for segment in segments if segment]
+        return "/".join(part for part in cleaned if part)
+
+    def list_id(self, kind: str) -> str:
+        """
+        The configured id of one of the four driving lists — *kind* being
+        ``"requests"``, ``"conversions"``, ``"xref"`` or ``"complexity"``
+        (:data:`LIST_KINDS`).
+
+        Raises
+        ------
+        SharePointError
+            The id is not configured. The message names the config key to
+            set, which beats Graph reporting that ``None`` is not a list.
+        """
+        try:
+            key = LIST_KINDS[kind]
+        except KeyError:
+            raise SharePointError(
+                f"unknown SharePoint list kind {kind!r}; expected one of "
+                f"{', '.join(sorted(LIST_KINDS))}"
+            ) from None
+        value = getattr(self, key)
+        if not value:
+            raise SharePointError(
+                f"no SharePoint {kind} list configured: set "
+                f"SHAREPOINT_{key.upper()} or sharepoint.{key} in config.json"
+            )
+        return value
 
 
 def _resolve_scopes() -> tuple[str, ...]:
@@ -265,11 +444,34 @@ class _GraphTokenCredential:
         return AccessToken(token, int(time.time()) + _CREDENTIAL_TTL)
 
 
-def _default_token_provider(scopes: tuple[str, ...]) -> str:
-    """Mint a Graph token via the shared :func:`app_config.azure.get_token`."""
-    from .azure import get_token
+def _token_provider(config: SharePointConfig) -> Callable[[tuple[str, ...]], str]:
+    """
+    The function that mints Graph tokens for *config*.
 
-    return get_token(scopes=scopes)
+    With a secret scope configured, SharePoint authenticates as its **own**
+    service principal, read from that scope under
+    :attr:`~SharePointConfig.tenant_id_key` and friends — a different identity
+    from the one that reaches Vault, which is how the reference deployment is
+    set up. With no scope anywhere, the shared :mod:`app_config.azure`
+    identity is used, which is the local/dev path.
+    """
+    if config.secret_scope:
+        keys = config.secret_keys
+        scope = config.secret_scope
+
+        def _as_sharepoint_principal(scopes: tuple[str, ...]) -> str:
+            from .azure import get_databricks_client
+
+            return get_databricks_client(scope, keys=keys).get_token(scopes)
+
+        return _as_sharepoint_principal
+
+    def _as_shared_identity(scopes: tuple[str, ...]) -> str:
+        from .azure import get_token
+
+        return get_token(scopes=scopes)
+
+    return _as_shared_identity
 
 
 def _drive_item_to_dict(item: Any) -> dict[str, Any]:
@@ -353,14 +555,19 @@ class SharePointClient:
         from .azure import AzureAuthConfig
 
         azure_config = AzureAuthConfig.from_env()
-        if not (azure_config.tenant_id and azure_config.client_id):
+        if not self.config.secret_scope and not (
+            azure_config.tenant_id and azure_config.client_id
+        ):
             raise SharePointError(
-                "no Entra ID identity for SharePoint: set AZURE_TENANT_ID and "
-                "AZURE_CLIENT_ID (plus AZURE_CLIENT_SECRET or a certificate) so "
-                "app_config.azure can mint a Microsoft Graph token"
+                "no Entra ID identity for SharePoint: point "
+                "SHAREPOINT_SECRET_SCOPE (or DATABRICKS_SECRET_SCOPE) at the "
+                "scope holding SharePoint's service principal, or set "
+                "AZURE_TENANT_ID and AZURE_CLIENT_ID (plus AZURE_CLIENT_SECRET "
+                "or a certificate) to mint a Microsoft Graph token with the "
+                "shared identity"
             )
         credential = self._credential or _GraphTokenCredential(
-            _default_token_provider, self.config.scopes
+            _token_provider(self.config), self.config.scopes
         )
         try:
             import httpx
@@ -466,18 +673,20 @@ class SharePointClient:
         """
         A Microsoft Graph access token for the configured identity — the
         authentication step, exposed for callers that need the bearer token
-        directly. Delegates to :func:`app_config.azure.get_token`.
+        directly. Uses the same provider the Graph client authenticates with
+        (:func:`_token_provider`), so this is never a *different* identity
+        from the one the operations use.
 
         Raises
         ------
         SharePointError
             The Entra ID login failed.
         """
-        from .azure import AzureAuthError, get_token
+        from .azure import AzureAuthError
 
         wanted = tuple(scopes) if scopes else self.config.scopes
         try:
-            return get_token(scopes=wanted)
+            return _token_provider(self.config)(wanted)
         except AzureAuthError as exc:
             raise SharePointError(
                 f"could not mint a Microsoft Graph token for SharePoint: {exc}"
@@ -502,6 +711,43 @@ class SharePointClient:
             raise SharePointError(
                 f"could not list SharePoint directory {path or '/'!r}: {exc}"
             ) from exc
+
+    def list_files(
+        self, path: str = "", extensions: tuple[str, ...] | list[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """
+        The *files* directly inside the folder at *path*, optionally filtered
+        by extension.
+
+        Folders are dropped, so a caller looking for source files does not have
+        to. *extensions* are matched case-insensitively with or without a
+        leading dot, so ``("sas", "txt")`` and ``(".SAS", ".TXT")`` agree;
+        ``None`` (default) keeps every file. Each entry additionally carries a
+        ``"path"`` key — the item's drive-relative path — since that is what
+        :meth:`download_file_as_text` and the domain layers pass around.
+
+        Raises
+        ------
+        SharePointError
+            The folder is absent, or the listing otherwise fails.
+        """
+        wanted = (
+            {ext.strip().lstrip(".").lower() for ext in extensions}
+            if extensions is not None
+            else None
+        )
+        folder = path.strip().strip("/")
+        files: list[dict[str, Any]] = []
+        for entry in self.list_directory(path):
+            if entry["is_folder"]:
+                continue
+            name = entry.get("name") or ""
+            if wanted is not None:
+                _, dot, suffix = name.rpartition(".")
+                if not dot or suffix.lower() not in wanted:
+                    continue
+            files.append({**entry, "path": f"{folder}/{name}" if folder else name})
+        return files
 
     async def _collect_children(self, path: str) -> list[dict[str, Any]]:
         builder = self._item(path).children
@@ -537,6 +783,44 @@ class SharePointClient:
             raise SharePointError(f"SharePoint file {path!r} returned no content")
         return content
 
+    def download_file_as_text(self, path: str, *, encoding: str = "utf-8") -> str:
+        """
+        The file at *path* decoded as text.
+
+        The encoding is explicit and undecodable bytes are replaced rather than
+        raising: these are SAS sources typed on assorted machines over assorted
+        decades, and one stray byte must not lose the whole file. ``utf-8-sig``
+        by effect — a BOM is stripped — since Windows editors add one.
+
+        Raises
+        ------
+        SharePointError
+            The file is absent, is a folder, or the download otherwise fails.
+        """
+        raw = self.read_file(path)
+        if encoding.lower() in ("utf-8", "utf8"):
+            encoding = "utf-8-sig"  # also accepts BOM-less files
+        return raw.decode(encoding, errors="replace")
+
+    def read_json_text(self, path: str, *, encoding: str = "utf-8") -> Any:
+        """
+        The JSON document at *path*, parsed.
+
+        Raises
+        ------
+        SharePointError
+            The file is absent, the download fails, or the content is not
+            valid JSON — the last of which names the path, because "expecting
+            value: line 1" on its own says nothing about which file.
+        """
+        text = self.download_file_as_text(path, encoding=encoding)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise SharePointError(
+                f"SharePoint file {path!r} is not valid JSON: {exc}"
+            ) from exc
+
     def write_file(self, path: str, content: bytes | str) -> dict[str, Any]:
         """
         Create or replace the file at *path* with *content* (``str`` is encoded
@@ -564,6 +848,61 @@ class SharePointClient:
                 f"could not write SharePoint file {path!r}: {exc}"
             ) from exc
         return _drive_item_to_dict(item)
+
+    def upload_file(
+        self, folder: str, name: str, content: bytes | str
+    ) -> dict[str, Any]:
+        """
+        :meth:`write_file` addressed as *folder* + *name* rather than as one
+        joined path.
+
+        The shape the domain layers want: they compose a folder from a
+        configured base (:meth:`SharePointConfig.drive_path`) and then upload
+        files into it by name, so joining the two here means no caller has to
+        get slashes right. ``upload_file("a/b", "c.sas", ...)`` and
+        ``write_file("a/b/c.sas", ...)`` are the same call.
+
+        Raises
+        ------
+        SharePointError
+            *name* is empty, or the upload fails.
+        """
+        leaf = name.strip().strip("/")
+        if not leaf:
+            raise SharePointError("upload_file needs a file name")
+        parent = folder.strip().strip("/")
+        return self.write_file(f"{parent}/{leaf}" if parent else leaf, content)
+
+    def create_folder(self, path: str) -> dict[str, Any]:
+        """
+        Ensure the folder at *path* exists, creating it and any missing parents,
+        and return it.
+
+        **Idempotent**, unlike :meth:`create_directory`: the upload flows call
+        this unconditionally before writing into a folder, so an existing one
+        is a success rather than a conflict. Each segment is created with
+        ``conflict_behavior="replace"``, which for a *folder* body means "use
+        the existing one" — Graph does not empty it.
+
+        Raises
+        ------
+        SharePointError
+            *path* names no folder, or a segment could not be created.
+        """
+        clean = path.strip().strip("/")
+        if not clean:
+            raise SharePointError(
+                "create_folder needs a folder path, not the library root"
+            )
+        item: dict[str, Any] | None = None
+        walked = ""
+        for segment in clean.split("/"):
+            if not segment:
+                continue
+            walked = f"{walked}/{segment}" if walked else segment
+            item = self.create_directory(walked, conflict_behavior="replace")
+        assert item is not None  # clean is non-empty, so the loop ran
+        return item
 
     def create_directory(
         self, path: str, *, conflict_behavior: str = "fail"
@@ -689,6 +1028,98 @@ class SharePointClient:
                 break
             response = await builder.with_url(next_link).get()
         return items
+
+    # -- list items ---------------------------------------------------------
+
+    def list_items(self, list_id: str, **options: Any) -> list[dict[str, Any]]:
+        """Every item in the list, as :meth:`read_list_items` returns them —
+        the name the domain layers and the reference both use."""
+        return self.read_list_items(list_id, **options)
+
+    def get_list_item(self, list_id: str, item_id: str | int) -> dict[str, Any]:
+        """
+        One item from *list_id* by its ``ID``, flattened to
+        ``{id, web_url, fields}`` like :meth:`read_list_items`.
+
+        Raises
+        ------
+        SharePointError
+            No site is configured, the list or item is absent, or the read
+            fails.
+        """
+        site_id = self._site_id()
+        try:
+            item = self._run(
+                self.client.sites.by_site_id(site_id)
+                .lists.by_list_id(list_id)
+                .items.by_list_item_id(str(item_id))
+                .get()
+            )
+        except SharePointError:
+            raise
+        except Exception as exc:
+            raise SharePointError(
+                f"could not read item {item_id!r} of SharePoint list "
+                f"{list_id!r}: {exc}"
+            ) from exc
+        if item is None:
+            raise SharePointError(
+                f"SharePoint list {list_id!r} has no item {item_id!r}"
+            )
+        return _list_item_to_dict(item)
+
+    def update_list_item(
+        self, list_id: str, item_id: str | int, fields: dict[str, Any]
+    ) -> dict[str, Any]:
+        """
+        Write *fields* onto one item of *list_id*, returning the updated column
+        values.
+
+        *fields* is keyed by **internal** column name, which is what the list's
+        columns are addressed by and often differs from the display name (a
+        space becomes ``_x0020_``, a renamed column keeps its original name).
+        A partial mapping is a partial update — columns not named are left
+        alone.
+
+        Raises
+        ------
+        SharePointError
+            *fields* is empty, no site is configured, the list or item is
+            absent, or the write fails.
+        """
+        if not fields:
+            raise SharePointError(
+                f"update_list_item was given no fields to write to item "
+                f"{item_id!r} of list {list_id!r}"
+            )
+        site_id = self._site_id()
+        try:
+            updated = self._run(self._update_fields(site_id, list_id, item_id, fields))
+        except SharePointError:
+            raise
+        except Exception as exc:
+            raise SharePointError(
+                f"could not update item {item_id!r} of SharePoint list "
+                f"{list_id!r}: {exc}"
+            ) from exc
+        data = getattr(updated, "additional_data", None)
+        logger.info(
+            f"update_list_item: wrote {sorted(fields)} to item {item_id} of "
+            f"list {list_id!r}"
+        )
+        return dict(data) if data else {}
+
+    async def _update_fields(
+        self, site_id: str, list_id: str, item_id: str | int, fields: dict[str, Any]
+    ) -> Any:
+        from msgraph.generated.models.field_value_set import FieldValueSet
+
+        return await (
+            self.client.sites.by_site_id(site_id)
+            .lists.by_list_id(list_id)
+            .items.by_list_item_id(str(item_id))
+            .fields.patch(FieldValueSet(additional_data=dict(fields)))
+        )
 
 
 # One client per process, mirroring app_config's config cache.

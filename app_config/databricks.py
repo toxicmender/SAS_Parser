@@ -148,7 +148,10 @@ AZURE_MANAGEMENT_SCOPE = f"{AZURE_MANAGEMENT_RESOURCE}/.default"
 WORKSPACE_RESOURCE_ID_HEADER = "X-Databricks-Azure-Workspace-Resource-Id"
 SP_MANAGEMENT_TOKEN_HEADER = "X-Databricks-Azure-SP-Management-Token"
 
-# Keys the service principal is filed under in the workspace secret scope.
+# Keys the *workspace/Vault* service principal is filed under in the secret
+# scope. It is not the only principal that lives there — SharePoint has one of
+# its own under `saact-hsv-*` in the same scope — so these are the default set
+# rather than the only set. See SecretKeySet.
 SECRET_KEY_CLIENT_ID = "sp-hsv-appid"
 SECRET_KEY_CLIENT_SECRET = "sp-hsv-secret"
 SECRET_KEY_TENANT_ID = "sp-hsv-tenantid"
@@ -181,6 +184,31 @@ class AzureServicePrincipal:
     tenant_id: str
     client_id: str
     client_secret: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class SecretKeySet:
+    """
+    Which three keys in a Databricks secret scope hold one service principal.
+
+    One scope commonly holds several: the workspace/Vault principal under
+    ``sp-hsv-*`` (:data:`DEFAULT_SECRET_KEYS`) and the SharePoint one under
+    ``saact-hsv-*``, for instance. Frozen and hashable so
+    :meth:`DatabricksConfig.service_principal` can cache per set — two
+    principals from one scope coexist rather than overwriting each other.
+    """
+
+    tenant_id_key: str = SECRET_KEY_TENANT_ID
+    client_id_key: str = SECRET_KEY_CLIENT_ID
+    client_secret_key: str = SECRET_KEY_CLIENT_SECRET
+
+    @property
+    def keys(self) -> tuple[str, str, str]:
+        """The three key names, for a single :func:`read_workspace_secrets`."""
+        return (self.tenant_id_key, self.client_id_key, self.client_secret_key)
+
+
+DEFAULT_SECRET_KEYS = SecretKeySet()
 
 
 def _normalise_host(host: str | None) -> str | None:
@@ -279,8 +307,8 @@ class DatabricksConfig:
     secret_scope: str | None = None
     # Resolved service principal and Entra ID client, populated on first use.
     # Excluded from init/repr/eq: they are caches, not configuration.
-    _principal: AzureServicePrincipal | None = field(
-        default=None, init=False, repr=False, compare=False
+    _principals: dict[SecretKeySet, AzureServicePrincipal] = field(
+        default_factory=dict, init=False, repr=False, compare=False
     )
     _azure: "AzureAuthClient | None" = field(
         default=None, init=False, repr=False, compare=False
@@ -396,18 +424,31 @@ class DatabricksConfig:
             return AUTH_AZURE_AD
         return None
 
-    def service_principal(self) -> AzureServicePrincipal:
+    def service_principal(
+        self, keys: SecretKeySet | None = None
+    ) -> AzureServicePrincipal:
         """
-        The Entra ID service principal for this workspace: the locally
-        configured ``ARM_*`` values when complete, else the three keys read
-        out of :attr:`secret_scope` (:data:`SECRET_KEY_TENANT_ID`,
-        :data:`SECRET_KEY_CLIENT_ID`, :data:`SECRET_KEY_CLIENT_SECRET`).
+        An Entra ID service principal out of this workspace's secret scope.
 
-        The scope read goes through :func:`read_workspace_secret`, which needs
+        With the default key set (:data:`DEFAULT_SECRET_KEYS`) this is the
+        *workspace* principal, and the locally configured ``ARM_*`` values win
+        when complete — they are how an operator pins that identity without a
+        scope at all. With any other key set the scope is always read: the
+        ``ARM_*`` values describe one specific principal, and a caller asking
+        for a different one (SharePoint's ``saact-hsv-*``, say) must not be
+        handed it.
+
+        The scope read goes through :func:`read_workspace_secrets`, which needs
         a workspace credential that is *not* this service principal — the
-        Databricks runtime's own on a cluster, or a PAT. Resolved once and
-        cached on the config; :func:`clear_cache` drops it with everything
-        else.
+        Databricks runtime's own on a cluster, or a PAT. Resolved once per key
+        set and cached on the config, so two principals from one scope coexist;
+        :func:`clear_cache` drops them with everything else.
+
+        Parameters
+        ----------
+        keys : SecretKeySet | None
+            Which three keys to read. ``None`` (default) uses
+            :data:`DEFAULT_SECRET_KEYS`.
 
         Raises
         ------
@@ -415,9 +456,11 @@ class DatabricksConfig:
             Neither source yields a complete service principal, or the secret
             scope could not be read.
         """
-        if self._principal is not None:
-            return self._principal
-        if self.has_service_principal:
+        keys = keys if keys is not None else DEFAULT_SECRET_KEYS
+        cached = self._principals.get(keys)
+        if cached is not None:
+            return cached
+        if self.has_service_principal and keys == DEFAULT_SECRET_KEYS:
             # Narrowed by has_service_principal; asserted for the type checker.
             assert self.azure_tenant_id and self.azure_client_id
             assert self.azure_client_secret
@@ -433,29 +476,27 @@ class DatabricksConfig:
         elif self.secret_scope:
             # One bootstrap client for all three keys, not one per key.
             values = read_workspace_secrets(
-                self.secret_scope,
-                (SECRET_KEY_TENANT_ID, SECRET_KEY_CLIENT_ID, SECRET_KEY_CLIENT_SECRET),
-                config=self,
+                self.secret_scope, keys.keys, config=self
             )
             principal = AzureServicePrincipal(
-                tenant_id=values[SECRET_KEY_TENANT_ID],
-                client_id=values[SECRET_KEY_CLIENT_ID],
-                client_secret=values[SECRET_KEY_CLIENT_SECRET],
+                tenant_id=values[keys.tenant_id_key],
+                client_id=values[keys.client_id_key],
+                client_secret=values[keys.client_secret_key],
             )
             logger.info(
                 f"service_principal: read principal {principal.client_id} in "
                 f"tenant {principal.tenant_id} from secret scope "
-                f"{self.secret_scope}"
+                f"{self.secret_scope} under {keys.client_id_key}"
             )
         else:
             raise DatabricksError(
                 "no Azure service principal configured: set ARM_TENANT_ID, "
                 "ARM_CLIENT_ID and ARM_CLIENT_SECRET, or point "
                 "DATABRICKS_SECRET_SCOPE at the scope holding "
-                f"{SECRET_KEY_TENANT_ID}/{SECRET_KEY_CLIENT_ID}/"
-                f"{SECRET_KEY_CLIENT_SECRET}"
+                f"{keys.tenant_id_key}/{keys.client_id_key}/"
+                f"{keys.client_secret_key}"
             )
-        self._principal = principal
+        self._principals[keys] = principal
         return principal
 
     def entra_token(self, scope: str = AZURE_DATABRICKS_SCOPE) -> str:

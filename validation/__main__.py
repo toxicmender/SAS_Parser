@@ -244,7 +244,12 @@ def main(argv: list[str] | None = None) -> int:
         logger.info(f"main: adding judged metrics  model={args.judge_model}")
         metrics.extend(
             judged_metrics(
-                LLMClient(LLMClientConfig(model=args.judge_model)),
+                # The "validator" role overlay: the reference gives the
+                # validator its own (much longer) gateway timeout, and
+                # --judge-model still wins over whatever it configures.
+                LLMClient(
+                    LLMClientConfig.for_role("validator", model=args.judge_model)
+                ),
                 output_language=target.display_name,
                 include=include,
             )
@@ -255,7 +260,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         cases = load_cases(args.cases)
         pipeline = SasLLMPipeline(
-            model=args.model, output_language=target.display_name
+            llm_config=LLMClientConfig(model=args.model),
+            output_language=target.display_name,
         )
         report = ValidationRunner(pipeline, metrics=metrics).run(cases)
     print(report.to_markdown())

@@ -368,7 +368,9 @@ class _RecordingChatModel:
 
 def test_pipeline_prompts_relevant_pair_not_recency_window():
     from chunker.models import SasBatch, SasChunk, SasChunkKind, SasChunkMetadata
+    from llm_client import LLMClientConfig
     from pipeline import SasLLMPipeline
+    from pipeline.setup import MemorySetup
     from memory.store import MemoryHub
 
     def _mk_chunk(chunk_id: str, text: str) -> SasChunk:
@@ -394,8 +396,8 @@ def test_pipeline_prompts_relevant_pair_not_recency_window():
 
     llm = _RecordingChatModel()
     pipeline = SasLLMPipeline(
-        model="unused-because-llm-injected",
-        memory=MemoryHub(),
+        llm_config=LLMClientConfig(model="unused-because-llm-injected"),
+        memory_setup=MemorySetup(memory=MemoryHub()),
         llm=llm,
         window_k=None,
         history_selector=RelevantHistorySelector(top_k=2, always_keep_last=1),

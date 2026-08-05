@@ -7,16 +7,17 @@ Two modes, as argparse subcommands:
     writes the translation as Jupyter notebooks under ``--out-dir``. Model,
     validation on/off, and retries are CLI flags.
 
-``sharepoint`` (Power Apps driven)
-    Picks one conversion request from a SharePoint list — the row whose request
-    id equals ``--request-id`` — pulls its input ``.sas`` scripts from the
-    document library folder named after the request's ``application_name``, runs
-    the pipeline, and writes the responses (and validation artifacts) back to
-    SharePoint under ``<application_name>/output/<timestamp>/``. The Power Apps
-    request id is used as the pipeline ``thread_id``, so the run's conversation
-    memory, run facts, and validation verdicts are keyed to it. The model,
-    validation on/off, application folder, and timestamp all come from the list
-    row — not from CLI flags.
+``sharepoint`` (list driven)
+    Picks one conversion request from the SharePoint requests list — the row
+    whose item ``ID`` equals ``--request-id`` — pulls its input ``.sas``
+    scripts from the document library folder named after the request's
+    application, runs the pipeline, and writes the responses (and validation
+    artifacts) back to SharePoint under
+    ``<application_name>/output/<timestamp>/``. The request id is used as the
+    pipeline ``thread_id``, so the run's conversation memory, run facts, and
+    validation verdicts are keyed to it. The application folder and validation
+    on/off come from the request row, and the model from the matching row of
+    the conversions list — not from CLI flags.
 
 End-to-end wiring the pipeline is built for:
 
@@ -85,16 +86,19 @@ In ``local`` mode, without ``--model`` the model comes from config.json
 (``llm_client.model``), falling back to the code default when that entry is null
 or absent.
 
-SharePoint (Power Apps)
------------------------
-``sharepoint`` mode reads the request list and the document library through
-:mod:`app_config.sharepoint`, which delegates authentication to the Entra ID
-service principal in :mod:`app_config.azure` (``AZURE_TENANT_ID`` /
-``AZURE_CLIENT_ID`` / ``AZURE_CLIENT_SECRET``, app permission
-``Sites.ReadWrite.All``). Point it at the site with ``SHAREPOINT_SITE_ID`` (or
-``SHAREPOINT_SITE_HOSTNAME`` + ``SHAREPOINT_SITE_PATH``) and name the request
-list with ``POWERAPPS_LIST_NAME`` (see :mod:`app_config.powerapps` for the
-column-name settings). All of these may also live in ``config.json``.
+SharePoint (list driven)
+------------------------
+``sharepoint`` mode reads the driving lists and the document library through
+:mod:`app_config.sharepoint` (the transport) and :mod:`conversion` (what the
+rows and folders mean). Authentication is SharePoint's own service principal
+out of the Databricks secret scope, or the Entra ID one in
+:mod:`app_config.azure` (``AZURE_TENANT_ID`` / ``AZURE_CLIENT_ID`` /
+``AZURE_CLIENT_SECRET``); either app registration needs the permission
+``Sites.ReadWrite.All``. Point it at the site with ``SHAREPOINT_SITE_ID`` (or
+``SHAREPOINT_SITE_HOSTNAME`` + ``SHAREPOINT_SITE_PATH``) and name the lists
+with ``SHAREPOINT_LIST_ID_SAS_REQUESTS`` and
+``SHAREPOINT_LIST_ID_SAS_CONVERSIONS``. All of these may also live in
+``config.json``.
 
 AI Gateway credential (the default)
 -----------------------------------
@@ -103,8 +107,8 @@ reached with no long-lived credential on disk::
 
     Databricks secret scope (sp-hsv-tenantid/appid/secret)
       └─ msal client_credentials ──► Entra ID JWT
-           └─ Vault jwt_login (VAULT_OIDC_ROLE)
-                └─ secret/data/appsvc/ai_gateway ──► api_key [+ base_url]
+           └─ Vault jwt_login (role VAULT_APP_NAME)
+                └─ secret/data/<app_name>/ai_gateway ──► api_key [+ base_url]
 
 The service principal is whichever :func:`app_config.azure.get_azure_client`
 resolves: ``AZURE_*``/``ARM_*`` when set, else the one in the Databricks secret
@@ -112,7 +116,8 @@ scope (``DATABRICKS_SECRET_SCOPE``, read with the cluster runtime's own
 credentials or ``DATABRICKS_TOKEN``). Set:
 
     VAULT_ADDR=https://vault.example:8200
-    VAULT_OIDC_ROLE=...      # the Vault role, bound to the SP's app id
+    VAULT_APP_NAME=...       # the application's name: the Vault role for the
+                             # login AND the prefix its secrets live under
 
 If the secret carries a ``base_url`` / ``endpoint`` / ``url`` it becomes the
 model's endpoint; otherwise config.json's ``llm_client.base_url`` stands.
@@ -151,10 +156,12 @@ import logging
 import shutil
 import sys
 import tempfile
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 import app_config
+from llm_client import LLMClientConfig
 from pipeline import SasLLMPipeline
 from chunker._repl import print_iterable
 from prompt_builder import PromptBuilder
@@ -433,13 +440,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     sharepoint = sub.add_parser(
         "sharepoint",
-        help="Run one Power Apps request read from a SharePoint list, with "
+        help="Run one conversion request read from the SharePoint lists, with "
         "inputs and outputs in the document library.",
     )
     sharepoint.add_argument(
         "--request-id",
         required=True,
-        help="The Power Apps request id — the list row to run. Also used as the "
+        help="The requests list item ID — the row to run. Also used as the "
         "pipeline thread_id.",
     )
     _add_common_args(sharepoint)
@@ -462,16 +469,24 @@ def _build_pipeline(
 ) -> SasLLMPipeline:
     """Load the reference corpus once and wire up the pipeline.
 
-    In-memory message store (``delta_table=None``) — no Spark/JVM is booted.
+    The message store is in-memory — ``MemorySetup()``'s default — so no
+    Spark/JVM is booted.
     ``base_url`` is forwarded only when the AI Gateway secret named an
     endpoint; ``None`` leaves config.json's ``llm_client.base_url`` in charge.
     """
     logger.info(f"building instruction corpus from {args.reference_dir}")
     builder = PromptBuilder.from_reference_dir(str(args.reference_dir))
+    # Transport and memory each arrive as one grouped config -- the pipeline
+    # takes no individual spellings of either. base_url / api_key are
+    # forwarded only when set, so an omitted one still defers to config.json
+    # (passing an explicit None would override it).
+    values: dict[str, Any] = {"model": model}
+    if api_key is not None:
+        values["api_key"] = api_key
+    if base_url is not None:
+        values["base_url"] = base_url
     return SasLLMPipeline(
-        model=model,
-        api_key=api_key,
-        base_url=base_url,
+        llm_config=LLMClientConfig(**values),
         output_language=args.output_language,
         prompt_builder=builder,
         validator=validator,
@@ -480,11 +495,10 @@ def _build_pipeline(
 
 
 def _item_header(out: dict) -> str:
-    """The ``=== id (kind) files=[...] [verdict] ===`` banner for one item."""
+    """The ``=== id files=[...] [verdict] ===`` banner for one item."""
     verdict = _format_verdict(out.get("validation"))
     return (
         f"=== {out['item_id']} "
-        f"({'batch' if out['is_batch'] else out['kind']}) "
         f"files={out['source_files']}{verdict} ==="
     )
 
@@ -859,36 +873,93 @@ def _upload_outputs(
     return out_dir
 
 
-def _run_sharepoint(args: argparse.Namespace) -> int:
-    from app_config.powerapps import (
-        PowerAppsConfig,
-        PowerAppsError,
-        parse_run_request,
-        select_request,
+@dataclass
+class _SharePointRun:
+    """The parameters one ``sharepoint`` run needs, resolved from the lists.
+
+    Assembled from two rows: the *request* row supplies the application and
+    whether validation documents are wanted, and the *conversion* row (if the
+    conversions list has one for it) supplies the model the operator chose.
+    """
+
+    request_id: str
+    application_name: str
+    model: str
+    live_validation: bool
+    timestamp: str
+    item_id: str | None = None
+
+
+def _run_timestamp() -> str:
+    """A path-safe UTC stamp naming this run's output folder."""
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _resolve_request(client, request_id: str, fallback_model: str) -> _SharePointRun:
+    """The request row *request_id* (a SharePoint list-item id), as a run.
+
+    Raises
+    ------
+    app_config.sharepoint.SharePointError
+        No row has that id, or the model on its conversion row is one this
+        deployment cannot reach.
+    """
+    from app_config import is_accessible_model
+    from app_config.sharepoint import SharePointError
+    from conversion.requests import conversion_items, requests
+
+    wanted = request_id.strip()
+    matches = [row for row in requests(client=client) if str(row.item_id) == wanted]
+    if not matches:
+        raise SharePointError(
+            f"no request row with ID={wanted!r} in the requests list"
+        )
+    request = matches[0]
+
+    # The model lives on the conversions list, one row per script; this mode
+    # runs a whole application through one pipeline, so the first row that
+    # names one wins and --model is the fallback.
+    model = fallback_model
+    for item in conversion_items(client=client):
+        if str(item.app_request_id) == wanted and item.preferred_llm:
+            model = item.preferred_llm
+            break
+    if not is_accessible_model(model):
+        raise SharePointError(
+            f"request {wanted!r} selected model {model!r}, which is not an "
+            f"accessible model for this deployment"
+        )
+    return _SharePointRun(
+        request_id=wanted,
+        application_name=request.application_name,
+        model=model,
+        live_validation=request.is_validation_required,
+        timestamp=_run_timestamp(),
+        item_id=request.item_id,
     )
+
+
+def _run_sharepoint(args: argparse.Namespace) -> int:
     from app_config.sharepoint import SharePointError, get_sharepoint_client
 
     if not args.reference_dir.is_dir():
         logger.error(f"reference_dir is not a directory: {args.reference_dir}")
         return 2
 
-    pa_config = PowerAppsConfig.from_env()
-    if not pa_config.list_name:
-        logger.error(
-            "no Power Apps list configured: set POWERAPPS_LIST_NAME (or "
-            "powerapps.list_name in config.json)"
-        )
-        return 2
-
     client = get_sharepoint_client()
 
-    # Resolve the request row -> normalised parameters.
+    # Resolve the request row -> normalised parameters. There is no --model in
+    # this mode: the row decides, and config.json is the fallback.
     try:
-        rows = client.read_list_items(pa_config.list_name)
-        row = select_request(rows, args.request_id, pa_config)
-        req = parse_run_request(row, pa_config)
-    except (SharePointError, PowerAppsError) as exc:
-        logger.error(f"could not resolve Power Apps request: {exc}")
+        req = _resolve_request(
+            client,
+            args.request_id,
+            app_config.llm_client_value("model", _DEFAULT_MODEL),
+        )
+    except SharePointError as exc:
+        logger.error(f"could not resolve the conversion request: {exc}")
         return 1
     logger.info(
         f"request {req.request_id!r}: application={req.application_name!r}  "
@@ -932,7 +1003,7 @@ def _run_sharepoint(args: argparse.Namespace) -> int:
             logger.error(f"could not download SharePoint inputs: {exc}")
             return 1
 
-        # The Power Apps request id is the pipeline thread_id, so run facts and
+        # The request id is the pipeline thread_id, so run facts and
         # validation verdicts land in memory keyed to this request.
         logger.info(
             f"running pipeline over {len(local_paths)} file(s) with "

@@ -62,7 +62,9 @@ where = ["."]
 # Markdown table without it), so it ships too — unlike validation, whose
 # Spark/MLflow tracking is dev-only tooling.
 # target_language is the leaf every one of them resolves the run's target
-# through, so it ships with all of them.
+# through, so it ships with all of them. conversion and xref are the SharePoint
+# domain layers a real run is driven by, and add no required dependency of
+# their own (Graph is the optional `sharepoint` extra, sqlglot the `sql` one).
 include = [
     "pipeline*",
     "chunker*",
@@ -71,6 +73,8 @@ include = [
     "prompt_builder*",
     "app_config*",
     "complexity*",
+    "conversion*",
+    "xref*",
     "target_language*",
 ]
 
@@ -91,6 +95,8 @@ source = [
     "app_config",
     "validation",
     "complexity",
+    "conversion",
+    "xref",
     "target_language",
 ]
 
@@ -113,6 +119,8 @@ include = [
     "app_config",
     "chunker",
     "complexity",
+    "conversion",
+    "xref",
     "pipeline",
     "memory",
     "llm_client",
