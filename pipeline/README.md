@@ -49,9 +49,8 @@ outputs = pipe.run_files(["macros.sas", "etl.sas", "reports.sas"])
 print(pipe.token_usage.summary())
 ```
 
-The transport and memory concerns also take grouped configs — the canonical
-form when more than a couple of knobs are set (the individual kwargs still
-work, but do not mix the two spellings for the same concern):
+Transport and memory are configured as two objects, and only as two
+objects — there is no per-knob spelling on the constructor:
 
 ```python
 from llm_client import LLMClientConfig
@@ -73,7 +72,7 @@ gateway reports no usage block.
 | File | Role |
 |------|------|
 | `engine.py` | `SasLLMPipeline`: the LangGraph `StateGraph` wiring, memory/validation integration, resume and fork, opt-in Anthropic prompt caching. |
-| `setup.py` | `MemorySetup`: the grouped form of the pipeline's memory wiring (store hub, task policy, thread memory, extractor, chat identity), with the cross-injection logic in `build()`. |
+| `setup.py` | `MemorySetup`: the pipeline's memory wiring (store hub, task policy, thread memory, extractor, chat identity), with the cross-injection logic in `build()`. |
 | `run_ledger.py` | `RunLedger`: the KV-side run bookkeeping — per-item outcome facts and stored verdicts, resume (what to skip, what to redo, the rewind), and the fact-copying half of fork. Never calls an LLM. |
 | `prompting.py` | Item → retrieval query / construct keys / scope tokens mapping (the sole SAS-metadata → `prompt_builder` bridge) and chunk/batch prompt formatting. |
 | `constants.py` | Prompt templates — the Markdown-sections system prompt and its structured-output counterpart (importable without langchain installed). |

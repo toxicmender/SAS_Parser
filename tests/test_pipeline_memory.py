@@ -29,7 +29,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, SystemMessage
 
+from llm_client import LLMClientConfig
 from pipeline import SasLLMPipeline
+from pipeline.setup import MemorySetup
 from memory.extractor import MemoryExtractor
 from memory.policy import TaskPolicy
 from memory.store import MemoryHub
@@ -50,13 +52,29 @@ class _RecordingChatModel:
         return AIMessage(f"## Analysis\nresp {len(self.prompts)}")
 
 
+# The memory knobs the pipeline now takes only as one MemorySetup. Kept as
+# individual arguments *of this helper* because that is what the ~20 call
+# sites below are about — which memory wiring produces which prompt — and
+# spelling the grouping out at each of them would bury the point.
+_MEMORY_KEYS = (
+    "memory", "task_id", "task_policy", "thread_memory", "memory_extractor",
+    "chat_id", "spark", "delta_table",
+)
+
+
 def _pipeline(llm=None, **kwargs) -> SasLLMPipeline:
     kwargs.setdefault("structured_output", False)
-    kwargs.setdefault("model", "unused-because-llm-injected")
     # An empty instruction set keeps the standing-instructions file (if the
     # developer has one configured) out of these prompts.
     kwargs.setdefault("user_instructions", "")
-    return SasLLMPipeline(llm=llm or _RecordingChatModel(), **kwargs)
+    memory = {key: kwargs.pop(key) for key in list(kwargs) if key in _MEMORY_KEYS}
+    model = kwargs.pop("model", "unused-because-llm-injected")
+    return SasLLMPipeline(
+        llm_config=LLMClientConfig(model=model),
+        memory_setup=MemorySetup(**memory),
+        llm=llm or _RecordingChatModel(),
+        **kwargs,
+    )
 
 
 def _system_texts(prompt) -> list[str]:

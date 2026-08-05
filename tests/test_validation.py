@@ -22,6 +22,7 @@ from memory.store import MemoryHub
 
 from chunker.models import SasBatch, SasChunk, SasChunkKind, SasChunkMetadata
 from pipeline import SasLLMPipeline
+from pipeline.setup import MemorySetup
 from validation import (
     DatasetFidelityMetric,
     Evaluator,
@@ -406,13 +407,27 @@ def test_bundled_sample_cases_load():
 # ---------------------------------------------------------------------------
 
 
+_MEMORY_KEYS = (
+    "memory", "task_id", "task_policy", "thread_memory", "memory_extractor",
+    "chat_id", "spark", "delta_table",
+)
+
+
 def _pipeline(responses: list[str], **kwargs) -> SasLLMPipeline:
     # Every canned response in this module is a PySpark translation, so the
     # pipeline under test declares that target — the metrics take theirs from
     # it (ValidationRunner) and would otherwise score against the config
     # default.
     kwargs.setdefault("output_language", "PySpark")
-    return SasLLMPipeline(llm=FakeListChatModel(responses=responses), **kwargs)
+    # The pipeline takes memory wiring only as one MemorySetup; this helper
+    # keeps the per-knob spelling so its call sites stay about what they are
+    # testing rather than about construction.
+    memory = {key: kwargs.pop(key) for key in list(kwargs) if key in _MEMORY_KEYS}
+    return SasLLMPipeline(
+        memory_setup=MemorySetup(**memory),
+        llm=FakeListChatModel(responses=responses),
+        **kwargs,
+    )
 
 
 def test_runner_end_to_end_passing_case():
@@ -964,7 +979,7 @@ def test_resume_without_stored_verdict_leaves_validation_none():
     # Same store, now with a validator attached, resumes the thread.
     resumed = SasLLMPipeline(
         llm=FakeListChatModel(responses=[GOOD_RESPONSE]),
-        memory=first._memory,
+        memory_setup=MemorySetup(memory=first._memory),
         validator=LiveValidator(output_language="PySpark"),
     )
     outputs = resumed._process(
@@ -1110,7 +1125,7 @@ def test_resume_redoes_stored_failing_item_when_retries_enabled():
     # never reached.
     first = SasLLMPipeline(
         llm=FakeListChatModel(responses=[PROSE_ONLY]),
-        memory=mem,
+        memory_setup=MemorySetup(memory=mem),
         validator=LiveValidator(output_language="PySpark"),
     )
     first._process(items=[_wrap(c1)], diagnostics=[], thread_id="run::redo")
@@ -1120,7 +1135,7 @@ def test_resume_redoes_stored_failing_item_when_retries_enabled():
     # "done" — it is regenerated (now with code) and the run continues to c2.
     resumed = SasLLMPipeline(
         llm=FakeListChatModel(responses=[GOOD_RESPONSE, GOOD_RESPONSE]),
-        memory=mem,
+        memory_setup=MemorySetup(memory=mem),
         validator=LiveValidator(output_language="PySpark"),
         validation_retries=1,
     )
@@ -1149,7 +1164,7 @@ def test_resume_keeps_passing_prefix_and_redoes_from_first_failure():
     # Observe-only prior run: c1 passes, c2 fails, both recorded as they are.
     first = SasLLMPipeline(
         llm=FakeListChatModel(responses=[GOOD_RESPONSE, PROSE_ONLY]),
-        memory=mem,
+        memory_setup=MemorySetup(memory=mem),
         validator=LiveValidator(output_language="PySpark"),
     )
     first._process(items=[_wrap(c1), _wrap(c2)], diagnostics=[], thread_id="run::prefix")
@@ -1159,7 +1174,7 @@ def test_resume_keeps_passing_prefix_and_redoes_from_first_failure():
 
     resumed = SasLLMPipeline(
         llm=FakeListChatModel(responses=[GOOD_RESPONSE]),
-        memory=mem,
+        memory_setup=MemorySetup(memory=mem),
         validator=LiveValidator(output_language="PySpark"),
         validation_retries=1,
     )

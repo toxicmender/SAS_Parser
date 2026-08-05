@@ -9,7 +9,6 @@ tests/test_complexity.py is the guard for that and passes unchanged.
 
 from __future__ import annotations
 
-import json
 import pathlib
 import sys
 from typing import Any

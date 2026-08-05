@@ -359,10 +359,14 @@ conversation memory the run uses — no post-hoc pass, no separate history.
 Opt in by handing the pipeline a `LiveValidator`:
 
 ```python
+from llm_client import LLMClientConfig
 from pipeline import SasLLMPipeline
 from validation import LiveValidator, validations_for_thread
 
-pipeline = SasLLMPipeline(model="claude-sonnet-4-5", validator=LiveValidator())
+pipeline = SasLLMPipeline(
+    llm_config=LLMClientConfig(model="claude-sonnet-4-5"),
+    validator=LiveValidator(),
+)
 pipeline.run_text(sas_source, source_id="job1.sas", thread_id="run::job1.sas")
 
 # One verdict per item, filed beside that item's run fact:

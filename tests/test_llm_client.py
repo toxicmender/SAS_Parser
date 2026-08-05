@@ -1110,13 +1110,15 @@ def test_pipeline_enforces_input_token_budget():
     # under any counter, so the call must fail before reaching the fake LLM.
     from chunker.models import SasBatch, SasChunk, SasChunkKind, SasChunkMetadata
     from pipeline import SasLLMPipeline
+    from pipeline.setup import MemorySetup
     from memory.store import MemoryHub
 
     pipeline = SasLLMPipeline(
-        model="unused-because-llm-injected",
-        memory=MemoryHub(),
+        llm_config=LLMClientConfig(
+            model="unused-because-llm-injected", max_input_tokens=1
+        ),
+        memory_setup=MemorySetup(memory=MemoryHub()),
         llm=FakeListChatModel(responses=["never reached"]),
-        max_input_tokens=1,
     )
     chunk = SasChunk(
         chunk_id="f1-chunk-0001",

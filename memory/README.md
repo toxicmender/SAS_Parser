@@ -372,12 +372,16 @@ spawns. Stored as one record per task, `policy::{task_id}`.
 
 ```python
 from memory.policy import TaskPolicy
+from pipeline import MemorySetup
 
 policy = TaskPolicy("customer_support", store=mem.kv)
 policy.add("Prefer concise responses.")
 policy.add("Escalate refund requests above $500.", overridable=False)
 
-pipeline = SasLLMPipeline(task_id="customer_support")   # loads and prompts it
+# Memory wiring goes in as one MemorySetup.
+pipeline = SasLLMPipeline(
+    memory_setup=MemorySetup(task_id="customer_support")
+)   # loads and prompts it
 ```
 
 - **Overridable vs fixed.** Each instruction declares whether a
@@ -400,13 +404,14 @@ Stored as one record per thread, `tmem::{thread_id}`.
 
 ```python
 from memory.thread_mem import ThreadMemory
+from pipeline import MemorySetup
 
 notes = ThreadMemory(store=mem.kv)
 notes.add("thread-1", "Customer prefers email.", kind="preference")
 notes.add("thread-1", "Discount approved.", kind="exception",
           source="supervisor", ttl_s=3600)
 
-pipeline = SasLLMPipeline(thread_memory=notes)
+pipeline = SasLLMPipeline(memory_setup=MemorySetup(thread_memory=notes))
 pipeline.remember("thread-1", "Do not offer the standard discount.")
 ```
 
@@ -437,9 +442,12 @@ policy, so it costs nothing on threads that have no notes.
 
 ```python
 from memory.extractor import MemoryExtractor
+from pipeline import MemorySetup
 
 extractor = MemoryExtractor(model, policy=policy, thread_memory=notes)
-pipeline = SasLLMPipeline(memory_extractor=extractor)   # observes kept turns
+pipeline = SasLLMPipeline(
+    memory_setup=MemorySetup(memory_extractor=extractor)
+)   # observes kept turns
 
 extractor.pending()          # permanent candidates awaiting approval
 extractor.approve(candidate_id, overridable=False)

@@ -158,9 +158,12 @@ import sys
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 import app_config
+from llm_client import LLMClientConfig
 from pipeline import SasLLMPipeline
+from pipeline.setup import MemorySetup
 from chunker._repl import print_iterable
 from prompt_builder import PromptBuilder
 from target_language import (
@@ -467,16 +470,24 @@ def _build_pipeline(
 ) -> SasLLMPipeline:
     """Load the reference corpus once and wire up the pipeline.
 
-    In-memory message store (``delta_table=None``) — no Spark/JVM is booted.
+    The message store is in-memory — ``MemorySetup()``'s default — so no
+    Spark/JVM is booted.
     ``base_url`` is forwarded only when the AI Gateway secret named an
     endpoint; ``None`` leaves config.json's ``llm_client.base_url`` in charge.
     """
     logger.info(f"building instruction corpus from {args.reference_dir}")
     builder = PromptBuilder.from_reference_dir(str(args.reference_dir))
+    # Transport and memory each arrive as one grouped config -- the pipeline
+    # takes no individual spellings of either. base_url / api_key are
+    # forwarded only when set, so an omitted one still defers to config.json
+    # (passing an explicit None would override it).
+    values: dict[str, Any] = {"model": model}
+    if api_key is not None:
+        values["api_key"] = api_key
+    if base_url is not None:
+        values["base_url"] = base_url
     return SasLLMPipeline(
-        model=model,
-        api_key=api_key,
-        base_url=base_url,
+        llm_config=LLMClientConfig(**values),
         output_language=args.output_language,
         prompt_builder=builder,
         validator=validator,
@@ -485,11 +496,10 @@ def _build_pipeline(
 
 
 def _item_header(out: dict) -> str:
-    """The ``=== id (kind) files=[...] [verdict] ===`` banner for one item."""
+    """The ``=== id files=[...] [verdict] ===`` banner for one item."""
     verdict = _format_verdict(out.get("validation"))
     return (
         f"=== {out['item_id']} "
-        f"({'batch' if out['is_batch'] else out['kind']}) "
         f"files={out['source_files']}{verdict} ==="
     )
 

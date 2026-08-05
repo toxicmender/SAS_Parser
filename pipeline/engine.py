@@ -14,7 +14,7 @@ import logging
 import time
 import warnings
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import app_config
 from langchain_core.messages import (
@@ -57,7 +57,6 @@ from llm_client import LLMClient, LLMClientConfig, TokenUsage, tokens
 from memory.extractor import MemoryExtractor
 from memory.policy import TaskPolicy
 from memory.relevance import RelevantHistorySelector
-from memory.store import MemoryHub
 from memory.summarize import RollingSummarizer
 from memory.thread_mem import ThreadMemory
 from prompt_builder import PromptBuilder, UserInstructionSet
@@ -78,9 +77,6 @@ from .prompting import (
 from .response_models import TranslationDocument
 from .run_ledger import DOCUMENT_KEY, RunLedger, document_of
 from .setup import MemorySetup
-
-if TYPE_CHECKING:
-    from pyspark.sql import SparkSession
 
 logger = logging.getLogger(__name__)
 
@@ -120,88 +116,34 @@ class SasLLMPipeline:
     conversation about one migration job. Call with an explicit
     ``thread_id`` to resume or fork that conversation later.
 
-    Every processed item is a :class:`SasBatch` (singletons arrive wrapped
-    by ``coalesce_into_batches``), so in each output dict ``is_batch`` is
-    always ``True`` and ``kind`` always ``None`` — both kept for output-shape
-    compatibility and deprecated.
+    Every processed item is a :class:`SasBatch` — singletons arrive wrapped
+    by ``coalesce_into_batches`` — so an output dict no longer carries an
+    ``is_batch`` flag or a ``kind``. Both were constants (``True`` and
+    ``None``), and a field that cannot vary tells a reader nothing while
+    inviting them to branch on it.
 
     Parameters
     ----------
-    model : str
-        Model id as the AI Gateway names it, e.g. ``"gpt-5.4"`` (the
-        default) or ``"claude-sonnet-4-5"``.
-        Every model reaches the gateway over its OpenAI-compatible API,
-        so the name selects the model, not the transport. Ignored (the
-        config's own model wins) when ``llm_config`` is passed.
     llm_config : LLMClientConfig | None
-        The canonical form of the LLM transport settings: a pre-built
-        :class:`llm_client.LLMClientConfig` used as-is (its ``model``
-        becomes the pipeline's model). Passing it together with any of the
-        individual transport kwargs (``model``, ``temperature``,
-        ``max_input_tokens``, ``requests_per_second``, ``max_retries``,
-        ``base_url``, ``api_key``, ``url_headers``, ``gateway_version``,
-        ``timeout``, ``model_kwargs``, ``llm_kwargs``) raises ``ValueError`` — grouped
-        and legacy spellings of the same concern do not mix. ``None``
-        (default) builds one from those kwargs exactly as before.
+        Every LLM transport setting, as one
+        :class:`llm_client.LLMClientConfig` used as-is: the model, the
+        endpoint and its credential, temperature, timeouts, retry budget,
+        the input-token budget, the rate limiter, and the request-body
+        extras. Its ``model`` is the pipeline's model. ``None`` (default)
+        builds ``LLMClientConfig()``, which resolves everything from
+        config.json and the environment.
+
+        There is deliberately no second spelling. These knobs were once
+        also accepted as ~12 individual keyword arguments here, which meant
+        two places to set one thing and a rejection branch to stop them
+        being set in both; the config object is the only way in now.
     memory_setup : MemorySetup | None
-        The canonical form of the memory wiring: a
-        :class:`pipeline.setup.MemorySetup` whose ``build()`` produces the
-        store hub, instruction memories, extractor, and chat identity.
-        Passing it together with any of the individual memory kwargs
-        (``memory``, ``task_id``, ``task_policy``, ``thread_memory``,
-        ``memory_extractor``, ``chat_id``, ``spark``, ``delta_table``)
-        raises ``ValueError``. ``None`` (default) builds one from those
-        kwargs exactly as before.
-    temperature : float | None
-        Sampling temperature for the LLM. ``None`` (default) keeps the
-        provider default. Forwarded to :class:`llm_client.LLMClientConfig`.
-    max_input_tokens : int | None
-        Input-token budget per LLM call; an over-budget prompt raises
-        :class:`llm_client.InputTokenLimitError` instead of being sent.
-        ``None`` (default) disables counting.
-    requests_per_second : float | None
-        Proactive client-side request throttle (``InMemoryRateLimiter``).
-        ``None`` (default) disables it. Ignored when ``llm`` is injected —
-        rate limiters attach at model construction time.
-    max_retries : int
-        Retries with exponential backoff for transient errors (rate
-        limits, overload / 5xx, timeouts, connection drops); other
-        errors are never retried.
-    base_url : str | None
-        Gateway endpoint (the OpenAI-compatible root). ``None``
-        (default) defers to config.json ``llm_client.base_url``, then
-        ``OPENAI_BASE_URL``. Ignored when ``llm`` is injected.
-    api_key : str | None
-        Explicit API key (the gateway token); held as a masked
-        ``SecretStr`` inside :class:`llm_client.LLMClientConfig`, never
-        logged. ``None`` (default) defers to ``OPENAI_API_KEY`` in the
-        environment. Ignored when ``llm`` is injected.
-    url_headers : dict[str, str] | None
-        Extra HTTP headers sent with every LLM request (forwarded as
-        ``default_headers`` — gateway auth, tracing, ...). ``None``
-        (default) defers to config.json ``llm_client.url_headers``.
-        Ignored when ``llm`` is injected.
-    gateway_version : str | None
-        The AI Gateway's protocol version, sent as the
-        ``ai-gateway-version`` header on every LLM request. ``None``
-        (default) defers to ``LLM_GATEWAY_VERSION`` / config.json
-        ``llm_client.gateway_version`` / the Vault gateway secret.
-        Ignored when ``llm`` is injected.
-    timeout : float | None
-        Per-request LLM timeout in seconds. ``None`` (default) defers to
-        config.json ``llm_client.timeout``, then the provider default.
-        Ignored when ``llm`` is injected.
-    model_kwargs : dict | None
-        Extra ``/chat/completions`` request-body fields (e.g.
-        ``{"top_k": 40}``), which is how the gateway takes model-specific
-        knobs outside the OpenAI schema. ``None`` (default) defers to
-        config.json ``llm_client.model_kwargs``. Ignored when ``llm`` is
-        injected.
-    llm_kwargs : dict | None
-        Escape hatch: arbitrary keyword arguments merged last into the
-        ``ChatOpenAI(...)`` call (the :class:`llm_client.LLMClientConfig`
-        field ``kwargs``), overriding anything the named knobs produced.
-        Ignored when ``llm`` is injected.
+        All memory wiring, as one :class:`pipeline.setup.MemorySetup`:
+        the store hub, the long-term policy, the thread notes, the
+        extractor, the chat identity, and the Delta/Spark target. Its
+        ``build()`` produces what the pipeline holds. ``None`` (default)
+        builds ``MemorySetup()`` — an in-memory store, no Spark, no JVM.
+        Like ``llm_config``, this is the only spelling.
     prompt_caching : bool | None
         Anthropic prompt caching for the system prompt: when enabled and
         ``model`` is an Anthropic model, the system prompt is sent as a
@@ -407,21 +349,9 @@ class SasLLMPipeline:
 
     def __init__(
         self,
-        model: str = "gpt-5.4",
         *,
         llm_config: LLMClientConfig | None = None,
         memory_setup: MemorySetup | None = None,
-        temperature: float | None = None,
-        max_input_tokens: int | None = None,
-        requests_per_second: float | None = None,
-        max_retries: int = 3,
-        base_url: str | None = None,
-        api_key: str | None = None,
-        url_headers: dict[str, str] | None = None,
-        gateway_version: str | None = None,
-        timeout: float | None = None,
-        model_kwargs: dict[str, Any] | None = None,
-        llm_kwargs: dict[str, Any] | None = None,
         prompt_caching: bool | None = None,
         min_words: int | None = None,
         max_words: int | None = None,
@@ -435,14 +365,6 @@ class SasLLMPipeline:
         max_merged_chunks: int = 8,
         max_merged_tokens: int | None = None,
         databricks_mapping: dict[str, str] | None = None,
-        memory: MemoryHub | None = None,
-        task_id: str | None = None,
-        task_policy: TaskPolicy | None = None,
-        thread_memory: ThreadMemory | None = None,
-        memory_extractor: MemoryExtractor | None = None,
-        chat_id: str | None = None,
-        spark: "SparkSession | None" = None,
-        delta_table: str | None = None,
         llm: Any | None = None,
         prompt_builder: PromptBuilder | None = None,
         user_instructions: "str | UserInstructionSet | None" = None,
@@ -459,63 +381,14 @@ class SasLLMPipeline:
         # from here, so they cannot each interpret the caller's spelling
         # differently (raises on an unknown name — see the argument docs).
         target = resolve_target_language(output_language)
-        # Grouped configs are the canonical form; the individual kwargs are
-        # the legacy spelling. Mixing the two for the same concern would make
-        # one of them silently lose, so it is rejected outright.
-        if llm_config is not None:
-            transport_kwargs = {
-                "temperature": temperature,
-                "max_input_tokens": max_input_tokens,
-                "requests_per_second": requests_per_second,
-                "base_url": base_url,
-                "api_key": api_key,
-                "url_headers": url_headers,
-                "gateway_version": gateway_version,
-                "timeout": timeout,
-                "model_kwargs": model_kwargs,
-                "llm_kwargs": llm_kwargs,
-            }
-            conflicts = sorted(k for k, v in transport_kwargs.items() if v is not None)
-            if model != "gpt-5.4":
-                conflicts.insert(0, "model")
-            if max_retries != 3:
-                conflicts.append("max_retries")
-            if conflicts:
-                raise ValueError(
-                    f"llm_config was given together with transport keyword "
-                    f"argument(s) {', '.join(conflicts)}; put them on the "
-                    f"LLMClientConfig instead"
-                )
-            model = llm_config.model
-        if memory_setup is not None:
-            memory_kwargs = {
-                "memory": memory,
-                "task_id": task_id,
-                "task_policy": task_policy,
-                "thread_memory": thread_memory,
-                "memory_extractor": memory_extractor,
-                "chat_id": chat_id,
-                "spark": spark,
-                "delta_table": delta_table,
-            }
-            conflicts = sorted(k for k, v in memory_kwargs.items() if v is not None)
-            if conflicts:
-                raise ValueError(
-                    f"memory_setup was given together with memory keyword "
-                    f"argument(s) {', '.join(conflicts)}; put them on the "
-                    f"MemorySetup instead"
-                )
-        else:
-            memory_setup = MemorySetup(
-                memory=memory,
-                task_id=task_id,
-                task_policy=task_policy,
-                thread_memory=thread_memory,
-                memory_extractor=memory_extractor,
-                chat_id=chat_id,
-                spark=spark,
-                delta_table=delta_table,
-            )
+        # The two grouped configs are the only spelling. Each defaults to its
+        # own all-defaults instance, so the no-argument constructor still
+        # works and every knob has exactly one place to be set.
+        if llm_config is None:
+            llm_config = LLMClientConfig()
+        if memory_setup is None:
+            memory_setup = MemorySetup()
+        model = llm_config.model
         # A validator built for another target fails every item on
         # `language_compliance` — and with validation_retries on, burns the
         # whole retry budget doing it. Cheap to detect, so say so up front
@@ -660,29 +533,6 @@ class SasLLMPipeline:
         # output cap, rate limiter) and invocation (transient-error retry,
         # input-token budget). An injected chat model replaces only the
         # construction half; retry and budget still apply.
-        if llm_config is None:
-            llm_config_kwargs: dict[str, Any] = {
-                "model": model,
-                "temperature": temperature,
-                "max_input_tokens": max_input_tokens,
-                "requests_per_second": requests_per_second,
-                "max_retries": max_retries,
-            }
-            # Endpoint knobs are forwarded only when set, so an omitted
-            # argument still defers to the config.json llm_client defaults
-            # (an explicit None here would override them).
-            for key, value in (
-                ("base_url", base_url),
-                ("api_key", api_key),
-                ("url_headers", url_headers),
-                ("gateway_version", gateway_version),
-                ("timeout", timeout),
-                ("model_kwargs", model_kwargs),
-                ("kwargs", llm_kwargs),
-            ):
-                if value is not None:
-                    llm_config_kwargs[key] = value
-            llm_config = LLMClientConfig(**llm_config_kwargs)
         self._llm_client = LLMClient(llm_config, llm=llm)
 
         # Which system prompt to send depends on whether this chat model can
@@ -1518,14 +1368,12 @@ class SasLLMPipeline:
                 outputs.append(
                     {
                         "item_id": item_id,
-                        "is_batch": True,
                         "chunk_ids": item.chunk_ids,
                         "chunk_sources": {
                             c.chunk_id: c.source_id or "<inline>"
                             for c in item.chunks
                         },
                         "source_files": item.source_files,
-                        "kind": None,
                         "prompt": user_msg,
                         "retrieval_context": retrieval_context,
                         "response": RunLedger.recovered_response(recovered, fact),
@@ -1595,14 +1443,12 @@ class SasLLMPipeline:
             outputs.append(
                 {
                     "item_id": item_id,
-                    "is_batch": True,
                     "chunk_ids": item.chunk_ids,
                     "chunk_sources": {
                         c.chunk_id: c.source_id or "<inline>"
                         for c in item.chunks
                     },
                     "source_files": item.source_files,
-                    "kind": None,
                     "prompt": user_msg,
                     "retrieval_context": retrieval_context,
                     "response": ai_text,

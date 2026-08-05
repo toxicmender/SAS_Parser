@@ -260,7 +260,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         cases = load_cases(args.cases)
         pipeline = SasLLMPipeline(
-            model=args.model, output_language=target.display_name
+            llm_config=LLMClientConfig(model=args.model),
+            output_language=target.display_name,
         )
         report = ValidationRunner(pipeline, metrics=metrics).run(cases)
     print(report.to_markdown())
