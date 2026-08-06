@@ -1,6 +1,6 @@
 """REPL conveniences for eyeballing chunker/batcher runs.
 
-Also imported by ``demo_run.py``, which renders each run's per-item summary
+Also imported by ``conversion.run``, which renders each run's per-item summary
 lines through :func:`print_iterable` into its logs.
 """
 
