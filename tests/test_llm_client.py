@@ -123,13 +123,12 @@ def test_requests_per_second_builds_rate_limiter(monkeypatch):
 @pytest.mark.parametrize(
     "configured, sent",
     [
-        # Every model goes out over the same OpenAI-compatible transport, so
-        # the name is passed through untouched...
+        # The name is passed through untouched...
         ("claude-sonnet-4-5", "claude-sonnet-4-5"),
         ("gpt-5.4", "gpt-5.4"),
         ("gemini-3.1-pro", "gemini-3.1-pro"),
         ("claude-sonnet-4-5-20250929", "claude-sonnet-4-5-20250929"),
-        # ...except for a LangChain provider prefix, which selected a client
+        # ...except for a LangChain provider prefix, which selects a client
         # class and would read as an unknown model id to the gateway.
         ("anthropic:claude-opus-4-6", "claude-opus-4-6"),
         ("openai:gpt-5.4", "gpt-5.4"),
@@ -137,7 +136,12 @@ def test_requests_per_second_builds_rate_limiter(monkeypatch):
 )
 def test_model_name_sent_to_the_gateway(monkeypatch, configured, sent):
     captured = _capture_init(monkeypatch)
-    LLMClient(LLMClientConfig(model=configured))
+    # Pinned to the LangChain transport: this is about the model *id*, and an
+    # anthropic prefix would otherwise route to the native client, which
+    # _capture_init does not observe. The routing itself is tested below.
+    LLMClient(
+        LLMClientConfig(model=configured, provider_client="openai_compatible")
+    )
 
     assert captured["model"] == sent
 
@@ -1226,7 +1230,12 @@ def test_split_model_leaves_an_unprefixed_id_alone():
 
 def test_prefixed_model_sends_only_the_id_to_the_gateway(monkeypatch):
     captured = _capture_init(monkeypatch)
-    LLMClient(LLMClientConfig(model="anthropic:claude-sonnet-4-5"))
+    LLMClient(
+        LLMClientConfig(
+            model="anthropic:claude-sonnet-4-5",
+            provider_client="openai_compatible",
+        )
+    )
 
     assert captured["model"] == "claude-sonnet-4-5"
 
@@ -1234,7 +1243,12 @@ def test_prefixed_model_sends_only_the_id_to_the_gateway(monkeypatch):
 def test_model_provider_is_recorded_not_dropped(monkeypatch, caplog):
     _capture_init(monkeypatch)
     with caplog.at_level(logging.INFO, logger="llm_client.client"):
-        LLMClient(LLMClientConfig(model="anthropic:claude-sonnet-4-5"))
+        LLMClient(
+            LLMClientConfig(
+                model="anthropic:claude-sonnet-4-5",
+                provider_client="openai_compatible",
+            )
+        )
 
     assert "provider=anthropic" in caplog.text
 
@@ -1244,11 +1258,95 @@ def test_explicit_model_provider_beats_the_prefix(monkeypatch, caplog):
     with caplog.at_level(logging.INFO, logger="llm_client.client"):
         LLMClient(
             LLMClientConfig(
-                model="anthropic:claude-sonnet-4-5", model_provider="pinned"
+                model="anthropic:claude-sonnet-4-5",
+                model_provider="pinned",
+                # An explicit client pin means the provider has nothing to
+                # route, so an unrecognised one is not an error here.
+                provider_client="openai_compatible",
             )
         )
 
     assert "provider=pinned" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# provider_client="auto" — the provider routes the client
+#
+# What the reference does against this same gateway:
+#     match model_provider.lower():
+#         case "openai" | "google": init_llm_model(...)     # ChatOpenAI
+#         case "anthropic":         init_claude_model(...)  # raw openai SDK
+#         case _: raise RuntimeError("UNKNOWN model provider.")
+# ---------------------------------------------------------------------------
+
+
+def _built_native(monkeypatch, **config_kwargs) -> bool:
+    """True when the config routes to the native client rather than ChatOpenAI.
+
+    Both builders are stubbed: this is about which *branch* is taken, and the
+    real native builder constructs an openai.OpenAI (credentials, TLS) that
+    these cases have no reason to pay for. What it produces is covered by the
+    provider_client="native" tests below.
+    """
+    seen: dict[str, bool] = {"native": False}
+
+    def _spy(config, provider, model):
+        seen["native"] = True
+        return FakeListChatModel(responses=["ok"])
+
+    monkeypatch.setattr(client_mod.LLMClient, "_build_native_model", _spy)
+    _capture_init(monkeypatch)
+    LLMClient(LLMClientConfig(**config_kwargs))
+    return seen["native"]
+
+
+@pytest.mark.parametrize(
+    "model, native",
+    [
+        ("anthropic:claude-sonnet-4-5", True),
+        ("openai:gpt-5.4", False),
+        ("google:gemini-3.1-pro", False),
+    ],
+)
+def test_provider_routes_the_client_by_default(monkeypatch, model, native):
+    assert _built_native(monkeypatch, model=model) is native
+
+
+def test_model_provider_routes_when_the_id_carries_no_prefix(monkeypatch):
+    assert (
+        _built_native(
+            monkeypatch, model="claude-sonnet-4-5", model_provider="anthropic"
+        )
+        is True
+    )
+
+
+def test_no_provider_at_all_keeps_the_openai_compatible_transport(monkeypatch):
+    # Nothing to route on: the behaviour every deployment that never set a
+    # provider has always had.
+    assert _built_native(monkeypatch, model="gpt-5.4") is False
+
+
+@pytest.mark.parametrize("pinned, native", [("native", True), ("openai_compatible", False)])
+def test_an_explicit_provider_client_wins_over_the_provider(
+    monkeypatch, pinned, native
+):
+    assert (
+        _built_native(
+            monkeypatch, model="anthropic:claude-sonnet-4-5", provider_client=pinned
+        )
+        is native
+    )
+    assert (
+        _built_native(monkeypatch, model="openai:gpt-5.4", provider_client=pinned)
+        is native
+    )
+
+
+def test_an_unknown_provider_raises_rather_than_guessing(monkeypatch):
+    _capture_init(monkeypatch)
+    with pytest.raises(client_mod.LLMClientError, match="unknown model provider"):
+        LLMClient(LLMClientConfig(model="mistral:mixtral-8x7b"))
 
 
 # ---------------------------------------------------------------------------

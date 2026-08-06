@@ -234,13 +234,34 @@ _LLM_CLIENT_TYPES: dict[str, type | tuple[type, ...]] = {
 # How the chat model is constructed. "openai_compatible" builds the
 # LangChain ChatOpenAI the whole client is written around; "native" wraps a
 # raw provider SDK client for a gateway that will not take the LangChain
-# payload. See llm_client.client for what the native path gives up.
+# payload. "auto" (the default) picks between them from the model's provider,
+# which is what the reference deployment does against this same gateway.
+# See llm_client.client for what the native path gives up.
+PROVIDER_CLIENT_AUTO = "auto"
 PROVIDER_CLIENT_OPENAI_COMPATIBLE = "openai_compatible"
 PROVIDER_CLIENT_NATIVE = "native"
 PROVIDER_CLIENTS: tuple[str, ...] = (
+    PROVIDER_CLIENT_AUTO,
     PROVIDER_CLIENT_OPENAI_COMPATIBLE,
     PROVIDER_CLIENT_NATIVE,
 )
+
+# Which client each model provider is reached through under "auto". The
+# reference's llm_client.ai_sas_converter does exactly this:
+#
+#     match model_provider.lower():
+#         case "openai" | "google": init_llm_model(...)    # ChatOpenAI
+#         case "anthropic":         init_claude_model(...) # raw openai SDK
+#         case _: raise RuntimeError("UNKNOWN model provider.")
+#
+# A provider absent from this table is an error rather than a guess: silently
+# choosing a client for an unknown provider is how a run fails deep in the
+# gateway instead of at construction.
+PROVIDER_CLIENT_BY_PROVIDER: dict[str, str] = {
+    "anthropic": PROVIDER_CLIENT_NATIVE,
+    "openai": PROVIDER_CLIENT_OPENAI_COMPATIBLE,
+    "google": PROVIDER_CLIENT_OPENAI_COMPATIBLE,
+}
 
 # llm_client keys that describe the *section* rather than one model, so a
 # per-role overlay may not carry them.

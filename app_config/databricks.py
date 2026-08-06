@@ -348,7 +348,11 @@ class DatabricksConfig:
             timeout=get_typed_value(
                 "databricks", "timeout", (int, float), DEFAULT_TIMEOUT
             ),
-            token=os.environ.get("DATABRICKS_TOKEN"),
+            # `token` (lowercase) is the reference deployment's own spelling —
+            # its configManager builds WorkspaceClient(token=os.getenv('token')).
+            # Accepted as a fallback so a .env written for the reference works
+            # here unchanged; DATABRICKS_TOKEN, the documented name, still wins.
+            token=os.environ.get("DATABRICKS_TOKEN") or os.environ.get("token"),
             azure_resource_id=(
                 os.environ.get("DATABRICKS_AZURE_RESOURCE_ID")
                 or get_value("databricks", "azure_workspace_resource_id")
