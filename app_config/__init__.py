@@ -381,6 +381,28 @@ def role_value(role: str | None, key: str, default: Any = None) -> Any:
     return _validate_llm_value(key, value, base, label)
 
 
+# The one spelling of a timestamp that goes in a path. Basic ISO 8601 with the
+# separators stripped, because ':' is not a filename character on Windows and
+# is percent-encoded in a SharePoint URL. Exposed as well as applied, since
+# validation.pdf formats an existing datetime with it rather than taking now().
+UTC_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
+
+
+def utc_stamp() -> str:
+    """
+    A path-safe UTC timestamp, ``20260806T120000Z``.
+
+    Names a run's output folder in the document library and in the local
+    report tree. It lives here — beside the config every one of those callers
+    already reads — because the two CLIs must agree on it: a run folder whose
+    name is formatted differently by the tool that wrote it and the tool that
+    lists it is a folder nobody finds.
+    """
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime(UTC_STAMP_FORMAT)
+
+
 def clear_cache() -> None:
     """Forget the cached file so the next access re-searches (for tests)."""
     global _cache

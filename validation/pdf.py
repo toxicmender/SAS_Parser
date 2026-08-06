@@ -77,8 +77,13 @@ def _report_stamp(report: ValidationReport | str) -> datetime:
 
 
 def _default_filename(report: ValidationReport | str) -> str:
-    """A timestamped name, e.g. ``validation-report-20260720T134501Z.pdf``."""
-    return f"validation-report-{_report_stamp(report):%Y%m%dT%H%M%SZ}.pdf"
+    """A timestamped name, e.g. ``validation-report-20260720T134501Z.pdf``.
+
+    Formatted with :data:`app_config.UTC_STAMP_FORMAT` — the same shape
+    :func:`app_config.utc_stamp` produces — because this name sits in the same
+    library as the run folders those name, and a reader sorts them together.
+    """
+    return f"validation-report-{_report_stamp(report):{app_config.UTC_STAMP_FORMAT}}.pdf"
 
 
 def _resolve_sharepoint_path(dest: str, report: ValidationReport | str) -> str:

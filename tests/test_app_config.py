@@ -516,3 +516,33 @@ def test_spark_module_does_not_import_pyspark():
     )
     completed = subprocess.run([sys.executable, "-c", code], check=False)
     assert completed.returncode == 0, "importing app_config.spark pulled in pyspark"
+
+
+def test_utc_stamp_is_path_safe_and_sortable():
+    import re
+
+    stamp = app_config.utc_stamp()
+
+    # No ':' — not a filename character on Windows, percent-encoded in a
+    # SharePoint URL — and lexically sortable, which is what makes a listing
+    # of run folders read chronologically.
+    assert re.fullmatch(r"\d{8}T\d{6}Z", stamp)
+    assert ":" not in stamp
+
+
+def test_utc_stamp_uses_the_shared_format():
+    from datetime import datetime, timezone
+
+    moment = datetime(2026, 8, 6, 12, 0, 0, tzinfo=timezone.utc)
+
+    assert f"{moment:{app_config.UTC_STAMP_FORMAT}}" == "20260806T120000Z"
+
+
+def test_the_two_clis_stamp_run_folders_identically():
+    """A folder named differently by the tool that wrote it and the tool that
+    lists it is a folder nobody finds."""
+    import complexity.__main__ as complexity_main
+    from conversion import run as conv_run
+
+    assert conv_run.utc_stamp is app_config.utc_stamp
+    assert len(complexity_main._timestamp()) == len(app_config.utc_stamp())
