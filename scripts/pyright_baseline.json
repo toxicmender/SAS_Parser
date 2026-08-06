@@ -35,9 +35,9 @@
     "conversion/__init__.py": 0,
     "conversion/paths.py": 0,
     "conversion/requests.py": 0,
+    "conversion/run.py": 0,
     "conversion/sources.py": 0,
     "conversion/upload.py": 0,
-    "demo_run.py": 0,
     "llm_client/__init__.py": 0,
     "llm_client/client.py": 0,
     "llm_client/tokens.py": 0,
@@ -67,6 +67,8 @@
     "prompt_builder/pdf_reader.py": 0,
     "prompt_builder/selector.py": 0,
     "prompt_builder/user_instructions.py": 0,
+    "reporting/__init__.py": 0,
+    "reporting/pdf.py": 0,
     "target_language/__init__.py": 0,
     "validation/__init__.py": 0,
     "validation/__main__.py": 0,
@@ -87,6 +89,7 @@
     "validation/tracking.py": 0,
     "xref/__init__.py": 0,
     "xref/apply.py": 0,
+    "xref/pre.py": 0,
     "xref/rewrite.py": 0,
     "xref/sourcing.py": 0
   }

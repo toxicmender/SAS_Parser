@@ -34,7 +34,7 @@ from chunker.models import (
 )
 from llm_client import LLMClientConfig
 from pipeline import SasLLMPipeline
-from pipeline.setup import MemorySetup
+from pipeline.setup import ChunkingSetup, MemorySetup, PromptingSetup
 from pipeline.prompting import _format_batch_message
 from target_language import resolve_target_language
 
@@ -177,9 +177,9 @@ def test_pipeline_accumulates_history_across_batches():
 
     pipeline = SasLLMPipeline(
         llm_config=LLMClientConfig(model="unused-because-llm-injected"),
-        memory_setup=MemorySetup(memory=mem),
+        # window_k=None: no trimming, so full history length is assertable.
+        memory_setup=MemorySetup(memory=mem, window_k=None),
         llm=fake_llm,
-        window_k=None,  # no trimming, so we can assert full history length
     )
 
     c1 = _mk_chunk(
@@ -253,7 +253,10 @@ def test_run_text_invokes_llm_only_per_batch():
 def test_max_merged_chunks_caps_calls_per_batch():
     fake_llm = FakeListChatModel(responses=[f"r{i}" for i in range(10)])
     pipeline = SasLLMPipeline(
-        llm_config=LLMClientConfig(model="unused"), memory_setup=MemorySetup(memory=MemoryHub()), llm=fake_llm, max_merged_chunks=1
+        llm_config=LLMClientConfig(model="unused"),
+        memory_setup=MemorySetup(memory=MemoryHub()),
+        llm=fake_llm,
+        chunking=ChunkingSetup(max_merged_chunks=1),
     )
 
     src = (
@@ -276,7 +279,7 @@ def test_max_merged_tokens_packs_adjacent_items_into_one_call():
         llm_config=LLMClientConfig(model="unused"),
         memory_setup=MemorySetup(memory=MemoryHub()),
         llm=fake_llm,
-        max_merged_tokens=100_000,
+        chunking=ChunkingSetup(max_merged_tokens=100_000),
     )
 
     src = (
@@ -304,7 +307,7 @@ def test_max_merged_tokens_zero_disables_packing():
         llm_config=LLMClientConfig(model="unused"),
         memory_setup=MemorySetup(memory=MemoryHub()),
         llm=fake_llm,
-        max_merged_tokens=0,
+        chunking=ChunkingSetup(max_merged_tokens=0),
     )
 
     src = (
@@ -322,11 +325,11 @@ def test_max_merged_tokens_zero_disables_packing():
 def test_max_merged_tokens_validates():
     with pytest.raises(ValueError, match="max_merged_tokens"):
         SasLLMPipeline(
-            llm_config=LLMClientConfig(model="unused"),
-            memory_setup=MemorySetup(memory=MemoryHub()),
-            llm=FakeListChatModel(responses=["ok"]),
-            max_merged_tokens=-1,
-        )
+        llm_config=LLMClientConfig(model="unused"),
+        memory_setup=MemorySetup(memory=MemoryHub()),
+        llm=FakeListChatModel(responses=["ok"]),
+        chunking=ChunkingSetup(max_merged_tokens=-1),
+    )
 
 
 def test_packing_budget_defaults_and_derivation():
@@ -338,8 +341,8 @@ def test_packing_budget_defaults_and_derivation():
                 model="unused", max_input_tokens=max_input_tokens
             ),
             memory_setup=MemorySetup(memory=MemoryHub()),
+            chunking=ChunkingSetup(**kwargs),
             llm=FakeListChatModel(responses=["ok"]),
-            **kwargs,
         )
 
     # No input budget: the conservative hard default applies.
@@ -360,9 +363,9 @@ def test_pipeline_window_trimming_limits_injected_history():
     mem = MemoryHub()
     pipeline = SasLLMPipeline(
         llm_config=LLMClientConfig(model="unused-because-llm-injected"),
-        memory_setup=MemorySetup(memory=mem),
+        memory_setup=MemorySetup(memory=mem, window_k=1),
         llm=fake_llm,
-        window_k=1,  # keep only last 1 human/ai pair in the prompt
+        # keep only last 1 human/ai pair in the prompt,
     )
 
     chunks: list[SasBatch | SasChunk] = [
@@ -551,10 +554,8 @@ def test_summarizer_gets_pipeline_store_and_summary_never_persisted():
     )
     pipeline = SasLLMPipeline(
         llm_config=LLMClientConfig(model="unused"),
-        memory_setup=MemorySetup(memory=mem),
+        memory_setup=MemorySetup(memory=mem, window_k=None, summarizer=summarizer),
         llm=fake_llm,
-        window_k=None,
-        summarizer=summarizer,
     )
     # A store-less summarizer is wired to the pipeline's KV layer.
     assert summarizer.store is mem.kv
@@ -623,7 +624,7 @@ def test_prompt_caching_marks_system_block_for_anthropic_models():
         llm_config=LLMClientConfig(model="claude-sonnet-4-5"),
         memory_setup=MemorySetup(memory=mem),
         llm=FakeListChatModel(responses=["ok"]),
-        prompt_caching=True,
+        prompting=PromptingSetup(prompt_caching=True),
     )
     system_msg = pipeline._prompt.messages[0]
     assert isinstance(system_msg, SystemMessage)
@@ -646,7 +647,7 @@ def test_prompt_caching_ignored_for_non_anthropic_models():
         llm_config=LLMClientConfig(model="gpt-5.4"),
         memory_setup=MemorySetup(memory=MemoryHub()),
         llm=FakeListChatModel(responses=["ok"]),
-        prompt_caching=True,
+        prompting=PromptingSetup(prompt_caching=True),
     )
     # Falls back to the plain template tuple (no concrete SystemMessage).
     assert not isinstance(pipeline._prompt.messages[0], SystemMessage)
@@ -752,48 +753,15 @@ def test_memory_setup_extractor_implies_thread_memory():
 # ---------------------------------------------------------------------------
 
 
-class _FakeSharePointClient:
-    """Duck-typed stand-in for app_config.sharepoint's client: read_file only."""
-
-    def __init__(self, files: dict[str, bytes]):
-        self.files = files
-        self.read_paths: list[str] = []
-
-    def read_file(self, path: str) -> bytes:
-        self.read_paths.append(path)
-        return self.files[path]
-
-
-_MAPPING_CSV = (
-    b"sas_name,databricks_name\n"
-    b"work,dev.staging\n"
-    b"mylib,prod.sales\n"
-)
-
-
-def _patch_sharepoint(monkeypatch, files: dict[str, bytes]) -> _FakeSharePointClient:
-    import app_config.sharepoint as sp_mod
-
-    fake = _FakeSharePointClient(files)
-    monkeypatch.setattr(sp_mod, "get_sharepoint_client", lambda: fake)
-    return fake
-
-
-def test_databricks_mapping_loaded_from_sharepoint_csv(monkeypatch):
-    from chunker.batcher import load_databricks_mapping_sharepoint
-
-    fake = _patch_sharepoint(monkeypatch, {"maps/sas_to_databricks.csv": _MAPPING_CSV})
-    mapping = load_databricks_mapping_sharepoint("maps/sas_to_databricks.csv")
-    assert fake.read_paths == ["maps/sas_to_databricks.csv"]
-    assert mapping == {
-        "work": "dev.staging",
-        "mylib": "prod.sales",
-    }
+def test_databricks_mapping_reaches_both_batchers():
+    # Where the mapping came from is xref's business (tests/test_xref.py);
+    # this is only that a mapping handed to the pipeline is applied.
+    mapping = {"work": "dev.staging", "mylib": "prod.sales"}
     pipeline = SasLLMPipeline(
         llm_config=LLMClientConfig(model="unused"),
         memory_setup=MemorySetup(memory=MemoryHub()),
         llm=FakeListChatModel(responses=["ok"]),
-        databricks_mapping=mapping,
+        chunking=ChunkingSetup(databricks_mapping=mapping),
     )
     assert pipeline.databricks_mapping == mapping
     # The mapping reaches both batchers and rewrites batched dataset names.
@@ -812,31 +780,6 @@ def test_databricks_mapping_loaded_from_sharepoint_csv(monkeypatch):
     ]
     assert "dev.staging.clean" in all_outputs
     assert pipeline.multi_batcher.databricks_mapping == pipeline.databricks_mapping
-
-
-def test_explicit_databricks_mapping_overrides_sharepoint_csv(monkeypatch):
-    # The merge is the caller's one-liner now: loaded CSV under explicit dict.
-    from chunker.batcher import load_databricks_mapping_sharepoint
-
-    _patch_sharepoint(monkeypatch, {"m.csv": _MAPPING_CSV})
-    mapping = {
-        **load_databricks_mapping_sharepoint("m.csv"),
-        **{"work": "override.schema"},
-    }
-    assert mapping == {
-        "work": "override.schema",  # explicit dict wins per key
-        "mylib": "prod.sales",  # CSV-only entries survive the merge
-    }
-
-
-def test_empty_sharepoint_mapping_csv_raises(monkeypatch):
-    import pytest
-
-    from chunker.batcher import load_databricks_mapping_sharepoint
-
-    _patch_sharepoint(monkeypatch, {"m.csv": b"sas_name,databricks_name\n"})
-    with pytest.raises(ValueError, match="zero entries"):
-        load_databricks_mapping_sharepoint("m.csv")
 
 
 def test_no_mapping_keeps_batchers_unmapped():
@@ -987,7 +930,7 @@ def test_model_without_structured_support_prompts_for_markdown():
         llm_config=LLMClientConfig(model="unused"),
         memory_setup=MemorySetup(memory=MemoryHub()),
         llm=FakeListChatModel(responses=["ok"]),
-        structured_output=True,
+        prompting=PromptingSetup(structured_output=True),
     )
     assert pipeline._structured_output is False
     assert "Structure every response with these Markdown sections" in (
@@ -999,7 +942,10 @@ def test_structured_output_can_be_turned_off():
     doc = _translation_document()
     fake = _StructuredFakeChatModel(responses=["plain answer"], documents=[doc])
     pipeline = SasLLMPipeline(
-        llm_config=LLMClientConfig(model="unused"), memory_setup=MemorySetup(memory=MemoryHub()), llm=fake, structured_output=False
+        llm_config=LLMClientConfig(model="unused"),
+        memory_setup=MemorySetup(memory=MemoryHub()),
+        llm=fake,
+        prompting=PromptingSetup(structured_output=False),
     )
 
     outputs = pipeline.run_text("data work.a; x=1; run;", source_id="etl.sas")
@@ -1051,8 +997,8 @@ def test_structured_prompt_names_the_cell_language_instead_of_a_fence():
         llm_config=LLMClientConfig(model="unused"),
         memory_setup=MemorySetup(memory=MemoryHub()),
         llm=fake,
-        structured_output=True,
         output_language="SparkSQL",
+        prompting=PromptingSetup(structured_output=True),
     )
     prompt = pipeline._system_prompt
     assert pipeline._structured_output is True
@@ -1082,8 +1028,8 @@ def test_structured_document_renders_with_the_target_fence():
         llm_config=LLMClientConfig(model="unused"),
         memory_setup=MemorySetup(memory=MemoryHub()),
         llm=fake,
-        structured_output=True,
         output_language="SparkSQL",
+        prompting=PromptingSetup(structured_output=True),
     )
 
     outputs = pipeline.run_text("data work.a; x=1; run;", source_id="etl.sas")
@@ -1092,3 +1038,78 @@ def test_structured_document_renders_with_the_target_fence():
     # validation suite reads exactly this text.
     assert "```sql" in outputs[0]["response"]
     assert "```python" not in outputs[0]["response"]
+
+
+# ---------------------------------------------------------------------------
+# run_texts — the in-memory corpus seam
+#
+# A SharePoint-hosted corpus has no local paths: the drive-relative path IS the
+# source id. run_files and run_texts must therefore differ only in where the
+# text came from, which is what _run_corpus exists to guarantee.
+# ---------------------------------------------------------------------------
+
+
+_ETL = "data work.clean;\n set raw.orders;\nrun;\n"
+_LOAD = "proc means data=work.clean;\nrun;\n"
+
+
+def _text_pipeline(responses=None):
+    return SasLLMPipeline(
+        llm_config=LLMClientConfig(model="unused"),
+        memory_setup=MemorySetup(memory=MemoryHub()),
+        llm=FakeListChatModel(responses=responses or [f"r{i}" for i in range(10)]),
+    )
+
+
+def test_run_texts_names_sources_by_their_given_id():
+    pipeline = _text_pipeline()
+
+    outputs = pipeline.run_texts(
+        [("Kit/MyApp/scripts_original/etl.sas", _ETL)],
+        thread_id="req-42",
+    )
+
+    assert outputs
+    named = {f for out in outputs for f in out["source_files"]}
+    # The library path, not a basename and not a temp path.
+    assert named == {"Kit/MyApp/scripts_original/etl.sas"}
+
+
+def test_run_texts_resolves_cross_file_dependencies():
+    # work.clean is produced by etl and consumed by load, so the two must land
+    # in one batch — the whole reason a corpus is run together.
+    pipeline = _text_pipeline()
+
+    outputs = pipeline.run_texts([("etl.sas", _ETL), ("load.sas", _LOAD)])
+
+    spanning = [out for out in outputs if len(out["source_files"]) > 1]
+    assert spanning, f"expected a cross-file batch, got {[o['source_files'] for o in outputs]}"
+    assert set(spanning[0]["source_files"]) == {"etl.sas", "load.sas"}
+
+
+def test_run_texts_matches_run_files_for_the_same_corpus(tmp_path):
+    (tmp_path / "etl.sas").write_text(_ETL, encoding="utf-8")
+    (tmp_path / "load.sas").write_text(_LOAD, encoding="utf-8")
+    paths = [str(tmp_path / "etl.sas"), str(tmp_path / "load.sas")]
+
+    from_files = _text_pipeline().run_files(paths)
+    from_texts = _text_pipeline().run_texts([(p, pathlib.Path(p).read_text()) for p in paths])
+
+    # Same items, same batching, same order — only the source of the text
+    # differs, and _run_corpus is what keeps it that way.
+    assert [o["item_id"] for o in from_texts] == [o["item_id"] for o in from_files]
+    assert [o["source_files"] for o in from_texts] == [
+        o["source_files"] for o in from_files
+    ]
+
+
+def test_run_texts_uses_one_thread_for_the_whole_corpus():
+    pipeline = _text_pipeline()
+
+    pipeline.run_texts([("etl.sas", _ETL), ("load.sas", _LOAD)], thread_id="req-7")
+
+    assert pipeline.get_thread_messages("req-7")
+
+
+def test_run_texts_with_no_sources_does_nothing():
+    assert _text_pipeline().run_texts([]) == []

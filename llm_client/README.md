@@ -115,7 +115,7 @@ chain = prompt | client.as_runnable()
   supports `+` and `-`, so a caller that shares one client across several runs
   attributes each run's spend by snapshotting before and subtracting after —
   which is what `ValidationRunner` does. It flows outward from here:
-  `SasLLMPipeline.token_usage` → `demo_run`'s run summary and
+  `SasLLMPipeline.token_usage` → `conversion.run`'s run summary and
   `validation/summary.json` → `ValidationReport.token_usage`, rendered into
   `to_markdown()` and so into the PDF.
 - **Proactive throttle**: an `InMemoryRateLimiter` paces request *starts* at

@@ -35,7 +35,14 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from app_config.sharepoint import SharePointConfig, SharePointError
+from app_config.sharepoint import (
+    SharePointConfig,
+    SharePointError,
+    field_text,
+    project_rows,
+    resolve_client,
+    resolve_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -139,15 +146,6 @@ class ConversionItem:
     status: str | None = None
 
 
-def _text(fields: dict[str, Any], column: str) -> str | None:
-    """A column's value as stripped text, or ``None`` when blank/absent."""
-    value = fields.get(column)
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
 def _flag(fields: dict[str, Any], column: str, *, default: bool = False) -> bool:
     """
     A SharePoint Yes/No column coerced to ``bool``.
@@ -190,7 +188,7 @@ def format_request_item_params(item: dict[str, Any]) -> ConversionRequest:
         the folder to write.
     """
     fields = item.get("fields") or {}
-    application_name = _text(fields, REQUEST_FIELDS["application_name"])
+    application_name = field_text(fields, REQUEST_FIELDS["application_name"])
     if not application_name:
         raise SharePointError(
             f"request row {item.get('id')!r} has no "
@@ -200,13 +198,13 @@ def format_request_item_params(item: dict[str, Any]) -> ConversionRequest:
     return ConversionRequest(
         item_id=item.get("id"),
         application_name=application_name,
-        input_language=_text(fields, REQUEST_FIELDS["input_language"]),
-        output_language=_text(fields, REQUEST_FIELDS["output_language"]),
-        macro_file_name=_text(fields, REQUEST_FIELDS["macro_file_name"]),
+        input_language=field_text(fields, REQUEST_FIELDS["input_language"]),
+        output_language=field_text(fields, REQUEST_FIELDS["output_language"]),
+        macro_file_name=field_text(fields, REQUEST_FIELDS["macro_file_name"]),
         is_validation_required=_flag(
             fields, REQUEST_FIELDS["is_validation_required"]
         ),
-        status=_text(fields, REQUEST_FIELDS["status"]),
+        status=field_text(fields, REQUEST_FIELDS["status"]),
     )
 
 
@@ -217,7 +215,7 @@ def format_conversion_item_params(item: dict[str, Any]) -> ConversionItem:
     ``None``: one malformed row must not abort the whole listing.
     """
     fields = item.get("fields") or {}
-    raw_request_id = _text(fields, CONVERSION_FIELDS["app_request_id"])
+    raw_request_id = field_text(fields, CONVERSION_FIELDS["app_request_id"])
     app_request_id: int | None = None
     if raw_request_id is not None:
         try:
@@ -232,22 +230,10 @@ def format_conversion_item_params(item: dict[str, Any]) -> ConversionItem:
     return ConversionItem(
         item_id=item.get("id"),
         app_request_id=app_request_id,
-        script_name=_text(fields, CONVERSION_FIELDS["script_name"]),
-        preferred_llm=_text(fields, CONVERSION_FIELDS["preferred_llm"]),
-        status=_text(fields, CONVERSION_FIELDS["status"]),
+        script_name=field_text(fields, CONVERSION_FIELDS["script_name"]),
+        preferred_llm=field_text(fields, CONVERSION_FIELDS["preferred_llm"]),
+        status=field_text(fields, CONVERSION_FIELDS["status"]),
     )
-
-
-def _client(client: Any | None) -> Any:
-    if client is not None:
-        return client
-    from app_config.sharepoint import get_sharepoint_client
-
-    return get_sharepoint_client()
-
-
-def _config(config: SharePointConfig | None) -> SharePointConfig:
-    return config if config is not None else SharePointConfig.from_env()
 
 
 def requests(
@@ -259,14 +245,9 @@ def requests(
     A row without an application name is skipped with a WARNING rather than
     failing the read: one bad row must not hide every good one.
     """
-    resolved = _config(config)
-    rows = _client(client).list_items(resolved.list_id("requests"))
-    out: list[ConversionRequest] = []
-    for row in rows:
-        try:
-            out.append(format_request_item_params(row))
-        except SharePointError as exc:
-            logger.warning(f"requests: skipping a malformed row: {exc}")
+    resolved = resolve_config(config)
+    rows = resolve_client(client).list_items(resolved.list_id("requests"))
+    out = project_rows(rows, format_request_item_params, label="requests")
     logger.info(f"requests: read {len(out)} request row(s) of {len(rows)}")
     return out
 
@@ -285,8 +266,8 @@ def conversion_items(
     *, client: Any | None = None, config: SharePointConfig | None = None
 ) -> list[ConversionItem]:
     """Every row of the conversions list, projected."""
-    resolved = _config(config)
-    rows = _client(client).list_items(resolved.list_id("conversions"))
+    resolved = resolve_config(config)
+    rows = resolve_client(client).list_items(resolved.list_id("conversions"))
     return [format_conversion_item_params(row) for row in rows]
 
 
@@ -308,7 +289,7 @@ def update_request_status(
     SharePointError
         The requests list is not configured, or the write failed.
     """
-    resolved = _config(config)
-    return _client(client).update_list_item(
+    resolved = resolve_config(config)
+    return resolve_client(client).update_list_item(
         resolved.list_id("requests"), item_id, {STATUS_FIELD: new_status}
     )

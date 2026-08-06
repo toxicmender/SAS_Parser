@@ -75,13 +75,13 @@ stored in a macro variable (`%let ds = mylib.orders;`, including the
 *text*, since a `%let` value never appears in the metadata dataset lists.
 
 The mapping can also come from a two-column CSV (`sas_name,databricks_name` —
-librefs or exact `libref.member` names) via `parse_databricks_mapping_csv`,
-or straight from the configured SharePoint document library (see
-`app_config.sharepoint`) via `load_databricks_mapping_sharepoint(path)` —
-the SharePoint client is imported lazily inside that call. Pass the resulting
-dict to either batcher or to `pipeline.SasLLMPipeline(databricks_mapping=...)`;
-merging a loaded CSV under explicit overrides is the caller's one-liner
-(`{**loaded, **overrides}`).
+librefs or exact `libref.member` names) via `parse_databricks_mapping_csv`.
+That parser is pure and lives here; *fetching* a mapping is `xref`'s job, since
+this package stays network-free — `xref.sourcing.mappings(app)` reads the
+SharePoint XREF list and `xref.sourcing.load_databricks_mapping_sharepoint(path)`
+a CSV in the document library. Pass the resulting dict to either batcher or to
+`pipeline.SasLLMPipeline(databricks_mapping=...)`; merging a loaded CSV under
+explicit overrides is the caller's one-liner (`{**loaded, **overrides}`).
 
 For running the work items end-to-end through an LLM, see the
 [`pipeline` README](../pipeline/README.md).

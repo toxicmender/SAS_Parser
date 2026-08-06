@@ -397,10 +397,12 @@ def test_pipeline_prompts_relevant_pair_not_recency_window():
     llm = _RecordingChatModel()
     pipeline = SasLLMPipeline(
         llm_config=LLMClientConfig(model="unused-because-llm-injected"),
-        memory_setup=MemorySetup(memory=MemoryHub()),
+        memory_setup=MemorySetup(
+            memory=MemoryHub(),
+            window_k=None,
+            history_selector=RelevantHistorySelector(top_k=2, always_keep_last=1),
+        ),
         llm=llm,
-        window_k=None,
-        history_selector=RelevantHistorySelector(top_k=2, always_keep_last=1),
     )
     chunks: list[SasBatch | SasChunk] = [
         _mk_chunk("c1", "data work.zzunique_first_xq; run;"),  # relevant to c4

@@ -45,7 +45,7 @@ __all__ = [
     "resolve_target_language",
 ]
 
-# The one code default. Both SasLLMPipeline and demo_run read it, so the two
+# The one code default. Both SasLLMPipeline and main.py read it, so the two
 # entry points can no longer disagree (they used to: "PySpark" vs "SparkSQL").
 # config.json's pipeline.output_language overrides it; an explicit argument
 # overrides that.

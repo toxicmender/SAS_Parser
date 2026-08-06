@@ -9,6 +9,9 @@ The XREF list maps a SAS dataset name to its Unity Catalog target —
 * :mod:`xref.apply` — *when* the substitution happens: ``"pre"`` (before
   conversion, over the SAS-side metadata), ``"post"`` (after, over the
   generated code), or ``"both"``.
+* :mod:`xref.pre` — the other half of ``"pre"``: the physical paths in
+  ``LIBNAME`` / ``INFILE`` / ``%INCLUDE``, which are not dataset names and so
+  are not something ``replace_dataset_names`` can or should reach.
 * :mod:`xref.rewrite` — the post-conversion rewriter, parsing generated Spark
   SQL with ``sqlglot`` and generated PySpark with the ``ast`` module.
 
@@ -40,12 +43,16 @@ from __future__ import annotations
 # would shadow the `xref.apply` submodule on this package. Reach it as
 # `xref.apply.apply`, or call apply_pre / apply_post directly.
 from .apply import APPLY_MODES, apply_post, apply_pre
-from .sourcing import XrefMappings, mappings
+from .pre import PreStats, rewrite_source_text
+from .sourcing import XrefMappings, load_databricks_mapping_sharepoint, mappings
 
 __all__ = [
     "APPLY_MODES",
+    "PreStats",
     "XrefMappings",
     "apply_post",
     "apply_pre",
+    "load_databricks_mapping_sharepoint",
     "mappings",
+    "rewrite_source_text",
 ]

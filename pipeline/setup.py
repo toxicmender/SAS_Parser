@@ -1,12 +1,29 @@
 """Grouped construction settings for :class:`pipeline.engine.SasLLMPipeline`.
 
-:class:`MemorySetup` bundles the pipeline's memory-wiring knobs — the store,
-the two instruction memories, the extractor, and the chat identity — and owns
-the cross-injection logic that used to live inline in the pipeline
-constructor: defaulting the hub, binding store-less components to it, and
-letting an extractor imply a thread memory. The pipeline takes one of these
-(``memory_setup=``) and nothing else — the individual kwargs it replaced are
-gone, so there is one place a memory knob can be set.
+One dataclass per concern, so the pipeline's constructor names concerns rather
+than knobs. It took 22 keyword arguments before these; it takes seven now, and
+each of the four groups is a thing a caller can build once and reuse.
+
+:class:`MemorySetup`
+    The store, the two instruction memories, the extractor, the chat identity,
+    and the history policy (window, selector, summarizer). It also owns the
+    cross-injection logic that used to live inline in the pipeline
+    constructor: defaulting the hub, binding store-less components to it, and
+    letting an extractor imply a thread memory.
+:class:`ChunkingSetup`
+    How the source is split and grouped — word limits, what to include, the
+    merge caps, and the dataset-name mapping the batchers apply.
+:class:`PromptingSetup`
+    What the model is asked and how — the system prompt, structured output,
+    prompt caching, and the two instruction channels.
+:class:`ValidationSetup`
+    The inline validator and its retry budget.
+
+The rule is the same one commit 97b5e8a applied to ``llm_config`` and
+``memory_setup``: **one spelling per knob**. The individual keyword arguments
+these replaced are gone rather than deprecated, so there is never a second
+place to set the same thing — and no rejection branch to stop someone setting
+it in both.
 
 Logger name: ``pipeline.setup``.
 """
@@ -16,16 +33,19 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from app_config.spark import describe_master, master_url
 from memory.context import MemoryContext
 from memory.extractor import MemoryExtractor
 from memory.policy import TaskPolicy
+from memory.relevance import RelevantHistorySelector
 from memory.store import MemoryHub
+from memory.summarize import RollingSummarizer
 from memory.thread_mem import ThreadMemory
 
 if TYPE_CHECKING:
+    from prompt_builder import PromptBuilder, UserInstructionSet
     from pyspark.sql import SparkSession
 
 logger = logging.getLogger(__name__)
@@ -53,7 +73,9 @@ class MemorySetup:
     ``delta_table`` is set); ``task_id`` / ``task_policy`` name or carry the
     long-term policy; ``thread_memory`` holds short-term notes (implied by a
     ``memory_extractor`` when omitted); ``chat_id`` identifies this
-    instance's span of every thread it writes.
+    instance's span of every thread it writes; ``window_k`` /
+    ``history_selector`` / ``summarizer`` decide which stored turns are
+    actually prompted.
     """
 
     memory: MemoryHub | None = None
@@ -64,6 +86,14 @@ class MemorySetup:
     chat_id: str | None = None
     spark: "SparkSession | None" = None
     delta_table: str | None = None
+    # History policy: which of the stored turns are actually prompted. It
+    # belongs here rather than in a group of its own because it is the same
+    # subject as the store — what is remembered versus what is re-sent — and
+    # splitting the two would put `memory` and `window_k` in different
+    # objects while they describe the same conversation.
+    window_k: int | None = 6
+    history_selector: RelevantHistorySelector | None = None
+    summarizer: RollingSummarizer | None = None
 
     def build(self) -> BuiltMemory:
         """Wire everything together and return the built components.
@@ -138,3 +168,64 @@ class MemorySetup:
                 .getOrCreate()
             )
         return MemoryHub(spark=spark, table=delta_table)
+
+
+@dataclass
+class ChunkingSetup:
+    """How the SAS source is split and grouped, for one pipeline instance.
+
+    Fields carry exactly the semantics of the same-named ``SasLLMPipeline``
+    keyword arguments they replaced. ``None`` on the word limits defers to
+    ``config.json`` ``sas_chunker.*``; ``max_merged_tokens`` ``None`` derives a
+    packing budget from the model's input headroom and ``0`` turns packing off.
+
+    ``databricks_mapping`` is the dataset-name cross-reference, which both
+    batchers apply as a post-pass after grouping. Sourcing one is the caller's
+    job — see :mod:`xref.sourcing`.
+    """
+
+    min_words: int | None = None
+    max_words: int | None = None
+    include_options_chunks: bool = True
+    include_comment_chunks: bool = False
+    max_merged_chunks: int = 8
+    max_merged_tokens: int | None = None
+    databricks_mapping: dict[str, str] | None = None
+
+
+@dataclass
+class PromptingSetup:
+    """What the model is asked, and how, for one pipeline instance.
+
+    Fields carry exactly the semantics of the same-named ``SasLLMPipeline``
+    keyword arguments they replaced: ``system_prompt`` overrides the built-in
+    template outright, ``structured_output`` asks for a typed
+    :class:`~pipeline.response_models.TranslationDocument` instead of Markdown,
+    ``prompt_caching`` puts a cache breakpoint on the system block, and the two
+    instruction channels supply per-item guidance.
+
+    ``None`` on the three flags defers to ``config.json``; ``user_instructions``
+    ``None`` still loads a standing instructions file if one is configured,
+    which is why it is not simply "off".
+    """
+
+    system_prompt: str | None = None
+    structured_output: bool | None = None
+    prompt_caching: bool | None = None
+    prompt_builder: "PromptBuilder | None" = None
+    user_instructions: "str | UserInstructionSet | None" = None
+
+
+@dataclass
+class ValidationSetup:
+    """Inline validation for one pipeline instance.
+
+    ``validator`` scores each item the moment its response returns; ``retries``
+    re-generates a failing item with the failed metrics fed back as correction.
+    ``0`` is observe-only — score and store, never act — and retries without a
+    validator is a no-op the pipeline warns about, since it reads as protection
+    that is not there.
+    """
+
+    validator: Any = None
+    retries: int = 0

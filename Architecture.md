@@ -75,6 +75,15 @@ not wired into the pipeline.
 ## Package layout
 
 ```
+main.py                 The entry point (console script: `sas-parser`).
+                        Argument parsing, validation-before-work, credential
+                        resolution, pipeline construction, and dispatch —
+                        nothing else; the per-request orchestration lives in
+                        conversion/run.py so it is testable without the CLI.
+                        SharePoint is the DEFAULT flow and a positional source
+                        directory is the explicit opt-out into local mode.
+                        Neither falls back to the other silently.
+
 chunker/
   models.py             Pydantic models: SasChunk(+Kind), SasChunkMetadata,
                         SasChunkResult, SasCorpus, SasBatch, SasBatchResult,
@@ -98,14 +107,20 @@ chunker/
                         resolution, context absorption, batch construction.
                         SasChunkBatcher is a one-file convenience over
                         MultiFileBatcher.
-  _repl.py              print_iterable REPL helper (also used by demo_run.py
+  _repl.py              print_iterable REPL helper (also used by conversion.run
                         to render per-item summary lines into its logs).
 pipeline/
-  setup.py              MemorySetup: grouped memory wiring for the pipeline
-                        constructor (store hub, task policy, thread memory,
-                        extractor, chat identity) with the cross-injection
-                        logic in build(). LLM transport groups under
-                        llm_client.LLMClientConfig the same way.
+  setup.py              The pipeline constructor's grouped configs, one per
+                        concern: MemorySetup (store hub, task policy, thread
+                        memory, extractor, chat identity, history policy —
+                        plus the cross-injection logic in build()),
+                        ChunkingSetup, PromptingSetup, ValidationSetup. LLM
+                        transport groups under llm_client.LLMClientConfig the
+                        same way. ONE SPELLING PER KNOB: these are fields on
+                        those objects, never keyword arguments on the pipeline
+                        as well — two places to set one thing means a
+                        rejection branch to stop them being set in both, which
+                        is what the 22-argument constructor used to carry.
   run_ledger.py         RunLedger: KV-side run bookkeeping — per-item
                         run/validation facts, resume (skip/redo resolution
                         and the rewind), and the fact-copying half of fork.
@@ -138,14 +153,22 @@ llm_client/
                         counting, chars//4 degradation when the encoding
                         data cannot load. A leaf module.
   client.py             LLMClient / LLMClientConfig: chat-model construction
-                        via ChatOpenAI — every model, Claude and Gemini
-                        included, is reached over the AI Gateway's
-                        OpenAI-compatible API (temperature, max output tokens,
-                        endpoint overrides — base_url / api_key / headers /
-                        timeout / model_kwargs, proactive InMemoryRateLimiter)
-                        and sync + async invocation (input-token budget via
-                        llm_client.tokens -> InputTokenLimitError,
-                        transient-error retry with exponential backoff).
+                        over the AI Gateway's OpenAI-compatible API
+                        (temperature, max output tokens, endpoint overrides —
+                        base_url / api_key / headers / timeout / model_kwargs,
+                        proactive InMemoryRateLimiter) and sync + async
+                        invocation (input-token budget via llm_client.tokens
+                        -> InputTokenLimitError, transient-error retry with
+                        exponential backoff). WHICH client is built follows the
+                        model's provider (provider_client="auto"): anthropic
+                        -> a raw openai.OpenAI wrapped to the surface this
+                        class invokes, openai/google -> ChatOpenAI, anything
+                        else -> LLMClientError. That is what the reference
+                        deployment does against this same gateway; an explicit
+                        provider_client pins it either way.
+                        from_ai_gateway() / from_vault_secret() are the two
+                        constructions that perform I/O, which is why they are
+                        classmethods rather than defaults.
                         Imports nothing from chunker or memory.
 
 memory/
@@ -265,6 +288,16 @@ app_config/
                         to conversion/, xref/, and complexity/sharepoint.py.
                         msgraph-sdk imported lazily (extra: sharepoint).
 
+reporting/
+  pdf.py                Markdown -> PDF: markdown-it parses, PyMuPDF's Story
+                        lays out. ONE implementation for both report surfaces
+                        -- complexity renders to a file beside the Markdown,
+                        validation to bytes for upload, and they share the
+                        stylesheet, the code folding (Story CLIPS a wide <pre>
+                        line rather than wrapping it), the image archive, and
+                        the paging-loop cap. A leaf: imports nothing from this
+                        repo.
+
 conversion/
   paths.py              The folder conventions one application's scripts live
                         under: scripts_original, scripts_converted,
@@ -282,17 +315,33 @@ conversion/
   upload.py             Writing converted scripts and validation artefacts
                         back, delegating notebook rendering to
                         pipeline/notebook.py rather than reimplementing it.
+  run.py                The orchestration over the other four: read a row's
+                        scripts, apply XREF, translate the application as ONE
+                        corpus on one thread, upload, write the row's Status
+                        (on the failure path too). Takes a transport and a
+                        pipeline FACTORY, so a whole run is testable without a
+                        network or an LLM. Also the run-reporting helpers the
+                        CLI prints through.
 
 xref/
   sourcing.py           XREF rows for one application, classified into exact /
                         by_libref / by_path. Title carries an optional type
                         marker; unmarked rows are table mappings, so existing
-                        rows need no backfill. by_path is populated but not
-                        yet consumed.
+                        rows need no backfill. Also the CSV file backend
+                        (load_databricks_mapping_sharepoint) -- fetching a
+                        mapping is this package's job, never chunker's.
   apply.py              WHEN the substitution happens: "pre" (default, over
                         the SAS-side metadata via chunker.batcher
                         .replace_dataset_names), "post" (over generated code),
                         or "both" (each, reporting what only post reached).
+  pre.py                The other half of "pre": the physical paths in
+                        LIBNAME / INFILE / %INCLUDE, keyed off by_path. Runs
+                        over the RAW TEXT before chunking, which is what keeps
+                        chunker and pipeline free of XREF knowledge. Matched by
+                        statement, not by blind sweep, and keys are applied
+                        longest-first (a path is routinely a prefix of a longer
+                        one). A path carrying an unresolved macro reference is
+                        counted and reported, never guessed at.
   rewrite.py            The post-conversion rewriter: sqlglot for Spark SQL,
                         the ast module + source-span substitution for PySpark
                         (so comments and formatting survive). Unparseable
@@ -799,6 +848,29 @@ any of these silently changes behavior.
    verdicts, and in report tables, so it keeps its name while checking the
    target.
 
+12. **One owner per cross-cutting concern, and the owner is not the caller.**
+   Three of these, each of which regressed once by growing a second
+   implementation next to the first, and each of which fails *silently* when
+   it does:
+
+   - **One XREF owner.** `xref/` fetches mappings; `chunker` only
+     *substitutes* what it is handed (`replace_dataset_names`,
+     `parse_databricks_mapping_csv`). `chunker` must import
+     `app_config.sharepoint` nowhere — `tests/test_xref.py` asserts this
+     directly, because the failure mode is a network call appearing inside a
+     package documented as network-free.
+   - **One credential chain.** `LLMClientConfig.from_ai_gateway()` is the only
+     way to build a gateway config. Assembling one by hand from
+     `vault.ai_gateway_token()` looks equivalent and silently drops the
+     `ai-gateway-version` header and the gateway's rate-limit pacing, both of
+     which that classmethod adds. It is also walked **once per run** and
+     copied per row (`model_copy`), never re-resolved.
+   - **One entry point.** `main.py` parses and dispatches; `conversion/run.py`
+     orchestrates. A second flow that reads the library and uploads to it will
+     drift on the folder conventions — which is exactly how a previous one
+     ended up reading from the drive root and writing to `{app}/output/`
+     instead of `{base}/{app}/scripts_converted/{model}/{timestamp}`.
+
 ## Conventions
 
 - **Logging:** f-string messages everywhere (never lazy `%`-style).
@@ -809,7 +881,8 @@ any of these silently changes behavior.
   `chunker.metadata`, `chunker.batcher`, `pipeline.engine`,
   `pipeline.prompting`, `pipeline.notebook`, `memory.store`,
   `memory.relevance`, `memory.summarize`, `llm_client.client`,
-  `target_language`.
+  `conversion.run`, `xref.pre`, `xref.sourcing`, `target_language`, and
+  `main` for the entry point.
 - **Names:** dataset/macro/libref names are lowercased at extraction;
   quoted physical paths keep a leading `'` so they can never collide with
   identifiers.

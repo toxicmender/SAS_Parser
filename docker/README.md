@@ -27,7 +27,7 @@ docker compose up -d --build
 Then drive the CLI inside the app container:
 
 ```bash
-docker compose exec app python demo_run.py local sas_scripts --out-dir out --md out/report.md
+docker compose exec app python main.py sas_scripts --out-dir out --md out/report.md
 ```
 
 That run keeps its conversation memory in process. To persist it to a Delta
@@ -35,7 +35,7 @@ table on the cluster instead, name one — the session is built against
 `SPARK_MASTER_URL`, which compose already sets on the `app` service:
 
 ```bash
-docker compose exec app python demo_run.py local sas_scripts --out-dir out --delta-table default.sas_parser_memory
+docker compose exec app python main.py sas_scripts --out-dir out --delta-table default.sas_parser_memory
 ```
 
 ```bash
@@ -83,7 +83,7 @@ dev-mode Vault forgets everything when it restarts.
 | Path                        | Read by                                                       |
 | --------------------------- | ------------------------------------------------------------- |
 | `secret/appsvc/ai_gateway`  | the default credential chain (`<app_name>/ai_gateway`, with compose setting `VAULT_APP_NAME=appsvc`) |
-| `secret/llm/anthropic`      | `demo_run.py ... --vault-secret llm/anthropic` (explicit AppRole read) |
+| `secret/llm/anthropic`      | `main.py ... --vault-secret llm/anthropic` (explicit AppRole read) |
 
 Both carry `api_key` (and `base_url` on the gateway secret when
 `OPENAI_BASE_URL` is set), taken from `OPENAI_API_KEY` in your environment or

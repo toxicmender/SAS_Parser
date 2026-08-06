@@ -627,6 +627,26 @@ def get_secret(
     return get_vault_client().get_secret(path, key, mount_point=mount_point)
 
 
+def is_configured() -> bool:
+    """
+    True when Vault is set up well enough to *try* the AI Gateway chain — an
+    address plus some way to log in.
+
+    Deliberately about **configuration, not reachability**. A workstation with
+    no Vault settings at all is a normal local-development case and should fall
+    back to the provider environment variable without ceremony; a
+    half-configured or broken Vault is not, and must fail loudly rather than
+    quietly use a different credential than the operator intended. So this
+    answers only "was Vault asked for?", and any failure after it says yes is
+    raised, never swallowed.
+
+    Performs no I/O — it reads :meth:`VaultConfig.from_env` and nothing else,
+    so a caller can branch on it before paying for a login.
+    """
+    config = VaultConfig.from_env()
+    return bool(config.address and config.auth_method)
+
+
 def get_ai_gateway_secret(path: str | None = None) -> dict[str, Any]:
     """
     The whole AI Gateway secret — by default the one under the application's

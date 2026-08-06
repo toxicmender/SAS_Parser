@@ -40,6 +40,9 @@ _DATABRICKS_ENV = (
     "ARM_TENANT_ID",
     "ARM_CLIENT_ID",
     "ARM_CLIENT_SECRET",
+    # The reference deployment's lowercase spelling of the PAT, accepted as a
+    # fallback by DatabricksConfig.from_env.
+    "token",
 )
 
 _AZURE_ENV = (
@@ -886,3 +889,19 @@ def test_get_databricks_config_is_cached():
     assert databricks.get_databricks_config() is first
     databricks.clear_cache()
     assert databricks.get_databricks_config() is not first
+
+
+def test_lowercase_token_env_var_is_accepted(monkeypatch):
+    # The reference deployment's configManager reads os.getenv('token'), so a
+    # .env written for it must work here unchanged.
+    monkeypatch.delenv("DATABRICKS_TOKEN", raising=False)
+    monkeypatch.setenv("token", "reference-pat")
+
+    assert databricks.DatabricksConfig.from_env().token == "reference-pat"
+
+
+def test_databricks_token_wins_over_the_lowercase_fallback(monkeypatch):
+    monkeypatch.setenv("DATABRICKS_TOKEN", "documented")
+    monkeypatch.setenv("token", "reference-pat")
+
+    assert databricks.DatabricksConfig.from_env().token == "documented"

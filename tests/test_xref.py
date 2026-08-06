@@ -20,7 +20,7 @@ import pytest
 
 import app_config
 from app_config.sharepoint import SharePointConfig, SharePointError
-from xref import apply as xref_apply, rewrite, sourcing
+from xref import apply as xref_apply, pre, rewrite, sourcing
 
 requires_sqlglot = pytest.mark.skipif(
     importlib.util.find_spec("sqlglot") is None,
@@ -385,3 +385,204 @@ def test_apply_both_through_the_dispatcher_runs_the_pre_pass_too():
         "cat.sales.orders"
     ]
     assert "cat.sales.orders" in outcome.code
+
+
+# ---------------------------------------------------------------------------
+# The CSV backend — sourcing.load_databricks_mapping_sharepoint
+#
+# It lives in xref/ rather than chunker/batcher.py because reading it is I/O
+# against SharePoint and chunker stays network-free; the parser it delegates
+# to is pure and stays in chunker.
+# ---------------------------------------------------------------------------
+
+
+class _FakeFileTransport:
+    """Duck-typed stand-in for the SharePoint client: read_file only."""
+
+    def __init__(self, files: dict[str, bytes]):
+        self.files = files
+        self.read_paths: list[str] = []
+
+    def read_file(self, path: str) -> bytes:
+        self.read_paths.append(path)
+        return self.files[path]
+
+
+_MAPPING_CSV = (
+    b"sas_name,databricks_name\n"
+    b"work,dev.staging\n"
+    b"mylib,prod.sales\n"
+)
+
+
+def _patch_sharepoint(monkeypatch, files: dict[str, bytes]) -> _FakeFileTransport:
+    import app_config.sharepoint as sp_mod
+
+    fake = _FakeFileTransport(files)
+    monkeypatch.setattr(sp_mod, "get_sharepoint_client", lambda: fake)
+    return fake
+
+
+def test_databricks_mapping_loaded_from_sharepoint_csv(monkeypatch):
+    fake = _patch_sharepoint(monkeypatch, {"maps/sas_to_databricks.csv": _MAPPING_CSV})
+
+    mapping = sourcing.load_databricks_mapping_sharepoint(
+        "maps/sas_to_databricks.csv"
+    )
+
+    assert fake.read_paths == ["maps/sas_to_databricks.csv"]
+    assert mapping == {"work": "dev.staging", "mylib": "prod.sales"}
+
+
+def test_explicit_databricks_mapping_overrides_the_csv(monkeypatch):
+    # The merge is the caller's one-liner: loaded CSV under an explicit dict.
+    _patch_sharepoint(monkeypatch, {"m.csv": _MAPPING_CSV})
+
+    mapping = {
+        **sourcing.load_databricks_mapping_sharepoint("m.csv"),
+        "work": "override.schema",
+    }
+
+    assert mapping == {
+        "work": "override.schema",  # the explicit entry wins per key
+        "mylib": "prod.sales",  # CSV-only entries survive the merge
+    }
+
+
+def test_empty_sharepoint_mapping_csv_raises(monkeypatch):
+    # Asking for renaming that cannot happen must stop the run rather than
+    # silently produce SAS-named output.
+    _patch_sharepoint(monkeypatch, {"m.csv": b"sas_name,databricks_name\n"})
+
+    with pytest.raises(ValueError, match="zero entries"):
+        sourcing.load_databricks_mapping_sharepoint("m.csv")
+
+
+def test_chunker_stays_network_free():
+    """chunker must not reach SharePoint; xref owns that (old-spec D3)."""
+    import chunker.batcher as batcher
+
+    assert not hasattr(batcher, "load_databricks_mapping_sharepoint")
+    source = pathlib.Path(batcher.__file__).read_text(encoding="utf-8")
+    assert "app_config.sharepoint" not in source
+
+
+# ---------------------------------------------------------------------------
+# xref.pre — physical paths in LIBNAME / INFILE / %INCLUDE
+#
+# The half of "pre" that replace_dataset_names cannot reach: _map_ds
+# early-returns on quoted paths, so nothing else rewrites them.
+# ---------------------------------------------------------------------------
+
+
+def _paths(**by_path) -> sourcing.XrefMappings:
+    return sourcing.XrefMappings(by_path=dict(by_path))
+
+
+def test_pre_is_a_no_op_without_path_mappings():
+    src = "libname raw '/data/in';\n"
+    out, stats = pre.rewrite_source_text(src, sourcing.XrefMappings())
+
+    assert out == src
+    assert not stats
+    assert stats.changed is False
+
+
+def test_pre_rewrites_a_libname_path():
+    src = "libname raw '/data/in';\ndata x; set raw.a; run;\n"
+    out, stats = pre.rewrite_source_text(src, _paths(**{"/data/in": "/mnt/bronze"}))
+
+    assert "libname raw '/mnt/bronze';" in out
+    assert stats.rewritten == {"/data/in": "/mnt/bronze"}
+    # Only the path moved; the libref and everything using it are untouched.
+    assert "set raw.a;" in out
+
+
+def test_pre_rewrites_libname_with_an_engine_and_double_quotes():
+    src = 'libname raw meta "/data/in";\n'
+    out, _ = pre.rewrite_source_text(src, _paths(**{"/data/in": "/mnt/bronze"}))
+
+    assert out == 'libname raw meta "/mnt/bronze";\n'
+
+
+def test_pre_rewrites_infile_file_and_include():
+    src = (
+        "%include '/code/common.sas';\n"
+        "data x; infile '/data/in/c.csv'; run;\n"
+        "data _null_; file '/data/out/r.txt'; run;\n"
+    )
+    out, stats = pre.rewrite_source_text(
+        src,
+        _paths(
+            **{
+                "/code/common.sas": "/repo/common.sas",
+                "/data/in/c.csv": "/mnt/bronze/c.csv",
+                "/data/out/r.txt": "/mnt/silver/r.txt",
+            }
+        ),
+    )
+
+    assert "'/repo/common.sas'" in out
+    assert "'/mnt/bronze/c.csv'" in out
+    assert "'/mnt/silver/r.txt'" in out
+    assert len(stats.rewritten) == 3
+
+
+def test_pre_applies_the_longest_matching_key_first():
+    # The reference sorts keys longest-first to avoid partial overlaps; the
+    # specific mapping must win over the prefix one.
+    src = "libname a '/data/in/sub';\nlibname b '/data/in';\n"
+    out, _ = pre.rewrite_source_text(
+        src, _paths(**{"/data/in": "/mnt/bronze", "/data/in/sub": "/mnt/gold"})
+    )
+
+    assert "libname a '/mnt/gold';" in out
+    assert "libname b '/mnt/bronze';" in out
+
+
+def test_pre_treats_a_key_as_a_directory_prefix():
+    src = "infile '/data/in/2026/c.csv';\n"
+    out, stats = pre.rewrite_source_text(src, _paths(**{"/data/in": "/mnt/bronze"}))
+
+    assert "'/mnt/bronze/2026/c.csv'" in out
+    assert stats.rewritten == {"/data/in/2026/c.csv": "/mnt/bronze/2026/c.csv"}
+
+
+def test_pre_prefix_match_stops_at_a_separator():
+    # /data/in must not match /data/inbound.
+    src = "infile '/data/inbound/c.csv';\n"
+    out, stats = pre.rewrite_source_text(src, _paths(**{"/data/in": "/mnt/bronze"}))
+
+    assert out == "infile '/data/inbound/c.csv';\n"
+    assert not stats.rewritten
+
+
+def test_pre_reports_unresolved_macro_paths_instead_of_guessing(caplog):
+    src = "libname raw \"&root/in\";\n"
+    with caplog.at_level("WARNING"):
+        out, stats = pre.rewrite_source_text(
+            src, _paths(**{"/data/in": "/mnt/bronze"}), source_id="etl.sas"
+        )
+
+    assert out == src  # left exactly as written
+    assert stats.unresolved == ["&root/in"]
+    assert not stats.rewritten
+    assert "unresolved macro reference" in caplog.text
+
+
+def test_pre_leaves_an_unmapped_path_alone():
+    src = "libname raw '/somewhere/else';\n"
+    out, stats = pre.rewrite_source_text(src, _paths(**{"/data/in": "/mnt/bronze"}))
+
+    assert out == src
+    assert not stats.rewritten
+
+
+def test_pre_does_not_touch_a_path_outside_a_path_statement():
+    # Matching by statement, not by blind sweep: a bare string that happens to
+    # look like a mapped path is not a path reference.
+    src = "%let note = '/data/in is the old location';\n"
+    out, stats = pre.rewrite_source_text(src, _paths(**{"/data/in": "/mnt/bronze"}))
+
+    assert out == src
+    assert not stats.rewritten

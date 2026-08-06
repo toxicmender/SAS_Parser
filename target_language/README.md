@@ -19,7 +19,7 @@ happened to need it, and every consumer guessed differently:
   Spark SQL run scored `0.0` with *"no fenced Python code blocks"* — and with
   `validation_retries` on, drove retries that could never pass;
 - the two entry points disagreed on the default (`SasLLMPipeline` said
-  PySpark, `demo_run` said SparkSQL), and `complexity.target` was a third,
+  PySpark, the CLI said SparkSQL), and `complexity.target` was a third,
   uncoordinated knob.
 
 Resolving once and passing the object down removes the class of bug.

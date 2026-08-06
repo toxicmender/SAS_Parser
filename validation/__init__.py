@@ -14,8 +14,8 @@ Public API:
   arbitrary (prompt, response) transcripts.
 - :class:`LiveValidator` / :func:`validations_for_thread` — inline scoring:
   the pipeline scores each item as its response returns and stores the
-  verdict in that conversation's memory (opt in via ``SasLLMPipeline(...,
-  validator=LiveValidator())``).
+  verdict in that conversation's memory (opt in via
+  ``SasLLMPipeline(validation=ValidationSetup(validator=LiveValidator()))``).
 - :func:`report_from_thread` / :func:`report_from_verdicts` — aggregate those
   inline verdicts into a :class:`ValidationReport`, so an inline run reuses the
   same report surface (``to_markdown()``, PDF, run history) as an offline run.

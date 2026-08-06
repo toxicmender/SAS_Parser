@@ -51,6 +51,15 @@ from . import tokens
 logger = logging.getLogger(__name__)
 
 
+class LLMClientError(RuntimeError):
+    """The chat model could not be constructed from this configuration.
+
+    Raised before any request is made — a misconfiguration, not a transport
+    failure — so a caller can tell "this run was never going to work" from "the
+    gateway said no".
+    """
+
+
 class InputTokenLimitError(ValueError):
     """Prompt exceeds the configured input-token budget; nothing was sent."""
 
@@ -127,20 +136,35 @@ class LLMClientConfig(BaseModel):
     provider_client : str | None
         How the chat model is built:
 
+        ``"auto"``
+            The default — :attr:`model_provider` decides, through
+            ``app_config.PROVIDER_CLIENT_BY_PROVIDER``: ``anthropic`` routes
+            to ``"native"``, ``openai`` and ``google`` to
+            ``"openai_compatible"``. This is what the reference deployment
+            does against this same gateway, so it is the behaviour a
+            gateway-hosted model gets without configuring anything. A model
+            id with no provider on it (and no ``model_provider`` set) has
+            nothing to route on and takes ``"openai_compatible"``; a named
+            but unrecognised provider raises :class:`LLMClientError` rather
+            than being guessed at.
         ``"openai_compatible"``
-            The default — ``langchain_openai.ChatOpenAI``, which is what
-            this whole class is written around.
+            ``langchain_openai.ChatOpenAI``, which is what this whole class
+            is written around. Set it explicitly to keep the LangChain
+            transport for a provider that would otherwise route to native.
         ``"native"``
             A raw ``openai.OpenAI`` client wrapped to the minimal surface
             :class:`LLMClient` invokes, for a gateway that will not accept
             the LangChain payload. **Everything that attaches at
             construction time is forfeited**: the rate limiter
             (:attr:`requests_per_second`), :attr:`model_kwargs`, and
-            structured output. Retry with ``Retry-After``, the input-token
-            budget, and usage accounting still apply, since those live in
-            :class:`LLMClient` rather than in the model. Configuring a
-            forfeited knob alongside it is logged at WARNING.
+            structured output — for which ``pipeline.notebook`` already
+            degrades to parsing the Markdown response. Retry with
+            ``Retry-After``, the input-token budget, and usage accounting
+            still apply, since those live in :class:`LLMClient` rather than
+            in the model. Configuring a forfeited knob alongside it is
+            logged at WARNING.
 
+        An explicit value always wins over the provider, in either direction.
         Config key: ``llm_client.provider_client``.
     base_url : str | None
         Gateway endpoint (the OpenAI-compatible root, e.g.
@@ -434,6 +458,72 @@ class LLMClientConfig(BaseModel):
             f"LLMClientConfig.from_ai_gateway: got the gateway token from Vault "
             f"(base_url={values.get('base_url')}, "
             f"overrides={sorted(overrides) or None})"
+        )
+        return cls(**values)
+
+    @classmethod
+    def from_vault_secret(
+        cls, path: str, key: str = "api_key", **overrides: Any
+    ) -> "LLMClientConfig":
+        """
+        A config whose :attr:`api_key` is field *key* of the Vault secret at
+        *path*, read over **AppRole** — the application's own identity
+        (``VAULT_ROLE_ID`` / ``VAULT_SECRET_ID``) rather than a personal token.
+
+        The escape hatch beside :meth:`from_ai_gateway`, for a deployment that
+        files its LLM key somewhere other than the gateway secret. Any ambient
+        ``VAULT_TOKEN`` is dropped so this path always exercises AppRole: the
+        point of naming it is to use the app identity, and silently falling
+        back to whatever token happens to be in the environment would read as
+        success while proving nothing.
+
+        Unlike :meth:`from_ai_gateway` this reads only the key — a secret of
+        the operator's own choosing carries no ``base_url`` or
+        ``gateway_version`` convention — so ``llm_client.base_url`` stands.
+
+        Parameters
+        ----------
+        path : str
+            KV path relative to the mount.
+        key : str
+            Field within that secret (default ``"api_key"``).
+        **overrides
+            Ordinary constructor arguments, applied last.
+
+        Raises
+        ------
+        app_config.vault.VaultError
+            No AppRole credentials are configured, Vault is unreachable, or
+            the secret has no usable value at *key*.
+
+        Notes
+        -----
+        Performs I/O, like :meth:`from_ai_gateway` and for the same reason it
+        is an explicit classmethod rather than a default.
+        """
+        from dataclasses import replace as _replace
+
+        from app_config.vault import VaultClient, VaultConfig, VaultError
+
+        base = VaultConfig.from_env()
+        if not (base.role_id and base.secret_id):
+            raise VaultError(
+                f"reading the LLM key from Vault secret {path!r} needs AppRole "
+                f"credentials: set VAULT_ROLE_ID and VAULT_SECRET_ID (and "
+                f"VAULT_ADDR)"
+            )
+        approle = _replace(base, token=None)  # force app identity, ignore any token
+        value = VaultClient(approle).get_secret(path, key)
+        if not isinstance(value, str) or not value:
+            raise VaultError(
+                f"Vault secret {path!r} field {key!r} is empty or not a string"
+            )
+        values: dict[str, Any] = {"api_key": SecretStr(value)}
+        values.update(overrides)
+        logger.info(
+            f"LLMClientConfig.from_vault_secret: got the key from Vault secret "
+            f"{path!r} (field {key!r}) via AppRole "
+            f"(overrides={sorted(overrides) or None})"
         )
         return cls(**values)
 
@@ -877,10 +967,57 @@ class LLMClient:
         return resolved
 
     @staticmethod
+    def _resolve_provider_client(
+        provider_client: str | None, provider: str | None
+    ) -> str:
+        """
+        Which construction strategy to use: an explicit *provider_client* wins,
+        otherwise *provider* decides through
+        :data:`app_config.PROVIDER_CLIENT_BY_PROVIDER`.
+
+        With no provider to route on — a bare model id and no
+        ``model_provider`` — the OpenAI-compatible path applies, which is what
+        every deployment that never sets a provider has always got.
+
+        Raises
+        ------
+        LLMClientError
+            The provider is named but unknown. The reference raises
+            ``"UNKNOWN model provider."`` here for the same reason: guessing a
+            client for an unrecognised provider turns a one-line config typo
+            into a failure deep inside the gateway.
+        """
+        if provider_client and provider_client != app_config.PROVIDER_CLIENT_AUTO:
+            return provider_client
+        if not provider:
+            return app_config.PROVIDER_CLIENT_OPENAI_COMPATIBLE
+        key = provider.strip().lower()
+        resolved = app_config.PROVIDER_CLIENT_BY_PROVIDER.get(key)
+        if resolved is None:
+            known = "/".join(sorted(app_config.PROVIDER_CLIENT_BY_PROVIDER))
+            raise LLMClientError(
+                f"unknown model provider {provider!r}: it is not one of {known}, "
+                f"so there is no client to build for it. Name a known provider "
+                f"in llm_client.model_provider (or as a 'provider:model' prefix), "
+                f"or pin llm_client.provider_client to "
+                f"'{app_config.PROVIDER_CLIENT_OPENAI_COMPATIBLE}' or "
+                f"'{app_config.PROVIDER_CLIENT_NATIVE}' outright"
+            )
+        logger.info(
+            f"_resolve_provider_client: provider {key!r} -> {resolved!r} "
+            f"(llm_client.provider_client is "
+            f"{provider_client or app_config.PROVIDER_CLIENT_AUTO!r})"
+        )
+        return resolved
+
+    @staticmethod
     def _build_model(config: LLMClientConfig) -> Any:
         provider, model = _split_model(config.model)
         provider = config.model_provider or provider
-        if config.provider_client == app_config.PROVIDER_CLIENT_NATIVE:
+        strategy = LLMClient._resolve_provider_client(
+            config.provider_client, provider
+        )
+        if strategy == app_config.PROVIDER_CLIENT_NATIVE:
             return LLMClient._build_native_model(config, provider, model)
         cert_path = (
             LLMClient._apply_cert_file(config.cert_file)
@@ -1014,8 +1151,10 @@ class LLMClient:
                 f"_build_native_model: provider_client='native' cannot apply "
                 f"{', '.join(forfeited)} — they attach when a LangChain chat "
                 f"model is constructed, and this path builds none. Structured "
-                f"output is unavailable on it too. Drop provider_client to go "
-                f"back to the openai_compatible transport"
+                f"output is unavailable on it too. Set "
+                f"llm_client.provider_client='openai_compatible' to go back to "
+                f"the LangChain transport (this run reached the native one "
+                f"because provider {provider!r} routes here)"
             )
         if config.cert_file is not None:
             LLMClient._apply_cert_file(config.cert_file)

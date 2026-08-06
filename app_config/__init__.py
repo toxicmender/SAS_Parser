@@ -234,13 +234,34 @@ _LLM_CLIENT_TYPES: dict[str, type | tuple[type, ...]] = {
 # How the chat model is constructed. "openai_compatible" builds the
 # LangChain ChatOpenAI the whole client is written around; "native" wraps a
 # raw provider SDK client for a gateway that will not take the LangChain
-# payload. See llm_client.client for what the native path gives up.
+# payload. "auto" (the default) picks between them from the model's provider,
+# which is what the reference deployment does against this same gateway.
+# See llm_client.client for what the native path gives up.
+PROVIDER_CLIENT_AUTO = "auto"
 PROVIDER_CLIENT_OPENAI_COMPATIBLE = "openai_compatible"
 PROVIDER_CLIENT_NATIVE = "native"
 PROVIDER_CLIENTS: tuple[str, ...] = (
+    PROVIDER_CLIENT_AUTO,
     PROVIDER_CLIENT_OPENAI_COMPATIBLE,
     PROVIDER_CLIENT_NATIVE,
 )
+
+# Which client each model provider is reached through under "auto". The
+# reference's llm_client.ai_sas_converter does exactly this:
+#
+#     match model_provider.lower():
+#         case "openai" | "google": init_llm_model(...)    # ChatOpenAI
+#         case "anthropic":         init_claude_model(...) # raw openai SDK
+#         case _: raise RuntimeError("UNKNOWN model provider.")
+#
+# A provider absent from this table is an error rather than a guess: silently
+# choosing a client for an unknown provider is how a run fails deep in the
+# gateway instead of at construction.
+PROVIDER_CLIENT_BY_PROVIDER: dict[str, str] = {
+    "anthropic": PROVIDER_CLIENT_NATIVE,
+    "openai": PROVIDER_CLIENT_OPENAI_COMPATIBLE,
+    "google": PROVIDER_CLIENT_OPENAI_COMPATIBLE,
+}
 
 # llm_client keys that describe the *section* rather than one model, so a
 # per-role overlay may not carry them.
@@ -358,6 +379,28 @@ def role_value(role: str | None, key: str, default: Any = None) -> Any:
     label = f"llm_client.roles.{role}.{key}"
     value = _typed(value, _LLM_CLIENT_TYPES[key], label, base)
     return _validate_llm_value(key, value, base, label)
+
+
+# The one spelling of a timestamp that goes in a path. Basic ISO 8601 with the
+# separators stripped, because ':' is not a filename character on Windows and
+# is percent-encoded in a SharePoint URL. Exposed as well as applied, since
+# validation.pdf formats an existing datetime with it rather than taking now().
+UTC_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
+
+
+def utc_stamp() -> str:
+    """
+    A path-safe UTC timestamp, ``20260806T120000Z``.
+
+    Names a run's output folder in the document library and in the local
+    report tree. It lives here — beside the config every one of those callers
+    already reads — because the two CLIs must agree on it: a run folder whose
+    name is formatted differently by the tool that wrote it and the tool that
+    lists it is a folder nobody finds.
+    """
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime(UTC_STAMP_FORMAT)
 
 
 def clear_cache() -> None:

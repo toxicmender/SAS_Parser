@@ -321,10 +321,10 @@ rows, and the run's token totals. Both CLIs write it to a file on request:
 
 ```bash
 python -m validation validation/cases --md report.md
-python demo_run.py local path/to/sas_dir --md report.md
+python main.py path/to/sas_dir --md report.md
 ```
 
-`demo_run.py sharepoint` always uploads it as
+A SharePoint-driven `main.py` run always uploads it as
 `<application_name>/output/<timestamp>/validation/report.md`.
 
 ## PDF report (and SharePoint)
@@ -394,7 +394,7 @@ publish_report_pdf(report, "Reports/Validation")               # SharePoint
 ```
 
 `report_from_verdicts` is the same builder over a raw list of verdict dicts —
-e.g. the `out["validation"]` values a `run_*` call returns. `demo_run.py` uses
+e.g. the `out["validation"]` values a `run_*` call returns. `conversion.run` uses
 exactly this: `--pdf` writes the inline report locally in `local` mode, and
 `sharepoint` mode uploads it as `.../validation/report.pdf` beside the JSON.
 
@@ -422,7 +422,7 @@ nothing, and the field stays `None` rather than claiming zero.
 
 Inline runs (`report_from_verdicts`) take `token_usage=pipeline.token_usage`
 explicitly: verdicts are per item, usage is per run, so it cannot be recovered
-from the verdicts. `demo_run.py` passes it, and also writes it into
+from the verdicts. `conversion.run` passes it, and also writes it into
 `.../validation/summary.json`.
 
 Each item is scored the instant its response returns, through the same
