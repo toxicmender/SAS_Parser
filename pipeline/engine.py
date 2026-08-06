@@ -50,6 +50,7 @@ from chunker.chunker import SasSemanticChunker
 from chunker.models import (
     SasBatch,
     SasBatchResult,
+    SasChunkResult,
     SasCorpus,
     SasDiagnostic,
 )
@@ -822,7 +823,56 @@ class SasLLMPipeline:
         ``resume`` behaves as in :meth:`run_file`.
         """
         logger.info(f"run_files: {len(paths)} file(s)  resume={resume}")
-        file_results = [self.chunker.chunk_file(p) for p in paths]
+        return self._run_corpus(
+            [self.chunker.chunk_file(p) for p in paths],
+            thread_id=thread_id,
+            resume=resume,
+        )
+
+    def run_texts(
+        self,
+        sources: list[tuple[str, str]],
+        *,
+        thread_id: str | None = None,
+        resume: bool = False,
+    ) -> list[dict[str, Any]]:
+        """
+        :meth:`run_files` for a corpus that is already in memory: *sources* is
+        a list of ``(source_id, text)`` pairs.
+
+        The same corpus-wide batching, on one shared thread — this differs from
+        :meth:`run_files` only in where the text came from. It exists because a
+        remotely hosted corpus has no local paths: ``conversion.sources`` hands
+        back a drive-relative path and the file's text, and that path is the
+        *source id* the reports, notebooks and run facts are named by. Staging
+        the corpus to a temporary directory just to have paths to pass would
+        name every source after a directory that no longer exists.
+
+        ``resume`` behaves as in :meth:`run_file`.
+        """
+        logger.info(f"run_texts: {len(sources)} source(s)  resume={resume}")
+        return self._run_corpus(
+            [
+                self.chunker.chunk_text(text, source_id=source_id)
+                for source_id, text in sources
+            ],
+            thread_id=thread_id,
+            resume=resume,
+        )
+
+    def _run_corpus(
+        self,
+        file_results: list[SasChunkResult],
+        *,
+        thread_id: str | None,
+        resume: bool,
+    ) -> list[dict[str, Any]]:
+        """Batch an already-chunked corpus and run every item on one thread.
+
+        The shared tail of :meth:`run_files` and :meth:`run_texts`: the two
+        differ only in how they produced *file_results*, and cross-file edge
+        resolution must not be able to drift between them.
+        """
         corpus = SasCorpus(file_results=file_results)
         multi_result = self.multi_batcher.batch(corpus)
         tid = thread_id or self._default_thread_id(corpus.source_ids)

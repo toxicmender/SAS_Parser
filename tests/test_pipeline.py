@@ -1034,3 +1034,78 @@ def test_structured_document_renders_with_the_target_fence():
     # validation suite reads exactly this text.
     assert "```sql" in outputs[0]["response"]
     assert "```python" not in outputs[0]["response"]
+
+
+# ---------------------------------------------------------------------------
+# run_texts — the in-memory corpus seam
+#
+# A SharePoint-hosted corpus has no local paths: the drive-relative path IS the
+# source id. run_files and run_texts must therefore differ only in where the
+# text came from, which is what _run_corpus exists to guarantee.
+# ---------------------------------------------------------------------------
+
+
+_ETL = "data work.clean;\n set raw.orders;\nrun;\n"
+_LOAD = "proc means data=work.clean;\nrun;\n"
+
+
+def _text_pipeline(responses=None):
+    return SasLLMPipeline(
+        llm_config=LLMClientConfig(model="unused"),
+        memory_setup=MemorySetup(memory=MemoryHub()),
+        llm=FakeListChatModel(responses=responses or [f"r{i}" for i in range(10)]),
+    )
+
+
+def test_run_texts_names_sources_by_their_given_id():
+    pipeline = _text_pipeline()
+
+    outputs = pipeline.run_texts(
+        [("Kit/MyApp/scripts_original/etl.sas", _ETL)],
+        thread_id="req-42",
+    )
+
+    assert outputs
+    named = {f for out in outputs for f in out["source_files"]}
+    # The library path, not a basename and not a temp path.
+    assert named == {"Kit/MyApp/scripts_original/etl.sas"}
+
+
+def test_run_texts_resolves_cross_file_dependencies():
+    # work.clean is produced by etl and consumed by load, so the two must land
+    # in one batch — the whole reason a corpus is run together.
+    pipeline = _text_pipeline()
+
+    outputs = pipeline.run_texts([("etl.sas", _ETL), ("load.sas", _LOAD)])
+
+    spanning = [out for out in outputs if len(out["source_files"]) > 1]
+    assert spanning, f"expected a cross-file batch, got {[o['source_files'] for o in outputs]}"
+    assert set(spanning[0]["source_files"]) == {"etl.sas", "load.sas"}
+
+
+def test_run_texts_matches_run_files_for_the_same_corpus(tmp_path):
+    (tmp_path / "etl.sas").write_text(_ETL, encoding="utf-8")
+    (tmp_path / "load.sas").write_text(_LOAD, encoding="utf-8")
+    paths = [str(tmp_path / "etl.sas"), str(tmp_path / "load.sas")]
+
+    from_files = _text_pipeline().run_files(paths)
+    from_texts = _text_pipeline().run_texts([(p, pathlib.Path(p).read_text()) for p in paths])
+
+    # Same items, same batching, same order — only the source of the text
+    # differs, and _run_corpus is what keeps it that way.
+    assert [o["item_id"] for o in from_texts] == [o["item_id"] for o in from_files]
+    assert [o["source_files"] for o in from_texts] == [
+        o["source_files"] for o in from_files
+    ]
+
+
+def test_run_texts_uses_one_thread_for_the_whole_corpus():
+    pipeline = _text_pipeline()
+
+    pipeline.run_texts([("etl.sas", _ETL), ("load.sas", _LOAD)], thread_id="req-7")
+
+    assert pipeline.get_thread_messages("req-7")
+
+
+def test_run_texts_with_no_sources_does_nothing():
+    assert _text_pipeline().run_texts([]) == []
