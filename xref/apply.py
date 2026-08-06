@@ -6,6 +6,24 @@
     substitution lands on known dataset names — in chunk metadata and in the
     ``%let`` values that carry one in source text — rather than on whatever a
     pattern match takes for a table.
+
+    **"pre" has a second half, and it runs earlier.** Physical paths —
+    ``LIBNAME`` / ``INFILE`` / ``%INCLUDE`` targets — are not dataset names,
+    and :func:`chunker.batcher._map_ds` deliberately skips quoted literals, so
+    nothing here reaches them. :func:`xref.pre.rewrite_source_text` does,
+    over the **raw text before chunking**. A caller applying "pre" in full
+    therefore does both:
+
+    .. code-block:: python
+
+        text, _ = xref.pre.rewrite_source_text(text, mappings)   # paths, pre-chunk
+        pipeline = SasLLMPipeline(databricks_mapping=mappings.dataset_mapping)
+
+    The second line is how :func:`apply_pre` reaches a real run: both batchers
+    take ``databricks_mapping`` and apply it as a post-pass after grouping, so
+    a pipeline constructed with it has already had this function's effect.
+    :func:`apply_pre` is for a caller holding a :class:`SasBatchResult`
+    directly.
 ``"post"``
     :mod:`xref.rewrite` over the generated code. Catches a table the SAS-side
     extraction never saw, at the cost of having to parse model output.

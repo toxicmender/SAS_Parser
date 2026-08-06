@@ -20,7 +20,7 @@ import pytest
 
 import app_config
 from app_config.sharepoint import SharePointConfig, SharePointError
-from xref import apply as xref_apply, rewrite, sourcing
+from xref import apply as xref_apply, pre, rewrite, sourcing
 
 requires_sqlglot = pytest.mark.skipif(
     importlib.util.find_spec("sqlglot") is None,
@@ -465,3 +465,124 @@ def test_chunker_stays_network_free():
     assert not hasattr(batcher, "load_databricks_mapping_sharepoint")
     source = pathlib.Path(batcher.__file__).read_text(encoding="utf-8")
     assert "app_config.sharepoint" not in source
+
+
+# ---------------------------------------------------------------------------
+# xref.pre — physical paths in LIBNAME / INFILE / %INCLUDE
+#
+# The half of "pre" that replace_dataset_names cannot reach: _map_ds
+# early-returns on quoted paths, so nothing else rewrites them.
+# ---------------------------------------------------------------------------
+
+
+def _paths(**by_path) -> sourcing.XrefMappings:
+    return sourcing.XrefMappings(by_path=dict(by_path))
+
+
+def test_pre_is_a_no_op_without_path_mappings():
+    src = "libname raw '/data/in';\n"
+    out, stats = pre.rewrite_source_text(src, sourcing.XrefMappings())
+
+    assert out == src
+    assert not stats
+    assert stats.changed is False
+
+
+def test_pre_rewrites_a_libname_path():
+    src = "libname raw '/data/in';\ndata x; set raw.a; run;\n"
+    out, stats = pre.rewrite_source_text(src, _paths(**{"/data/in": "/mnt/bronze"}))
+
+    assert "libname raw '/mnt/bronze';" in out
+    assert stats.rewritten == {"/data/in": "/mnt/bronze"}
+    # Only the path moved; the libref and everything using it are untouched.
+    assert "set raw.a;" in out
+
+
+def test_pre_rewrites_libname_with_an_engine_and_double_quotes():
+    src = 'libname raw meta "/data/in";\n'
+    out, _ = pre.rewrite_source_text(src, _paths(**{"/data/in": "/mnt/bronze"}))
+
+    assert out == 'libname raw meta "/mnt/bronze";\n'
+
+
+def test_pre_rewrites_infile_file_and_include():
+    src = (
+        "%include '/code/common.sas';\n"
+        "data x; infile '/data/in/c.csv'; run;\n"
+        "data _null_; file '/data/out/r.txt'; run;\n"
+    )
+    out, stats = pre.rewrite_source_text(
+        src,
+        _paths(
+            **{
+                "/code/common.sas": "/repo/common.sas",
+                "/data/in/c.csv": "/mnt/bronze/c.csv",
+                "/data/out/r.txt": "/mnt/silver/r.txt",
+            }
+        ),
+    )
+
+    assert "'/repo/common.sas'" in out
+    assert "'/mnt/bronze/c.csv'" in out
+    assert "'/mnt/silver/r.txt'" in out
+    assert len(stats.rewritten) == 3
+
+
+def test_pre_applies_the_longest_matching_key_first():
+    # The reference sorts keys longest-first to avoid partial overlaps; the
+    # specific mapping must win over the prefix one.
+    src = "libname a '/data/in/sub';\nlibname b '/data/in';\n"
+    out, _ = pre.rewrite_source_text(
+        src, _paths(**{"/data/in": "/mnt/bronze", "/data/in/sub": "/mnt/gold"})
+    )
+
+    assert "libname a '/mnt/gold';" in out
+    assert "libname b '/mnt/bronze';" in out
+
+
+def test_pre_treats_a_key_as_a_directory_prefix():
+    src = "infile '/data/in/2026/c.csv';\n"
+    out, stats = pre.rewrite_source_text(src, _paths(**{"/data/in": "/mnt/bronze"}))
+
+    assert "'/mnt/bronze/2026/c.csv'" in out
+    assert stats.rewritten == {"/data/in/2026/c.csv": "/mnt/bronze/2026/c.csv"}
+
+
+def test_pre_prefix_match_stops_at_a_separator():
+    # /data/in must not match /data/inbound.
+    src = "infile '/data/inbound/c.csv';\n"
+    out, stats = pre.rewrite_source_text(src, _paths(**{"/data/in": "/mnt/bronze"}))
+
+    assert out == "infile '/data/inbound/c.csv';\n"
+    assert not stats.rewritten
+
+
+def test_pre_reports_unresolved_macro_paths_instead_of_guessing(caplog):
+    src = "libname raw \"&root/in\";\n"
+    with caplog.at_level("WARNING"):
+        out, stats = pre.rewrite_source_text(
+            src, _paths(**{"/data/in": "/mnt/bronze"}), source_id="etl.sas"
+        )
+
+    assert out == src  # left exactly as written
+    assert stats.unresolved == ["&root/in"]
+    assert not stats.rewritten
+    assert "unresolved macro reference" in caplog.text
+
+
+def test_pre_leaves_an_unmapped_path_alone():
+    src = "libname raw '/somewhere/else';\n"
+    out, stats = pre.rewrite_source_text(src, _paths(**{"/data/in": "/mnt/bronze"}))
+
+    assert out == src
+    assert not stats.rewritten
+
+
+def test_pre_does_not_touch_a_path_outside_a_path_statement():
+    # Matching by statement, not by blind sweep: a bare string that happens to
+    # look like a mapped path is not a path reference.
+    src = "%let note = '/data/in is the old location';\n"
+    out, stats = pre.rewrite_source_text(src, _paths(**{"/data/in": "/mnt/bronze"}))
+
+    assert out == src
+    assert not stats.rewritten
