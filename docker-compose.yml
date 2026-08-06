@@ -11,7 +11,7 @@
 #   app          the repo, with every extra installed, driving both
 #
 #   docker compose up -d --build
-#   docker compose exec app python demo_run.py local sas_scripts --out-dir out
+#   docker compose exec app python main.py sas_scripts --out-dir out
 #
 # Full walkthrough, and what changes for a real Vault / a real Databricks
 # workspace: docker/README.md.

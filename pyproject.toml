@@ -24,6 +24,11 @@ dependencies = [
     "tiktoken>=0.7",
 ]
 
+[project.scripts]
+# main.py is the entry point: SharePoint-driven by default, local with a
+# positional source directory.
+sas-parser = "main:main"
+
 [project.optional-dependencies]
 # Delta memory backend + validation tracking (Spark/JVM). The default
 # in-memory mode must import and run without pyspark (Architecture.md
@@ -87,6 +92,12 @@ include = [
     "target_language*",
 ]
 
+[tool.setuptools]
+# main.py is a top-level *module*, not a package, so packages.find below never
+# picks it up — and without it the `sas-parser` console script has nothing to
+# import.
+py-modules = ["main"]
+
 [tool.setuptools.package-data]
 # complexity/profiles/*.json IS the rule catalogue — the package scores nothing
 # without it, so the JSON must ship inside the wheel alongside the code.
@@ -137,7 +148,6 @@ include = [
     "target_language",
     "validation",
     "main.py",
-    "demo_run.py",
 ]
 exclude = ["**/build/**", "**/.venv/**", "**/__pycache__/**"]
 # Resolve the same interpreter and installed packages CI uses (uv's .venv),
