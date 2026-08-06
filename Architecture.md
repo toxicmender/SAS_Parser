@@ -282,6 +282,16 @@ app_config/
                         to conversion/, xref/, and complexity/sharepoint.py.
                         msgraph-sdk imported lazily (extra: sharepoint).
 
+reporting/
+  pdf.py                Markdown -> PDF: markdown-it parses, PyMuPDF's Story
+                        lays out. ONE implementation for both report surfaces
+                        -- complexity renders to a file beside the Markdown,
+                        validation to bytes for upload, and they share the
+                        stylesheet, the code folding (Story CLIPS a wide <pre>
+                        line rather than wrapping it), the image archive, and
+                        the paging-loop cap. A leaf: imports nothing from this
+                        repo.
+
 conversion/
   paths.py              The folder conventions one application's scripts live
                         under: scripts_original, scripts_converted,

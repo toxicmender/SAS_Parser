@@ -67,6 +67,8 @@
     "prompt_builder/pdf_reader.py": 0,
     "prompt_builder/selector.py": 0,
     "prompt_builder/user_instructions.py": 0,
+    "reporting/__init__.py": 0,
+    "reporting/pdf.py": 0,
     "target_language/__init__.py": 0,
     "validation/__init__.py": 0,
     "validation/__main__.py": 0,

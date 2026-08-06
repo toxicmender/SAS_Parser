@@ -90,6 +90,8 @@ include = [
     "conversion*",
     "xref*",
     "target_language*",
+    # Markdown -> PDF for both report surfaces. A leaf, like target_language.
+    "reporting*",
 ]
 
 [tool.setuptools]
@@ -117,6 +119,7 @@ source = [
     "complexity",
     "conversion",
     "xref",
+    "reporting",
     "target_language",
 ]
 
@@ -141,6 +144,7 @@ include = [
     "complexity",
     "conversion",
     "xref",
+    "reporting",
     "pipeline",
     "memory",
     "llm_client",

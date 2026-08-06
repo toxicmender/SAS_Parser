@@ -249,3 +249,61 @@ def test_report_from_thread_reads_stored_verdicts():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# What sharing reporting.pdf gives this report
+#
+# It used to carry its own copy of the markdown-it -> PyMuPDF loop, with no
+# code folding and no cap on the paging loop. Both are now the shared
+# implementation's, so both are asserted here rather than only on the
+# complexity side.
+# ---------------------------------------------------------------------------
+
+
+def test_a_long_code_line_is_folded_rather_than_clipped():
+    # Story clips a wide <pre> line at the frame edge instead of wrapping it,
+    # so a 400-column SAS statement would lose its tail off the page.
+    statement = "proc sql; create table x as select " + ", ".join(
+        f"col_{i}" for i in range(60)
+    ) + " from y; quit;"
+    markdown = f"# Report\n\n```sas\n{statement}\n```\n"
+
+    pdf = report_to_pdf(markdown)
+
+    with pymupdf.open(stream=pdf, filetype="pdf") as doc:
+        text = "".join(page.get_text() for page in doc)
+    # The tail survived, which it only can if the line was folded.
+    assert "col_59" in text
+
+
+def test_the_paging_loop_is_capped():
+    from reporting import pdf as reporting_pdf
+
+    # A report that would page forever must produce a truncated PDF with a
+    # warning, not fill a disk.
+    assert reporting_pdf._MAX_PAGES > 0
+    huge = "# Report\n\n" + "\n\n".join(f"Paragraph {i}." for i in range(4000))
+
+    pdf = report_to_pdf(huge)
+
+    with pymupdf.open(stream=pdf, filetype="pdf") as doc:
+        assert 0 < doc.page_count <= reporting_pdf._MAX_PAGES
+
+
+def test_extra_css_is_appended_after_the_shared_stylesheet():
+    # Later rules win, so a caller can still restyle the page.
+    plain = report_to_pdf(_report())
+    styled = report_to_pdf(_report(), css="body { font-size: 20px; }")
+
+    assert plain[:5] == b"%PDF-" and styled[:5] == b"%PDF-"
+    assert plain != styled
+
+
+def test_complexity_and_validation_render_through_one_implementation():
+    import complexity.pdf as complexity_pdf
+    import reporting.pdf as reporting_pdf
+
+    # Not two copies that happen to agree today.
+    assert complexity_pdf.render_pdf is reporting_pdf.render_pdf
+    assert complexity_pdf.STYLESHEET is reporting_pdf.STYLESHEET
