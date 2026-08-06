@@ -37,9 +37,9 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Any, Callable
 
+import app_config
 from app_config.sharepoint import SharePointConfig, SharePointError
 
 from .paths import validation as validation_folder
@@ -61,9 +61,10 @@ REPORT_NAME = "report.md"
 REPORT_PDF_NAME = "report.pdf"
 
 
-def utc_stamp() -> str:
-    """A path-safe UTC stamp naming one run's output folder."""
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+# Re-exported so `conversion.run.utc_stamp` keeps working; the one
+# implementation is app_config's, because the complexity CLI names its run
+# folders with the same stamp and the two must not drift.
+utc_stamp = app_config.utc_stamp
 
 
 @dataclass

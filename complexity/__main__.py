@@ -75,6 +75,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import app_config
 from chunker import MultiFileBatcher, SasCorpus, SasSemanticChunker
 
 from .analyzer import ComplexityAnalyzer
@@ -381,9 +382,9 @@ def _load_sharepoint_sources(
     is what the per-file reports are named after (via ``source_stems``) and
     what a reader needs to find the script again.
     """
-    from . import sharepoint as sp
+    from conversion.sources import load, source_files
 
-    paths = sp.source_files(application, client=client)
+    paths = source_files(application, client=client)
     if not paths:
         logger.error(f"no source files under the {application!r} scripts folder")
         return None
@@ -394,7 +395,7 @@ def _load_sharepoint_sources(
     failures: list[str] = []
     for path in paths:
         try:
-            results.append(chunker.chunk_text(sp.load(path, client=client), source_id=path))
+            results.append(chunker.chunk_text(load(path, client=client), source_id=path))
         except Exception as exc:
             logger.error(f"could not chunk {path}: {exc}")
             failures.append(path)
@@ -551,10 +552,12 @@ def _run_local(args: argparse.Namespace) -> int:
 
 
 def _timestamp() -> str:
-    """A path-safe UTC stamp naming one run's upload folder."""
-    from datetime import datetime, timezone
+    """A path-safe UTC stamp naming one run's upload folder.
 
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ``app_config``'s, not a local one: a conversion run names its folders with
+    the same stamp, and two spellings of it is two folder layouts.
+    """
+    return app_config.utc_stamp()
 
 
 def _segment(value: str) -> str:

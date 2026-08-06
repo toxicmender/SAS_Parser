@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 
-from app_config.sharepoint import SharePointConfig
+from app_config.sharepoint import SharePointConfig, resolve_config
 
 logger = logging.getLogger(__name__)
 
@@ -30,29 +30,25 @@ CONVERTED_FOLDER = "scripts_converted"
 VALIDATION_FOLDER = "validation"
 
 
-def _config(config: SharePointConfig | None) -> SharePointConfig:
-    return config if config is not None else SharePointConfig.from_env()
-
-
 def original_scripts(
     application: str, *, config: SharePointConfig | None = None
 ) -> str:
     """The folder holding *application*'s untranslated SAS sources."""
-    return _config(config).drive_path(application, ORIGINAL_FOLDER)
+    return resolve_config(config).drive_path(application, ORIGINAL_FOLDER)
 
 
 def converted_scripts(
     application: str, *, config: SharePointConfig | None = None
 ) -> str:
     """The root of *application*'s converted output."""
-    return _config(config).drive_path(application, CONVERTED_FOLDER)
+    return resolve_config(config).drive_path(application, CONVERTED_FOLDER)
 
 
 def validation(application: str, *, config: SharePointConfig | None = None) -> str:
     """Where *application*'s validation artefacts go — beside the converted
     scripts, not inside a run folder, so a reviewer finds the latest verdicts
     in one place."""
-    return _config(config).drive_path(
+    return resolve_config(config).drive_path(
         application, CONVERTED_FOLDER, VALIDATION_FOLDER
     )
 
@@ -72,6 +68,6 @@ def upload_target(
     the model because two models translate the same source differently, and
     the timestamp because a re-run must never overwrite what came before.
     """
-    return _config(config).drive_path(
+    return resolve_config(config).drive_path(
         application, CONVERTED_FOLDER, model, timestamp
     )

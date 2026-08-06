@@ -25,6 +25,13 @@ because it depends on :class:`~complexity.models.CorpusComplexityReport` and
 nothing depends on it. ``conversion`` and ``xref`` are top-level because the
 pipeline consumes both.
 
+**Sourcing the scripts is not here.** It is the same folder and the same
+extension set a conversion run reads, so callers use
+:func:`conversion.sources.source_files` and :func:`conversion.sources.load`
+directly. This module used to re-export both, which only hid the dependency:
+the import graph said ``complexity -> conversion`` either way, and a wrapper
+that adds nothing is a place for the two to drift apart.
+
 Logger name: ``complexity.sharepoint``.
 """
 
@@ -35,7 +42,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from app_config.sharepoint import SharePointConfig, SharePointError
+from app_config.sharepoint import (
+    SharePointConfig,
+    SharePointError,
+    field_text,
+    project_rows,
+    resolve_client,
+    resolve_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,14 +88,6 @@ class ComplexityRequest:
     preferred_llm: str | None = None
 
 
-def _text(fields: dict[str, Any], column: str) -> str | None:
-    value = fields.get(column)
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
 def format_complexity_item_params(item: dict[str, Any]) -> ComplexityRequest:
     """
     One raw list item (``{id, web_url, fields}``) as a
@@ -94,7 +100,7 @@ def format_complexity_item_params(item: dict[str, Any]) -> ComplexityRequest:
         proceed without.
     """
     fields = item.get("fields") or {}
-    application = _text(fields, COMPLEXITY_FIELDS["application"])
+    application = field_text(fields, COMPLEXITY_FIELDS["application"])
     if not application:
         raise SharePointError(
             f"complexity row {item.get('id')!r} has no "
@@ -104,21 +110,9 @@ def format_complexity_item_params(item: dict[str, Any]) -> ComplexityRequest:
     return ComplexityRequest(
         item_id=str(item.get("id") or ""),
         application=application,
-        output_language=_text(fields, COMPLEXITY_FIELDS["output_language"]),
-        preferred_llm=_text(fields, COMPLEXITY_FIELDS["preferred_llm"]),
+        output_language=field_text(fields, COMPLEXITY_FIELDS["output_language"]),
+        preferred_llm=field_text(fields, COMPLEXITY_FIELDS["preferred_llm"]),
     )
-
-
-def _client(client: Any | None) -> Any:
-    if client is not None:
-        return client
-    from app_config.sharepoint import get_sharepoint_client
-
-    return get_sharepoint_client()
-
-
-def _config(config: SharePointConfig | None) -> SharePointConfig:
-    return config if config is not None else SharePointConfig.from_env()
 
 
 def requests(
@@ -139,14 +133,9 @@ def requests(
     SharePointError
         The complexity list is not configured, or the read failed.
     """
-    resolved = _config(config)
-    rows = _client(client).list_items(resolved.list_id("complexity"))
-    out: list[ComplexityRequest] = []
-    for row in rows:
-        try:
-            out.append(format_complexity_item_params(row))
-        except SharePointError as exc:
-            logger.warning(f"requests: skipping a malformed row: {exc}")
+    resolved = resolve_config(config)
+    rows = resolve_client(client).list_items(resolved.list_id("complexity"))
+    out = project_rows(rows, format_complexity_item_params, label="requests")
     if application is not None:
         wanted = application.strip().casefold()
         out = [row for row in out if row.application.casefold() == wanted]
@@ -169,31 +158,9 @@ def request(
         The list is not configured, the row is absent, or it names no
         application.
     """
-    resolved = _config(config)
-    row = _client(client).get_list_item(resolved.list_id("complexity"), item_id)
+    resolved = resolve_config(config)
+    row = resolve_client(client).get_list_item(resolved.list_id("complexity"), item_id)
     return format_complexity_item_params(row)
-
-
-def source_files(
-    application: str,
-    file_type: str = "sas",
-    *,
-    client: Any | None = None,
-    config: SharePointConfig | None = None,
-) -> list[str]:
-    """The application's source scripts — shared with :mod:`conversion.sources`
-    rather than reimplemented, because it is the same folder and the same
-    extension set."""
-    from conversion.sources import source_files as _source_files
-
-    return _source_files(application, file_type, client=client, config=config)
-
-
-def load(path: str, *, client: Any | None = None) -> str:
-    """One source file's text — shared with :func:`conversion.sources.load`."""
-    from conversion.sources import load as _load
-
-    return _load(path, client=client)
 
 
 def report_folder(
@@ -212,7 +179,7 @@ def report_folder(
     conversion's ``{model}/{timestamp}`` while still meaning something for an
     entirely offline run, where there is no model to name.
     """
-    return _config(config).drive_path(
+    return resolve_config(config).drive_path(
         application, COMPLEXITY_FOLDER, label, timestamp
     )
 
@@ -245,7 +212,7 @@ def upload_reports(
         A folder could not be created, or an upload failed.
     """
     folder = report_folder(application, label, timestamp, config=config)
-    transport = _client(client)
+    transport = resolve_client(client)
     transport.create_folder(folder)
     root = Path(staging_root) if staging_root is not None else None
 

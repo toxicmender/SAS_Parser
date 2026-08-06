@@ -584,7 +584,7 @@ def test_create_directory_rejects_root():
 
 
 # ---------------------------------------------------------------------------
-# read_list_items (PowerApps)
+# list_items
 # ---------------------------------------------------------------------------
 
 
@@ -608,7 +608,7 @@ class _ListItem:
 
 
 @requires_msgraph
-def test_read_list_items_flattens_fields():
+def test_list_items_flattens_fields():
     pages = [
         _Collection(
             [
@@ -618,7 +618,7 @@ def test_read_list_items_flattens_fields():
         )
     ]
     client, fake, _ = _site_client(pages=pages)
-    rows = client.read_list_items("Tasks")
+    rows = client.list_items("Tasks")
     assert rows == [
         {"id": "1", "web_url": "u/1", "fields": {"Title": "Task A", "Status": "Open"}},
         {"id": "2", "web_url": "u/2", "fields": {"Title": "Task B", "Status": "Done"}},
@@ -628,29 +628,29 @@ def test_read_list_items_flattens_fields():
 
 
 @requires_msgraph
-def test_read_list_items_expands_fields_by_default():
+def test_list_items_expands_fields_by_default():
     client, _, items_builder = _site_client()
-    client.read_list_items("Tasks")
+    client.list_items("Tasks")
     (config,) = items_builder.configs
     assert config.query_parameters.expand == ["fields"]
 
 
 @requires_msgraph
-def test_read_list_items_follows_paging():
+def test_list_items_follows_paging():
     pages = [
         _Collection([_ListItem("1", {"Title": "A"})], next_link="https://next"),
         _Collection([_ListItem("2", {"Title": "B"})]),
     ]
     client, _, _ = _site_client(pages=pages)
-    rows = client.read_list_items("Tasks")
+    rows = client.list_items("Tasks")
     assert [r["id"] for r in rows] == ["1", "2"]
 
 
-def test_read_list_items_without_site_raises():
+def test_list_items_without_site_raises():
     cfg = sharepoint.SharePointConfig(drive_id="DRV")  # a drive, but no site
     client = sharepoint.SharePointClient(cfg, client=_FakeGraphClient())
     with pytest.raises(sharepoint.SharePointError, match="no SharePoint site"):
-        client.read_list_items("Tasks")
+        client.list_items("Tasks")
 
 
 # ---------------------------------------------------------------------------
@@ -1134,11 +1134,18 @@ def _list_client(items):
 
 
 @requires_msgraph
-def test_list_items_is_read_list_items():
+def test_list_items_reads_a_list_by_id():
     client, _ = _list_client({1: {"Title": "one"}, 2: {"Title": "two"}})
     rows = client.list_items("L-xref")
 
     assert [row["fields"]["Title"] for row in rows] == ["one", "two"]
+
+
+def test_there_is_only_one_list_read_method():
+    """`read_list_items` was a second name for this, with no callers left."""
+    from app_config.sharepoint import SharePointClient
+
+    assert not hasattr(SharePointClient, "read_list_items")
 
 
 def test_get_list_item_returns_one_row():
@@ -1172,3 +1179,117 @@ def test_update_list_item_refuses_an_empty_write():
     client, _ = _list_client({7: {"Status": "New"}})
     with pytest.raises(sharepoint.SharePointError, match="no fields to write"):
         client.update_list_item("L-req", 7, {})
+
+
+# ---------------------------------------------------------------------------
+# Resolution helpers for the domain layers
+#
+# These were a `_client` in five modules, a `_config` in four, and a `_text` in
+# three across conversion/, xref/ and complexity/. Transport-level and
+# domain-free, so sharing them adds no coupling in either direction.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_client_prefers_an_injected_one(monkeypatch):
+    import app_config.sharepoint as sp_mod
+
+    sentinel = object()
+    monkeypatch.setattr(
+        sp_mod, "get_sharepoint_client", lambda: pytest.fail("must not build one")
+    )
+
+    assert sp_mod.resolve_client(sentinel) is sentinel
+
+
+def test_resolve_client_falls_back_to_the_shared_one(monkeypatch):
+    import app_config.sharepoint as sp_mod
+
+    shared = object()
+    monkeypatch.setattr(sp_mod, "get_sharepoint_client", lambda: shared)
+
+    assert sp_mod.resolve_client(None) is shared
+    assert sp_mod.resolve_client() is shared
+
+
+def test_resolve_config_prefers_an_injected_one():
+    from app_config.sharepoint import SharePointConfig, resolve_config
+
+    explicit = SharePointConfig(site_id="SITE")
+
+    assert resolve_config(explicit) is explicit
+    assert isinstance(resolve_config(None), SharePointConfig)
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("MyApp", "MyApp"),
+        ("  MyApp  ", "MyApp"),
+        # Blank IS absent: SharePoint returns "" for a column never filled in,
+        # and a caller checking `if value:` and one checking `is not None`
+        # must not disagree about the same row.
+        ("", None),
+        ("   ", None),
+        (None, None),
+        (7, "7"),
+    ],
+)
+def test_field_text_normalises_a_column_value(raw, expected):
+    from app_config.sharepoint import field_text
+
+    assert field_text({"Application": raw}, "Application") == expected
+
+
+def test_field_text_treats_a_missing_column_as_absent():
+    from app_config.sharepoint import field_text
+
+    assert field_text({}, "Application") is None
+
+
+def test_upload_into_creates_the_folder_then_uploads():
+    from app_config.sharepoint import upload_into
+
+    calls: list[tuple] = []
+
+    class _T:
+        def create_folder(self, path):
+            calls.append(("create", path))
+
+        def upload_file(self, folder, name, content):
+            calls.append(("upload", folder, name, content))
+
+    path = upload_into(_T(), "Kit/MyApp", "etl.ipynb", "{}")
+
+    # Order matters: Graph's simple upload does not create missing parents.
+    assert calls == [
+        ("create", "Kit/MyApp"),
+        ("upload", "Kit/MyApp", "etl.ipynb", "{}"),
+    ]
+    assert path == "Kit/MyApp/etl.ipynb"
+
+
+def test_project_rows_skips_a_malformed_row_without_losing_the_rest(caplog):
+    from app_config.sharepoint import SharePointError, project_rows
+
+    def _formatter(row):
+        if not row.get("ok"):
+            raise SharePointError("no application name")
+        return row["ok"]
+
+    with caplog.at_level("WARNING"):
+        out = project_rows(
+            [{"ok": "a"}, {}, {"ok": "b"}], _formatter, label="requests"
+        )
+
+    assert out == ["a", "b"]
+    assert "skipping a malformed row" in caplog.text
+
+
+def test_project_rows_lets_an_unexpected_error_through():
+    from app_config.sharepoint import project_rows
+
+    def _formatter(row):
+        raise KeyError("a programming error, not a bad row")
+
+    with pytest.raises(KeyError):
+        project_rows([{}], _formatter, label="requests")

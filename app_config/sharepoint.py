@@ -71,7 +71,7 @@ Typical use
     body = sp.read_file("Reports/summary.csv")
     sp.write_file("Reports/notes.txt", "hello")
     sp.create_directory("Reports/2024")
-    rows = sp.read_list_items("Tasks")          # for a PowerApps grid
+    rows = sp.list_items("Tasks")               # every row, fields expanded
 
 Call :func:`clear_cache` to drop the shared client after the environment
 changes (tests do).
@@ -952,7 +952,7 @@ class SharePointClient:
         )
         return await self._item(parent).children.post(body)
 
-    def read_list_items(
+    def list_items(
         self,
         list_name: str,
         *,
@@ -964,8 +964,10 @@ class SharePointClient:
         """
         Read items from the SharePoint list *list_name* (its id or display
         name), each flattened to ``{id, web_url, fields}`` by
-        :func:`_list_item_to_dict` — the shape a PowerApps grid or gallery
-        binds to. Paged results are followed and concatenated.
+        :func:`_list_item_to_dict`. Paged results are followed and
+        concatenated.
+
+        This is the name the domain layers and the reference system both use.
 
         Parameters
         ----------
@@ -1031,15 +1033,10 @@ class SharePointClient:
 
     # -- list items ---------------------------------------------------------
 
-    def list_items(self, list_id: str, **options: Any) -> list[dict[str, Any]]:
-        """Every item in the list, as :meth:`read_list_items` returns them —
-        the name the domain layers and the reference both use."""
-        return self.read_list_items(list_id, **options)
-
     def get_list_item(self, list_id: str, item_id: str | int) -> dict[str, Any]:
         """
         One item from *list_id* by its ``ID``, flattened to
-        ``{id, web_url, fields}`` like :meth:`read_list_items`.
+        ``{id, web_url, fields}`` like :meth:`list_items`.
 
         Raises
         ------
@@ -1140,3 +1137,86 @@ def clear_cache() -> None:
     if _client_cache is not None:
         _client_cache.close()
     _client_cache = None
+
+
+# ---------------------------------------------------------------------------
+# Resolution helpers for the domain layers
+#
+# Every domain function takes an optional client and config so a run can be
+# driven against a fake transport, which means every one of them needs the
+# same two lines to turn "or None" into "the shared one". Those two lines were
+# copied into five modules across three packages; they live here instead —
+# transport-level and domain-free, so sharing them adds no coupling.
+# ---------------------------------------------------------------------------
+
+
+def resolve_client(client: Any | None = None) -> Any:
+    """*client*, or the process-wide one when it is ``None``.
+
+    The import stays inside the call in the domain layers that use it, so this
+    keeps the same property: :func:`get_sharepoint_client` is only reached when
+    no client was passed, and a test that injects a fake never builds a real
+    Graph client (or needs ``msgraph-sdk`` installed).
+    """
+    return client if client is not None else get_sharepoint_client()
+
+
+def resolve_config(config: "SharePointConfig | None" = None) -> "SharePointConfig":
+    """*config*, or one resolved from the environment when it is ``None``."""
+    return config if config is not None else SharePointConfig.from_env()
+
+
+def field_text(fields: dict[str, Any], column: str) -> str | None:
+    """
+    A list column's value as stripped text, or ``None`` when blank or absent.
+
+    Blank-is-absent is the rule every projection here wants: SharePoint returns
+    an empty string for a column that was never filled in, and a caller
+    checking ``if value:`` and one checking ``if value is not None:`` would
+    otherwise disagree about the same row.
+    """
+    value = fields.get(column)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def upload_into(
+    transport: Any, folder: str, name: str, content: str | bytes
+) -> str:
+    """
+    Create *folder*, upload *name* into it, and return the path it landed at.
+
+    Graph's simple upload does not create missing parents, so every upload site
+    had the same create-then-upload-then-join sequence. :meth:`create_folder`
+    is idempotent, so calling it before each write is safe rather than merely
+    tolerable.
+    """
+    transport.create_folder(folder)
+    transport.upload_file(folder, name, content)
+    return f"{folder}/{name}"
+
+
+def project_rows(
+    rows: list[dict[str, Any]],
+    formatter: Callable[[dict[str, Any]], Any],
+    *,
+    label: str,
+) -> list[Any]:
+    """
+    Project *rows* through *formatter*, skipping malformed ones with a WARNING.
+
+    One bad row must not hide every good one — a list is edited by hand, so a
+    row missing the field its projection requires is a normal occurrence rather
+    than an outage. *label* names the caller in the log line.
+    """
+    out: list[Any] = []
+    for row in rows:
+        try:
+            out.append(formatter(row))
+        except SharePointError as exc:
+            logger.warning(f"{label}: skipping a malformed row: {exc}")
+    if len(out) != len(rows):
+        logger.info(f"{label}: projected {len(out)} of {len(rows)} row(s)")
+    return out

@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from app_config.sharepoint import SharePointConfig
+from app_config.sharepoint import SharePointConfig, resolve_client, upload_into
 from target_language import resolve_target_language
 
 from .paths import upload_target, validation
@@ -58,14 +58,6 @@ def set_file_extension(file_name: str, file_type: str) -> str:
         file_name.strip()
     )
     return f"{stem or 'output'}.{extension}"
-
-
-def _client(client: Any | None) -> Any:
-    if client is not None:
-        return client
-    from app_config.sharepoint import get_sharepoint_client
-
-    return get_sharepoint_client()
 
 
 def _as_notebook(contents: str, file_type: str) -> str:
@@ -109,10 +101,7 @@ def upload_converted_script(
     contents = _as_notebook(file_contents, kind) if kind in NOTEBOOK_TYPES else (
         file_contents
     )
-    transport = _client(client)
-    transport.create_folder(folder)
-    transport.upload_file(folder, name, contents)
-    path = f"{folder}/{name}"
+    path = upload_into(resolve_client(client), folder, name, contents)
     logger.info(f"upload_converted_script: wrote {path!r} ({kind})")
     return path
 
@@ -138,9 +127,6 @@ def upload_validation_file(
         The folder could not be created, or the upload failed.
     """
     folder = validation(application, config=config)
-    transport = _client(client)
-    transport.create_folder(folder)
-    transport.upload_file(folder, file_name, file_contents)
-    path = f"{folder}/{file_name}"
+    path = upload_into(resolve_client(client), folder, file_name, file_contents)
     logger.info(f"upload_validation_file: wrote {path!r}")
     return path

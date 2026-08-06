@@ -14,7 +14,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from app_config.sharepoint import SharePointConfig, SharePointError
+from app_config.sharepoint import (
+    SharePointConfig,
+    SharePointError,
+    resolve_client,
+)
 
 from .paths import original_scripts
 
@@ -48,14 +52,6 @@ def applicable_extensions(file_type: str) -> tuple[str, ...]:
         ) from None
 
 
-def _client(client: Any | None) -> Any:
-    if client is not None:
-        return client
-    from app_config.sharepoint import get_sharepoint_client
-
-    return get_sharepoint_client()
-
-
 def source_files(
     application: str,
     file_type: str = "sas",
@@ -75,7 +71,7 @@ def source_files(
         *file_type* is unknown, or the folder cannot be listed.
     """
     folder = original_scripts(application, config=config)
-    entries = _client(client).list_files(folder, applicable_extensions(file_type))
+    entries = resolve_client(client).list_files(folder, applicable_extensions(file_type))
     paths = sorted(entry["path"] for entry in entries)
     logger.info(
         f"source_files: {len(paths)} {file_type} file(s) under {folder!r}"
@@ -93,4 +89,4 @@ def load(
     SharePointError
         The file is absent or could not be downloaded.
     """
-    return _client(client).download_file_as_text(path)
+    return resolve_client(client).download_file_as_text(path)

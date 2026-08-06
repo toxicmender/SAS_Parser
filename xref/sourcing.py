@@ -46,7 +46,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from app_config.sharepoint import SharePointConfig
+from app_config.sharepoint import SharePointConfig, resolve_client, resolve_config
 
 logger = logging.getLogger(__name__)
 
@@ -114,18 +114,6 @@ def _text(value: Any) -> str:
     return str(value).strip() if value is not None else ""
 
 
-def _client(client: Any | None) -> Any:
-    if client is not None:
-        return client
-    from app_config.sharepoint import get_sharepoint_client
-
-    return get_sharepoint_client()
-
-
-def _config(config: SharePointConfig | None) -> SharePointConfig:
-    return config if config is not None else SharePointConfig.from_env()
-
-
 def classify(rows: list[dict[str, Any]]) -> XrefMappings:
     """
     Projected XREF rows sorted into the three slots of :class:`XrefMappings`.
@@ -189,8 +177,8 @@ def mappings(
     app_config.sharepoint.SharePointError
         The XREF list is not configured, or the read failed.
     """
-    resolved = _config(config)
-    rows = _client(client).list_items(resolved.list_id("xref"))
+    resolved = resolve_config(config)
+    rows = resolve_client(client).list_items(resolved.list_id("xref"))
     wanted = application_name.strip().casefold()
     projected = [
         row
@@ -234,7 +222,7 @@ def load_databricks_mapping_sharepoint(path: str) -> dict[str, str]:
         f"load_databricks_mapping_sharepoint: reading mapping CSV from "
         f"SharePoint '{path}'"
     )
-    body = _client(None).read_file(path)
+    body = resolve_client().read_file(path)
     mapping = parse_databricks_mapping_csv(body.decode("utf-8-sig"))
     if not mapping:
         raise ValueError(
