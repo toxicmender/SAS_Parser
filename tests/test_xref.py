@@ -385,3 +385,83 @@ def test_apply_both_through_the_dispatcher_runs_the_pre_pass_too():
         "cat.sales.orders"
     ]
     assert "cat.sales.orders" in outcome.code
+
+
+# ---------------------------------------------------------------------------
+# The CSV backend — sourcing.load_databricks_mapping_sharepoint
+#
+# It lives in xref/ rather than chunker/batcher.py because reading it is I/O
+# against SharePoint and chunker stays network-free; the parser it delegates
+# to is pure and stays in chunker.
+# ---------------------------------------------------------------------------
+
+
+class _FakeFileTransport:
+    """Duck-typed stand-in for the SharePoint client: read_file only."""
+
+    def __init__(self, files: dict[str, bytes]):
+        self.files = files
+        self.read_paths: list[str] = []
+
+    def read_file(self, path: str) -> bytes:
+        self.read_paths.append(path)
+        return self.files[path]
+
+
+_MAPPING_CSV = (
+    b"sas_name,databricks_name\n"
+    b"work,dev.staging\n"
+    b"mylib,prod.sales\n"
+)
+
+
+def _patch_sharepoint(monkeypatch, files: dict[str, bytes]) -> _FakeFileTransport:
+    import app_config.sharepoint as sp_mod
+
+    fake = _FakeFileTransport(files)
+    monkeypatch.setattr(sp_mod, "get_sharepoint_client", lambda: fake)
+    return fake
+
+
+def test_databricks_mapping_loaded_from_sharepoint_csv(monkeypatch):
+    fake = _patch_sharepoint(monkeypatch, {"maps/sas_to_databricks.csv": _MAPPING_CSV})
+
+    mapping = sourcing.load_databricks_mapping_sharepoint(
+        "maps/sas_to_databricks.csv"
+    )
+
+    assert fake.read_paths == ["maps/sas_to_databricks.csv"]
+    assert mapping == {"work": "dev.staging", "mylib": "prod.sales"}
+
+
+def test_explicit_databricks_mapping_overrides_the_csv(monkeypatch):
+    # The merge is the caller's one-liner: loaded CSV under an explicit dict.
+    _patch_sharepoint(monkeypatch, {"m.csv": _MAPPING_CSV})
+
+    mapping = {
+        **sourcing.load_databricks_mapping_sharepoint("m.csv"),
+        "work": "override.schema",
+    }
+
+    assert mapping == {
+        "work": "override.schema",  # the explicit entry wins per key
+        "mylib": "prod.sales",  # CSV-only entries survive the merge
+    }
+
+
+def test_empty_sharepoint_mapping_csv_raises(monkeypatch):
+    # Asking for renaming that cannot happen must stop the run rather than
+    # silently produce SAS-named output.
+    _patch_sharepoint(monkeypatch, {"m.csv": b"sas_name,databricks_name\n"})
+
+    with pytest.raises(ValueError, match="zero entries"):
+        sourcing.load_databricks_mapping_sharepoint("m.csv")
+
+
+def test_chunker_stays_network_free():
+    """chunker must not reach SharePoint; xref owns that (old-spec D3)."""
+    import chunker.batcher as batcher
+
+    assert not hasattr(batcher, "load_databricks_mapping_sharepoint")
+    source = pathlib.Path(batcher.__file__).read_text(encoding="utf-8")
+    assert "app_config.sharepoint" not in source

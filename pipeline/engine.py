@@ -480,9 +480,10 @@ class SasLLMPipeline:
         )
 
         # SAS→Databricks dataset renaming, forwarded to both batchers, which
-        # apply it as a post-pass after grouping. A SharePoint-hosted CSV is
-        # the caller's job now: chunker.batcher.load_databricks_mapping_sharepoint
-        # loads one, and merging it under an explicit dict is one line there.
+        # apply it as a post-pass after grouping. Sourcing one is the caller's
+        # job: xref.sourcing.mappings() reads the SharePoint XREF list and
+        # load_databricks_mapping_sharepoint() a CSV in the library; both
+        # return this shape, so merging them is one line there.
         self.databricks_mapping = databricks_mapping or None
 
         self.chunker = SasSemanticChunker(min_words=min_words, max_words=max_words)

@@ -40,12 +40,13 @@ from __future__ import annotations
 # would shadow the `xref.apply` submodule on this package. Reach it as
 # `xref.apply.apply`, or call apply_pre / apply_post directly.
 from .apply import APPLY_MODES, apply_post, apply_pre
-from .sourcing import XrefMappings, mappings
+from .sourcing import XrefMappings, load_databricks_mapping_sharepoint, mappings
 
 __all__ = [
     "APPLY_MODES",
     "XrefMappings",
     "apply_post",
     "apply_pre",
+    "load_databricks_mapping_sharepoint",
     "mappings",
 ]

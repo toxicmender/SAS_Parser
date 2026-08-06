@@ -204,3 +204,44 @@ def mappings(
         f"mapping(s) of {len(rows)} row(s) in the list"
     )
     return result
+
+
+def load_databricks_mapping_sharepoint(path: str) -> dict[str, str]:
+    """
+    Read the SAS→Databricks mapping CSV at *path* in the configured
+    SharePoint document library and parse it with
+    :func:`chunker.batcher.parse_databricks_mapping_csv`.
+
+    The **file** backend, beside :func:`mappings`' list backend: some
+    deployments keep the cross-reference as a two-column CSV in the library
+    rather than as list rows. Both produce the flat dict
+    :func:`chunker.batcher.replace_dataset_names` takes, so a caller merges or
+    chooses between them in one line.
+
+    It lives here rather than in ``chunker.batcher`` (where it used to) because
+    reading it is I/O against SharePoint, and ``chunker`` stays network-free —
+    the parser it delegates to is pure and correctly stays there.
+
+    ``utf-8-sig`` decoding strips the BOM Excel stamps on exported CSVs.
+    An unreadable file (``SharePointError``) propagates, and a file that
+    parses to zero entries raises ``ValueError`` — both mean the operator
+    asked for renaming that cannot happen, which should stop the run rather
+    than silently produce SAS-named output.
+    """
+    from chunker.batcher import parse_databricks_mapping_csv
+
+    logger.info(
+        f"load_databricks_mapping_sharepoint: reading mapping CSV from "
+        f"SharePoint '{path}'"
+    )
+    body = _client(None).read_file(path)
+    mapping = parse_databricks_mapping_csv(body.decode("utf-8-sig"))
+    if not mapping:
+        raise ValueError(
+            f"SharePoint Databricks mapping '{path}' parsed to zero entries; "
+            f"expected CSV rows of <sas_libref_or_dataset>,<databricks_target>"
+        )
+    logger.info(
+        f"load_databricks_mapping_sharepoint: loaded {len(mapping)} mapping entries"
+    )
+    return mapping

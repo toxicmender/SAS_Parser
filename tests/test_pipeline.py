@@ -752,43 +752,10 @@ def test_memory_setup_extractor_implies_thread_memory():
 # ---------------------------------------------------------------------------
 
 
-class _FakeSharePointClient:
-    """Duck-typed stand-in for app_config.sharepoint's client: read_file only."""
-
-    def __init__(self, files: dict[str, bytes]):
-        self.files = files
-        self.read_paths: list[str] = []
-
-    def read_file(self, path: str) -> bytes:
-        self.read_paths.append(path)
-        return self.files[path]
-
-
-_MAPPING_CSV = (
-    b"sas_name,databricks_name\n"
-    b"work,dev.staging\n"
-    b"mylib,prod.sales\n"
-)
-
-
-def _patch_sharepoint(monkeypatch, files: dict[str, bytes]) -> _FakeSharePointClient:
-    import app_config.sharepoint as sp_mod
-
-    fake = _FakeSharePointClient(files)
-    monkeypatch.setattr(sp_mod, "get_sharepoint_client", lambda: fake)
-    return fake
-
-
-def test_databricks_mapping_loaded_from_sharepoint_csv(monkeypatch):
-    from chunker.batcher import load_databricks_mapping_sharepoint
-
-    fake = _patch_sharepoint(monkeypatch, {"maps/sas_to_databricks.csv": _MAPPING_CSV})
-    mapping = load_databricks_mapping_sharepoint("maps/sas_to_databricks.csv")
-    assert fake.read_paths == ["maps/sas_to_databricks.csv"]
-    assert mapping == {
-        "work": "dev.staging",
-        "mylib": "prod.sales",
-    }
+def test_databricks_mapping_reaches_both_batchers():
+    # Where the mapping came from is xref's business (tests/test_xref.py);
+    # this is only that a mapping handed to the pipeline is applied.
+    mapping = {"work": "dev.staging", "mylib": "prod.sales"}
     pipeline = SasLLMPipeline(
         llm_config=LLMClientConfig(model="unused"),
         memory_setup=MemorySetup(memory=MemoryHub()),
@@ -812,31 +779,6 @@ def test_databricks_mapping_loaded_from_sharepoint_csv(monkeypatch):
     ]
     assert "dev.staging.clean" in all_outputs
     assert pipeline.multi_batcher.databricks_mapping == pipeline.databricks_mapping
-
-
-def test_explicit_databricks_mapping_overrides_sharepoint_csv(monkeypatch):
-    # The merge is the caller's one-liner now: loaded CSV under explicit dict.
-    from chunker.batcher import load_databricks_mapping_sharepoint
-
-    _patch_sharepoint(monkeypatch, {"m.csv": _MAPPING_CSV})
-    mapping = {
-        **load_databricks_mapping_sharepoint("m.csv"),
-        **{"work": "override.schema"},
-    }
-    assert mapping == {
-        "work": "override.schema",  # explicit dict wins per key
-        "mylib": "prod.sales",  # CSV-only entries survive the merge
-    }
-
-
-def test_empty_sharepoint_mapping_csv_raises(monkeypatch):
-    import pytest
-
-    from chunker.batcher import load_databricks_mapping_sharepoint
-
-    _patch_sharepoint(monkeypatch, {"m.csv": b"sas_name,databricks_name\n"})
-    with pytest.raises(ValueError, match="zero entries"):
-        load_databricks_mapping_sharepoint("m.csv")
 
 
 def test_no_mapping_keeps_batchers_unmapped():
