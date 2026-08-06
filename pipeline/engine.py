@@ -57,8 +57,6 @@ from chunker.models import (
 from llm_client import LLMClient, LLMClientConfig, TokenUsage, tokens
 from memory.extractor import MemoryExtractor
 from memory.policy import TaskPolicy
-from memory.relevance import RelevantHistorySelector
-from memory.summarize import RollingSummarizer
 from memory.thread_mem import ThreadMemory
 from prompt_builder import PromptBuilder, UserInstructionSet
 from target_language import TargetLanguage, resolve_target_language
@@ -77,7 +75,7 @@ from .prompting import (
 )
 from .response_models import TranslationDocument
 from .run_ledger import DOCUMENT_KEY, RunLedger, document_of
-from .setup import MemorySetup
+from .setup import ChunkingSetup, MemorySetup, PromptingSetup, ValidationSetup
 
 logger = logging.getLogger(__name__)
 
@@ -133,19 +131,122 @@ class SasLLMPipeline:
         extras. Its ``model`` is the pipeline's model. ``None`` (default)
         builds ``LLMClientConfig()``, which resolves everything from
         config.json and the environment.
-
-        There is deliberately no second spelling. These knobs were once
-        also accepted as ~12 individual keyword arguments here, which meant
-        two places to set one thing and a rejection branch to stop them
-        being set in both; the config object is the only way in now.
     memory_setup : MemorySetup | None
-        All memory wiring, as one :class:`pipeline.setup.MemorySetup`:
-        the store hub, the long-term policy, the thread notes, the
-        extractor, the chat identity, and the Delta/Spark target. Its
-        ``build()`` produces what the pipeline holds. ``None`` (default)
-        builds ``MemorySetup()`` — an in-memory store, no Spark, no JVM.
-        Like ``llm_config``, this is the only spelling.
-    prompt_caching : bool | None
+        All memory wiring, as one :class:`pipeline.setup.MemorySetup`: the
+        store hub, the long-term policy, the thread notes, the extractor,
+        the chat identity, the Delta/Spark target, and the history policy
+        below. Its ``build()`` produces what the pipeline holds. ``None``
+        (default) builds ``MemorySetup()`` — an in-memory store, no Spark,
+        no JVM.
+    chunking : ChunkingSetup | None
+        How the source is split and grouped (:class:`pipeline.setup.ChunkingSetup`).
+    prompting : PromptingSetup | None
+        What the model is asked, and how (:class:`pipeline.setup.PromptingSetup`).
+    validation : ValidationSetup | None
+        Inline validation and its retry budget
+        (:class:`pipeline.setup.ValidationSetup`).
+    output_language : str | None
+        Target language to translate into. Resolved once, here, through the
+        ``target_language`` registry: the name is folded (``"spark sql"``,
+        ``"SparkSQL"``, and ``"Spark SQL"`` are one target) and canonicalised,
+        and the resolved :class:`~target_language.TargetLanguage` then drives
+        the system prompt, the ``[lang: ...]`` instruction axis, the notebook
+        kernel and fence tags, and what the validation suite checks the
+        emitted code against. An unrecognised name raises
+        :class:`~target_language.UnknownTargetLanguage` rather than degrading
+        into a Python run that only looks right. ``None`` (default) defers to
+        config.json ``pipeline.output_language``, then
+        ``target_language.DEFAULT_OUTPUT_LANGUAGE`` (``"SparkSQL"``).
+    llm : Any | None
+        Pre-built LangChain chat model to use instead of constructing one
+        from ``model`` via :class:`llm_client.LLMClient`.  Useful for
+        injecting a fake or pre-configured client (e.g. in tests).  The
+        retry and input-token-budget layers still wrap an injected model;
+        the construction-time knobs (``temperature``, ``base_url``,
+        ``api_key``, ``url_headers``, ``gateway_version``, ``timeout``,
+        ``model_kwargs``, ``llm_kwargs``, ``requests_per_second``) do not
+        apply to it.
+
+    Group fields
+    ------------
+    There is deliberately **one spelling per knob**: these are fields on the
+    five objects above, never keyword arguments here as well. Two places to
+    set one thing means a rejection branch to stop them being set in both,
+    which is what this constructor used to carry.
+
+    memory_setup.window_k : int | None
+        Rolling-window size in (human, AI) turn-pairs kept in context per
+        LLM call. ``None`` disables trimming (full history every call).
+        Ignored when ``history_selector`` is set.
+    memory_setup.history_selector : RelevantHistorySelector | None
+        Relevance-based history selection: per LLM call, prompt only the
+        turn pairs most relevant to the current batch/chunk message
+        (BM25 + optional FAISS dense retrieval, RRF-fused) instead of the
+        recency window. ``None`` (default) keeps ``window_k`` behaviour.
+    memory_setup.summarizer : RollingSummarizer | None
+        Rolling thread summarization (``memory.summarize``): turns older
+        than the summarizer's recency tail are folded into one running
+        summary per thread, prepended to every prompt as a SystemMessage
+        after trimming/selection. Like reference guidance, the summary is
+        **prompted but never persisted** to the ``msg::`` history — it
+        lives in the KV layer and is re-derivable from the full stored
+        thread. A summarizer constructed without a ``store`` is given this
+        pipeline's ``memory.kv``. ``None`` (default) disables compression.
+    chunking.min_words, max_words : int | None
+        Forwarded to :class:`SasSemanticChunker`. ``None`` (default) lets
+        the chunker read ``sas_chunker.*`` from config.json (see the
+        ``app_config`` package), falling back to 300/700.
+    chunking.include_options_chunks, include_comment_chunks : bool
+        Forwarded to the batchers.
+    chunking.max_merged_chunks : int
+        Every LLM call is made per :class:`SasBatch`: before a run, the
+        batcher's ordered items are coalesced so each dependency batch stays
+        one call and each maximal run of consecutive independent singleton
+        chunks is packed into synthetic ``merged-NNN`` batches of at most this
+        many members (see :func:`chunker.batcher.coalesce_into_batches`).
+        Larger values mean fewer, larger requests; the cap keeps a merged
+        prompt from blowing ``max_input_tokens``. Must be ``>= 1`` (``1``
+        wraps each singleton as its own batch without merging). Default ``8``.
+    chunking.max_merged_tokens : int | None
+        Token-budgeted call packing: when set, coalescing accumulates
+        *adjacent* items — singletons **and** real dependency batches — into
+        one LLM call while the estimated prompt cost stays under this budget
+        (and total members under ``max_merged_chunks``), emitting multi-item
+        windows as synthetic ``packed-NNN`` batches (see
+        :func:`chunker.batcher.coalesce_into_batches`). Cost is estimated
+        with this pipeline's tokenizer
+        (:func:`pipeline.prompting.prompt_cost_estimator`), so the budget
+        and ``max_input_tokens`` count under one vocabulary. The
+        global-context batch never packs, and item identity changes versus
+        unpacked runs (``packed-NNN`` ids), so resume only matches runs made
+        under the same budget. ``None`` (default) defers to config.json
+        ``pipeline.max_merged_tokens``, then to a **derived default — packing
+        is on by default**: with ``max_input_tokens`` set,
+        ``0.8 × (max_input_tokens − system prompt − guidance/history
+        headroom)`` (a budget too small to pack disables it); otherwise
+        ~64,000 tokens. Pass ``0`` (or set the config key to ``0``) to turn
+        packing off and keep the original count-capped singleton merging
+        only. Must be ``>= 1``, or ``0`` for off.
+    chunking.databricks_mapping : dict[str, str] | None
+        SAS→Databricks dataset-name mapping forwarded to the batchers
+        (see :func:`chunker.batcher.replace_dataset_names`): batch and
+        chunk metadata dataset names — and ``%let`` values holding a
+        dataset reference — are rewritten to Unity Catalog
+        ``catalog.schema.table`` names before prompting.  Default:
+        ``None`` (no renaming).
+    prompting.system_prompt : str | None
+        Override the default prompt from ``pipeline.constants``.
+    prompting.structured_output : bool | None
+        Ask the model for a
+        :class:`~pipeline.response_models.TranslationDocument` instead of
+        free-form Markdown, so the notebook renderer knows exactly which cells
+        are runnable code (see ``pipeline.notebook``). ``None`` (default) defers
+        to config.json ``pipeline.structured_output``, then ``True``. Either
+        way the *persisted* turn and the item's ``response`` are Markdown, so
+        conversation memory, resume, and every validation metric are unchanged;
+        a gateway that rejects the schema degrades to the model's prose with a
+        warning rather than failing the run.
+    prompting.prompt_caching : bool | None
         Anthropic prompt caching for the system prompt: when enabled and
         ``model`` is an Anthropic model, the system prompt is sent as a
         content block carrying a ``cache_control`` breakpoint, so every
@@ -166,152 +267,14 @@ class SasLLMPipeline:
         it, re-sends, and drops it from every later call (one WARNING,
         one failed request per process). The run then simply pays full
         price for the system prompt.
-    min_words, max_words : int | None
-        Forwarded to :class:`SasSemanticChunker`. ``None`` (default) lets
-        the chunker read ``sas_chunker.*`` from config.json (see the
-        ``app_config`` package), falling back to 300/700.
-    output_language : str | None
-        Target language to translate into. Resolved once, here, through the
-        ``target_language`` registry: the name is folded (``"spark sql"``,
-        ``"SparkSQL"``, and ``"Spark SQL"`` are one target) and canonicalised,
-        and the resolved :class:`~target_language.TargetLanguage` then drives
-        the system prompt, the ``[lang: ...]`` instruction axis, the notebook
-        kernel and fence tags, and what the validation suite checks the
-        emitted code against. An unrecognised name raises
-        :class:`~target_language.UnknownTargetLanguage` rather than degrading
-        into a Python run that only looks right. ``None`` (default) defers to
-        config.json ``pipeline.output_language``, then
-        ``target_language.DEFAULT_OUTPUT_LANGUAGE`` (``"SparkSQL"``).
-    system_prompt : str | None
-        Override the default prompt from ``pipeline.constants``.
-    structured_output : bool | None
-        Ask the model for a
-        :class:`~pipeline.response_models.TranslationDocument` instead of
-        free-form Markdown, so the notebook renderer knows exactly which cells
-        are runnable code (see ``pipeline.notebook``). ``None`` (default) defers
-        to config.json ``pipeline.structured_output``, then ``True``. Either
-        way the *persisted* turn and the item's ``response`` are Markdown, so
-        conversation memory, resume, and every validation metric are unchanged;
-        a gateway that rejects the schema degrades to the model's prose with a
-        warning rather than failing the run.
-    window_k : int | None
-        Rolling-window size in (human, AI) turn-pairs kept in context per
-        LLM call. ``None`` disables trimming (full history every call).
-        Ignored when ``history_selector`` is set.
-    history_selector : RelevantHistorySelector | None
-        Relevance-based history selection: per LLM call, prompt only the
-        turn pairs most relevant to the current batch/chunk message
-        (BM25 + optional FAISS dense retrieval, RRF-fused) instead of the
-        recency window. ``None`` (default) keeps ``window_k`` behaviour.
-    summarizer : RollingSummarizer | None
-        Rolling thread summarization (``memory.summarize``): turns older
-        than the summarizer's recency tail are folded into one running
-        summary per thread, prepended to every prompt as a SystemMessage
-        after trimming/selection. Like reference guidance, the summary is
-        **prompted but never persisted** to the ``msg::`` history — it
-        lives in the KV layer and is re-derivable from the full stored
-        thread. A summarizer constructed without a ``store`` is given this
-        pipeline's ``memory.kv``. ``None`` (default) disables compression.
-    include_options_chunks, include_comment_chunks : bool
-        Forwarded to the batchers.
-    max_merged_chunks : int
-        Every LLM call is made per :class:`SasBatch`: before a run, the
-        batcher's ordered items are coalesced so each dependency batch stays
-        one call and each maximal run of consecutive independent singleton
-        chunks is packed into synthetic ``merged-NNN`` batches of at most this
-        many members (see :func:`chunker.batcher.coalesce_into_batches`).
-        Larger values mean fewer, larger requests; the cap keeps a merged
-        prompt from blowing ``max_input_tokens``. Must be ``>= 1`` (``1``
-        wraps each singleton as its own batch without merging). Default ``8``.
-    max_merged_tokens : int | None
-        Token-budgeted call packing: when set, coalescing accumulates
-        *adjacent* items — singletons **and** real dependency batches — into
-        one LLM call while the estimated prompt cost stays under this budget
-        (and total members under ``max_merged_chunks``), emitting multi-item
-        windows as synthetic ``packed-NNN`` batches (see
-        :func:`chunker.batcher.coalesce_into_batches`). Cost is estimated
-        with this pipeline's tokenizer
-        (:func:`pipeline.prompting.prompt_cost_estimator`), so the budget
-        and ``max_input_tokens`` count under one vocabulary. The
-        global-context batch never packs, and item identity changes versus
-        unpacked runs (``packed-NNN`` ids), so resume only matches runs made
-        under the same budget. ``None`` (default) defers to config.json
-        ``pipeline.max_merged_tokens``, then to a **derived default — packing
-        is on by default**: with ``max_input_tokens`` set,
-        ``0.8 × (max_input_tokens − system prompt − guidance/history
-        headroom)`` (a budget too small to pack disables it); otherwise
-        ~64,000 tokens. Pass ``0`` (or set the config key to ``0``) to turn
-        packing off and keep the original count-capped singleton merging
-        only. Must be ``>= 1``, or ``0`` for off.
-    databricks_mapping : dict[str, str] | None
-        SAS→Databricks dataset-name mapping forwarded to the batchers
-        (see :func:`chunker.batcher.replace_dataset_names`): batch and
-        chunk metadata dataset names — and ``%let`` values holding a
-        dataset reference — are rewritten to Unity Catalog
-        ``catalog.schema.table`` names before prompting.  Default:
-        ``None`` (no renaming).
-    memory : MemoryHub | None
-        Pre-built memory.store facade. If omitted, one is constructed from
-        ``spark``/``delta_table``.
-    task_id : str | None
-        Names the *task* whose long-term policy this run works under
-        (``memory.policy``). A :class:`~memory.policy.TaskPolicy` is loaded
-        from the KV store for it and its instructions are folded into the
-        (cached) system prompt. ``None`` (default) disables long-term memory.
-        Ignored when ``task_policy`` is passed — that policy's own task id
-        wins.
-    task_policy : TaskPolicy | None
-        A pre-built policy, for callers that seeded or edited one before the
-        run. A store-less policy is bound to this pipeline's ``memory.kv``
-        and reloaded. The policy text is **snapshotted at construction**:
-        editing it later does not change this pipeline (which is what keeps
-        the cached prompt prefix stable) — build a new pipeline to pick it up.
-    thread_memory : ThreadMemory | None
-        Short-term, conversation-scoped notes (``memory.thread_mem``): each
-        turn's prompt carries the live notes of its thread through the same
-        ephemeral channel as reference guidance — prompted, never persisted,
-        never scored by the relevance selector. ``None`` (default) disables
-        short-term memory, unless a ``memory_extractor`` is given (which
-        implies one). Notes travel with :meth:`fork_run`.
-    memory_extractor : MemoryExtractor | None
-        Classifies each *accepted* turn into permanent (a policy proposal,
-        held for approval) or temporary (a thread note, applied) memory —
-        see ``memory.extractor``. Gated on instruction-shaped cues, so
-        ordinary translation turns cost no extra LLM call. ``None`` (default)
-        disables memory writes entirely.
-    chat_id : str | None
-        Identifies this pipeline instance's span of every thread it writes
-        (Task → Thread → Chat → Message); recorded as a ``chat::`` index row
-        and readable through :meth:`get_chats`. ``None`` (default) generates
-        one per instance, which is the intended granularity: a resumed or
-        forked run opens a new chat on the same thread.
-    spark : SparkSession | None
-        Forwarded to :class:`MemoryHub` if ``memory`` is omitted.
-        Only needed when ``delta_table`` is set; if omitted then, a local
-        in-process Spark session is created.  The in-memory store never
-        touches Spark, so no session is started when ``delta_table`` is
-        ``None``.
-    delta_table : str | None
-        Forwarded to :class:`MemoryHub` if ``memory`` is omitted.
-        ``None`` (default) keeps the store in-memory — a plain dict, no
-        Delta table, no Spark/JVM.
-    llm : Any | None
-        Pre-built LangChain chat model to use instead of constructing one
-        from ``model`` via :class:`llm_client.LLMClient`.  Useful for
-        injecting a fake or pre-configured client (e.g. in tests).  The
-        retry and input-token-budget layers still wrap an injected model;
-        the construction-time knobs (``temperature``, ``base_url``,
-        ``api_key``, ``url_headers``, ``gateway_version``, ``timeout``,
-        ``model_kwargs``, ``llm_kwargs``, ``requests_per_second``) do not
-        apply to it.
-    prompt_builder : PromptBuilder | None
+    prompting.prompt_builder : PromptBuilder | None
         Reference-PDF guidance source. When set, each item's prompt gains a
         block of instruction chunks relevant to that item's constructs
         (retrieved from the reference corpus). The guidance is **ephemeral**:
         it is prompted but never stored in the thread's history — see the
         load-bearing invariant on this in Architecture.md. ``None`` (default)
         disables guidance injection entirely.
-    user_instructions : str | UserInstructionSet | None
+    prompting.user_instructions : str | UserInstructionSet | None
         Operator-supplied project rules (see
         ``prompt_builder/user_instructions.py`` for the heading/directive
         syntax). ``None`` (default) falls back to the standing instructions
@@ -323,7 +286,7 @@ class SasLLMPipeline:
         no reference PDFs at all. Selected rules render in a
         ``## Project instructions`` block and are ephemeral like all
         guidance: prompted, never persisted.
-    validator : Any | None
+    validation.validator : Any | None
         Optional inline validator (``validation.live.LiveValidator`` —
         duck-typed, so this package imports nothing from ``validation``,
         which itself imports this one). When set, each item is scored the
@@ -333,7 +296,7 @@ class SasLLMPipeline:
         (default) validation is observe-only: a failing or erroring
         validation never retries the item or aborts the run. ``None``
         (default) disables inline validation entirely.
-    validation_retries : int
+    validation.retries : int
         How many times to *re-generate* an item that fails inline validation
         before accepting its answer (``0``, default, keeps the observe-only
         policy — score and store, never act). Requires a ``validator``.
@@ -353,42 +316,55 @@ class SasLLMPipeline:
         *,
         llm_config: LLMClientConfig | None = None,
         memory_setup: MemorySetup | None = None,
-        prompt_caching: bool | None = None,
-        min_words: int | None = None,
-        max_words: int | None = None,
+        chunking: ChunkingSetup | None = None,
+        prompting: PromptingSetup | None = None,
+        validation: ValidationSetup | None = None,
         output_language: str | None = None,
-        system_prompt: str | None = None,
-        window_k: int | None = 6,
-        history_selector: RelevantHistorySelector | None = None,
-        summarizer: RollingSummarizer | None = None,
-        include_options_chunks: bool = True,
-        include_comment_chunks: bool = False,
-        max_merged_chunks: int = 8,
-        max_merged_tokens: int | None = None,
-        databricks_mapping: dict[str, str] | None = None,
         llm: Any | None = None,
-        prompt_builder: PromptBuilder | None = None,
-        user_instructions: "str | UserInstructionSet | None" = None,
-        validator: Any | None = None,
-        validation_retries: int = 0,
-        structured_output: bool | None = None,
     ) -> None:
+        # Each group defaults to its own all-defaults instance, so the
+        # no-argument constructor still works and every knob has exactly one
+        # place to be set.
+        if llm_config is None:
+            llm_config = LLMClientConfig()
+        if memory_setup is None:
+            memory_setup = MemorySetup()
+        if chunking is None:
+            chunking = ChunkingSetup()
+        if prompting is None:
+            prompting = PromptingSetup()
+        if validation is None:
+            validation = ValidationSetup()
+
+        # Unpacked once, here, so the body below reads exactly as it did
+        # before the grouping and no use site has to spell out its group.
+        window_k = memory_setup.window_k
+        history_selector = memory_setup.history_selector
+        summarizer = memory_setup.summarizer
+        min_words = chunking.min_words
+        max_words = chunking.max_words
+        include_options_chunks = chunking.include_options_chunks
+        include_comment_chunks = chunking.include_comment_chunks
+        max_merged_chunks = chunking.max_merged_chunks
+        max_merged_tokens = chunking.max_merged_tokens
+        databricks_mapping = chunking.databricks_mapping
+        system_prompt = prompting.system_prompt
+        structured_output = prompting.structured_output
+        prompt_caching = prompting.prompt_caching
+        prompt_builder = prompting.prompt_builder
+        user_instructions = prompting.user_instructions
+        validator = validation.validator
+        validation_retries = validation.retries
+
         if validation_retries < 0:
             raise ValueError(
-                f"validation_retries must be >= 0, got {validation_retries}"
+                f"ValidationSetup.retries must be >= 0, got {validation_retries}"
             )
         # Resolved once, before anything reads it: the prompt, the guidance
         # selector, the notebook writer, and the validator all take the target
         # from here, so they cannot each interpret the caller's spelling
         # differently (raises on an unknown name — see the argument docs).
         target = resolve_target_language(output_language)
-        # The two grouped configs are the only spelling. Each defaults to its
-        # own all-defaults instance, so the no-argument constructor still
-        # works and every knob has exactly one place to be set.
-        if llm_config is None:
-            llm_config = LLMClientConfig()
-        if memory_setup is None:
-            memory_setup = MemorySetup()
         model = llm_config.model
         # A validator built for another target fails every item on
         # `language_compliance` — and with validation_retries on, burns the

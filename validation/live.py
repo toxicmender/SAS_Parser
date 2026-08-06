@@ -32,7 +32,8 @@ Observe-only by default
 The validator itself only scores and stores — it never re-runs the model or
 aborts the run, and the pipeline additionally swallows any validator error.
 Whether a *failing* verdict is then acted upon is the pipeline's decision:
-with ``SasLLMPipeline(validation_retries=0)`` (the default) it is not, matching
+with ``SasLLMPipeline(validation=ValidationSetup(validator=...))`` (retries=0,
+the default) it is not, matching
 the standing policy in ``validation/README.md``; with a positive budget the
 pipeline re-generates the item with corrective feedback (and treats a stored
 failing verdict as not-done on resume). See ``SasLLMPipeline._answer_item``.

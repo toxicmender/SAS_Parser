@@ -110,11 +110,17 @@ chunker/
   _repl.py              print_iterable REPL helper (also used by conversion.run
                         to render per-item summary lines into its logs).
 pipeline/
-  setup.py              MemorySetup: grouped memory wiring for the pipeline
-                        constructor (store hub, task policy, thread memory,
-                        extractor, chat identity) with the cross-injection
-                        logic in build(). LLM transport groups under
-                        llm_client.LLMClientConfig the same way.
+  setup.py              The pipeline constructor's grouped configs, one per
+                        concern: MemorySetup (store hub, task policy, thread
+                        memory, extractor, chat identity, history policy —
+                        plus the cross-injection logic in build()),
+                        ChunkingSetup, PromptingSetup, ValidationSetup. LLM
+                        transport groups under llm_client.LLMClientConfig the
+                        same way. ONE SPELLING PER KNOB: these are fields on
+                        those objects, never keyword arguments on the pipeline
+                        as well — two places to set one thing means a
+                        rejection branch to stop them being set in both, which
+                        is what the 22-argument constructor used to carry.
   run_ledger.py         RunLedger: KV-side run bookkeeping — per-item
                         run/validation facts, resume (skip/redo resolution
                         and the rewind), and the fact-copying half of fork.

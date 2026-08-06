@@ -383,7 +383,7 @@ def build_pipeline(
     output as Python is exactly the mismatch that argument exists to prevent.
     """
     from pipeline import SasLLMPipeline
-    from pipeline.setup import MemorySetup
+    from pipeline.setup import MemorySetup, PromptingSetup, ValidationSetup
     from prompt_builder import PromptBuilder
     from validation import LiveValidator
 
@@ -406,9 +406,8 @@ def build_pipeline(
         llm_config=llm_config,
         memory_setup=MemorySetup(delta_table=args.delta_table),
         output_language=target.display_name,
-        prompt_builder=builder,
-        validator=validator,
-        validation_retries=args.validation_retries,
+        prompting=PromptingSetup(prompt_builder=builder),
+        validation=ValidationSetup(validator=validator, retries=args.validation_retries),
     )
 
 

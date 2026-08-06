@@ -34,7 +34,7 @@ from chunker.models import (
 )
 from llm_client import LLMClientConfig
 from pipeline import SasLLMPipeline
-from pipeline.setup import MemorySetup
+from pipeline.setup import ChunkingSetup, MemorySetup, PromptingSetup
 from pipeline.prompting import _format_batch_message
 from target_language import resolve_target_language
 
@@ -177,9 +177,9 @@ def test_pipeline_accumulates_history_across_batches():
 
     pipeline = SasLLMPipeline(
         llm_config=LLMClientConfig(model="unused-because-llm-injected"),
-        memory_setup=MemorySetup(memory=mem),
+        # window_k=None: no trimming, so full history length is assertable.
+        memory_setup=MemorySetup(memory=mem, window_k=None),
         llm=fake_llm,
-        window_k=None,  # no trimming, so we can assert full history length
     )
 
     c1 = _mk_chunk(
@@ -253,7 +253,10 @@ def test_run_text_invokes_llm_only_per_batch():
 def test_max_merged_chunks_caps_calls_per_batch():
     fake_llm = FakeListChatModel(responses=[f"r{i}" for i in range(10)])
     pipeline = SasLLMPipeline(
-        llm_config=LLMClientConfig(model="unused"), memory_setup=MemorySetup(memory=MemoryHub()), llm=fake_llm, max_merged_chunks=1
+        llm_config=LLMClientConfig(model="unused"),
+        memory_setup=MemorySetup(memory=MemoryHub()),
+        llm=fake_llm,
+        chunking=ChunkingSetup(max_merged_chunks=1),
     )
 
     src = (
@@ -276,7 +279,7 @@ def test_max_merged_tokens_packs_adjacent_items_into_one_call():
         llm_config=LLMClientConfig(model="unused"),
         memory_setup=MemorySetup(memory=MemoryHub()),
         llm=fake_llm,
-        max_merged_tokens=100_000,
+        chunking=ChunkingSetup(max_merged_tokens=100_000),
     )
 
     src = (
@@ -304,7 +307,7 @@ def test_max_merged_tokens_zero_disables_packing():
         llm_config=LLMClientConfig(model="unused"),
         memory_setup=MemorySetup(memory=MemoryHub()),
         llm=fake_llm,
-        max_merged_tokens=0,
+        chunking=ChunkingSetup(max_merged_tokens=0),
     )
 
     src = (
@@ -322,11 +325,11 @@ def test_max_merged_tokens_zero_disables_packing():
 def test_max_merged_tokens_validates():
     with pytest.raises(ValueError, match="max_merged_tokens"):
         SasLLMPipeline(
-            llm_config=LLMClientConfig(model="unused"),
-            memory_setup=MemorySetup(memory=MemoryHub()),
-            llm=FakeListChatModel(responses=["ok"]),
-            max_merged_tokens=-1,
-        )
+        llm_config=LLMClientConfig(model="unused"),
+        memory_setup=MemorySetup(memory=MemoryHub()),
+        llm=FakeListChatModel(responses=["ok"]),
+        chunking=ChunkingSetup(max_merged_tokens=-1),
+    )
 
 
 def test_packing_budget_defaults_and_derivation():
@@ -338,8 +341,8 @@ def test_packing_budget_defaults_and_derivation():
                 model="unused", max_input_tokens=max_input_tokens
             ),
             memory_setup=MemorySetup(memory=MemoryHub()),
+            chunking=ChunkingSetup(**kwargs),
             llm=FakeListChatModel(responses=["ok"]),
-            **kwargs,
         )
 
     # No input budget: the conservative hard default applies.
@@ -360,9 +363,9 @@ def test_pipeline_window_trimming_limits_injected_history():
     mem = MemoryHub()
     pipeline = SasLLMPipeline(
         llm_config=LLMClientConfig(model="unused-because-llm-injected"),
-        memory_setup=MemorySetup(memory=mem),
+        memory_setup=MemorySetup(memory=mem, window_k=1),
         llm=fake_llm,
-        window_k=1,  # keep only last 1 human/ai pair in the prompt
+        # keep only last 1 human/ai pair in the prompt,
     )
 
     chunks: list[SasBatch | SasChunk] = [
@@ -551,10 +554,8 @@ def test_summarizer_gets_pipeline_store_and_summary_never_persisted():
     )
     pipeline = SasLLMPipeline(
         llm_config=LLMClientConfig(model="unused"),
-        memory_setup=MemorySetup(memory=mem),
+        memory_setup=MemorySetup(memory=mem, window_k=None, summarizer=summarizer),
         llm=fake_llm,
-        window_k=None,
-        summarizer=summarizer,
     )
     # A store-less summarizer is wired to the pipeline's KV layer.
     assert summarizer.store is mem.kv
@@ -623,7 +624,7 @@ def test_prompt_caching_marks_system_block_for_anthropic_models():
         llm_config=LLMClientConfig(model="claude-sonnet-4-5"),
         memory_setup=MemorySetup(memory=mem),
         llm=FakeListChatModel(responses=["ok"]),
-        prompt_caching=True,
+        prompting=PromptingSetup(prompt_caching=True),
     )
     system_msg = pipeline._prompt.messages[0]
     assert isinstance(system_msg, SystemMessage)
@@ -646,7 +647,7 @@ def test_prompt_caching_ignored_for_non_anthropic_models():
         llm_config=LLMClientConfig(model="gpt-5.4"),
         memory_setup=MemorySetup(memory=MemoryHub()),
         llm=FakeListChatModel(responses=["ok"]),
-        prompt_caching=True,
+        prompting=PromptingSetup(prompt_caching=True),
     )
     # Falls back to the plain template tuple (no concrete SystemMessage).
     assert not isinstance(pipeline._prompt.messages[0], SystemMessage)
@@ -760,7 +761,7 @@ def test_databricks_mapping_reaches_both_batchers():
         llm_config=LLMClientConfig(model="unused"),
         memory_setup=MemorySetup(memory=MemoryHub()),
         llm=FakeListChatModel(responses=["ok"]),
-        databricks_mapping=mapping,
+        chunking=ChunkingSetup(databricks_mapping=mapping),
     )
     assert pipeline.databricks_mapping == mapping
     # The mapping reaches both batchers and rewrites batched dataset names.
@@ -929,7 +930,7 @@ def test_model_without_structured_support_prompts_for_markdown():
         llm_config=LLMClientConfig(model="unused"),
         memory_setup=MemorySetup(memory=MemoryHub()),
         llm=FakeListChatModel(responses=["ok"]),
-        structured_output=True,
+        prompting=PromptingSetup(structured_output=True),
     )
     assert pipeline._structured_output is False
     assert "Structure every response with these Markdown sections" in (
@@ -941,7 +942,10 @@ def test_structured_output_can_be_turned_off():
     doc = _translation_document()
     fake = _StructuredFakeChatModel(responses=["plain answer"], documents=[doc])
     pipeline = SasLLMPipeline(
-        llm_config=LLMClientConfig(model="unused"), memory_setup=MemorySetup(memory=MemoryHub()), llm=fake, structured_output=False
+        llm_config=LLMClientConfig(model="unused"),
+        memory_setup=MemorySetup(memory=MemoryHub()),
+        llm=fake,
+        prompting=PromptingSetup(structured_output=False),
     )
 
     outputs = pipeline.run_text("data work.a; x=1; run;", source_id="etl.sas")
@@ -993,8 +997,8 @@ def test_structured_prompt_names_the_cell_language_instead_of_a_fence():
         llm_config=LLMClientConfig(model="unused"),
         memory_setup=MemorySetup(memory=MemoryHub()),
         llm=fake,
-        structured_output=True,
         output_language="SparkSQL",
+        prompting=PromptingSetup(structured_output=True),
     )
     prompt = pipeline._system_prompt
     assert pipeline._structured_output is True
@@ -1024,8 +1028,8 @@ def test_structured_document_renders_with_the_target_fence():
         llm_config=LLMClientConfig(model="unused"),
         memory_setup=MemorySetup(memory=MemoryHub()),
         llm=fake,
-        structured_output=True,
         output_language="SparkSQL",
+        prompting=PromptingSetup(structured_output=True),
     )
 
     outputs = pipeline.run_text("data work.a; x=1; run;", source_id="etl.sas")

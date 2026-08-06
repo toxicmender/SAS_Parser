@@ -22,7 +22,12 @@ from memory.store import MemoryHub
 
 from chunker.models import SasBatch, SasChunk, SasChunkKind, SasChunkMetadata
 from pipeline import SasLLMPipeline
-from pipeline.setup import MemorySetup
+from pipeline.setup import (
+    ChunkingSetup,
+    MemorySetup,
+    PromptingSetup,
+    ValidationSetup,
+)
 from validation import (
     DatasetFidelityMetric,
     Evaluator,
@@ -413,20 +418,48 @@ _MEMORY_KEYS = (
 )
 
 
+_PROMPTING_KEYS = (
+    "system_prompt", "structured_output", "prompt_caching", "prompt_builder",
+    "user_instructions",
+)
+_CHUNKING_KEYS = (
+    "min_words", "max_words", "include_options_chunks", "include_comment_chunks",
+    "max_merged_chunks", "max_merged_tokens", "databricks_mapping",
+)
+_VALIDATION_KEYS = ("validator", "retries")
+
+
+def _grouped(kwargs: dict) -> dict:
+    """Per-knob keyword arguments, sorted into the pipeline's grouped configs.
+
+    The grouping is the pipeline's contract; spelling it out at ~25 call sites
+    would bury what each of them is actually testing.
+    """
+    memory = {k: kwargs.pop(k) for k in list(kwargs) if k in _MEMORY_KEYS}
+    prompting = {k: kwargs.pop(k) for k in list(kwargs) if k in _PROMPTING_KEYS}
+    chunking = {k: kwargs.pop(k) for k in list(kwargs) if k in _CHUNKING_KEYS}
+    validation = {k: kwargs.pop(k) for k in list(kwargs) if k in _VALIDATION_KEYS}
+    return {
+        "memory_setup": MemorySetup(**memory),
+        "prompting": PromptingSetup(**prompting),
+        "chunking": ChunkingSetup(**chunking),
+        "validation": ValidationSetup(**validation),
+        **kwargs,
+    }
+
+
 def _pipeline(responses: list[str], **kwargs) -> SasLLMPipeline:
     # Every canned response in this module is a PySpark translation, so the
     # pipeline under test declares that target — the metrics take theirs from
     # it (ValidationRunner) and would otherwise score against the config
     # default.
     kwargs.setdefault("output_language", "PySpark")
-    # The pipeline takes memory wiring only as one MemorySetup; this helper
-    # keeps the per-knob spelling so its call sites stay about what they are
-    # testing rather than about construction.
-    memory = {key: kwargs.pop(key) for key in list(kwargs) if key in _MEMORY_KEYS}
+    # The pipeline takes its knobs only as grouped configs; this helper keeps
+    # the per-knob spelling so its call sites stay about what they are testing
+    # rather than about construction.
     return SasLLMPipeline(
-        memory_setup=MemorySetup(**memory),
         llm=FakeListChatModel(responses=responses),
-        **kwargs,
+        **_grouped(kwargs),
     )
 
 
@@ -863,10 +896,10 @@ def test_live_validator_scores_single_item_and_stores_in_kv():
 
 
 def _validated_pipeline(responses, validator=None, **kwargs):
+    kwargs["validator"] = validator or LiveValidator(output_language="PySpark")
     return SasLLMPipeline(
         llm=FakeListChatModel(responses=responses),
-        validator=validator or LiveValidator(output_language="PySpark"),
-        **kwargs,
+        **_grouped(kwargs),
     )
 
 
@@ -980,7 +1013,7 @@ def test_resume_without_stored_verdict_leaves_validation_none():
     resumed = SasLLMPipeline(
         llm=FakeListChatModel(responses=[GOOD_RESPONSE]),
         memory_setup=MemorySetup(memory=first._memory),
-        validator=LiveValidator(output_language="PySpark"),
+        validation=ValidationSetup(validator=LiveValidator(output_language="PySpark")),
     )
     outputs = resumed._process(
         items=[_wrap(_mk_chunk("c1")), _wrap(_mk_chunk("c2"))],
@@ -1000,9 +1033,8 @@ def _retry_pipeline(responses, retries=1, validator=None, **kwargs):
     kwargs.setdefault("output_language", "PySpark")
     return SasLLMPipeline(
         llm=FakeListChatModel(responses=responses),
-        validator=validator or LiveValidator(output_language=kwargs["output_language"]),
-        validation_retries=retries,
         **kwargs,
+        validation=ValidationSetup(validator=validator or LiveValidator(output_language=kwargs["output_language"]), retries=retries),
     )
 
 
@@ -1079,10 +1111,10 @@ def test_the_retry_note_tells_the_model_which_language_was_wrong():
 def test_a_validator_built_for_another_target_is_flagged_at_construction(caplog):
     with caplog.at_level("WARNING"):
         SasLLMPipeline(
-            llm=FakeListChatModel(responses=["ok"]),
-            output_language="SparkSQL",
-            validator=LiveValidator(output_language="PySpark"),
-        )
+        llm=FakeListChatModel(responses=["ok"]),
+        output_language="SparkSQL",
+        validation=ValidationSetup(validator=LiveValidator(output_language="PySpark")),
+    )
     assert any(
         "validator scores against PySpark" in record.message
         and "Spark SQL" in record.message
@@ -1126,7 +1158,7 @@ def test_resume_redoes_stored_failing_item_when_retries_enabled():
     first = SasLLMPipeline(
         llm=FakeListChatModel(responses=[PROSE_ONLY]),
         memory_setup=MemorySetup(memory=mem),
-        validator=LiveValidator(output_language="PySpark"),
+        validation=ValidationSetup(validator=LiveValidator(output_language="PySpark")),
     )
     first._process(items=[_wrap(c1)], diagnostics=[], thread_id="run::redo")
     assert first.get_validation_facts("run::redo")[0]["passed"] is False
@@ -1136,8 +1168,7 @@ def test_resume_redoes_stored_failing_item_when_retries_enabled():
     resumed = SasLLMPipeline(
         llm=FakeListChatModel(responses=[GOOD_RESPONSE, GOOD_RESPONSE]),
         memory_setup=MemorySetup(memory=mem),
-        validator=LiveValidator(output_language="PySpark"),
-        validation_retries=1,
+        validation=ValidationSetup(validator=LiveValidator(output_language="PySpark"), retries=1),
     )
     outputs = resumed._process(
         items=[_wrap(c1), _wrap(c2)], diagnostics=[], thread_id="run::redo", resume=True
@@ -1165,7 +1196,7 @@ def test_resume_keeps_passing_prefix_and_redoes_from_first_failure():
     first = SasLLMPipeline(
         llm=FakeListChatModel(responses=[GOOD_RESPONSE, PROSE_ONLY]),
         memory_setup=MemorySetup(memory=mem),
-        validator=LiveValidator(output_language="PySpark"),
+        validation=ValidationSetup(validator=LiveValidator(output_language="PySpark")),
     )
     first._process(items=[_wrap(c1), _wrap(c2)], diagnostics=[], thread_id="run::prefix")
     assert first.get_validation_facts("run::prefix")[0]["passed"] is True
@@ -1175,8 +1206,7 @@ def test_resume_keeps_passing_prefix_and_redoes_from_first_failure():
     resumed = SasLLMPipeline(
         llm=FakeListChatModel(responses=[GOOD_RESPONSE]),
         memory_setup=MemorySetup(memory=mem),
-        validator=LiveValidator(output_language="PySpark"),
-        validation_retries=1,
+        validation=ValidationSetup(validator=LiveValidator(output_language="PySpark"), retries=1),
     )
     outputs = resumed._process(
         items=[_wrap(c1), _wrap(c2)], diagnostics=[], thread_id="run::prefix", resume=True
@@ -1251,7 +1281,7 @@ def test_instructions_fingerprint_flows_into_report_and_rows():
 
     with_rules = SasLLMPipeline(
         llm=FakeListChatModel(responses=[GOOD_RESPONSE]),
-        user_instructions="## Rules\nAlways emit a risk table.",
+        prompting=PromptingSetup(user_instructions="## Rules\nAlways emit a risk table."),
     )
     report = ValidationRunner(with_rules).run([case])
     assert report.instructions_fingerprint == with_rules.instructions_fingerprint

@@ -31,7 +31,7 @@ from langchain_core.messages import AIMessage, SystemMessage
 
 from llm_client import LLMClientConfig
 from pipeline import SasLLMPipeline
-from pipeline.setup import MemorySetup
+from pipeline.setup import MemorySetup, PromptingSetup, ValidationSetup
 from memory.extractor import MemoryExtractor
 from memory.policy import TaskPolicy
 from memory.store import MemoryHub
@@ -52,14 +52,20 @@ class _RecordingChatModel:
         return AIMessage(f"## Analysis\nresp {len(self.prompts)}")
 
 
-# The memory knobs the pipeline now takes only as one MemorySetup. Kept as
-# individual arguments *of this helper* because that is what the ~20 call
-# sites below are about — which memory wiring produces which prompt — and
-# spelling the grouping out at each of them would bury the point.
+# The pipeline takes its knobs only as grouped configs. This helper keeps them
+# as individual arguments and does the grouping, because what the ~20 call
+# sites below are about is which memory wiring produces which prompt — and
+# spelling out three constructors at each of them would bury the point.
 _MEMORY_KEYS = (
     "memory", "task_id", "task_policy", "thread_memory", "memory_extractor",
-    "chat_id", "spark", "delta_table",
+    "chat_id", "spark", "delta_table", "window_k", "history_selector",
+    "summarizer",
 )
+_PROMPTING_KEYS = (
+    "system_prompt", "structured_output", "prompt_caching", "prompt_builder",
+    "user_instructions",
+)
+_VALIDATION_KEYS = ("validator", "retries")
 
 
 def _pipeline(llm=None, **kwargs) -> SasLLMPipeline:
@@ -67,11 +73,15 @@ def _pipeline(llm=None, **kwargs) -> SasLLMPipeline:
     # An empty instruction set keeps the standing-instructions file (if the
     # developer has one configured) out of these prompts.
     kwargs.setdefault("user_instructions", "")
-    memory = {key: kwargs.pop(key) for key in list(kwargs) if key in _MEMORY_KEYS}
+    memory = {k: kwargs.pop(k) for k in list(kwargs) if k in _MEMORY_KEYS}
+    prompting = {k: kwargs.pop(k) for k in list(kwargs) if k in _PROMPTING_KEYS}
+    validation = {k: kwargs.pop(k) for k in list(kwargs) if k in _VALIDATION_KEYS}
     model = kwargs.pop("model", "unused-because-llm-injected")
     return SasLLMPipeline(
         llm_config=LLMClientConfig(model=model),
         memory_setup=MemorySetup(**memory),
+        prompting=PromptingSetup(**prompting),
+        validation=ValidationSetup(**validation),
         llm=llm or _RecordingChatModel(),
         **kwargs,
     )

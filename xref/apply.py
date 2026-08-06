@@ -17,7 +17,9 @@
     .. code-block:: python
 
         text, _ = xref.pre.rewrite_source_text(text, mappings)   # paths, pre-chunk
-        pipeline = SasLLMPipeline(databricks_mapping=mappings.dataset_mapping)
+        pipeline = SasLLMPipeline(
+            chunking=ChunkingSetup(databricks_mapping=mappings.dataset_mapping)
+        )
 
     The second line is how :func:`apply_pre` reaches a real run: both batchers
     take ``databricks_mapping`` and apply it as a post-pass after grouping, so
