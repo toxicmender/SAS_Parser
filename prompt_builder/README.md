@@ -509,8 +509,12 @@ instructions/
     dataset_ops.md     SORT / APPEND / SET-union / dataset options
     datastep.md        RETAIN, ARRAY, OUTPUT, sequential-IF consolidation
     formats.md         PROC FORMAT and PUT with a user-defined format
+    lookup.md          hash-object lookups (the join they really are)
+    librefs.md         LIBNAME / FILENAME -> catalogs, schemas, volumes
+    ingest.md          PROC IMPORT/EXPORT, INFILE/INPUT -> COPY INTO
     proc_freq.md       PROC FREQ
     proc_univariate.md PROC UNIVARIATE
+    orchestration.md   [topic] SAS step sequence as a job DAG
     macros.md          macro variables, SYMPUT, macro decomposition
     examples.md        worked SAS -> Spark SQL pairs
   _common/           -> language-agnostic (the leading _ opts out of scoping)
