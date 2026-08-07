@@ -1,4 +1,4 @@
-## Macros and macro variables
+## [meta: invokes_macros, defines_macros, produces_macrovars] Macros and macro variables
 Spark SQL has no macro processor. A SAS macro variable reference (`&name`)
 resolves *before* the SQL runs, so translate it to a query parameter or a
 literal substituted at generation time — never emit `&name` into SQL. State

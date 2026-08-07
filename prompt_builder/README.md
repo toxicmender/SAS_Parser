@@ -488,8 +488,16 @@ SQL API docs](https://spark.apache.org/docs/latest/api/python/reference/pyspark.
 and checked against Spark 4.1.2 — load it with
 `from_dir("prompt_builder/instructions")` and run the pipeline with
 `output_language="SparkSQL"`. Review and adapt it to your project's
-conventions before relying on it; site-specific policy belongs in `_common/`
-or your own directory, not in the shipped `sparksql/` slice.
+conventions before relying on it.
+
+The shipped slice holds only guidance that is true of the *languages* —
+nothing about how your shop wants its SQL to look. House rules (parameterising
+hardcoded filters, leaving physical layout alone, emitting reconciliation
+queries) are illustrated in
+[`docs/instruction-examples/site-policy.md`](../docs/instruction-examples/site-policy.md),
+deliberately outside this tree so pointing `dir` at the bundled set never
+drags one organisation's conventions along. Copy it into your own directory
+and edit it.
 
 `[example: <keys>]` sections hold **few-shot worked pairs** — curated
 SAS → target translations demonstrating the full desired response shape
@@ -508,14 +516,26 @@ standing file named by `config.json` `user_instructions.path` (missing file =
 WARNING and continue).
 
 Selection priority per item: **user always → user construct-matched →
-user examples → reference pinned → hazard constructs → other constructs →
-user `[topic]` → reference topical** — the topical ranking is partitioned so
+user kind/meta-gated → user examples → reference pinned → hazard constructs →
+other constructs → user `[topic]` → reference topical** — the topical ranking is partitioned so
 every relevant user `[topic]` chunk precedes any reference hit, and `top_k`
 caps the tier as a whole. Operator rules and examples have first claim on
 the budget; one that doesn't fit logs a WARNING naming it.
+The three user-rule tiers run **most specific first**: unconditional rules,
+then rules matched on the item's exact constructs (`[when:]`/`[category:]`),
+then rules merely gated on its chunk kind or metadata (`[kind:]`/`[meta:]`
+with no primary scope). A `[kind: DATA_STEP]` note is broader than a rule
+naming the function the item actually calls, so it yields to it — otherwise a
+handful of broad notes fill the budget and the precise guidance, the reason
+the item retrieved anything at all, is what gets dropped.
+
 `user_instructions.max_words` (config or the `user_max_words` argument)
 additionally caps the user chunks (rules and examples together) inside the
-overall budget. Selected rules render in a `## Project instructions` block
+overall budget. **Set it whenever the instruction set is large.** With the
+bundled SparkSQL set and the default 1500-word budget, uncapped operator
+rules take ~1500 words on a date-and-hashing-heavy item and leave nothing for
+reference retrieval; `900` still admits every rule matching that item's own
+constructs and leaves ~650 words for the corpus. Selected rules render in a `## Project instructions` block
 above the reference guidance, with the operator's own headings and no page
 citations; selected examples render in a `## Worked examples` block placed
 last.

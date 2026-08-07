@@ -1,4 +1,4 @@
-## Date and datetime epoch
+## [category: date_time] Date and datetime epoch
 ⚠️ SAS counts from **1960-01-01**; Spark SQL `DATE`/`TIMESTAMP` count from
 1970-01-01. The offset is 3653 days, or 315 619 200 seconds. A raw SAS numeric
 cast directly to a date is wrong by exactly that.

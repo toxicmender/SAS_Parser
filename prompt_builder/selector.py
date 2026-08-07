@@ -161,6 +161,7 @@ class InstructionSelector:
         # word counts, and the ranker index stay uniform) but are tracked by
         # scope and excluded from the reference-only structures below.
         self._user_always: list[int] = []
+        self._user_gated: list[int] = []
         self._user_conditional: list[tuple[frozenset[ConstructKey], int]] = []
         self._user_examples: list[tuple[frozenset[ConstructKey], int]] = []
         self._user_topical: set[int] = set()
@@ -180,10 +181,20 @@ class InstructionSelector:
                     )
                 elif scope == SCOPE_TOPIC:
                     self._user_topical.add(idx)
+                elif kinds_of(chunk) or metas_of(chunk):
+                    # No primary scope, but gated on chunk kind / metadata:
+                    # conditional in practice, so it claims budget *after* the
+                    # construct-matched rules rather than ahead of them. A
+                    # `[kind: DATA_STEP]` note is broader than a rule naming
+                    # the exact function the item calls, and letting the broad
+                    # one win drops the precise one — which is the guidance
+                    # the item most needed.
+                    self._user_gated.append(idx)
                 else:
                     self._user_always.append(idx)
         self._user_rule_indices = (
             set(self._user_always)
+            | set(self._user_gated)
             | {idx for _, idx in self._user_conditional}
             | {idx for _, idx in self._user_examples}
         )
@@ -360,6 +371,9 @@ class InstructionSelector:
             return True
 
         # Tiers 1-3 — operator rules and examples, first claim on the budget.
+        # Within them, most specific first: unconditional rules, then rules
+        # matched on the item's exact constructs, then rules merely gated on
+        # its chunk kind or metadata flags.
         constructs = list(constructs)
         construct_set = set(constructs)
         for idx in self._user_always:
@@ -369,6 +383,8 @@ class InstructionSelector:
                 # The matched key, in the caller's (meaningful) order.
                 matched = next(k for k in constructs if k in keys)
                 add(idx, SelectionTier.USER_WHEN, matched, warn_overflow=True)
+        for idx in self._user_gated:
+            add(idx, SelectionTier.USER_ALWAYS, warn_overflow=True)
         for keys, idx in self._user_examples:
             if not keys:  # unconditional example
                 add(idx, SelectionTier.USER_EXAMPLE, warn_overflow=True)

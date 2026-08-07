@@ -1,12 +1,8 @@
-SAS DATA-step and macro-time functions map to Spark SQL **built-in functions**
-(see the [Spark SQL functions
-reference](https://spark.apache.org/docs/latest/api/sql/index.html)). Reach for
-a built-in before hand-rolling a `CASE`/regex; most SAS scalar functions have a
-direct Spark equivalent. The gotchas below are where the *semantics* differ —
-translate the intent, not the name. Date/time functions (`INTNX`, `INTCK`,
-`PUT`/`INPUT` with date formats, `TODAY`, …) are covered separately in the
-datetime guidance; this section is string, numeric, and null/conditional
-functions.
+## [category: character, descriptive_statistics, truncation, special] Scalar function mapping
+Most SAS scalar functions have a direct Spark [built-in
+equivalent](https://spark.apache.org/docs/latest/api/sql/index.html); reach for
+one before hand-rolling a `CASE` or a regex. The sections below are the cases
+where the *semantics* differ — translate the intent, not the name.
 
 ## [when: function:coalesce, function:coalescec] COALESCE
 `COALESCE(a, b, …)` (and character `COALESCEC`) both map directly to Spark
