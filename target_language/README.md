@@ -33,9 +33,15 @@ target = resolve_target_language("spark sql")
 target.display_name        # "Spark SQL" — the only spelling that reaches a prompt
 target.default_fence       # "sql"       — the tag translated code must carry
 target.cell_language       # "sql"       — notebook cell / schema `language`
+target.comment_prefix      # "--"        — line-comment token for the prompt
 target.owns_fence("sql")   # True; owns_fence("python") is False
 target.check_syntax(sql)   # None when it parses, else an error message
 ```
+
+`comment_prefix` exists so the system prompt can ask for a
+`-- NOT CONVERTIBLE TO Spark SQL: <reason>` marker without hard-coding one
+target's comment syntax — the templates interpolate `{comment_prefix}` and
+the same sentence renders as `#` for PySpark and `//` for Spark Scala.
 
 Normally you do not call this directly: `SasLLMPipeline` resolves at
 construction and exposes the result as `.target_language`, and everything
@@ -43,11 +49,11 @@ downstream should take it from there.
 
 ## Targets
 
-| Target | Folds from | Fences | Kernel | Complexity profile |
-|---|---|---|---|---|
-| PySpark | `pyspark`, `python`, `python3`, `py` | `python`, `py`, `pyspark` | python3 | `pyspark` |
-| Spark SQL | `sparksql`, `spark sql`, `sql`, `databrickssql` | `sql`, `sparksql` | sql | `sparksql` |
-| Spark Scala | `sparkscala`, `scala` | `scala` | scala | `pyspark` |
+| Target | Folds from | Fences | Kernel | Comment | Complexity profile |
+|---|---|---|---|---|---|
+| PySpark | `pyspark`, `python`, `python3`, `py` | `python`, `py`, `pyspark` | python3 | `#` | `pyspark` |
+| Spark SQL | `sparksql`, `spark sql`, `sql`, `databrickssql` | `sql`, `sparksql` | sql | `--` | `sparksql` |
+| Spark Scala | `sparkscala`, `scala` | `scala` | scala | `//` | `pyspark` |
 
 Spelling is folded case-, space-, hyphen-, and underscore-insensitively — the
 same rule `prompt_builder` matches `[lang: ...]` directive tokens with, which

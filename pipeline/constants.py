@@ -18,11 +18,13 @@ validation suite scores the emitted fences against exactly these.
 _LANGUAGE_RULE = """\
 ## Target language (strict)
 Translate into {output_language} and nothing else. Do not emit any other
-target language — not as an alternative, not as a fallback, and not "for
-comparison" — and never present the original SAS as the translation. If a
-SAS construct has no clean {output_language} equivalent, say so in the risks
-and give the closest {output_language} form; do not switch languages to make
-it fit.
+target language as runnable code — not as an alternative, not as a fallback,
+and not "for comparison" — and never present the original SAS as the
+translation. If a SAS construct has no clean {output_language} equivalent,
+say so in the risks and give the closest {output_language} form; do not
+switch languages to make it fit. The single exception is the
+`NOT CONVERTIBLE` marker described below, whose suggested equivalent is
+always commented out and therefore never runs.
 """
 
 # The preamble both templates open with — same wording, so a run reads the
@@ -61,9 +63,25 @@ every block of translated code carries it and nothing else does. When
 translating a batch, preserve execution order across member chunks/files and
 make cross-file/cross-chunk dependencies explicit.
 
+Preserve what the SAS source specifies: table and column names, join types,
+filter predicates, grouping, ordering, and any de-duplication it asks for.
+Renaming or dropping one of those is a decision to report under Risks, never
+a silent one. Equally, add nothing it does not ask for \u2014 no extra
+aggregations, statistics, orderings, or physical-layout directives.
+
+An input dataset that no earlier step produces is an external dependency:
+name it as one rather than inventing a definition for it.
+
 ## Risks
 Flag every P0 silent-error risk with a \u26a0\ufe0f marker. If a translation is
 ambiguous or unsafe, say so explicitly rather than guessing.
+
+Where a construct genuinely has no {output_language} equivalent, mark the
+spot in the code with a comment reading
+`{comment_prefix} NOT CONVERTIBLE TO {output_language}: <reason>`, follow it
+with the closest equivalent **commented out**, and explain it here. That
+marker is the one place another language may appear, and only ever as a
+comment - never as code.
 
 Reason as thoroughly as the item requires in Analysis and Mapping; keep
 Translation and Risks concise.
@@ -100,9 +118,20 @@ every field:
   the member id it implements, exactly as listed under '## Batch members' — it
   routes the cell into its source file's notebook (a cell serving several
   members carries the id of the one whose step it completes).
+  Preserve what the SAS source specifies: table and column names, join types,
+  filter predicates, grouping, ordering, and any de-duplication it asks for —
+  renaming or dropping one of those belongs in `risks`, never silent. Equally,
+  add nothing it does not ask for: no extra aggregations, statistics,
+  orderings, or physical-layout directives. An input dataset no earlier step
+  produces is an external dependency; name it as one rather than inventing a
+  definition. Where a construct genuinely has no {output_language} equivalent,
+  mark the spot with a
+  `{comment_prefix} NOT CONVERTIBLE TO {output_language}: <reason>` comment and
+  follow it with the closest equivalent **commented out** — that marker is the
+  one place another language may appear, and only ever as a comment.
 - `risks`: every risk worth flagging, worst first, P0 for a silent-error risk.
   If a translation is ambiguous or unsafe, say so explicitly rather than
-  guessing.
+  guessing. Include every `NOT CONVERTIBLE` marker left in the cells.
 
 Reason as thoroughly as the item requires in `analysis` and `mapping`; keep
 the cells and `risks` concise.

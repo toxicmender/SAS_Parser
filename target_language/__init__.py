@@ -157,6 +157,11 @@ class TargetLanguage:
     cell_language
         What a notebook code cell records as its language, and the value the
         structured schema's ``TranslationCell.language`` is asked for.
+    comment_prefix
+        The line-comment token (``--``, ``#``, ``//``). The system prompt
+        interpolates it so the "not convertible" marker is spelled in the
+        target's own comment syntax — one place resolves it, rather than each
+        caller guessing.
     kernelspec, language_info
         The notebook-level metadata blocks (nbformat v4.5).
     complexity_profile
@@ -175,6 +180,7 @@ class TargetLanguage:
     kernelspec: dict[str, str]
     language_info: dict[str, str]
     complexity_profile: str
+    comment_prefix: str
     syntax_checker: Callable[[str], str | None] = field(
         repr=False, default=_check_none
     )
@@ -237,6 +243,7 @@ PYSPARK = TargetLanguage(
     kernelspec=_PYTHON_KERNELSPEC,
     language_info=_PYTHON_LANGUAGE_INFO,
     complexity_profile="pyspark",
+    comment_prefix="#",
     syntax_checker=_check_python,
 )
 
@@ -254,6 +261,7 @@ SPARKSQL = TargetLanguage(
         "mimetype": "application/sql",
     },
     complexity_profile="sparksql",
+    comment_prefix="--",
     syntax_checker=_check_sql,
 )
 
@@ -273,6 +281,7 @@ SPARKSCALA = TargetLanguage(
     # No Scala rule set of its own; the DataFrame-API profile is the closer
     # of the two (same constructs, different surface syntax).
     complexity_profile="pyspark",
+    comment_prefix="//",
 )
 
 KNOWN_TARGETS: tuple[TargetLanguage, ...] = (PYSPARK, SPARKSQL, SPARKSCALA)

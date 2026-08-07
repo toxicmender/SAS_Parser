@@ -532,7 +532,7 @@ class SasLLMPipeline:
             if self._structured_output
             else _SYSTEM_PROMPT_TEMPLATE
         )
-        # Both templates are filled with all three target facts; each uses the
+        # Both templates are filled with every target fact; each uses the
         # subset it needs (the Markdown one names the fence tag, the
         # structured one the cell `language` value), and .format() ignores the
         # rest.
@@ -540,6 +540,7 @@ class SasLLMPipeline:
             output_language=target.display_name,
             fence_info=target.default_fence,
             cell_language=target.cell_language,
+            comment_prefix=target.comment_prefix,
         )
         # The long-term task policy rides INSIDE the cached system block: it
         # is the same text for every thread and every item of the run, so it
