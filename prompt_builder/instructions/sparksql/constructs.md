@@ -14,6 +14,13 @@ almost directly, then adjust for these differences:
 - `monotonic()`/`number()`-style row numbering maps to
   `ROW_NUMBER() OVER (ORDER BY ...)`; an unordered SAS row counter has no
   faithful Spark equivalent — call that out.
+- ⚠️ **Do not emit `QUALIFY`.** Databricks SQL accepts it, so it is an easy
+  reflex, but it is **not in open-source Spark SQL** and the statement fails
+  to parse there. Filter a window function through a CTE or subquery instead:
+  compute `ROW_NUMBER() OVER (...) AS rn` inside, then `WHERE rn = 1` outside.
+- `CREATE VIEW` (and a DATA step's `/ VIEW=` option) defines a stored query,
+  not a table: map it to `CREATE OR REPLACE TEMP VIEW`. Keep it a view —
+  materialising it into a table changes when the query runs and what it sees.
 
 ## [kind: DATA_STEP] MERGE and BY-group joins
 A SAS `DATA` step `MERGE a b; BY key;` is a full outer join on `key`, not an
@@ -34,14 +41,29 @@ guessing.
 accumulators across a BY group become `SUM(...) OVER (PARTITION BY ... ORDER
 BY ...)`.
 
-## [when: proc:means, proc:summary] Summary statistics
+## [when: proc:means, proc:summary] [kind: PROC_STEP] Summary statistics
 `PROC MEANS` / `PROC SUMMARY` map to `GROUP BY` with aggregate functions
 (`AVG`, `SUM`, `MIN`, `MAX`, `COUNT`, `STDDEV`). The `CLASS` variables are
-the `GROUP BY` keys; `VAR` variables are the aggregated columns; a `TYPES` /
-`WAYS` request for multiple subtotal levels maps to `GROUPING SETS`,
-`ROLLUP`, or `CUBE`. Remember Spark aggregates skip `NULL`, so `N` vs
-`NMISS` must be `COUNT(col)` vs `SUM(CASE WHEN col IS NULL THEN 1 ELSE 0
-END)`.
+the `GROUP BY` keys; `VAR` variables are the aggregated columns. Remember
+Spark aggregates skip `NULL`, so `N` vs `NMISS` must be `COUNT(col)` vs
+`SUM(CASE WHEN col IS NULL THEN 1 ELSE 0 END)`.
+
+⚠️ **Subtotals are opt-in, and the default is the trap.** Without `NWAY`, SAS
+emits *every* combination of CLASS levels — the grand total (`_TYPE_=0`),
+each one-way margin, and so on — and a plain `GROUP BY` reproduces only the
+last of those. So: `NWAY` -> a plain `GROUP BY` on all CLASS variables (the
+common case); a `TYPES` / `WAYS` request -> `GROUPING SETS` / `ROLLUP` /
+`CUBE` naming exactly the requested levels. Never add a `ROLLUP` the SAS did
+not ask for, and where the source relies on `_TYPE_` or `_FREQ_`, reproduce
+them explicitly (`GROUPING_ID()` and `COUNT(*)`).
+
+⚠️ **`MISSING`**: by default `PROC MEANS` drops observations whose CLASS
+variable is missing, while Spark `GROUP BY` keeps `NULL` as a group. Add
+`WHERE <class vars> IS NOT NULL` unless the SAS specifies `MISSING`.
+
+`OUTPUT OUT=` names the result dataset, and its `stat=name` options name the
+columns — alias every aggregate to the SAS output variable name exactly, so a
+later step reading `mean_amt` still finds it.
 
 ## [when: proc:transpose] PROC TRANSPOSE
 Long-to-wide maps to conditional aggregation (`MAX(CASE WHEN key = 'x' THEN

@@ -9,6 +9,13 @@ after the SAS output dataset (`work.foo` -> a view/table `foo`). Keep one
 statement per logical step; do not collapse several SAS steps into a single
 opaque query unless they are a trivial rename.
 
+Pick the statement by where the SAS wrote: a temporary dataset (`work.*`, or
+an unqualified name) -> `CREATE OR REPLACE TEMP VIEW`; a permanent libref
+-> `CREATE TABLE ... AS SELECT`. Inside one step, lift each stage of a
+multi-part transformation into its own named CTE rather than nesting
+subqueries — a long `CASE` chain or a repeated aggregate reads better named
+once, and the CTE names carry the SAS step's intent into the SQL.
+
 ## Set-based, not row-by-row
 SAS DATA steps iterate the PDV row by row with implicit retain and `_N_`.
 Spark SQL is declarative and unordered. Re-express row logic as set

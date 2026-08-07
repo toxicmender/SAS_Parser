@@ -16,6 +16,33 @@ When the SAS value is a wall-clock reading rather than an instant, target
 `TIMESTAMP_NTZ` (`CAST(... AS TIMESTAMP_NTZ)`) to preserve it exactly. State
 the epoch *and* the timezone assumption in Mapping.
 
+## [category: date_time] Date literals and date parts
+**Literals.** A SAS date constant is a quoted string with a type suffix; it is
+not a string in Spark:
+`'01JAN2020'd` -> `DATE '2020-01-01'`,
+`'01JAN2020:09:30:00'dt` -> `TIMESTAMP '2020-01-01 09:30:00'`,
+`'09:30:00't` -> a time value or an interval, depending on use. Never leave
+the SAS spelling quoted — `'01JAN2020'` compared against a `DATE` column is a
+string-vs-date comparison that ANSI mode rejects outright.
+
+**Extractors** are one-to-one: `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND`
+-> `year`/`month`/`day`/`hour`/`minute`/`second`, `QTR` -> `quarter`,
+`DATEPART(dt)` -> `CAST(dt AS DATE)`, `TIMEPART(dt)` -> `DATE_FORMAT(dt,
+'HH:mm:ss')`. Constructors: `MDY(m,d,y)` -> `make_date(y, m, d)` (⚠️ **reversed
+argument order**), `DHMS(d,h,m,s)` -> `make_timestamp(...)` or the epoch
+arithmetic above, `HMS(h,m,s)` -> `make_interval(0,0,0,0,h,m,s)`.
+
+⚠️ **`WEEKDAY` maps to `dayofweek`, not `weekday`.** SAS `WEEKDAY()` returns
+1=Sunday … 7=Saturday. Spark's `dayofweek` uses exactly that numbering;
+Spark's similarly-named `weekday` returns 0=Monday … 6=Sunday. Reaching for
+the name-alike shifts every value and changes which rows a weekend filter
+selects.
+
+⚠️ `HOLIDAY`, `HOLIDAYCK`, and `HOLIDAYCOUNT` read SAS's built-in holiday
+calendar, which **has no Spark equivalent**. Emit the non-convertible marker
+and translate against an explicit calendar/holiday lookup table joined into
+the query — never approximate a holiday as "not a weekend".
+
 ## [when: function:intnx] INTNX -> date arithmetic
 `INTNX('interval', start, n, 'alignment')` advances a date/datetime by `n`
 intervals. Map the interval:
