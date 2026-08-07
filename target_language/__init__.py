@@ -94,11 +94,13 @@ def _check_sql(source: str) -> str | None:
     result can fail an item and drive a retry, and a heuristic that guesses
     would spend LLM calls re-answering correct translations.
 
-    The ``databricks`` dialect, not ``spark``: this target's guidance emits
-    ``QUALIFY``, SQL scripting, and ``EXECUTE IMMEDIATE``, which open-source
-    Spark does not have. sqlglot's ``spark`` dialect happens to accept all of
-    them today, so the two agree — but it would be within its rights to tighten,
-    and that would start failing correct translations.
+    The dialect is ``databricks`` because that is what this target *is*: the
+    bundled guidance emits ``QUALIFY``, SQL scripting, ``EXECUTE IMMEDIATE``
+    and three-level names, none of which open-source Spark has. It also keeps
+    the two sqlglot consumers agreeing — ``xref.rewrite`` parses the *same*
+    generated SQL under ``xref.dialect``, which defaults to ``databricks`` —
+    and one checker calling a statement valid while the other fails to parse it
+    is precisely the split-brain this module exists to prevent.
     """
     try:
         import sqlglot

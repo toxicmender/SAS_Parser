@@ -179,7 +179,21 @@ def test_sql_uses_sqlglot_when_it_is_importable(monkeypatch):
     assert SPARKSQL.check_syntax("SELECT 1") is None
     error = SPARKSQL.check_syntax("BROKEN")
     assert error is not None and "ParseError" in error
-    # The Databricks dialect, not the generic one — and not `spark`, which
-    # would be within its rights to reject the QUALIFY / SQL-scripting /
-    # EXECUTE IMMEDIATE syntax this target's guidance emits.
+    # Databricks, not the generic dialect and not `spark`: this target emits
+    # QUALIFY, SQL scripting and EXECUTE IMMEDIATE, which open-source Spark
+    # does not have.
     assert {dialect for _, dialect in calls} == {"databricks"}
+
+
+def test_syntax_checker_and_xref_rewriter_agree_on_the_dialect():
+    """The two sqlglot consumers must read the same SQL the same way.
+
+    `xref.rewrite` parses the *generated* SQL to rewrite table references and
+    returns it unchanged when it does not parse. If the checker accepted a
+    statement the rewriter could not read, the rewrite would silently no-op on
+    exactly the Databricks-only syntax this target emits — a split-brain that
+    shows up as missing table rewrites, not as an error.
+    """
+    from xref.rewrite import DEFAULT_DIALECT
+
+    assert DEFAULT_DIALECT == "databricks"

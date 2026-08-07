@@ -74,11 +74,15 @@ Spark SQL uses **sqlglot** (`pip install 'sas-parser[sql]'`) with the
 flags only unbalanced brackets and quotes — deliberately conservative, because
 a false failure here spends an LLM call re-answering a correct item.
 
-The dialect is `databricks` rather than `spark` because the bundled instruction
-set targets Databricks and emits `QUALIFY`, SQL scripting, and
-`EXECUTE IMMEDIATE`. sqlglot's `spark` dialect accepts all of those today, so
-the two agree — but it would be within its rights to tighten, and that would
-start failing correct translations. `checker_name` reports which ran, and
+The dialect is `databricks` because that is what this target is: the bundled
+instruction set emits `QUALIFY`, SQL scripting, `EXECUTE IMMEDIATE` and
+three-level names, none of which open-source Spark has.
+
+It also keeps the repo's two sqlglot consumers in agreement. `xref.rewrite`
+parses the *same* generated SQL to rewrite table references, under
+`xref.dialect` — which already defaulted to `databricks`. A checker calling a
+statement valid while the rewriter fails to parse it (and so silently returns
+it un-rewritten) is exactly the split-brain this package exists to prevent. `checker_name` reports which ran, and
 the metric puts it in its `details`. Spark Scala has no checker, so
 `checks_syntax` is `False` and the metric skips rather than passing everything.
 
