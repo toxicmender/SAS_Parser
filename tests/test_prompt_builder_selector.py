@@ -252,6 +252,43 @@ def test_top_k_caps_user_and_reference_topical_together():
     assert "c4" not in ids
 
 
+def test_construct_matched_rules_outrank_kind_gated_ones():
+    """Most specific first, within the operator tiers.
+
+    ``[kind:]``/``[meta:]`` are modifiers, so a section carrying only those
+    still has primary scope 'always'. Left in the always tier it claimed the
+    budget ahead of rules matched on the item's actual constructs — so a
+    broad "this is a DATA step" note could evict the guidance for the exact
+    function the step called, which is the guidance it retrieved anything for.
+    """
+    rules = (
+        "## [kind: DATA_STEP] Broad\n" + "wide " * 40 + "\n\n"
+        "## [when: function:intnx] Precise\n" + "narrow " * 40 + "\n"
+    )
+    sel = InstructionSelector(
+        [], user_instructions=UserInstructionSet.from_text(rules)
+    )
+    # Room for exactly one of the two rules.
+    out = sel.select("zzz", [INTNX], max_words=45, kinds={"DATA_STEP"})
+    assert [c.section_path for c in out] == ["Precise"]
+
+    # With room for both, the precise rule still comes first.
+    out = sel.select("zzz", [INTNX], max_words=200, kinds={"DATA_STEP"})
+    assert [c.section_path for c in out] == ["Precise", "Broad"]
+
+
+def test_kind_gated_rule_still_precedes_reference_chunks():
+    """Demoting it below construct-matched rules must not push it below the
+    reference corpus — it is still an operator rule."""
+    rules = "## [kind: DATA_STEP] Broad\nwide guidance here.\n"
+    sel = InstructionSelector(
+        _corpus(), user_instructions=UserInstructionSet.from_text(rules)
+    )
+    out = sel.select("zzz", [INTNX], max_words=10_000, kinds={"DATA_STEP"})
+    ids = [c.chunk_id for c in out]
+    assert ids[0].startswith("user::")
+
+
 def test_user_max_words_caps_user_block_only(caplog):
     import logging
 

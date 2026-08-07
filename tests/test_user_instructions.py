@@ -239,6 +239,45 @@ def test_meta_directive_scopes_a_section():
     assert ins.diagnostics == []
 
 
+def test_category_directive_is_a_conditional_scope():
+    """``[category:]`` is sugar for ``[when: category:x]`` — a primary scope,
+    unlike the ``kind``/``meta`` modifiers, because it matches on construct
+    keys the pipeline derives from the item's functions."""
+    ins = UserInstructionSet.from_text(
+        "## [category: date_time, Hashing-Security] Rule\nbody"
+    )
+    chunk = ins.chunks[0]
+    assert scope_of(chunk) == SCOPE_WHEN
+    assert set(chunk.construct_keys) == {
+        ConstructKey(kind="category", name="date_time"),
+        ConstructKey(kind="category", name="hashing_security"),
+    }
+    assert chunk.section_path == "Rule"
+    assert ins.diagnostics == []
+
+
+def test_category_directive_stacks_with_modifiers():
+    ins = UserInstructionSet.from_text(
+        "## [category: date_time] [kind: DATA_STEP] [lang: sparksql] Rule\nbody"
+    )
+    chunk = ins.chunks[0]
+    assert scope_of(chunk) == SCOPE_WHEN
+    assert chunk.construct_keys == [
+        ConstructKey(kind="category", name="date_time")
+    ]
+    assert kinds_of(chunk) == ["DATA_STEP"]
+    assert langs_of(chunk) == ["sparksql"]
+
+
+def test_empty_category_directive_degrades_to_always_on():
+    """Over-include rather than silently drop, as ``[when:]`` does."""
+    ins = UserInstructionSet.from_text("## [category: ] Rule\nbody")
+    chunk = ins.chunks[0]
+    assert scope_of(chunk) == SCOPE_ALWAYS
+    assert chunk.construct_keys == []
+    assert [d.code for d in ins.diagnostics] == ["INVALID_CONSTRUCT_KEY"]
+
+
 def test_all_modifiers_stack_with_a_primary_scope():
     ins = UserInstructionSet.from_text(
         "## [when: proc:sql] [kind: PROC_STEP] [meta: symput_hazard] "
@@ -407,6 +446,44 @@ def test_from_dir_missing_directory_returns_empty(tmp_path, caplog):
         ins = UserInstructionSet.from_dir(str(tmp_path / "nope"))
     assert len(ins) == 0
     assert "not a directory" in caplog.text
+
+
+def test_from_dir_skips_documentation_files(tmp_path):
+    """A README describes the rules; it must not become one of them.
+
+    An instructions directory almost always carries a README, and prose about
+    the directive grammar parses as perfectly good always-on sections — which
+    are then prompted with every item, for every target.
+    """
+    (tmp_path / "sparksql").mkdir()
+    (tmp_path / "README.md").write_text(
+        "## Layout convention\nProse about the directory.", encoding="utf-8"
+    )
+    (tmp_path / "sparksql" / "readme.md").write_text(
+        "## Nested doc\nAlso prose.", encoding="utf-8"
+    )
+    (tmp_path / "sparksql" / "_draft.md").write_text(
+        "## Draft\nNot ready.", encoding="utf-8"
+    )
+    (tmp_path / "sparksql" / "rules.md").write_text(
+        "## Real rule\nEmit Spark SQL.", encoding="utf-8"
+    )
+    ins = UserInstructionSet.from_dir(str(tmp_path))
+    assert [c.section_path for c in ins.chunks] == ["Real rule"]
+
+
+def test_from_dir_underscore_file_and_underscore_directory_differ(tmp_path):
+    """``_`` means "skip" on a file and "language-agnostic" on a directory."""
+    (tmp_path / "_common").mkdir()
+    (tmp_path / "_common" / "shared.md").write_text(
+        "## Shared\nApplies everywhere.", encoding="utf-8"
+    )
+    (tmp_path / "_common" / "_wip.md").write_text(
+        "## WIP\nSkipped.", encoding="utf-8"
+    )
+    ins = UserInstructionSet.from_dir(str(tmp_path))
+    assert [c.section_path for c in ins.chunks] == ["Shared"]
+    assert langs_of(ins.chunks[0]) == []
 
 
 # ---------------------------------------------------------------------------

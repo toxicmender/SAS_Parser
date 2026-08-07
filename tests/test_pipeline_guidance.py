@@ -99,6 +99,41 @@ def test_constructs_for_item_maps_functions_and_hazards():
     assert ConstructKey(kind="call_routine", name="symput") in keys  # hazard added
 
 
+def test_constructs_for_item_adds_function_category_keys():
+    """Every recognised function also contributes its family key, so a
+    ``[category: date_time]`` rule fires without enumerating members."""
+    keys = _constructs_for_item(_batch(_intnx_chunk()))
+    assert ConstructKey(kind="category", name="date_time") in keys
+
+
+def test_category_keys_come_after_the_specific_ones():
+    """Specific before general: a rule naming the exact function is offered
+    ahead of one covering its whole family."""
+    keys = _constructs_for_item(_batch(_intnx_chunk()))
+    kinds = [k.kind for k in keys]
+    assert kinds.index("function") < kinds.index("category")
+
+
+def test_constructs_for_item_emits_no_category_for_unmapped_functions():
+    """An unmapped name contributes nothing — the same as having no rule."""
+    text = "data a; set b; x = airy(y); run;"
+    chunk = SasChunk(
+        chunk_id="c9",
+        source_id="etl.sas",
+        text=text,
+        kind=SasChunkKind.DATA_STEP,
+        title="airy",
+        start_line=1,
+        end_line=1,
+        start_char=0,
+        end_char=len(text),
+        metadata=SasChunkMetadata(recognized_functions=["airy"]),
+    )
+    keys = _constructs_for_item(_batch(chunk))
+    assert ConstructKey(kind="function", name="airy") in keys
+    assert [k for k in keys if k.kind == "category"] == []
+
+
 def test_query_for_item_uses_constructs_not_dataset_names():
     query = _query_for_item(_batch(_intnx_chunk()))
     assert "intnx" in query

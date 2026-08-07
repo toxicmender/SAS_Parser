@@ -110,6 +110,22 @@ def test_owns_fence(target, info, owned):
     assert target.owns_fence(info) is owned
 
 
+@pytest.mark.parametrize(
+    "target,prefix",
+    [(SPARKSQL, "--"), (PYSPARK, "#"), (SPARKSCALA, "//")],
+)
+def test_comment_prefix(target, prefix):
+    """The system prompt interpolates this to spell the NOT CONVERTIBLE
+    marker in the target's own comment syntax."""
+    assert target.comment_prefix == prefix
+
+
+def test_every_target_defines_a_comment_prefix():
+    from target_language import KNOWN_TARGETS
+
+    assert all(t.comment_prefix for t in KNOWN_TARGETS)
+
+
 # ---------------------------------------------------------------------------
 # Syntax checking
 # ---------------------------------------------------------------------------

@@ -91,7 +91,7 @@ For running the work items end-to-end through an LLM, see the
 | File | Role |
 |------|------|
 | `models.py` | Pydantic models: `SasChunk` (+`Kind`), `SasChunkMetadata`, `SasChunkResult`, `SasCorpus`, `SasBatch`, `SasBatchResult`, `SasDiagnostic` (+`Severity`). |
-| `keywords.py` | SAS keyword catalogues transcribed from the SAS docs (reserved macro words, autocall macros, function / CALL-routine dictionaries) + the patterns compiled from them. Pure data; no package imports, no logging. |
+| `keywords.py` | SAS keyword catalogues transcribed from the SAS docs (reserved macro words, autocall macros, function / CALL-routine dictionaries, and `SAS_FUNCTION_CATEGORIES`) + the patterns compiled from them. Pure data; no package imports, no logging. |
 | `scanner.py` | Lexical layer: `_Unit` / `_Region` parse primitives, the statement classifier (`_classify`), text normalisation / sanitisation, line-offset helpers, and the `_Deadline` / `_ParseWatchdog` stuck-parser machinery. |
 | `metadata.py` | Per-chunk semantic extraction: `_metadata_for`, `_io_for` (directed dataset I/O), `_macro_body_io` (literal vs parameterised body refs), symput / SQL-INTO / CALL EXECUTE extractors, `_merge_meta`, and the extraction regex catalogue. |
 | `chunker.py` | `SasSemanticChunker` orchestration (scan → group → build chunks, oversized-split with overlap). |
@@ -210,6 +210,16 @@ these silently changes behavior.
    and SAS-provided autocall macros in `_STANDARD_AUTOCALL_MACROS` — the three
    sets have distinct, citable identities and distinct consumers; do not fold
    them together.
+7. **`SAS_FUNCTION_CATEGORIES` is advisory and deliberately partial.** It maps
+   a function or routine name to its family in *SAS Functions and CALL Routines
+   by Category*, and its only consumer is `prompt_builder`'s `[category: ...]`
+   instruction scope (reached via `pipeline.prompting._constructs_for_item`, so
+   `prompt_builder` still imports nothing from here). Only families that carry
+   translation guidance are mapped — an unmapped name contributes no category
+   key, which is the same as having no rule for it. Every mapped name must
+   exist in `_SAS_FUNCTIONS` or `_SAS_CALL_ROUTINES`;
+   `tests/test_bundled_instructions.py` enforces both ends, so a typo cannot
+   silently create a category nothing can ever match.
 
 ## Logging
 
