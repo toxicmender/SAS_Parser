@@ -363,6 +363,9 @@ One fenced PySpark block per SAS step, then a risk table.
 ## [when: proc:sql, component_object:hash] Lookup rules  <- construct-scoped
 Prefer broadcast joins when the lookup side is small.
 
+## [category: date_time] Date family rules            <- function-family-scoped
+One section covering every date/time function.
+
 ## [topic] Partitioning guidance                       <- retrieved by ranking
 Wide fact tables are partitioned by load_date.
 
@@ -375,6 +378,29 @@ Translate PROC SQL directly to Spark SQL.               (stacked groups)
 ## [kind: DATA_STEP] [meta: symput_hazard] SYMPUT       <- kind/metadata-scoped
 Trace the write/read ordering before translating.
 ```
+
+### Family scoping (`[category:]`)
+
+`## [category: date_time, hashing_security] Rule` fires when the item uses
+*any* function in one of those SAS families, so one section covers a whole
+category without enumerating its members. It is **sugar for
+`[when: category:date_time]`**: `pipeline.prompting._constructs_for_item`
+derives a `category` construct key per recognised function from
+`chunker.keywords.SAS_FUNCTION_CATEGORIES`, so the rule rides the ordinary
+construct-matched tier with no extra machinery — it stacks with `[kind:]` /
+`[meta:]` / `[lang:]` like any other primary scope, and shows up in focus
+hints as *"date time functions"*.
+
+Category keys are emitted **after** the specific `function:`/`call_routine:`
+keys, so a rule for the exact function is offered before the family rule.
+They never match the reference corpus: PDF sections are titled per function
+(`INTNX Function` → `function:intnx`), so no reference chunk carries a
+`category` key. The axis exists for operator rules only.
+
+`SAS_FUNCTION_CATEGORIES` is a curated subset of the taxonomy in *SAS
+Functions and CALL Routines by Category* — only families that carry
+translation guidance are mapped, because an unmapped name simply contributes
+no category key. Widening a category there widens every rule scoped on it.
 
 ### Modifier clauses: language, chunk kind, metadata (`[lang:]`/`[kind:]`/`[meta:]`)
 

@@ -10,6 +10,14 @@ scope:
 * ``## [when: proc:sql, component_object:hash] SQL rules`` — **conditional**:
   injected only when the item's constructs intersect the listed keys. The
   ``kind:name`` syntax is exactly ``str(ConstructKey)``.
+* ``## [category: date_time, hashing_security] Rules`` — **conditional** on a
+  SAS function *family* rather than a named function, so one section covers a
+  whole category without enumerating its members. Sugar for
+  ``[when: category:date_time, category:hashing_security]``: the pipeline
+  derives a ``category`` construct key per recognised function from
+  ``chunker.keywords.SAS_FUNCTION_CATEGORIES``, so this rides the ordinary
+  conditional tier. Reference PDF sections are titled per function and carry
+  no category keys, so these match user instructions only.
 * ``## [topic] Partitioning guidance`` — **topical**: indexed for retrieval
   and surfaced by ranking, like a reference chunk.
 * ``## [example: proc:sql] SQL join`` — **example** (few-shot): a worked
@@ -125,6 +133,18 @@ def normalize_meta(name: str) -> str:
 
     Lower-cased with spaces/hyphens folded to underscores, matching the flag
     vocabulary the pipeline emits (``symput_hazard``, ``unclosed_block``, ...).
+    """
+    return re.sub(r"[\s-]+", "_", name.strip().lower())
+
+
+def normalize_category(name: str) -> str:
+    """Fold a ``[category: ...]`` token to its comparison key.
+
+    Lower-cased with spaces/hyphens folded to underscores, matching the slugs
+    the pipeline emits from ``chunker.keywords.SAS_FUNCTION_CATEGORIES``
+    (``date_time``, ``regular_expression_prx``, ...). Same folding as
+    :func:`normalize_meta`; kept separate because the two vocabularies are
+    unrelated and only one of them is a construct key.
     """
     return re.sub(r"[\s-]+", "_", name.strip().lower())
 
@@ -569,6 +589,23 @@ def _classify_group(
         )
         return _GroupResult(SCOPE_EXAMPLE, [], [], [], [])
 
+    if lowered.startswith("category:"):
+        keys = _parse_category_keys(body[9:])
+        if keys:
+            # Sugar for [when: category:x] — a category is just a construct
+            # key the pipeline derives from the item's functions, so it rides
+            # the same conditional tier with no extra machinery.
+            return _GroupResult(SCOPE_WHEN, keys, [], [], [])
+        diagnostics.append(
+            InstructionDiagnostic(
+                code="INVALID_CONSTRUCT_KEY",
+                message=f"category-directive in heading '{heading.strip()}' "
+                f"lists no categories; treating the instruction as always-on",
+                doc_id=doc_id,
+            )
+        )
+        return _GroupResult(SCOPE_ALWAYS, [], [], [], [])
+
     if lowered.startswith("when:"):
         keys = _parse_when_keys(body[5:], heading, doc_id, diagnostics)
         if keys:
@@ -598,6 +635,20 @@ def _classify_group(
 def _parse_lang_tokens(raw: str) -> list[str]:
     """Comma-separated ``[lang: ...]`` tokens, normalized and de-duped."""
     return _parse_scoped_tokens(raw, normalize_language)
+
+
+def _parse_category_keys(raw: str) -> list[ConstructKey]:
+    """Comma-separated ``[category: ...]`` tokens as ``category:`` keys.
+
+    No validation against a known-category list: this module holds no SAS
+    vocabulary (that is ``chunker``'s, reached only via the pipeline), so an
+    unknown slug yields a key that simply never matches — the same outcome as
+    a ``[when:]`` key for a construct the item does not use.
+    """
+    return [
+        ConstructKey(kind="category", name=value)
+        for value in _parse_scoped_tokens(raw, normalize_category)
+    ]
 
 
 def _parse_scoped_tokens(raw: str, normalize: Callable[[str], str]) -> list[str]:

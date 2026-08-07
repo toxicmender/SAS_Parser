@@ -56,13 +56,18 @@ _KIND_LABELS = {
     "informat": "{name} informat",
     "option": "{name} option",
     "system_option": "{name} system option",
+    # A family, not a construct — read as prose ("date time functions").
+    "category": "{words} functions",
 }
 
 
 def _describe_construct(key: ConstructKey) -> str:
     template = _KIND_LABELS.get(key.kind, "{name} ({kind})")
     return template.format(
-        name=key.name.upper(), lower=key.name.lower(), kind=key.kind
+        name=key.name.upper(),
+        lower=key.name.lower(),
+        words=key.name.lower().replace("_", " "),
+        kind=key.kind,
     )
 
 

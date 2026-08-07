@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 
+from chunker.keywords import SAS_FUNCTION_CATEGORIES
 from chunker.models import (
     SasBatch,
     SasChunk,
@@ -92,9 +93,18 @@ def _constructs_for_item(item: SasBatch) -> list[ConstructKey]:
 
     Hazard flags add their canonical construct even when the name extractor
     missed it, so the selector still pulls the SYMPUT / %GOTO / %ABORT section.
+
+    Every recognised function/routine also contributes a ``category`` key
+    (:data:`~chunker.keywords.SAS_FUNCTION_CATEGORIES`), so an instruction can
+    be scoped to a whole family — ``[category: date_time]`` — instead of
+    enumerating its members. Category keys are emitted after the specific ones
+    so the more precise match is offered first, and they never hit the
+    reference corpus: PDF sections are titled per function, so no reference
+    chunk carries a ``category`` key. They exist for user instructions.
     """
     keys: list[ConstructKey] = []
     seen: set[ConstructKey] = set()
+    categories: set[str] = set()
 
     def add(kind: str, name: str | None) -> None:
         if not name:
@@ -104,12 +114,19 @@ def _constructs_for_item(item: SasBatch) -> list[ConstructKey]:
             seen.add(key)
             keys.append(key)
 
+    def note_category(name: str) -> None:
+        category = SAS_FUNCTION_CATEGORIES.get(name.lower())
+        if category:
+            categories.add(category)
+
     for name in sorted(item.proc_names):
         add("proc", name)
     for name in sorted(item.recognized_functions):
         add("function", name)
+        note_category(name)
     for name in sorted(item.recognized_call_routines):
         add("call_routine", name)
+        note_category(name)
     for name in sorted(item.component_objects):
         add("component_object", name)
     for name in sorted(item.global_statement_keywords):
@@ -120,6 +137,8 @@ def _constructs_for_item(item: SasBatch) -> list[ConstructKey]:
         add("macro_statement", "goto")
     if item.has_abort:
         add("macro_statement", "abort")
+    for category in sorted(categories):
+        add("category", category)
     return keys
 
 

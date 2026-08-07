@@ -60,7 +60,11 @@ class ConstructKey(BaseModel, frozen=True):
 
     kind: str  # function | call_routine | macro_function | macro_statement |
     #            global_statement | proc | format | informat | option |
-    #            system_option | component_object
+    #            system_option | component_object | category
+    #
+    # ``category`` names a SAS function *family* (``category:date_time``)
+    # rather than one construct. Only the pipeline emits it, and only user
+    # instructions match it — reference sections are titled per function.
     name: str  # lowercased identifier, e.g. "intnx", "symput", "let", "sql"
 
     def __str__(self) -> str:

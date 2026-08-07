@@ -249,6 +249,84 @@ _SAS_CALL_ROUTINES = frozenset(
     }
 )
 
+
+# Function/routine name -> category slug, following the taxonomy in "SAS
+# Functions and CALL Routines by Category" (SAS 9.4 Functions and CALL
+# Routines: Reference). A *curated subset*: only the categories that carry
+# translation guidance are mapped, because the only consumer is the
+# ``[category: ...]`` instruction scope — a name with no entry simply
+# contributes no category key, which is the same as having no rule for it.
+# Extend a category here and every instruction scoped on it widens with it.
+#
+# Names must exist in _SAS_FUNCTIONS or _SAS_CALL_ROUTINES; the test suite
+# enforces that, so a typo cannot silently create an unreachable category.
+SAS_FUNCTION_CATEGORIES: dict[str, str] = {
+    # ── Date and Time ──────────────────────────────────────────────────────
+    **dict.fromkeys(
+        (
+            'date', 'datejul', 'datepart', 'datetime', 'day', 'dhms', 'hms',
+            'holiday', 'holidayck', 'holidaycount', 'holidayname', 'hour',
+            'intck', 'intnx', 'juldate', 'juldate7', 'mdy', 'minute', 'month',
+            'qtr', 'second', 'time', 'timepart', 'today', 'week', 'weekday',
+            'year', 'yrdif', 'datdif', 'yyq', 'nwkdom', 'intshift', 'inttest',
+        ),
+        'date_time',
+    ),
+    # ── Character ──────────────────────────────────────────────────────────
+    **dict.fromkeys(
+        (
+            'cat', 'catq', 'cats', 'catt', 'catx', 'char', 'compbl', 'compare',
+            'compress', 'countc', 'countw', 'dequote', 'find', 'findc', 'findw',
+            'index', 'indexc', 'indexw', 'left', 'length', 'lengthc', 'lengthm',
+            'lengthn', 'lowcase', 'missing', 'propcase', 'quote', 'repeat',
+            'reverse', 'right', 'scan', 'strip', 'substr', 'translate',
+            'tranwrd', 'trim', 'trimn', 'upcase', 'verify',
+        ),
+        'character',
+    ),
+    # ── Character String Matching (Perl regular expressions) ───────────────
+    **dict.fromkeys(
+        (
+            'prxchange', 'prxdebug', 'prxfree', 'prxmatch', 'prxnext',
+            'prxparen', 'prxparse', 'prxposn', 'prxsubstr',
+        ),
+        'regular_expression_prx',
+    ),
+    # ── Hashing and security ───────────────────────────────────────────────
+    **dict.fromkeys(
+        ('md5', 'sha256', 'sha256hex', 'sha256hmachex', 'hashing',
+         'hashing_file', 'hashing_hmac', 'hashing_hmac_file',
+         'hashing_hmac_init', 'hashing_init', 'hashing_part',
+         'hashing_term'),
+        'hashing_security',
+    ),
+    # ── Descriptive Statistics (across arguments, not aggregates) ──────────
+    **dict.fromkeys(
+        (
+            'css', 'cv', 'kurtosis', 'mean', 'median', 'n', 'nmiss', 'ordinal',
+            'pctl', 'range', 'skewness', 'std', 'stderr', 'sum', 'sumabs',
+            'uss', 'var', 'largest', 'smallest', 'rms',
+        ),
+        'descriptive_statistics',
+    ),
+    # ── Truncation ─────────────────────────────────────────────────────────
+    **dict.fromkeys(
+        ('ceil', 'ceilz', 'floor', 'floorz', 'fuzz', 'int', 'intz', 'round',
+         'rounde', 'roundz', 'trunc'),
+        'truncation',
+    ),
+    # ── Macro (DATA-step interface to the macro processor) ─────────────────
+    **dict.fromkeys(
+        ('symget', 'symput', 'symputx', 'resolve', 'execute'),
+        'macro',
+    ),
+    # ── Special (informat/format application) ──────────────────────────────
+    **dict.fromkeys(
+        ('input', 'inputc', 'inputn', 'put', 'putc', 'putn'),
+        'special',
+    ),
+}
+
 # DATA step component objects — SAS Programmer's Guide: Essentials, Ch. 9
 # ("DATA Step Component Objects"): hash, hash iterator (HITER), Java, logger,
 # and appender objects. Usage is keyed on the declaration syntax
