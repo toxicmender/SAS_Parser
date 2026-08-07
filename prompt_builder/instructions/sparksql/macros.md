@@ -46,3 +46,41 @@ another and as separate views where a later SAS step reads them by name.
 - A macro invoked several times with different arguments produces several
   concrete step sequences. Name each output distinctly rather than emitting
   one view that silently overwrites the previous call's result.
+
+## [kind: MACRO_DEFINITION, MACRO_CALL, MACRO_CONTROL_FLOW] When to use SQL scripting instead
+Databricks SQL has real procedural statements — `BEGIN ... END`, `IF/THEN/ELSE`,
+`CASE`, `FOR`, `WHILE`, `LOOP`, `REPEAT`, `LEAVE`, `ITERATE`, `SIGNAL`,
+`GET DIAGNOSTICS` — so a SAS control-flow construct is no longer automatically
+untranslatable.
+
+**Expansion stays the default.** Most SAS macros are code generators whose loop
+bounds and branches are known at translation time; expanding them yields the
+one-view-per-step shape the output format asks for, and a reviewer can diff it
+against the SAS. Reach for scripting only when the control flow genuinely
+depends on data read at run time — then the mapping is:
+
+| SAS | Databricks SQL |
+|---|---|
+| `%DO i = 1 %TO n` over a data-driven `n` | `FOR ... DO ... END FOR` over a query |
+| `%DO %WHILE` / `%DO %UNTIL` | `WHILE ... DO` / `REPEAT ... UNTIL` |
+| `%IF ... %THEN` on run-time data | `IF ... THEN ... ELSE ... END IF` |
+| `%GOTO` out of a loop | `LEAVE` (or `ITERATE` to skip to the next pass) |
+| `%ABORT` / `%ABORT CANCEL` | `SIGNAL` with a condition and message |
+
+⚠️ Scripting runs statement by statement, so it gives up the whole-script
+optimisation a set-based translation gets. Say in Risks why the loop could not
+be expanded.
+
+## [meta: invokes_macros, produces_macrovars] Dynamic SQL and generated identifiers
+Where a macro builds SQL *text* rather than parameter values:
+
+- `CALL EXECUTE('...')` and a `%SYSFUNC`-assembled statement -> `EXECUTE
+  IMMEDIATE`, which also takes `USING` arguments and can write results `INTO`
+  variables. Prefer binding values over concatenating them.
+- A macro-variable-built **object name** (`&lib..&ds`, `work.&prefix._out`) ->
+  the `IDENTIFIER()` clause: `SELECT * FROM IDENTIFIER(:tbl)`. A parameter
+  marker cannot stand where a table name goes, and string-concatenating the
+  name into the statement is an injection risk; `IDENTIFIER()` is the construct
+  for exactly this.
+- ⚠️ Prefer resolving the name at translation time when the macro variable is
+  known — a literal name is reviewable, a dynamic one is not.

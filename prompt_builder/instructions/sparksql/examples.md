@@ -130,15 +130,11 @@ proc sort data=work.txns out=work.latest nodupkey;
 run;
 ```
 
-Spark SQL:
+Databricks SQL:
 ```sql
 CREATE OR REPLACE TEMP VIEW latest AS
-SELECT * EXCEPT (rn) FROM (
-  SELECT t.*,
-         ROW_NUMBER() OVER (PARTITION BY cust_id
-                            ORDER BY txn_dt DESC) AS rn
-  FROM txns t
-) WHERE rn = 1;
+SELECT * FROM txns
+QUALIFY ROW_NUMBER() OVER (PARTITION BY cust_id ORDER BY txn_dt DESC) = 1;
 ```
 Notes: `NODUPKEY` keeps the first row per BY key *in the sort order just
 applied*, so the window's `ORDER BY` must repeat the PROC SORT keys exactly —

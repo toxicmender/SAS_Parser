@@ -69,10 +69,16 @@ writing it under the wrong kernel.
 ## Syntax checking
 
 `check_syntax` returns an error message or `None`. Python uses `ast.parse`.
-Spark SQL uses **sqlglot** (`pip install 'sas-parser[sql]'`) and, without it,
-falls back to a structural check that flags only unbalanced brackets and
-quotes — deliberately conservative, because a false failure here spends an
-LLM call re-answering a correct item. `checker_name` reports which ran, and
+Spark SQL uses **sqlglot** (`pip install 'sas-parser[sql]'`) with the
+**`databricks`** dialect, and without it falls back to a structural check that
+flags only unbalanced brackets and quotes — deliberately conservative, because
+a false failure here spends an LLM call re-answering a correct item.
+
+The dialect is `databricks` rather than `spark` because the bundled instruction
+set targets Databricks and emits `QUALIFY`, SQL scripting, and
+`EXECUTE IMMEDIATE`. sqlglot's `spark` dialect accepts all of those today, so
+the two agree — but it would be within its rights to tighten, and that would
+start failing correct translations. `checker_name` reports which ran, and
 the metric puts it in its `details`. Spark Scala has no checker, so
 `checks_syntax` is `False` and the metric skips rather than passing everything.
 

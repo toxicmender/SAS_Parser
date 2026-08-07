@@ -90,8 +90,11 @@ informats are handled in the datetime guidance.
   power of ten; for a general unit use `round(x / u) * u`. ⚠️ Flag any
   `ROUND` whose second argument is not a power of ten.
 - `CEIL(x)` -> `ceil(x)`, `FLOOR(x)` -> `floor(x)`.
-- `INT(x)` truncates **toward zero** -> `cast(x AS BIGINT)` (also toward zero),
-  *not* `floor` (which differs for negatives).
+- `INT(x)` truncates **toward zero**. ⚠️ Do *not* map it to
+  `cast(x AS BIGINT)`: under ANSI mode a numeric-to-integral cast that would
+  truncate is an **error**, not a truncation, so `CAST(5.1 AS INT)` raises.
+  Use `TRUNC(x, 0)`, which truncates toward zero as SAS does. `floor` is wrong
+  in the other direction — it disagrees with `INT` for negatives.
 
 ## [when: function:mod] MOD
 `MOD(a, b)` -> `mod(a, b)` (or the `%` operator); both take the sign of the

@@ -357,6 +357,10 @@ _SAS_COMPONENT_OBJECT_RE = re.compile(
 _SAS_DATA_STEP_STATEMENTS: tuple[str, ...] = (
     "merge", "by", "retain", "array", "output", "set", "update", "modify",
     "where", "infile", "do",
+    # Declaration statements. They carry no logic, but they carry the
+    # *documentation* a migration should preserve — a LABEL is a column
+    # comment, a FORMAT is a display rule with no target equivalent.
+    "label", "format", "length",
 )
 # Statement position is the start of the text, just after a `;`, or just after
 # `THEN`/`ELSE` — a conditional `if x then output b;` is still an OUTPUT

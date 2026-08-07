@@ -179,5 +179,7 @@ def test_sql_uses_sqlglot_when_it_is_importable(monkeypatch):
     assert SPARKSQL.check_syntax("SELECT 1") is None
     error = SPARKSQL.check_syntax("BROKEN")
     assert error is not None and "ParseError" in error
-    # The Spark dialect, not the generic one.
-    assert {dialect for _, dialect in calls} == {"spark"}
+    # The Databricks dialect, not the generic one — and not `spark`, which
+    # would be within its rights to reject the QUALIFY / SQL-scripting /
+    # EXECUTE IMMEDIATE syntax this target's guidance emits.
+    assert {dialect for _, dialect in calls} == {"databricks"}

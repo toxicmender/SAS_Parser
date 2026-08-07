@@ -87,12 +87,18 @@ def _check_python(source: str) -> str | None:
 
 
 def _check_sql(source: str) -> str | None:
-    """Parse *source* as Spark SQL with sqlglot, or check it structurally.
+    """Parse *source* as Databricks SQL with sqlglot, or check it structurally.
 
     sqlglot is optional (the ``sql`` extra). Without it the fallback flags
     only what is unambiguous — unbalanced brackets or quotes — because this
     result can fail an item and drive a retry, and a heuristic that guesses
     would spend LLM calls re-answering correct translations.
+
+    The ``databricks`` dialect, not ``spark``: this target's guidance emits
+    ``QUALIFY``, SQL scripting, and ``EXECUTE IMMEDIATE``, which open-source
+    Spark does not have. sqlglot's ``spark`` dialect happens to accept all of
+    them today, so the two agree — but it would be within its rights to tighten,
+    and that would start failing correct translations.
     """
     try:
         import sqlglot
@@ -100,7 +106,7 @@ def _check_sql(source: str) -> str | None:
         return _check_sql_structure(source)
     try:
         # A statement list: a translation cell is routinely several statements.
-        sqlglot.parse(source, dialect="spark")
+        sqlglot.parse(source, dialect="databricks")
     except Exception as exc:  # sqlglot raises ParseError/TokenError/...
         return f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
     return None

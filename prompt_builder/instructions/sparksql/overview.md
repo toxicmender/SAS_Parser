@@ -1,14 +1,23 @@
-Target Spark SQL, not the PySpark DataFrame API: emit `spark.sql("...")`-ready
-statements, one readable script mirroring the SAS step sequence.
+Target **Databricks SQL** (Databricks Runtime or a SQL warehouse), not the
+PySpark DataFrame API: emit `spark.sql("...")`-ready statements, one readable
+script mirroring the SAS step sequence. ⚠️ This guidance uses constructs
+open-source Spark does not have — `QUALIFY`, SQL scripting, `EXECUTE
+IMMEDIATE`, `UNPIVOT`, three-level names — so do not follow it for a
+non-Databricks Spark deployment.
 
 ## Output format
 One fenced ```sql block per SAS step, in execution order, named after the SAS
-output dataset (`work.foo` -> `foo`). One statement per logical step; never
-collapse several steps into one opaque query. Choose the statement by where
-the SAS wrote: a temporary dataset (`work.*` or unqualified) ->
-`CREATE OR REPLACE TEMP VIEW`; a permanent libref -> `CREATE TABLE ... AS
-SELECT`. Within a step, lift each stage into its own named CTE rather than
-nesting subqueries — the names carry the SAS step's intent into the SQL.
+output dataset. One statement per logical step; never collapse several steps
+into one query. Within a step, lift each stage into a named CTE rather than
+nesting subqueries — the names carry the step's intent.
+
+SAS names are two-level `libref.dataset`, Databricks three-level
+`catalog.schema.table`. `work.*` (or unqualified) -> `CREATE OR REPLACE TEMP
+VIEW foo`; a permanent libref becomes the **schema** ->
+`CREATE TABLE <catalog>.mylib.accounts AS SELECT ...`, a managed Delta table.
+State the catalog you assumed, once. Delta is the default, so no `USING DELTA`;
+⚠️ no `LOCATION` either — that makes the table external, changing who owns the
+files — unless the SAS libname pointed at an explicit path.
 
 ## [kind: DATA_STEP] Set-based, not row-by-row
 SAS DATA steps iterate the PDV row by row with implicit retain and `_N_`.
@@ -24,10 +33,12 @@ SAS character to `STRING`. SAS has no boolean type; a numeric 0/1 flag maps
 to `BOOLEAN` only when the source clearly uses it as one. Quote string
 literals with single quotes; escape embedded quotes by doubling them.
 
-## ANSI mode: Spark raises where SAS returned missing
-⚠️ Spark 4 enables `spark.sql.ansi.enabled` by **default**, so operations SAS
-completed with a missing value and a log note now abort the query: divide by
-zero, invalid cast, and arithmetic overflow. Use the `try_*` form —
+## ANSI mode: the query raises where SAS returned missing
+⚠️ `ANSI_MODE` is **on by default** (for Databricks accounts created from
+19 Oct 2022, and in Spark 4), so operations SAS completed with a missing value
+and a log note now abort the query: divide by zero, invalid cast, arithmetic
+overflow — and a numeric-to-integral cast that would truncate. Use the `try_*`
+form —
 `try_divide`, `try_cast`, `try_add`, `try_sum`, `try_to_date`,
 `try_to_timestamp` — wherever the SAS original would have produced a missing
 value and carried on. A raised error turns a row-level nuisance into a failed

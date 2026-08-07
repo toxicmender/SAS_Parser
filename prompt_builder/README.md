@@ -528,13 +528,19 @@ is not a rule — ingested, it parses as always-on sections and is prompted with
 every item, for every target.
 
 The package ships a starter set at `prompt_builder/instructions/sparksql/`,
-synthesised from the [Spark SQL
-reference](https://spark.apache.org/docs/latest/sql-ref.html) and the [PySpark
-SQL API docs](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/index.html)
-and checked against Spark 4.1.2 — load it with
-`from_dir("prompt_builder/instructions")` and run the pipeline with
-`output_language="SparkSQL"`. Review and adapt it to your project's
-conventions before relying on it.
+checked against the [Databricks SQL language
+reference](https://learn.microsoft.com/azure/databricks/sql/language-manual/)
+and Spark 4.1.2 — load it with `from_dir("prompt_builder/instructions")` and
+run the pipeline with `output_language="SparkSQL"`. Review and adapt it to your
+project's conventions before relying on it.
+
+> ⚠️ **The shipped slice targets Databricks**, not open-source Spark. It uses
+> `QUALIFY`, SQL scripting (`FOR`/`WHILE`/`SIGNAL`), `EXECUTE IMMEDIATE`,
+> `UNPIVOT` and three-level `catalog.schema.table` names, none of which
+> open-source Spark has — a non-Databricks deployment needs those rules
+> rewritten. The directory is named `sparksql/` because that is the target key
+> `databrickssql` folds to (see `target_language`); the two are one target
+> today, so the slice must commit to one of them.
 
 The shipped slice holds only guidance that is true of the *languages* —
 nothing about how your shop wants its SQL to look. House rules (parameterising

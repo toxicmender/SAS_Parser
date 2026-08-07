@@ -11,10 +11,8 @@ De-duplication is the part that carries meaning:
   `DISTINCT`:
   ```sql
   CREATE OR REPLACE TEMP VIEW dedup AS
-  SELECT * EXCEPT (rn) FROM (
-    SELECT t.*, ROW_NUMBER() OVER (PARTITION BY cust_id ORDER BY load_dt) AS rn
-    FROM txns t
-  ) WHERE rn = 1;
+  SELECT * FROM txns
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY cust_id ORDER BY load_dt) = 1;
   ```
   ⚠️ "First" is only defined once you say by what. SAS takes the first row in
   the sort order it just applied; the `ORDER BY` inside the window must
@@ -24,8 +22,8 @@ De-duplication is the part that carries meaning:
   columns -> `SELECT DISTINCT *`. ⚠️ It compares only *adjacent* rows in SAS,
   so on unsorted input it removes less than `DISTINCT` does. Flag the
   difference rather than assuming they agree.
-- `DUPOUT=` names a dataset of the removed rows: `WHERE rn > 1` over the same
-  window.
+- `DUPOUT=` names a dataset of the removed rows: the same window with
+  `QUALIFY ROW_NUMBER() OVER (...) > 1`.
 
 ⚠️ **Preserve de-duplication; never invent or remove it.** Keep every
 `DISTINCT` the SAS specifies, and add none it does not. Where a `DISTINCT`

@@ -211,11 +211,13 @@ these silently changes behavior.
    sets have distinct, citable identities and distinct consumers; do not fold
    them together.
 7. **`data_step_statements` is advisory and DATA-step-only.** It reports which
-   statements a step uses (`merge`, `by`, `retain`, `array`, `output`, …) plus
-   four constructs the scan derives rather than reads: `retain` for a sum
-   statement, `subsetting_if` for an `if <expr>;` that drops rows, `set_multi`
-   for a concatenating `SET a b;`, and `dataset_option` for `keep=` and
-   friends. A PROC's statements are already identified by `proc_name`, so the
+   statements a step uses — logic statements (`merge`, `by`, `retain`, `array`,
+   `output`, `set`, `update`, `modify`, `where`, `infile`, `do`) and
+   declaration statements (`label`, `format`, `length`, which carry the
+   documentation a migration should preserve) — plus four constructs the scan
+   derives rather than reads: `retain` for a sum statement, `subsetting_if` for
+   an `if <expr>;` that drops rows, `set_multi` for a concatenating
+   `SET a b;`, and `dataset_option` for `keep=` and friends. A PROC's statements are already identified by `proc_name`, so the
    scan skips non-DATA chunks. Never gates chunking or batching; the consumer
    is `prompt_builder`'s `[when: statement:...]` scope, which is what lets
    guidance fire on the steps that raise a problem instead of on every step.
