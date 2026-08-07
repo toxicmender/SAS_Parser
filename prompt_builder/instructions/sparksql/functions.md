@@ -23,8 +23,11 @@ substr(s,p+length(new)))`).
 ## [when: function:scan] SCAN
 `SCAN(s, n, delims)` returns the n-th word. Map to `split_part(s, delim, n)`
 (1-based) for a single delimiter, or `element_at(split(s, regex), n)` when SAS
-used several delimiters (`split` takes a **regex**, so escape/`[]`-group the
-delimiter set). ⚠️ SAS `SCAN` treats runs of delimiters as one and accepts a
+used several delimiters. `split` takes a **regex**, so regex-escape the
+delimiter set and group it as `[...]+` — with a bare `[...]`, a run of two
+delimiters yields an empty element and every later index shifts by one, which
+is exactly the SAS behaviour you are trying to reproduce. ⚠️ SAS `SCAN` treats
+runs of delimiters as one and accepts a
 **negative n** to count from the end (`element_at(..., n)` with negative n does
 this in Spark); a naive `split_part` does neither. Default SAS delimiters are a
 large punctuation set, not just space — reproduce the exact set.
@@ -76,10 +79,13 @@ prefer the `LENGTHN` semantics unless the SAS code depended on the padded width.
 ## [when: function:put, function:input] PUT / INPUT (non-date)
 For **non-date** conversions: numeric-to-character `PUT(n, best12.)` -> `cast(n
 AS STRING)` (or `format_string('%d', n)` / `format_number(n, d)` for a specific
-width/decimals); character-to-numeric `INPUT(s, 8.)` -> `cast(s AS DOUBLE)` or
-`try_cast(s AS DOUBLE)` when a non-numeric string should yield `NULL` rather
-than error. Date/time formats and informats are handled in the datetime
-guidance — do not treat those as plain casts.
+width/decimals); character-to-numeric `INPUT(s, 8.)` -> **`try_cast(s AS
+DOUBLE)`**. ⚠️ Use `try_cast`, not `cast`, as the default here: SAS `INPUT`
+yields a missing value and a log note on unparseable text, whereas under Spark
+4's ANSI default a plain `cast` **raises** and kills the query. Plain `cast` is
+right only when the column is provably clean. `PUT` with a *user-defined*
+format is not a cast at all — see the format guidance. Date/time formats and
+informats are handled in the datetime guidance.
 
 ## [when: function:round, function:ceil, function:floor, function:int] Rounding and truncation
 - `ROUND(x)` -> `round(x)`; `ROUND(x, u)` rounds to the nearest multiple of the
