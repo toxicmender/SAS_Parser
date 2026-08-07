@@ -531,11 +531,24 @@ the item retrieved anything at all, is what gets dropped.
 
 `user_instructions.max_words` (config or the `user_max_words` argument)
 additionally caps the user chunks (rules and examples together) inside the
-overall budget. **Set it whenever the instruction set is large.** With the
-bundled SparkSQL set and the default 1500-word budget, uncapped operator
-rules take ~1500 words on a date-and-hashing-heavy item and leave nothing for
-reference retrieval; `900` still admits every rule matching that item's own
-constructs and leaves ~650 words for the corpus. Selected rules render in a `## Project instructions` block
+overall budget.
+
+**Budget the two together, and size them for your items.** The bundled
+SparkSQL set is ~6,700 words, so what fits matters. Measured against it:
+
+| Item | `max_instruction_words` | `user_instructions.max_words` |
+|---|---|---|
+| Single step (one DATA step or PROC) | 1500 (default) | 900 |
+| Dependency batch (several steps, mixed kinds) | 4000 | 2800 |
+
+At the default 1500/900 a single step gets every rule matching its own
+constructs and still leaves ~650 words for the reference corpus. A *batch*
+spanning a macro, a PROC SQL, a DATA step, and a PROC SORT legitimately needs
+more: at 1500/900 it loses its MERGE, regex, hashing, and sequential-`IF`
+guidance to the cap, and it takes ~4000/2800 before all of them fit. Raise
+both when `max_merged_tokens` lets large batches form; leaving
+`max_words` null instead is not the fix, since uncapped operator rules simply
+consume the whole budget and starve reference retrieval. Selected rules render in a `## Project instructions` block
 above the reference guidance, with the operator's own headings and no page
 citations; selected examples render in a `## Worked examples` block placed
 last.
