@@ -85,8 +85,39 @@ def test_bom_prefixed_file_loads(_isolated_config):
     assert app_config.get_value("sas_chunker", "min_words", 300) == 42
 
 
+def test_resolve_path_anchors_relative_values_to_the_repo_root(tmp_path, monkeypatch):
+    """A relative path *inside* config.json must survive the cwd.
+
+    config.json itself is found relative to the repo root even when the
+    process starts elsewhere, so a value like 'prompt_builder/instructions'
+    resolving only against cwd would silently miss for a Docker entrypoint or
+    a scheduled job.
+    """
+    repo_root = pathlib.Path(app_config.__file__).resolve().parents[1]
+    monkeypatch.chdir(tmp_path)
+    assert app_config.resolve_path("prompt_builder/instructions").is_dir()
+    assert (
+        app_config.resolve_path("prompt_builder/instructions")
+        == repo_root / "prompt_builder/instructions"
+    )
+
+
+def test_resolve_path_prefers_cwd_and_honours_absolute(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "local").mkdir()
+    # Exists relative to cwd -> taken as given, not rewritten to the repo root.
+    assert app_config.resolve_path("local") == pathlib.Path("local")
+    absolute = tmp_path / "elsewhere"
+    assert app_config.resolve_path(str(absolute)) == absolute
+
+
 def test_repo_config_json_matches_code_defaults():
-    """The shipped template must be a no-op: every value == the hard default."""
+    """The shipped file is a no-op except where it deliberately is not.
+
+    Every value must equal the hard default, so a fresh checkout behaves as
+    though no config existed — with one documented exception, the bundled
+    instruction set and the budget sized for it (asserted explicitly below).
+    """
     repo_cfg = json.loads(
         (pathlib.Path(__file__).resolve().parents[1] / "config.json").read_text(
             encoding="utf-8"
@@ -98,9 +129,12 @@ def test_repo_config_json_matches_code_defaults():
         "max_words": 900,
         "overlap_words": 60,
     }
+    # Sized for the bundled instruction set enabled below, not the code
+    # default: at 1500 a dependency batch received 2 of the 7 rules its
+    # constructs matched, silently dropping silent-error guidance.
     assert repo_cfg["prompt_builder"] == {
         "top_k": 6,
-        "max_instruction_words": 1500,
+        "max_instruction_words": 3500,
         "focus_hints": None,  # null = unset -> code default (True)
         "reasoning_directives": None,  # null = unset -> code default (True)
     }
@@ -128,11 +162,25 @@ def test_repo_config_json_matches_code_defaults():
             "complexity": {"timeout": None, "model": None},
         },
     }
+    # The one section that ships non-null: the bundled SparkSQL instruction
+    # set is on by default. It is scoped [lang: sparksql], so it is inert
+    # under any other output_language, and `max_words` is set with it so
+    # operator rules cannot consume the whole retrieval budget and starve the
+    # reference corpus.
     assert repo_cfg["user_instructions"] == {
         "path": None,
-        "dir": None,
-        "max_words": None,
+        "dir": "prompt_builder/instructions",
+        "max_words": 2450,
     }
+    assert (
+        pathlib.Path(__file__).resolve().parents[1]
+        / repo_cfg["user_instructions"]["dir"]
+    ).is_dir(), "config.json points user_instructions.dir at a missing directory"
+    # Operator rules must leave room for the reference corpus they sit above.
+    assert (
+        repo_cfg["user_instructions"]["max_words"]
+        < repo_cfg["prompt_builder"]["max_instruction_words"]
+    ), "user_instructions.max_words must leave budget for reference chunks"
     # Every section the refactor added ships all-null too, so a fresh checkout
     # behaves exactly as it did before any of them are filled in.
     for section in ("vault", "azure", "databricks", "sharepoint", "xref",

@@ -391,27 +391,29 @@ class UserInstructionSet(BaseModel):
         """
         directory = app_config.get_value("user_instructions", "dir")
         if directory is not None:
-            if not Path(directory).is_dir():
+            resolved = app_config.resolve_path(directory)
+            if not resolved.is_dir():
                 logger.warning(
                     f"UserInstructionSet.from_config: configured instructions "
                     f"directory '{directory}' not found; continuing without "
                     f"user instructions"
                 )
                 return None
-            logger.info(f"UserInstructionSet.from_config: loading dir '{directory}'")
-            return cls.from_dir(str(directory))
+            logger.info(f"UserInstructionSet.from_config: loading dir '{resolved}'")
+            return cls.from_dir(str(resolved))
 
         path = app_config.get_value("user_instructions", "path")
         if path is None:
             return None
-        if not Path(path).is_file():
+        resolved = app_config.resolve_path(path)
+        if not resolved.is_file():
             logger.warning(
                 f"UserInstructionSet.from_config: configured instructions "
                 f"file '{path}' not found; continuing without user instructions"
             )
             return None
-        logger.info(f"UserInstructionSet.from_config: loading '{path}'")
-        return cls.from_file(str(path))
+        logger.info(f"UserInstructionSet.from_config: loading '{resolved}'")
+        return cls.from_file(str(resolved))
 
     # ------------------------------------------------------------------
     # Scope views

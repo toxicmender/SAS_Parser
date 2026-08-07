@@ -133,6 +133,23 @@ def resolve(explicit: Any, section: str, key: str, default: Any) -> Any:
     return get_value(section, key, default)
 
 
+def resolve_path(value: str) -> Path:
+    """A path *from* config, anchored so it survives the working directory.
+
+    ``config.json`` is found relative to the repo root even when the process
+    runs elsewhere (see :func:`_candidate_paths`), so a relative path *inside*
+    it that only resolved against ``cwd`` would silently miss for any caller
+    not started from the root — a Docker entrypoint, a scheduled job, an
+    editor's test runner. Absolute paths and paths that exist relative to
+    ``cwd`` are honoured as given; anything else falls back to the repo root,
+    which is what a value like ``prompt_builder/instructions`` means.
+    """
+    path = Path(value)
+    if path.is_absolute() or path.exists():
+        return path
+    return Path(__file__).resolve().parents[1] / path
+
+
 def _typed(
     value: Any,
     expected: type | tuple[type, ...],

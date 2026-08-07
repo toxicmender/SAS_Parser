@@ -9,9 +9,10 @@
     "max_words": 900,
     "overlap_words": 60
   },
+  "_prompt_builder_comment": "'max_instruction_words' is the total word budget for the per-item guidance block, shared by operator rules and retrieved reference chunks; the selector fills it in priority order and drops whole chunks at the tail. It is sized here for the bundled SparkSQL instruction set (~6700 words, enabled below): measured, a multi-step dependency batch needs 3500 for every rule its constructs match to arrive, and a single DATA step needs 2500 -- at the old 1500 a batch received 2 of its 7 matching rules and a single step 3 of 5, silently losing the hashing and sequential-IF guidance those rules exist to give. The cost is roughly 4.3k guidance tokens per item instead of 1.9k. Lower it to 2500 (with user_instructions.max_words 1750) if your items are single steps, or back to 1500 if you disable the bundled set. Keep it >= chunkers.instruction.max_words so one reference section always fits.",
   "prompt_builder": {
     "top_k": 6,
-    "max_instruction_words": 1500,
+    "max_instruction_words": 3500,
     "focus_hints": null,
     "reasoning_directives": null
   },
@@ -64,11 +65,11 @@
     "max_story_points": null,
     "use_cross_file": null
   },
-  "_user_instructions_comment": "Operator translation rules injected per item. 'dir' is a directory of *.md files whose first path component names the target language ('sparksql/', or '_common/' for language-agnostic); it takes precedence over the single-file 'path'. README*.md and _-prefixed files are documentation and are never ingested. Both stay null here because this file ships as an all-null template — a fresh checkout injects no operator rules. The package bundles a reviewed SparkSQL starter set: set 'dir' to 'prompt_builder/instructions' to enable it, after reading it against your project's conventions (it is scoped [lang: sparksql], so it is inert under any other output_language). 'max_words' caps operator rules and examples inside prompt_builder.max_instruction_words so they cannot starve the reference corpus; null means uncapped, which is fine for a handful of rules but not for a large set - uncapped rules simply consume the whole budget. Measured against the bundled SparkSQL set (~6700 words): a single-step item wants max_instruction_words 1500 with max_words 900, which admits every rule matching its own constructs and leaves ~650 words for the corpus; a dependency batch spanning several steps wants 4000 with 2800, because at 1500/900 it loses its MERGE, regex, hashing and sequential-IF guidance to the cap. Size both for the items your max_merged_tokens actually produces.",
+  "_user_instructions_comment": "Operator translation rules injected per item. 'dir' is a directory of *.md files whose first path component names the target language ('sparksql/', or '_common/' for language-agnostic); it takes precedence over the single-file 'path'. README*.md and _-prefixed files are documentation and are never ingested. 'dir' ships pointing at the bundled SparkSQL starter set, which is scoped [lang: sparksql] and therefore inert under any other output_language; set it to null to inject no operator rules, or to your own directory to use project conventions instead. A relative value is resolved against the repo root when it does not exist relative to the working directory, so the default survives being run from elsewhere.'max_words' caps operator rules and examples inside prompt_builder.max_instruction_words so they cannot starve the reference corpus; null means uncapped, which is fine for a handful of rules but not for a large set - uncapped rules simply consume the whole budget. It is set to 70% of max_instruction_words, which leaves ~1050 words for reference chunks; move the two together if you change either.",
   "user_instructions": {
     "path": null,
-    "dir": null,
-    "max_words": null
+    "dir": "prompt_builder/instructions",
+    "max_words": 2450
   },
   "_validation_comment": "Per-metric pass thresholds; null uses the metric class default. Two metrics are scored against the run's pipeline.output_language: 'language_compliance' (the fraction of translated code blocks actually in the target language) and 'python_syntax' (which, despite the historical name kept for this key, parses the emitted blocks as the TARGET language, not as Python). Every metric is higher-is-better, hallucination_threshold included: that metric reports groundedness (1 - deepeval's hallucination rate), so 0.8 means 'at most 20% of ground-truth contexts contradicted'. The thresholds below llm_judge_threshold belong to the opt-in LLM-judged suite (validation.judged_metrics); they are inert unless it is enabled. prompt_instructions is a list of strings prompt_alignment checks the response against, overriding validation.agentic_metrics.DEFAULT_PROMPT_INSTRUCTIONS.",
   "validation": {
