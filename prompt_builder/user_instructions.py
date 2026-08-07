@@ -93,6 +93,17 @@ _META_TAG_PREFIX = "meta:"
 _PREAMBLE_TITLE = "General"
 
 
+def _is_doc_file(filename: str) -> bool:
+    """Whether *filename* documents an instruction directory rather than
+    instructing the model — skipped by :meth:`UserInstructionSet.from_dir`.
+
+    A ``README*.md`` or a ``_``-prefixed file. Prose about the rules is not a
+    rule: ingested, it would parse as always-on sections and be prompted with
+    every item, for every target.
+    """
+    return filename.startswith("_") or filename.lower().startswith("readme")
+
+
 # The run's target language is folded to a comparison key by the same rule
 # that resolves it (``target_language.normalize_language``) — re-exported, not
 # reimplemented, so a ``[lang: ...]`` token and a resolved target can never
@@ -285,6 +296,14 @@ class UserInstructionSet(BaseModel):
         ``output_language``, so one directory can hold guidance for several
         targets side by side.
 
+        **Documentation files are skipped**, not ingested: a ``README*.md`` at
+        any depth, and any file whose name starts with ``_``. A directory of
+        instructions almost always carries a README describing itself, and
+        prose *about* the rules is not a rule — ingested, it would land in the
+        always-on tier and be prompted with every item. (The ``_`` prefix means
+        "not instructions" for a file, and "language-agnostic" for a directory;
+        the two readings never collide, since only one applies per path part.)
+
         A missing directory yields an empty set (mirrors :meth:`from_config`'s
         degradation): losing an instructions directory should not halt a run.
         """
@@ -300,6 +319,12 @@ class UserInstructionSet(BaseModel):
         diagnostics: list[InstructionDiagnostic] = []
         parts: list[str] = []
         for path in sorted(base.rglob("*.md"), key=lambda p: p.as_posix()):
+            if _is_doc_file(path.name):
+                logger.debug(
+                    f"UserInstructionSet.from_dir: skipping documentation file "
+                    f"'{path.relative_to(base).as_posix()}'"
+                )
+                continue
             rel = path.relative_to(base)
             language = (
                 rel.parts[0]

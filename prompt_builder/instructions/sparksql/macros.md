@@ -15,7 +15,7 @@ via a CTE/`CROSS JOIN` of a one-row value). Make the read-after-write
 ordering explicit and flag it — a naive translation that reads the variable
 too early is a silent-error class.
 
-## [when: macro_function:sysfunc] %SYSFUNC
+## [meta: invokes_macros] %SYSFUNC and macro-time function calls
 `%SYSFUNC(fn(args))` calls a DATA-step function at macro-resolution time,
 before any query runs. Evaluate it at generation time where possible (e.g.
 `%SYSFUNC(today())` -> a bound date parameter), or map it to the equivalent

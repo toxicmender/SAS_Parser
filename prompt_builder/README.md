@@ -425,11 +425,45 @@ Point config.json `user_instructions.dir` at such a directory (it takes
 precedence over `user_instructions.path`); a missing directory warns and
 continues, like a missing file.
 
-The package ships a starter set at `prompt_builder/instructions/sparksql/`
-(overview, constructs, datetime, macros, worked examples) synthesised from
-the Spark SQL reference and PySpark SQL API docs — load it with
+```
+instructions/
+  sparksql/          -> every section scoped [lang: sparksql]
+    overview.md        always-on: output shape, ANSI mode, null semantics
+    constructs.md      PROC SQL, MERGE, BY-groups, MEANS/SUMMARY, TRANSPOSE
+    functions.md       string / numeric / conditional scalar functions
+    datetime.md        epoch, INTNX/INTCK, date parts, date literals
+    hashing.md         MD5 / SHA256 / HASHING family
+    regex.md           PRX family
+    dataset_ops.md     SORT / APPEND / SET-union / dataset options
+    datastep.md        RETAIN, ARRAY, OUTPUT, sequential-IF consolidation
+    formats.md         PROC FORMAT and PUT with a user-defined format
+    proc_freq.md       PROC FREQ
+    proc_univariate.md PROC UNIVARIATE
+    macros.md          macro variables, SYMPUT, macro decomposition
+    examples.md        worked SAS -> Spark SQL pairs
+  _common/           -> language-agnostic (the leading _ opts out of scoping)
+  <root>.md          -> language-agnostic
+```
+
+Add a target by creating a sibling directory (`pyspark/`, `snowflake/`, …).
+The run's `output_language` selects the matching slice at build time, so
+several targets coexist without leaking into each other.
+
+**Documentation files are skipped**, not ingested: a `README*.md` at any
+depth, and any file whose name starts with `_`. An instructions directory
+almost always carries a README describing itself, and prose *about* the rules
+is not a rule — ingested, it parses as always-on sections and is prompted with
+every item, for every target.
+
+The package ships a starter set at `prompt_builder/instructions/sparksql/`,
+synthesised from the [Spark SQL
+reference](https://spark.apache.org/docs/latest/sql-ref.html) and the [PySpark
+SQL API docs](https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/index.html)
+and checked against Spark 4.1.2 — load it with
 `from_dir("prompt_builder/instructions")` and run the pipeline with
-`output_language="SparkSQL"`.
+`output_language="SparkSQL"`. Review and adapt it to your project's
+conventions before relying on it; site-specific policy belongs in `_common/`
+or your own directory, not in the shipped `sparksql/` slice.
 
 `[example: <keys>]` sections hold **few-shot worked pairs** — curated
 SAS → target translations demonstrating the full desired response shape
