@@ -104,6 +104,13 @@ class SasChunkMetadata(BaseModel):
     # DATA step component objects the chunk declares (hash, hiter, javaobj,
     # logger, appender) — via DECLARE/DCL or the _NEW_ operator.
     component_objects: list[str] = Field(default_factory=list)
+    # DATA step statements present in the chunk (``merge``, ``by``, ``retain``,
+    # ``array``, ``output``, ...), plus the three keyword-less constructs the
+    # scan derives: ``retain`` for a sum statement, ``subsetting_if`` for an
+    # ``if <expr>;`` that drops rows, and ``dataset_option`` for ``keep=`` and
+    # friends. Each names a distinct translation problem, so guidance can be
+    # scoped to the steps that actually raise it instead of to every DATA step.
+    data_step_statements: list[str] = Field(default_factory=list)
 
     input_datasets: list[str] = Field(default_factory=list)
     output_datasets: list[str] = Field(default_factory=list)
@@ -361,6 +368,13 @@ class SasBatch(BaseModel):
     def component_objects(self) -> set[str]:
         """DATA-step component objects declared in the batch (``hash``, ...)."""
         return {o for c in self.chunks for o in c.metadata.component_objects}
+
+    @property
+    def data_step_statements(self) -> set[str]:
+        """DATA-step statements used across member chunks (``merge``, ...)."""
+        return {
+            s for c in self.chunks for s in c.metadata.data_step_statements
+        }
 
     @property
     def proc_names(self) -> set[str]:

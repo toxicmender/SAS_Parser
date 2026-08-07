@@ -134,7 +134,7 @@ def test_repo_config_json_matches_code_defaults():
     # constructs matched, silently dropping silent-error guidance.
     assert repo_cfg["prompt_builder"] == {
         "top_k": 6,
-        "max_instruction_words": 3500,
+        "max_instruction_words": 4000,
         "focus_hints": None,  # null = unset -> code default (True)
         "reasoning_directives": None,  # null = unset -> code default (True)
     }
@@ -170,7 +170,7 @@ def test_repo_config_json_matches_code_defaults():
     assert repo_cfg["user_instructions"] == {
         "path": None,
         "dir": "prompt_builder/instructions",
-        "max_words": 2450,
+        "max_words": 2800,
     }
     assert (
         pathlib.Path(__file__).resolve().parents[1]

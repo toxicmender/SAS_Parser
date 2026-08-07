@@ -9,10 +9,10 @@
     "max_words": 900,
     "overlap_words": 60
   },
-  "_prompt_builder_comment": "'max_instruction_words' is the total word budget for the per-item guidance block, shared by operator rules and retrieved reference chunks; the selector fills it in priority order and drops whole chunks at the tail. It is sized here for the bundled SparkSQL instruction set (~6700 words, enabled below): measured, a multi-step dependency batch needs 3500 for every rule its constructs match to arrive, and a single DATA step needs 2500 -- at the old 1500 a batch received 2 of its 7 matching rules and a single step 3 of 5, silently losing the hashing and sequential-IF guidance those rules exist to give. The cost is roughly 4.3k guidance tokens per item instead of 1.9k. Lower it to 2500 (with user_instructions.max_words 1750) if your items are single steps, or back to 1500 if you disable the bundled set. Keep it >= chunkers.instruction.max_words so one reference section always fits.",
+  "_prompt_builder_comment": "'max_instruction_words' is the total word budget for the per-item guidance block, shared by operator rules and retrieved reference chunks; the selector fills it in priority order and drops whole chunks at the tail. It is sized here for the bundled SparkSQL instruction set (~6700 words, enabled below): measured, a multi-step dependency batch needs 4000 for every rule its constructs match to arrive; at 1500 it received 2 of 7, silently losing the hashing, regex and sequential-IF guidance those rules exist to give. This is a ceiling, not a cost floor: every section is scoped to a construct, statement, or function family the item actually uses, so a simple DATA step draws only ~1.4k words (~2.7k tokens) no matter how high this is set, and only a genuinely broad batch reaches the cap (~2.8k words, ~4.9k tokens). Lower it only if you disable the bundled set. Keep it >= chunkers.instruction.max_words so one reference section always fits.",
   "prompt_builder": {
     "top_k": 6,
-    "max_instruction_words": 3500,
+    "max_instruction_words": 4000,
     "focus_hints": null,
     "reasoning_directives": null
   },
@@ -69,7 +69,7 @@
   "user_instructions": {
     "path": null,
     "dir": "prompt_builder/instructions",
-    "max_words": 2450
+    "max_words": 2800
   },
   "_validation_comment": "Per-metric pass thresholds; null uses the metric class default. Two metrics are scored against the run's pipeline.output_language: 'language_compliance' (the fraction of translated code blocks actually in the target language) and 'python_syntax' (which, despite the historical name kept for this key, parses the emitted blocks as the TARGET language, not as Python). Every metric is higher-is-better, hallucination_threshold included: that metric reports groundedness (1 - deepeval's hallucination rate), so 0.8 means 'at most 20% of ground-truth contexts contradicted'. The thresholds below llm_judge_threshold belong to the opt-in LLM-judged suite (validation.judged_metrics); they are inert unless it is enabled. prompt_instructions is a list of strings prompt_alignment checks the response against, overriding validation.agentic_metrics.DEFAULT_PROMPT_INSTRUCTIONS.",
   "validation": {

@@ -379,6 +379,24 @@ Translate PROC SQL directly to Spark SQL.               (stacked groups)
 Trace the write/read ordering before translating.
 ```
 
+### Statement scoping (`[when: statement:...]`)
+
+A DATA step's *statements* are construct keys too, so guidance can name the
+problem it solves rather than the chunk kind it lives in:
+`## [when: statement:merge] ...` fires on steps that merge, where
+`## [kind: DATA_STEP] ...` fires on every step there is. The vocabulary is
+`chunker.keywords.SAS_DATA_STEP_STATEMENT_TOKENS` — the statement keywords
+(`merge`, `by`, `retain`, `array`, `output`, `set`, `update`, `modify`,
+`where`, `infile`, `do`) plus four the scan derives rather than reads:
+`retain` for a sum statement (`x + expr;`), `subsetting_if` for an `if <expr>;`
+that drops rows, `set_multi` for a concatenating `SET a b;`, and
+`dataset_option` for `keep=` and friends.
+
+This matters more than it looks. Measured on a DATA step using dates, hashing
+and sequential `IF`s, `[kind: DATA_STEP]` scoping delivered 520 words (22% of
+the block) of MERGE, BY-group, RETAIN and ARRAY guidance the step could not
+use; on statement scoping that is 0.
+
 ### Family scoping (`[category:]`)
 
 `## [category: date_time, hashing_security] Rule` fires when the item uses
@@ -536,18 +554,18 @@ overall budget.
 **Budget the two together, and size them for your items.** The bundled
 SparkSQL set is ~6,700 words, so what fits matters. Measured against it:
 
-| Item | `max_instruction_words` | `user_instructions.max_words` | Rules delivered |
+| Item | `max_instruction_words` | Words drawn | Rules delivered |
 |---|---|---|---|
-| Single DATA step | 1500 | 1050 | 3 of 5 |
-| Single DATA step | 2500 | 1750 | 5 of 5 |
-| Batch (macro + PROC SQL + DATA step + PROC SORT) | 1500 | 1050 | 2 of 7 |
-| Batch | **3500** | **2450** | 7 of 7 |
+| Single DATA step | 1500 | 1034 | 4 of 5 |
+| Single DATA step | **4000** | 1442 | 5 of 5 |
+| Batch (macro + PROC SQL + DATA step + PROC SORT) | 1500 | 1035 | 2 of 7 |
+| Batch | **4000** | 2769 | 7 of 7 |
 
-config.json ships the last row, because a batch that loses its MERGE, regex,
-hashing, and sequential-`IF` guidance has lost exactly the rules the set
-exists to carry. It costs ~4.3k guidance tokens per item against ~1.9k at
-1500, and leaves ~1050 words for the reference corpus. Drop to 2500/1750 if
-`max_merged_tokens` keeps your items to single steps.
+config.json ships 4000 with `max_words` 2800. **It is a ceiling, not a cost
+floor.** Every section is scoped to a construct, statement, or function family
+the item actually uses, so the single DATA step draws 1442 words however high
+the budget goes — raising it buys nothing for simple items and completeness
+for complex ones. Only a genuinely broad batch reaches the cap.
 
 Leaving `max_words` null is not the cheaper alternative: uncapped operator
 rules simply take the whole budget and starve reference retrieval. Selected rules render in a `## Project instructions` block

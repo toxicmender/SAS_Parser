@@ -99,6 +99,26 @@ def test_constructs_for_item_maps_functions_and_hazards():
     assert ConstructKey(kind="call_routine", name="symput") in keys  # hazard added
 
 
+def test_constructs_for_item_adds_data_step_statement_keys():
+    """So a MERGE rule fires on steps that merge, not on every DATA step."""
+    text = "data a; merge b c; by id; run;"
+    chunk = SasChunk(
+        chunk_id="c8",
+        source_id="etl.sas",
+        text=text,
+        kind=SasChunkKind.DATA_STEP,
+        title="merge",
+        start_line=1,
+        end_line=1,
+        start_char=0,
+        end_char=len(text),
+        metadata=SasChunkMetadata(data_step_statements=["merge", "by"]),
+    )
+    keys = _constructs_for_item(_batch(chunk))
+    assert ConstructKey(kind="statement", name="merge") in keys
+    assert ConstructKey(kind="statement", name="by") in keys
+
+
 def test_constructs_for_item_adds_function_category_keys():
     """Every recognised function also contributes its family key, so a
     ``[category: date_time]`` rule fires without enumerating members."""

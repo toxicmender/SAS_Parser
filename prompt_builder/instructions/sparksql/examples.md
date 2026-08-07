@@ -59,7 +59,7 @@ SELECT acct.*,
 FROM acct;
 ```
 
-## [example] [kind: DATA_STEP] MERGE with BY-group flags
+## [example: statement:merge] MERGE with BY-group flags
 SAS:
 ```sas
 data work.enriched;

@@ -344,6 +344,70 @@ _SAS_COMPONENT_OBJECT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ── DATA-step statements ───────────────────────────────────────────────────
+# Statement keywords whose *presence* changes how a step must be translated —
+# a MERGE is a join, a BY is a window partition, an ARRAY is a reshape. They
+# are not functions, PROCs, or global statements, so nothing else in this file
+# sees them, and without them an instruction can only be scoped to "any DATA
+# step" and fires on every one.
+#
+# Advisory metadata, like the function catalogues: never gates chunking or
+# batching. Matched at statement position (start of text, or after a `;`) so a
+# variable named `output` or a `set` inside an expression does not register.
+_SAS_DATA_STEP_STATEMENTS: tuple[str, ...] = (
+    "merge", "by", "retain", "array", "output", "set", "update", "modify",
+    "where", "infile", "do",
+)
+# Statement position is the start of the text, just after a `;`, or just after
+# `THEN`/`ELSE` — a conditional `if x then output b;` is still an OUTPUT
+# statement, and that is where OUTPUT most often appears.
+_SAS_DATA_STEP_STATEMENT_RE = re.compile(
+    rf"(?:^|;|\bthen\b|\belse\b)\s*({'|'.join(_SAS_DATA_STEP_STATEMENTS)})\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# ``SET a b;`` over two or more datasets is a concatenation — the UNION ALL
+# case — whereas the single-dataset ``SET a;`` that opens almost every DATA
+# step says nothing. Only the former is worth an instruction, so it gets its
+# own token rather than drowning in `set`.
+_SAS_SET_MULTI_RE = re.compile(
+    r"(?:^|;)\s*set\s+(?:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?"
+    r"(?:\s*\([^)]*\))?\s+){1,}[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# The sum statement — ``var + expression;`` — is an implicitly retained
+# accumulator with no keyword of its own, so it is reported as `retain`: the
+# translation question it raises (a running total needs a window frame) is the
+# same one RETAIN raises. Excludes `=` so an ordinary assignment never matches.
+_SAS_SUM_STATEMENT_RE = re.compile(
+    r"(?:^|;)\s*[A-Za-z_]\w*\s*\+[^;=]+;",
+    re.MULTILINE,
+)
+
+# A *subsetting* IF — ``if <expr>;`` with no THEN — silently drops rows, which
+# is a WHERE clause rather than a CASE. Reported separately from `if/then`
+# because the two translate to different things entirely.
+_SAS_SUBSETTING_IF_RE = re.compile(
+    r"(?:^|;)\s*if\b(?:(?!\bthen\b)[^;])*;",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Dataset options that survive into the SELECT list (`keep=`, `in=`, ...).
+# Reported as `dataset_option` so one instruction can cover the family.
+_SAS_DATASET_OPTION_RE = re.compile(
+    r"\b(keep|drop|rename|in|obs|firstobs)\s*=",
+    re.IGNORECASE,
+)
+
+# Every token `SasChunkMetadata.data_step_statements` can hold: the keywords
+# above plus the four the scan derives rather than reads. Public because it is
+# the vocabulary an instruction scopes on (`[when: statement:merge]`), and a
+# rule naming anything outside it can never fire.
+SAS_DATA_STEP_STATEMENT_TOKENS: frozenset[str] = frozenset(
+    _SAS_DATA_STEP_STATEMENTS
+) | {"set_multi", "subsetting_if", "dataset_option"}
+
 # A function call is ``name(`` where the name is not glued to a preceding ``%``,
 # ``&``, or ``.``; a CALL routine is ``CALL name`` at a word boundary. Both
 # scans capture the *generic* identifier token and leave the "is it a known

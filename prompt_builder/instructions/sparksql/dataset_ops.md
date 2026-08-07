@@ -33,7 +33,7 @@ looks redundant because a key already guarantees uniqueness, say so under
 Risks and leave it in place — a wrong uniqueness assumption silently changes
 the row count, and the SAS output is the reference.
 
-## [kind: DATA_STEP, PROC_STEP] Stacking, appending, and dataset options
+## [when: proc:append, statement:set_multi, statement:dataset_option] Stacking, appending, and dataset options
 `PROC APPEND BASE=a DATA=b` and a DATA step's `SET a b;` both concatenate ->
 `SELECT ... FROM a UNION ALL SELECT ... FROM b`. Use `UNION ALL`, never
 `UNION`: plain `UNION` de-duplicates, which SAS does not.

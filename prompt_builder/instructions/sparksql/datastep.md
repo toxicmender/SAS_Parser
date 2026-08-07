@@ -32,7 +32,7 @@ chain, not a priority list, and flattening them changes the answer. Keep those
 sequential, as nested `CASE`s or successive CTEs, one per stage. State which
 form you applied and why.
 
-## [kind: DATA_STEP] RETAIN and accumulators
+## [when: statement:retain] RETAIN and accumulators
 A `RETAIN`ed variable keeps its value across rows, and `x + expr;` (the sum
 statement) is an implicit retained accumulator that also ignores missing
 values. Both are running aggregates -> a window function with an explicit
@@ -42,7 +42,7 @@ PRECEDING AND CURRENT ROW)`. ⚠️ Spark's default window frame changes with th
 ordering column the SAS relied on — if the DATA step depended on physical
 input order with no sort key, there is no faithful translation; say so.
 
-## [kind: DATA_STEP] Subsetting IF, WHERE, and OUTPUT
+## [when: statement:subsetting_if, statement:where, statement:output] Subsetting IF, WHERE, and OUTPUT
 - A **subsetting `IF`** (`if region = 'N';` with no `then`) drops rows -> a
   `WHERE` clause. ⚠️ It filters *after* the assignments above it, so a
   computed column may be referenced; `WHERE` cannot see select-list aliases,
@@ -58,7 +58,7 @@ input order with no sort key, there is no faithful translation; say so.
   needs an explicit order; `END=eof` marks the last row -> compare
   `ROW_NUMBER()` against `COUNT(*) OVER ()`.
 
-## [kind: DATA_STEP] ARRAY and DO loops
+## [when: statement:array, statement:do] ARRAY and DO loops
 An `ARRAY` names a set of existing columns and a `DO i = 1 TO n` loop walks
 them — together they are a wide-to-long reshape. Map to `STACK(...)` or a
 `UNION ALL` of the column selections, apply the loop body once against the

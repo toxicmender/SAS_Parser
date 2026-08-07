@@ -234,5 +234,67 @@ class TestComponentObjectDetection(unittest.TestCase):
         self.assertEqual(_component_objects(code), set())
 
 
+def _statements(code: str) -> set[str]:
+    """Union of data_step_statements across every chunk of *code*."""
+    return {
+        s for c in _C.chunk_text(code).chunks for s in c.metadata.data_step_statements
+    }
+
+
+class TestDataStepStatements(unittest.TestCase):
+    """Statement detection exists so an instruction can be scoped to the steps
+    that raise its problem, instead of firing on every DATA step."""
+
+    def test_merge_by_and_dataset_options(self):
+        code = "data a; merge b(in=x) c; by id; if first.id then s=0; run;"
+        self.assertEqual(
+            _statements(code), {"merge", "by", "dataset_option"}
+        )
+
+    def test_sum_statement_reports_retain_without_the_keyword(self):
+        """``t + amt;`` is an implicitly retained accumulator."""
+        self.assertIn("retain", _statements("data a; set b; t + amt; run;"))
+
+    def test_assignment_is_not_a_sum_statement(self):
+        self.assertNotIn("retain", _statements("data a; set b; t = amt + 1; run;"))
+
+    def test_conditional_output_is_still_an_output_statement(self):
+        """OUTPUT most often appears after THEN, not at statement position."""
+        code = "data a b; set c; if x then output a; else output b; run;"
+        self.assertIn("output", _statements(code))
+
+    def test_subsetting_if_is_distinguished_from_if_then(self):
+        """One filters rows (a WHERE), the other assigns (a CASE)."""
+        self.assertIn(
+            "subsetting_if", _statements("data a; set b; if region = 1; run;")
+        )
+        self.assertNotIn(
+            "subsetting_if",
+            _statements("data a; set b; if region = 1 then f = 1; run;"),
+        )
+
+    def test_only_a_multi_dataset_set_reports_set_multi(self):
+        """``SET a;`` opens almost every step and says nothing; ``SET a b;``
+        is a concatenation."""
+        self.assertIn("set_multi", _statements("data all; set jan feb mar; run;"))
+        self.assertNotIn("set_multi", _statements("data a; set b; run;"))
+
+    def test_proc_steps_report_no_data_step_statements(self):
+        """A PROC's statements are already identified by proc_name."""
+        code = "proc sort data=a out=b nodupkey; by id; run;"
+        self.assertEqual(_statements(code), set())
+
+    def test_every_reported_token_is_in_the_published_vocabulary(self):
+        """The vocabulary instructions scope on must be exhaustive."""
+        from chunker.keywords import SAS_DATA_STEP_STATEMENT_TOKENS
+
+        code = (
+            "data a; set b c; merge d; by id; retain t; t + amt;"
+            " array q{2} q1-q2; do i=1 to 2; end; where amt>0;"
+            " if flag; output; run;"
+        )
+        self.assertTrue(_statements(code) <= SAS_DATA_STEP_STATEMENT_TOKENS)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -84,11 +84,9 @@ to a date; map to `TO_DATE(str, 'yyyy-MM-dd')` / `TO_TIMESTAMP(...)`. The
 SAS informat/format name determines the pattern — translate the specific
 width and layout, not a generic default.
 
-⚠️ **Parsing is strict.** Since Spark 3.0 these use the Java
-`DateTimeFormatter`, which *raises* on text that does not match the pattern;
-SAS `INPUT` yields a missing value and a log note. Use `TRY_TO_DATE` /
-`TRY_TO_TIMESTAMP` whenever the source text is not provably clean — that is
-the faithful translation of SAS's behaviour, and it keeps one bad row from
-failing the job. Note also that pattern `yyyy` means *year-of-era* and `uuuu`
-means *proleptic year*; they differ only before 1 CE, but `uuuu` is the safer
-letter when a pattern is used for both parsing and formatting.
+⚠️ **Parsing is strict** — since Spark 3.0 these use the Java
+`DateTimeFormatter`, so `TRY_TO_DATE` / `TRY_TO_TIMESTAMP` are the faithful
+form for the same reason `TRY_CAST` is (see the non-date `PUT`/`INPUT`
+guidance). Pattern `yyyy` is *year-of-era* and `uuuu` is *proleptic year*;
+they differ only before 1 CE, but `uuuu` is safer for a pattern used to both
+parse and format.

@@ -16,11 +16,11 @@ ordering explicit and flag it — a naive translation that reads the variable
 too early is a silent-error class.
 
 ## [meta: invokes_macros] %SYSFUNC and macro-time function calls
-`%SYSFUNC(fn(args))` calls a DATA-step function at macro-resolution time,
-before any query runs. Evaluate it at generation time where possible (e.g.
-`%SYSFUNC(today())` -> a bound date parameter), or map it to the equivalent
-Spark SQL function inside the query when it genuinely depends on row data.
-Do not leave `%SYSFUNC` in the emitted SQL.
+`%SYSFUNC(fn(args))` runs a DATA-step function at macro-resolution time,
+before any query. Evaluate it at generation time where you can
+(`%SYSFUNC(today())` -> a bound date), or map it to the Spark function inside
+the query when it genuinely depends on row data. Never leave `%SYSFUNC` in the
+emitted SQL.
 
 ## [kind: MACRO_DEFINITION, MACRO_CALL] Decomposing a macro
 A macro is a *code generator*, not a function: it emits SAS text that is then

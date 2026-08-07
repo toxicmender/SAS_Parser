@@ -22,7 +22,7 @@ almost directly, then adjust for these differences:
   not a table: map it to `CREATE OR REPLACE TEMP VIEW`. Keep it a view —
   materialising it into a table changes when the query runs and what it sees.
 
-## [kind: DATA_STEP] MERGE and BY-group joins
+## [when: statement:merge, statement:update, statement:modify] MERGE and BY-group joins
 A SAS `DATA` step `MERGE a b; BY key;` is a full outer join on `key`, not an
 inner join — unmatched rows from either side are kept. Translate to
 `FULL OUTER JOIN ... USING (key)` (or `LEFT`/`INNER` only when `IF a` / `IF
@@ -33,7 +33,7 @@ kept. A `MERGE` without `BY` is positional (one-to-one by row position) and
 has no correct Spark SQL translation — flag it as unsafe rather than
 guessing.
 
-## [kind: DATA_STEP] BY-group processing (FIRST./LAST.)
+## [when: statement:by] [kind: DATA_STEP] BY-group processing (FIRST./LAST.)
 `FIRST.var` / `LAST.var` flags map to window functions over
 `PARTITION BY <by-vars> ORDER BY <by-vars>`: `FIRST.x` is
 `ROW_NUMBER() = 1`, `LAST.x` is `ROW_NUMBER() OVER (... ORDER BY ... DESC) =

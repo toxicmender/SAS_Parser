@@ -129,6 +129,8 @@ def _constructs_for_item(item: SasBatch) -> list[ConstructKey]:
         note_category(name)
     for name in sorted(item.component_objects):
         add("component_object", name)
+    for name in sorted(item.data_step_statements):
+        add("statement", name)
     for name in sorted(item.global_statement_keywords):
         add("global_statement", name)
     if item.has_symput_scope_hazard:

@@ -1,13 +1,11 @@
-Target Spark SQL (ANSI dialect), not the PySpark DataFrame API. Emit
-`spark.sql("...")`-ready statements — `CREATE OR REPLACE TEMP VIEW` /
-`CREATE TABLE ... AS SELECT` for each SAS step's output dataset — so the
-translation is one readable SQL script that mirrors the SAS step sequence.
+Target Spark SQL, not the PySpark DataFrame API: emit `spark.sql("...")`-ready
+statements, one readable script mirroring the SAS step sequence.
 
 ## Output format
 One fenced ```sql block per SAS step, in execution order, named after the SAS
-output dataset (`work.foo` -> `foo`). Keep one statement per logical step;
-do not collapse several SAS steps into one opaque query. Pick the statement by
-where the SAS wrote: a temporary dataset (`work.*` or unqualified) ->
+output dataset (`work.foo` -> `foo`). One statement per logical step; never
+collapse several steps into one opaque query. Choose the statement by where
+the SAS wrote: a temporary dataset (`work.*` or unqualified) ->
 `CREATE OR REPLACE TEMP VIEW`; a permanent libref -> `CREATE TABLE ... AS
 SELECT`. Within a step, lift each stage into its own named CTE rather than
 nesting subqueries — the names carry the SAS step's intent into the SQL.

@@ -32,6 +32,7 @@ import pytest
 from chunker.keywords import (
     _SAS_CALL_ROUTINES,
     _SAS_FUNCTIONS,
+    SAS_DATA_STEP_STATEMENT_TOKENS,
     SAS_FUNCTION_CATEGORIES,
 )
 from chunker.models import SasChunkKind
@@ -54,7 +55,7 @@ INSTRUCTIONS_DIR = pathlib.Path(__file__).resolve().parents[1] / (
 # directive naming anything else is dead on arrival — it will never match.
 EMITTABLE_KINDS = frozenset(
     {"proc", "function", "call_routine", "component_object",
-     "global_statement", "category"}
+     "global_statement", "category", "statement"}
 )
 # ``macro_statement`` is emitted, but only ever for these two names.
 EMITTABLE_MACRO_STATEMENTS = frozenset({"goto", "abort"})
@@ -150,6 +151,8 @@ def test_every_directive_key_is_reachable(bundled):
                 ok = key.name in _SAS_CALL_ROUTINES
             elif key.kind == "category":
                 ok = key.name in set(SAS_FUNCTION_CATEGORIES.values())
+            elif key.kind == "statement":
+                ok = key.name in SAS_DATA_STEP_STATEMENT_TOKENS
             else:
                 ok = True
             if not ok:
