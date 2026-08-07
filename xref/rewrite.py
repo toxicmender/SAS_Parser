@@ -35,10 +35,9 @@ import ast
 import logging
 
 import app_config
+from target_language import SPARKSQL, resolve_target_language
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_DIALECT = "databricks"
 
 ON_PARSE_FAILURE_WARN = "warn"
 ON_PARSE_FAILURE_ERROR = "error"
@@ -56,9 +55,42 @@ class XrefRewriteError(RuntimeError):
     whether the run stops."""
 
 
+def default_dialect() -> str:
+    """The run's target language, as a sqlglot dialect.
+
+    Resolved from ``pipeline.output_language`` rather than held as a constant
+    here: the syntax checker parses generated SQL under the *same* target's
+    :attr:`~target_language.TargetLanguage.sqlglot_dialect`, and a rewriter
+    reading it differently would silently return code un-rewritten (the hard
+    rule above) on exactly the syntax the checker had just called valid.
+
+    A non-SQL target (PySpark, Spark Scala) has no dialect of its own, but this
+    module still reaches sqlglot for the SQL inside ``spark.sql("...")`` — so
+    those fall back to the SQL target's dialect rather than to nothing.
+    """
+    configured = app_config.get_value("pipeline", "output_language")
+    if configured:
+        try:
+            target = resolve_target_language(str(configured))
+        except Exception:
+            # An unknown name is the pipeline's error to raise, not ours: the
+            # rewriter should not be what fails a run over a config typo.
+            target = SPARKSQL
+    else:
+        target = SPARKSQL
+    return target.sqlglot_dialect or SPARKSQL.sqlglot_dialect or "databricks"
+
+
 def dialect() -> str:
-    """The sqlglot dialect for the post rewriter (``xref.dialect``)."""
-    return app_config.get_typed_value("xref", "dialect", str, DEFAULT_DIALECT)
+    """The sqlglot dialect for the post rewriter.
+
+    ``xref.dialect`` overrides it; unset, it follows the run's target language
+    (:func:`default_dialect`), so the rewriter and the syntax checker agree by
+    construction.
+    """
+    return app_config.get_typed_value(
+        "xref", "dialect", str, default_dialect()
+    )
 
 
 def on_parse_failure() -> str:

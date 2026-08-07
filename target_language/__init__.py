@@ -86,21 +86,18 @@ def _check_python(source: str) -> str | None:
     return None
 
 
-def _check_sql(source: str) -> str | None:
-    """Parse *source* as Databricks SQL with sqlglot, or check it structurally.
+def _check_sql(source: str, dialect: str) -> str | None:
+    """Parse *source* as *dialect* SQL with sqlglot, or check it structurally.
 
     sqlglot is optional (the ``sql`` extra). Without it the fallback flags
     only what is unambiguous — unbalanced brackets or quotes — because this
     result can fail an item and drive a retry, and a heuristic that guesses
     would spend LLM calls re-answering correct translations.
 
-    The dialect is ``databricks`` because that is what this target *is*: the
-    bundled guidance emits ``QUALIFY``, SQL scripting, ``EXECUTE IMMEDIATE``
-    and three-level names, none of which open-source Spark has. It also keeps
-    the two sqlglot consumers agreeing — ``xref.rewrite`` parses the *same*
-    generated SQL under ``xref.dialect``, which defaults to ``databricks`` —
-    and one checker calling a statement valid while the other fails to parse it
-    is precisely the split-brain this module exists to prevent.
+    *dialect* comes from the target's :attr:`TargetLanguage.sqlglot_dialect`,
+    never from a constant here, so this and ``xref.rewrite`` — which parses the
+    *same* generated SQL to rewrite table references — can never disagree about
+    the same statement.
     """
     try:
         import sqlglot
@@ -108,7 +105,7 @@ def _check_sql(source: str) -> str | None:
         return _check_sql_structure(source)
     try:
         # A statement list: a translation cell is routinely several statements.
-        sqlglot.parse(source, dialect="databricks")
+        sqlglot.parse(source, dialect=dialect)
     except Exception as exc:  # sqlglot raises ParseError/TokenError/...
         return f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
     return None
@@ -175,8 +172,15 @@ class TargetLanguage:
     complexity_profile
         The ``complexity/profiles/*.json`` rule set that rates SAS constructs
         against this target.
+    sqlglot_dialect
+        The sqlglot dialect this target's code is SQL in, or ``None`` when it
+        is not SQL. Every consumer that parses generated code reads it from
+        here — the syntax checker and ``xref.rewrite``'s table rewriter — so
+        the two can never disagree about the same statement.
     syntax_checker
-        ``source -> error message | None``. ``None`` means "parses".
+        ``source -> error message | None``. ``None`` means "parses". Only
+        consulted for targets with no ``sqlglot_dialect``; a SQL target is
+        checked by parsing under its dialect.
     """
 
     key: str
@@ -189,6 +193,7 @@ class TargetLanguage:
     language_info: dict[str, str]
     complexity_profile: str
     comment_prefix: str
+    sqlglot_dialect: str | None = None
     syntax_checker: Callable[[str], str | None] = field(
         repr=False, default=_check_none
     )
@@ -204,6 +209,8 @@ class TargetLanguage:
 
     def check_syntax(self, source: str) -> str | None:
         """An error message for *source*, or ``None`` when it is well-formed."""
+        if self.sqlglot_dialect is not None:
+            return _check_sql(source, self.sqlglot_dialect)
         return self.syntax_checker(source)
 
     @property
@@ -213,21 +220,24 @@ class TargetLanguage:
         Resolved live rather than at construction because it depends on
         whether an optional dependency is importable *now*.
         """
-        if self.syntax_checker is _check_python:
-            return "ast"
-        if self.syntax_checker is _check_sql:
+        if self.sqlglot_dialect is not None:
             try:
                 import sqlglot  # noqa: F401
             except ImportError:
                 return "structural"
             return "sqlglot"
+        if self.syntax_checker is _check_python:
+            return "ast"
         return "none"
 
     @property
     def checks_syntax(self) -> bool:
         """False when this target has no syntax checker at all (the metric
         skips rather than scoring everything as valid)."""
-        return self.syntax_checker is not _check_none
+        return (
+            self.sqlglot_dialect is not None
+            or self.syntax_checker is not _check_none
+        )
 
 
 _PYTHON_KERNELSPEC = {
@@ -270,7 +280,9 @@ SPARKSQL = TargetLanguage(
     },
     complexity_profile="sparksql",
     comment_prefix="--",
-    syntax_checker=_check_sql,
+    # The bundled guidance emits QUALIFY, SQL scripting, EXECUTE IMMEDIATE and
+    # three-level names — Databricks SQL, not open-source Spark.
+    sqlglot_dialect="databricks",
 )
 
 SPARKSCALA = TargetLanguage(
