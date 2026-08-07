@@ -21,6 +21,7 @@ from llm_client import LLMClientConfig
 from pipeline import SasLLMPipeline
 from pipeline.setup import MemorySetup, PromptingSetup
 from pipeline.prompting import (
+    _attribution_for_item,
     _constructs_for_item,
     _kinds_for_item,
     _meta_flags_for_item,
@@ -97,6 +98,81 @@ def test_constructs_for_item_maps_functions_and_hazards():
     keys = _constructs_for_item(_batch(chunk))
     assert ConstructKey(kind="function", name="intnx") in keys
     assert ConstructKey(kind="call_routine", name="symput") in keys  # hazard added
+
+
+def test_construct_key_emission_order_is_the_selector_contract():
+    """The selector treats the caller's order as meaningful — it reports the
+    first matching key as a pick's provenance and interleaves construct hits in
+    it — so the sequence is pinned, not incidental."""
+    batch = _batch(
+        _meta_chunk(
+            "c1",
+            recognized_functions=["intnx", "upcase"],
+            recognized_call_routines=["symput"],
+            component_objects=["hash"],
+            data_step_statements=["merge", "by"],
+            symput_scope_hazard=True,
+            contains_computed_goto=True,
+            contains_abort=True,
+        ),
+        _meta_chunk("c2", kind=SasChunkKind.PROC_STEP, proc_name="sql"),
+        _meta_chunk(
+            "c3",
+            kind=SasChunkKind.GLOBAL_STATEMENT,
+            global_statement_keyword="libname",
+        ),
+    )
+    assert [str(k) for k in _constructs_for_item(batch)] == [
+        "proc:sql",
+        "function:intnx",
+        "function:upcase",
+        "call_routine:symput",
+        "component_object:hash",
+        "statement:by",
+        "statement:merge",
+        "global_statement:libname",
+        "macro_statement:goto",
+        "macro_statement:abort",
+        "category:character",
+        "category:date_time",
+        "category:macro",
+    ]
+
+
+def test_attribution_maps_each_construct_to_the_member_that_uses_it():
+    """A multi-member batch's guidance can name the step it serves."""
+    batch = _batch(
+        _meta_chunk("c1", data_step_statements=["merge", "by"]),
+        _meta_chunk("c2", recognized_functions=["intnx"]),
+        _meta_chunk("c3", kind=SasChunkKind.PROC_STEP, proc_name="sort"),
+    )
+    attribution = _attribution_for_item(batch)
+    assert attribution[ConstructKey(kind="statement", name="merge")] == ["c1"]
+    assert attribution[ConstructKey(kind="function", name="intnx")] == ["c2"]
+    assert attribution[ConstructKey(kind="proc", name="sort")] == ["c3"]
+    # A category key follows its function to the same member.
+    assert attribution[ConstructKey(kind="category", name="date_time")] == ["c2"]
+
+
+def test_attribution_lists_every_member_sharing_a_construct_in_batch_order():
+    batch = _batch(
+        _meta_chunk("c1", recognized_functions=["intnx"]),
+        _meta_chunk("c2", recognized_functions=["upcase"]),
+        _meta_chunk("c3", recognized_functions=["intnx"]),
+    )
+    attribution = _attribution_for_item(batch)
+    assert attribution[ConstructKey(kind="function", name="intnx")] == ["c1", "c3"]
+
+
+def test_attribution_covers_every_key_the_batch_reports():
+    """No construct may be selected on and then be unattributable — a batch
+    rollup is by definition the union of its members."""
+    batch = _batch(
+        _meta_chunk("c1", data_step_statements=["merge"], recognized_functions=["intnx"]),
+        _meta_chunk("c2", kind=SasChunkKind.PROC_STEP, proc_name="sql"),
+    )
+    attribution = _attribution_for_item(batch)
+    assert all(key in attribution for key in _constructs_for_item(batch))
 
 
 def test_constructs_for_item_adds_data_step_statement_keys():

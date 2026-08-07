@@ -66,6 +66,7 @@ from .constants import (
     _SYSTEM_PROMPT_TEMPLATE,
 )
 from .prompting import (
+    _attribution_for_item,
     _constructs_for_item,
     _format_batch_message,
     _kinds_for_item,
@@ -1195,7 +1196,16 @@ class SasLLMPipeline:
             meta_flags=_meta_flags_for_item(item),
         )
         retrieval_context = [pick.chunk.text for pick in picks]
-        guidance = self._prompt_builder.build_from_picks(picks, constructs)
+        # Label each section with the member that pulled it in — but only when
+        # there is more than one member to tell apart. On a singleton every
+        # label would name the same chunk, which is noise, so pass None and
+        # render exactly what an unattributed build does.
+        attribution = (
+            _attribution_for_item(item) if len(item.chunks) > 1 else None
+        )
+        guidance = self._prompt_builder.build_from_picks(
+            picks, constructs, attribution=attribution
+        )
         if not guidance:
             return [], retrieval_context
         item_id = item.batch_id

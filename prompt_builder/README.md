@@ -306,6 +306,34 @@ that `build_from_picks` takes the **item's** constructs, not the selection's:
 the hazard hints and reasoning directives are keyed on them so they survive
 when no reference section matched.
 
+### Member attribution (`attribution=`)
+
+An item is a *batch*, and a batch spanning a macro, a PROC SQL, a DATA step and
+a PROC SORT gets one guidance block covering all four. Passing `attribution` — a
+`{ConstructKey: [member id, ...]}` map — labels each section with the member
+whose constructs brought it in:
+
+```
+### MERGE and BY-group joins  [chunk-0002]
+### PROC SORT  [chunk-0003]
+### Output format
+```
+
+so the model is not left to re-derive from the member bodies what the batch
+summary already knows. Reference sections carry the id inside their existing
+citation run (`### [functions · … · construct: intnx · chunk-0002]`).
+
+Only picks with a matched construct key are labelled. An always-on rule, a
+pinned or topical section, and a `[kind:]`/`[meta:]`-gated note have no key and
+are batch-wide by nature, so they stay unlabelled — that is the correct reading,
+not a missing label. `None` (the default) renders exactly the unlabelled block,
+which is what a single-member batch should pass, since there every label would
+name the same chunk.
+
+The ids are opaque strings: `pipeline.prompting._attribution_for_item` builds the
+map by running the same construct-key derivation over each member, which is what
+keeps this package free of any `chunker` import.
+
 ### Focus hints (directional stimulus)
 
 The `## Focus hints` block is a compact per-item stimulus — the item's

@@ -163,6 +163,8 @@ _BATCH_CONTEXT_TEMPLATE = """\
 - Autocall macros   : {standard_autocall_macros}
 - Macrovars (req)   : {required_macrovars}
 - Macrovars (prod)  : {produced_macrovars}
+- PROCs run         : {proc_names}
+- DATA-step stmts   : {data_step_statements}
 - SAS functions     : {sas_functions}
 - CALL routines     : {call_routines}
 - Component objects : {component_objects}

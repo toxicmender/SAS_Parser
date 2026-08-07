@@ -434,3 +434,90 @@ def test_from_specs_loads_and_builds(tmp_path):
     pb = PromptBuilder.from_specs([spec], cache_dir=str(tmp_path / "cache"))
     block = _built(pb.build("advance a date", [INTNX]))
     assert "INTNX Function" in block
+
+
+# ---------------------------------------------------------------------------
+# Member attribution — labelling a batch's guidance with the member it serves
+# ---------------------------------------------------------------------------
+
+MERGE = ConstructKey(kind="statement", name="merge")
+
+_ATTRIBUTION_RULES = (
+    "## Output format\nAlways-on, applies to the whole batch.\n\n"
+    "## [when: function:intnx] Date shifting\nUse ADD_MONTHS.\n\n"
+    "## [when: statement:merge] Joining\nA MERGE is a full outer join.\n\n"
+    "## [example: function:intnx] Worked INTNX\nA worked pair.\n"
+)
+
+
+def _attributed_builder():
+    from prompt_builder.user_instructions import UserInstructionSet
+
+    return PromptBuilder(
+        _corpus(), user_instructions=UserInstructionSet.from_text(_ATTRIBUTION_RULES)
+    )
+
+
+def test_attribution_labels_construct_matched_sections_with_their_member():
+    pb = _attributed_builder()
+    block = _built(
+        pb.build(
+            "advance a date interval",
+            [INTNX, MERGE],
+            attribution={INTNX: ["chunk-0002"], MERGE: ["chunk-0001"]},
+        )
+    )
+    assert "### Date shifting  [chunk-0002]" in block
+    assert "### Joining  [chunk-0001]" in block
+    # The reference hit joins its existing citation run rather than trailing it.
+    assert "· construct: intnx · chunk-0002]" in block
+    # A worked example is labelled like the rule it demonstrates.
+    assert "### Worked INTNX  [chunk-0002]" in block
+
+
+def test_attribution_leaves_always_on_sections_unlabelled():
+    """An unconditional rule has no matched key: it is batch-wide, not
+    unattributable, so it must read exactly as it does without labelling."""
+    pb = _attributed_builder()
+    block = _built(
+        pb.build("advance a date interval", [INTNX], attribution={INTNX: ["chunk-0002"]})
+    )
+    assert "### Output format\n" in block
+    assert "### Output format  [" not in block
+
+
+def test_attribution_explains_itself_once():
+    pb = _attributed_builder()
+    block = _built(
+        pb.build("advance a date interval", [INTNX], attribution={INTNX: ["chunk-0002"]})
+    )
+    assert block.count("A bracketed id names the batch member") == 1
+
+
+def test_attribution_lists_several_members_for_a_shared_construct():
+    pb = _attributed_builder()
+    block = _built(
+        pb.build(
+            "advance a date interval",
+            [INTNX],
+            attribution={INTNX: ["chunk-0001", "chunk-0003"]},
+        )
+    )
+    assert "### Date shifting  [chunk-0001, chunk-0003]" in block
+
+
+def test_no_attribution_renders_exactly_the_unlabelled_block():
+    """The single-member path: passing None must change nothing at all."""
+    pb = _attributed_builder()
+    args = ("advance a date interval", [INTNX, MERGE])
+    assert pb.build(*args, attribution=None) == pb.build(*args)
+
+
+def test_a_key_absent_from_the_map_is_not_labelled():
+    """Guards against rendering an empty '[]' when a key has no member."""
+    pb = _attributed_builder()
+    block = _built(
+        pb.build("advance a date interval", [INTNX, MERGE], attribution={INTNX: []})
+    )
+    assert "[]" not in block
+    assert "### Date shifting\n" in block

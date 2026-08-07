@@ -136,6 +136,44 @@ def test_format_batch_message_includes_all_members_and_cross_file_flag():
     assert "dataset_flow(work.base)" in msg
 
 
+def test_format_batch_message_lists_procs_and_data_step_statements():
+    """The facts shown must cover the keys guidance is selected on.
+
+    Rules are scoped `[when: proc:sort]` and `[when: statement:merge]`, so a
+    context block naming neither leaves the model to re-derive from the member
+    bodies what the batch summary already knows.
+    """
+    merge_step = _mk_chunk(
+        "f1-chunk-0001",
+        "etl.sas",
+        "data work.out; merge work.a work.b; by id; run;",
+        data_step_statements=["by", "merge"],
+    )
+    sort_step = _mk_chunk(
+        "f1-chunk-0002",
+        "etl.sas",
+        "proc sort data=work.out; by id; run;",
+        proc_name="sort",
+    )
+    sort_step.kind = SasChunkKind.PROC_STEP
+    batch = _mk_batch("batch-001", [merge_step, sort_step], source_files=["etl.sas"])
+
+    msg = _format_batch_message(batch, index=1, total=1, diagnostics=[])
+
+    assert "- PROCs run         : sort" in msg
+    assert "- DATA-step stmts   : by, merge" in msg
+
+
+def test_format_batch_message_reports_none_for_absent_rollups():
+    chunk = _mk_chunk("f1-chunk-0001", "etl.sas", "data a; set b; run;")
+    batch = _mk_batch("batch-001", [chunk], source_files=["etl.sas"])
+
+    msg = _format_batch_message(batch, index=1, total=1, diagnostics=[])
+
+    assert "- PROCs run         : none" in msg
+    assert "- DATA-step stmts   : none" in msg
+
+
 # ---------------------------------------------------------------------------
 # Persistence wiring — KVChatMessageHistory round-trip via MemoryHub
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ Logger name: ``prompt_builder.builder``.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping, Sequence
 from typing import Any, Callable, Iterable
 
 import app_config
@@ -403,6 +404,7 @@ class PromptBuilder:
         output_language: str | None = None,
         kinds: Iterable[str] = (),
         meta_flags: Iterable[str] = (),
+        attribution: Mapping[ConstructKey, Sequence[str]] | None = None,
     ) -> str | None:
         """
         The Markdown block(s) for one item — a ``## Project instructions``
@@ -418,6 +420,8 @@ class PromptBuilder:
         chunk-kind-, and metadata-scoped user instructions (see
         :meth:`InstructionSelector.select_detailed`); *output_language*
         ``None`` falls back to the builder's construction-time value.
+        *attribution* labels each section with the batch member it came from
+        (see :meth:`build_from_picks`).
 
         :meth:`select` + :meth:`build_from_picks` is the same thing in two
         steps, for a caller that needs the picks themselves.
@@ -430,12 +434,14 @@ class PromptBuilder:
             kinds=kinds,
             meta_flags=meta_flags,
         )
-        return self.build_from_picks(picks, constructs)
+        return self.build_from_picks(picks, constructs, attribution=attribution)
 
     def build_from_picks(
         self,
         picks: list[SelectedInstruction],
         constructs: Iterable[ConstructKey] = (),
+        *,
+        attribution: Mapping[ConstructKey, Sequence[str]] | None = None,
     ) -> str | None:
         """
         Render already-retrieved *picks* into :meth:`build`'s Markdown block(s),
@@ -444,16 +450,28 @@ class PromptBuilder:
         *constructs* are the **item's** constructs, not the selection's: the
         hazard hint line and the reasoning directives are keyed on them so they
         survive even when no reference section matched.
+
+        *attribution* maps a construct key to the ids of the batch members that
+        use it, and turns on **member labels**: a section retrieved because one
+        member merges is headed with that member's id, so a multi-member batch
+        does not hand the model a pile of rules and leave it to work out which
+        step each belongs to. The ids are opaque strings — the caller owns what
+        they mean, which is what keeps this package free of any ``chunker``
+        import.
+
+        Only picks carrying a matched construct key are labelled. An always-on
+        rule, a pinned or topical section, and a ``[kind:]``/``[meta:]``-gated
+        note have no key and are batch-wide by nature, so they stay unlabelled.
+        Pass ``None`` (the default, and what a single-member batch should use)
+        and the output is exactly what it was before labelling existed.
         """
         constructs = list(constructs)
         if not picks:
             logger.debug("build: no relevant instruction chunks; no block")
             return None
-        examples = [
-            p.chunk for p in picks if p.tier is SelectionTier.USER_EXAMPLE
-        ]
+        examples = [p for p in picks if p.tier is SelectionTier.USER_EXAMPLE]
         user = [
-            p.chunk
+            p
             for p in picks
             if p.chunk.role is DocRole.USER_INSTRUCTION
             and p.tier is not SelectionTier.USER_EXAMPLE
@@ -464,10 +482,11 @@ class PromptBuilder:
         logger.debug(
             f"build: {len(user)} user + {len(examples)} example + "
             f"{len(reference)} reference chunk(s) injected"
+            f"{'  (member-attributed)' if attribution else ''}"
         )
         blocks: list[str] = []
         if user:
-            blocks.append(self._format_user(user))
+            blocks.append(self._format_user(user, attribution))
         if self.focus_hints:
             hints = self._format_hints(picks, constructs)
             if hints:
@@ -477,10 +496,28 @@ class PromptBuilder:
             if directives:
                 blocks.append(directives)
         if reference:
-            blocks.append(self._format_reference(reference))
+            blocks.append(self._format_reference(reference, attribution))
         if examples:
-            blocks.append(self._format_examples(examples))
+            blocks.append(self._format_examples(examples, attribution))
         return "\n\n".join(blocks)
+
+    @staticmethod
+    def _attribution_suffix(
+        pick: SelectedInstruction,
+        attribution: Mapping[ConstructKey, Sequence[str]] | None,
+    ) -> str:
+        """``"  [chunk-0002]"`` for a keyed pick, else ``""``.
+
+        Empty whenever labelling is off, the pick carries no matched key, or
+        the key belongs to no member — so an unlabelled section reads exactly
+        as it did before, rather than as a section whose member is unknown.
+        """
+        if not attribution or pick.construct_key is None:
+            return ""
+        members = attribution.get(pick.construct_key)
+        if not members:
+            return ""
+        return f"  [{', '.join(members)}]"
 
     def _format_directives(self, constructs: list[ConstructKey]) -> str | None:
         """
@@ -565,16 +602,34 @@ class PromptBuilder:
         parts = chunk.text.split("\n\n", 1)
         return (parts[1] if len(parts) > 1 else chunk.text).strip()
 
-    def _format_user(self, picks: list[InstructionChunk]) -> str:
+    def _format_user(
+        self,
+        picks: list[SelectedInstruction],
+        attribution: Mapping[ConstructKey, Sequence[str]] | None = None,
+    ) -> str:
         lines = [f"## {self.project_heading}", ""]
-        for chunk in picks:
+        if attribution:
+            lines += [
+                "A bracketed id names the batch member whose constructs "
+                "brought that rule in; a rule with no id applies to the batch "
+                "as a whole.",
+                "",
+            ]
+        for pick in picks:
             # Operator rules cite no document or pages — just their heading.
-            lines.append(f"### {chunk.section_path}")
-            lines.append(self._body_of(chunk))
+            lines.append(
+                f"### {pick.chunk.section_path}"
+                f"{self._attribution_suffix(pick, attribution)}"
+            )
+            lines.append(self._body_of(pick.chunk))
             lines.append("")
         return "\n".join(lines).rstrip()
 
-    def _format_examples(self, picks: list[InstructionChunk]) -> str:
+    def _format_examples(
+        self,
+        picks: list[SelectedInstruction],
+        attribution: Mapping[ConstructKey, Sequence[str]] | None = None,
+    ) -> str:
         lines = [
             f"## {self.examples_heading}",
             "",
@@ -582,10 +637,13 @@ class PromptBuilder:
             "demonstrate:",
             "",
         ]
-        for chunk in picks:
+        for pick in picks:
             # Like operator rules: the operator's own heading, no citations.
-            lines.append(f"### {chunk.section_path}")
-            lines.append(self._body_of(chunk))
+            lines.append(
+                f"### {pick.chunk.section_path}"
+                f"{self._attribution_suffix(pick, attribution)}"
+            )
+            lines.append(self._body_of(pick.chunk))
             lines.append("")
         return "\n".join(lines).rstrip()
 
@@ -603,7 +661,11 @@ class PromptBuilder:
             return f"{pick.tier.value}: {pick.construct_key.name}"
         return pick.tier.value  # pinned | topical
 
-    def _format_reference(self, picks: list[SelectedInstruction]) -> str:
+    def _format_reference(
+        self,
+        picks: list[SelectedInstruction],
+        attribution: Mapping[ConstructKey, Sequence[str]] | None = None,
+    ) -> str:
         lines = [f"## {self.heading}", ""]
         for pick in picks:
             chunk = pick.chunk
@@ -612,9 +674,13 @@ class PromptBuilder:
                 if chunk.page_start == chunk.page_end
                 else f"pp. {chunk.page_start}-{chunk.page_end}"
             )
+            # The member id joins the citation rather than trailing the header,
+            # so the whole provenance stays inside one bracketed run.
+            members = self._attribution_suffix(pick, attribution).strip()
+            member_cite = f" · {members[1:-1]}" if members else ""
             lines.append(
                 f"### [{chunk.doc_id} · {chunk.section_path} · {pages} · "
-                f"{self._selection_reason(pick)}]"
+                f"{self._selection_reason(pick)}{member_cite}]"
             )
             lines.append(self._body_of(chunk))
             lines.append("")
