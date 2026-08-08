@@ -9,10 +9,10 @@
     "max_tokens": 1300,
     "overlap_tokens": 90
   },
-  "_prompt_builder_comment": "'max_instruction_tokens' is the total TOKEN budget for the per-item guidance block, shared by operator rules and retrieved reference chunks; the selector fills it in priority order and drops whole chunks at the tail. Tokens, not words: measured over the bundled reference corpus the tokens-per-word ratio runs 1.01 to 4.41 (median 1.44) depending on how much of a section is code, so a word budget silently under-counted exactly the SQL-heavy guidance this set is made of. BREAKING: the old 'max_instruction_words' key is gone -- app_config raises if it is still present rather than reverting to a default. 8000 is an interim value, and MEASURED SHORT: over a 70-line reference program batching into two items it still drops 7 of the rules those items' constructs matched. Zero drops needs 14000 with user_instructions.max_tokens 9800, at which point the items draw 12.4k tokens and more budget buys nothing. Raising it is a per-item cost decision, which is why it is not simply set there. It is a ceiling, not a cost floor -- every section is scoped to a construct the item actually uses, so a simple DATA step draws far less no matter how high this is set. Keep it >= instruction_chunker.max_tokens so one reference section always fits.",
+  "_prompt_builder_comment": "'max_instruction_tokens' is the total TOKEN budget for the per-item guidance block, shared by operator rules and retrieved reference chunks; the selector fills it in priority order and drops whole chunks at the tail. Tokens, not words: measured over the bundled reference corpus the tokens-per-word ratio runs 1.01 to 4.41 (median 1.44) depending on how much of a section is code, so a word budget silently under-counted exactly the SQL-heavy guidance this set is made of. BREAKING: the old 'max_instruction_words' key is gone -- app_config raises if it is still present rather than reverting to a default. 14000 is the measured zero-drop point: over a 70-line reference program batching into two items, every rule those items' constructs matched arrives, the items draw 12.4k tokens, and more budget buys nothing (8000 dropped 7 rules, 10000 dropped 4). Pair it with user_instructions.max_tokens 9800 (70%). It is a ceiling, not a cost floor -- every section is scoped to a construct the item actually uses, so a simple DATA step draws far less no matter how high this is set. Keep it >= instruction_chunker.max_tokens so one reference section always fits.",
   "prompt_builder": {
     "top_k": 6,
-    "max_instruction_tokens": 8000,
+    "max_instruction_tokens": 14000,
     "focus_hints": null,
     "reasoning_directives": null
   },
@@ -69,7 +69,7 @@
   "user_instructions": {
     "path": null,
     "dir": "prompt_builder/instructions",
-    "max_tokens": 5600
+    "max_tokens": 9800
   },
   "_validation_comment": "Per-metric pass thresholds; null uses the metric class default. Two metrics are scored against the run's pipeline.output_language: 'language_compliance' (the fraction of translated code blocks actually in the target language) and 'python_syntax' (which, despite the historical name kept for this key, parses the emitted blocks as the TARGET language, not as Python). Every metric is higher-is-better, hallucination_threshold included: that metric reports groundedness (1 - deepeval's hallucination rate), so 0.8 means 'at most 20% of ground-truth contexts contradicted'. The thresholds below llm_judge_threshold belong to the opt-in LLM-judged suite (validation.judged_metrics); they are inert unless it is enabled. prompt_instructions is a list of strings prompt_alignment checks the response against, overriding validation.agentic_metrics.DEFAULT_PROMPT_INSTRUCTIONS.",
   "validation": {

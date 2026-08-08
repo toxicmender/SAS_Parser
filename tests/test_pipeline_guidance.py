@@ -668,3 +668,44 @@ def test_select_then_build_from_picks_reproduces_build():
     assert builder.build_from_picks(picks, constructs) == builder.build(
         query, constructs
     )
+
+
+# ---------------------------------------------------------------------------
+# Packing headroom — the guidance budget and the call packer share a request
+# ---------------------------------------------------------------------------
+
+
+def test_packing_headroom_tracks_the_guidance_budget():
+    """Packing must reserve room for the guidance that rides the same call.
+
+    The derived packing budget is `max_input_tokens` minus what else lands in
+    the request, and retrieved guidance is one of those things. It used to be a
+    2,000-token constant, written when the guidance budget was ~2,000 tokens;
+    once that budget moved the packer would have packed against a stale figure
+    and pushed requests over `max_input_tokens`. Reading the builder's own
+    number means it cannot drift again.
+    """
+    resolve = SasLLMPipeline._resolve_packing_budget
+    system = "x " * 500
+
+    generous = resolve(None, 60_000, system, "gpt-5.4", guidance_headroom=0)
+    tight = resolve(None, 60_000, system, "gpt-5.4", guidance_headroom=14_000)
+    assert generous is not None and tight is not None
+    # Every token reserved for guidance is a token not packed with items.
+    assert generous - tight == int(0.8 * 14_000)
+
+
+def test_packing_headroom_is_zero_without_a_prompt_builder():
+    """No builder means no guidance block, so nothing to reserve for."""
+    resolve = SasLLMPipeline._resolve_packing_budget
+    system = "x " * 500
+    assert resolve(None, 60_000, system, "gpt-5.4") == resolve(
+        None, 60_000, system, "gpt-5.4", guidance_headroom=0
+    )
+
+
+def test_explicit_packing_budget_ignores_the_headroom():
+    """An operator who names a budget gets it, headroom or not."""
+    resolve = SasLLMPipeline._resolve_packing_budget
+    assert resolve(9_999, 60_000, "x", "gpt-5.4", guidance_headroom=14_000) == 9_999
+    assert resolve(0, 60_000, "x", "gpt-5.4", guidance_headroom=14_000) is None

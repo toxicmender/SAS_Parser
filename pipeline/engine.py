@@ -84,11 +84,12 @@ logger = logging.getLogger(__name__)
 # Token-budgeted call packing defaults (see _resolve_packing_budget). The
 # hard default assumes a modern long-context model (the gpt-5.4 default) and
 # packs aggressively; tighten it via pipeline.max_merged_tokens if per-item
-# answer quality drops. The headrooms mirror what shares the request with
-# the item text — retrieved guidance (prompt_builder's max_instruction_tokens
-# default, ~1.3 tokens/word) and the window_k history.
+# answer quality drops. The history headroom mirrors the window_k turns that
+# share the request with the item text; the *guidance* headroom is not a
+# constant — it is read from the attached PromptBuilder's own budget, because
+# that is a configured number that has moved before and would silently
+# under-reserve the moment it moved again.
 _DEFAULT_MAX_MERGED_TOKENS = 64_000
-_PACKING_GUIDANCE_HEADROOM_TOKENS = 2_000
 _PACKING_HISTORY_HEADROOM_TOKENS = 4_000
 
 
@@ -576,6 +577,11 @@ class SasLLMPipeline:
             self._llm_client.config.max_input_tokens,
             self._system_prompt,
             model,
+            guidance_headroom=(
+                self._prompt_builder.max_instruction_tokens
+                if self._prompt_builder is not None
+                else 0
+            ),
         )
         self._item_cost = (
             prompt_cost_estimator(model)
@@ -1058,6 +1064,7 @@ class SasLLMPipeline:
         max_input_tokens: int | None,
         system_prompt: str,
         model: str,
+        guidance_headroom: int = 0,
     ) -> int | None:
         """The packing token budget actually in force, or ``None`` for off.
 
@@ -1069,6 +1076,13 @@ class SasLLMPipeline:
         stays inside the input budget (derived ≤ 0 disables packing: a tiny
         input budget leaves no room to pack); without one, a conservative
         ~64k-token default.
+
+        *guidance_headroom* is the attached builder's ``max_instruction_tokens``
+        — the most the retrieved guidance can add to the same request — and 0
+        when no builder is attached, since then no guidance is injected at all.
+        Reserving a constant here would mean packing against a stale figure the
+        moment that budget is retuned, and packing too optimistically is how a
+        request ends up over ``max_input_tokens``.
         """
         if requested is not None:
             return requested or None  # 0 = packing off
@@ -1080,7 +1094,7 @@ class SasLLMPipeline:
             * (
                 max_input_tokens
                 - system_tokens
-                - _PACKING_GUIDANCE_HEADROOM_TOKENS
+                - guidance_headroom
                 - _PACKING_HISTORY_HEADROOM_TOKENS
             )
         )

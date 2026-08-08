@@ -134,7 +134,7 @@ def test_repo_config_json_matches_code_defaults():
     # constructs matched, silently dropping silent-error guidance.
     assert repo_cfg["prompt_builder"] == {
         "top_k": 6,
-        "max_instruction_tokens": 8000,
+        "max_instruction_tokens": 14000,
         "focus_hints": None,  # null = unset -> code default (True)
         "reasoning_directives": None,  # null = unset -> code default (True)
     }
@@ -170,7 +170,7 @@ def test_repo_config_json_matches_code_defaults():
     assert repo_cfg["user_instructions"] == {
         "path": None,
         "dir": "prompt_builder/instructions",
-        "max_tokens": 5600,
+        "max_tokens": 9800,
     }
     assert (
         pathlib.Path(__file__).resolve().parents[1]
@@ -490,7 +490,7 @@ def test_defaults_without_config(_isolated_config):
 
     assert SasSemanticChunker().min_words == 300
     assert InstructionChunker().max_tokens == 1300
-    assert PromptBuilder([]).max_instruction_tokens == 8000
+    assert PromptBuilder([]).max_instruction_tokens == 14000
     assert LLMClientConfig().max_input_tokens is None
     assert LLMClientConfig().model == "gpt-5.4"
     assert LLMClientConfig().max_retries == 3

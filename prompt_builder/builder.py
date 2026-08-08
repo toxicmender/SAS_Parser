@@ -178,7 +178,7 @@ class PromptBuilder:
     max_instruction_tokens : int | None
         Token budget for the whole guidance block — the same currency the
         prompt is priced in. ``None`` reads
-        ``prompt_builder.max_instruction_tokens``, falling back to 8000.
+        ``prompt_builder.max_instruction_tokens``, falling back to 14000.
         Keep this >= the instruction chunker's ``max_tokens`` so any single
         reference section always fits.
     pinned_sections : Iterable[str]
@@ -240,7 +240,7 @@ class PromptBuilder:
     ) -> None:
         self.top_k = app_config.resolve(top_k, "prompt_builder", "top_k", 6)
         self.max_instruction_tokens = app_config.resolve(
-            max_instruction_tokens, "prompt_builder", "max_instruction_tokens", 8000
+            max_instruction_tokens, "prompt_builder", "max_instruction_tokens", 14000
         )
         # None default keeps user chunks limited only by the overall budget.
         self.user_max_tokens = app_config.resolve(

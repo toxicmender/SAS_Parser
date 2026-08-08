@@ -611,19 +611,24 @@ reference program that batches into two items:
 | `max_instruction_tokens` / `max_tokens` | Tokens drawn | Matched rules dropped |
 |---|---|---|
 | 4000 / 2800 | 5,419 | 14 |
-| **8000 / 5600** *(shipped)* | 8,250 | **7** |
+| 8000 / 5600 | 8,250 | 7 |
 | 10000 / 7000 | 9,679 | 4 |
-| 14000 / 9800 | 12,368 | **0** |
+| **14000 / 9800** *(shipped)* | 12,368 | **0** |
 
-⚠️ The shipped 8000 is an interim value and is **measured short** — it still
-drops 7 rules those items' constructs matched. Zero needs 14000/9800, past
-which the items draw 12.4k tokens and more budget buys nothing. Raising it is a
-per-item cost decision, so it is documented rather than simply set.
+config.json ships the last row — the measured point where every rule an item's
+constructs match actually arrives. Past it the items still draw 12,368 tokens,
+so more budget buys nothing.
 
 **It is a ceiling, not a cost floor.** Every section is scoped to a construct,
 statement, or function family the item actually uses, so a simple DATA step
 draws far less however high the budget goes — raising it buys nothing for
 simple items and completeness for complex ones.
+
+⚠️ The pipeline reserves this figure as packing headroom
+(`_resolve_packing_budget`), so raising it *lowers* how much SAS source shares
+a call when `llm_client.max_input_tokens` is set. That is the intended trade —
+guidance and items compete for one request — but it is why the number is read
+from the builder rather than duplicated as a constant.
 
 Leaving `max_tokens` null is not the cheaper alternative: uncapped operator
 rules simply take the whole budget and starve reference retrieval. Selected rules render in a `## Project instructions` block
