@@ -5,13 +5,14 @@
     "max_words": 700
   },
   "instruction_chunker": {
-    "min_words": 120,
-    "max_words": 900,
-    "overlap_words": 60
+    "min_tokens": 175,
+    "max_tokens": 1300,
+    "overlap_tokens": 90
   },
+  "_prompt_builder_comment": "'max_instruction_tokens' is the total TOKEN budget for the per-item guidance block, shared by operator rules and retrieved reference chunks; the selector fills it in priority order and drops whole chunks at the tail. Tokens, not words: measured over the bundled reference corpus the tokens-per-word ratio runs 1.01 to 4.41 (median 1.44) depending on how much of a section is code, so a word budget silently under-counted exactly the SQL-heavy guidance this set is made of. BREAKING: the old 'max_instruction_words' key is gone -- app_config raises if it is still present rather than reverting to a default. 14000 is the measured zero-drop point: over a 70-line reference program batching into two items, every rule those items' constructs matched arrives, the items draw 12.4k tokens, and more budget buys nothing (8000 dropped 7 rules, 10000 dropped 4). Pair it with user_instructions.max_tokens 9800 (70%). It is a ceiling, not a cost floor -- every section is scoped to a construct the item actually uses, so a simple DATA step draws far less no matter how high this is set. Keep it >= instruction_chunker.max_tokens so one reference section always fits.",
   "prompt_builder": {
     "top_k": 6,
-    "max_instruction_words": 1500,
+    "max_instruction_tokens": 14000,
     "focus_hints": null,
     "reasoning_directives": null
   },
@@ -64,10 +65,11 @@
     "max_story_points": null,
     "use_cross_file": null
   },
+  "_user_instructions_comment": "Operator translation rules injected per item. 'dir' is a directory of *.md files whose first path component names the target language ('sparksql/', or '_common/' for language-agnostic); it takes precedence over the single-file 'path'. README*.md and _-prefixed files are documentation and are never ingested. 'dir' ships pointing at the bundled starter set, which is scoped [lang: sparksql] and therefore inert under any other output_language; set it to null to inject no operator rules, or to your own directory to use project conventions instead. WARNING: that set targets DATABRICKS SQL - it uses QUALIFY, SQL scripting, EXECUTE IMMEDIATE, UNPIVOT and three-level catalog.schema.table names, which open-source Spark does not have. Point 'dir' elsewhere if you run a non-Databricks Spark. A relative value is resolved against the repo root when it does not exist relative to the working directory, so the default survives being run from elsewhere.'max_tokens' caps operator rules and examples inside prompt_builder.max_instruction_tokens so they cannot starve the reference corpus; null means uncapped, which is fine for a handful of rules but not for a large set - uncapped rules simply consume the whole budget. It is set to 70% of max_instruction_tokens, which leaves ~1050 words for reference chunks; move the two together if you change either.",
   "user_instructions": {
     "path": null,
-    "dir": null,
-    "max_words": null
+    "dir": "prompt_builder/instructions",
+    "max_tokens": 9800
   },
   "_validation_comment": "Per-metric pass thresholds; null uses the metric class default. Two metrics are scored against the run's pipeline.output_language: 'language_compliance' (the fraction of translated code blocks actually in the target language) and 'python_syntax' (which, despite the historical name kept for this key, parses the emitted blocks as the TARGET language, not as Python). Every metric is higher-is-better, hallucination_threshold included: that metric reports groundedness (1 - deepeval's hallucination rate), so 0.8 means 'at most 20% of ground-truth contexts contradicted'. The thresholds below llm_judge_threshold belong to the opt-in LLM-judged suite (validation.judged_metrics); they are inert unless it is enabled. prompt_instructions is a list of strings prompt_alignment checks the response against, overriding validation.agentic_metrics.DEFAULT_PROMPT_INSTRUCTIONS.",
   "validation": {
@@ -159,7 +161,7 @@
     "list_id_xref": null,
     "list_id_sas_complexity": null
   },
-  "_xref_comment": "Dataset-name cross-reference: the SharePoint XREF list maps 'schema.table' to 'catalog.schema.table'. 'apply' picks when the substitution happens -- 'pre' (default) rewrites SAS dataset names in the chunk metadata and source before conversion, which is where the parser already knows what a dataset reference is; 'post' rewrites the GENERATED code by parsing it (sqlglot for Spark SQL, the ast module for PySpark); 'both' does the two and reports names only one of them reached, which is how you find out whether 'pre' is missing anything. 'dialect' is the sqlglot dialect for the post rewriter. 'on_parse_failure' governs unparseable generated code: 'warn' (default) leaves the output exactly as the model wrote it, 'error' raises -- a rewriter that corrupts generated code is worse than one that no-ops. The post mode needs the 'sql' extra installed.",
+  "_xref_comment": "Dataset-name cross-reference: the SharePoint XREF list maps 'schema.table' to 'catalog.schema.table'. 'apply' picks when the substitution happens -- 'pre' (default) rewrites SAS dataset names in the chunk metadata and source before conversion, which is where the parser already knows what a dataset reference is; 'post' rewrites the GENERATED code by parsing it (sqlglot for Spark SQL, the ast module for PySpark); 'both' does the two and reports names only one of them reached, which is how you find out whether 'pre' is missing anything. 'dialect' overrides the sqlglot dialect for the post rewriter; null (the default) follows the run's pipeline.output_language via target_language, so the rewriter and the syntax checker parse generated code identically -- setting it to something the checker does not use means the rewriter can silently leave code un-rewritten. 'on_parse_failure' governs unparseable generated code: 'warn' (default) leaves the output exactly as the model wrote it, 'error' raises -- a rewriter that corrupts generated code is worse than one that no-ops. The post mode needs the 'sql' extra installed.",
   "xref": {
     "apply": null,
     "dialect": null,

@@ -97,7 +97,7 @@ def test_pinned_section_appears_in_block():
     assert "Output Format" in block
 
 
-def test_max_instruction_words_caps_block():
+def test_max_instruction_tokens_caps_block():
     big = [
         _chunk("c0", "Funcs > A", " ".join(f"w{i}" for i in range(400)), keys=[INTNX]),
         _chunk(
@@ -107,9 +107,10 @@ def test_max_instruction_words_caps_block():
             keys=[ConstructKey(kind="function", name="b")],
         ),
     ]
-    pb = PromptBuilder(big, max_instruction_words=420)
+    # Each 400-word chunk of synthetic tokens is ~800 tokens, so a 900-token
+    # budget admits the first and drops the second whole.
+    pb = PromptBuilder(big, max_instruction_tokens=900)
     block = _built(pb.build("w1 w2", [INTNX, ConstructKey(kind="function", name="b")]))
-    # Only the first ~400-word chunk fits the 420 budget.
     assert "Funcs > A" in block
     assert "Funcs > B" not in block
 
@@ -434,3 +435,125 @@ def test_from_specs_loads_and_builds(tmp_path):
     pb = PromptBuilder.from_specs([spec], cache_dir=str(tmp_path / "cache"))
     block = _built(pb.build("advance a date", [INTNX]))
     assert "INTNX Function" in block
+
+
+# ---------------------------------------------------------------------------
+# Member attribution — labelling a batch's guidance with the member it serves
+# ---------------------------------------------------------------------------
+
+MERGE = ConstructKey(kind="statement", name="merge")
+
+_ATTRIBUTION_RULES = (
+    "## Output format\nAlways-on, applies to the whole batch.\n\n"
+    "## [when: function:intnx] Date shifting\nUse ADD_MONTHS.\n\n"
+    "## [when: statement:merge] Joining\nA MERGE is a full outer join.\n\n"
+    "## [example: function:intnx] Worked INTNX\nA worked pair.\n"
+)
+
+
+def _attributed_builder():
+    from prompt_builder.user_instructions import UserInstructionSet
+
+    return PromptBuilder(
+        _corpus(), user_instructions=UserInstructionSet.from_text(_ATTRIBUTION_RULES)
+    )
+
+
+def test_attribution_labels_construct_matched_sections_with_their_member():
+    pb = _attributed_builder()
+    block = _built(
+        pb.build(
+            "advance a date interval",
+            [INTNX, MERGE],
+            attribution={INTNX: ["chunk-0002"], MERGE: ["chunk-0001"]},
+        )
+    )
+    assert "### Date shifting  [chunk-0002]" in block
+    assert "### Joining  [chunk-0001]" in block
+    # The reference hit joins its existing citation run rather than trailing it.
+    assert "· construct: intnx · chunk-0002]" in block
+    # A worked example is labelled like the rule it demonstrates.
+    assert "### Worked INTNX  [chunk-0002]" in block
+
+
+def test_attribution_leaves_always_on_sections_unlabelled():
+    """An unconditional rule has no matched key: it is batch-wide, not
+    unattributable, so it must read exactly as it does without labelling."""
+    pb = _attributed_builder()
+    block = _built(
+        pb.build("advance a date interval", [INTNX], attribution={INTNX: ["chunk-0002"]})
+    )
+    assert "### Output format\n" in block
+    assert "### Output format  [" not in block
+
+
+def test_attribution_explains_itself_once():
+    pb = _attributed_builder()
+    block = _built(
+        pb.build("advance a date interval", [INTNX], attribution={INTNX: ["chunk-0002"]})
+    )
+    assert block.count("A bracketed id names the batch member") == 1
+
+
+def test_attribution_lists_several_members_for_a_shared_construct():
+    pb = _attributed_builder()
+    block = _built(
+        pb.build(
+            "advance a date interval",
+            [INTNX],
+            attribution={INTNX: ["chunk-0001", "chunk-0003"]},
+        )
+    )
+    assert "### Date shifting  [chunk-0001, chunk-0003]" in block
+
+
+def test_no_attribution_renders_exactly_the_unlabelled_block():
+    """The single-member path: passing None must change nothing at all."""
+    pb = _attributed_builder()
+    args = ("advance a date interval", [INTNX, MERGE])
+    assert pb.build(*args, attribution=None) == pb.build(*args)
+
+
+def test_a_key_absent_from_the_map_is_not_labelled():
+    """Guards against rendering an empty '[]' when a key has no member."""
+    pb = _attributed_builder()
+    block = _built(
+        pb.build("advance a date interval", [INTNX, MERGE], attribution={INTNX: []})
+    )
+    assert "[]" not in block
+    assert "### Date shifting\n" in block
+
+
+# ---------------------------------------------------------------------------
+# Dependency boundary — why token_budget is its own package
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_builder_does_not_import_llm_client():
+    """The budget is counted in tokens, but not at the cost of this import.
+
+    `token_budget` was extracted from `llm_client` precisely so this package
+    could count tokens: importing `llm_client.tokens` executes
+    `llm_client/__init__.py`, which pulls in the chat-model stack — measured at
+    ~7.5s and ~1,600 modules against ~0.1s and ~80 for the leaf. Note the
+    assertion is about `llm_client`, not langchain: `memory.relevance` already
+    brings in `langchain_core`, so a blanket "no langchain" claim would be
+    false.
+    """
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys, prompt_builder; "
+        "print('llm_client' in sys.modules, "
+        "'langchain_openai' in sys.modules, "
+        "'token_budget' in sys.modules)"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        cwd=str(pathlib.Path(__file__).resolve().parents[1]),
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["False", "False", "True"], out.stdout

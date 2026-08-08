@@ -33,9 +33,16 @@ target = resolve_target_language("spark sql")
 target.display_name        # "Spark SQL" — the only spelling that reaches a prompt
 target.default_fence       # "sql"       — the tag translated code must carry
 target.cell_language       # "sql"       — notebook cell / schema `language`
+target.comment_prefix      # "--"        — line-comment token for the prompt
+target.sqlglot_dialect     # "databricks" — how generated code is parsed, or None
 target.owns_fence("sql")   # True; owns_fence("python") is False
 target.check_syntax(sql)   # None when it parses, else an error message
 ```
+
+`comment_prefix` exists so the system prompt can ask for a
+`-- NOT CONVERTIBLE TO Spark SQL: <reason>` marker without hard-coding one
+target's comment syntax — the templates interpolate `{comment_prefix}` and
+the same sentence renders as `#` for PySpark and `//` for Spark Scala.
 
 Normally you do not call this directly: `SasLLMPipeline` resolves at
 construction and exposes the result as `.target_language`, and everything
@@ -43,11 +50,11 @@ downstream should take it from there.
 
 ## Targets
 
-| Target | Folds from | Fences | Kernel | Complexity profile |
-|---|---|---|---|---|
-| PySpark | `pyspark`, `python`, `python3`, `py` | `python`, `py`, `pyspark` | python3 | `pyspark` |
-| Spark SQL | `sparksql`, `spark sql`, `sql`, `databrickssql` | `sql`, `sparksql` | sql | `sparksql` |
-| Spark Scala | `sparkscala`, `scala` | `scala` | scala | `pyspark` |
+| Target | Folds from | Fences | Kernel | Comment | Complexity profile |
+|---|---|---|---|---|---|
+| PySpark | `pyspark`, `python`, `python3`, `py` | `python`, `py`, `pyspark` | python3 | `#` | `pyspark` |
+| Spark SQL | `sparksql`, `spark sql`, `sql`, `databrickssql` | `sql`, `sparksql` | sql | `--` | `sparksql` |
+| Spark Scala | `sparkscala`, `scala` | `scala` | scala | `//` | `pyspark` |
 
 Spelling is folded case-, space-, hyphen-, and underscore-insensitively — the
 same rule `prompt_builder` matches `[lang: ...]` directive tokens with, which
@@ -63,10 +70,27 @@ writing it under the wrong kernel.
 ## Syntax checking
 
 `check_syntax` returns an error message or `None`. Python uses `ast.parse`.
-Spark SQL uses **sqlglot** (`pip install 'sas-parser[sql]'`) and, without it,
-falls back to a structural check that flags only unbalanced brackets and
-quotes — deliberately conservative, because a false failure here spends an
-LLM call re-answering a correct item. `checker_name` reports which ran, and
+Spark SQL uses **sqlglot** (`pip install 'sas-parser[sql]'`) with the
+**`databricks`** dialect, and without it falls back to a structural check that
+flags only unbalanced brackets and quotes — deliberately conservative, because
+a false failure here spends an LLM call re-answering a correct item.
+
+The dialect is `databricks` because that is what this target is: the bundled
+instruction set emits `QUALIFY`, SQL scripting, `EXECUTE IMMEDIATE` and
+three-level names, none of which open-source Spark has.
+
+It lives on the target as `sqlglot_dialect`, and **both** consumers that parse
+generated code read it from there. `xref.rewrite` parses the same SQL to
+rewrite table references and returns it unchanged when it cannot — so a
+rewriter reading a different dialect from the checker would silently leave code
+un-rewritten on exactly the syntax the checker had just called valid, showing
+up as missing table names rather than an error. Resolving both from one field
+makes that unrepresentable; `xref.dialect` remains as an explicit override.
+
+A target with no `sqlglot_dialect` is not SQL (`PYSPARK` is checked with
+`ast.parse`, `SPARKSCALA` not at all). The rewriter still needs a dialect for
+those, because it recurses into the SQL inside `spark.sql("...")`, so it falls
+back to the SQL target's. `checker_name` reports which ran, and
 the metric puts it in its `details`. Spark Scala has no checker, so
 `checks_syntax` is `False` and the metric skips rather than passing everything.
 

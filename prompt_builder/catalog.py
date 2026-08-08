@@ -43,18 +43,24 @@ _CODE_HASH: str | None = None
 
 def _code_fingerprint() -> str:
     """
-    Hash of the extractor source files (pdf_reader.py + doc_chunker.py),
-    folded into every cache signature so a code change re-extracts
-    automatically — no manual EXTRACTOR_VERSION bump needed for the common
-    case. Computed once per process.
+    Hash of the extractor source files (pdf_reader.py + doc_chunker.py +
+    models.py), folded into every cache signature so a code change
+    re-extracts automatically — no manual EXTRACTOR_VERSION bump needed for
+    the common case. Computed once per process.
+
+    ``models.py`` is in the list because the cache stores whole
+    :class:`InstructionChunk` dumps: a field added there (``token_count``, say)
+    changes what a cached entry should contain even when neither extractor
+    changed, and without it the stale entry would load silently.
     """
     global _CODE_HASH
     if _CODE_HASH is None:
         from . import doc_chunker as _dc
+        from . import models as _mo
         from . import pdf_reader as _pr
 
         digest = hashlib.sha256()
-        for module in (_pr, _dc):
+        for module in (_pr, _dc, _mo):
             # __file__ is Optional only for namespace packages and builtins;
             # both of these are ordinary file-backed modules.
             source = module.__file__
@@ -347,8 +353,8 @@ class CorpusLoader:
             f"reader={self.reader.min_body_ratio},{self.reader.max_heading_words},"
             f"{self.reader.header_footer_threshold},{self.reader.min_page_chars},"
             f"{self.reader.max_heading_search_pages}",
-            f"chunker={self.chunker.min_words},{self.chunker.max_words},"
-            f"{self.chunker.overlap_words}",
+            f"chunker={self.chunker.min_tokens},{self.chunker.max_tokens},"
+            f"{self.chunker.overlap_tokens}",
         ]
         return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 

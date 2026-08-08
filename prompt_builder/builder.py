@@ -16,6 +16,7 @@ Logger name: ``prompt_builder.builder``.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping, Sequence
 from typing import Any, Callable, Iterable
 
 import app_config
@@ -56,13 +57,18 @@ _KIND_LABELS = {
     "informat": "{name} informat",
     "option": "{name} option",
     "system_option": "{name} system option",
+    # A family, not a construct — read as prose ("date time functions").
+    "category": "{words} functions",
 }
 
 
 def _describe_construct(key: ConstructKey) -> str:
     template = _KIND_LABELS.get(key.kind, "{name} ({kind})")
     return template.format(
-        name=key.name.upper(), lower=key.name.lower(), kind=key.kind
+        name=key.name.upper(),
+        lower=key.name.lower(),
+        words=key.name.lower().replace("_", " "),
+        kind=key.kind,
     )
 
 
@@ -169,10 +175,11 @@ class PromptBuilder:
         Maximum topical (ranked) chunks per item. ``None`` (default) reads
         ``prompt_builder.top_k`` from config.json, falling back to 6 (see
         the ``app_config`` package).
-    max_instruction_words : int | None
-        Word budget for the whole guidance block. ``None`` reads
-        ``prompt_builder.max_instruction_words``, falling back to 1500.
-        Keep this >= the instruction chunker's ``max_words`` so any single
+    max_instruction_tokens : int | None
+        Token budget for the whole guidance block — the same currency the
+        prompt is priced in. ``None`` reads
+        ``prompt_builder.max_instruction_tokens``, falling back to 14000.
+        Keep this >= the instruction chunker's ``max_tokens`` so any single
         reference section always fits.
     pinned_sections : Iterable[str]
         Section-path substrings always injected first.
@@ -214,9 +221,9 @@ class PromptBuilder:
         chunks: Iterable[InstructionChunk],
         *,
         user_instructions: "str | UserInstructionSet | None" = None,
-        user_max_words: int | None = None,
+        user_max_tokens: int | None = None,
         top_k: int | None = None,
-        max_instruction_words: int | None = None,
+        max_instruction_tokens: int | None = None,
         pinned_sections: Iterable[str] = (),
         embeddings: Any | None = None,
         embedding_cache_path: str | None = None,
@@ -232,12 +239,12 @@ class PromptBuilder:
         examples_heading: str = "Worked examples",
     ) -> None:
         self.top_k = app_config.resolve(top_k, "prompt_builder", "top_k", 6)
-        self.max_instruction_words = app_config.resolve(
-            max_instruction_words, "prompt_builder", "max_instruction_words", 1500
+        self.max_instruction_tokens = app_config.resolve(
+            max_instruction_tokens, "prompt_builder", "max_instruction_tokens", 14000
         )
         # None default keeps user chunks limited only by the overall budget.
-        self.user_max_words = app_config.resolve(
-            user_max_words, "user_instructions", "max_words", None
+        self.user_max_tokens = app_config.resolve(
+            user_max_tokens, "user_instructions", "max_tokens", None
         )
         self.focus_hints = app_config.resolve(
             focus_hints, "prompt_builder", "focus_hints", True
@@ -266,7 +273,7 @@ class PromptBuilder:
         self._selector = InstructionSelector(
             chunks,
             user_instructions=user_instructions,
-            user_max_words=self.user_max_words,
+            user_max_tokens=self.user_max_tokens,
             embeddings=embeddings,
             embedding_cache_path=embedding_cache_path,
             rrf_k=rrf_k,
@@ -285,9 +292,9 @@ class PromptBuilder:
         return PromptBuilder(
             self._selector.reference_chunks,
             user_instructions=user_instructions,
-            user_max_words=self.user_max_words,
+            user_max_tokens=self.user_max_tokens,
             top_k=self.top_k,
-            max_instruction_words=self.max_instruction_words,
+            max_instruction_tokens=self.max_instruction_tokens,
             pinned_sections=self._pinned_sections,
             embeddings=self._embeddings,
             embedding_cache_path=self._embedding_cache_path,
@@ -324,11 +331,11 @@ class PromptBuilder:
         builder = cls(chunks, pinned_sections=pins, **kwargs)
         # A budget below the chunker's window size silently drops whole
         # construct hits — the known misconfiguration; warn loudly.
-        if builder.max_instruction_words < loader.chunker.max_words:
+        if builder.max_instruction_tokens < loader.chunker.max_tokens:
             logger.warning(
-                f"from_specs: max_instruction_words="
-                f"{builder.max_instruction_words} is below the chunker's "
-                f"max_words={loader.chunker.max_words}; single reference "
+                f"from_specs: max_instruction_tokens="
+                f"{builder.max_instruction_tokens} is below the chunker's "
+                f"max_tokens={loader.chunker.max_tokens}; single reference "
                 f"sections may not fit the budget and will be dropped whole"
             )
         return builder
@@ -383,7 +390,7 @@ class PromptBuilder:
         return self._selector.select_detailed(
             query,
             list(constructs),
-            max_words=self.max_instruction_words,
+            max_tokens=self.max_instruction_tokens,
             top_k=self.top_k,
             language=language,
             kinds=kinds,
@@ -398,6 +405,7 @@ class PromptBuilder:
         output_language: str | None = None,
         kinds: Iterable[str] = (),
         meta_flags: Iterable[str] = (),
+        attribution: Mapping[ConstructKey, Sequence[str]] | None = None,
     ) -> str | None:
         """
         The Markdown block(s) for one item — a ``## Project instructions``
@@ -413,6 +421,8 @@ class PromptBuilder:
         chunk-kind-, and metadata-scoped user instructions (see
         :meth:`InstructionSelector.select_detailed`); *output_language*
         ``None`` falls back to the builder's construction-time value.
+        *attribution* labels each section with the batch member it came from
+        (see :meth:`build_from_picks`).
 
         :meth:`select` + :meth:`build_from_picks` is the same thing in two
         steps, for a caller that needs the picks themselves.
@@ -425,12 +435,14 @@ class PromptBuilder:
             kinds=kinds,
             meta_flags=meta_flags,
         )
-        return self.build_from_picks(picks, constructs)
+        return self.build_from_picks(picks, constructs, attribution=attribution)
 
     def build_from_picks(
         self,
         picks: list[SelectedInstruction],
         constructs: Iterable[ConstructKey] = (),
+        *,
+        attribution: Mapping[ConstructKey, Sequence[str]] | None = None,
     ) -> str | None:
         """
         Render already-retrieved *picks* into :meth:`build`'s Markdown block(s),
@@ -439,16 +451,28 @@ class PromptBuilder:
         *constructs* are the **item's** constructs, not the selection's: the
         hazard hint line and the reasoning directives are keyed on them so they
         survive even when no reference section matched.
+
+        *attribution* maps a construct key to the ids of the batch members that
+        use it, and turns on **member labels**: a section retrieved because one
+        member merges is headed with that member's id, so a multi-member batch
+        does not hand the model a pile of rules and leave it to work out which
+        step each belongs to. The ids are opaque strings — the caller owns what
+        they mean, which is what keeps this package free of any ``chunker``
+        import.
+
+        Only picks carrying a matched construct key are labelled. An always-on
+        rule, a pinned or topical section, and a ``[kind:]``/``[meta:]``-gated
+        note have no key and are batch-wide by nature, so they stay unlabelled.
+        Pass ``None`` (the default, and what a single-member batch should use)
+        and the output is exactly what it was before labelling existed.
         """
         constructs = list(constructs)
         if not picks:
             logger.debug("build: no relevant instruction chunks; no block")
             return None
-        examples = [
-            p.chunk for p in picks if p.tier is SelectionTier.USER_EXAMPLE
-        ]
+        examples = [p for p in picks if p.tier is SelectionTier.USER_EXAMPLE]
         user = [
-            p.chunk
+            p
             for p in picks
             if p.chunk.role is DocRole.USER_INSTRUCTION
             and p.tier is not SelectionTier.USER_EXAMPLE
@@ -459,10 +483,11 @@ class PromptBuilder:
         logger.debug(
             f"build: {len(user)} user + {len(examples)} example + "
             f"{len(reference)} reference chunk(s) injected"
+            f"{'  (member-attributed)' if attribution else ''}"
         )
         blocks: list[str] = []
         if user:
-            blocks.append(self._format_user(user))
+            blocks.append(self._format_user(user, attribution))
         if self.focus_hints:
             hints = self._format_hints(picks, constructs)
             if hints:
@@ -472,10 +497,28 @@ class PromptBuilder:
             if directives:
                 blocks.append(directives)
         if reference:
-            blocks.append(self._format_reference(reference))
+            blocks.append(self._format_reference(reference, attribution))
         if examples:
-            blocks.append(self._format_examples(examples))
+            blocks.append(self._format_examples(examples, attribution))
         return "\n\n".join(blocks)
+
+    @staticmethod
+    def _attribution_suffix(
+        pick: SelectedInstruction,
+        attribution: Mapping[ConstructKey, Sequence[str]] | None,
+    ) -> str:
+        """``"  [chunk-0002]"`` for a keyed pick, else ``""``.
+
+        Empty whenever labelling is off, the pick carries no matched key, or
+        the key belongs to no member — so an unlabelled section reads exactly
+        as it did before, rather than as a section whose member is unknown.
+        """
+        if not attribution or pick.construct_key is None:
+            return ""
+        members = attribution.get(pick.construct_key)
+        if not members:
+            return ""
+        return f"  [{', '.join(members)}]"
 
     def _format_directives(self, constructs: list[ConstructKey]) -> str | None:
         """
@@ -560,16 +603,34 @@ class PromptBuilder:
         parts = chunk.text.split("\n\n", 1)
         return (parts[1] if len(parts) > 1 else chunk.text).strip()
 
-    def _format_user(self, picks: list[InstructionChunk]) -> str:
+    def _format_user(
+        self,
+        picks: list[SelectedInstruction],
+        attribution: Mapping[ConstructKey, Sequence[str]] | None = None,
+    ) -> str:
         lines = [f"## {self.project_heading}", ""]
-        for chunk in picks:
+        if attribution:
+            lines += [
+                "A bracketed id names the batch member whose constructs "
+                "brought that rule in; a rule with no id applies to the batch "
+                "as a whole.",
+                "",
+            ]
+        for pick in picks:
             # Operator rules cite no document or pages — just their heading.
-            lines.append(f"### {chunk.section_path}")
-            lines.append(self._body_of(chunk))
+            lines.append(
+                f"### {pick.chunk.section_path}"
+                f"{self._attribution_suffix(pick, attribution)}"
+            )
+            lines.append(self._body_of(pick.chunk))
             lines.append("")
         return "\n".join(lines).rstrip()
 
-    def _format_examples(self, picks: list[InstructionChunk]) -> str:
+    def _format_examples(
+        self,
+        picks: list[SelectedInstruction],
+        attribution: Mapping[ConstructKey, Sequence[str]] | None = None,
+    ) -> str:
         lines = [
             f"## {self.examples_heading}",
             "",
@@ -577,10 +638,13 @@ class PromptBuilder:
             "demonstrate:",
             "",
         ]
-        for chunk in picks:
+        for pick in picks:
             # Like operator rules: the operator's own heading, no citations.
-            lines.append(f"### {chunk.section_path}")
-            lines.append(self._body_of(chunk))
+            lines.append(
+                f"### {pick.chunk.section_path}"
+                f"{self._attribution_suffix(pick, attribution)}"
+            )
+            lines.append(self._body_of(pick.chunk))
             lines.append("")
         return "\n".join(lines).rstrip()
 
@@ -598,7 +662,11 @@ class PromptBuilder:
             return f"{pick.tier.value}: {pick.construct_key.name}"
         return pick.tier.value  # pinned | topical
 
-    def _format_reference(self, picks: list[SelectedInstruction]) -> str:
+    def _format_reference(
+        self,
+        picks: list[SelectedInstruction],
+        attribution: Mapping[ConstructKey, Sequence[str]] | None = None,
+    ) -> str:
         lines = [f"## {self.heading}", ""]
         for pick in picks:
             chunk = pick.chunk
@@ -607,9 +675,13 @@ class PromptBuilder:
                 if chunk.page_start == chunk.page_end
                 else f"pp. {chunk.page_start}-{chunk.page_end}"
             )
+            # The member id joins the citation rather than trailing the header,
+            # so the whole provenance stays inside one bracketed run.
+            members = self._attribution_suffix(pick, attribution).strip()
+            member_cite = f" · {members[1:-1]}" if members else ""
             lines.append(
                 f"### [{chunk.doc_id} · {chunk.section_path} · {pages} · "
-                f"{self._selection_reason(pick)}]"
+                f"{self._selection_reason(pick)}{member_cite}]"
             )
             lines.append(self._body_of(chunk))
             lines.append("")

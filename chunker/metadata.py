@@ -18,9 +18,14 @@ from .keywords import (
     _SAS_CALL_ROUTINE_RE,
     _SAS_CALL_ROUTINES,
     _SAS_COMPONENT_OBJECT_RE,
+    _SAS_DATA_STEP_STATEMENT_RE,
+    _SAS_DATASET_OPTION_RE,
     _SAS_FUNCTION_CALL_RE,
     _SAS_FUNCTIONS,
     _SAS_RESERVED,
+    _SAS_SET_MULTI_RE,
+    _SAS_SUBSETTING_IF_RE,
+    _SAS_SUM_STATEMENT_RE,
 )
 from .models import SasChunkKind, SasChunkMetadata
 from .scanner import _blank_span, _sanitise
@@ -573,6 +578,29 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
         {m.group(1).lower() for m in _SAS_COMPONENT_OBJECT_RE.finditer(mt)}
     )
 
+    # ── DATA step statements ────────────────────────────────────────────────
+    # Scanned on `mt` (string literals blanked) at statement position, so a
+    # variable named `output` or the word `set` inside an expression does not
+    # register. Only meaningful for DATA steps; a PROC's own statements are
+    # already identified by `proc_name`.
+    data_step_statements: set[str] = set()
+    if kind == SasChunkKind.DATA_STEP:
+        data_step_statements = {
+            m.group(1).lower() for m in _SAS_DATA_STEP_STATEMENT_RE.finditer(mt)
+        }
+        # The sum statement is a retained accumulator without the keyword.
+        if _SAS_SUM_STATEMENT_RE.search(mt):
+            data_step_statements.add("retain")
+        # `SET a b;` concatenates; the ubiquitous single-dataset `SET a;` does
+        # not, so only the multi-dataset form earns a token of its own.
+        if _SAS_SET_MULTI_RE.search(mt):
+            data_step_statements.add("set_multi")
+        # A subsetting IF filters rows; an IF/THEN assigns. Different targets.
+        if _SAS_SUBSETTING_IF_RE.search(mt):
+            data_step_statements.add("subsetting_if")
+        if _SAS_DATASET_OPTION_RE.search(mt):
+            data_step_statements.add("dataset_option")
+
     return SasChunkMetadata(
         step_name=_nid(dm.group(1)) if dm else None,
         proc_name=_nid(pm.group(1)) if pm else None,
@@ -591,6 +619,7 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
         recognized_functions=recognized_functions,
         recognized_call_routines=recognized_call_routines,
         component_objects=component_objects,
+        data_step_statements=sorted(data_step_statements),
         control_flow_op=control_flow_op,
         contains_abort=has_abort,
         contains_computed_goto=has_computed_goto,

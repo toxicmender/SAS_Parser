@@ -110,6 +110,22 @@ def test_owns_fence(target, info, owned):
     assert target.owns_fence(info) is owned
 
 
+@pytest.mark.parametrize(
+    "target,prefix",
+    [(SPARKSQL, "--"), (PYSPARK, "#"), (SPARKSCALA, "//")],
+)
+def test_comment_prefix(target, prefix):
+    """The system prompt interpolates this to spell the NOT CONVERTIBLE
+    marker in the target's own comment syntax."""
+    assert target.comment_prefix == prefix
+
+
+def test_every_target_defines_a_comment_prefix():
+    from target_language import KNOWN_TARGETS
+
+    assert all(t.comment_prefix for t in KNOWN_TARGETS)
+
+
 # ---------------------------------------------------------------------------
 # Syntax checking
 # ---------------------------------------------------------------------------
@@ -163,5 +179,47 @@ def test_sql_uses_sqlglot_when_it_is_importable(monkeypatch):
     assert SPARKSQL.check_syntax("SELECT 1") is None
     error = SPARKSQL.check_syntax("BROKEN")
     assert error is not None and "ParseError" in error
-    # The Spark dialect, not the generic one.
-    assert {dialect for _, dialect in calls} == {"spark"}
+    # Databricks, not the generic dialect and not `spark`: this target emits
+    # QUALIFY, SQL scripting and EXECUTE IMMEDIATE, which open-source Spark
+    # does not have.
+    assert {dialect for _, dialect in calls} == {"databricks"}
+
+
+def test_sparksql_declares_the_databricks_dialect():
+    """The bundled guidance emits QUALIFY, SQL scripting and EXECUTE
+    IMMEDIATE, which open-source Spark does not have."""
+    assert SPARKSQL.sqlglot_dialect == "databricks"
+    assert PYSPARK.sqlglot_dialect is None
+    assert SPARKSCALA.sqlglot_dialect is None
+
+
+def test_xref_rewriter_takes_its_dialect_from_the_target(monkeypatch):
+    """The two sqlglot consumers read the same SQL the same way.
+
+    `xref.rewrite` parses the *generated* SQL to rewrite table references and
+    returns it unchanged when it does not parse. If the checker accepted a
+    statement the rewriter could not read, the rewrite would silently no-op on
+    exactly the Databricks-only syntax this target emits — a split-brain that
+    shows up as missing table rewrites, not as an error. Resolving both from
+    one field is what makes that unrepresentable.
+    """
+    import app_config
+    import xref.rewrite as rewrite
+
+    monkeypatch.setattr(
+        app_config, "get_value", lambda s, k, default=None: "SparkSQL"
+    )
+    assert rewrite.default_dialect() == SPARKSQL.sqlglot_dialect
+
+    # A non-SQL target still needs a dialect: the rewriter reaches sqlglot for
+    # the SQL inside `spark.sql("...")`.
+    monkeypatch.setattr(
+        app_config, "get_value", lambda s, k, default=None: "PySpark"
+    )
+    assert rewrite.default_dialect() == SPARKSQL.sqlglot_dialect
+
+    # A config typo is the pipeline's error to raise, not the rewriter's.
+    monkeypatch.setattr(
+        app_config, "get_value", lambda s, k, default=None: "Klingon"
+    )
+    assert rewrite.default_dialect() == SPARKSQL.sqlglot_dialect

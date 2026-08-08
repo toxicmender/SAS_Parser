@@ -173,7 +173,7 @@ def test_changed_chunker_params_invalidate_cache(tmp_path):
     reader_b = _CountingReader()
     CorpusLoader(
         reader=reader_b,
-        chunker=InstructionChunker(min_words=999, max_words=1000),
+        chunker=InstructionChunker(min_tokens=999, max_tokens=1000),
         cache_dir=cache_dir,
     ).load_one(_spec(path))
     assert reader_b.read_calls == 1

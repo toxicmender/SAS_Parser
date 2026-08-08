@@ -21,6 +21,7 @@ from llm_client import LLMClientConfig
 from pipeline import SasLLMPipeline
 from pipeline.setup import MemorySetup, PromptingSetup
 from pipeline.prompting import (
+    _attribution_for_item,
     _constructs_for_item,
     _kinds_for_item,
     _meta_flags_for_item,
@@ -97,6 +98,136 @@ def test_constructs_for_item_maps_functions_and_hazards():
     keys = _constructs_for_item(_batch(chunk))
     assert ConstructKey(kind="function", name="intnx") in keys
     assert ConstructKey(kind="call_routine", name="symput") in keys  # hazard added
+
+
+def test_construct_key_emission_order_is_the_selector_contract():
+    """The selector treats the caller's order as meaningful — it reports the
+    first matching key as a pick's provenance and interleaves construct hits in
+    it — so the sequence is pinned, not incidental."""
+    batch = _batch(
+        _meta_chunk(
+            "c1",
+            recognized_functions=["intnx", "upcase"],
+            recognized_call_routines=["symput"],
+            component_objects=["hash"],
+            data_step_statements=["merge", "by"],
+            symput_scope_hazard=True,
+            contains_computed_goto=True,
+            contains_abort=True,
+        ),
+        _meta_chunk("c2", kind=SasChunkKind.PROC_STEP, proc_name="sql"),
+        _meta_chunk(
+            "c3",
+            kind=SasChunkKind.GLOBAL_STATEMENT,
+            global_statement_keyword="libname",
+        ),
+    )
+    assert [str(k) for k in _constructs_for_item(batch)] == [
+        "proc:sql",
+        "function:intnx",
+        "function:upcase",
+        "call_routine:symput",
+        "component_object:hash",
+        "statement:by",
+        "statement:merge",
+        "global_statement:libname",
+        "macro_statement:goto",
+        "macro_statement:abort",
+        "category:character",
+        "category:date_time",
+        "category:macro",
+    ]
+
+
+def test_attribution_maps_each_construct_to_the_member_that_uses_it():
+    """A multi-member batch's guidance can name the step it serves."""
+    batch = _batch(
+        _meta_chunk("c1", data_step_statements=["merge", "by"]),
+        _meta_chunk("c2", recognized_functions=["intnx"]),
+        _meta_chunk("c3", kind=SasChunkKind.PROC_STEP, proc_name="sort"),
+    )
+    attribution = _attribution_for_item(batch)
+    assert attribution[ConstructKey(kind="statement", name="merge")] == ["c1"]
+    assert attribution[ConstructKey(kind="function", name="intnx")] == ["c2"]
+    assert attribution[ConstructKey(kind="proc", name="sort")] == ["c3"]
+    # A category key follows its function to the same member.
+    assert attribution[ConstructKey(kind="category", name="date_time")] == ["c2"]
+
+
+def test_attribution_lists_every_member_sharing_a_construct_in_batch_order():
+    batch = _batch(
+        _meta_chunk("c1", recognized_functions=["intnx"]),
+        _meta_chunk("c2", recognized_functions=["upcase"]),
+        _meta_chunk("c3", recognized_functions=["intnx"]),
+    )
+    attribution = _attribution_for_item(batch)
+    assert attribution[ConstructKey(kind="function", name="intnx")] == ["c1", "c3"]
+
+
+def test_attribution_covers_every_key_the_batch_reports():
+    """No construct may be selected on and then be unattributable — a batch
+    rollup is by definition the union of its members."""
+    batch = _batch(
+        _meta_chunk("c1", data_step_statements=["merge"], recognized_functions=["intnx"]),
+        _meta_chunk("c2", kind=SasChunkKind.PROC_STEP, proc_name="sql"),
+    )
+    attribution = _attribution_for_item(batch)
+    assert all(key in attribution for key in _constructs_for_item(batch))
+
+
+def test_constructs_for_item_adds_data_step_statement_keys():
+    """So a MERGE rule fires on steps that merge, not on every DATA step."""
+    text = "data a; merge b c; by id; run;"
+    chunk = SasChunk(
+        chunk_id="c8",
+        source_id="etl.sas",
+        text=text,
+        kind=SasChunkKind.DATA_STEP,
+        title="merge",
+        start_line=1,
+        end_line=1,
+        start_char=0,
+        end_char=len(text),
+        metadata=SasChunkMetadata(data_step_statements=["merge", "by"]),
+    )
+    keys = _constructs_for_item(_batch(chunk))
+    assert ConstructKey(kind="statement", name="merge") in keys
+    assert ConstructKey(kind="statement", name="by") in keys
+
+
+def test_constructs_for_item_adds_function_category_keys():
+    """Every recognised function also contributes its family key, so a
+    ``[category: date_time]`` rule fires without enumerating members."""
+    keys = _constructs_for_item(_batch(_intnx_chunk()))
+    assert ConstructKey(kind="category", name="date_time") in keys
+
+
+def test_category_keys_come_after_the_specific_ones():
+    """Specific before general: a rule naming the exact function is offered
+    ahead of one covering its whole family."""
+    keys = _constructs_for_item(_batch(_intnx_chunk()))
+    kinds = [k.kind for k in keys]
+    assert kinds.index("function") < kinds.index("category")
+
+
+def test_constructs_for_item_emits_no_category_for_unmapped_functions():
+    """An unmapped name contributes nothing — the same as having no rule."""
+    text = "data a; set b; x = airy(y); run;"
+    chunk = SasChunk(
+        chunk_id="c9",
+        source_id="etl.sas",
+        text=text,
+        kind=SasChunkKind.DATA_STEP,
+        title="airy",
+        start_line=1,
+        end_line=1,
+        start_char=0,
+        end_char=len(text),
+        metadata=SasChunkMetadata(recognized_functions=["airy"]),
+    )
+    keys = _constructs_for_item(_batch(chunk))
+    assert ConstructKey(kind="function", name="airy") in keys
+    assert [k for k in keys if k.kind == "category"] == []
 
 
 def test_query_for_item_uses_constructs_not_dataset_names():
@@ -537,3 +668,44 @@ def test_select_then_build_from_picks_reproduces_build():
     assert builder.build_from_picks(picks, constructs) == builder.build(
         query, constructs
     )
+
+
+# ---------------------------------------------------------------------------
+# Packing headroom — the guidance budget and the call packer share a request
+# ---------------------------------------------------------------------------
+
+
+def test_packing_headroom_tracks_the_guidance_budget():
+    """Packing must reserve room for the guidance that rides the same call.
+
+    The derived packing budget is `max_input_tokens` minus what else lands in
+    the request, and retrieved guidance is one of those things. It used to be a
+    2,000-token constant, written when the guidance budget was ~2,000 tokens;
+    once that budget moved the packer would have packed against a stale figure
+    and pushed requests over `max_input_tokens`. Reading the builder's own
+    number means it cannot drift again.
+    """
+    resolve = SasLLMPipeline._resolve_packing_budget
+    system = "x " * 500
+
+    generous = resolve(None, 60_000, system, "gpt-5.4", guidance_headroom=0)
+    tight = resolve(None, 60_000, system, "gpt-5.4", guidance_headroom=14_000)
+    assert generous is not None and tight is not None
+    # Every token reserved for guidance is a token not packed with items.
+    assert generous - tight == int(0.8 * 14_000)
+
+
+def test_packing_headroom_is_zero_without_a_prompt_builder():
+    """No builder means no guidance block, so nothing to reserve for."""
+    resolve = SasLLMPipeline._resolve_packing_budget
+    system = "x " * 500
+    assert resolve(None, 60_000, system, "gpt-5.4") == resolve(
+        None, 60_000, system, "gpt-5.4", guidance_headroom=0
+    )
+
+
+def test_explicit_packing_budget_ignores_the_headroom():
+    """An operator who names a budget gets it, headroom or not."""
+    resolve = SasLLMPipeline._resolve_packing_budget
+    assert resolve(9_999, 60_000, "x", "gpt-5.4", guidance_headroom=14_000) == 9_999
+    assert resolve(0, 60_000, "x", "gpt-5.4", guidance_headroom=14_000) is None

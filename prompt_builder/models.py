@@ -60,7 +60,11 @@ class ConstructKey(BaseModel, frozen=True):
 
     kind: str  # function | call_routine | macro_function | macro_statement |
     #            global_statement | proc | format | informat | option |
-    #            system_option | component_object
+    #            system_option | component_object | category
+    #
+    # ``category`` names a SAS function *family* (``category:date_time``)
+    # rather than one construct. Only the pipeline emits it, and only user
+    # instructions match it — reference sections are titled per function.
     name: str  # lowercased identifier, e.g. "intnx", "symput", "let", "sql"
 
     def __str__(self) -> str:
@@ -128,7 +132,7 @@ class InstructionDoc(BaseModel):
 
 class InstructionChunk(BaseModel):
     """
-    A word-budgeted, retrieval-ready instruction unit (produced in Phase 3
+    A token-budgeted, retrieval-ready instruction unit (produced in Phase 3
     from one or more :class:`DocSection`s). Defined here so the whole data
     model lives in one place; the reader itself emits :class:`DocSection`s.
     """
@@ -142,6 +146,18 @@ class InstructionChunk(BaseModel):
     role: DocRole = DocRole.SAS_REFERENCE
     construct_keys: list[ConstructKey] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
+    # Tokens in ``text``, counted once where the chunk is built and carried
+    # here so the selector never re-tokenises. Measured over the bundled
+    # corpus, counting is ~22x the cost of a word count (3.9s vs 0.18s for
+    # 5,145 chunks) — paid per PromptBuilder construction if it is not
+    # cached, and free once it rides the on-disk extraction cache.
+    #
+    # Counted under the default encoding rather than the run's model:
+    # `token_budget`'s prefix map sends almost every id to `o200k_base`, and
+    # this is an estimate that tracks the real count, not a billing figure.
+    # 0 means "not counted yet" — the selector counts on the fly for a chunk
+    # built by a caller that did not populate it.
+    token_count: int = 0
 
     def __str__(self) -> str:
         return f"InstructionChunk({self.chunk_id}: {self.section_path})"
@@ -170,6 +186,9 @@ class InstructionChunk(BaseModel):
                 "role": self.role.value,
                 "construct_keys": [str(k) for k in self.construct_keys],
                 "tags": list(self.tags),
+                # Carried so the round trip stays lossless; an int is a value
+                # every vector-store backend accepts.
+                "token_count": self.token_count,
             },
         )
 
@@ -191,6 +210,7 @@ class InstructionChunk(BaseModel):
             role=DocRole(meta.get("role", DocRole.SAS_REFERENCE.value)),
             construct_keys=keys,
             tags=list(meta.get("tags", [])),
+            token_count=int(meta.get("token_count", 0)),
         )
 
 

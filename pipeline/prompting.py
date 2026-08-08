@@ -20,14 +20,15 @@ Logger name: ``pipeline.prompting``.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
+from chunker.keywords import SAS_FUNCTION_CATEGORIES
 from chunker.models import (
     SasBatch,
     SasChunk,
     SasDiagnostic,
 )
-from llm_client import tokens
+import token_budget as tokens
 from prompt_builder import ConstructKey
 
 from .constants import (
@@ -92,9 +93,77 @@ def _constructs_for_item(item: SasBatch) -> list[ConstructKey]:
 
     Hazard flags add their canonical construct even when the name extractor
     missed it, so the selector still pulls the SYMPUT / %GOTO / %ABORT section.
+
+    Every recognised function/routine also contributes a ``category`` key
+    (:data:`~chunker.keywords.SAS_FUNCTION_CATEGORIES`), so an instruction can
+    be scoped to a whole family — ``[category: date_time]`` — instead of
+    enumerating its members. Category keys are emitted after the specific ones
+    so the more precise match is offered first, and they never hit the
+    reference corpus: PDF sections are titled per function, so no reference
+    chunk carries a ``category`` key. They exist for user instructions.
+    """
+    return _construct_keys(
+        procs=item.proc_names,
+        functions=item.recognized_functions,
+        call_routines=item.recognized_call_routines,
+        component_objects=item.component_objects,
+        statements=item.data_step_statements,
+        global_statements=item.global_statement_keywords,
+        symput_hazard=item.has_symput_scope_hazard,
+        computed_goto=item.has_computed_goto,
+        abort=item.has_abort,
+    )
+
+
+def _constructs_for_chunk(chunk: SasChunk) -> list[ConstructKey]:
+    """:func:`_constructs_for_item`'s keys for a single member chunk.
+
+    Same primitive, same emission order — the difference is only the scope of
+    the identifier sets. Used to attribute a batch's guidance back to the
+    member whose constructs pulled it in (:func:`_attribution_for_item`); the
+    batch-level function stays driven off the batch rollups so its output is
+    unaffected by how members are visited.
+    """
+    m = chunk.metadata
+    return _construct_keys(
+        procs={m.proc_name} if m.proc_name else set(),
+        functions=m.recognized_functions,
+        call_routines=m.recognized_call_routines,
+        component_objects=m.component_objects,
+        statements=m.data_step_statements,
+        global_statements=(
+            {m.global_statement_keyword} if m.global_statement_keyword else set()
+        ),
+        symput_hazard=m.symput_scope_hazard,
+        computed_goto=m.contains_computed_goto,
+        abort=m.contains_abort,
+    )
+
+
+def _construct_keys(
+    *,
+    procs: Iterable[str],
+    functions: Iterable[str],
+    call_routines: Iterable[str],
+    component_objects: Iterable[str],
+    statements: Iterable[str],
+    global_statements: Iterable[str],
+    symput_hazard: bool,
+    computed_goto: bool,
+    abort: bool,
+) -> list[ConstructKey]:
+    """Build the ordered, deduplicated construct keys for one scope.
+
+    The single place the metadata -> :class:`ConstructKey` mapping lives, so a
+    batch and one of its members can never disagree about what a construct is
+    called. Emission order is part of the contract: the selector treats the
+    caller's order as meaningful (it reports the first matching key as a pick's
+    provenance and interleaves construct hits in it), so specific kinds come
+    before ``category``, and the whole sequence is deterministic.
     """
     keys: list[ConstructKey] = []
     seen: set[ConstructKey] = set()
+    categories: set[str] = set()
 
     def add(kind: str, name: str | None) -> None:
         if not name:
@@ -104,23 +173,53 @@ def _constructs_for_item(item: SasBatch) -> list[ConstructKey]:
             seen.add(key)
             keys.append(key)
 
-    for name in sorted(item.proc_names):
+    def note_category(name: str) -> None:
+        category = SAS_FUNCTION_CATEGORIES.get(name.lower())
+        if category:
+            categories.add(category)
+
+    for name in sorted(procs):
         add("proc", name)
-    for name in sorted(item.recognized_functions):
+    for name in sorted(functions):
         add("function", name)
-    for name in sorted(item.recognized_call_routines):
+        note_category(name)
+    for name in sorted(call_routines):
         add("call_routine", name)
-    for name in sorted(item.component_objects):
+        note_category(name)
+    for name in sorted(component_objects):
         add("component_object", name)
-    for name in sorted(item.global_statement_keywords):
+    for name in sorted(statements):
+        add("statement", name)
+    for name in sorted(global_statements):
         add("global_statement", name)
-    if item.has_symput_scope_hazard:
+    if symput_hazard:
         add("call_routine", "symput")
-    if item.has_computed_goto:
+    if computed_goto:
         add("macro_statement", "goto")
-    if item.has_abort:
+    if abort:
         add("macro_statement", "abort")
+    for category in sorted(categories):
+        add("category", category)
     return keys
+
+
+def _attribution_for_item(item: SasBatch) -> dict[ConstructKey, list[str]]:
+    """Which member chunk(s) each of the batch's constructs came from.
+
+    Lets the guidance block say *why* a section is present in a multi-member
+    batch — a MERGE rule names the member that merges, rather than leaving the
+    model to re-derive the mapping from the member bodies. Chunk ids are in
+    batch order and deduplicated; a construct several members share lists them
+    all. Keys with no member (only the batch rollup can produce those, and it
+    cannot) simply do not appear.
+    """
+    attribution: dict[ConstructKey, list[str]] = {}
+    for chunk in item.chunks:
+        for key in _constructs_for_chunk(chunk):
+            ids = attribution.setdefault(key, [])
+            if chunk.chunk_id not in ids:
+                ids.append(chunk.chunk_id)
+    return attribution
 
 
 def _kinds_for_item(item: SasBatch) -> set[str]:
@@ -252,6 +351,8 @@ def _format_batch_message(
         standard_autocall_macros=_fmt_list(batch.standard_autocall_macros),
         required_macrovars=_fmt_list(batch.required_macrovars),
         produced_macrovars=_fmt_list(batch.produced_macrovars),
+        proc_names=_fmt_list(sorted(batch.proc_names)),
+        data_step_statements=_fmt_list(sorted(batch.data_step_statements)),
         sas_functions=_fmt_list(sorted(batch.recognized_functions)),
         call_routines=_fmt_list(sorted(batch.recognized_call_routines)),
         component_objects=_fmt_list(sorted(batch.component_objects)),

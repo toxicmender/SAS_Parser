@@ -6,8 +6,17 @@ guidance relevant to *each* batch/singleton it sends the LLM — targeted per
 item instead of one bloated static system prompt.
 
 The package imports nothing from `chunker` or `llm_client`; it reuses
-`memory.relevance.HybridRanker` for retrieval. `pipeline.engine` remains the
-sole integration point.
+`memory.relevance.HybridRanker` for retrieval and the leaf `token_budget` for
+counting. `pipeline.engine` remains the sole integration point.
+
+Budgets here are **tokens**, the currency the prompt is priced in. Words were
+a stand-in and a poor one: over the bundled corpus the tokens-per-word ratio
+runs 1.01 to 4.41 (median 1.44), and for the SQL-heavy instruction set it is
+1.72 — so a word budget believed it had ~40% more room than it did, and
+dropped chunks later and less predictably than its numbers suggested. Counting
+lives in `token_budget` rather than `llm_client.tokens` because importing the
+latter executes `llm_client/__init__.py` and drags in langchain (7.5s, 1,642
+modules) — see `token_budget/README.md`.
 
 > **Status:** complete. The pipeline injects per-item reference guidance when a
 > `PromptBuilder` is passed to `SasLLMPipeline(prompt_builder=...)`.
@@ -19,7 +28,7 @@ models.py            InstructionDiagnostic, ConstructKey, DocSection,
                      InstructionDoc, InstructionChunk, SelectedInstruction
                      (+ DocRole / ExtractionStrategy / SelectionTier)
 pdf_reader.py        PdfReader — PDF -> list[DocSection], two strategies
-doc_chunker.py       InstructionChunker — DocSection -> word-budgeted InstructionChunk
+doc_chunker.py       InstructionChunker — DocSection -> token-budgeted InstructionChunk
 catalog.py           DocumentSpec + default_catalog + CorpusLoader (on-disk cache)
 selector.py          InstructionSelector — construct lookup + HybridRanker retrieval
 builder.py           PromptBuilder facade: read -> chunk -> index -> build(query)
@@ -133,29 +142,31 @@ a clean text layer.
 
 ## InstructionChunker
 
-Turns reader sections into retrieval-ready `InstructionChunk`s under a word
-budget:
+Turns reader sections into retrieval-ready `InstructionChunk`s under a token
+budget, and records each chunk's `token_count` so the selector never has to
+re-tokenise the corpus (counting it costs ~3.9s against ~0.18s for words, and
+rides the on-disk cache):
 
 ```python
 from prompt_builder.doc_chunker import InstructionChunker
 
-chunks = InstructionChunker(min_words=120, max_words=900, overlap_words=60).chunk(
+chunks = InstructionChunker(min_tokens=175, max_tokens=1300, overlap_tokens=90).chunk(
     sections, role=summary.role
 )
 ```
 
 - **Merge.** Consecutive sections under the *same parent heading* whose combined
-  text is below `min_words` merge into one chunk (SAS function dictionaries have
+  text is below `min_tokens` merge into one chunk (SAS function dictionaries have
   the odd one-line entry). The merged chunk collapses to the shared parent
   breadcrumb and aggregates every member's construct key; a section that already
-  meets `min_words` stands alone.
-- **Split.** A chunk over `max_words` splits into overlapping windows at
+  meets `min_tokens` stands alone.
+- **Split.** A chunk over `max_tokens` splits into overlapping windows at
   paragraph boundaries (a single over-long paragraph is hard-split on word
-  count). Unlike the SAS chunker there is no parent/child pair — the LLM only
+  boundaries, stepped by its own token density). Unlike the SAS chunker there is no parent/child pair — the LLM only
   ever sees the retrieved window, so plain windows suffice.
 - **Breadcrumb prefix.** Every chunk's stored text is prefixed with its section
   breadcrumb, so heading terms ("MERGE", "INTNX") weigh on retrieval even when
-  the prose below never repeats them. The word budget governs the section
+  the prose below never repeats them. The token budget governs the section
   *body*; the small breadcrumb prefix sits on top of it (the hard token cap is
   `llm_client`'s job at prompt time).
 
@@ -216,7 +227,7 @@ sel = InstructionSelector(chunks, pinned_sections=["Output Format"])
 picks = sel.select(
     query="advance a date to the next month interval",
     constructs=[ConstructKey(kind="function", name="intnx")],
-    max_words=1500,
+    max_tokens=8000,
     top_k=6,
 )
 ```
@@ -230,7 +241,7 @@ picks = sel.select(
    over the whole chunk corpus surfaces guidance no title lookup can find —
    target-platform sections keyed off the free-text query.
 
-Results fill `max_words` in priority order — **pinned → hazard constructs →
+Results fill `max_tokens` in priority order — **pinned → hazard constructs →
 other constructs → topical** (at most `top_k` topical chunks) — dropping whole
 chunks at the tail, never truncating. Nothing relevant yields an empty list, so
 the caller emits no guidance block (irrelevant reference pages are worse than
@@ -306,6 +317,34 @@ that `build_from_picks` takes the **item's** constructs, not the selection's:
 the hazard hints and reasoning directives are keyed on them so they survive
 when no reference section matched.
 
+### Member attribution (`attribution=`)
+
+An item is a *batch*, and a batch spanning a macro, a PROC SQL, a DATA step and
+a PROC SORT gets one guidance block covering all four. Passing `attribution` — a
+`{ConstructKey: [member id, ...]}` map — labels each section with the member
+whose constructs brought it in:
+
+```
+### MERGE and BY-group joins  [chunk-0002]
+### PROC SORT  [chunk-0003]
+### Output format
+```
+
+so the model is not left to re-derive from the member bodies what the batch
+summary already knows. Reference sections carry the id inside their existing
+citation run (`### [functions · … · construct: intnx · chunk-0002]`).
+
+Only picks with a matched construct key are labelled. An always-on rule, a
+pinned or topical section, and a `[kind:]`/`[meta:]`-gated note have no key and
+are batch-wide by nature, so they stay unlabelled — that is the correct reading,
+not a missing label. `None` (the default) renders exactly the unlabelled block,
+which is what a single-member batch should pass, since there every label would
+name the same chunk.
+
+The ids are opaque strings: `pipeline.prompting._attribution_for_item` builds the
+map by running the same construct-key derivation over each member, which is what
+keeps this package free of any `chunker` import.
+
 ### Focus hints (directional stimulus)
 
 The `## Focus hints` block is a compact per-item stimulus — the item's
@@ -318,7 +357,7 @@ construct and topic lines come from the selection, so they are already
 stop-list-filtered and budget-bounded. The block is skipped when there is
 nothing to hint at (e.g. a pinned-only selection), and `focus_hints=False`
 (or config.json `prompt_builder.focus_hints`) disables it entirely. Hint
-lines are small and sit outside the word budget, like breadcrumb prefixes.
+lines are small and sit outside the token budget, like breadcrumb prefixes.
 
 ### Reasoning directives (conditional chain-of-thought)
 
@@ -335,7 +374,7 @@ the pipeline's system prompt, which scaffolds every response as
 **Analysis → Mapping → Translation → Risks** and scopes conciseness to the
 final sections so reasoning isn't suppressed.
 
-Keep `max_instruction_words` ≥ the chunker's `max_words` (default 1500 ≥ 900)
+Keep `max_instruction_tokens` ≥ the chunker's `max_tokens` (default 8000 ≥ 1300)
 so any single reference section always fits — the budget then limits only the
 *number* of chunks, dropping whole chunks at the tail, never a lone construct
 hit; `from_specs` logs a WARNING when the budget is misconfigured below the
@@ -344,8 +383,8 @@ its SAS metadata (`pipeline.prompting._query_for_item` / `_constructs_for_item`)
 — that mapping lives in the pipeline, not here, so this package imports no
 `chunker`.
 
-`top_k` and `max_instruction_words` default from `config.json`
-(`prompt_builder.*`), as do the chunkers' word budgets — see the `app_config`
+`top_k` and `max_instruction_tokens` default from `config.json`
+(`prompt_builder.*`), as do the chunker's token budgets — see the `app_config`
 package: explicit argument > config.json > hard default.
 
 ## User instructions
@@ -363,6 +402,9 @@ One fenced PySpark block per SAS step, then a risk table.
 ## [when: proc:sql, component_object:hash] Lookup rules  <- construct-scoped
 Prefer broadcast joins when the lookup side is small.
 
+## [category: date_time] Date family rules            <- function-family-scoped
+One section covering every date/time function.
+
 ## [topic] Partitioning guidance                       <- retrieved by ranking
 Wide fact tables are partitioned by load_date.
 
@@ -375,6 +417,47 @@ Translate PROC SQL directly to Spark SQL.               (stacked groups)
 ## [kind: DATA_STEP] [meta: symput_hazard] SYMPUT       <- kind/metadata-scoped
 Trace the write/read ordering before translating.
 ```
+
+### Statement scoping (`[when: statement:...]`)
+
+A DATA step's *statements* are construct keys too, so guidance can name the
+problem it solves rather than the chunk kind it lives in:
+`## [when: statement:merge] ...` fires on steps that merge, where
+`## [kind: DATA_STEP] ...` fires on every step there is. The vocabulary is
+`chunker.keywords.SAS_DATA_STEP_STATEMENT_TOKENS` — the statement keywords
+(`merge`, `by`, `retain`, `array`, `output`, `set`, `update`, `modify`,
+`where`, `infile`, `do`) plus four the scan derives rather than reads:
+`retain` for a sum statement (`x + expr;`), `subsetting_if` for an `if <expr>;`
+that drops rows, `set_multi` for a concatenating `SET a b;`, and
+`dataset_option` for `keep=` and friends.
+
+This matters more than it looks. Measured on a DATA step using dates, hashing
+and sequential `IF`s, `[kind: DATA_STEP]` scoping delivered 520 words (22% of
+the block) of MERGE, BY-group, RETAIN and ARRAY guidance the step could not
+use; on statement scoping that is 0.
+
+### Family scoping (`[category:]`)
+
+`## [category: date_time, hashing_security] Rule` fires when the item uses
+*any* function in one of those SAS families, so one section covers a whole
+category without enumerating its members. It is **sugar for
+`[when: category:date_time]`**: `pipeline.prompting._constructs_for_item`
+derives a `category` construct key per recognised function from
+`chunker.keywords.SAS_FUNCTION_CATEGORIES`, so the rule rides the ordinary
+construct-matched tier with no extra machinery — it stacks with `[kind:]` /
+`[meta:]` / `[lang:]` like any other primary scope, and shows up in focus
+hints as *"date time functions"*.
+
+Category keys are emitted **after** the specific `function:`/`call_routine:`
+keys, so a rule for the exact function is offered before the family rule.
+They never match the reference corpus: PDF sections are titled per function
+(`INTNX Function` → `function:intnx`), so no reference chunk carries a
+`category` key. The axis exists for operator rules only.
+
+`SAS_FUNCTION_CATEGORIES` is a curated subset of the taxonomy in *SAS
+Functions and CALL Routines by Category* — only families that carry
+translation guidance are mapped, because an unmapped name simply contributes
+no category key. Widening a category there widens every rule scoped on it.
 
 ### Modifier clauses: language, chunk kind, metadata (`[lang:]`/`[kind:]`/`[meta:]`)
 
@@ -425,11 +508,67 @@ Point config.json `user_instructions.dir` at such a directory (it takes
 precedence over `user_instructions.path`); a missing directory warns and
 continues, like a missing file.
 
-The package ships a starter set at `prompt_builder/instructions/sparksql/`
-(overview, constructs, datetime, macros, worked examples) synthesised from
-the Spark SQL reference and PySpark SQL API docs — load it with
-`from_dir("prompt_builder/instructions")` and run the pipeline with
-`output_language="SparkSQL"`.
+```
+instructions/
+  sparksql/          -> every section scoped [lang: sparksql]
+    overview.md        always-on: output shape, ANSI mode, null semantics
+    constructs.md      PROC SQL, MERGE, BY-groups, MEANS/SUMMARY, TRANSPOSE
+    functions.md       string / numeric / conditional scalar functions
+    datetime.md        epoch, INTNX/INTCK, date parts, date literals
+    hashing.md         MD5 / SHA256 / HASHING family
+    regex.md           PRX family
+    dataset_ops.md     SORT / APPEND / SET-union / dataset options
+    datastep.md        RETAIN, ARRAY, OUTPUT, sequential-IF consolidation
+    formats.md         PROC FORMAT and PUT with a user-defined format
+    lookup.md          hash-object lookups (the join they really are)
+    librefs.md         LIBNAME / FILENAME -> catalogs, schemas, volumes
+    ingest.md          PROC IMPORT/EXPORT, INFILE/INPUT -> COPY INTO
+    proc_freq.md       PROC FREQ
+    proc_univariate.md PROC UNIVARIATE
+    proc_rank.md       PROC RANK / PROC STANDARD
+    proc_compare.md    PROC COMPARE as a reconciliation query
+    catalog_ops.md     DATASETS / DELETE / COPY / CONTENTS -> DDL and catalog
+    reporting.md       PRINT / REPORT / TABULATE (OUT= only), FEDSQL
+    orchestration.md   [topic] SAS step sequence as a job DAG
+    macros.md          macro variables, SYMPUT, macro decomposition
+    examples.md        worked SAS -> Spark SQL pairs
+  _common/           -> language-agnostic (the leading _ opts out of scoping)
+  <root>.md          -> language-agnostic
+```
+
+Add a target by creating a sibling directory (`pyspark/`, `snowflake/`, …).
+The run's `output_language` selects the matching slice at build time, so
+several targets coexist without leaking into each other.
+
+**Documentation files are skipped**, not ingested: a `README*.md` at any
+depth, and any file whose name starts with `_`. An instructions directory
+almost always carries a README describing itself, and prose *about* the rules
+is not a rule — ingested, it parses as always-on sections and is prompted with
+every item, for every target.
+
+The package ships a starter set at `prompt_builder/instructions/sparksql/`,
+checked against the [Databricks SQL language
+reference](https://learn.microsoft.com/azure/databricks/sql/language-manual/)
+and Spark 4.1.2 — load it with `from_dir("prompt_builder/instructions")` and
+run the pipeline with `output_language="SparkSQL"`. Review and adapt it to your
+project's conventions before relying on it.
+
+> ⚠️ **The shipped slice targets Databricks**, not open-source Spark. It uses
+> `QUALIFY`, SQL scripting (`FOR`/`WHILE`/`SIGNAL`), `EXECUTE IMMEDIATE`,
+> `UNPIVOT` and three-level `catalog.schema.table` names, none of which
+> open-source Spark has — a non-Databricks deployment needs those rules
+> rewritten. The directory is named `sparksql/` because that is the target key
+> `databrickssql` folds to (see `target_language`); the two are one target
+> today, so the slice must commit to one of them.
+
+The shipped slice holds only guidance that is true of the *languages* —
+nothing about how your shop wants its SQL to look. House rules (parameterising
+hardcoded filters, leaving physical layout alone, emitting reconciliation
+queries) are illustrated in
+[`docs/instruction-examples/site-policy.md`](../docs/instruction-examples/site-policy.md),
+deliberately outside this tree so pointing `dir` at the bundled set never
+drags one organisation's conventions along. Copy it into your own directory
+and edit it.
 
 `[example: <keys>]` sections hold **few-shot worked pairs** — curated
 SAS → target translations demonstrating the full desired response shape
@@ -448,14 +587,51 @@ standing file named by `config.json` `user_instructions.path` (missing file =
 WARNING and continue).
 
 Selection priority per item: **user always → user construct-matched →
-user examples → reference pinned → hazard constructs → other constructs →
-user `[topic]` → reference topical** — the topical ranking is partitioned so
+user kind/meta-gated → user examples → reference pinned → hazard constructs →
+other constructs → user `[topic]` → reference topical** — the topical ranking is partitioned so
 every relevant user `[topic]` chunk precedes any reference hit, and `top_k`
 caps the tier as a whole. Operator rules and examples have first claim on
 the budget; one that doesn't fit logs a WARNING naming it.
-`user_instructions.max_words` (config or the `user_max_words` argument)
+The three user-rule tiers run **most specific first**: unconditional rules,
+then rules matched on the item's exact constructs (`[when:]`/`[category:]`),
+then rules merely gated on its chunk kind or metadata (`[kind:]`/`[meta:]`
+with no primary scope). A `[kind: DATA_STEP]` note is broader than a rule
+naming the function the item actually calls, so it yields to it — otherwise a
+handful of broad notes fill the budget and the precise guidance, the reason
+the item retrieved anything at all, is what gets dropped.
+
+`user_instructions.max_tokens` (config or the `user_max_tokens` argument)
 additionally caps the user chunks (rules and examples together) inside the
-overall budget. Selected rules render in a `## Project instructions` block
+overall budget.
+
+**Budget the two together, and size them for your items.** The bundled
+SparkSQL set is ~17.9k tokens, so what fits matters. Measured over a 70-line
+reference program that batches into two items:
+
+| `max_instruction_tokens` / `max_tokens` | Tokens drawn | Matched rules dropped |
+|---|---|---|
+| 4000 / 2800 | 5,419 | 14 |
+| 8000 / 5600 | 8,250 | 7 |
+| 10000 / 7000 | 9,679 | 4 |
+| **14000 / 9800** *(shipped)* | 12,368 | **0** |
+
+config.json ships the last row — the measured point where every rule an item's
+constructs match actually arrives. Past it the items still draw 12,368 tokens,
+so more budget buys nothing.
+
+**It is a ceiling, not a cost floor.** Every section is scoped to a construct,
+statement, or function family the item actually uses, so a simple DATA step
+draws far less however high the budget goes — raising it buys nothing for
+simple items and completeness for complex ones.
+
+⚠️ The pipeline reserves this figure as packing headroom
+(`_resolve_packing_budget`), so raising it *lowers* how much SAS source shares
+a call when `llm_client.max_input_tokens` is set. That is the intended trade —
+guidance and items compete for one request — but it is why the number is read
+from the builder rather than duplicated as a constant.
+
+Leaving `max_tokens` null is not the cheaper alternative: uncapped operator
+rules simply take the whole budget and starve reference retrieval. Selected rules render in a `## Project instructions` block
 above the reference guidance, with the operator's own headings and no page
 citations; selected examples render in a `## Worked examples` block placed
 last.

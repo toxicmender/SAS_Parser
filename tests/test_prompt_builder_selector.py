@@ -99,7 +99,8 @@ def test_hazard_construct_ordered_before_ordinary():
 def test_hazard_construct_wins_tight_budget():
     sel = InstructionSelector(_corpus())
     # Each chunk ~43 words; budget fits only one.
-    out = sel.select("zzz", [INTNX, SYMPUT], max_words=50)
+    # Fixture chunks are ~90 tokens each, so this admits exactly one.
+    out = sel.select("zzz", [INTNX, SYMPUT], max_tokens=100)
     assert [c.chunk_id for c in out] == ["c2"]
 
 
@@ -110,7 +111,7 @@ def test_multi_window_construct_returns_all_windows_breadth_first():
         _chunk("w1", "Funcs > BIGFN Function", "window two " + _words(30), keys=[big]),
     ]
     sel = InstructionSelector(corpus)
-    out = sel.select("zzz", [big, INTNX], max_words=10_000, top_k=0)
+    out = sel.select("zzz", [big, INTNX], max_tokens=10_000, top_k=0)
     ids = [c.chunk_id for c in out]
     # All windows of BIGFN present, but INTNX's primary section comes before
     # BIGFN's second window (breadth-first interleave).
@@ -167,8 +168,8 @@ def test_pinned_plus_construct():
 
 def test_budget_drops_whole_chunks_without_truncating():
     sel = InstructionSelector(_corpus())
-    out = sel.select("zzz", [INTNX, SQL, SYMPUT], max_words=50)
-    assert len(out) == 1  # only one ~43-word chunk fits
+    out = sel.select("zzz", [INTNX, SQL, SYMPUT], max_tokens=100)
+    assert len(out) == 1  # only one ~90-token chunk fits
     # returned chunk is intact (not truncated)
     assert len(out[0].text.split()) > 40
 
@@ -252,7 +253,44 @@ def test_top_k_caps_user_and_reference_topical_together():
     assert "c4" not in ids
 
 
-def test_user_max_words_caps_user_block_only(caplog):
+def test_construct_matched_rules_outrank_kind_gated_ones():
+    """Most specific first, within the operator tiers.
+
+    ``[kind:]``/``[meta:]`` are modifiers, so a section carrying only those
+    still has primary scope 'always'. Left in the always tier it claimed the
+    budget ahead of rules matched on the item's actual constructs — so a
+    broad "this is a DATA step" note could evict the guidance for the exact
+    function the step called, which is the guidance it retrieved anything for.
+    """
+    rules = (
+        "## [kind: DATA_STEP] Broad\n" + "wide " * 40 + "\n\n"
+        "## [when: function:intnx] Precise\n" + "narrow " * 40 + "\n"
+    )
+    sel = InstructionSelector(
+        [], user_instructions=UserInstructionSet.from_text(rules)
+    )
+    # Room for exactly one of the two rules.
+    out = sel.select("zzz", [INTNX], max_tokens=45, kinds={"DATA_STEP"})
+    assert [c.section_path for c in out] == ["Precise"]
+
+    # With room for both, the precise rule still comes first.
+    out = sel.select("zzz", [INTNX], max_tokens=200, kinds={"DATA_STEP"})
+    assert [c.section_path for c in out] == ["Precise", "Broad"]
+
+
+def test_kind_gated_rule_still_precedes_reference_chunks():
+    """Demoting it below construct-matched rules must not push it below the
+    reference corpus — it is still an operator rule."""
+    rules = "## [kind: DATA_STEP] Broad\nwide guidance here.\n"
+    sel = InstructionSelector(
+        _corpus(), user_instructions=UserInstructionSet.from_text(rules)
+    )
+    out = sel.select("zzz", [INTNX], max_tokens=10_000, kinds={"DATA_STEP"})
+    ids = [c.chunk_id for c in out]
+    assert ids[0].startswith("user::")
+
+
+def test_user_max_tokens_caps_user_block_only(caplog):
     import logging
 
     two_rules = (
@@ -262,15 +300,15 @@ def test_user_max_words_caps_user_block_only(caplog):
     sel = InstructionSelector(
         _corpus(),
         user_instructions=UserInstructionSet.from_text(two_rules),
-        user_max_words=9,  # each rule chunk is ~7 words; only one fits
+        user_max_tokens=9,  # each rule chunk is ~7 words; only one fits
     )
     with caplog.at_level(logging.WARNING, logger="prompt_builder.selector"):
-        out = sel.select("zzz", [INTNX], max_words=10_000)
+        out = sel.select("zzz", [INTNX], max_tokens=10_000)
     ids = [c.chunk_id for c in out]
     assert "user::c0000" in ids  # first rule within the user cap
     assert "user::c0001" not in ids  # second rule over the user cap
     assert "c0" in ids  # reference chunks unaffected by the user cap
-    assert "user_max_words=9" in caplog.text
+    assert "user_max_tokens=9" in caplog.text
 
 
 def test_user_always_overflow_warns(caplog):
@@ -278,7 +316,7 @@ def test_user_always_overflow_warns(caplog):
 
     sel = _user_selector()
     with caplog.at_level(logging.WARNING, logger="prompt_builder.selector"):
-        out = sel.select("zzz", [], max_words=5)
+        out = sel.select("zzz", [], max_tokens=5)
     assert out == []
     assert "does not fit budget" in caplog.text
 

@@ -91,13 +91,19 @@ For running the work items end-to-end through an LLM, see the
 | File | Role |
 |------|------|
 | `models.py` | Pydantic models: `SasChunk` (+`Kind`), `SasChunkMetadata`, `SasChunkResult`, `SasCorpus`, `SasBatch`, `SasBatchResult`, `SasDiagnostic` (+`Severity`). |
-| `keywords.py` | SAS keyword catalogues transcribed from the SAS docs (reserved macro words, autocall macros, function / CALL-routine dictionaries) + the patterns compiled from them. Pure data; no package imports, no logging. |
+| `keywords.py` | SAS keyword catalogues transcribed from the SAS docs (reserved macro words, autocall macros, function / CALL-routine dictionaries, and `SAS_FUNCTION_CATEGORIES`) + the patterns compiled from them. Pure data; no package imports, no logging. |
 | `scanner.py` | Lexical layer: `_Unit` / `_Region` parse primitives, the statement classifier (`_classify`), text normalisation / sanitisation, line-offset helpers, and the `_Deadline` / `_ParseWatchdog` stuck-parser machinery. |
 | `metadata.py` | Per-chunk semantic extraction: `_metadata_for`, `_io_for` (directed dataset I/O), `_macro_body_io` (literal vs parameterised body refs), symput / SQL-INTO / CALL EXECUTE extractors, `_merge_meta`, and the extraction regex catalogue. |
 | `chunker.py` | `SasSemanticChunker` orchestration (scan → group → build chunks, oversized-split with overlap). |
 | `batcher.py` | `_EdgeDiscovery` + Union-Find grouping, weak-edge resolution, context absorption, batch construction. `SasChunkBatcher` is a one-file convenience over `MultiFileBatcher`. |
 | `_repl.py` | `print_iterable` REPL helper (imported by nothing). |
 | `pipeline.py`, `pipeline_constants.py`, `response_models.py`, `notebook.py` | **Deprecated shims** re-exporting from the top-level `pipeline` package, where these modules now live. |
+
+> **Budgets here stay in words.** `sas_chunker.min_words`/`max_words` size SAS
+> *source* into semantic units — a question about where a step ends, not about
+> what a prompt costs. `prompt_builder` budgets in tokens because it is filling
+> a prompt; `chunker.batcher` then packs these units by token cost
+> (`pipeline.max_merged_tokens`) on top. Two different questions, two units.
 
 **Import direction is strictly downward:** `keywords` and `models` import
 nothing from the package; `scanner` and `metadata` import from them; `chunker.py`
@@ -210,6 +216,28 @@ these silently changes behavior.
    and SAS-provided autocall macros in `_STANDARD_AUTOCALL_MACROS` — the three
    sets have distinct, citable identities and distinct consumers; do not fold
    them together.
+7. **`data_step_statements` is advisory and DATA-step-only.** It reports which
+   statements a step uses — logic statements (`merge`, `by`, `retain`, `array`,
+   `output`, `set`, `update`, `modify`, `where`, `infile`, `do`) and
+   declaration statements (`label`, `format`, `length`, which carry the
+   documentation a migration should preserve) — plus four constructs the scan
+   derives rather than reads: `retain` for a sum statement, `subsetting_if` for
+   an `if <expr>;` that drops rows, `set_multi` for a concatenating
+   `SET a b;`, and `dataset_option` for `keep=` and friends. A PROC's statements are already identified by `proc_name`, so the
+   scan skips non-DATA chunks. Never gates chunking or batching; the consumer
+   is `prompt_builder`'s `[when: statement:...]` scope, which is what lets
+   guidance fire on the steps that raise a problem instead of on every step.
+   `SAS_DATA_STEP_STATEMENT_TOKENS` publishes the full vocabulary.
+8. **`SAS_FUNCTION_CATEGORIES` is advisory and deliberately partial.** It maps
+   a function or routine name to its family in *SAS Functions and CALL Routines
+   by Category*, and its only consumer is `prompt_builder`'s `[category: ...]`
+   instruction scope (reached via `pipeline.prompting._constructs_for_item`, so
+   `prompt_builder` still imports nothing from here). Only families that carry
+   translation guidance are mapped — an unmapped name contributes no category
+   key, which is the same as having no rule for it. Every mapped name must
+   exist in `_SAS_FUNCTIONS` or `_SAS_CALL_ROUTINES`;
+   `tests/test_bundled_instructions.py` enforces both ends, so a typo cannot
+   silently create a category nothing can ever match.
 
 ## Logging
 

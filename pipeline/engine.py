@@ -54,7 +54,8 @@ from chunker.models import (
     SasCorpus,
     SasDiagnostic,
 )
-from llm_client import LLMClient, LLMClientConfig, TokenUsage, tokens
+import token_budget as tokens
+from llm_client import LLMClient, LLMClientConfig, TokenUsage
 from memory.extractor import MemoryExtractor
 from memory.policy import TaskPolicy
 from memory.thread_mem import ThreadMemory
@@ -66,6 +67,7 @@ from .constants import (
     _SYSTEM_PROMPT_TEMPLATE,
 )
 from .prompting import (
+    _attribution_for_item,
     _constructs_for_item,
     _format_batch_message,
     _kinds_for_item,
@@ -82,11 +84,12 @@ logger = logging.getLogger(__name__)
 # Token-budgeted call packing defaults (see _resolve_packing_budget). The
 # hard default assumes a modern long-context model (the gpt-5.4 default) and
 # packs aggressively; tighten it via pipeline.max_merged_tokens if per-item
-# answer quality drops. The headrooms mirror what shares the request with
-# the item text — retrieved guidance (prompt_builder's max_instruction_words
-# default, ~1.3 tokens/word) and the window_k history.
+# answer quality drops. The history headroom mirrors the window_k turns that
+# share the request with the item text; the *guidance* headroom is not a
+# constant — it is read from the attached PromptBuilder's own budget, because
+# that is a configured number that has moved before and would silently
+# under-reserve the moment it moved again.
 _DEFAULT_MAX_MERGED_TOKENS = 64_000
-_PACKING_GUIDANCE_HEADROOM_TOKENS = 2_000
 _PACKING_HISTORY_HEADROOM_TOKENS = 4_000
 
 
@@ -532,7 +535,7 @@ class SasLLMPipeline:
             if self._structured_output
             else _SYSTEM_PROMPT_TEMPLATE
         )
-        # Both templates are filled with all three target facts; each uses the
+        # Both templates are filled with every target fact; each uses the
         # subset it needs (the Markdown one names the fence tag, the
         # structured one the cell `language` value), and .format() ignores the
         # rest.
@@ -540,6 +543,7 @@ class SasLLMPipeline:
             output_language=target.display_name,
             fence_info=target.default_fence,
             cell_language=target.cell_language,
+            comment_prefix=target.comment_prefix,
         )
         # The long-term task policy rides INSIDE the cached system block: it
         # is the same text for every thread and every item of the run, so it
@@ -573,6 +577,11 @@ class SasLLMPipeline:
             self._llm_client.config.max_input_tokens,
             self._system_prompt,
             model,
+            guidance_headroom=(
+                self._prompt_builder.max_instruction_tokens
+                if self._prompt_builder is not None
+                else 0
+            ),
         )
         self._item_cost = (
             prompt_cost_estimator(model)
@@ -1055,6 +1064,7 @@ class SasLLMPipeline:
         max_input_tokens: int | None,
         system_prompt: str,
         model: str,
+        guidance_headroom: int = 0,
     ) -> int | None:
         """The packing token budget actually in force, or ``None`` for off.
 
@@ -1066,6 +1076,13 @@ class SasLLMPipeline:
         stays inside the input budget (derived ≤ 0 disables packing: a tiny
         input budget leaves no room to pack); without one, a conservative
         ~64k-token default.
+
+        *guidance_headroom* is the attached builder's ``max_instruction_tokens``
+        — the most the retrieved guidance can add to the same request — and 0
+        when no builder is attached, since then no guidance is injected at all.
+        Reserving a constant here would mean packing against a stale figure the
+        moment that budget is retuned, and packing too optimistically is how a
+        request ends up over ``max_input_tokens``.
         """
         if requested is not None:
             return requested or None  # 0 = packing off
@@ -1077,7 +1094,7 @@ class SasLLMPipeline:
             * (
                 max_input_tokens
                 - system_tokens
-                - _PACKING_GUIDANCE_HEADROOM_TOKENS
+                - guidance_headroom
                 - _PACKING_HISTORY_HEADROOM_TOKENS
             )
         )
@@ -1194,7 +1211,16 @@ class SasLLMPipeline:
             meta_flags=_meta_flags_for_item(item),
         )
         retrieval_context = [pick.chunk.text for pick in picks]
-        guidance = self._prompt_builder.build_from_picks(picks, constructs)
+        # Label each section with the member that pulled it in — but only when
+        # there is more than one member to tell apart. On a singleton every
+        # label would name the same chunk, which is noise, so pass None and
+        # render exactly what an unattributed build does.
+        attribution = (
+            _attribution_for_item(item) if len(item.chunks) > 1 else None
+        )
+        guidance = self._prompt_builder.build_from_picks(
+            picks, constructs, attribution=attribution
+        )
         if not guidance:
             return [], retrieval_context
         item_id = item.batch_id

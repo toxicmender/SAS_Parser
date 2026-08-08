@@ -10,6 +10,14 @@ scope:
 * ``## [when: proc:sql, component_object:hash] SQL rules`` — **conditional**:
   injected only when the item's constructs intersect the listed keys. The
   ``kind:name`` syntax is exactly ``str(ConstructKey)``.
+* ``## [category: date_time, hashing_security] Rules`` — **conditional** on a
+  SAS function *family* rather than a named function, so one section covers a
+  whole category without enumerating its members. Sugar for
+  ``[when: category:date_time, category:hashing_security]``: the pipeline
+  derives a ``category`` construct key per recognised function from
+  ``chunker.keywords.SAS_FUNCTION_CATEGORIES``, so this rides the ordinary
+  conditional tier. Reference PDF sections are titled per function and carry
+  no category keys, so these match user instructions only.
 * ``## [topic] Partitioning guidance`` — **topical**: indexed for retrieval
   and surfaced by ranking, like a reference chunk.
 * ``## [example: proc:sql] SQL join`` — **example** (few-shot): a worked
@@ -63,6 +71,7 @@ from pathlib import Path
 from typing import Callable, Iterable, NamedTuple
 
 import app_config
+import token_budget
 from pydantic import BaseModel, Field
 from target_language import normalize_language as _normalize_language
 
@@ -93,6 +102,17 @@ _META_TAG_PREFIX = "meta:"
 _PREAMBLE_TITLE = "General"
 
 
+def _is_doc_file(filename: str) -> bool:
+    """Whether *filename* documents an instruction directory rather than
+    instructing the model — skipped by :meth:`UserInstructionSet.from_dir`.
+
+    A ``README*.md`` or a ``_``-prefixed file. Prose about the rules is not a
+    rule: ingested, it would parse as always-on sections and be prompted with
+    every item, for every target.
+    """
+    return filename.startswith("_") or filename.lower().startswith("readme")
+
+
 # The run's target language is folded to a comparison key by the same rule
 # that resolves it (``target_language.normalize_language``) — re-exported, not
 # reimplemented, so a ``[lang: ...]`` token and a resolved target can never
@@ -114,6 +134,18 @@ def normalize_meta(name: str) -> str:
 
     Lower-cased with spaces/hyphens folded to underscores, matching the flag
     vocabulary the pipeline emits (``symput_hazard``, ``unclosed_block``, ...).
+    """
+    return re.sub(r"[\s-]+", "_", name.strip().lower())
+
+
+def normalize_category(name: str) -> str:
+    """Fold a ``[category: ...]`` token to its comparison key.
+
+    Lower-cased with spaces/hyphens folded to underscores, matching the slugs
+    the pipeline emits from ``chunker.keywords.SAS_FUNCTION_CATEGORIES``
+    (``date_time``, ``regular_expression_prx``, ...). Same folding as
+    :func:`normalize_meta`; kept separate because the two vocabularies are
+    unrelated and only one of them is a construct key.
     """
     return re.sub(r"[\s-]+", "_", name.strip().lower())
 
@@ -236,17 +268,22 @@ class UserInstructionSet(BaseModel):
             scope, clean_title, keys = parsed.scope, parsed.title, parsed.keys
             kinds, metas = parsed.kinds, parsed.metas
             section_langs = parsed.langs or fallback_langs
+            text = f"{clean_title}\n\n{body.strip()}"
             chunks.append(
                 InstructionChunk(
                     chunk_id=f"{doc_id}::c{len(chunks):04d}",
                     doc_id=doc_id,
                     section_path=clean_title,
-                    text=f"{clean_title}\n\n{body.strip()}",
+                    text=text,
                     page_start=0,
                     page_end=0,
                     role=DocRole.USER_INSTRUCTION,
                     construct_keys=keys,
                     tags=_section_tags(scope, section_langs, kinds, metas),
+                    # Counted here like a reference chunk, so the selector
+                    # budgets both kinds in one currency. An operator set is
+                    # small, so this is not the corpus's 3.9s — it is instant.
+                    token_count=token_budget.count_text(text),
                 )
             )
 
@@ -285,6 +322,14 @@ class UserInstructionSet(BaseModel):
         ``output_language``, so one directory can hold guidance for several
         targets side by side.
 
+        **Documentation files are skipped**, not ingested: a ``README*.md`` at
+        any depth, and any file whose name starts with ``_``. A directory of
+        instructions almost always carries a README describing itself, and
+        prose *about* the rules is not a rule — ingested, it would land in the
+        always-on tier and be prompted with every item. (The ``_`` prefix means
+        "not instructions" for a file, and "language-agnostic" for a directory;
+        the two readings never collide, since only one applies per path part.)
+
         A missing directory yields an empty set (mirrors :meth:`from_config`'s
         degradation): losing an instructions directory should not halt a run.
         """
@@ -300,6 +345,12 @@ class UserInstructionSet(BaseModel):
         diagnostics: list[InstructionDiagnostic] = []
         parts: list[str] = []
         for path in sorted(base.rglob("*.md"), key=lambda p: p.as_posix()):
+            if _is_doc_file(path.name):
+                logger.debug(
+                    f"UserInstructionSet.from_dir: skipping documentation file "
+                    f"'{path.relative_to(base).as_posix()}'"
+                )
+                continue
             rel = path.relative_to(base)
             language = (
                 rel.parts[0]
@@ -346,27 +397,29 @@ class UserInstructionSet(BaseModel):
         """
         directory = app_config.get_value("user_instructions", "dir")
         if directory is not None:
-            if not Path(directory).is_dir():
+            resolved = app_config.resolve_path(directory)
+            if not resolved.is_dir():
                 logger.warning(
                     f"UserInstructionSet.from_config: configured instructions "
                     f"directory '{directory}' not found; continuing without "
                     f"user instructions"
                 )
                 return None
-            logger.info(f"UserInstructionSet.from_config: loading dir '{directory}'")
-            return cls.from_dir(str(directory))
+            logger.info(f"UserInstructionSet.from_config: loading dir '{resolved}'")
+            return cls.from_dir(str(resolved))
 
         path = app_config.get_value("user_instructions", "path")
         if path is None:
             return None
-        if not Path(path).is_file():
+        resolved = app_config.resolve_path(path)
+        if not resolved.is_file():
             logger.warning(
                 f"UserInstructionSet.from_config: configured instructions "
                 f"file '{path}' not found; continuing without user instructions"
             )
             return None
-        logger.info(f"UserInstructionSet.from_config: loading '{path}'")
-        return cls.from_file(str(path))
+        logger.info(f"UserInstructionSet.from_config: loading '{resolved}'")
+        return cls.from_file(str(resolved))
 
     # ------------------------------------------------------------------
     # Scope views
@@ -544,6 +597,23 @@ def _classify_group(
         )
         return _GroupResult(SCOPE_EXAMPLE, [], [], [], [])
 
+    if lowered.startswith("category:"):
+        keys = _parse_category_keys(body[9:])
+        if keys:
+            # Sugar for [when: category:x] — a category is just a construct
+            # key the pipeline derives from the item's functions, so it rides
+            # the same conditional tier with no extra machinery.
+            return _GroupResult(SCOPE_WHEN, keys, [], [], [])
+        diagnostics.append(
+            InstructionDiagnostic(
+                code="INVALID_CONSTRUCT_KEY",
+                message=f"category-directive in heading '{heading.strip()}' "
+                f"lists no categories; treating the instruction as always-on",
+                doc_id=doc_id,
+            )
+        )
+        return _GroupResult(SCOPE_ALWAYS, [], [], [], [])
+
     if lowered.startswith("when:"):
         keys = _parse_when_keys(body[5:], heading, doc_id, diagnostics)
         if keys:
@@ -573,6 +643,20 @@ def _classify_group(
 def _parse_lang_tokens(raw: str) -> list[str]:
     """Comma-separated ``[lang: ...]`` tokens, normalized and de-duped."""
     return _parse_scoped_tokens(raw, normalize_language)
+
+
+def _parse_category_keys(raw: str) -> list[ConstructKey]:
+    """Comma-separated ``[category: ...]`` tokens as ``category:`` keys.
+
+    No validation against a known-category list: this module holds no SAS
+    vocabulary (that is ``chunker``'s, reached only via the pipeline), so an
+    unknown slug yields a key that simply never matches — the same outcome as
+    a ``[when:]`` key for a construct the item does not use.
+    """
+    return [
+        ConstructKey(kind="category", name=value)
+        for value in _parse_scoped_tokens(raw, normalize_category)
+    ]
 
 
 def _parse_scoped_tokens(raw: str, normalize: Callable[[str], str]) -> list[str]:

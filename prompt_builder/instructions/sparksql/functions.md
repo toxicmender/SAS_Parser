@@ -1,12 +1,8 @@
-SAS DATA-step and macro-time functions map to Spark SQL **built-in functions**
-(see the [Spark SQL functions
-reference](https://spark.apache.org/docs/latest/api/sql/index.html)). Reach for
-a built-in before hand-rolling a `CASE`/regex; most SAS scalar functions have a
-direct Spark equivalent. The gotchas below are where the *semantics* differ —
-translate the intent, not the name. Date/time functions (`INTNX`, `INTCK`,
-`PUT`/`INPUT` with date formats, `TODAY`, …) are covered separately in the
-datetime guidance; this section is string, numeric, and null/conditional
-functions.
+## [category: character, descriptive_statistics, truncation, special] Scalar function mapping
+Most SAS scalar functions have a direct Spark [built-in
+equivalent](https://spark.apache.org/docs/latest/api/sql/index.html); reach for
+one before hand-rolling a `CASE` or a regex. The sections below are the cases
+where the *semantics* differ — translate the intent, not the name.
 
 ## [when: function:coalesce, function:coalescec] COALESCE
 `COALESCE(a, b, …)` (and character `COALESCEC`) both map directly to Spark
@@ -23,8 +19,11 @@ substr(s,p+length(new)))`).
 ## [when: function:scan] SCAN
 `SCAN(s, n, delims)` returns the n-th word. Map to `split_part(s, delim, n)`
 (1-based) for a single delimiter, or `element_at(split(s, regex), n)` when SAS
-used several delimiters (`split` takes a **regex**, so escape/`[]`-group the
-delimiter set). ⚠️ SAS `SCAN` treats runs of delimiters as one and accepts a
+used several delimiters. `split` takes a **regex**, so regex-escape the
+delimiter set and group it as `[...]+` — with a bare `[...]`, a run of two
+delimiters yields an empty element and every later index shifts by one, which
+is exactly the SAS behaviour you are trying to reproduce. ⚠️ SAS `SCAN` treats
+runs of delimiters as one and accepts a
 **negative n** to count from the end (`element_at(..., n)` with negative n does
 this in Spark); a naive `split_part` does neither. Default SAS delimiters are a
 large punctuation set, not just space — reproduce the exact set.
@@ -76,10 +75,13 @@ prefer the `LENGTHN` semantics unless the SAS code depended on the padded width.
 ## [when: function:put, function:input] PUT / INPUT (non-date)
 For **non-date** conversions: numeric-to-character `PUT(n, best12.)` -> `cast(n
 AS STRING)` (or `format_string('%d', n)` / `format_number(n, d)` for a specific
-width/decimals); character-to-numeric `INPUT(s, 8.)` -> `cast(s AS DOUBLE)` or
-`try_cast(s AS DOUBLE)` when a non-numeric string should yield `NULL` rather
-than error. Date/time formats and informats are handled in the datetime
-guidance — do not treat those as plain casts.
+width/decimals); character-to-numeric `INPUT(s, 8.)` -> **`try_cast(s AS
+DOUBLE)`**. ⚠️ Use `try_cast`, not `cast`, as the default here: SAS `INPUT`
+yields a missing value and a log note on unparseable text, whereas under Spark
+4's ANSI default a plain `cast` **raises** and kills the query. Plain `cast` is
+right only when the column is provably clean. `PUT` with a *user-defined*
+format is not a cast at all — see the format guidance. Date/time formats and
+informats are handled in the datetime guidance.
 
 ## [when: function:round, function:ceil, function:floor, function:int] Rounding and truncation
 - `ROUND(x)` -> `round(x)`; `ROUND(x, u)` rounds to the nearest multiple of the
@@ -88,8 +90,11 @@ guidance — do not treat those as plain casts.
   power of ten; for a general unit use `round(x / u) * u`. ⚠️ Flag any
   `ROUND` whose second argument is not a power of ten.
 - `CEIL(x)` -> `ceil(x)`, `FLOOR(x)` -> `floor(x)`.
-- `INT(x)` truncates **toward zero** -> `cast(x AS BIGINT)` (also toward zero),
-  *not* `floor` (which differs for negatives).
+- `INT(x)` truncates **toward zero**. ⚠️ Do *not* map it to
+  `cast(x AS BIGINT)`: under ANSI mode a numeric-to-integral cast that would
+  truncate is an **error**, not a truncation, so `CAST(5.1 AS INT)` raises.
+  Use `TRUNC(x, 0)`, which truncates toward zero as SAS does. `floor` is wrong
+  in the other direction — it disagrees with `INT` for negatives.
 
 ## [when: function:mod] MOD
 `MOD(a, b)` -> `mod(a, b)` (or the `%` operator); both take the sign of the

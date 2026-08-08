@@ -15,7 +15,7 @@ Two-stage selection per pipeline item:
    title lookup can find — target-platform sections ("DataFrames and SQL",
    "Structured Streaming") keyed off a free-text query built from the item.
 
-Results fill a word budget in priority order (pinned -> hazard constructs ->
+Results fill a **token** budget in priority order (pinned -> hazard constructs ->
 other constructs -> topical), dropping whole chunks at the tail rather than
 truncating. Nothing relevant -> an empty list, so the prompt carries no
 guidance block (irrelevant reference pages are worse than none).
@@ -31,6 +31,7 @@ from typing import Any, Callable, Iterable, TypeVar
 
 # DiskCachedEmbeddings moved to memory.relevance so any HybridRanker consumer
 # (this selector, the KV store's hybrid search) can share the on-disk cache.
+import token_budget
 from memory.relevance import DiskCachedEmbeddings, HybridRanker
 
 from .models import (
@@ -90,6 +91,18 @@ DEFAULT_HAZARD_CONSTRUCTS: frozenset[ConstructKey] = frozenset(
 _T = TypeVar("_T")
 
 
+def _chunk_tokens(chunk: InstructionChunk) -> int:
+    """A chunk's token cost, counted once at build time where possible.
+
+    ``token_count`` is populated by the chunker and by the user-instruction
+    parser and cached on disk with the chunk, so the common path is a field
+    read. Counting the bundled corpus costs ~3.9s against ~0.18s for a word
+    count, which is why it is not done here per construction. A chunk built by
+    a caller that predates the field falls back to counting now.
+    """
+    return chunk.token_count or token_budget.count_text(chunk.text)
+
+
 def _interleave(lists: list[list[_T]]) -> list[_T]:
     """Round-robin merge: firsts of every list, then seconds, and so on."""
     out: list[_T] = []
@@ -125,9 +138,9 @@ class InstructionSelector:
         Where to persist document embeddings when dense retrieval is on.
     rrf_k, reranker :
         Forwarded to :class:`~memory.relevance.HybridRanker`.
-    user_max_words : int | None
-        Cap on the total words of *user-instruction* chunks per selection,
-        within the overall ``max_words`` budget. ``None`` (default) leaves
+    user_max_tokens : int | None
+        Cap on the total tokens of *user-instruction* chunks per selection,
+        within the overall ``max_tokens`` budget. ``None`` (default) leaves
         user chunks limited only by the overall budget.
     pinned_sections : Iterable[str]
         Section-path substrings (case-insensitive) whose reference chunks are
@@ -141,7 +154,7 @@ class InstructionSelector:
         chunks: Iterable[InstructionChunk],
         *,
         user_instructions: UserInstructionSet | None = None,
-        user_max_words: int | None = None,
+        user_max_tokens: int | None = None,
         embeddings: Any | None = None,
         embedding_cache_path: str | None = None,
         rrf_k: int = 60,
@@ -150,7 +163,7 @@ class InstructionSelector:
         stop_constructs: Iterable[ConstructKey] = DEFAULT_STOP_CONSTRUCTS,
         hazard_constructs: Iterable[ConstructKey] = DEFAULT_HAZARD_CONSTRUCTS,
     ) -> None:
-        self._user_max_words = user_max_words
+        self._user_max_tokens = user_max_tokens
         self._chunks = list(chunks)
         self._reference_count = len(self._chunks)
         reference_count = self._reference_count
@@ -158,9 +171,10 @@ class InstructionSelector:
         self._hazard = frozenset(hazard_constructs)
 
         # User-instruction tiers: chunks join the shared list (so indices,
-        # word counts, and the ranker index stay uniform) but are tracked by
+        # token counts, and the ranker index stay uniform) but are tracked by
         # scope and excluded from the reference-only structures below.
         self._user_always: list[int] = []
+        self._user_gated: list[int] = []
         self._user_conditional: list[tuple[frozenset[ConstructKey], int]] = []
         self._user_examples: list[tuple[frozenset[ConstructKey], int]] = []
         self._user_topical: set[int] = set()
@@ -180,15 +194,25 @@ class InstructionSelector:
                     )
                 elif scope == SCOPE_TOPIC:
                     self._user_topical.add(idx)
+                elif kinds_of(chunk) or metas_of(chunk):
+                    # No primary scope, but gated on chunk kind / metadata:
+                    # conditional in practice, so it claims budget *after* the
+                    # construct-matched rules rather than ahead of them. A
+                    # `[kind: DATA_STEP]` note is broader than a rule naming
+                    # the exact function the item calls, and letting the broad
+                    # one win drops the precise one — which is the guidance
+                    # the item most needed.
+                    self._user_gated.append(idx)
                 else:
                     self._user_always.append(idx)
         self._user_rule_indices = (
             set(self._user_always)
+            | set(self._user_gated)
             | {idx for _, idx in self._user_conditional}
             | {idx for _, idx in self._user_examples}
         )
 
-        self._wc = [len(c.text.split()) for c in self._chunks]
+        self._tc = [_chunk_tokens(c) for c in self._chunks]
         # Per-chunk modifier scopes (empty = agnostic on that axis). Reference
         # chunks never carry these tags, so they pass every modifier filter.
         self._langs = [frozenset(langs_of(c)) for c in self._chunks]
@@ -238,7 +262,7 @@ class InstructionSelector:
         query: str,
         constructs: Iterable[ConstructKey] = (),
         *,
-        max_words: int = 1500,
+        max_tokens: int = 14000,
         top_k: int = 6,
         language: str | None = None,
         kinds: Iterable[str] = (),
@@ -248,7 +272,7 @@ class InstructionSelector:
         Chunks to inject for one item, in priority order — user always ->
         user construct-matched -> user examples -> reference pinned ->
         hazard constructs -> other constructs -> user topical -> reference
-        topical — filling ``max_words`` and taking at most ``top_k`` topical
+        topical — filling ``max_tokens`` and taking at most ``top_k`` topical
         chunks in total. Empty when nothing is relevant. *language*, *kinds*,
         and *meta_flags* filter out chunks scoped to a different target /
         chunk kind / metadata flag (see :meth:`select_detailed`).
@@ -258,7 +282,7 @@ class InstructionSelector:
             for pick in self.select_detailed(
                 query,
                 constructs,
-                max_words=max_words,
+                max_tokens=max_tokens,
                 top_k=top_k,
                 language=language,
                 kinds=kinds,
@@ -271,7 +295,7 @@ class InstructionSelector:
         query: str,
         constructs: Iterable[ConstructKey] = (),
         *,
-        max_words: int = 1500,
+        max_tokens: int = 14000,
         top_k: int = 6,
         language: str | None = None,
         kinds: Iterable[str] = (),
@@ -330,22 +354,22 @@ class InstructionSelector:
             is_user = idx >= self._reference_count
             over_user_cap = (
                 is_user
-                and self._user_max_words is not None
-                and user_used + self._wc[idx] > self._user_max_words
+                and self._user_max_tokens is not None
+                and user_used + self._tc[idx] > self._user_max_tokens
             )
-            if over_user_cap or used + self._wc[idx] > max_words:
+            if over_user_cap or used + self._tc[idx] > max_tokens:
                 if warn_overflow:
                     # Operator rules have first claim on the budget; even they
                     # did not fit. That's a misconfiguration, not tail-drop.
                     limit = (
-                        f"user_max_words={self._user_max_words}"
+                        f"user_max_tokens={self._user_max_tokens}"
                         if over_user_cap
-                        else f"budget ({max_words - used}/{max_words})"
+                        else f"budget ({max_tokens - used}/{max_tokens})"
                     )
                     logger.warning(
                         f"select: user instruction "
                         f"'{self._chunks[idx].section_path}' "
-                        f"({self._wc[idx]} words) does not fit {limit}; dropped"
+                        f"({self._tc[idx]} words) does not fit {limit}; dropped"
                     )
                 return False
             chosen.append(
@@ -354,12 +378,15 @@ class InstructionSelector:
                 )
             )
             chosen_set.add(idx)
-            used += self._wc[idx]
+            used += self._tc[idx]
             if is_user:
-                user_used += self._wc[idx]
+                user_used += self._tc[idx]
             return True
 
         # Tiers 1-3 — operator rules and examples, first claim on the budget.
+        # Within them, most specific first: unconditional rules, then rules
+        # matched on the item's exact constructs, then rules merely gated on
+        # its chunk kind or metadata flags.
         constructs = list(constructs)
         construct_set = set(constructs)
         for idx in self._user_always:
@@ -369,6 +396,8 @@ class InstructionSelector:
                 # The matched key, in the caller's (meaningful) order.
                 matched = next(k for k in constructs if k in keys)
                 add(idx, SelectionTier.USER_WHEN, matched, warn_overflow=True)
+        for idx in self._user_gated:
+            add(idx, SelectionTier.USER_ALWAYS, warn_overflow=True)
         for keys, idx in self._user_examples:
             if not keys:  # unconditional example
                 add(idx, SelectionTier.USER_EXAMPLE, warn_overflow=True)
@@ -414,7 +443,7 @@ class InstructionSelector:
                         topical_added += 1
 
         logger.debug(
-            f"select: {len(chosen)} chunk(s)  words={used}/{max_words}  "
+            f"select: {len(chosen)} chunk(s)  tokens={used}/{max_tokens}  "
             f"pinned={len(self._pinned)}  hazard={len(hazard)}  "
             f"construct={len(normal)}  topical={topical_added}"
         )

@@ -75,11 +75,51 @@ def load_config() -> dict[str, Any]:
             logger.warning(f"load_config: unreadable '{path}': {exc}; skipping")
             continue
         logger.info(f"load_config: using '{path}'")
+        _reject_removed_keys(config, path)
         _cache = config
         return config
     logger.info("load_config: no config.json found; using hard defaults")
     _cache = {}
     return _cache
+
+
+# Keys that were removed, and what replaced them. A removed key is worse than
+# a wrong one: `get_value` would fall through to the default and the run would
+# proceed quietly on a setting the operator believes they changed. These moved
+# from words to tokens, so silently ignoring the old value would also mean
+# running with a budget ~40% off what the file says.
+_REMOVED_KEYS: dict[tuple[str, str], str] = {
+    ("prompt_builder", "max_instruction_words"): (
+        "prompt_builder.max_instruction_tokens (tokens, not words)"
+    ),
+    ("user_instructions", "max_words"): (
+        "user_instructions.max_tokens (tokens, not words)"
+    ),
+    ("instruction_chunker", "min_words"): "instruction_chunker.min_tokens",
+    ("instruction_chunker", "max_words"): "instruction_chunker.max_tokens",
+    ("instruction_chunker", "overlap_words"): "instruction_chunker.overlap_tokens",
+}
+
+
+def _reject_removed_keys(config: dict[str, Any], path: Path) -> None:
+    """Raise when *config* still sets a key this version no longer reads.
+
+    Deliberately not a fallback: the value is not converted or honoured. The
+    point is that a stale config fails visibly at load rather than running with
+    a budget nobody chose.
+    """
+    stale = [
+        f"{section}.{key} -> {replacement}"
+        for (section, key), replacement in _REMOVED_KEYS.items()
+        if isinstance(config.get(section), dict) and key in config[section]
+    ]
+    if stale:
+        raise ValueError(
+            f"'{path}' sets configuration keys that were removed: "
+            + "; ".join(stale)
+            + ". These budgets are counted in tokens now, not words, so the "
+            "old values are not carried over — set the new keys explicitly."
+        )
 
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
@@ -131,6 +171,23 @@ def resolve(explicit: Any, section: str, key: str, default: Any) -> Any:
     if explicit is not None:
         return explicit
     return get_value(section, key, default)
+
+
+def resolve_path(value: str) -> Path:
+    """A path *from* config, anchored so it survives the working directory.
+
+    ``config.json`` is found relative to the repo root even when the process
+    runs elsewhere (see :func:`_candidate_paths`), so a relative path *inside*
+    it that only resolved against ``cwd`` would silently miss for any caller
+    not started from the root — a Docker entrypoint, a scheduled job, an
+    editor's test runner. Absolute paths and paths that exist relative to
+    ``cwd`` are honoured as given; anything else falls back to the repo root,
+    which is what a value like ``prompt_builder/instructions`` means.
+    """
+    path = Path(value)
+    if path.is_absolute() or path.exists():
+        return path
+    return Path(__file__).resolve().parents[1] / path
 
 
 def _typed(

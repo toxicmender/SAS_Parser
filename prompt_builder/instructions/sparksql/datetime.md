@@ -1,12 +1,47 @@
-## Date and datetime epoch
-⚠️ SAS date values count days from 1960-01-01; Spark SQL `DATE`/`TIMESTAMP`
-count from 1970-01-01. A raw SAS numeric date is off by 3653 days if cast
-directly. When the source column is a true SAS date, convert with
-`DATE_ADD(DATE'1960-01-01', CAST(sas_num AS INT))` rather than casting the
-number to a date. SAS datetime values are *seconds* since 1960-01-01
-00:00:00; convert with `TIMESTAMP'1960-01-01 00:00:00' + MAKE_INTERVAL(0,0,
-0,0,0,0, sas_dt_seconds)` or arithmetic on `unix_timestamp`. State the epoch
-assumption in Mapping.
+## [category: date_time] Date and datetime epoch
+⚠️ SAS counts from **1960-01-01**; Spark SQL `DATE`/`TIMESTAMP` count from
+1970-01-01. The offset is 3653 days, or 315 619 200 seconds. A raw SAS numeric
+cast directly to a date is wrong by exactly that.
+- SAS **date** (days) -> `DATE_ADD(DATE '1960-01-01', CAST(sas_num AS INT))`.
+- SAS **datetime** (seconds) -> `TIMESTAMP_SECONDS(sas_dt - 315619200)`. One
+  function, no interval arithmetic.
+- SAS **time** (seconds since midnight) -> `MAKE_INTERVAL(0,0,0,0,0,0, sas_t)`
+  added to a date, or format it directly.
+
+⚠️ **Timezone.** A SAS datetime is naive — it carries no zone. Spark's
+`TIMESTAMP` is `TIMESTAMP_LTZ`: it is *interpreted* in
+`spark.sql.session.timeZone`, so the same stored value reads differently under
+a different session setting, and a round trip can shift the wall-clock time.
+When the SAS value is a wall-clock reading rather than an instant, target
+`TIMESTAMP_NTZ` (`CAST(... AS TIMESTAMP_NTZ)`) to preserve it exactly. State
+the epoch *and* the timezone assumption in Mapping.
+
+## [category: date_time] Date literals and date parts
+**Literals.** A SAS date constant is a quoted string with a type suffix; it is
+not a string in Spark:
+`'01JAN2020'd` -> `DATE '2020-01-01'`,
+`'01JAN2020:09:30:00'dt` -> `TIMESTAMP '2020-01-01 09:30:00'`,
+`'09:30:00't` -> a time value or an interval, depending on use. Never leave
+the SAS spelling quoted — `'01JAN2020'` compared against a `DATE` column is a
+string-vs-date comparison that ANSI mode rejects outright.
+
+**Extractors** are one-to-one: `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND`
+-> `year`/`month`/`day`/`hour`/`minute`/`second`, `QTR` -> `quarter`,
+`DATEPART(dt)` -> `CAST(dt AS DATE)`, `TIMEPART(dt)` -> `DATE_FORMAT(dt,
+'HH:mm:ss')`. Constructors: `MDY(m,d,y)` -> `make_date(y, m, d)` (⚠️ **reversed
+argument order**), `DHMS(d,h,m,s)` -> `make_timestamp(...)` or the epoch
+arithmetic above, `HMS(h,m,s)` -> `make_interval(0,0,0,0,h,m,s)`.
+
+⚠️ **`WEEKDAY` maps to `dayofweek`, not `weekday`.** SAS `WEEKDAY()` returns
+1=Sunday … 7=Saturday. Spark's `dayofweek` uses exactly that numbering;
+Spark's similarly-named `weekday` returns 0=Monday … 6=Sunday. Reaching for
+the name-alike shifts every value and changes which rows a weekend filter
+selects.
+
+⚠️ `HOLIDAY`, `HOLIDAYCK`, and `HOLIDAYCOUNT` read SAS's built-in holiday
+calendar, which **has no Spark equivalent**. Emit the non-convertible marker
+and translate against an explicit calendar/holiday lookup table joined into
+the query — never approximate a holiday as "not a weekend".
 
 ## [when: function:intnx] INTNX -> date arithmetic
 `INTNX('interval', start, n, 'alignment')` advances a date/datetime by `n`
@@ -20,13 +55,21 @@ interval), so `INTNX('MONTH', d, 1)` returns the first of next month, not
 `d + 1 month`. Reproduce alignment explicitly with `TRUNC(..., 'MM')`,
 `LAST_DAY(...)`, etc. Do not translate `INTNX` as a plain `DATE_ADD` of days.
 
+⚠️ **`TRUNC` is date-only.** `TRUNC(d, 'MM')` takes a `DATE`. For a
+`TIMESTAMP` the function is `DATE_TRUNC('MONTH', ts)` — a different name *and*
+the **reverse argument order** (unit first). Mixing them up is a silent type
+error at best.
+
 ## [when: function:intck] INTCK -> date difference
 `INTCK('interval', from, to)` counts interval *boundaries* crossed, not
-elapsed units. `INTCK('MONTH', a, b)` -> `MONTHS_BETWEEN(TRUNC(b,'MM'),
-TRUNC(a,'MM'))` (integer), `INTCK('DAY', a, b)` -> `DATEDIFF(b, a)`,
-`INTCK('YEAR', a, b)` -> difference of `YEAR()` parts. ⚠️ Because it counts
-boundaries, `INTCK('MONTH','31JAN','01FEB')` is 1, not ~0 — do not
-substitute a fractional `MONTHS_BETWEEN` without `TRUNC`.
+elapsed units. ⚠️ Because it counts boundaries, `INTCK('MONTH','31JAN','01FEB')`
+is 1, not ~0 — never substitute a bare `MONTHS_BETWEEN`.
+- `INTCK('DAY', a, b)` -> `DATEDIFF(b, a)`.
+- `INTCK('MONTH', a, b)` -> `CAST(MONTHS_BETWEEN(TRUNC(b,'MM'),
+  TRUNC(a,'MM')) AS INT)`. ⚠️ `MONTHS_BETWEEN` returns a **DOUBLE**; without
+  the cast the result is `1.0`, not `1`, and any downstream integer comparison
+  or join key drifts.
+- `INTCK('YEAR', a, b)` -> `YEAR(b) - YEAR(a)`.
 
 ## [when: function:today, function:date, function:datetime] Current date/time
 `TODAY()`/`DATE()` -> `CURRENT_DATE()`; `DATETIME()` -> `CURRENT_TIMESTAMP()`;
@@ -40,3 +83,10 @@ extraction. Note these are evaluated per query in Spark.
 to a date; map to `TO_DATE(str, 'yyyy-MM-dd')` / `TO_TIMESTAMP(...)`. The
 SAS informat/format name determines the pattern — translate the specific
 width and layout, not a generic default.
+
+⚠️ **Parsing is strict** — since Spark 3.0 these use the Java
+`DateTimeFormatter`, so `TRY_TO_DATE` / `TRY_TO_TIMESTAMP` are the faithful
+form for the same reason `TRY_CAST` is (see the non-date `PUT`/`INPUT`
+guidance). Pattern `yyyy` is *year-of-era* and `uuuu` is *proleptic year*;
+they differ only before 1 CE, but `uuuu` is safer for a pattern used to both
+parse and format.

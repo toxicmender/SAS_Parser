@@ -14,8 +14,37 @@ almost directly, then adjust for these differences:
 - `monotonic()`/`number()`-style row numbering maps to
   `ROW_NUMBER() OVER (ORDER BY ...)`; an unordered SAS row counter has no
   faithful Spark equivalent — call that out.
+- Filtering on a window function is `QUALIFY`, which runs after the window is
+  computed: `SELECT ... QUALIFY ROW_NUMBER() OVER (PARTITION BY k ORDER BY d) = 1`.
+  Prefer it to the CTE-plus-`WHERE rn = 1` wrapper — same result, one level of
+  nesting fewer. (`WHERE` cannot see a window function; that is what `QUALIFY`
+  exists for.)
+- `CREATE VIEW` (and a DATA step's `/ VIEW=` option) defines a stored query,
+  not a table: map it to `CREATE OR REPLACE TEMP VIEW`. Keep it a view —
+  materialising it into a table changes when the query runs and what it sees.
 
-## MERGE and BY-group joins
+## [when: statement:update, statement:modify] UPDATE / MODIFY are upserts
+⚠️ A SAS `UPDATE master transaction; BY key;` (and `MODIFY`) is **not** the
+same construct as `MERGE`: it applies a transaction dataset onto a master,
+replacing matched values and — for `UPDATE` — leaving a column untouched where
+the transaction's value is *missing*. That is an upsert:
+
+```sql
+MERGE INTO master AS m
+USING txn AS t ON m.key = t.key
+WHEN MATCHED THEN UPDATE SET
+  m.amt  = COALESCE(t.amt,  m.amt),   -- missing in txn leaves master's value
+  m.name = COALESCE(t.name, m.name)
+WHEN NOT MATCHED THEN INSERT *;
+```
+
+⚠️ The `COALESCE` is the point: a plain `UPDATE SET *` overwrites a master
+value with the transaction's missing one, silently wiping data SAS would have
+kept. `MODIFY` additionally updates in place without rewriting unmatched rows,
+so drop the `WHEN NOT MATCHED` branch unless the SAS adds observations. The
+target must be a table, not a view.
+
+## [when: statement:merge] MERGE and BY-group joins
 A SAS `DATA` step `MERGE a b; BY key;` is a full outer join on `key`, not an
 inner join — unmatched rows from either side are kept. Translate to
 `FULL OUTER JOIN ... USING (key)` (or `LEFT`/`INNER` only when `IF a` / `IF
@@ -26,7 +55,7 @@ kept. A `MERGE` without `BY` is positional (one-to-one by row position) and
 has no correct Spark SQL translation — flag it as unsafe rather than
 guessing.
 
-## BY-group processing (FIRST./LAST.)
+## [when: statement:by] [kind: DATA_STEP] BY-group processing (FIRST./LAST.)
 `FIRST.var` / `LAST.var` flags map to window functions over
 `PARTITION BY <by-vars> ORDER BY <by-vars>`: `FIRST.x` is
 `ROW_NUMBER() = 1`, `LAST.x` is `ROW_NUMBER() OVER (... ORDER BY ... DESC) =
@@ -34,18 +63,38 @@ guessing.
 accumulators across a BY group become `SUM(...) OVER (PARTITION BY ... ORDER
 BY ...)`.
 
-## [when: proc:means, proc:summary] Summary statistics
+## [when: proc:means, proc:summary] [kind: PROC_STEP] Summary statistics
 `PROC MEANS` / `PROC SUMMARY` map to `GROUP BY` with aggregate functions
 (`AVG`, `SUM`, `MIN`, `MAX`, `COUNT`, `STDDEV`). The `CLASS` variables are
-the `GROUP BY` keys; `VAR` variables are the aggregated columns; a `TYPES` /
-`WAYS` request for multiple subtotal levels maps to `GROUPING SETS`,
-`ROLLUP`, or `CUBE`. Remember Spark aggregates skip `NULL`, so `N` vs
-`NMISS` must be `COUNT(col)` vs `SUM(CASE WHEN col IS NULL THEN 1 ELSE 0
-END)`.
+the `GROUP BY` keys; `VAR` variables are the aggregated columns. Remember
+Spark aggregates skip `NULL`, so `N` vs `NMISS` must be `COUNT(col)` vs
+`SUM(CASE WHEN col IS NULL THEN 1 ELSE 0 END)`.
+
+⚠️ **Subtotals are opt-in, and the default is the trap.** Without `NWAY`, SAS
+emits *every* combination of CLASS levels — the grand total (`_TYPE_=0`),
+each one-way margin, and so on — and a plain `GROUP BY` reproduces only the
+last of those. So: `NWAY` -> a plain `GROUP BY` on all CLASS variables (the
+common case); a `TYPES` / `WAYS` request -> `GROUPING SETS` / `ROLLUP` /
+`CUBE` naming exactly the requested levels. Never add a `ROLLUP` the SAS did
+not ask for, and where the source relies on `_TYPE_` or `_FREQ_`, reproduce
+them explicitly (`GROUPING_ID()` and `COUNT(*)`).
+
+⚠️ **`MISSING`**: by default `PROC MEANS` drops observations whose CLASS
+variable is missing, while Spark `GROUP BY` keeps `NULL` as a group. Add
+`WHERE <class vars> IS NOT NULL` unless the SAS specifies `MISSING`.
+
+`OUTPUT OUT=` names the result dataset, and its `stat=name` options name the
+columns — alias every aggregate to the SAS output variable name exactly, so a
+later step reading `mean_amt` still finds it.
 
 ## [when: proc:transpose] PROC TRANSPOSE
-Long-to-wide maps to conditional aggregation (`MAX(CASE WHEN key = 'x' THEN
-value END)`) or Spark's `PIVOT` clause; wide-to-long maps to `STACK(...)` or
-a `UNION ALL` of column selections. Preserve the `ID`, `VAR`, and `BY`
-roles: `BY` -> `GROUP BY`, `ID` -> the pivot key, `VAR` -> the pivoted
-value.
+Long-to-wide is the `PIVOT` clause (or conditional aggregation,
+`MAX(CASE WHEN key = 'x' THEN value END)`, when the key list is dynamic);
+wide-to-long is the `UNPIVOT` clause. Preserve the `ID`, `VAR`, and `BY`
+roles: `BY` -> `GROUP BY`, `ID` -> the pivot key, `VAR` -> the pivoted value.
+
+⚠️ `PIVOT` needs its column list stated in the query, while `PROC TRANSPOSE`
+discovers it from the data. Where the SAS relies on that discovery, the column
+set becomes fixed at translation time — say so, and name the values assumed.
+`UNPIVOT` excludes NULLs by default, which `PROC TRANSPOSE` does not; add
+`INCLUDE NULLS` to match.

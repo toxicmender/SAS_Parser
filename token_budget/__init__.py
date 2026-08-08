@@ -1,5 +1,15 @@
-"""Shared tiktoken-backed token estimation. A leaf module — imports nothing
-from the repo and nothing from langchain (messages are duck-typed).
+"""Shared tiktoken-backed token estimation — how many tokens a piece of text
+will cost, in one place.
+
+A **leaf package**: imports nothing from the repo and nothing from langchain
+(messages are duck-typed). That is the whole reason it is a package rather than
+a module inside ``llm_client``. Everything that budgets prompt space needs to
+count tokens — ``llm_client`` for its input budget, ``pipeline`` for batch
+packing, ``prompt_builder`` for the retrieval budget — but importing
+``llm_client.tokens`` executes ``llm_client/__init__.py``, which pulls in
+langchain: measured at 7.5s and 1,642 modules, in packages that are otherwise
+langchain-free and deliberately so. Same reasoning that made
+``target_language`` its own package.
 
 One vocabulary question, answered in one place: which encoding estimates
 tokens for a given gateway model id. Resolution is by explicit prefix map —
@@ -21,7 +31,7 @@ proxy — every counter here degrades to the ~4-chars/token approximation with
 a one-time WARNING per encoding, and the failure is cached so later calls do
 not re-pay the fetch attempt.
 
-Logger name: ``llm_client.tokens``.
+Logger name: ``token_budget``.
 """
 
 from __future__ import annotations
