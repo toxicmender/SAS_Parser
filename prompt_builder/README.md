@@ -514,6 +514,10 @@ instructions/
     ingest.md          PROC IMPORT/EXPORT, INFILE/INPUT -> COPY INTO
     proc_freq.md       PROC FREQ
     proc_univariate.md PROC UNIVARIATE
+    proc_rank.md       PROC RANK / PROC STANDARD
+    proc_compare.md    PROC COMPARE as a reconciliation query
+    catalog_ops.md     DATASETS / DELETE / COPY / CONTENTS -> DDL and catalog
+    reporting.md       PRINT / REPORT / TABULATE (OUT= only), FEDSQL
     orchestration.md   [topic] SAS step sequence as a job DAG
     macros.md          macro variables, SYMPUT, macro decomposition
     examples.md        worked SAS -> Spark SQL pairs
