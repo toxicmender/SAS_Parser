@@ -99,6 +99,12 @@ For running the work items end-to-end through an LLM, see the
 | `_repl.py` | `print_iterable` REPL helper (imported by nothing). |
 | `pipeline.py`, `pipeline_constants.py`, `response_models.py`, `notebook.py` | **Deprecated shims** re-exporting from the top-level `pipeline` package, where these modules now live. |
 
+> **Budgets here stay in words.** `sas_chunker.min_words`/`max_words` size SAS
+> *source* into semantic units — a question about where a step ends, not about
+> what a prompt costs. `prompt_builder` budgets in tokens because it is filling
+> a prompt; `chunker.batcher` then packs these units by token cost
+> (`pipeline.max_merged_tokens`) on top. Two different questions, two units.
+
 **Import direction is strictly downward:** `keywords` and `models` import
 nothing from the package; `scanner` and `metadata` import from them; `chunker.py`
 imports from all four; `batcher` imports from `keywords`, `metadata`, `models`.

@@ -175,10 +175,11 @@ class PromptBuilder:
         Maximum topical (ranked) chunks per item. ``None`` (default) reads
         ``prompt_builder.top_k`` from config.json, falling back to 6 (see
         the ``app_config`` package).
-    max_instruction_words : int | None
-        Word budget for the whole guidance block. ``None`` reads
-        ``prompt_builder.max_instruction_words``, falling back to 1500.
-        Keep this >= the instruction chunker's ``max_words`` so any single
+    max_instruction_tokens : int | None
+        Token budget for the whole guidance block — the same currency the
+        prompt is priced in. ``None`` reads
+        ``prompt_builder.max_instruction_tokens``, falling back to 8000.
+        Keep this >= the instruction chunker's ``max_tokens`` so any single
         reference section always fits.
     pinned_sections : Iterable[str]
         Section-path substrings always injected first.
@@ -220,9 +221,9 @@ class PromptBuilder:
         chunks: Iterable[InstructionChunk],
         *,
         user_instructions: "str | UserInstructionSet | None" = None,
-        user_max_words: int | None = None,
+        user_max_tokens: int | None = None,
         top_k: int | None = None,
-        max_instruction_words: int | None = None,
+        max_instruction_tokens: int | None = None,
         pinned_sections: Iterable[str] = (),
         embeddings: Any | None = None,
         embedding_cache_path: str | None = None,
@@ -238,12 +239,12 @@ class PromptBuilder:
         examples_heading: str = "Worked examples",
     ) -> None:
         self.top_k = app_config.resolve(top_k, "prompt_builder", "top_k", 6)
-        self.max_instruction_words = app_config.resolve(
-            max_instruction_words, "prompt_builder", "max_instruction_words", 1500
+        self.max_instruction_tokens = app_config.resolve(
+            max_instruction_tokens, "prompt_builder", "max_instruction_tokens", 8000
         )
         # None default keeps user chunks limited only by the overall budget.
-        self.user_max_words = app_config.resolve(
-            user_max_words, "user_instructions", "max_words", None
+        self.user_max_tokens = app_config.resolve(
+            user_max_tokens, "user_instructions", "max_tokens", None
         )
         self.focus_hints = app_config.resolve(
             focus_hints, "prompt_builder", "focus_hints", True
@@ -272,7 +273,7 @@ class PromptBuilder:
         self._selector = InstructionSelector(
             chunks,
             user_instructions=user_instructions,
-            user_max_words=self.user_max_words,
+            user_max_tokens=self.user_max_tokens,
             embeddings=embeddings,
             embedding_cache_path=embedding_cache_path,
             rrf_k=rrf_k,
@@ -291,9 +292,9 @@ class PromptBuilder:
         return PromptBuilder(
             self._selector.reference_chunks,
             user_instructions=user_instructions,
-            user_max_words=self.user_max_words,
+            user_max_tokens=self.user_max_tokens,
             top_k=self.top_k,
-            max_instruction_words=self.max_instruction_words,
+            max_instruction_tokens=self.max_instruction_tokens,
             pinned_sections=self._pinned_sections,
             embeddings=self._embeddings,
             embedding_cache_path=self._embedding_cache_path,
@@ -330,11 +331,11 @@ class PromptBuilder:
         builder = cls(chunks, pinned_sections=pins, **kwargs)
         # A budget below the chunker's window size silently drops whole
         # construct hits — the known misconfiguration; warn loudly.
-        if builder.max_instruction_words < loader.chunker.max_words:
+        if builder.max_instruction_tokens < loader.chunker.max_tokens:
             logger.warning(
-                f"from_specs: max_instruction_words="
-                f"{builder.max_instruction_words} is below the chunker's "
-                f"max_words={loader.chunker.max_words}; single reference "
+                f"from_specs: max_instruction_tokens="
+                f"{builder.max_instruction_tokens} is below the chunker's "
+                f"max_tokens={loader.chunker.max_tokens}; single reference "
                 f"sections may not fit the budget and will be dropped whole"
             )
         return builder
@@ -389,7 +390,7 @@ class PromptBuilder:
         return self._selector.select_detailed(
             query,
             list(constructs),
-            max_words=self.max_instruction_words,
+            max_tokens=self.max_instruction_tokens,
             top_k=self.top_k,
             language=language,
             kinds=kinds,

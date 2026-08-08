@@ -46,7 +46,7 @@ from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 from langchain_openai import ChatOpenAI
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, SecretStr
 
-from . import tokens
+import token_budget as tokens
 
 logger = logging.getLogger(__name__)
 

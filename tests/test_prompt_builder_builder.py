@@ -97,7 +97,7 @@ def test_pinned_section_appears_in_block():
     assert "Output Format" in block
 
 
-def test_max_instruction_words_caps_block():
+def test_max_instruction_tokens_caps_block():
     big = [
         _chunk("c0", "Funcs > A", " ".join(f"w{i}" for i in range(400)), keys=[INTNX]),
         _chunk(
@@ -107,9 +107,10 @@ def test_max_instruction_words_caps_block():
             keys=[ConstructKey(kind="function", name="b")],
         ),
     ]
-    pb = PromptBuilder(big, max_instruction_words=420)
+    # Each 400-word chunk of synthetic tokens is ~800 tokens, so a 900-token
+    # budget admits the first and drops the second whole.
+    pb = PromptBuilder(big, max_instruction_tokens=900)
     block = _built(pb.build("w1 w2", [INTNX, ConstructKey(kind="function", name="b")]))
-    # Only the first ~400-word chunk fits the 420 budget.
     assert "Funcs > A" in block
     assert "Funcs > B" not in block
 
@@ -521,3 +522,38 @@ def test_a_key_absent_from_the_map_is_not_labelled():
     )
     assert "[]" not in block
     assert "### Date shifting\n" in block
+
+
+# ---------------------------------------------------------------------------
+# Dependency boundary — why token_budget is its own package
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_builder_does_not_import_llm_client():
+    """The budget is counted in tokens, but not at the cost of this import.
+
+    `token_budget` was extracted from `llm_client` precisely so this package
+    could count tokens: importing `llm_client.tokens` executes
+    `llm_client/__init__.py`, which pulls in the chat-model stack — measured at
+    ~7.5s and ~1,600 modules against ~0.1s and ~80 for the leaf. Note the
+    assertion is about `llm_client`, not langchain: `memory.relevance` already
+    brings in `langchain_core`, so a blanket "no langchain" claim would be
+    false.
+    """
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys, prompt_builder; "
+        "print('llm_client' in sys.modules, "
+        "'langchain_openai' in sys.modules, "
+        "'token_budget' in sys.modules)"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        cwd=str(pathlib.Path(__file__).resolve().parents[1]),
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["False", "False", "True"], out.stdout

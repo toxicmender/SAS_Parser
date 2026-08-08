@@ -550,7 +550,7 @@ def test_no_budget_means_counter_never_runs():
 def test_counter_failure_falls_back_to_chars_over_four(monkeypatch):
     # An unloadable encoding (offline, blocking proxy) degrades to chars//4
     # plus the per-message framing constants, and the call still goes out.
-    from llm_client import tokens as tokens_mod
+    import token_budget as tokens_mod
 
     monkeypatch.setattr(tokens_mod, "_encoding", lambda name: None)
     client = LLMClient(

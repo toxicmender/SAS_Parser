@@ -127,8 +127,10 @@ chain = prompt | client.as_runnable()
   injected `llm`.
 - **Input-token budget**: when `max_input_tokens` is set, the prompt is counted
   before the call and `InputTokenLimitError` is raised instead of sending an
-  over-budget request. Counting is client-owned, via the shared tiktoken
-  counter in `llm_client.tokens`: the encoding resolves from the model id by
+  over-budget request. Counting lives in the leaf **`token_budget`** package
+  (moved out of here so `prompt_builder`, which must stay free of this
+  package's langchain imports, can budget in the same currency — see
+  `token_budget/README.md`): the encoding resolves from the model id by
   an explicit prefix map — `o200k_base` for the modern GPT families **and**
   for every non-OpenAI id (Claude, Gemini: a real tokenizer run under a
   stand-in vocabulary — an *estimate*, not that provider's own tokenization,

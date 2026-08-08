@@ -63,8 +63,10 @@ EMITTABLE_MACRO_STATEMENTS = frozenset({"goto", "abort"})
 
 # Ceiling on rules injected into *every* item regardless of content. Guidance
 # that applies to everything is guidance the budget pays for every time, so it
-# stays small; anything larger belongs behind a scope.
-MAX_UNCONDITIONAL_WORDS = 450
+# stays small; anything larger belongs behind a scope. Counted in tokens, the
+# currency the budget is spent in — this set runs ~1.7 tokens per word, so a
+# word ceiling would have been reading ~40% low.
+MAX_UNCONDITIONAL_TOKENS = 750
 
 # Ceiling on `[topic]` sections. They are not construct-gated — they are ranked
 # against the reference corpus — so in the *shipped* configuration, where the
@@ -72,7 +74,7 @@ MAX_UNCONDITIONAL_WORDS = 450
 # section has nothing to lose to and is retrieved for every item. It is charged
 # like an unconditional rule while looking scoped, which is exactly why it needs
 # a ceiling of its own rather than being trusted to the ranker.
-MAX_TOPICAL_WORDS = 250
+MAX_TOPICAL_TOKENS = 320
 
 
 @pytest.fixture(scope="module")
@@ -89,8 +91,8 @@ def _unconditional(chunk) -> bool:
     )
 
 
-def _words(chunks) -> int:
-    return sum(len(c.text.split()) for c in chunks)
+def _tokens(chunks) -> int:
+    return sum(c.token_count for c in chunks)
 
 
 def test_bundled_set_is_non_empty(bundled):
@@ -213,14 +215,14 @@ def test_language_scoped_sections_name_a_known_target(bundled):
 def test_unconditional_tier_stays_within_budget(bundled):
     """Always-on rules are charged to every item; keep the tier small."""
     unconditional = [c for c in bundled.chunks if _unconditional(c)]
-    total = _words(unconditional)
+    total = _tokens(unconditional)
     breakdown = sorted(
-        ((len(c.text.split()), c.section_path) for c in unconditional),
+        ((c.token_count, c.section_path) for c in unconditional),
         reverse=True,
     )
-    assert total <= MAX_UNCONDITIONAL_WORDS, (
-        f"unconditional instructions total {total} words "
-        f"(ceiling {MAX_UNCONDITIONAL_WORDS}); scope one of these behind a "
+    assert total <= MAX_UNCONDITIONAL_TOKENS, (
+        f"unconditional instructions total {total} tokens "
+        f"(ceiling {MAX_UNCONDITIONAL_TOKENS}); scope one of these behind a "
         f"[when:]/[category:]/[kind:] directive: {breakdown}"
     )
 
@@ -235,13 +237,13 @@ def test_topical_tier_stays_within_budget(bundled):
     separately, because the unconditional check cannot see it.
     """
     topical = [c for c in bundled.chunks if scope_of(c) == SCOPE_TOPIC]
-    total = _words(topical)
+    total = _tokens(topical)
     breakdown = sorted(
-        ((len(c.text.split()), c.section_path) for c in topical), reverse=True
+        ((c.token_count, c.section_path) for c in topical), reverse=True
     )
-    assert total <= MAX_TOPICAL_WORDS, (
-        f"[topic] instructions total {total} words (ceiling "
-        f"{MAX_TOPICAL_WORDS}). With no reference corpus these are retrieved "
+    assert total <= MAX_TOPICAL_TOKENS, (
+        f"[topic] instructions total {total} tokens (ceiling "
+        f"{MAX_TOPICAL_TOKENS}). With no reference corpus these are retrieved "
         f"for every item, so they cost what an always-on rule costs: {breakdown}"
     )
 
@@ -254,10 +256,10 @@ def test_guidance_charged_to_every_item_is_bounded(bundled):
         for c in bundled.chunks
         if _unconditional(c) or scope_of(c) == SCOPE_TOPIC
     ]
-    total = _words(always_charged)
-    ceiling = MAX_UNCONDITIONAL_WORDS + MAX_TOPICAL_WORDS
+    total = _tokens(always_charged)
+    ceiling = MAX_UNCONDITIONAL_TOKENS + MAX_TOPICAL_TOKENS
     assert total <= ceiling, (
-        f"{total} words reach every item regardless of its constructs "
+        f"{total} tokens reach every item regardless of its constructs "
         f"(ceiling {ceiling})"
     )
 

@@ -71,6 +71,7 @@ from pathlib import Path
 from typing import Callable, Iterable, NamedTuple
 
 import app_config
+import token_budget
 from pydantic import BaseModel, Field
 from target_language import normalize_language as _normalize_language
 
@@ -267,17 +268,22 @@ class UserInstructionSet(BaseModel):
             scope, clean_title, keys = parsed.scope, parsed.title, parsed.keys
             kinds, metas = parsed.kinds, parsed.metas
             section_langs = parsed.langs or fallback_langs
+            text = f"{clean_title}\n\n{body.strip()}"
             chunks.append(
                 InstructionChunk(
                     chunk_id=f"{doc_id}::c{len(chunks):04d}",
                     doc_id=doc_id,
                     section_path=clean_title,
-                    text=f"{clean_title}\n\n{body.strip()}",
+                    text=text,
                     page_start=0,
                     page_end=0,
                     role=DocRole.USER_INSTRUCTION,
                     construct_keys=keys,
                     tags=_section_tags(scope, section_langs, kinds, metas),
+                    # Counted here like a reference chunk, so the selector
+                    # budgets both kinds in one currency. An operator set is
+                    # small, so this is not the corpus's 3.9s — it is instant.
+                    token_count=token_budget.count_text(text),
                 )
             )
 

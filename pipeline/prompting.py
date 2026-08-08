@@ -28,7 +28,7 @@ from chunker.models import (
     SasChunk,
     SasDiagnostic,
 )
-from llm_client import tokens
+import token_budget as tokens
 from prompt_builder import ConstructKey
 
 from .constants import (

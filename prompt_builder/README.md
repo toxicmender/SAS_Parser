@@ -6,8 +6,17 @@ guidance relevant to *each* batch/singleton it sends the LLM — targeted per
 item instead of one bloated static system prompt.
 
 The package imports nothing from `chunker` or `llm_client`; it reuses
-`memory.relevance.HybridRanker` for retrieval. `pipeline.engine` remains the
-sole integration point.
+`memory.relevance.HybridRanker` for retrieval and the leaf `token_budget` for
+counting. `pipeline.engine` remains the sole integration point.
+
+Budgets here are **tokens**, the currency the prompt is priced in. Words were
+a stand-in and a poor one: over the bundled corpus the tokens-per-word ratio
+runs 1.01 to 4.41 (median 1.44), and for the SQL-heavy instruction set it is
+1.72 — so a word budget believed it had ~40% more room than it did, and
+dropped chunks later and less predictably than its numbers suggested. Counting
+lives in `token_budget` rather than `llm_client.tokens` because importing the
+latter executes `llm_client/__init__.py` and drags in langchain (7.5s, 1,642
+modules) — see `token_budget/README.md`.
 
 > **Status:** complete. The pipeline injects per-item reference guidance when a
 > `PromptBuilder` is passed to `SasLLMPipeline(prompt_builder=...)`.
@@ -19,7 +28,7 @@ models.py            InstructionDiagnostic, ConstructKey, DocSection,
                      InstructionDoc, InstructionChunk, SelectedInstruction
                      (+ DocRole / ExtractionStrategy / SelectionTier)
 pdf_reader.py        PdfReader — PDF -> list[DocSection], two strategies
-doc_chunker.py       InstructionChunker — DocSection -> word-budgeted InstructionChunk
+doc_chunker.py       InstructionChunker — DocSection -> token-budgeted InstructionChunk
 catalog.py           DocumentSpec + default_catalog + CorpusLoader (on-disk cache)
 selector.py          InstructionSelector — construct lookup + HybridRanker retrieval
 builder.py           PromptBuilder facade: read -> chunk -> index -> build(query)
@@ -133,29 +142,31 @@ a clean text layer.
 
 ## InstructionChunker
 
-Turns reader sections into retrieval-ready `InstructionChunk`s under a word
-budget:
+Turns reader sections into retrieval-ready `InstructionChunk`s under a token
+budget, and records each chunk's `token_count` so the selector never has to
+re-tokenise the corpus (counting it costs ~3.9s against ~0.18s for words, and
+rides the on-disk cache):
 
 ```python
 from prompt_builder.doc_chunker import InstructionChunker
 
-chunks = InstructionChunker(min_words=120, max_words=900, overlap_words=60).chunk(
+chunks = InstructionChunker(min_tokens=175, max_tokens=1300, overlap_tokens=90).chunk(
     sections, role=summary.role
 )
 ```
 
 - **Merge.** Consecutive sections under the *same parent heading* whose combined
-  text is below `min_words` merge into one chunk (SAS function dictionaries have
+  text is below `min_tokens` merge into one chunk (SAS function dictionaries have
   the odd one-line entry). The merged chunk collapses to the shared parent
   breadcrumb and aggregates every member's construct key; a section that already
-  meets `min_words` stands alone.
-- **Split.** A chunk over `max_words` splits into overlapping windows at
+  meets `min_tokens` stands alone.
+- **Split.** A chunk over `max_tokens` splits into overlapping windows at
   paragraph boundaries (a single over-long paragraph is hard-split on word
-  count). Unlike the SAS chunker there is no parent/child pair — the LLM only
+  boundaries, stepped by its own token density). Unlike the SAS chunker there is no parent/child pair — the LLM only
   ever sees the retrieved window, so plain windows suffice.
 - **Breadcrumb prefix.** Every chunk's stored text is prefixed with its section
   breadcrumb, so heading terms ("MERGE", "INTNX") weigh on retrieval even when
-  the prose below never repeats them. The word budget governs the section
+  the prose below never repeats them. The token budget governs the section
   *body*; the small breadcrumb prefix sits on top of it (the hard token cap is
   `llm_client`'s job at prompt time).
 
@@ -216,7 +227,7 @@ sel = InstructionSelector(chunks, pinned_sections=["Output Format"])
 picks = sel.select(
     query="advance a date to the next month interval",
     constructs=[ConstructKey(kind="function", name="intnx")],
-    max_words=1500,
+    max_tokens=8000,
     top_k=6,
 )
 ```
@@ -230,7 +241,7 @@ picks = sel.select(
    over the whole chunk corpus surfaces guidance no title lookup can find —
    target-platform sections keyed off the free-text query.
 
-Results fill `max_words` in priority order — **pinned → hazard constructs →
+Results fill `max_tokens` in priority order — **pinned → hazard constructs →
 other constructs → topical** (at most `top_k` topical chunks) — dropping whole
 chunks at the tail, never truncating. Nothing relevant yields an empty list, so
 the caller emits no guidance block (irrelevant reference pages are worse than
@@ -346,7 +357,7 @@ construct and topic lines come from the selection, so they are already
 stop-list-filtered and budget-bounded. The block is skipped when there is
 nothing to hint at (e.g. a pinned-only selection), and `focus_hints=False`
 (or config.json `prompt_builder.focus_hints`) disables it entirely. Hint
-lines are small and sit outside the word budget, like breadcrumb prefixes.
+lines are small and sit outside the token budget, like breadcrumb prefixes.
 
 ### Reasoning directives (conditional chain-of-thought)
 
@@ -363,7 +374,7 @@ the pipeline's system prompt, which scaffolds every response as
 **Analysis → Mapping → Translation → Risks** and scopes conciseness to the
 final sections so reasoning isn't suppressed.
 
-Keep `max_instruction_words` ≥ the chunker's `max_words` (default 1500 ≥ 900)
+Keep `max_instruction_tokens` ≥ the chunker's `max_tokens` (default 8000 ≥ 1300)
 so any single reference section always fits — the budget then limits only the
 *number* of chunks, dropping whole chunks at the tail, never a lone construct
 hit; `from_specs` logs a WARNING when the budget is misconfigured below the
@@ -372,8 +383,8 @@ its SAS metadata (`pipeline.prompting._query_for_item` / `_constructs_for_item`)
 — that mapping lives in the pipeline, not here, so this package imports no
 `chunker`.
 
-`top_k` and `max_instruction_words` default from `config.json`
-(`prompt_builder.*`), as do the chunkers' word budgets — see the `app_config`
+`top_k` and `max_instruction_tokens` default from `config.json`
+(`prompt_builder.*`), as do the chunker's token budgets — see the `app_config`
 package: explicit argument > config.json > hard default.
 
 ## User instructions
@@ -589,27 +600,32 @@ naming the function the item actually calls, so it yields to it — otherwise a
 handful of broad notes fill the budget and the precise guidance, the reason
 the item retrieved anything at all, is what gets dropped.
 
-`user_instructions.max_words` (config or the `user_max_words` argument)
+`user_instructions.max_tokens` (config or the `user_max_tokens` argument)
 additionally caps the user chunks (rules and examples together) inside the
 overall budget.
 
 **Budget the two together, and size them for your items.** The bundled
-SparkSQL set is ~6,700 words, so what fits matters. Measured against it:
+SparkSQL set is ~17.9k tokens, so what fits matters. Measured over a 70-line
+reference program that batches into two items:
 
-| Item | `max_instruction_words` | Words drawn | Rules delivered |
-|---|---|---|---|
-| Single DATA step | 1500 | 1034 | 4 of 5 |
-| Single DATA step | **4000** | 1442 | 5 of 5 |
-| Batch (macro + PROC SQL + DATA step + PROC SORT) | 1500 | 1035 | 2 of 7 |
-| Batch | **4000** | 2769 | 7 of 7 |
+| `max_instruction_tokens` / `max_tokens` | Tokens drawn | Matched rules dropped |
+|---|---|---|
+| 4000 / 2800 | 5,419 | 14 |
+| **8000 / 5600** *(shipped)* | 8,250 | **7** |
+| 10000 / 7000 | 9,679 | 4 |
+| 14000 / 9800 | 12,368 | **0** |
 
-config.json ships 4000 with `max_words` 2800. **It is a ceiling, not a cost
-floor.** Every section is scoped to a construct, statement, or function family
-the item actually uses, so the single DATA step draws 1442 words however high
-the budget goes — raising it buys nothing for simple items and completeness
-for complex ones. Only a genuinely broad batch reaches the cap.
+⚠️ The shipped 8000 is an interim value and is **measured short** — it still
+drops 7 rules those items' constructs matched. Zero needs 14000/9800, past
+which the items draw 12.4k tokens and more budget buys nothing. Raising it is a
+per-item cost decision, so it is documented rather than simply set.
 
-Leaving `max_words` null is not the cheaper alternative: uncapped operator
+**It is a ceiling, not a cost floor.** Every section is scoped to a construct,
+statement, or function family the item actually uses, so a simple DATA step
+draws far less however high the budget goes — raising it buys nothing for
+simple items and completeness for complex ones.
+
+Leaving `max_tokens` null is not the cheaper alternative: uncapped operator
 rules simply take the whole budget and starve reference retrieval. Selected rules render in a `## Project instructions` block
 above the reference guidance, with the operator's own headings and no page
 citations; selected examples render in a `## Worked examples` block placed

@@ -54,7 +54,8 @@ from chunker.models import (
     SasCorpus,
     SasDiagnostic,
 )
-from llm_client import LLMClient, LLMClientConfig, TokenUsage, tokens
+import token_budget as tokens
+from llm_client import LLMClient, LLMClientConfig, TokenUsage
 from memory.extractor import MemoryExtractor
 from memory.policy import TaskPolicy
 from memory.thread_mem import ThreadMemory
@@ -84,7 +85,7 @@ logger = logging.getLogger(__name__)
 # hard default assumes a modern long-context model (the gpt-5.4 default) and
 # packs aggressively; tighten it via pipeline.max_merged_tokens if per-item
 # answer quality drops. The headrooms mirror what shares the request with
-# the item text — retrieved guidance (prompt_builder's max_instruction_words
+# the item text — retrieved guidance (prompt_builder's max_instruction_tokens
 # default, ~1.3 tokens/word) and the window_k history.
 _DEFAULT_MAX_MERGED_TOKENS = 64_000
 _PACKING_GUIDANCE_HEADROOM_TOKENS = 2_000

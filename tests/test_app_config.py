@@ -125,16 +125,16 @@ def test_repo_config_json_matches_code_defaults():
     )
     assert repo_cfg["sas_chunker"] == {"min_words": 300, "max_words": 700}
     assert repo_cfg["instruction_chunker"] == {
-        "min_words": 120,
-        "max_words": 900,
-        "overlap_words": 60,
+        "min_tokens": 175,
+        "max_tokens": 1300,
+        "overlap_tokens": 90,
     }
     # Sized for the bundled instruction set enabled below, not the code
     # default: at 1500 a dependency batch received 2 of the 7 rules its
     # constructs matched, silently dropping silent-error guidance.
     assert repo_cfg["prompt_builder"] == {
         "top_k": 6,
-        "max_instruction_words": 4000,
+        "max_instruction_tokens": 8000,
         "focus_hints": None,  # null = unset -> code default (True)
         "reasoning_directives": None,  # null = unset -> code default (True)
     }
@@ -164,13 +164,13 @@ def test_repo_config_json_matches_code_defaults():
     }
     # The one section that ships non-null: the bundled SparkSQL instruction
     # set is on by default. It is scoped [lang: sparksql], so it is inert
-    # under any other output_language, and `max_words` is set with it so
+    # under any other output_language, and `max_tokens` is set with it so
     # operator rules cannot consume the whole retrieval budget and starve the
     # reference corpus.
     assert repo_cfg["user_instructions"] == {
         "path": None,
         "dir": "prompt_builder/instructions",
-        "max_words": 2800,
+        "max_tokens": 5600,
     }
     assert (
         pathlib.Path(__file__).resolve().parents[1]
@@ -178,9 +178,9 @@ def test_repo_config_json_matches_code_defaults():
     ).is_dir(), "config.json points user_instructions.dir at a missing directory"
     # Operator rules must leave room for the reference corpus they sit above.
     assert (
-        repo_cfg["user_instructions"]["max_words"]
-        < repo_cfg["prompt_builder"]["max_instruction_words"]
-    ), "user_instructions.max_words must leave budget for reference chunks"
+        repo_cfg["user_instructions"]["max_tokens"]
+        < repo_cfg["prompt_builder"]["max_instruction_tokens"]
+    ), "user_instructions.max_tokens must leave budget for reference chunks"
     # Every section the refactor added ships all-null too, so a fresh checkout
     # behaves exactly as it did before any of them are filled in.
     for section in ("vault", "azure", "databricks", "sharepoint", "xref",
@@ -209,11 +209,11 @@ def test_instruction_chunker_reads_config(_isolated_config):
 
     _set(
         _isolated_config,
-        {"instruction_chunker": {"min_words": 11, "max_words": 33, "overlap_words": 2}},
+        {"instruction_chunker": {"min_tokens": 11, "max_tokens": 33, "overlap_tokens": 2}},
     )
     chunker = InstructionChunker()
-    assert (chunker.min_words, chunker.max_words, chunker.overlap_words) == (11, 33, 2)
-    assert InstructionChunker(max_words=99).max_words == 99
+    assert (chunker.min_tokens, chunker.max_tokens, chunker.overlap_tokens) == (11, 33, 2)
+    assert InstructionChunker(max_tokens=99).max_tokens == 99
 
 
 def test_prompt_builder_reads_config(_isolated_config):
@@ -221,10 +221,10 @@ def test_prompt_builder_reads_config(_isolated_config):
 
     _set(
         _isolated_config,
-        {"prompt_builder": {"top_k": 2, "max_instruction_words": 77}},
+        {"prompt_builder": {"top_k": 2, "max_instruction_tokens": 77}},
     )
     builder = PromptBuilder([])
-    assert (builder.top_k, builder.max_instruction_words) == (2, 77)
+    assert (builder.top_k, builder.max_instruction_tokens) == (2, 77)
     assert PromptBuilder([], top_k=9).top_k == 9
 
 
@@ -489,8 +489,8 @@ def test_defaults_without_config(_isolated_config):
     from prompt_builder.doc_chunker import InstructionChunker
 
     assert SasSemanticChunker().min_words == 300
-    assert InstructionChunker().max_words == 900
-    assert PromptBuilder([]).max_instruction_words == 1500
+    assert InstructionChunker().max_tokens == 1300
+    assert PromptBuilder([]).max_instruction_tokens == 8000
     assert LLMClientConfig().max_input_tokens is None
     assert LLMClientConfig().model == "gpt-5.4"
     assert LLMClientConfig().max_retries == 3
