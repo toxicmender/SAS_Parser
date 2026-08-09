@@ -5,7 +5,6 @@ The XREF list maps a SAS dataset name to its Unity Catalog target —
 
 * :mod:`xref.sourcing` — reading and classifying the rows. Source-agnostic in
   signature, because the reference deployment also has a file-based XREF
-  (``sftp_config.xref_file_path``) that will want to slot in beside the list.
 * :mod:`xref.apply` — *when* the substitution happens: ``"pre"`` (before
   conversion, over the SAS-side metadata), ``"post"`` (after, over the
   generated code), or ``"both"``.

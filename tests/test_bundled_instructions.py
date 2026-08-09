@@ -276,3 +276,13 @@ def test_sparksql_slice_is_scoped_to_sparksql(bundled):
         if c.doc_id.startswith("sparksql_") and "sparksql" not in langs_of(c)
     ]
     assert unscoped == [], f"sparksql sections not scoped to SparkSQL: {unscoped}"
+
+
+def test_pyspark_slice_is_scoped_to_pyspark(bundled):
+    """Files under pyspark/ must not leak into another target run."""
+    unscoped = [
+        c.section_path
+        for c in bundled.chunks
+        if c.doc_id.startswith("pyspark_") and "pyspark" not in langs_of(c)
+    ]
+    assert unscoped == [], f"pyspark sections not scoped to PySpark: {unscoped}"

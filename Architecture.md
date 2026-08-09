@@ -359,7 +359,7 @@ target_language/
                         Scala. A leaf package — stdlib only — imported by
                         pipeline, prompt_builder, validation, and complexity,
                         which is what keeps them agreeing on one target.
-                        sqlglot optional (extra: sql) for the SQL check.
+                        sqlglot core dependency for the SQL check.
 
 validation/
   models.py             Pydantic models: ValidationCase, CaseRun,
@@ -367,11 +367,10 @@ validation/
                         (score/passed are computed fields; to_markdown()).
   metrics.py            Deterministic metrics + default_metrics(language):
                         response_coverage, dataset_fidelity,
-                        language_compliance, python_syntax, required_terms,
+                        language_compliance, target_syntax, required_terms,
                         reference_similarity. The two language-aware ones
-                        score against the run's target (python_syntax keeps
-                        its historical name but parses the TARGET, not
-                        Python). Thresholds resolve via app_config
+                        score against the run's target. target_syntax parses
+                        the selected target language. Thresholds resolve via app_config
                         (validation.<name>_threshold).
   judge.py              LLMJudgeMetric — opt-in LLM-as-judge (any
                         LangChain-style model / llm_client.LLMClient);
@@ -844,9 +843,8 @@ any of these silently changes behavior.
    validation suite. Re-deriving it from a string downstream is what let the
    layers disagree: the syntax metric checked Python on a Spark SQL run and
    scored a correct translation 0.0. Metric *names* are also part of this
-   contract — `python_syntax` is a stable key in config.json, in stored
-   verdicts, and in report tables, so it keeps its name while checking the
-   target.
+   contract — `target_syntax` is the config, stored-verdict, and report key
+   for syntax checks of the selected target.
 
 12. **One owner per cross-cutting concern, and the owner is not the caller.**
    Three of these, each of which regressed once by growing a second

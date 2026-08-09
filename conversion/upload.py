@@ -30,7 +30,6 @@ logger = logging.getLogger(__name__)
 FILE_EXTENSIONS: dict[str, str] = {
     "pyspark": "ipynb",
     "sparksql": "ipynb",
-    "sparkscala": "ipynb",
     "python": "py",
     "py": "py",
     "sql": "sql",
@@ -40,7 +39,7 @@ FILE_EXTENSIONS: dict[str, str] = {
 
 # Output types delivered as a runnable notebook rather than a flat file: on
 # Databricks that is what an operator actually runs.
-NOTEBOOK_TYPES = frozenset({"pyspark", "sparksql", "sparkscala"})
+NOTEBOOK_TYPES = frozenset({"pyspark", "sparksql"})
 
 DEFAULT_EXTENSION = "txt"
 

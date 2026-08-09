@@ -60,11 +60,6 @@ APPLY_MODES = (APPLY_PRE, APPLY_POST, APPLY_BOTH)
 
 DEFAULT_MODE = APPLY_PRE
 
-# Target languages the post rewriter can parse, by their normalised key.
-_SQL_LANGUAGES = frozenset({"sparksql", "sql", "spark_sql"})
-_PYTHON_LANGUAGES = frozenset({"pyspark", "python", "py"})
-
-
 def configured_mode() -> str:
     """
     When to apply the substitution: ``XREF_APPLY`` > ``config.json``
@@ -117,25 +112,17 @@ def apply_post(
     """
     *code* with its table references rewritten, after conversion.
 
-    *language* picks the parser — Spark SQL through ``sqlglot``, PySpark
-    through the ``ast`` module. A language neither one covers (Spark Scala,
-    say) is returned unchanged with a WARNING: no parser means no safe
-    rewrite, and an unsafe one is out of the question.
+    *language* is resolved strictly before dispatch: Spark SQL uses sqlglot
+    and PySpark uses the ``ast`` module.
     """
     if not mapping or not code.strip():
         return code
-    from target_language import normalize_language
+    from target_language import resolve_target_language
 
-    key = normalize_language(language)
-    if key in _SQL_LANGUAGES:
+    target = resolve_target_language(language)
+    if target.sqlglot_dialect is not None:
         return rewrite_sql(code, mapping, on_failure=on_failure)
-    if key in _PYTHON_LANGUAGES:
-        return rewrite_python(code, mapping, on_failure=on_failure)
-    logger.warning(
-        f"apply_post: no XREF rewriter for target language {language!r}; the "
-        f"generated code is unchanged"
-    )
-    return code
+    return rewrite_python(code, mapping, on_failure=on_failure)
 
 
 @dataclass

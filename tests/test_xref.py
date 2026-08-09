@@ -9,7 +9,6 @@ code is worse than one that no-ops.
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import pathlib
 import sys
@@ -21,12 +20,6 @@ import pytest
 import app_config
 from app_config.sharepoint import SharePointConfig, SharePointError
 from xref import apply as xref_apply, pre, rewrite, sourcing
-
-requires_sqlglot = pytest.mark.skipif(
-    importlib.util.find_spec("sqlglot") is None,
-    reason="sqlglot (the 'sql' extra) is not installed",
-)
-
 
 @pytest.fixture(autouse=True)
 def _isolated(monkeypatch, tmp_path):
@@ -248,20 +241,17 @@ def test_apply_pre_with_no_mapping_is_a_no_op():
 _MAPPING = {"sales.orders": "cat.sales.orders"}
 
 
-@requires_sqlglot
 def test_sql_table_reference_is_rewritten():
     out = rewrite.rewrite_sql("SELECT * FROM sales.orders", _MAPPING)
     assert "cat.sales.orders" in out
     assert "FROM sales.orders" not in out
 
 
-@requires_sqlglot
 def test_sql_leaves_unmapped_tables_alone():
     out = rewrite.rewrite_sql("SELECT * FROM hr.staff", _MAPPING)
     assert out == "SELECT * FROM hr.staff"
 
 
-@requires_sqlglot
 def test_unparseable_sql_is_returned_untouched(caplog):
     import logging
 
@@ -270,7 +260,6 @@ def test_unparseable_sql_is_returned_untouched(caplog):
         assert rewrite.rewrite_sql(broken, _MAPPING) == broken
 
 
-@requires_sqlglot
 def test_unparseable_sql_can_be_made_fatal():
     broken = "SELECT * FROM ((( sales.orders WHERE"
     with pytest.raises(rewrite.XrefRewriteError):
@@ -295,7 +284,6 @@ def test_pyspark_leaves_unrelated_strings_alone():
     assert rewrite.rewrite_python(source, _MAPPING) == source
 
 
-@requires_sqlglot
 def test_pyspark_recurses_into_spark_sql():
     source = 'df = spark.sql("SELECT * FROM sales.orders")\n'
     out = rewrite.rewrite_python(source, _MAPPING)
@@ -324,13 +312,10 @@ def test_apply_post_dispatches_on_language():
     assert "cat.sales.orders" in xref_apply.apply_post(source, "PySpark", _MAPPING)
 
 
-def test_apply_post_leaves_an_unsupported_language_alone(caplog):
-    import logging
-
+def test_apply_post_rejects_an_unsupported_language():
     source = 'val df = spark.table("sales.orders")'
-    with caplog.at_level(logging.WARNING, logger="xref.apply"):
-        assert xref_apply.apply_post(source, "Spark Scala", _MAPPING) == source
-    assert "no XREF rewriter" in caplog.text
+    with pytest.raises(ValueError, match="unknown output language"):
+        xref_apply.apply_post(source, "Spark Scala", _MAPPING)
 
 
 # ---------------------------------------------------------------------------

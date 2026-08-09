@@ -2779,6 +2779,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pymupdf" },
     { name = "python-dotenv" },
+    { name = "sqlglot" },
     { name = "tiktoken" },
 ]
 
@@ -2806,9 +2807,6 @@ sharepoint = [
 ]
 spark = [
     { name = "pyspark" },
-]
-sql = [
-    { name = "sqlglot" },
 ]
 vault = [
     { name = "hvac" },
@@ -2838,10 +2836,10 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'" },
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "ruff", marker = "extra == 'dev'" },
-    { name = "sqlglot", marker = "extra == 'sql'", specifier = ">=25" },
+    { name = "sqlglot", specifier = ">=25" },
     { name = "tiktoken", specifier = ">=0.7" },
 ]
-provides-extras = ["spark", "vault", "azure", "databricks", "sharepoint", "dev", "graph", "sql"]
+provides-extras = ["spark", "vault", "azure", "databricks", "sharepoint", "dev", "graph"]
 
 [[package]]
 name = "six"

@@ -49,7 +49,7 @@ jobs:
       - name: Install dependencies
         run: >
           uv sync --locked
-          --extra dev --extra spark --extra sql
+          --extra dev --extra spark
           --extra vault --extra azure --extra databricks --extra sharepoint
 
       # Pinned like ruff so local and CI agree on the exact diagnostics.
@@ -89,10 +89,10 @@ jobs:
       # if uv.lock is out of sync with pyproject.toml instead of re-resolving.
       # pyspark is an extra (in-memory mode is Spark-free); CI installs it so
       # the Spark-backed tests (Delta contract, tracking) keep running here.
-      # sql brings sqlglot, so the Spark SQL syntax check runs for real rather
-      # than degrading to its structural fallback.
+      # sqlglot is a core dependency, so Spark SQL syntax checks always use
+      # the Databricks dialect.
       - name: Install dependencies
-        run: uv sync --locked --extra dev --extra spark --extra sql
+        run: uv sync --locked --extra dev --extra spark
 
       # Slow end-to-end tests skip themselves automatically: they need the
       # user-provided reference_docs/ PDFs, which are gitignored and absent here.

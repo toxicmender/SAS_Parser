@@ -13,7 +13,7 @@ message and reports it as the item's ``response``, so conversation memory, the
 resume path, and every ``validation`` metric keep seeing exactly the shape they
 see today. In particular ``## Translation`` emits each code cell as a fenced
 block tagged with its language, which is what
-``validation.metrics.PythonSyntaxMetric`` scans for.
+``validation.metrics.TargetSyntaxMetric`` scans for.
 
 Pydantic only — no langchain import — so ``import chunker`` stays cheap
 (``SasLLMPipeline`` is the lazily-imported one; see ``chunker/__init__.py``).

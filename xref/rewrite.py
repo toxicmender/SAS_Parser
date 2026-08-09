@@ -35,7 +35,7 @@ import ast
 import logging
 
 import app_config
-from target_language import SPARKSQL, resolve_target_language
+from target_language import SPARKSQL
 
 logger = logging.getLogger(__name__)
 
@@ -68,30 +68,7 @@ def default_dialect() -> str:
     module still reaches sqlglot for the SQL inside ``spark.sql("...")`` — so
     those fall back to the SQL target's dialect rather than to nothing.
     """
-    configured = app_config.get_value("pipeline", "output_language")
-    if configured:
-        try:
-            target = resolve_target_language(str(configured))
-        except Exception:
-            # An unknown name is the pipeline's error to raise, not ours: the
-            # rewriter should not be what fails a run over a config typo.
-            target = SPARKSQL
-    else:
-        target = SPARKSQL
-    return target.sqlglot_dialect or SPARKSQL.sqlglot_dialect or "databricks"
-
-
-def dialect() -> str:
-    """The sqlglot dialect for the post rewriter.
-
-    ``xref.dialect`` overrides it; unset, it follows the run's target language
-    (:func:`default_dialect`), so the rewriter and the syntax checker agree by
-    construction.
-    """
-    return app_config.get_typed_value(
-        "xref", "dialect", str, default_dialect()
-    )
-
+    return SPARKSQL.sqlglot_dialect or "databricks"
 
 def on_parse_failure() -> str:
     """What to do with unparseable generated code (``xref.on_parse_failure``).
@@ -164,7 +141,7 @@ def rewrite_sql(
         )
         return sql
 
-    read = dialect()
+    read = SPARKSQL.sqlglot_dialect or "databricks"
     try:
         statements = sqlglot.parse(sql, read=read)
     except Exception as exc:  # sqlglot raises several unrelated types

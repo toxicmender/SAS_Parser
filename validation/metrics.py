@@ -248,11 +248,11 @@ class DatasetFidelityMetric(ValidationMetric):
         return self._result(mentioned / expected, details)
 
 
-class PythonSyntaxMetric(ValidationMetric):
+class TargetSyntaxMetric(ValidationMetric):
     """Translated code in the responses must actually parse as the target.
 
     Despite the name — kept because it is the stable key in config.json
-    (``validation.python_syntax_threshold``), in stored verdicts, and in the
+    (``validation.target_syntax_threshold``), in stored verdicts, and in the
     report tables — this checks the run's **target** language, not Python. It
     used to check Python unconditionally, which scored a correct Spark SQL
     run 0.0 ("no fenced Python code blocks") and, with
@@ -264,10 +264,10 @@ class PythonSyntaxMetric(ValidationMetric):
     section and runs the target's checker over each. Scores
     ``valid blocks / blocks``; a case whose responses contain no target code
     at all scores 0 — a translation run that emits only prose is a failure,
-    not a skip. Targets with no checker (Spark Scala) skip.
+    not a skip.
     """
 
-    name = "python_syntax"
+    name = "target_syntax"
     default_threshold = 1.0
 
     def __init__(
@@ -320,7 +320,7 @@ class LanguageComplianceMetric(ValidationMetric):
 
     Prose and source-echo fences (```sas```, ```text```, ...) are not code and
     are ignored rather than counted against the score. A translation section
-    with no code block at all scores 0, matching ``python_syntax``: prose is
+    with no code block at all scores 0, matching ``target_syntax``: prose is
     not a translation.
     """
 
@@ -423,7 +423,7 @@ def default_metrics(
         ResponseCoverageMetric(),
         DatasetFidelityMetric(),
         LanguageComplianceMetric(output_language=target),
-        PythonSyntaxMetric(output_language=target),
+        TargetSyntaxMetric(output_language=target),
         RequiredTermsMetric(),
         ReferenceSimilarityMetric(),
     ]

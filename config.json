@@ -46,7 +46,7 @@
     }
   },
   "_pipeline_comment": "Pipeline behaviour. 'structured_output' asks the model for a typed TranslationDocument (analysis / mapping / ordered notebook cells / risks) instead of free-form Markdown, so pipeline.notebook knows which cells are runnable code rather than guessing from fences. The turn persisted to memory and the item's 'response' stay Markdown either way, so conversation memory, resume, and validation are unaffected; a gateway that will not honour the schema degrades to the model's prose with a warning. Set false to prompt for plain Markdown. 'max_merged_tokens' bounds token-budgeted call packing: adjacent work items (independent singletons AND small dependency batches) share one LLM call while the estimated prompt cost stays under this many tokens, cutting per-call overhead. null derives a default (packing is ON by default: 0.8 x the input-token headroom when llm_client.max_input_tokens is set, else ~64000); set 0 to turn packing off (count-capped singleton merging only). Item ids change under packing (packed-NNN), so resume only matches runs made under the same budget.",
-  "_pipeline_language_comment": "'output_language' is the target every stage of a run resolves against: it names the language in the system prompt, selects '[lang: ...]'-scoped user instructions, picks the notebook kernel and the fence tag translated code must carry, and tells the validation suite which language to check the emitted code parses as. Known targets are PySpark, Spark SQL, and Spark Scala; spelling is folded, so 'SparkSQL', 'spark sql', and 'spark_sql' are one target, as are 'sql' and 'Spark SQL'. An unknown name is an error, not a silent Python run. null uses the code default (SparkSQL); an explicit SasLLMPipeline(output_language=...) or main.py --output-language wins over this file. In a SharePoint-driven run the request row's Destination Language wins over all of them.",
+  "_pipeline_language_comment": "'output_language' resolves once for every run and controls prompting, instruction selection, notebook metadata, validation, complexity, and XREF. Supported targets are PySpark and Spark SQL. Spelling is folded, so SparkSQL, spark sql, spark_sql, sql, and Spark SQL select Spark SQL. Unsupported names fail before conversion. null uses the code default (Spark SQL); an explicit pipeline or CLI value wins over this file, while a SharePoint request row wins for its request.",
   "pipeline": {
     "structured_output": null,
     "max_merged_tokens": null,
@@ -71,11 +71,11 @@
     "dir": "prompt_builder/instructions",
     "max_tokens": 9800
   },
-  "_validation_comment": "Per-metric pass thresholds; null uses the metric class default. Two metrics are scored against the run's pipeline.output_language: 'language_compliance' (the fraction of translated code blocks actually in the target language) and 'python_syntax' (which, despite the historical name kept for this key, parses the emitted blocks as the TARGET language, not as Python). Every metric is higher-is-better, hallucination_threshold included: that metric reports groundedness (1 - deepeval's hallucination rate), so 0.8 means 'at most 20% of ground-truth contexts contradicted'. The thresholds below llm_judge_threshold belong to the opt-in LLM-judged suite (validation.judged_metrics); they are inert unless it is enabled. prompt_instructions is a list of strings prompt_alignment checks the response against, overriding validation.agentic_metrics.DEFAULT_PROMPT_INSTRUCTIONS.",
+  "_validation_comment": "Per-metric pass thresholds; null uses the metric class default. language_compliance scores whether emitted code blocks use the selected target, and target_syntax verifies them with Python AST for PySpark or sqlglot under the Databricks dialect for Spark SQL. Every metric is higher-is-better. The LLM-judged thresholds are inert unless that suite is enabled.",
   "validation": {
     "response_coverage_threshold": null,
     "dataset_fidelity_threshold": null,
-    "python_syntax_threshold": null,
+      "target_syntax_threshold": null,
     "language_compliance_threshold": null,
     "required_terms_threshold": null,
     "reference_similarity_threshold": null,
@@ -112,7 +112,7 @@
     "ai_gateway_path": null,
     "ai_gateway_key": null
   },
-  "_databricks_comment": "Non-secret Databricks workspace settings only. The token (DATABRICKS_TOKEN) and the service-principal secret (ARM_CLIENT_SECRET) come from the environment, never this file; on a cluster no credential is needed, and off-cluster an Entra ID service principal is preferred over a PAT. Every key here is also read from its standard env var, which wins over this file: DATABRICKS_* for the workspace ones, ARM_TENANT_ID/ARM_CLIENT_ID for the service principal (the names Databricks documents), DATABRICKS_AZURE_RESOURCE_ID for azure_workspace_resource_id, DATABRICKS_SECRET_SCOPE for secret_scope. Set azure_workspace_resource_id only when the service principal is NOT assigned to the workspace. secret_scope names a Databricks secret scope holding the service principal under sp-hsv-tenantid/sp-hsv-appid/sp-hsv-secret; reading it needs a credential of its own (a cluster runtime or a PAT). The SAME scope also holds the SharePoint principal, under different keys -- see sharepoint.tenant_id_key. dbfs_root_path and workspace_output_folder are schema only for now: nothing publishes to the workspace yet (generated notebooks are written to local disk), so setting workspace_output_folder does not make validation output land in /Workspace.",
+  "_databricks_comment": "Non-secret Databricks workspace settings only. The token (DATABRICKS_TOKEN) and service-principal secret (ARM_CLIENT_SECRET) come from the environment, never this file. DATABRICKS_* values and ARM_TENANT_ID/ARM_CLIENT_ID override this file. Set azure_workspace_resource_id only when the service principal is not assigned to the workspace. secret_scope names the Databricks scope holding the service-principal and SharePoint credentials.",
   "databricks": {
     "host": null,
     "http_path": null,
@@ -124,9 +124,7 @@
     "azure_tenant_id": null,
     "azure_client_id": null,
     "azure_workspace_resource_id": null,
-    "secret_scope": null,
-    "dbfs_root_path": null,
-    "workspace_output_folder": null
+    "secret_scope": null
   },
   "_azure_comment": "Non-secret Microsoft Entra ID (Azure AD) settings only. The client secret (AZURE_CLIENT_SECRET) comes from the environment, never this file. tenant_id/client_id/authority_host/scopes/certificate_* also read from AZURE_TENANT_ID/AZURE_CLIENT_ID/AZURE_AUTHORITY_HOST/AZURE_SCOPES/AZURE_CLIENT_CERTIFICATE_PATH/AZURE_CLIENT_CERTIFICATE_THUMBPRINT, which win over these. flow: 'client_credentials' (service principal) or 'device_code' (interactive user login); null infers it from the credentials present. 'verify' is TLS verification for the Entra ID call itself (true, false, or a path to a CA bundle) and matters on a TLS-intercepting network, where the token request fails before Vault is ever contacted; null inherits vault.verify, since one bundle normally covers both legs. 'proxies' is an optional {scheme: url} mapping handed straight to MSAL. Also read from AZURE_VERIFY.",
   "azure": {
@@ -161,31 +159,9 @@
     "list_id_xref": null,
     "list_id_sas_complexity": null
   },
-  "_xref_comment": "Dataset-name cross-reference: the SharePoint XREF list maps 'schema.table' to 'catalog.schema.table'. 'apply' picks when the substitution happens -- 'pre' (default) rewrites SAS dataset names in the chunk metadata and source before conversion, which is where the parser already knows what a dataset reference is; 'post' rewrites the GENERATED code by parsing it (sqlglot for Spark SQL, the ast module for PySpark); 'both' does the two and reports names only one of them reached, which is how you find out whether 'pre' is missing anything. 'dialect' overrides the sqlglot dialect for the post rewriter; null (the default) follows the run's pipeline.output_language via target_language, so the rewriter and the syntax checker parse generated code identically -- setting it to something the checker does not use means the rewriter can silently leave code un-rewritten. 'on_parse_failure' governs unparseable generated code: 'warn' (default) leaves the output exactly as the model wrote it, 'error' raises -- a rewriter that corrupts generated code is worse than one that no-ops. The post mode needs the 'sql' extra installed.",
+  "_xref_comment": "Dataset-name cross-reference: the SharePoint XREF list maps schema.table to catalog.schema.table. pre rewrites SAS metadata before conversion; post parses generated Spark SQL with sqlglot under the Databricks dialect or PySpark with AST; both reports names reached only after conversion. on_parse_failure is warn or error. sqlglot is a required dependency.",
   "xref": {
     "apply": null,
-    "dialect": null,
     "on_parse_failure": null
-  },
-  "_adls_comment": "Azure Data Lake Storage coordinates. Schema only: nothing in this repo reads them yet, and no ADLS client exists. Declared here so adopting one later is not a second breaking config change.",
-  "adls": {
-    "storage_account": null,
-    "container": null,
-    "workspace_host": null,
-    "root_path": null,
-    "applications_path": null,
-    "main_path": null,
-    "archive_path": null,
-    "external_table_path": null
-  },
-  "_sftp_comment": "SFTP source coordinates, including a file-based XREF alternative to the SharePoint list. Schema only: no SFTP client exists here yet.",
-  "sftp": {
-    "source_path": null,
-    "cred_path": null,
-    "xref_file_path": null
-  },
-  "_sas_comment": "SAS source handling. 'inlining' asks for %include targets to be inlined into the file that includes them before chunking. Schema only: the key is read, but no inlining behaviour is implemented yet.",
-  "sas": {
-    "inlining": null
   }
 }
