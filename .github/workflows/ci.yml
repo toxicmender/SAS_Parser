@@ -41,7 +41,7 @@ jobs:
           cache-dependency-glob: uv.lock
 
       # All extras so optional imports (pyspark, msal, hvac, delta,
-      # databricks, msgraph-sdk, ...) resolve; otherwise pyright reports them
+      # databricks, databricks-langchain, msgraph-sdk, ...) resolve; otherwise pyright reports them
       # as missing and the counts drift from a local run. [tool.pyright]
       # points pyright at this .venv. The LLM client (langchain-openai) is a
       # core dependency now — every model is reached over the gateway's
@@ -50,15 +50,21 @@ jobs:
         run: >
           uv sync --locked
           --extra dev --extra spark
-          --extra vault --extra azure --extra databricks --extra sharepoint
+          --extra vault --extra azure --extra databricks --extra databricks-ai
+          --extra sharepoint
 
       # Pinned like ruff so local and CI agree on the exact diagnostics.
+      # Pyright returns nonzero for every diagnostic.  The ratchet below is
+      # deliberately the blocking gate: it allows diagnostics in new,
+      # un-baselined modules while rejecting regressions in existing modules.
       - name: Pyright
+        continue-on-error: true
         run: uvx pyright@1.1.406 --outputjson > pyright.json
 
       # Gate: fail only when a file already in the baseline gains errors. New
       # modules and tests/ are not gated (see scripts/pyright_ratchet.py).
       - name: Ratchet against baseline
+        if: always()
         run: uv run python scripts/pyright_ratchet.py --input pyright.json
 
       # Advisory: surface tests/ type errors without blocking (tests are
