@@ -46,7 +46,7 @@ metrics.py       Deterministic metrics + default_metrics(output_language):
                                         in its response                (>= 0.75)
                    language_compliance  translated blocks are in the
                                         run's target language          (>= 1.0)
-                   python_syntax        those blocks parse as the
+                   target_syntax        those blocks parse as the
                                         target (historical name)       (>= 1.0)
                    required_terms       declared substrings            (>= 1.0)
                    reference_similarity token-F1 vs golden reference   (>= 0.5)

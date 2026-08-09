@@ -19,6 +19,7 @@ dependencies = [
     "pydantic>=2.13.4",
     "pymupdf>=1.28.0",
     "python-dotenv>=1.0",
+    "sqlglot>=25",
     # llm_client.tokens and memory.turns count tokens with it directly (it
     # already arrives via langchain-openai; declared so that stays true).
     "tiktoken>=0.7",
@@ -60,10 +61,6 @@ dev        = ["pytest>=8", "pytest-cov", "ruff", "nbformat>=5.10", "matplotlib>=
 # Markdown table, and render_png returns None (with a log line) when matplotlib
 # is absent — the picture is a supplement, never the only copy.
 graph      = ["matplotlib>=3.8"]
-# Real SQL parsing for target_language's Spark SQL syntax check (which the
-# validation suite scores a SQL run with). Optional: without it the check
-# degrades to a conservative structural one — see target_language._check_sql.
-sql        = ["sqlglot>=25"]
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -78,7 +75,7 @@ where = ["."]
 # target_language is the leaf every one of them resolves the run's target
 # through, so it ships with all of them. conversion and xref are the SharePoint
 # domain layers a real run is driven by, and add no required dependency of
-# their own (Graph is the optional `sharepoint` extra, sqlglot the `sql` one).
+# their own (Graph is the optional `sharepoint` extra; sqlglot is core).
 include = [
     "pipeline*",
     "chunker*",

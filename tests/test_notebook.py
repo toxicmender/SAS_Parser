@@ -171,9 +171,11 @@ class TestKernelSelection(unittest.TestCase):
         nb = build_notebook([], output_language="Spark SQL")
         self.assertEqual(nb["metadata"]["language_info"]["name"], "sql")
 
-    def test_unknown_language_falls_back_to_python(self):
-        nb = build_notebook([], output_language="Cobol")
-        self.assertEqual(nb["metadata"]["kernelspec"]["name"], "python3")
+    def test_unknown_language_is_rejected(self):
+        from target_language import UnknownTargetLanguage
+
+        with self.assertRaises(UnknownTargetLanguage):
+            build_notebook([], output_language="Cobol")
 
     def test_output_language_is_recorded(self):
         nb = build_notebook([], output_language="PySpark")
@@ -373,7 +375,7 @@ class TestItemCells(unittest.TestCase):
                     "passed": False,
                     "score": 0.42,
                     "metrics": [
-                        {"metric": "python_syntax", "passed": False, "skipped": False},
+                        {"metric": "target_syntax", "passed": False, "skipped": False},
                         {"metric": "coverage", "passed": True, "skipped": False},
                     ],
                 }
@@ -384,7 +386,7 @@ class TestItemCells(unittest.TestCase):
         self.assertIn("a.sas", header)
         self.assertIn("FAIL", header)
         self.assertIn("0.42", header)
-        self.assertIn("python_syntax", header)
+        self.assertIn("target_syntax", header)
         self.assertNotIn("coverage", header)
 
 

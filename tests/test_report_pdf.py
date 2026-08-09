@@ -35,7 +35,7 @@ def _report(model: str = "claude-sonnet-4-5", cases: int = 1) -> ValidationRepor
                     metric="response_coverage", score=1.0, threshold=1.0, passed=True
                 ),
                 MetricResult(
-                    metric="python_syntax",
+                    metric="target_syntax",
                     score=0.0,
                     threshold=1.0,
                     passed=False,
@@ -172,7 +172,7 @@ def _verdict(case_id: str, passed: bool, **extra):
         item_count=1,
         metrics=[
             MetricResult(
-                metric="python_syntax",
+                metric="target_syntax",
                 score=1.0 if passed else 0.0,
                 threshold=1.0,
                 passed=passed,

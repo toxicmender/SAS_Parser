@@ -324,13 +324,10 @@ def test_apply_post_dispatches_on_language():
     assert "cat.sales.orders" in xref_apply.apply_post(source, "PySpark", _MAPPING)
 
 
-def test_apply_post_leaves_an_unsupported_language_alone(caplog):
-    import logging
-
+def test_apply_post_rejects_an_unsupported_language():
     source = 'val df = spark.table("sales.orders")'
-    with caplog.at_level(logging.WARNING, logger="xref.apply"):
-        assert xref_apply.apply_post(source, "Spark Scala", _MAPPING) == source
-    assert "no XREF rewriter" in caplog.text
+    with pytest.raises(ValueError, match="unknown output language"):
+        xref_apply.apply_post(source, "Spark Scala", _MAPPING)
 
 
 # ---------------------------------------------------------------------------

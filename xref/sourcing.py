@@ -119,7 +119,6 @@ def classify(rows: list[dict[str, Any]]) -> XrefMappings:
     Projected XREF rows sorted into the three slots of :class:`XrefMappings`.
 
     Pure: takes already-read rows, so a second backend (the reference's
-    file-based ``sftp_config.xref_file_path``) can reuse the classification by
     projecting onto the same four names.
 
     Rows with either side blank are skipped — a half-filled row expresses no
@@ -169,7 +168,6 @@ def mappings(
     non-indexed column.
 
     The signature stays source-agnostic on purpose: a file-based XREF backend
-    (the reference's ``sftp_config.xref_file_path``) should slot in behind this
     name rather than beside it.
 
     Raises

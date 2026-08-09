@@ -25,7 +25,7 @@ pipe.output_language        # "Spark SQL" — canonical, whatever you typed
 pipe.target_language        # the resolved TargetLanguage; pass it downstream
 ```
 
-Known targets are **PySpark**, **Spark SQL**, and **Spark Scala**; spelling is
+Known targets are **PySpark** and **Spark SQL**; spelling is
 folded (`SparkSQL`, `spark sql`, `spark_sql`, and `sql` are one target). An
 unrecognised name raises `UnknownTargetLanguage` instead of silently behaving
 like a Python run. Omit the argument to take config.json

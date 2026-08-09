@@ -1,6 +1,6 @@
 # SAS Parser
 
-Translate SAS programs into a Spark target — PySpark, Spark SQL, or Spark Scala
+Translate SAS programs into a Databricks target — PySpark or Spark SQL
 — with the corpus chunked semantically, batched by its real dependency graph,
 and converted through an LLM behind an AI Gateway.
 

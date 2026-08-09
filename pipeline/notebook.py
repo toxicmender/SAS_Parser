@@ -87,7 +87,7 @@ def _target_for(output_language: str | TargetLanguage | None) -> TargetLanguage:
     """
     if isinstance(output_language, TargetLanguage):
         return output_language
-    return resolve_target_language(output_language, allow_unknown=True)
+    return resolve_target_language(output_language)
 
 
 # ---------------------------------------------------------------------------

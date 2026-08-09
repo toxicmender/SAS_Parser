@@ -697,7 +697,7 @@ def load_ruleset(
             # than raise — complexity analysis does not need the pipeline to
             # be runnable.
             target = resolve_target_language(
-                None, allow_unknown=True
+                None
             ).complexity_profile
             logger.debug(
                 f"load_ruleset: no complexity.target set; following the run's "

@@ -162,9 +162,8 @@ def test_repo_config_json_matches_code_defaults():
             "complexity": {"timeout": None, "model": None},
         },
     }
-    # The one section that ships non-null: the bundled SparkSQL instruction
-    # set is on by default. It is scoped [lang: sparksql], so it is inert
-    # under any other output_language, and `max_tokens` is set with it so
+    # The one section that ships non-null: the bundled target instruction
+    # sets are on by default. max_tokens is set with them so
     # operator rules cannot consume the whole retrieval budget and starve the
     # reference corpus.
     assert repo_cfg["user_instructions"] == {
@@ -183,8 +182,7 @@ def test_repo_config_json_matches_code_defaults():
     ), "user_instructions.max_tokens must leave budget for reference chunks"
     # Every section the refactor added ships all-null too, so a fresh checkout
     # behaves exactly as it did before any of them are filled in.
-    for section in ("vault", "azure", "databricks", "sharepoint", "xref",
-                    "adls", "sftp", "sas"):
+    for section in ("vault", "azure", "databricks", "sharepoint", "xref"):
         assert all(value is None for value in repo_cfg[section].values()), section
     assert "powerapps" not in repo_cfg
 
