@@ -693,6 +693,11 @@ class SasLLMPipeline:
                 *instructions,
                 *self._memory_context.thread_messages(thread_id),
             ]
+            # A configured CDF consumer observes commits made by other
+            # long-lived workers before this process reads its cached history.
+            # In-memory and ordinary Delta deployments pay nothing here.
+            if self._memory.cdf_enabled:
+                self._memory.sync_changes()
             history = self._memory.get_thread(thread_id, chat_id=self.chat_id)
             input_message = state["messages"][-1]
             history_messages = history.messages

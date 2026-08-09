@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -287,6 +288,41 @@ _LLM_CLIENT_TYPES: dict[str, type | tuple[type, ...]] = {
     "max_bucket_size": int,
     "roles": dict,
 }
+
+# Delta memory tables are deliberately required to be fully qualified. Unlike
+# SQL values, table identifiers cannot be passed through parameter markers;
+# keeping one Catalog.Schema.Table spelling in config makes it unambiguous
+# which Unity Catalog object production memory will mutate.
+_MEMORY_TABLE_TYPES: dict[str, type] = {
+    "delta_table": str,
+    "cdf_audit_table": str,
+}
+_FULL_TABLE_NAME = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\Z"
+)
+
+
+def memory_table_value(key: str, default: str | None = None) -> str | None:
+    """Validated ``memory.<key>`` table name from ``config.json``.
+
+    Both the primary KV table and its CDF audit table must use a normal,
+    three-part Unity Catalog identifier (``Catalog.Schema.Table``). ``null``
+    retains the supplied default, so a shipped config can document both
+    settings without enabling Delta for local runs.
+    """
+    expected = _MEMORY_TABLE_TYPES.get(key)
+    if expected is None:
+        raise KeyError(f"unknown memory table config key {key!r}")
+    value = get_typed_value("memory", key, expected, default)
+    if value is not None and not _FULL_TABLE_NAME.fullmatch(value):
+        logger.warning(
+            "memory_table_value: config.json memory.%s must be a fully "
+            "qualified Catalog.Schema.Table; ignoring %r",
+            key,
+            value,
+        )
+        return default
+    return value
 
 # How the chat model is constructed. "openai_compatible" builds the
 # LangChain ChatOpenAI the whole client is written around; "native" wraps a

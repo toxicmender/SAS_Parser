@@ -47,6 +47,10 @@ spark      = ["pyspark>=4.1.2,<4.2"]
 vault      = ["hvac>=2.0"]
 azure      = ["msal>=1.28"]
 databricks = ["databricks-sdk>=0.30", "databricks-sql-connector>=3.0"]
+# Optional Databricks Model Serving adapters used by memory.databricks_ai.
+# It is intentionally separate from the workspace/SQL SDK extra and never a
+# core dependency: plain memory, tests, and local development remain offline.
+databricks-ai = ["databricks-langchain>=0.15"]
 # SharePoint over Microsoft Graph. msal comes along because auth is delegated to
 # app_config.azure (which mints the Graph token); msgraph-sdk pulls in
 # azure-identity, the kiota runtime, and httpx itself.

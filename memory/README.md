@@ -228,6 +228,66 @@ invalidated by anything that deletes messages through the instance
 frontier), but out-of-band deletes or backdated keys are not seen until
 the next invalidation.
 
+### Delta change feed, audit, and cross-process caches
+
+For a shared Delta deployment, configure both a per-process consumer id and
+an **independent** audit table. `MemoryHub.sync_changes()` establishes a
+snapshot boundary on its first call (invalidating all local thread caches),
+then consumes later committed CDF versions and invalidates only cached threads
+whose `msg::` or `chat::` rows changed. The consumer checkpoint lives in the
+audit table, never in the source memory table, so processing it cannot create
+an endless CDF feedback loop.
+
+```python
+mem = MemoryHub(
+    spark=spark,
+    table="catalog.schema.langchain_mem",
+    cdf_consumer_id="pipeline_worker_1",
+    cdf_audit_table="catalog.schema.langchain_mem_audit",
+)
+mem.sync_changes()  # once at each long-lived worker's request boundary
+```
+
+The two table names may instead be declared once under config.json
+`memory.delta_table` and `memory.cdf_audit_table`. They are validated as
+fully-qualified `Catalog.Schema.Table` identifiers; explicit `MemorySetup`
+values take precedence. `cdf_consumer_id` remains an explicit per-worker
+setting so two workers never share a checkpoint.
+
+CDF begins only after the feature is enabled and its files follow the source
+table's VACUUM retention. The first call is therefore a baseline rather than
+a false historical audit; later CDF events are upserted into the separately
+retained audit Delta table with the durable checkpoint. Keep source retention
+longer than the longest expected CDF consumer outage.
+
+### Delta maintenance
+
+Maintenance is explicit and never runs in the request path. Use
+`DeltaMemoryMaintenance` from a scheduled job to inspect history, compact, or
+vacuum a memory table. `VacuumPolicy` rejects retention below seven days or
+above four 30-day months, and requires it to exceed the configured worst-case
+CDF consumer outage. `vacuum()` is a dry run by default.
+
+```python
+from memory import DeltaMemoryMaintenance, VacuumPolicy
+
+ops = DeltaMemoryMaintenance(
+    spark, "catalog.schema.langchain_mem",
+    policy=VacuumPolicy(retention_hours=30 * 24, max_cdf_outage_hours=7 * 24),
+)
+ops.optimize()
+ops.vacuum()  # dry run
+```
+
+### Optional Databricks AI Bridge
+
+Install `sas-parser[databricks-ai]` only where Databricks Model Serving is
+needed. The optional extra installs `databricks-langchain`; importing
+`memory` stays independent of it. `memory.chat_model()` returns a
+`ChatDatabricks` instance that can be passed as `SasLLMPipeline(llm=...)` or
+as the model for `MemoryExtractor` / `RollingSummarizer`; `memory.embeddings()`
+returns `DatabricksEmbeddings` for `HybridRanker(embeddings=...)`.
+
 ### Invariant — in-memory mode stays Spark-free
 
 `_InMemoryBackend` (and therefore `MemoryHub()` with no arguments) must
