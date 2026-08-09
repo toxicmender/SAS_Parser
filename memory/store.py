@@ -9,11 +9,14 @@ Logger name: ``memory.store``.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from bisect import bisect_left, bisect_right, insort
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 from langchain_core.chat_history import BaseChatMessageHistory
@@ -36,9 +39,11 @@ if TYPE_CHECKING:
     from pyspark.sql import functions as F
     from pyspark.sql.types import (
         DoubleType,
+        LongType,
         StringType,
         StructField,
         StructType,
+        TimestampType,
     )
 
 try:
@@ -46,9 +51,11 @@ try:
     from pyspark.sql import functions as F
     from pyspark.sql.types import (
         DoubleType,
+        LongType,
         StringType,
         StructField,
         StructType,
+        TimestampType,
     )
 
     _PYSPARK_AVAILABLE = True
@@ -80,8 +87,46 @@ def _jload(s: str) -> Any:
     return json.loads(s)
 
 
+_IDENTIFIER_PART = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _quoted_table_name(table: str) -> str:
+    """Return a SQL-safe one- to three-part table identifier.
+
+    Spark SQL parameter markers cannot represent identifiers.  Memory table
+    names are configuration, rather than data, but accepting arbitrary SQL in
+    that configuration would still make every DDL/DML call injectable.  Keep
+    the production contract deliberately narrow: Unity Catalog identifiers
+    are one, two, or three ordinary identifier parts.
+    """
+    if not isinstance(table, str) or not table:
+        raise ValueError("Delta table must be a non-empty identifier")
+    parts = table.split(".")
+    if not 1 <= len(parts) <= 3 or any(not _IDENTIFIER_PART.fullmatch(p) for p in parts):
+        raise ValueError(
+            "Delta table must be a one- to three-part identifier containing "
+            "only letters, numbers, and underscores"
+        )
+    return ".".join(f"`{part}`" for part in parts)
+
+
+@dataclass(frozen=True)
+class CDFSyncResult:
+    """Outcome of one durable Change Data Feed consumption pass.
+
+    ``baseline`` means the caller must discard all local caches: the consumer
+    has just established its initial snapshot/version boundary and CDF cannot
+    describe changes written before that boundary.
+    """
+
+    baseline: bool = False
+    events: tuple[dict[str, Any], ...] = ()
+    checkpoint_version: int | None = None
+
+
 # Schema for the Delta table (built lazily; Delta mode only)
 _KV_SCHEMA = None
+_AUDIT_SCHEMA = None
 
 
 def _schema():
@@ -98,6 +143,27 @@ def _schema():
             ]
         )
     return _KV_SCHEMA
+
+
+def _audit_schema():
+    """Schema for the independent, append-only CDF audit table."""
+    global _AUDIT_SCHEMA
+    if _AUDIT_SCHEMA is None:
+        _AUDIT_SCHEMA = StructType(
+            [
+                StructField("event_id", StringType(), nullable=False),
+                StructField("consumer_id", StringType(), nullable=False),
+                StructField("source_table", StringType(), nullable=False),
+                StructField("kv_key", StringType(), nullable=True),
+                StructField("change_type", StringType(), nullable=False),
+                StructField("commit_version", LongType(), nullable=False),
+                StructField("commit_timestamp", TimestampType(), nullable=True),
+                StructField("value", StringType(), nullable=True),
+                StructField("tags", StringType(), nullable=True),
+                StructField("recorded_at", DoubleType(), nullable=False),
+            ]
+        )
+    return _AUDIT_SCHEMA
 
 
 # Storage backends. Both speak the same raw record shape, a tuple in
@@ -232,19 +298,32 @@ class _DeltaBackend:
     format if it does not already exist.
     """
 
-    def __init__(self, spark: "SparkSession | None", table: str) -> None:
+    def __init__(
+        self,
+        spark: "SparkSession | None",
+        table: str,
+        *,
+        audit_table: str | None = None,
+        max_write_retries: int = 3,
+    ) -> None:
         if not _PYSPARK_AVAILABLE:
             raise RuntimeError("pyspark is not installed. Run: pip install pyspark")
         if spark is None:
             raise ValueError(
                 f"Delta mode (table={table!r}) requires an active SparkSession"
             )
+        if max_write_retries < 0:
+            raise ValueError("max_write_retries must be >= 0")
         self._spark = spark
-        self._table = table
+        self._table_name = table
+        self._table = _quoted_table_name(table)
+        self._audit_table_name = audit_table
+        self._audit_table = _quoted_table_name(audit_table) if audit_table else None
+        self._max_write_retries = max_write_retries
         self._ensure_table()
 
     def _ensure_table(self) -> None:
-        """Create the Delta table if it does not already exist."""
+        """Create, migrate, and verify the production Delta table contract."""
         self._spark.sql(f"""
             CREATE TABLE IF NOT EXISTS {self._table} (
                 kv_key     STRING  NOT NULL,
@@ -257,6 +336,79 @@ class _DeltaBackend:
             USING DELTA
             TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')
         """)
+        # CREATE TABLE IF NOT EXISTS leaves an existing table untouched, so
+        # CDF must be enabled explicitly for upgraded deployments. CDF only
+        # captures writes after this point; startup validation makes that
+        # boundary visible instead of silently running without coherence.
+        self._spark.sql(
+            f"ALTER TABLE {self._table} SET TBLPROPERTIES "
+            "('delta.enableChangeDataFeed' = 'true')"
+        )
+        self._migrate_schema()
+        self._validate_schema()
+
+    def _migrate_schema(self) -> None:
+        """Apply safe additive migrations to legacy memory tables.
+
+        The original schema predates provenance. ``source`` is nullable and
+        can therefore be added safely; missing identity/value columns are a
+        hard error because inventing them could corrupt existing memory.
+        """
+        fields = {field.name: field for field in self._spark.table(self._table).schema}
+        if "source" not in fields:
+            self._spark.sql(f"ALTER TABLE {self._table} ADD COLUMNS (source STRING)")
+
+    def _validate_schema(self) -> None:
+        expected = {
+            "kv_key": "string",
+            "value": "string",
+            "tags": "string",
+            "created_at": "double",
+            "updated_at": "double",
+            "source": "string",
+        }
+        actual = {
+            field.name: field.dataType.simpleString()
+            for field in self._spark.table(self._table).schema
+        }
+        invalid = {
+            name: (expected_type, actual.get(name))
+            for name, expected_type in expected.items()
+            if actual.get(name) != expected_type
+        }
+        if invalid:
+            raise RuntimeError(
+                f"Delta table {self._table_name!r} has an incompatible memory "
+                f"schema: {invalid!r}"
+            )
+
+    @staticmethod
+    def _is_concurrent_write(exc: Exception) -> bool:
+        text = str(exc).upper()
+        return (
+            "CONCURRENT" in text
+            or "CONFLICT" in text
+            or ("DELTA_" in text and "COMMIT" in text)
+        )
+
+    def _with_write_retry(self, operation: str, action: Any) -> None:
+        """Retry idempotent Delta writes, never a full-store restore."""
+        for attempt in range(self._max_write_retries + 1):
+            try:
+                action()
+                return
+            except Exception as exc:
+                if not self._is_concurrent_write(exc) or attempt == self._max_write_retries:
+                    raise
+                delay = 0.05 * (2**attempt)
+                logger.warning(
+                    "Delta %s conflicted; retrying (%s/%s) in %.2fs",
+                    operation,
+                    attempt + 1,
+                    self._max_write_retries,
+                    delay,
+                )
+                time.sleep(delay)
 
     def _df(self, prefix: str = "") -> "DataFrame":
         df = self._spark.table(self._table)
@@ -281,17 +433,20 @@ class _DeltaBackend:
         view = f"_kv_upsert_{uuid.uuid4().hex}"
         self._stage(rows, now).createOrReplaceTempView(view)
         try:
-            self._spark.sql(f"""
-                MERGE INTO {self._table} AS target
-                USING {view} AS source
-                  ON target.kv_key = source.kv_key
-                WHEN MATCHED THEN UPDATE SET
-                    target.value      = source.value,
-                    target.tags       = COALESCE(source.tags, target.tags),
-                    target.updated_at = source.updated_at,
-                    target.source     = COALESCE(source.source, target.source)
-                WHEN NOT MATCHED THEN INSERT *
-            """)
+            def merge() -> None:
+                self._spark.sql(f"""
+                    MERGE INTO {self._table} AS target
+                    USING {view} AS source
+                      ON target.kv_key = source.kv_key
+                    WHEN MATCHED THEN UPDATE SET
+                        target.value      = source.value,
+                        target.tags       = COALESCE(source.tags, target.tags),
+                        target.updated_at = source.updated_at,
+                        target.source     = COALESCE(source.source, target.source)
+                    WHEN NOT MATCHED THEN INSERT *
+                """)
+
+            self._with_write_retry("MERGE", merge)
         finally:
             self._spark.catalog.dropTempView(view)
 
@@ -361,9 +516,12 @@ class _DeltaBackend:
         self._spark.createDataFrame([(k,) for k in keys], "kv_key STRING") \
             .createOrReplaceTempView(view)
         try:
-            self._spark.sql(
-                f"MERGE INTO {self._table} tgt USING {view} src "
-                f"ON tgt.kv_key = src.kv_key WHEN MATCHED THEN DELETE"
+            self._with_write_retry(
+                "DELETE",
+                lambda: self._spark.sql(
+                    f"MERGE INTO {self._table} tgt USING {view} src "
+                    f"ON tgt.kv_key = src.kv_key WHEN MATCHED THEN DELETE"
+                ),
             )
         finally:
             self._spark.catalog.dropTempView(view)
@@ -392,14 +550,166 @@ class _DeltaBackend:
         return len(keys)
 
     def clear(self) -> None:
-        self._spark.sql(f"DELETE FROM {self._table}")
+        self._with_write_retry("CLEAR", lambda: self._spark.sql(f"DELETE FROM {self._table}"))
 
     def count(self) -> int:
         return self._df().count()
 
+    def _latest_version(self) -> int:
+        row = self._spark.sql(f"DESCRIBE HISTORY {self._table} LIMIT 1").first()
+        return int(row.version) if row is not None else 0
+
+    def _ensure_audit_table(self) -> str:
+        if self._audit_table is None:
+            raise RuntimeError(
+                "CDF synchronization needs audit_table= so checkpoints and "
+                "the durable audit trail are outside the source memory table"
+            )
+        self._spark.sql(f"""
+            CREATE TABLE IF NOT EXISTS {self._audit_table} (
+                event_id         STRING NOT NULL,
+                consumer_id      STRING NOT NULL,
+                source_table     STRING NOT NULL,
+                kv_key           STRING,
+                change_type      STRING NOT NULL,
+                commit_version   BIGINT NOT NULL,
+                commit_timestamp TIMESTAMP,
+                value            STRING,
+                tags             STRING,
+                recorded_at      DOUBLE NOT NULL
+            )
+            USING DELTA
+        """)
+        return self._audit_table
+
+    @staticmethod
+    def _audit_event_id(
+        consumer_id: str, source_table: str, version: int, key: str, change_type: str
+    ) -> str:
+        # A source change is global and must be audited exactly once even
+        # when many cache consumers read it. Checkpoints are per consumer.
+        material = (
+            f"{consumer_id}\0{source_table}\0{version}\0{key}\0{change_type}"
+            if change_type == "checkpoint"
+            else f"{source_table}\0{version}\0{key}\0{change_type}"
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    def _audit_upsert(self, rows: list[tuple[Any, ...]]) -> None:
+        """Idempotently persist events and the consumer checkpoint together."""
+        audit = self._ensure_audit_table()
+        view = f"_kv_cdf_audit_{uuid.uuid4().hex}"
+        self._spark.createDataFrame(rows, schema=_audit_schema()).createOrReplaceTempView(view)
+        try:
+            self._with_write_retry(
+                "CDF audit MERGE",
+                lambda: self._spark.sql(f"""
+                    MERGE INTO {audit} AS target
+                    USING {view} AS source
+                      ON target.event_id = source.event_id
+                    WHEN MATCHED THEN UPDATE SET
+                        target.commit_version = source.commit_version,
+                        target.commit_timestamp = source.commit_timestamp,
+                        target.recorded_at = source.recorded_at
+                    WHEN NOT MATCHED THEN INSERT *
+                """),
+            )
+        finally:
+            self._spark.catalog.dropTempView(view)
+
+    def sync_cdf(self, consumer_id: str) -> CDFSyncResult:
+        """Read committed changes since *consumer_id*'s durable checkpoint.
+
+        The first invocation deliberately establishes a snapshot boundary
+        rather than pretending historical CDF exists. Later calls read whole
+        committed versions, write their audit rows and updated checkpoint to a
+        separate Delta table, then return the affected keys for local cache
+        invalidation.
+        """
+        if not isinstance(consumer_id, str) or not consumer_id.strip():
+            raise ValueError("CDF consumer_id must be a non-empty string")
+        audit = self._ensure_audit_table()
+        checkpoint_key = self._audit_event_id(
+            consumer_id, self._table_name, -1, "__checkpoint__", "checkpoint"
+        )
+        checkpoint_rows = (
+            self._spark.table(audit)
+            .filter(F.col("event_id") == checkpoint_key)
+            .select("commit_version")
+            .limit(1)
+            .collect()
+        )
+        latest = self._latest_version()
+        now = _now()
+        if not checkpoint_rows:
+            self._audit_upsert([
+                (
+                    checkpoint_key, consumer_id, self._table_name, None,
+                    "checkpoint", latest, None, None, None, now,
+                )
+            ])
+            return CDFSyncResult(baseline=True, checkpoint_version=latest)
+
+        checkpoint = int(checkpoint_rows[0].commit_version)
+        if checkpoint >= latest:
+            return CDFSyncResult(checkpoint_version=checkpoint)
+        changes = (
+            self._spark.read.format("delta")
+            .option("readChangeFeed", "true")
+            .option("startingVersion", checkpoint + 1)
+            .option("endingVersion", latest)
+            .table(self._table)
+            .collect()
+        )
+        events: list[dict[str, Any]] = []
+        audit_rows: list[tuple[Any, ...]] = []
+        for row in changes:
+            data = row.asDict(recursive=True)
+            key = str(data["kv_key"])
+            change_type = str(data["_change_type"])
+            version = int(data["_commit_version"])
+            event = {
+                "key": key,
+                "change_type": change_type,
+                "commit_version": version,
+                "commit_timestamp": data.get("_commit_timestamp"),
+            }
+            events.append(event)
+            audit_rows.append(
+                (
+                    self._audit_event_id(
+                        consumer_id, self._table_name, version, key, change_type
+                    ),
+                    consumer_id, self._table_name, key, change_type, version,
+                    data.get("_commit_timestamp"), data.get("value"),
+                    data.get("tags"), now,
+                )
+            )
+        audit_rows.append(
+            (
+                checkpoint_key, consumer_id, self._table_name, None,
+                "checkpoint", latest, None, None, None, now,
+            )
+        )
+        self._audit_upsert(audit_rows)
+        return CDFSyncResult(events=tuple(events), checkpoint_version=latest)
+
+    def operations(self) -> Dict[str, Any]:
+        """Lightweight table diagnostics used by the maintenance runbook."""
+        latest = self._spark.sql(f"DESCRIBE HISTORY {self._table} LIMIT 1").first()
+        detail = self._spark.sql(f"DESCRIBE DETAIL {self._table}").first()
+        return {
+            "table": self._table_name,
+            "latest_version": int(latest.version) if latest is not None else None,
+            "last_operation": getattr(latest, "operation", None),
+            "size_in_bytes": getattr(detail, "sizeInBytes", None),
+            "num_files": getattr(detail, "numFiles", None),
+            "audit_table": self._audit_table_name,
+        }
+
     @property
     def label(self) -> str:
-        return f"Delta:{self._table}"
+        return f"Delta:{self._table_name}"
 
 
 # ===========================================================================
@@ -448,9 +758,23 @@ class KVStore:
         self,
         spark: "SparkSession | None" = None,
         table: Optional[str] = None,
+        *,
+        audit_table: Optional[str] = None,
+        max_write_retries: int = 3,
     ) -> None:
         self._table = table
-        self._backend = _DeltaBackend(spark, table) if table else _InMemoryBackend()
+        if audit_table is not None and table is None:
+            raise ValueError("audit_table requires a Delta table")
+        self._backend = (
+            _DeltaBackend(
+                spark,
+                table,
+                audit_table=audit_table,
+                max_write_retries=max_write_retries,
+            )
+            if table
+            else _InMemoryBackend()
+        )
 
     # ---- CRUD --------------------------------------------------------------
 
@@ -639,6 +963,26 @@ class KVStore:
                 )
             )
         self._backend.replace_all(rows, now)
+
+    # ---- Delta change-feed / operations ----------------------------------
+
+    def sync_cdf(self, consumer_id: str) -> CDFSyncResult:
+        """Consume one consumer's CDF tail and return changed memory keys.
+
+        Available only when this store was configured with both a Delta
+        ``table`` and an independent ``audit_table``. The latter holds the
+        durable checkpoint and the audit trail, so VACUUM of the source table
+        cannot make a consumer silently lose its position.
+        """
+        sync = getattr(self._backend, "sync_cdf", None)
+        if sync is None:
+            raise RuntimeError("CDF synchronization requires a Delta-backed KVStore")
+        return sync(consumer_id)
+
+    def operations(self) -> Dict[str, Any]:
+        """Backend diagnostics suitable for a maintenance job or health check."""
+        operations = getattr(self._backend, "operations", None)
+        return operations() if operations is not None else {"backend": self._backend.label}
 
     # ---- Diagnostics -------------------------------------------------------
 
@@ -1273,6 +1617,18 @@ class ThreadMemoryManager:
         for thread in self._threads.values():
             thread._invalidate_cache()
 
+    def invalidate_for_keys(self, keys: Sequence[str]) -> None:
+        """Invalidate only cached threads affected by CDF change events."""
+        affected: set[str] = set()
+        for key in keys:
+            if key.startswith(("msg::", "chat::")):
+                remainder = key.split("::", 1)[1]
+                affected.add(remainder.rsplit("::", 1)[0])
+        for thread_id in affected:
+            thread = self._threads.get(thread_id)
+            if thread is not None:
+                thread._invalidate_cache()
+
     def thread_summary(self, thread_id: str) -> Dict[str, Any]:
         return self.get_thread(thread_id).get_session_metadata()
 
@@ -1491,8 +1847,22 @@ class MemoryHub:
         ranker: Any | None = None,
         retention_max_age_s: float | None = None,
         retention_max_messages: int | None = None,
+        *,
+        cdf_consumer_id: str | None = None,
+        cdf_audit_table: str | None = None,
+        max_write_retries: int = 3,
     ) -> None:
-        self._store = KVStore(spark=spark, table=table)
+        if cdf_consumer_id is not None and cdf_audit_table is None:
+            raise ValueError(
+                "cdf_consumer_id requires cdf_audit_table"
+            )
+        self._cdf_consumer_id = cdf_consumer_id
+        self._store = KVStore(
+            spark=spark,
+            table=table,
+            audit_table=cdf_audit_table,
+            max_write_retries=max_write_retries,
+        )
         self.threads = ThreadMemoryManager(
             store=self._store,
             max_age_s=retention_max_age_s,
@@ -1557,6 +1927,32 @@ class MemoryHub:
         # their append-only read caches no longer describe the store.
         self.threads.invalidate_caches()
 
+    def sync_changes(self) -> CDFSyncResult:
+        """Apply other processes' committed Delta changes to local caches.
+
+        Call this at a request boundary in every long-lived process. The first
+        call establishes the snapshot boundary and conservatively invalidates
+        every cached thread; later calls invalidate only threads with changed
+        ``msg::`` or ``chat::`` records.
+        """
+        if self._cdf_consumer_id is None:
+            raise RuntimeError(
+                "sync_changes requires cdf_consumer_id and cdf_audit_table"
+            )
+        result = self._store.sync_cdf(self._cdf_consumer_id)
+        if result.baseline:
+            self.threads.invalidate_caches()
+        else:
+            self.threads.invalidate_for_keys(
+                [str(event["key"]) for event in result.events]
+            )
+        return result
+
+    @property
+    def cdf_enabled(self) -> bool:
+        """Whether this hub has an explicitly configured CDF consumer."""
+        return self._cdf_consumer_id is not None
+
     def prune_thread(self, thread_id: str, before_ts: float) -> int:
         """Storage-side trim: delete *thread_id* messages older than
         *before_ts* (Unix seconds).  Returns the number removed."""
@@ -1565,6 +1961,7 @@ class MemoryHub:
     def summary(self) -> Dict[str, Any]:
         return {
             "store": self._store.stats(),
+            "operations": self._store.operations(),
             "threads": self.threads.list_threads(),
             "kv": self.kv.stats(),
         }

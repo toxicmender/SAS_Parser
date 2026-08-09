@@ -60,6 +60,28 @@ def test_null_means_unset(_isolated_config):
     assert app_config.get_value("sas_chunker", "min_words", 300) == 300
 
 
+def test_memory_table_values_require_catalog_schema_table(_isolated_config, caplog):
+    _set(
+        _isolated_config,
+        {
+            "memory": {
+                "delta_table": "main.agent.memory",
+                "cdf_audit_table": "main.agent.memory_audit",
+            }
+        },
+    )
+    assert app_config.memory_table_value("delta_table") == "main.agent.memory"
+    assert app_config.memory_table_value("cdf_audit_table") == "main.agent.memory_audit"
+
+    _set(_isolated_config, {"memory": {"delta_table": "agent.memory"}})
+    with caplog.at_level(logging.WARNING):
+        assert app_config.memory_table_value("delta_table") is None
+    assert "Catalog.Schema.Table" in caplog.text
+
+    with pytest.raises(KeyError, match="unknown memory table"):
+        app_config.memory_table_value("unknown")
+
+
 def test_resolve_precedence_explicit_beats_config(_isolated_config):
     _set(_isolated_config, {"sas_chunker": {"min_words": 42}})
     assert app_config.resolve(7, "sas_chunker", "min_words", 300) == 7
@@ -161,6 +183,10 @@ def test_repo_config_json_matches_code_defaults():
             "validator": {"timeout": None, "model": None},
             "complexity": {"timeout": None, "model": None},
         },
+    }
+    assert repo_cfg["memory"] == {
+        "delta_table": None,
+        "cdf_audit_table": None,
     }
     # The one section that ships non-null: the bundled target instruction
     # sets are on by default. max_tokens is set with them so

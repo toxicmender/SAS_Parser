@@ -35,6 +35,7 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+import app_config
 from app_config.spark import describe_master, master_url
 from memory.context import MemoryContext
 from memory.extractor import MemoryExtractor
@@ -70,7 +71,10 @@ class MemorySetup:
     Fields carry exactly the semantics of the same-named ``SasLLMPipeline``
     keyword arguments (see its docstring): ``memory`` is a pre-built
     :class:`MemoryHub` (default: in-memory store, or Delta when
-    ``delta_table`` is set); ``task_id`` / ``task_policy`` name or carry the
+    ``delta_table`` or config.json ``memory.delta_table`` is set);
+    ``cdf_audit_table`` likewise falls back to config.json
+    ``memory.cdf_audit_table``; both configured names must be
+    ``Catalog.Schema.Table``. ``task_id`` / ``task_policy`` name or carry the
     long-term policy; ``thread_memory`` holds short-term notes (implied by a
     ``memory_extractor`` when omitted); ``chat_id`` identifies this
     instance's span of every thread it writes; ``window_k`` /
@@ -86,6 +90,9 @@ class MemorySetup:
     chat_id: str | None = None
     spark: "SparkSession | None" = None
     delta_table: str | None = None
+    cdf_consumer_id: str | None = None
+    cdf_audit_table: str | None = None
+    max_delta_write_retries: int = 3
     # History policy: which of the stored turns are actually prompted. It
     # belongs here rather than in a group of its own because it is the same
     # subject as the store — what is remembered versus what is re-sent — and
@@ -104,7 +111,18 @@ class MemorySetup:
         memories) and shares the policy/thread memory unless it brought its
         own.
         """
-        hub = self.memory or self._default_hub(self.spark, self.delta_table)
+        delta_table = self.delta_table or app_config.memory_table_value("delta_table")
+        cdf_audit_table = (
+            self.cdf_audit_table
+            or app_config.memory_table_value("cdf_audit_table")
+        )
+        hub = self.memory or self._default_hub(
+            self.spark,
+            delta_table,
+            cdf_consumer_id=self.cdf_consumer_id,
+            cdf_audit_table=cdf_audit_table,
+            max_write_retries=self.max_delta_write_retries,
+        )
         chat_id = self.chat_id or uuid.uuid4().hex[:12]
 
         task_id = self.task_id
@@ -145,9 +163,16 @@ class MemorySetup:
 
     @staticmethod
     def _default_hub(
-        spark: "SparkSession | None", delta_table: str | None
+        spark: "SparkSession | None",
+        delta_table: str | None,
+        *,
+        cdf_consumer_id: str | None = None,
+        cdf_audit_table: str | None = None,
+        max_write_retries: int = 3,
     ) -> MemoryHub:
         if delta_table is None:
+            if cdf_consumer_id is not None or cdf_audit_table is not None:
+                raise ValueError("CDF settings require MemorySetup.delta_table")
             # In-memory store never touches Spark, so don't boot a JVM session.
             logger.info(
                 "MemorySetup: in-memory message store (no Delta table, no "
@@ -167,7 +192,13 @@ class MemorySetup:
                 .appName("chunker_pipeline")
                 .getOrCreate()
             )
-        return MemoryHub(spark=spark, table=delta_table)
+        return MemoryHub(
+            spark=spark,
+            table=delta_table,
+            cdf_consumer_id=cdf_consumer_id,
+            cdf_audit_table=cdf_audit_table,
+            max_write_retries=max_write_retries,
+        )
 
 
 @dataclass
