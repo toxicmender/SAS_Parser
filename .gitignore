@@ -26,3 +26,6 @@ pyright.json
 
 # Reference PDFs — user-provided, copyrighted SAS/O'Reilly manuals; never commit
 reference_docs/
+
+# Claude Code worktrees
+.claude/worktrees/
