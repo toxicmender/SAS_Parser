@@ -1,4 +1,4 @@
-## [lang: pyspark] Macro processing
+## [meta: invokes_macros, defines_macros, produces_macrovars] [lang: pyspark] Macro processing
 
 SAS macro expansion happens before execution and has no DataFrame equivalent.
 Resolve known macro variables into Python constants or notebook parameters;

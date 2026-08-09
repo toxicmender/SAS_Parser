@@ -1,4 +1,4 @@
-## [lang: pyspark] DATA step translation
+## [kind: DATA_STEP] [lang: pyspark] DATA step translation
 
 Read tables with `spark.table("catalog.schema.table")` and write managed
 tables with `write.mode(...).saveAsTable(...)`. Translate row expressions with

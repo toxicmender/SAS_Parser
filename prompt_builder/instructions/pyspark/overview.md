@@ -1,4 +1,4 @@
-## [lang: pyspark] Databricks PySpark target
+## [kind: DATA_STEP, PROC_STEP] [lang: pyspark] Databricks PySpark target
 
 Emit executable PySpark DataFrame code for a Databricks notebook. Import
 `pyspark.sql.functions as F` and use the existing `spark` session; do not

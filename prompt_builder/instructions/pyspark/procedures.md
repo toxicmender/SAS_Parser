@@ -1,4 +1,4 @@
-## [lang: pyspark] Procedures and summaries
+## [kind: PROC_STEP] [lang: pyspark] Procedures and summaries
 
 Use `groupBy().agg()` with named `pyspark.sql.functions` aggregates for PROC
 MEANS, SUMMARY, and FREQ-style summaries. Use `join` with an explicit join
