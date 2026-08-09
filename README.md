@@ -9,13 +9,19 @@ to convert and with which model, the scripts come out of the document library,
 and the notebooks go back into it. A local directory of `.sas` files is the
 offline fallback.
 
-## Install
+## Requirements and installation
+
+- Python 3.12 or later
+- [uv](https://docs.astral.sh/uv/)
+
+Install the core dependencies from the repository root:
 
 ```bash
 uv sync
 ```
 
-Optional extras, each pulling only what it needs:
+The core install supports local conversion with an OpenAI-compatible API key.
+Add only the integrations your run needs:
 
 | Extra | For |
 |---|---|
@@ -25,30 +31,101 @@ Optional extras, each pulling only what it needs:
 | `databricks` | Workspace and SQL warehouse access |
 | `spark` | Delta-backed conversation memory and validation tracking |
 | `graph` | The complexity report's dependency-graph PNG |
-| `sql` | Real SQL parsing for the Spark SQL syntax check and the XREF post-rewriter |
 | `dev` | pytest, ruff, and the test-only dependencies |
 
-A real run wants `uv pip install -e ".[sharepoint,vault,azure]"`.
-
-## Running a conversion
+For example, a SharePoint run using the default AI Gateway credential chain
+needs:
 
 ```bash
-python main.py                              # every pending request row
-python main.py --request-id 42              # one row
-python main.py --app "MyApp"                # one application's rows
-python main.py --no-upload                  # dry run: convert, write nothing back
-python main.py path/to/sas --out-dir out/   # the local fallback
-python main.py path/to/sas --md report.md --pdf report.pdf
+uv sync --extra sharepoint --extra vault --extra azure
 ```
 
-Installed as a console script, so `sas-parser --app MyApp` is the same command.
-`python main.py --help` lists every flag.
+`sqlglot`, used for Spark SQL checks and XREF post-rewriting, is included in
+the core install; there is no separate `sql` extra.
 
-The mode is explicit either way — a positional path means local, its absence
-means SharePoint. Nothing falls back silently: converting the wrong corpus
-because a config key was missing is worse than a clear error.
+## Usage
 
-### What a SharePoint run does
+The command has two deliberately separate modes. Supplying a source directory
+runs locally; omitting it reads the SharePoint request list. The program
+rejects flags that belong to the other mode instead of silently ignoring them.
+
+| Mode | Command shape | Delivers output to |
+|---|---|---|
+| Local | `sas-parser <sas-directory> [options]` | Standard output and, when requested, local notebooks/reports |
+| SharePoint (default) | `sas-parser [options]` | The configured SharePoint document library and request list |
+
+Run `uv run sas-parser --help` for the complete, installed command reference.
+`python main.py ...` is equivalent when running from a checkout.
+
+### Local conversion
+
+For a direct local run, set `OPENAI_API_KEY` in your shell or in an untracked
+`.env` file. `.env` is loaded automatically from the working directory (or a
+parent); an already-exported environment variable wins. Use
+[`.env.example`](.env.example) as the annotated list of supported settings,
+but never copy its placeholder credentials into a real environment.
+
+From the repository root, convert every `.sas` file under a directory and
+write notebooks plus validation reports:
+
+```bash
+uv run sas-parser path/to/sas --out-dir out/ --md reports/validation.md --pdf reports/validation.pdf --no-gateway-auth
+```
+
+This command recursively discovers `*.sas` files, converts the application as
+one corpus so cross-file dependencies can be resolved, prints each generated
+translation, and writes one notebook per source file. A batch spanning files
+also produces `_cross_file.ipynb`. `--out-dir` is optional: without it,
+translations are printed but no notebooks are written.
+
+Useful local options:
+
+```bash
+# Use a different filename pattern and emit PySpark instead of the configured target.
+uv run sas-parser path/to/sas --pattern "*.SAS" --output-language PySpark --out-dir out/
+
+# Choose the model exposed by the gateway and retain run memory in Delta.
+uv run sas-parser path/to/sas --model <gateway-model-id> --delta-table default.sas_parser_memory
+
+# Score output but do not retry failed validation checks.
+uv run sas-parser path/to/sas --validation-retries 0
+
+# Disable inline validation. Markdown/PDF validation reports are then not produced.
+uv run sas-parser path/to/sas --no-validate
+```
+
+The supported targets are `PySpark` and `Spark SQL` (case and spacing are
+normalized). `--md` and `--pdf` write reports only when inline validation is
+enabled, which is the default. Passing `--delta-table` requires the `spark`
+extra and starts a Spark session; otherwise run memory remains in process.
+
+### SharePoint conversion
+
+Configure the SharePoint site, document library, list identifiers, and
+credential chain in `config.json` and/or environment variables before running
+this mode. See [Configuration](#configuration) below. By default, only
+pending request rows are selected.
+
+```bash
+# Convert every pending request row.
+uv run sas-parser
+
+# Convert one request row, or all pending rows for one application.
+uv run sas-parser --request-id 42
+uv run sas-parser --app "MyApp"
+
+# Re-run completed rows as well, without writing files or changing row status.
+uv run sas-parser --all-rows --no-upload
+
+# Convert without applying the application's XREF mappings.
+uv run sas-parser --app "MyApp" --no-xref
+```
+
+`--request-id` and `--app` are mutually exclusive. `--no-upload` is a real
+conversion dry run: it still reads source files and calls the model, but does
+not upload notebooks or update request status.
+
+#### What a SharePoint run does
 
 1. Reads the pending rows of the requests list.
 2. Pulls each application's scripts from `{base}/{app}/scripts_original`.
@@ -75,14 +152,21 @@ python -m validation --help                           # the offline validation s
 
 ## Configuration
 
-Everything non-secret lives in [`config.json`](config.json), which documents
-each section inline. Every key is also readable from an environment variable
-that **wins over the file** — see [`.env.example`](.env.example) for the full
-list. Secrets are never read from `config.json`.
+Start with [`config.json`](config.json) for non-secret defaults and
+[`.env.example`](.env.example) for the environment-variable names and
+credential setup. Keep secrets in your shell, an untracked `.env`, Databricks
+secret scopes, or Vault — never in `config.json`.
 
 Precedence is the same everywhere: **explicit argument > environment variable >
 `config.json` > code default**. A JSON `null` means "unset", so a template
 config listing every key changes nothing until edited.
+
+For a local direct-key run, the minimum configuration is `OPENAI_API_KEY`
+(plus a gateway base URL when your deployment needs one). For a SharePoint
+run, configure the site (`SHAREPOINT_SITE_ID` or hostname/path), document
+library, request/conversion list IDs, and an Entra ID credential source. The
+example file documents the optional Vault, Databricks, XREF, and Docker
+settings as well.
 
 ### Credentials
 
