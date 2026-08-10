@@ -422,6 +422,85 @@ def test_hostname_without_path_has_no_site_id():
 
 
 # ---------------------------------------------------------------------------
+# Describing a failure
+#
+# ODataError's own str() is frequently empty or just the class name, so
+# _describe reaches for the fields that actually diagnose the call. Duck-typed
+# stand-ins here rather than the SDK's classes, matching how _describe reads
+# them and keeping these runnable without the sharepoint extra.
+# ---------------------------------------------------------------------------
+
+
+class _MainError:
+    def __init__(self, code=None, message=None):
+        self.code = code
+        self.message = message
+
+
+class _Headers:
+    """kiota's HeadersCollection returns a *set* of values per header."""
+
+    def __init__(self, values):
+        self._values = values
+
+    def get(self, name):
+        return self._values.get(name)
+
+
+class _ODataError(Exception):
+    def __init__(self, status=None, code=None, message=None, request_id=None):
+        super().__init__("")  # the SDK's own str() is routinely empty
+        self.response_status_code = status
+        self.error = _MainError(code, message)
+        self.response_headers = (
+            _Headers({"client-request-id": {request_id}}) if request_id else None
+        )
+
+
+def test_describe_unpacks_a_graph_error():
+    described = sharepoint._describe(
+        _ODataError(403, "accessDenied", "Access denied", "req-1")
+    )
+    assert "HTTP 403" in described
+    assert "accessDenied" in described
+    assert "Access denied" in described
+    assert "request-id=req-1" in described
+
+
+def test_describe_reports_a_throttling_response():
+    described = sharepoint._describe(_ODataError(429, "activityLimitReached", "Slow"))
+    assert "HTTP 429" in described
+    assert "activityLimitReached" in described
+
+
+def test_describe_falls_back_to_type_and_message_for_a_plain_error():
+    described = sharepoint._describe(OSError("network down"))
+    assert described == "OSError: network down"
+
+
+def test_describe_names_the_type_when_there_is_nothing_else():
+    class _Silent(Exception):
+        pass
+
+    assert sharepoint._describe(_Silent()) == "_Silent"
+
+
+def test_describe_survives_an_unexpected_header_bag():
+    class _Hostile(Exception):
+        response_status_code = 500
+        response_headers = "not a mapping"
+
+    assert "HTTP 500" in sharepoint._describe(_Hostile())
+
+
+def test_describe_does_not_repeat_the_message_twice():
+    """`error.message` and `str(exc)` are often the same string."""
+    exc = _ODataError(404, "itemNotFound", "The resource could not be found")
+    described = sharepoint._describe(exc)
+    assert described.count("The resource could not be found") == 1
+
+
+# ---------------------------------------------------------------------------
 # Path -> drive-item id addressing
 # ---------------------------------------------------------------------------
 
@@ -496,6 +575,25 @@ def test_list_directory_wraps_errors():
     client, _ = _client(item=_ItemBuilder(children=_Boom([_Collection([])])))
     with pytest.raises(sharepoint.SharePointError, match="could not list SharePoint"):
         client.list_directory("Reports")
+
+
+def test_a_wrapped_graph_error_carries_its_status_and_code():
+    """The wrap must not flatten a Graph failure into an unreadable repr: the
+    status and error code are what say whether this is consent, a wrong path,
+    or throttling."""
+
+    class _Boom(_ChildrenBuilder):
+        def _get(self, config=None):
+            raise _ODataError(403, "accessDenied", "Access denied", "req-42")
+
+    client, _ = _client(item=_ItemBuilder(children=_Boom([_Collection([])])))
+    with pytest.raises(sharepoint.SharePointError) as caught:
+        client.list_directory("Reports")
+
+    message = str(caught.value)
+    assert "HTTP 403" in message
+    assert "accessDenied" in message
+    assert "req-42" in message
 
 
 # ---------------------------------------------------------------------------

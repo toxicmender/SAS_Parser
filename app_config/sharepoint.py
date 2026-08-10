@@ -144,6 +144,70 @@ class SharePointError(RuntimeError):
     """
 
 
+def _request_id(exc: BaseException) -> str | None:
+    """The Graph correlation id from a failed call's response headers, if any.
+
+    ``client-request-id`` is the value Microsoft support asks for when a call
+    has to be traced service-side, so it is the one part of a Graph failure
+    worth carrying into our own message.
+    """
+    headers = getattr(exc, "response_headers", None)
+    if headers is None:
+        return None
+    for name in ("client-request-id", "request-id"):
+        try:
+            value = headers.get(name)
+        except Exception:  # a header bag of an unexpected shape is not a failure
+            return None
+        if not value:
+            continue
+        # kiota's HeadersCollection returns the values as a set.
+        if isinstance(value, (set, frozenset, list, tuple)):
+            joined = ", ".join(sorted(str(item) for item in value))
+            if joined:
+                return joined
+            continue
+        return str(value)
+    return None
+
+
+def _describe(exc: BaseException) -> str:
+    """
+    *exc* as a one-line description worth putting in a :class:`SharePointError`.
+
+    A Graph failure arrives as the SDK's ``ODataError``, whose ``str()`` is
+    frequently empty or just the class name — which leaves a reader unable to
+    tell 403 (the app registration lacks the consented permission) from 404
+    (the configured path does not exist) from 429 (throttled), the three
+    outcomes a misconfigured deployment actually produces. The status code,
+    the Graph error code, the service's own message and the correlation id are
+    all on the object; this pulls out whichever are present.
+
+    Duck-typed rather than importing ``ODataError``, so it stays usable when
+    the ``sharepoint`` extra is not installed and when the failure is an
+    ordinary ``httpx`` or TLS error instead.
+    """
+    parts: list[str] = []
+    status = getattr(exc, "response_status_code", None)
+    if status:
+        parts.append(f"HTTP {status}")
+    error = getattr(exc, "error", None)
+    code = getattr(error, "code", None)
+    if code:
+        parts.append(str(code))
+    text = str(
+        getattr(error, "message", None) or getattr(exc, "message", None) or exc
+    ).strip()
+    if text and text not in parts:
+        parts.append(text)
+    request_id = _request_id(exc)
+    if request_id:
+        parts.append(f"request-id={request_id}")
+    detail = "; ".join(parts)
+    name = type(exc).__name__
+    return f"{name}: {detail}" if detail else name
+
+
 def _drive_item_id(path: str) -> str:
     """
     The Graph drive-item id for a path *relative to the library root*: the
@@ -771,7 +835,7 @@ class SharePointClient:
             raise
         except Exception as exc:
             raise SharePointError(
-                f"could not list SharePoint directory {path or '/'!r}: {exc}"
+                f"could not list SharePoint directory {path or '/'!r}: {_describe(exc)}"
             ) from exc
 
     def list_files(
@@ -839,7 +903,7 @@ class SharePointClient:
             raise
         except Exception as exc:
             raise SharePointError(
-                f"could not read SharePoint file {path!r}: {exc}"
+                f"could not read SharePoint file {path!r}: {_describe(exc)}"
             ) from exc
         if content is None:
             raise SharePointError(f"SharePoint file {path!r} returned no content")
@@ -907,7 +971,7 @@ class SharePointClient:
             raise
         except Exception as exc:
             raise SharePointError(
-                f"could not write SharePoint file {path!r}: {exc}"
+                f"could not write SharePoint file {path!r}: {_describe(exc)}"
             ) from exc
         return _drive_item_to_dict(item)
 
@@ -997,7 +1061,7 @@ class SharePointClient:
             raise
         except Exception as exc:
             raise SharePointError(
-                f"could not create SharePoint directory {path!r}: {exc}"
+                f"could not create SharePoint directory {path!r}: {_describe(exc)}"
             ) from exc
         return _drive_item_to_dict(item)
 
@@ -1055,7 +1119,7 @@ class SharePointClient:
             raise
         except Exception as exc:
             raise SharePointError(
-                f"could not read SharePoint list {list_name!r}: {exc}"
+                f"could not read SharePoint list {list_name!r}: {_describe(exc)}"
             ) from exc
 
     async def _collect_list_items(
@@ -1119,7 +1183,7 @@ class SharePointClient:
         except Exception as exc:
             raise SharePointError(
                 f"could not read item {item_id!r} of SharePoint list "
-                f"{list_id!r}: {exc}"
+                f"{list_id!r}: {_describe(exc)}"
             ) from exc
         if item is None:
             raise SharePointError(
@@ -1159,7 +1223,7 @@ class SharePointClient:
         except Exception as exc:
             raise SharePointError(
                 f"could not update item {item_id!r} of SharePoint list "
-                f"{list_id!r}: {exc}"
+                f"{list_id!r}: {_describe(exc)}"
             ) from exc
         data = getattr(updated, "additional_data", None)
         logger.info(

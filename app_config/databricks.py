@@ -724,7 +724,45 @@ def _bootstrap_client(config: DatabricksConfig, scope: str):
         params["host"] = config.host
     if config.token:
         params["token"] = config.token
-    return WorkspaceClient(**params)
+    try:
+        return WorkspaceClient(**params)
+    except Exception as exc:
+        raise DatabricksError(_bootstrap_failure(scope, in_runtime, exc)) from exc
+
+
+def _subprocess_hint() -> str:
+    """The "you are in a child process" note, when that is a live possibility.
+
+    Called out by name because it is invisible from the error the SDK raises.
+    ``DATABRICKS_RUNTIME_VERSION`` is inherited by any child process on a
+    cluster, so :func:`in_databricks_runtime` is ``True`` inside a
+    ``!python …`` shell cell — but the notebook's *credential* lives in the
+    REPL process, not in the environment, so the child inherits the detection
+    without the authentication. The SDK then walks its whole auth chain and
+    ends up shelling out to ``az account show``, which reports something about
+    the Azure CLI and nothing about the real cause.
+
+    Empty off-cluster and when a PAT is set, where neither applies.
+    """
+    if not in_databricks_runtime() or os.environ.get("DATABRICKS_TOKEN"):
+        return ""
+    return (
+        ". This process looks like a Databricks cluster but has no workspace "
+        "credential. If it is a '!python ...' or subprocess cell, that is the "
+        "cause: only DATABRICKS_RUNTIME_VERSION is inherited by child "
+        "processes, not the notebook's credential. Run it in the notebook's "
+        "own Python (import the module and call it, or use %run) so dbutils is "
+        "available, or set DATABRICKS_TOKEN for the child process"
+    )
+
+
+def _bootstrap_failure(scope: str, in_runtime: bool, exc: Exception) -> str:
+    """Why the bootstrap client could not be built, and what to do about it."""
+    detail = f"{type(exc).__name__}: {exc}"
+    return (
+        f"could not build a Databricks client to read secret scope "
+        f"'{scope}': {detail}" + _subprocess_hint()
+    )
 
 
 def read_workspace_secrets(
@@ -755,9 +793,13 @@ def read_workspace_secrets(
         try:
             value = client.dbutils.secrets.get(scope, key)
         except Exception as exc:
+            # The SDK resolves its credentials lazily, so an unauthenticated
+            # client is built without complaint and fails here instead — which
+            # is why the subprocess hint belongs on this path too.
             raise DatabricksError(
                 f"could not read secret '{key}' from Databricks scope "
-                f"'{scope}': {exc}"
+                f"'{scope}': {type(exc).__name__}: {exc}"
+                + _subprocess_hint()
             ) from exc
         if not value:
             raise DatabricksError(
