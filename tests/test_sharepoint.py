@@ -16,6 +16,7 @@ import importlib.util
 import json
 import pathlib
 import sys
+import threading
 from typing import Any
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -775,20 +776,70 @@ def test_missing_sdk_raises_helpful_error(monkeypatch, _isolated):
 
 
 # ---------------------------------------------------------------------------
-# Synchronous facade guardrail
+# Synchronous facade
+#
+# The blocking methods run on the client's own worker thread, which is what
+# lets them be called from a caller that already has an event loop running.
+# A Jupyter or Databricks notebook keeps a loop in its main thread for the
+# whole session, so a facade that refused those calls refused to work in the
+# deployment target this package exists to serve.
 # ---------------------------------------------------------------------------
 
 
-def test_calling_from_a_running_loop_raises():
-    client, _ = _client(item=_ItemBuilder(content=_ContentBuilder(get_value=b"x")))
+def test_a_call_from_a_running_loop_returns_the_same_result():
+    item = _ItemBuilder(content=_ContentBuilder(get_value=b"payload"))
+    client, _ = _client(item=item)
 
     async def _inside():
-        # Inside a running loop the blocking facade must refuse rather than
-        # nest and strand the httpx pool on another loop.
-        client.read_file("a.txt")
+        return client.read_file("a.txt")
 
-    with pytest.raises(sharepoint.SharePointError, match="running event loop"):
+    assert asyncio.run(_inside()) == b"payload"
+    # And the same client still works from ordinary synchronous code after.
+    assert client.read_file("a.txt") == b"payload"
+
+
+def test_an_error_from_a_running_loop_still_surfaces():
+    """The worker thread must re-raise, not swallow or wrap in a Future error."""
+
+    class _Boom(_ChildrenBuilder):
+        def _get(self, config=None):
+            raise OSError("network down")
+
+    client, _ = _client(item=_ItemBuilder(children=_Boom([_Collection([])])))
+
+    async def _inside():
+        client.list_directory("Reports")
+
+    with pytest.raises(sharepoint.SharePointError, match="could not list SharePoint"):
         asyncio.run(_inside())
+
+
+def test_the_worker_is_one_thread_and_is_reused():
+    seen: list[str] = []
+
+    class _Watching(_ChildrenBuilder):
+        def _get(self, config=None):
+            seen.append(threading.current_thread().name)
+            return super()._get(config)
+
+    client, _ = _client(item=_ItemBuilder(children=_Watching([_Collection([])] * 3)))
+    client.list_directory()
+    client.list_directory()
+
+    assert len(set(seen)) == 1  # one worker for the client's lifetime
+    assert seen[0] != threading.current_thread().name  # and not the caller's
+
+
+def test_close_shuts_the_worker_down_and_the_client_rebuilds():
+    item = _ItemBuilder(content=_ContentBuilder(get_value=b"x"))
+    client, _ = _client(item=item)
+    assert client.read_file("a.txt") == b"x"
+
+    client.close()
+
+    # Single-use is about the loop and thread, not the client object: the next
+    # call builds both again rather than failing.
+    assert client.read_file("a.txt") == b"x"
 
 
 # ---------------------------------------------------------------------------

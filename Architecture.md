@@ -869,6 +869,17 @@ any of these silently changes behavior.
      ended up reading from the drive root and writing to `{app}/output/`
      instead of `{base}/{app}/scripts_converted/{model}/{timestamp}`.
 
+13. **`SharePointClient` owns a worker thread, not just a loop.** The blocking
+    facade must stay callable from a caller that already has a running event
+    loop, because a Jupyter or Databricks notebook keeps one in its main thread
+    for the whole session — and SharePoint mode is deployed *in* a notebook.
+    Blocking on the calling thread (`run_until_complete` there) made every
+    SharePoint operation raise inside the deployment target. The invariant that
+    actually matters is that the `httpx` connection pool stays bound to one
+    loop driven by one thread; `max_workers=1` gets that unconditionally and
+    stops caring what the caller's thread is doing. Corollary: one client
+    serialises its calls, so it is not a way to parallelise Graph traffic.
+
 ## Conventions
 
 - **Logging:** f-string messages everywhere (never lazy `%`-style).

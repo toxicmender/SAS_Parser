@@ -47,11 +47,15 @@ Synchronous facade
 ------------------
 The Graph SDK is asynchronous; every method here is an ordinary blocking call,
 to match the rest of the package. Each :class:`SharePointClient` owns one
-private event loop and drives its coroutines to completion on it
+private event loop *and one worker thread to drive it*
 (:meth:`~SharePointClient._run`), so the underlying ``httpx`` connection pool
-stays bound to a single loop. Calling these methods from *inside* a running
-event loop is therefore rejected with a clear error — use them from synchronous
-code, or drive the Graph SDK directly.
+stays bound to a single loop driven by a single thread.
+
+Owning the thread is what makes these methods safe to call from anywhere,
+including from a thread that already has a loop of its own running — which a
+Jupyter or Databricks notebook always does. Calls are serialised onto that one
+worker, so one client is not a way to parallelise Graph traffic; use several
+clients, or the ``msgraph-sdk`` client directly, for that.
 
 Dependency
 ----------
@@ -86,6 +90,7 @@ import json
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -539,6 +544,7 @@ class SharePointClient:
         self._credential = credential
         self._resolved_drive_id: str | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._pool: ThreadPoolExecutor | None = None
 
     # -- client construction ------------------------------------------------
 
@@ -599,31 +605,61 @@ class SharePointClient:
 
     # -- async plumbing -----------------------------------------------------
 
+    def _executor(self) -> ThreadPoolExecutor:
+        """This client's single worker thread, created on first use."""
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="sharepoint"
+            )
+        return self._pool
+
     def _run(self, coro: Any) -> Any:
         """
-        Drive *coro* to completion on this client's private event loop.
+        Drive *coro* to completion on this client's private event loop, which
+        runs on a worker thread of its own.
 
-        Raising rather than nesting when a loop is already running keeps the
-        ``httpx`` connection pool bound to one loop; an async caller should
-        drive the Graph SDK directly instead of through this blocking facade.
+        The property that matters is that the ``httpx`` connection pool stays
+        bound to exactly one loop, driven by exactly one thread. Owning a
+        thread gets that unconditionally, and — unlike blocking on the calling
+        thread — it does not care whether the caller already has a loop of its
+        own running.
+
+        That last part is not a nicety. A Jupyter or Databricks notebook runs
+        an asyncio loop in its main thread for the whole session, so a facade
+        that refused to be called from a running loop refused to be called
+        from a notebook at all: the deployment target this package exists to
+        serve. ``max_workers=1`` keeps calls serialised, so the loop is never
+        driven from two threads at once.
         """
         try:
-            asyncio.get_running_loop()
+            running = asyncio.get_running_loop()
         except RuntimeError:
-            pass
-        else:
+            running = None
+        if running is not None and running is self._loop:
+            # Submitting here would block the worker thread on itself. The
+            # helpers that run inside `_run` must await the `*_async` form
+            # (see `_item_async`) rather than call a synchronous method.
             coro.close()
             raise SharePointError(
-                "SharePointClient's synchronous methods cannot be called from a "
-                "running event loop; call them from synchronous code, or use the "
-                "msgraph-sdk client directly for async access"
+                "SharePointClient._run was re-entered from its own event loop: "
+                "a coroutine helper called a synchronous method instead of "
+                "awaiting the corresponding *_async one"
             )
         if self._loop is None or self._loop.is_closed():
             self._loop = asyncio.new_event_loop()
-        return self._loop.run_until_complete(coro)
+        loop = self._loop
+        return self._executor().submit(loop.run_until_complete, coro).result()
 
     def close(self) -> None:
-        """Close the private event loop (if any). The client is single-use after."""
+        """Close the worker thread and the private event loop (if any).
+
+        The client is single-use after: the next call builds both again. The
+        thread is shut down first, so nothing is still running on the loop
+        when it is closed.
+        """
+        if self._pool is not None:
+            self._pool.shutdown(wait=True)
+            self._pool = None
         if self._loop is not None and not self._loop.is_closed():
             self._loop.close()
         self._loop = None
