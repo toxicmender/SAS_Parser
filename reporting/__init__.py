@@ -1,13 +1,4 @@
-"""Rendering reports for delivery — currently, Markdown to PDF.
-
-A leaf package: it imports ``markdown_it`` and ``pymupdf`` and nothing from
-this repo, so any layer may depend on it without a cycle. It exists because
-:mod:`complexity` and :mod:`validation` both had a Markdown-to-PDF renderer,
-running the same paging loop against two stylesheets that had drifted apart —
-and the weaker copy was the one an operator actually received.
-
-Logger names: ``reporting.*``.
-"""
+"""Shared Markdown-to-PDF reporting utilities. See ``reporting/README.md``."""
 
 from __future__ import annotations
 

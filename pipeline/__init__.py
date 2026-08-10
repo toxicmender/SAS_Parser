@@ -1,18 +1,9 @@
-"""SAS → target-language LLM pipeline: orchestration, prompt templates,
-structured response models, and the notebook deliverable.
-
-Sits above ``chunker``, ``memory``, ``llm_client``, and ``prompt_builder`` —
-the only package that imports all four. ``SasLLMPipeline`` is resolved
-lazily so that importing the response models or the notebook renderer never
-pulls in langchain/langgraph.
-"""
+"""LLM conversion pipeline and notebook renderer. See ``pipeline/README.md``."""
 
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    # Static-only imports so type checkers resolve the lazily-served names
-    # precisely: without these, the union of __getattr__'s return statements
-    # (type[SasLLMPipeline] | type[MemorySetup]) leaks into every caller.
+    # Keep lazy exports precise for type checkers.
     from .engine import SasLLMPipeline as SasLLMPipeline
     from .setup import MemorySetup as MemorySetup
 

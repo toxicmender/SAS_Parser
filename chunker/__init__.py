@@ -1,9 +1,4 @@
-"""SAS semantic chunker and dependency batcher. See chunker/README.md.
-
-The LLM orchestration layer, structured response models, and notebook
-renderer live in the top-level ``pipeline`` package. They were once
-re-exported here; those bridges are gone, so import them from ``pipeline``.
-"""
+"""SAS semantic chunking and dependency batching. See ``chunker/README.md``."""
 
 from .batcher import (
     MultiFileBatcher,

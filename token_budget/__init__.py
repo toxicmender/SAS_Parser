@@ -1,38 +1,4 @@
-"""Shared tiktoken-backed token estimation — how many tokens a piece of text
-will cost, in one place.
-
-A **leaf package**: imports nothing from the repo and nothing from langchain
-(messages are duck-typed). That is the whole reason it is a package rather than
-a module inside ``llm_client``. Everything that budgets prompt space needs to
-count tokens — ``llm_client`` for its input budget, ``pipeline`` for batch
-packing, ``prompt_builder`` for the retrieval budget — but importing
-``llm_client.tokens`` executes ``llm_client/__init__.py``, which pulls in
-langchain: measured at 7.5s and 1,642 modules, in packages that are otherwise
-langchain-free and deliberately so. Same reasoning that made
-``target_language`` its own package.
-
-One vocabulary question, answered in one place: which encoding estimates
-tokens for a given gateway model id. Resolution is by explicit prefix map —
-never ``tiktoken.encoding_for_model``, whose lookup raises ``KeyError`` for
-any name it does not know (``"gpt-5.4"`` included, since tiktoken's table
-keys on ``"gpt-5-"`` with a dash) — so an unknown or non-OpenAI model id can
-never fail a call mid-run:
-
-- ``gpt-5*`` / ``gpt-4o*`` / ``gpt-4.1*`` / ``o1``/``o3``/``o4`` reasoning
-  ids → ``o200k_base`` (their real vocabulary);
-- ``gpt-4*`` / ``gpt-3.5*`` (the older families) → ``cl100k_base``;
-- anything else — Claude, Gemini, a future id — → ``o200k_base``: a real
-  tokenizer run under a stand-in vocabulary, an estimate but far closer than
-  a chars//4 guess.
-
-Loading an encoding needs its BPE data file (tiktoken fetches it over the
-network on first use and caches it). Where that fails — offline, a blocking
-proxy — every counter here degrades to the ~4-chars/token approximation with
-a one-time WARNING per encoding, and the failure is cached so later calls do
-not re-pay the fetch attempt.
-
-Logger name: ``token_budget``.
-"""
+"""Shared, offline-tolerant token estimation. See ``token_budget/README.md``."""
 
 from __future__ import annotations
 
@@ -41,17 +7,14 @@ from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
 
-# Offline approximation: ~4 characters per token for English text and code.
+# Offline fallback: roughly four characters per token.
 _FALLBACK_CHARS_PER_TOKEN = 4
 
-# ChatML-style per-message accounting, as langchain-openai counts it for the
-# modern GPT families: ~3 tokens of framing per message plus ~3 priming the
-# assistant reply. Constants, not gospel — the budget consumers here need an
-# estimate that tracks the real count, not billing-grade precision.
+# Approximate ChatML framing; suitable for budgeting, not billing.
 _TOKENS_PER_MESSAGE = 3
 _REPLY_PRIMER_TOKENS = 3
 
-# Longest prefix wins by order: gpt-4o / gpt-4.1 must match before gpt-4.
+# Keep specific model prefixes ahead of their general family.
 _ENCODING_BY_PREFIX: tuple[tuple[str, str], ...] = (
     ("gpt-5", "o200k_base"),
     ("gpt-4o", "o200k_base"),
@@ -65,8 +28,7 @@ _ENCODING_BY_PREFIX: tuple[tuple[str, str], ...] = (
 )
 _DEFAULT_ENCODING = "o200k_base"
 
-# encoding name -> tiktoken.Encoding, or None once loading it has failed
-# (so an unreachable BPE file is paid for once, not per call).
+# Cache failed loads too, avoiding repeated BPE fetch attempts.
 _encodings: dict[str, Any] = {}
 _warned_encodings: set[str] = set()
 

@@ -1,36 +1,4 @@
-"""Repo-wide runtime configuration loaded from ``config.json``.
-
-Centralises the tunable word/token limits that were previously hard-coded
-defaults scattered across ``SasSemanticChunker``, ``InstructionChunker``,
-``PromptBuilder``, and ``LLMClientConfig``. Resolution precedence, applied by
-each consumer via :func:`get_value`:
-
-    explicit constructor argument  >  config.json value  >  hard default
-
-A JSON ``null`` (or absent key/section/file) means "unset" and falls through
-to the default, so a sparse or missing file is always valid.
-
-Two access levels: :func:`get_value` returns raw JSON values, while
-:func:`get_typed_value` also checks the JSON type and degrades a wrong-typed
-entry to the default with a WARNING. The ``llm_client`` section is parsed
-through a schema (:func:`llm_client_value`) so every LLM knob read from the
-file is type-checked in one place; :func:`role_value` layers a named role's
-sparse overrides (``llm_client.roles.<role>``) on top of it, which is how the
-validator and complexity runs get their own timeouts and models.
-
-The file is searched in order: the ``SAS_PARSER_CONFIG`` environment variable
-(explicit path), ``config.json`` in the current working directory, then
-``config.json`` at the repo root (next to this package — present in a source
-checkout, absent in an installed wheel). The first readable hit wins and is
-cached for the process; call :func:`clear_cache` after changing the
-environment (tests do).
-
-This package imports nothing from ``chunker``, ``memory``, ``llm_client``, or
-``prompt_builder`` — it is a leaf, like ``chunker.keywords``, so any package
-may depend on it without violating the downward-import rule.
-
-Logger name: ``app_config``.
-"""
+"""Runtime configuration and external-service clients. See ``app_config/README.md``."""
 
 from __future__ import annotations
 
@@ -69,8 +37,7 @@ def load_config() -> dict[str, Any]:
         if not path.is_file():
             continue
         try:
-            # utf-8-sig also accepts BOM-less files; Windows editors and
-            # PowerShell 5.1 commonly prepend a BOM, which plain utf-8 rejects.
+            # Accept UTF-8 files with or without a Windows BOM.
             config = json.loads(path.read_text(encoding="utf-8-sig"))
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning(f"load_config: unreadable '{path}': {exc}; skipping")
@@ -84,11 +51,7 @@ def load_config() -> dict[str, Any]:
     return _cache
 
 
-# Keys that were removed, and what replaced them. A removed key is worse than
-# a wrong one: `get_value` would fall through to the default and the run would
-# proceed quietly on a setting the operator believes they changed. These moved
-# from words to tokens, so silently ignoring the old value would also mean
-# running with a budget ~40% off what the file says.
+# Removed config keys and their explicit replacements.
 _REMOVED_KEYS: dict[tuple[str, str], str] = {
     ("prompt_builder", "max_instruction_words"): (
         "prompt_builder.max_instruction_tokens (tokens, not words)"
@@ -238,12 +201,7 @@ def get_typed_value(
     return _typed(value, expected, f"{section}.{key}", default)
 
 
-# Chat-model identifiers this deployment can actually reach. An
-# llm_client.model config value that names anything else is ignored with a
-# WARNING (the default applies), the same degrade-don't-crash rule as a
-# wrong-typed entry. Provider-prefixed ("anthropic:claude-opus-4-6") and
-# date-suffixed ("claude-sonnet-4-5-20250929") forms of an accessible model
-# are accepted.
+# Allowed model families; provider prefixes and dated snapshots are accepted.
 ACCESSIBLE_MODELS: tuple[str, ...] = (
     "claude-sonnet-4-5",  # Anthropic Claude Sonnet 4.5
     "claude-opus-4-6",    # Anthropic Claude Opus 4.6
@@ -265,10 +223,7 @@ def is_accessible_model(model: str) -> bool:
     )
 
 
-# JSON types accepted per llm_client key. The section's parse rules live
-# here beside the loader — one schema — instead of scattered through the
-# LLMClientConfig default factories. api_key is deliberately absent:
-# secrets are not read from config.json.
+# ``llm_client`` schema; credentials are never read from ``config.json``.
 _LLM_CLIENT_TYPES: dict[str, type | tuple[type, ...]] = {
     "model": str,
     "model_provider": str,
@@ -289,10 +244,7 @@ _LLM_CLIENT_TYPES: dict[str, type | tuple[type, ...]] = {
     "roles": dict,
 }
 
-# Delta memory tables are deliberately required to be fully qualified. Unlike
-# SQL values, table identifiers cannot be passed through parameter markers;
-# keeping one Catalog.Schema.Table spelling in config makes it unambiguous
-# which Unity Catalog object production memory will mutate.
+# Delta memory tables must use a fully-qualified Unity Catalog name.
 _MEMORY_TABLE_TYPES: dict[str, type] = {
     "delta_table": str,
     "cdf_audit_table": str,
@@ -324,12 +276,7 @@ def memory_table_value(key: str, default: str | None = None) -> str | None:
         return default
     return value
 
-# How the chat model is constructed. "openai_compatible" builds the
-# LangChain ChatOpenAI the whole client is written around; "native" wraps a
-# raw provider SDK client for a gateway that will not take the LangChain
-# payload. "auto" (the default) picks between them from the model's provider,
-# which is what the reference deployment does against this same gateway.
-# See llm_client.client for what the native path gives up.
+# Supported chat-client construction strategies.
 PROVIDER_CLIENT_AUTO = "auto"
 PROVIDER_CLIENT_OPENAI_COMPATIBLE = "openai_compatible"
 PROVIDER_CLIENT_NATIVE = "native"
@@ -339,25 +286,14 @@ PROVIDER_CLIENTS: tuple[str, ...] = (
     PROVIDER_CLIENT_NATIVE,
 )
 
-# Which client each model provider is reached through under "auto". The
-# reference's llm_client.ai_sas_converter does exactly this:
-#
-#     match model_provider.lower():
-#         case "openai" | "google": init_llm_model(...)    # ChatOpenAI
-#         case "anthropic":         init_claude_model(...) # raw openai SDK
-#         case _: raise RuntimeError("UNKNOWN model provider.")
-#
-# A provider absent from this table is an error rather than a guess: silently
-# choosing a client for an unknown provider is how a run fails deep in the
-# gateway instead of at construction.
+# Provider-to-client mapping used by ``provider_client="auto"``.
 PROVIDER_CLIENT_BY_PROVIDER: dict[str, str] = {
     "anthropic": PROVIDER_CLIENT_NATIVE,
     "openai": PROVIDER_CLIENT_OPENAI_COMPATIBLE,
     "google": PROVIDER_CLIENT_OPENAI_COMPATIBLE,
 }
 
-# llm_client keys that describe the *section* rather than one model, so a
-# per-role overlay may not carry them.
+# Section-wide keys excluded from per-role overlays.
 _ROLE_EXCLUDED_KEYS = frozenset({"roles"})
 
 
@@ -474,10 +410,7 @@ def role_value(role: str | None, key: str, default: Any = None) -> Any:
     return _validate_llm_value(key, value, base, label)
 
 
-# The one spelling of a timestamp that goes in a path. Basic ISO 8601 with the
-# separators stripped, because ':' is not a filename character on Windows and
-# is percent-encoded in a SharePoint URL. Exposed as well as applied, since
-# validation.pdf formats an existing datetime with it rather than taking now().
+# Path-safe UTC timestamp shared by report and upload paths.
 UTC_STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 
 
