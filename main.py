@@ -25,8 +25,23 @@ Usage
     python main.py --request-id 42              # one row
     python main.py --app "MyApp"                # one application's rows
     python main.py --no-upload                  # dry run: convert, write nothing
+    python main.py --check                      # preflight only: read, convert nothing
     python main.py path/to/sas --out-dir out/   # the local fallback
     python main.py path/to/sas --md report.md --pdf report.pdf
+
+Debugging a SharePoint deployment
+---------------------------------
+``--check`` is the place to start: it resolves the configuration (saying which
+environment variable or ``config.json`` key each value came from), mints a
+Graph token and reports the permissions actually granted to the app
+registration, then reads the library and each configured list — writing
+nothing and paying no LLM. ``python -m app_config.sharepoint_check`` is the
+same preflight standalone, and takes ``--offline`` to check the configuration
+with no network at all.
+
+``--log-file`` captures a run (secrets redacted), and ``--trace-http`` adds the
+individual Graph requests. Plain ``--debug`` deliberately leaves the transport
+libraries at INFO so the pipeline's own lines stay readable.
 
 Installed as the ``sas-parser`` console script, so ``sas-parser --app MyApp``
 is the same command.
@@ -138,6 +153,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Skip the XREF cross-reference substitution. By default the "
         "application's rows in the XREF list rewrite dataset names (and any "
         "path-marked rows, physical paths) before conversion.",
+    )
+    sharepoint.add_argument(
+        "--check",
+        action="store_true",
+        help="Run the read-only SharePoint preflight and exit, converting "
+        "nothing and paying no LLM: resolves the configuration (reporting "
+        "which env var or config.json key each value came from), mints a Graph "
+        "token and reports its granted permissions, then reads the library and "
+        "each configured list. Writes nothing. Same as "
+        "'python -m app_config.sharepoint_check'.",
     )
 
     local = parser.add_argument_group("Local mode (with a source directory)")
@@ -256,7 +281,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 #: Flags that only mean something for one of the two modes, so naming one
 #: against the other mode is a mistake worth reporting rather than ignoring.
-_SHAREPOINT_ONLY = ("--request-id", "--app", "--all-rows", "--no-upload", "--no-xref")
+_SHAREPOINT_ONLY = (
+    "--request-id",
+    "--app",
+    "--all-rows",
+    "--no-upload",
+    "--no-xref",
+    "--check",
+)
 _LOCAL_ONLY = ("--out-dir", "--md", "--pdf")
 
 
@@ -274,6 +306,7 @@ def _argument_error(args: argparse.Namespace) -> str | None:
             ("--all-rows", args.all_rows),
             ("--no-upload", args.no_upload),
             ("--no-xref", args.no_xref),
+            ("--check", args.check),
         ):
             if value:
                 return (
@@ -297,9 +330,18 @@ def _argument_error(args: argparse.Namespace) -> str | None:
                 )
         if args.request_id and args.app:
             return "--request-id and --app both narrow the row set; give one"
+        if args.check and (args.request_id or args.app or args.all_rows):
+            return (
+                "--check inspects the deployment rather than any particular "
+                "row; drop the row filter."
+            )
     if args.validation_retries < 0:
         return "--validation-retries must be >= 0"
-    if not args.reference_dir.is_dir():
+    # --check converts nothing, so it needs neither the reference PDFs nor a
+    # model. Requiring them would make the diagnostic unusable on exactly the
+    # machine it exists to diagnose — a fresh checkout where reference_docs/ is
+    # gitignored and absent.
+    if not args.check and not args.reference_dir.is_dir():
         return f"reference_dir is not a directory: {args.reference_dir}"
     return None
 
@@ -647,9 +689,20 @@ def main(argv: list[str] | None = None) -> int:
     if problem is not None:
         return _fail(problem)
 
+    if args.check:
+        return _run_check(args)
     if args.sas_dir is not None:
         return _run_local(args)
     return _run_sharepoint(args)
+
+
+def _run_check(args: argparse.Namespace) -> int:
+    """Run the read-only SharePoint preflight and print its report."""
+    from app_config import sharepoint_check
+
+    results = sharepoint_check.run_checks()
+    print(sharepoint_check.render(results, verbose=args.debug))
+    return 1 if any(r.status == sharepoint_check.FAIL for r in results) else 0
 
 
 if __name__ == "__main__":

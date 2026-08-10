@@ -287,6 +287,15 @@ app_config/
                         Domain-free: what a folder or a column MEANS belongs
                         to conversion/, xref/, and complexity/sharepoint.py.
                         msgraph-sdk imported lazily (extra: sharepoint).
+  sharepoint_check.py   Read-only preflight for the SharePoint deployment
+                        (`python -m app_config.sharepoint_check`, or
+                        `sas-parser --check`): resolves the config REPORTING
+                        THE SOURCE of each value, reads the service principal
+                        out of the Databricks secret scope, mints a Graph token
+                        and decodes its `roles` claim (the granted application
+                        permissions — the 403 diagnosis), then reads the
+                        library and each configured list. Writes nothing and
+                        calls no model. --offline stops after the config.
   logging_setup.py      Console/file logging for the three CLI entry points.
                         --debug does NOT raise the HTTP transport libraries
                         (TRANSPORT_LOGGERS) to DEBUG; --trace-http is the

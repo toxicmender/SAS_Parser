@@ -142,6 +142,39 @@ not upload notebooks or update request status.
 One row failing does not stop the others; the exit status is non-zero if any
 did.
 
+#### Checking the deployment before converting anything
+
+`--check` is the preflight. It resolves the configuration, mints a Graph token,
+and reads the library and lists — writing nothing, converting nothing, and
+paying no LLM. Start here whenever a SharePoint run misbehaves.
+
+```bash
+uv run sas-parser --check
+```
+
+It reports each stage in dependency order, and for every setting it says
+**which** source the value came from — the environment variable or the
+`config.json` key. That is usually the whole diagnosis: a value that is correct
+in `config.json` and stale in the environment looks identical to a correct one
+until you know which won. The base path is reported both as written and as
+normalised, so the `Shared Documents/` strip is visible rather than surprising.
+
+The token stage decodes the granted application permissions out of the token's
+`roles` claim. This is what separates "the app registration was never granted
+`Sites.ReadWrite.All`" from "it was granted but admin consent was never
+clicked" — the two causes of a Graph 403, which are otherwise indistinguishable
+from the outside. A missing role is reported as a warning and the later stages
+still run, so you can see exactly which calls it blocks.
+
+The same preflight runs standalone, and takes `--offline` to check the
+configuration with no network at all:
+
+```bash
+python -m app_config.sharepoint_check --verbose
+python -m app_config.sharepoint_check --offline
+python -m app_config.sharepoint_check --json
+```
+
 #### Capturing a run
 
 ```bash
@@ -166,6 +199,7 @@ shape possible. All three flags work on `python -m complexity` and
 python -m complexity path/to/sas --out-dir reports/   # offline complexity + sizing
 python -m complexity --sharepoint --app "MyApp"       # from the complexity list
 python -m validation --help                           # the offline validation suite
+python -m app_config.sharepoint_check                 # read-only SharePoint preflight
 ```
 
 ## Configuration
