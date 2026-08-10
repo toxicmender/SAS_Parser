@@ -142,6 +142,24 @@ not upload notebooks or update request status.
 One row failing does not stop the others; the exit status is non-zero if any
 did.
 
+#### Capturing a run
+
+```bash
+# Everything the console shows, also written to a file (appended).
+uv run sas-parser --app "MyApp" --log-file logs/myapp.log
+
+# Plus every individual Graph request, its status, and the SDK's own retries.
+uv run sas-parser --app "MyApp" --log-file logs/myapp.log --trace-http
+```
+
+`--debug` raises the first-party loggers to DEBUG but deliberately leaves the
+HTTP transport libraries at INFO, so the pipeline's own lines stay readable;
+`--trace-http` is the opt-in for the wire. Bearer tokens and secret-shaped
+values are masked before anything reaches a handler, but a log file is still
+sensitive — the redaction covers the shapes these libraries emit, not every
+shape possible. All three flags work on `python -m complexity` and
+`python -m validation` too.
+
 ## Other entry points
 
 ```bash

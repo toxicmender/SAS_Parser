@@ -41,6 +41,7 @@ import logging
 import sys
 from pathlib import Path
 
+from app_config.logging_setup import configure_logging
 from app_config.spark import describe_master, master_url
 from pipeline import SasLLMPipeline
 from llm_client import LLMClient, LLMClientConfig, TokenUsage
@@ -201,7 +202,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "validation.report_sharepoint_path (then the library root).",
     )
     parser.add_argument(
-        "--debug", action="store_true", help="Enable DEBUG logging."
+        "--debug",
+        action="store_true",
+        help="Enable DEBUG logging. The HTTP transport libraries stay at INFO; "
+        "add --trace-http for those.",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Also write the log to this file, appending to it. Secrets are "
+        "redacted, but treat the file as sensitive.",
+    )
+    parser.add_argument(
+        "--trace-http",
+        action="store_true",
+        help="Log every HTTP request the Graph SDK and the LLM client make. "
+        "Verbose by design — pair it with --log-file.",
     )
     args = parser.parse_args(argv)
     if (args.cases is None) == (args.thread is None):
@@ -229,9 +245,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    configure_logging(
+        debug=args.debug, log_file=args.log_file, trace_http=args.trace_http
     )
 
     # One resolution for the whole invocation: the deterministic suite, the

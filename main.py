@@ -69,6 +69,7 @@ from pathlib import Path
 from typing import Any
 
 import app_config
+from app_config.logging_setup import configure_logging
 from llm_client import LLMClientConfig
 from target_language import (
     DEFAULT_OUTPUT_LANGUAGE,
@@ -231,7 +232,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     common.add_argument(
         "--debug",
         action="store_true",
-        help="Enable DEBUG logging for the whole pipeline.",
+        help="Enable DEBUG logging for the whole pipeline. The HTTP transport "
+        "libraries stay at INFO so the pipeline's own lines stay readable; add "
+        "--trace-http for those.",
+    )
+    common.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="Also write the log to this file, appending to it. The console "
+        "output is unchanged. Secrets are redacted, but treat the file as "
+        "sensitive.",
+    )
+    common.add_argument(
+        "--trace-http",
+        action="store_true",
+        help="Log every HTTP request the Graph SDK and the LLM client make, "
+        "with status codes and the SDK's own retries. Verbose by design — pair "
+        "it with --log-file.",
     )
     return parser.parse_args(argv)
 
@@ -292,20 +310,9 @@ def _argument_error(args: argparse.Namespace) -> str | None:
 
 
 def _load_dotenv() -> None:
-    """Load ``.env`` (walking up from cwd) into the environment.
-
-    Existing environment variables win (``override=False``), so a value already
-    exported in the shell still takes precedence over the file. A missing
-    ``.env`` is a no-op.
-    """
-    try:
-        from dotenv import find_dotenv, load_dotenv
-    except ImportError:  # pragma: no cover - python-dotenv is a declared dep
-        logger.debug("python-dotenv not installed; skipping .env load")
-        return
-    path = find_dotenv(usecwd=True)
-    if path and load_dotenv(path):
-        logger.debug(f"loaded environment from {path}")
+    """Load ``.env`` into the environment — see
+    :func:`app_config.load_dotenv_file`."""
+    app_config.load_dotenv_file()
 
 
 def resolve_llm_config(args: argparse.Namespace, **overrides: Any) -> LLMClientConfig:
@@ -629,9 +636,8 @@ def _fail(message: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    configure_logging(
+        debug=args.debug, log_file=args.log_file, trace_http=args.trace_http
     )
     # Before anything reads it: the Vault credentials, OPENAI_API_KEY, and the
     # SharePoint/Azure settings all live there. The real shell environment wins.

@@ -118,6 +118,32 @@ def _verify_setting(value: Any) -> bool | str | None:
     return text
 
 
+def load_dotenv_file() -> str | None:
+    """Load ``.env`` (walking up from cwd) into the environment, if present.
+
+    Returns the path loaded, or ``None`` when there was nothing to load.
+
+    Existing environment variables win (``override=False``), so a value already
+    exported in the shell still takes precedence over the file. A missing
+    ``.env`` — or a missing ``python-dotenv`` — is a no-op.
+
+    Lives here rather than in one entry point because every command-line
+    surface has to do it before anything reads a setting, and the diagnostic in
+    :mod:`app_config.sharepoint_check` is only useful if it resolves settings
+    from exactly the environment a real run would see.
+    """
+    try:
+        from dotenv import find_dotenv, load_dotenv
+    except ImportError:  # pragma: no cover - python-dotenv is a declared dep
+        logger.debug("python-dotenv not installed; skipping .env load")
+        return None
+    path = find_dotenv(usecwd=True)
+    if path and load_dotenv(path):
+        logger.debug(f"loaded environment from {path}")
+        return path
+    return None
+
+
 def get_value(section: str, key: str, default: Any = None) -> Any:
     """
     ``config[section][key]``, or *default* when the file, section, or key is

@@ -287,6 +287,12 @@ app_config/
                         Domain-free: what a folder or a column MEANS belongs
                         to conversion/, xref/, and complexity/sharepoint.py.
                         msgraph-sdk imported lazily (extra: sharepoint).
+  logging_setup.py      Console/file logging for the three CLI entry points.
+                        --debug does NOT raise the HTTP transport libraries
+                        (TRANSPORT_LOGGERS) to DEBUG; --trace-http is the
+                        opt-in for the wire. A RedactingFilter masks bearer
+                        tokens and secret-shaped key/values on every handler.
+                        Standard library only.
 
 reporting/
   pdf.py                Markdown -> PDF: markdown-it parses, PyMuPDF's Story
@@ -903,7 +909,10 @@ any of these silently changes behavior.
   `pipeline.prompting`, `pipeline.notebook`, `memory.store`,
   `memory.relevance`, `memory.summarize`, `llm_client.client`,
   `conversion.run`, `xref.pre`, `xref.sourcing`, `target_language`, and
-  `main` for the entry point.
+  `main` for the entry point. The CLI entry points configure logging through
+  `app_config.logging_setup.configure_logging()` rather than calling
+  `logging.basicConfig` themselves, which is what gives them `--log-file`,
+  `--trace-http`, and secret redaction uniformly.
 - **Names:** dataset/macro/libref names are lowercased at extraction;
   quoted physical paths keep a leading `'` so they can never collide with
   identifiers.
