@@ -676,32 +676,58 @@ class SharePointClient:
             )
         return site_id
 
-    def _drive_id(self) -> str:
+    async def _drive_id_async(self) -> str:
         """
         The target document library id: the configured
         :attr:`~SharePointConfig.drive_id`, else the site's default library,
         resolved once and cached on this client.
+
+        The async form is the real one because resolving the default library is
+        itself a Graph call. The helpers that run *inside* :meth:`_run` await
+        this; :meth:`_drive_id` is the synchronous wrapper for callers outside
+        a loop. Doing it the other way round — a sync ``_drive_id`` that the
+        coroutines called — meant re-entering :meth:`_run` from within its own
+        loop, which raises.
         """
         if self.config.drive_id:
             return self.config.drive_id
         resolved = self._resolved_drive_id
         if resolved is None:
             site_id = self._site_id()
-            drive = self._run(self.client.sites.by_site_id(site_id).drive.get())
+            drive = await self.client.sites.by_site_id(site_id).drive.get()
             resolved = getattr(drive, "id", None)
             if not resolved:
                 raise SharePointError(
                     f"site {site_id!r} has no accessible default document library; "
                     f"set SHAREPOINT_DRIVE_ID to target one explicitly"
                 )
+            logger.info(
+                f"SharePointClient: resolved the default document library of "
+                f"site {site_id!r} to drive {resolved!r}"
+            )
             self._resolved_drive_id = resolved
         return resolved
+
+    def _drive_id(self) -> str:
+        """:meth:`_drive_id_async` for synchronous callers (outside :meth:`_run`)."""
+        if self.config.drive_id:
+            return self.config.drive_id
+        if self._resolved_drive_id is None:
+            return self._run(self._drive_id_async())
+        return self._resolved_drive_id
 
     def _drive(self) -> Any:
         return self.client.drives.by_drive_id(self._drive_id())
 
     def _item(self, path: str) -> Any:
         return self._drive().items.by_drive_item_id(_drive_item_id(path))
+
+    async def _item_async(self, path: str) -> Any:
+        """:meth:`_item` for use inside a coroutine already being driven by
+        :meth:`_run` — the drive is resolved with an ``await`` rather than a
+        nested :meth:`_run`."""
+        drive = self.client.drives.by_drive_id(await self._drive_id_async())
+        return drive.items.by_drive_item_id(_drive_item_id(path))
 
     # -- operations ---------------------------------------------------------
 
@@ -786,7 +812,7 @@ class SharePointClient:
         return files
 
     async def _collect_children(self, path: str) -> list[dict[str, Any]]:
-        builder = self._item(path).children
+        builder = (await self._item_async(path)).children
         response = await builder.get()
         items: list[dict[str, Any]] = []
         while response is not None:
@@ -986,7 +1012,7 @@ class SharePointClient:
             folder=Folder(),
             additional_data={"@microsoft.graph.conflictBehavior": conflict_behavior},
         )
-        return await self._item(parent).children.post(body)
+        return await (await self._item_async(parent)).children.post(body)
 
     def list_items(
         self,

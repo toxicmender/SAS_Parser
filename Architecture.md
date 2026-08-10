@@ -880,6 +880,18 @@ any of these silently changes behavior.
     stops caring what the caller's thread is doing. Corollary: one client
     serialises its calls, so it is not a way to parallelise Graph traffic.
 
+14. **A Graph call built inside a coroutine must resolve the drive with
+    `await`, never through `SharePointClient._run`.** `_run` drives its loop on
+    the worker thread of invariant 13, so a helper that reaches `_drive_id()`
+    from within a coroutine would block that worker on itself — `_run` detects
+    the re-entry and raises rather than deadlock. It bites only when
+    `SHAREPOINT_DRIVE_ID` is unset and the library has to be resolved from the
+    site, which is the documented default. `_item_async` / `_drive_id_async`
+    exist for exactly this; `_collect_children` and `_create_folder` use them.
+    The failure is invisible to any test that pins a `drive_id`, so
+    `tests/test_sharepoint.py` covers `list_directory`, `list_files` and
+    `create_folder` against a site-resolved drive specifically.
+
 ## Conventions
 
 - **Logging:** f-string messages everywhere (never lazy `%`-style).

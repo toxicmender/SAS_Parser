@@ -696,6 +696,54 @@ def test_no_default_library_raises():
         client.read_file("a.txt")
 
 
+# The operations whose Graph call is built *inside* the coroutine `_run` drives,
+# rather than in the argument expression before it. Resolving the drive there
+# has to `await`, because re-entering `_run` from within its own loop is refused
+# by design — which is what these operations used to do, so every one of them
+# failed whenever SHAREPOINT_DRIVE_ID was unset and the library had to be
+# resolved from the site. That is the default configuration, and list_directory
+# is the first call a conversion run makes.
+
+
+def _site_default_drive_client():
+    site = _SiteBuilder(drive_item=_DriveItem(id="SITE-DRV"))
+    children = _ChildrenBuilder([_Collection([_DriveItem(name="a.sas")])])
+    fake = _FakeGraphClient(item=_ItemBuilder(children=children), site=site)
+    config = sharepoint.SharePointConfig(site_id="SITE")  # no explicit drive_id
+    return sharepoint.SharePointClient(config, client=fake), fake
+
+
+def test_list_directory_resolves_the_drive_from_the_site():
+    client, fake = _site_default_drive_client()
+    assert [e["name"] for e in client.list_directory("Apps")] == ["a.sas"]
+    assert fake.drives.requested_ids == ["SITE-DRV"]
+
+
+def test_list_files_resolves_the_drive_from_the_site():
+    client, _ = _site_default_drive_client()
+    assert [f["path"] for f in client.list_files("Apps")] == ["Apps/a.sas"]
+
+
+def test_create_folder_resolves_the_drive_from_the_site():
+    client, fake = _site_default_drive_client()
+    client.create_folder("Apps/out")
+    assert fake.drives.requested_ids == ["SITE-DRV", "SITE-DRV"]
+
+
+def test_the_drive_is_resolved_once_across_both_call_styles():
+    """A sync-built call and a coroutine-built one share the cached drive id."""
+    site = _SiteBuilder(drive_item=_DriveItem(id="SITE-DRV"))
+    children = _ChildrenBuilder([_Collection([])])
+    item = _ItemBuilder(content=_ContentBuilder(get_value=b"x"), children=children)
+    fake = _FakeGraphClient(item=item, site=site)
+    client = sharepoint.SharePointClient(
+        sharepoint.SharePointConfig(site_id="SITE"), client=fake
+    )
+    client.read_file("a.txt")  # resolves outside the loop
+    client.list_directory("Apps")  # would resolve inside it
+    assert site.drive.get.calls == [()]
+
+
 # ---------------------------------------------------------------------------
 # get_token (authentication)
 # ---------------------------------------------------------------------------
