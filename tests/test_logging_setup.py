@@ -1,10 +1,12 @@
 """
 Tests for app_config.logging_setup — the shared CLI logging configuration.
 
-Two behaviours carry the weight: --debug must not drag the HTTP transport
+Three behaviours carry the weight: --debug must not drag the HTTP transport
 libraries to DEBUG (or the wire trace is always on and the first-party lines
-are unreadable), and anything secret-shaped must be masked before it reaches a
-handler, because the log file exists to be shared.
+are unreadable), anything secret-shaped must be masked before it reaches a
+handler, because the log file exists to be shared, and an unhandled traceback
+must reach the log file — a captured run that stops mid-way without saying why
+is the failure mode --log-file exists to prevent.
 """
 
 from __future__ import annotations
@@ -12,6 +14,8 @@ from __future__ import annotations
 import logging
 import pathlib
 import sys
+import threading
+from types import TracebackType
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -27,11 +31,12 @@ from app_config.logging_setup import (
 
 @pytest.fixture(autouse=True)
 def _restore_logging():
-    """Put the root handlers and transport levels back after each test."""
+    """Put the root handlers, transport levels and crash hooks back."""
     root = logging.getLogger()
     handlers = list(root.handlers)
     level = root.level
     levels = {name: logging.getLogger(name).level for name in TRANSPORT_LOGGERS}
+    hooks = (sys.excepthook, threading.excepthook)
     yield
     for handler in list(root.handlers):
         if handler not in handlers:
@@ -40,6 +45,7 @@ def _restore_logging():
     root.setLevel(level)
     for name, saved in levels.items():
         logging.getLogger(name).setLevel(saved)
+    sys.excepthook, threading.excepthook = hooks
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +127,100 @@ def test_console_still_gets_records_when_a_file_is_used(tmp_path, capsys):
     logging.getLogger("test").info("on both")
 
     assert "on both" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Crash capture
+# ---------------------------------------------------------------------------
+
+
+def _raise(
+    exc: BaseException,
+) -> tuple[type[BaseException], BaseException, TracebackType | None]:
+    """Real exc_info for *exc*, raised so it carries an actual traceback.
+
+    Built from the exception itself rather than returning ``sys.exc_info()``,
+    whose three members are each Optional and would need narrowing at every
+    call site.
+    """
+    try:
+        raise exc
+    except type(exc):
+        return type(exc), exc, exc.__traceback__
+
+
+def test_an_unhandled_traceback_reaches_the_log_file(tmp_path):
+    """The whole point: a captured run must say why it stopped."""
+    log = tmp_path / "run.log"
+    configure_logging(log_file=log)
+
+    sys.excepthook(*_raise(RuntimeError("the thing exploded")))
+
+    text = log.read_text(encoding="utf-8")
+    assert "the thing exploded" in text
+    assert "RuntimeError" in text
+    assert "Traceback (most recent call last)" in text
+
+
+def test_the_crash_is_logged_once_after_configuring_twice(tmp_path):
+    """Hooks are assigned, not chained, so a second call must not double it."""
+    log = tmp_path / "run.log"
+    configure_logging(log_file=log)
+    configure_logging(log_file=log)
+
+    sys.excepthook(*_raise(RuntimeError("exploded once")))
+
+    assert log.read_text(encoding="utf-8").count("exploded once") == 1
+
+
+def test_a_keyboard_interrupt_is_left_to_the_default_hook(tmp_path, monkeypatch):
+    """Ctrl-C is the operator stopping the run, not a failure to report."""
+    log = tmp_path / "run.log"
+    configure_logging(log_file=log)
+    seen = []
+    monkeypatch.setattr(sys, "__excepthook__", lambda *a: seen.append(a))
+
+    sys.excepthook(*_raise(KeyboardInterrupt()))
+
+    assert len(seen) == 1
+    assert "KeyboardInterrupt" not in log.read_text(encoding="utf-8")
+
+
+def test_capture_crashes_false_leaves_the_hook_alone():
+    """An embedding caller that owns its own hook keeps it."""
+    original = sys.excepthook
+
+    configure_logging(capture_crashes=False)
+
+    assert sys.excepthook is original
+
+
+def test_a_worker_thread_crash_reaches_the_log_file(tmp_path):
+    """The SharePoint client drives Graph from a worker thread; a failure
+    there must not be the one that escapes the file."""
+    log = tmp_path / "run.log"
+    configure_logging(log_file=log)
+
+    def boom():
+        raise RuntimeError("worker thread exploded")
+
+    thread = threading.Thread(target=boom)
+    thread.start()
+    thread.join()
+
+    assert "worker thread exploded" in log.read_text(encoding="utf-8")
+
+
+def test_a_secret_in_a_traceback_is_masked(tmp_path):
+    """The crash path carries exception text, which getMessage() never sees."""
+    log = tmp_path / "run.log"
+    configure_logging(log_file=log)
+
+    sys.excepthook(*_raise(RuntimeError("GET /me?access_token=abc123def456 failed")))
+
+    text = log.read_text(encoding="utf-8")
+    assert "abc123def456" not in text
+    assert "<redacted>" in text
 
 
 # ---------------------------------------------------------------------------
