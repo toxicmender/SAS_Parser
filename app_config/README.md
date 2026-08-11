@@ -54,6 +54,10 @@ run because an earlier one failed is reported as skipped rather than silently
 passed. Nothing is written: no folder created, no file uploaded, no list item
 patched.
 
+`imports` asks whether a Graph client can be *built*, so it is skipped rather
+than failed when `run_checks(client=...)` was handed one — the question is moot,
+and the `sharepoint` extra is genuinely not needed on that path.
+
 Three stages carry most of the diagnostic value:
 
 - **`config`** names the source of every resolved setting (`$SHAREPOINT_SITE_ID`

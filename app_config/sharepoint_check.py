@@ -272,13 +272,32 @@ def _config_path() -> str:
     return "none found (hard defaults apply)"
 
 
-def check_imports() -> CheckResult:
-    """Report whether the optional ``sharepoint`` extra is installed."""
+def check_imports(*, needed: bool = True) -> CheckResult:
+    """Report whether the optional ``sharepoint`` extra is installed.
+
+    Parameters
+    ----------
+    needed : bool
+        Whether this run would have to build a Graph client of its own. When a
+        caller supplies a pre-built one, the SDK is not required and a missing
+        extra is reported as skipped rather than failed — the question the
+        stage asks ("can we build a client?") is moot when we were handed one.
+        That is not a testing convenience: it is the same reasoning
+        :func:`run_checks` already applies when deciding whether a missing SDK
+        should stop the later stages.
+    """
     modules = ("msgraph", "msgraph_core", "kiota_abstractions", "msal", "httpx")
     missing = [name for name in modules if importlib.util.find_spec(name) is None]
     detail = {
         name: ("missing" if name in missing else "installed") for name in modules
     }
+    if missing and not needed:
+        return CheckResult(
+            "imports",
+            SKIP,
+            f"not needed (a client was supplied); missing: {', '.join(missing)}",
+            detail,
+        )
     if missing:
         return CheckResult(
             "imports",
@@ -625,7 +644,7 @@ def run_checks(*, offline: bool = False, client: Any | None = None) -> list[Chec
 
     config = client.config if client is not None else SharePointConfig.from_env()
     results = [check_config(config)]
-    imports = check_imports()
+    imports = check_imports(needed=client is None)
     results.append(imports)
 
     later = ("identity", "secrets", "token", "site", "base", "lists")

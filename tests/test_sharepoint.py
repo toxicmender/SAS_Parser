@@ -822,6 +822,7 @@ def test_list_files_resolves_the_drive_from_the_site():
     assert [f["path"] for f in client.list_files("Apps")] == ["Apps/a.sas"]
 
 
+@requires_msgraph  # _create_folder builds a DriveItem body from the SDK
 def test_create_folder_resolves_the_drive_from_the_site():
     client, fake = _site_default_drive_client()
     client.create_folder("Apps/out")

@@ -11,6 +11,7 @@ naming the setting to change is the situation this module exists to end.
 from __future__ import annotations
 
 import base64
+import importlib.util
 import json
 import logging
 import pathlib
@@ -24,6 +25,15 @@ import pytest
 import app_config
 from app_config import azure, sharepoint, sharepoint_check
 from app_config.sharepoint_check import FAIL, PASS, SKIP, WARN
+
+# msgraph-sdk is the optional 'sharepoint' extra, and the CI test job installs
+# only --extra dev --extra spark. Nearly everything here injects a client and
+# so never needs it; the handful of cases whose *expected outcome* depends on
+# the extra being present skip without it.
+requires_msgraph = pytest.mark.skipif(
+    importlib.util.find_spec("msgraph") is None,
+    reason="msgraph-sdk (the 'sharepoint' extra) is not installed",
+)
 
 _ENV = (
     "SHAREPOINT_SITE_HOSTNAME",
@@ -235,6 +245,58 @@ def test_config_passes_when_site_and_requests_list_are_set(monkeypatch):
     result = sharepoint_check.check_config(sharepoint.SharePointConfig.from_env())
 
     assert result.status == PASS
+
+
+# ---------------------------------------------------------------------------
+# The imports stage — "can we build a client?", which is moot if given one
+# ---------------------------------------------------------------------------
+
+
+def _no_extra(monkeypatch) -> None:
+    monkeypatch.setattr(sharepoint_check.importlib.util, "find_spec", lambda _n: None)
+
+
+def test_a_missing_extra_fails_when_a_client_must_be_built(monkeypatch):
+    _no_extra(monkeypatch)
+    result = sharepoint_check.check_imports(needed=True)
+
+    assert result.status == FAIL
+    assert result.fix is not None
+    assert "sharepoint" in result.fix
+    assert result.detail["msgraph"] == "missing"
+
+
+def test_a_missing_extra_is_skipped_when_a_client_was_supplied(monkeypatch):
+    _no_extra(monkeypatch)
+    result = sharepoint_check.check_imports(needed=False)
+
+    assert result.status == SKIP
+    assert "a client was supplied" in result.summary
+
+
+def test_an_injected_client_reaches_the_graph_stages_without_the_extra(
+    monkeypatch, _readable_scope
+):
+    """CI runs without the extra; a stubbed run must still exercise every stage."""
+    _no_extra(monkeypatch)
+    client = _StubClient(_configured(), rows={"L-REQ": [{"fields": {"Title": "a"}}]})
+    results = _by_name(sharepoint_check.run_checks(client=client))
+
+    assert results["imports"].status == SKIP
+    assert results["site"].status == PASS
+    assert results["base"].status == PASS
+    assert all(r.status != FAIL for r in results.values())
+
+
+def test_without_a_client_a_missing_extra_stops_the_run(monkeypatch):
+    _no_extra(monkeypatch)
+    monkeypatch.setenv("SHAREPOINT_SITE_ID", "SITE")
+    monkeypatch.setenv("SHAREPOINT_LIST_ID_SAS_REQUESTS", "L-REQ")
+    results = _by_name(sharepoint_check.run_checks())
+
+    assert results["imports"].status == FAIL
+    assert results["identity"].status == SKIP
+    assert results["token"].status == SKIP
 
 
 # ---------------------------------------------------------------------------
@@ -507,7 +569,11 @@ def test_run_checks_end_to_end_passes(_readable_scope):
 
 
 def test_run_checks_never_writes(_readable_scope):
-    """The stub has no write surface at all, so a write would be an AttributeError."""
+    """The stub has no write surface at all, so a write would be an AttributeError.
+
+    Passes with or without the sharepoint extra: an injected client means the
+    SDK is not needed, so `imports` reports skipped rather than failed.
+    """
     client = _StubClient(_configured())
     for name in ("write_file", "upload_file", "create_folder", "update_list_item"):
         assert not hasattr(client, name)
@@ -625,6 +691,7 @@ def test_main_offline_returns_nonzero_without_a_site(capsys):
     assert "no SharePoint site is configured" in capsys.readouterr().out
 
 
+@requires_msgraph  # without the extra, `imports` fails and the exit code is 1
 def test_main_offline_returns_zero_when_configured(monkeypatch, capsys):
     monkeypatch.setenv("SHAREPOINT_SITE_ID", "SITE")
     monkeypatch.setenv("SHAREPOINT_LIST_ID_SAS_REQUESTS", "L-REQ")
@@ -634,13 +701,26 @@ def test_main_offline_returns_zero_when_configured(monkeypatch, capsys):
     assert "PASSED" in capsys.readouterr().out
 
 
+def test_main_without_the_extra_fails_and_says_how_to_install_it(monkeypatch, capsys):
+    """The complement of the above, and the state CI actually runs in."""
+    monkeypatch.setattr(sharepoint_check.importlib.util, "find_spec", lambda _n: None)
+    monkeypatch.setenv("SHAREPOINT_SITE_ID", "SITE")
+    monkeypatch.setenv("SHAREPOINT_LIST_ID_SAS_REQUESTS", "L-REQ")
+    code = sharepoint_check.main(["--offline"])
+
+    assert code == 1
+    assert "sharepoint" in capsys.readouterr().out
+
+
 def test_main_json_flag_emits_json(monkeypatch, capsys):
     monkeypatch.setenv("SHAREPOINT_SITE_ID", "SITE")
-    code = sharepoint_check.main(["--offline", "--json"])
+    sharepoint_check.main(["--offline", "--json"])
 
-    assert code == 0
+    # The shape is the assertion here; whether `imports` passes depends on
+    # whether the optional extra happens to be installed.
     payload = json.loads(capsys.readouterr().out)
     assert {r["name"] for r in payload} >= {"config", "imports"}
+    assert all({"name", "status", "summary", "detail", "fix"} <= set(r) for r in payload)
 
 
 def test_main_writes_a_log_file(monkeypatch, tmp_path):
