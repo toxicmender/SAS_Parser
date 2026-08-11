@@ -508,6 +508,53 @@ def test_missing_secret_surfaces_as_databricks_error(monkeypatch, _isolated):
         cfg.service_principal()
 
 
+# On a cluster, DATABRICKS_RUNTIME_VERSION is inherited by child processes but
+# the notebook's credential is not, so a `!python ...` cell passes the
+# bootstrap guard and then fails inside the SDK — which walks its whole auth
+# chain and reports something about the Azure CLI. These pin the hint that
+# names the real cause.
+
+
+def test_a_scope_read_failure_on_a_cluster_names_the_subprocess_pitfall(
+    monkeypatch, _isolated
+):
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "15.4")
+    _patched_secrets(monkeypatch, {})
+    cfg = databricks.DatabricksConfig(secret_scope="kv")
+
+    with pytest.raises(databricks.DatabricksError) as caught:
+        databricks.read_workspace_secret("kv", "sp-hsv-appid", config=cfg)
+
+    message = str(caught.value)
+    assert "!python" in message
+    assert "DATABRICKS_TOKEN" in message
+    assert "%run" in message
+
+
+def test_the_subprocess_hint_is_absent_when_a_pat_is_set(monkeypatch, _isolated):
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "15.4")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-boot")
+    _patched_secrets(monkeypatch, {})
+    cfg = databricks.DatabricksConfig(secret_scope="kv", token="dapi-boot")
+
+    with pytest.raises(databricks.DatabricksError) as caught:
+        databricks.read_workspace_secret("kv", "sp-hsv-appid", config=cfg)
+
+    assert "!python" not in str(caught.value)
+
+
+def test_the_subprocess_hint_is_absent_off_cluster(monkeypatch, _isolated):
+    _patched_secrets(monkeypatch, {})
+    cfg = databricks.DatabricksConfig(
+        host="https://adb-1.net", token="dapi-boot", secret_scope="kv"
+    )
+
+    with pytest.raises(databricks.DatabricksError) as caught:
+        databricks.read_workspace_secret("kv", "sp-hsv-appid", config=cfg)
+
+    assert "!python" not in str(caught.value)
+
+
 def test_no_principal_anywhere_raises(_isolated):
     with pytest.raises(
         databricks.DatabricksError, match="no Azure service principal configured"

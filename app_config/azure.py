@@ -525,8 +525,14 @@ class AzureAuthClient:
         except AzureAuthError:
             raise
         except Exception as exc:  # network / TLS / bad authority surface here
+            # The type is named because these all read alike once stringified,
+            # and they need opposite fixes: SSLError means the corporate CA
+            # bundle is missing (AZURE_VERIFY), ConnectionError/ProxyError mean
+            # the host is unreachable, and a ValueError from MSAL usually means
+            # the authority itself is wrong.
             raise AzureAuthError(
-                f"could not reach Entra ID at {self.config.authority}: {exc}"
+                f"could not reach Entra ID at {self.config.authority}: "
+                f"{type(exc).__name__}: {exc}"
             ) from exc
 
     def _acquire_by_device_code(self, app: Any, scopes: tuple[str, ...]) -> dict:

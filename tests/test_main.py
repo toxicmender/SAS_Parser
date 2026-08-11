@@ -116,6 +116,7 @@ def test_parse_args_defaults_to_sharepoint_mode():
         ("--all-rows", None),
         ("--no-upload", None),
         ("--no-xref", None),
+        ("--check", None),
     ],
 )
 def test_sharepoint_flags_are_rejected_with_a_local_directory(
@@ -149,6 +150,78 @@ def test_request_id_and_app_are_mutually_exclusive(reference_dir):
     problem = main_mod._argument_error(args)
 
     assert problem is not None and "give one" in problem
+
+
+# ---------------------------------------------------------------------------
+# --check, the read-only preflight
+# ---------------------------------------------------------------------------
+
+
+def test_check_dispatches_to_the_preflight_and_converts_nothing(
+    monkeypatch, reference_dir
+):
+    from app_config import sharepoint_check
+
+    taken: list[str] = []
+    monkeypatch.setattr(
+        main_mod, "_run_sharepoint", lambda args: taken.append("sharepoint") or 0
+    )
+    monkeypatch.setattr(main_mod, "_run_local", lambda args: taken.append("local") or 0)
+    monkeypatch.setattr(
+        sharepoint_check,
+        "run_checks",
+        lambda **_kwargs: [sharepoint_check.CheckResult("config", "pass", "fine")],
+    )
+
+    code = main_mod.main(["--check", "--reference-dir", str(reference_dir)])
+
+    assert code == 0
+    assert taken == []  # neither conversion flow ran
+
+
+def test_check_exits_non_zero_when_a_stage_failed(monkeypatch, reference_dir, capsys):
+    from app_config import sharepoint_check
+
+    monkeypatch.setattr(
+        sharepoint_check,
+        "run_checks",
+        lambda **_kwargs: [
+            sharepoint_check.CheckResult("identity", "fail", "no identity", fix="set X")
+        ],
+    )
+
+    code = main_mod.main(["--check", "--reference-dir", str(reference_dir)])
+
+    assert code == 1
+    assert "set X" in capsys.readouterr().out
+
+
+def test_check_does_not_require_the_reference_directory(tmp_path):
+    """The preflight converts nothing, so demanding the reference PDFs would
+    make it unusable on the fresh checkout it exists to diagnose."""
+    args = main_mod.parse_args(["--check", "--reference-dir", str(tmp_path / "nope")])
+
+    assert main_mod._argument_error(args) is None
+
+
+def test_check_still_requires_the_reference_directory_for_a_real_run(tmp_path):
+    args = main_mod.parse_args(["--reference-dir", str(tmp_path / "nope")])
+
+    problem = main_mod._argument_error(args)
+
+    assert problem is not None and "reference_dir" in problem
+
+
+@pytest.mark.parametrize(
+    "flag, value", [("--request-id", "42"), ("--app", "MyApp"), ("--all-rows", None)]
+)
+def test_check_rejects_a_row_filter(reference_dir, flag, value):
+    extra = [flag] if value is None else [flag, value]
+    args = _args(reference_dir, "--check", *extra)
+
+    problem = main_mod._argument_error(args)
+
+    assert problem is not None and "--check" in problem
 
 
 def test_a_missing_source_directory_is_reported(reference_dir, tmp_path):

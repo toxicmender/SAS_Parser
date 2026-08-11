@@ -47,11 +47,15 @@ Synchronous facade
 ------------------
 The Graph SDK is asynchronous; every method here is an ordinary blocking call,
 to match the rest of the package. Each :class:`SharePointClient` owns one
-private event loop and drives its coroutines to completion on it
+private event loop *and one worker thread to drive it*
 (:meth:`~SharePointClient._run`), so the underlying ``httpx`` connection pool
-stays bound to a single loop. Calling these methods from *inside* a running
-event loop is therefore rejected with a clear error — use them from synchronous
-code, or drive the Graph SDK directly.
+stays bound to a single loop driven by a single thread.
+
+Owning the thread is what makes these methods safe to call from anywhere,
+including from a thread that already has a loop of its own running — which a
+Jupyter or Databricks notebook always does. Calls are serialised onto that one
+worker, so one client is not a way to parallelise Graph traffic; use several
+clients, or the ``msgraph-sdk`` client directly, for that.
 
 Dependency
 ----------
@@ -86,6 +90,7 @@ import json
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -137,6 +142,70 @@ class SharePointError(RuntimeError):
     A single error type so callers can ``except SharePointError`` around an
     operation regardless of which stage failed; the message says which.
     """
+
+
+def _request_id(exc: BaseException) -> str | None:
+    """The Graph correlation id from a failed call's response headers, if any.
+
+    ``client-request-id`` is the value Microsoft support asks for when a call
+    has to be traced service-side, so it is the one part of a Graph failure
+    worth carrying into our own message.
+    """
+    headers = getattr(exc, "response_headers", None)
+    if headers is None:
+        return None
+    for name in ("client-request-id", "request-id"):
+        try:
+            value = headers.get(name)
+        except Exception:  # a header bag of an unexpected shape is not a failure
+            return None
+        if not value:
+            continue
+        # kiota's HeadersCollection returns the values as a set.
+        if isinstance(value, (set, frozenset, list, tuple)):
+            joined = ", ".join(sorted(str(item) for item in value))
+            if joined:
+                return joined
+            continue
+        return str(value)
+    return None
+
+
+def _describe(exc: BaseException) -> str:
+    """
+    *exc* as a one-line description worth putting in a :class:`SharePointError`.
+
+    A Graph failure arrives as the SDK's ``ODataError``, whose ``str()`` is
+    frequently empty or just the class name — which leaves a reader unable to
+    tell 403 (the app registration lacks the consented permission) from 404
+    (the configured path does not exist) from 429 (throttled), the three
+    outcomes a misconfigured deployment actually produces. The status code,
+    the Graph error code, the service's own message and the correlation id are
+    all on the object; this pulls out whichever are present.
+
+    Duck-typed rather than importing ``ODataError``, so it stays usable when
+    the ``sharepoint`` extra is not installed and when the failure is an
+    ordinary ``httpx`` or TLS error instead.
+    """
+    parts: list[str] = []
+    status = getattr(exc, "response_status_code", None)
+    if status:
+        parts.append(f"HTTP {status}")
+    error = getattr(exc, "error", None)
+    code = getattr(error, "code", None)
+    if code:
+        parts.append(str(code))
+    text = str(
+        getattr(error, "message", None) or getattr(exc, "message", None) or exc
+    ).strip()
+    if text and text not in parts:
+        parts.append(text)
+    request_id = _request_id(exc)
+    if request_id:
+        parts.append(f"request-id={request_id}")
+    detail = "; ".join(parts)
+    name = type(exc).__name__
+    return f"{name}: {detail}" if detail else name
 
 
 def _drive_item_id(path: str) -> str:
@@ -539,6 +608,7 @@ class SharePointClient:
         self._credential = credential
         self._resolved_drive_id: str | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._pool: ThreadPoolExecutor | None = None
 
     # -- client construction ------------------------------------------------
 
@@ -599,31 +669,61 @@ class SharePointClient:
 
     # -- async plumbing -----------------------------------------------------
 
+    def _executor(self) -> ThreadPoolExecutor:
+        """This client's single worker thread, created on first use."""
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="sharepoint"
+            )
+        return self._pool
+
     def _run(self, coro: Any) -> Any:
         """
-        Drive *coro* to completion on this client's private event loop.
+        Drive *coro* to completion on this client's private event loop, which
+        runs on a worker thread of its own.
 
-        Raising rather than nesting when a loop is already running keeps the
-        ``httpx`` connection pool bound to one loop; an async caller should
-        drive the Graph SDK directly instead of through this blocking facade.
+        The property that matters is that the ``httpx`` connection pool stays
+        bound to exactly one loop, driven by exactly one thread. Owning a
+        thread gets that unconditionally, and — unlike blocking on the calling
+        thread — it does not care whether the caller already has a loop of its
+        own running.
+
+        That last part is not a nicety. A Jupyter or Databricks notebook runs
+        an asyncio loop in its main thread for the whole session, so a facade
+        that refused to be called from a running loop refused to be called
+        from a notebook at all: the deployment target this package exists to
+        serve. ``max_workers=1`` keeps calls serialised, so the loop is never
+        driven from two threads at once.
         """
         try:
-            asyncio.get_running_loop()
+            running = asyncio.get_running_loop()
         except RuntimeError:
-            pass
-        else:
+            running = None
+        if running is not None and running is self._loop:
+            # Submitting here would block the worker thread on itself. The
+            # helpers that run inside `_run` must await the `*_async` form
+            # (see `_item_async`) rather than call a synchronous method.
             coro.close()
             raise SharePointError(
-                "SharePointClient's synchronous methods cannot be called from a "
-                "running event loop; call them from synchronous code, or use the "
-                "msgraph-sdk client directly for async access"
+                "SharePointClient._run was re-entered from its own event loop: "
+                "a coroutine helper called a synchronous method instead of "
+                "awaiting the corresponding *_async one"
             )
         if self._loop is None or self._loop.is_closed():
             self._loop = asyncio.new_event_loop()
-        return self._loop.run_until_complete(coro)
+        loop = self._loop
+        return self._executor().submit(loop.run_until_complete, coro).result()
 
     def close(self) -> None:
-        """Close the private event loop (if any). The client is single-use after."""
+        """Close the worker thread and the private event loop (if any).
+
+        The client is single-use after: the next call builds both again. The
+        thread is shut down first, so nothing is still running on the loop
+        when it is closed.
+        """
+        if self._pool is not None:
+            self._pool.shutdown(wait=True)
+            self._pool = None
         if self._loop is not None and not self._loop.is_closed():
             self._loop.close()
         self._loop = None
@@ -640,32 +740,58 @@ class SharePointClient:
             )
         return site_id
 
-    def _drive_id(self) -> str:
+    async def _drive_id_async(self) -> str:
         """
         The target document library id: the configured
         :attr:`~SharePointConfig.drive_id`, else the site's default library,
         resolved once and cached on this client.
+
+        The async form is the real one because resolving the default library is
+        itself a Graph call. The helpers that run *inside* :meth:`_run` await
+        this; :meth:`_drive_id` is the synchronous wrapper for callers outside
+        a loop. Doing it the other way round — a sync ``_drive_id`` that the
+        coroutines called — meant re-entering :meth:`_run` from within its own
+        loop, which raises.
         """
         if self.config.drive_id:
             return self.config.drive_id
         resolved = self._resolved_drive_id
         if resolved is None:
             site_id = self._site_id()
-            drive = self._run(self.client.sites.by_site_id(site_id).drive.get())
+            drive = await self.client.sites.by_site_id(site_id).drive.get()
             resolved = getattr(drive, "id", None)
             if not resolved:
                 raise SharePointError(
                     f"site {site_id!r} has no accessible default document library; "
                     f"set SHAREPOINT_DRIVE_ID to target one explicitly"
                 )
+            logger.info(
+                f"SharePointClient: resolved the default document library of "
+                f"site {site_id!r} to drive {resolved!r}"
+            )
             self._resolved_drive_id = resolved
         return resolved
+
+    def _drive_id(self) -> str:
+        """:meth:`_drive_id_async` for synchronous callers (outside :meth:`_run`)."""
+        if self.config.drive_id:
+            return self.config.drive_id
+        if self._resolved_drive_id is None:
+            return self._run(self._drive_id_async())
+        return self._resolved_drive_id
 
     def _drive(self) -> Any:
         return self.client.drives.by_drive_id(self._drive_id())
 
     def _item(self, path: str) -> Any:
         return self._drive().items.by_drive_item_id(_drive_item_id(path))
+
+    async def _item_async(self, path: str) -> Any:
+        """:meth:`_item` for use inside a coroutine already being driven by
+        :meth:`_run` — the drive is resolved with an ``await`` rather than a
+        nested :meth:`_run`."""
+        drive = self.client.drives.by_drive_id(await self._drive_id_async())
+        return drive.items.by_drive_item_id(_drive_item_id(path))
 
     # -- operations ---------------------------------------------------------
 
@@ -709,7 +835,7 @@ class SharePointClient:
             raise
         except Exception as exc:
             raise SharePointError(
-                f"could not list SharePoint directory {path or '/'!r}: {exc}"
+                f"could not list SharePoint directory {path or '/'!r}: {_describe(exc)}"
             ) from exc
 
     def list_files(
@@ -750,7 +876,7 @@ class SharePointClient:
         return files
 
     async def _collect_children(self, path: str) -> list[dict[str, Any]]:
-        builder = self._item(path).children
+        builder = (await self._item_async(path)).children
         response = await builder.get()
         items: list[dict[str, Any]] = []
         while response is not None:
@@ -777,7 +903,7 @@ class SharePointClient:
             raise
         except Exception as exc:
             raise SharePointError(
-                f"could not read SharePoint file {path!r}: {exc}"
+                f"could not read SharePoint file {path!r}: {_describe(exc)}"
             ) from exc
         if content is None:
             raise SharePointError(f"SharePoint file {path!r} returned no content")
@@ -845,7 +971,7 @@ class SharePointClient:
             raise
         except Exception as exc:
             raise SharePointError(
-                f"could not write SharePoint file {path!r}: {exc}"
+                f"could not write SharePoint file {path!r}: {_describe(exc)}"
             ) from exc
         return _drive_item_to_dict(item)
 
@@ -935,7 +1061,7 @@ class SharePointClient:
             raise
         except Exception as exc:
             raise SharePointError(
-                f"could not create SharePoint directory {path!r}: {exc}"
+                f"could not create SharePoint directory {path!r}: {_describe(exc)}"
             ) from exc
         return _drive_item_to_dict(item)
 
@@ -950,7 +1076,7 @@ class SharePointClient:
             folder=Folder(),
             additional_data={"@microsoft.graph.conflictBehavior": conflict_behavior},
         )
-        return await self._item(parent).children.post(body)
+        return await (await self._item_async(parent)).children.post(body)
 
     def list_items(
         self,
@@ -993,7 +1119,7 @@ class SharePointClient:
             raise
         except Exception as exc:
             raise SharePointError(
-                f"could not read SharePoint list {list_name!r}: {exc}"
+                f"could not read SharePoint list {list_name!r}: {_describe(exc)}"
             ) from exc
 
     async def _collect_list_items(
@@ -1057,7 +1183,7 @@ class SharePointClient:
         except Exception as exc:
             raise SharePointError(
                 f"could not read item {item_id!r} of SharePoint list "
-                f"{list_id!r}: {exc}"
+                f"{list_id!r}: {_describe(exc)}"
             ) from exc
         if item is None:
             raise SharePointError(
@@ -1097,7 +1223,7 @@ class SharePointClient:
         except Exception as exc:
             raise SharePointError(
                 f"could not update item {item_id!r} of SharePoint list "
-                f"{list_id!r}: {exc}"
+                f"{list_id!r}: {_describe(exc)}"
             ) from exc
         data = getattr(updated, "additional_data", None)
         logger.info(

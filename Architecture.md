@@ -287,6 +287,21 @@ app_config/
                         Domain-free: what a folder or a column MEANS belongs
                         to conversion/, xref/, and complexity/sharepoint.py.
                         msgraph-sdk imported lazily (extra: sharepoint).
+  sharepoint_check.py   Read-only preflight for the SharePoint deployment
+                        (`python -m app_config.sharepoint_check`, or
+                        `sas-parser --check`): resolves the config REPORTING
+                        THE SOURCE of each value, reads the service principal
+                        out of the Databricks secret scope, mints a Graph token
+                        and decodes its `roles` claim (the granted application
+                        permissions — the 403 diagnosis), then reads the
+                        library and each configured list. Writes nothing and
+                        calls no model. --offline stops after the config.
+  logging_setup.py      Console/file logging for the three CLI entry points.
+                        --debug does NOT raise the HTTP transport libraries
+                        (TRANSPORT_LOGGERS) to DEBUG; --trace-http is the
+                        opt-in for the wire. A RedactingFilter masks bearer
+                        tokens and secret-shaped key/values on every handler.
+                        Standard library only.
 
 reporting/
   pdf.py                Markdown -> PDF: markdown-it parses, PyMuPDF's Story
@@ -869,6 +884,29 @@ any of these silently changes behavior.
      ended up reading from the drive root and writing to `{app}/output/`
      instead of `{base}/{app}/scripts_converted/{model}/{timestamp}`.
 
+13. **`SharePointClient` owns a worker thread, not just a loop.** The blocking
+    facade must stay callable from a caller that already has a running event
+    loop, because a Jupyter or Databricks notebook keeps one in its main thread
+    for the whole session — and SharePoint mode is deployed *in* a notebook.
+    Blocking on the calling thread (`run_until_complete` there) made every
+    SharePoint operation raise inside the deployment target. The invariant that
+    actually matters is that the `httpx` connection pool stays bound to one
+    loop driven by one thread; `max_workers=1` gets that unconditionally and
+    stops caring what the caller's thread is doing. Corollary: one client
+    serialises its calls, so it is not a way to parallelise Graph traffic.
+
+14. **A Graph call built inside a coroutine must resolve the drive with
+    `await`, never through `SharePointClient._run`.** `_run` drives its loop on
+    the worker thread of invariant 13, so a helper that reaches `_drive_id()`
+    from within a coroutine would block that worker on itself — `_run` detects
+    the re-entry and raises rather than deadlock. It bites only when
+    `SHAREPOINT_DRIVE_ID` is unset and the library has to be resolved from the
+    site, which is the documented default. `_item_async` / `_drive_id_async`
+    exist for exactly this; `_collect_children` and `_create_folder` use them.
+    The failure is invisible to any test that pins a `drive_id`, so
+    `tests/test_sharepoint.py` covers `list_directory`, `list_files` and
+    `create_folder` against a site-resolved drive specifically.
+
 ## Conventions
 
 - **Logging:** f-string messages everywhere (never lazy `%`-style).
@@ -880,7 +918,10 @@ any of these silently changes behavior.
   `pipeline.prompting`, `pipeline.notebook`, `memory.store`,
   `memory.relevance`, `memory.summarize`, `llm_client.client`,
   `conversion.run`, `xref.pre`, `xref.sourcing`, `target_language`, and
-  `main` for the entry point.
+  `main` for the entry point. The CLI entry points configure logging through
+  `app_config.logging_setup.configure_logging()` rather than calling
+  `logging.basicConfig` themselves, which is what gives them `--log-file`,
+  `--trace-http`, and secret redaction uniformly.
 - **Names:** dataset/macro/libref names are lowercased at extraction;
   quoted physical paths keep a leading `'` so they can never collide with
   identifiers.

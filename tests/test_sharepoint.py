@@ -16,6 +16,7 @@ import importlib.util
 import json
 import pathlib
 import sys
+import threading
 from typing import Any
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -421,6 +422,85 @@ def test_hostname_without_path_has_no_site_id():
 
 
 # ---------------------------------------------------------------------------
+# Describing a failure
+#
+# ODataError's own str() is frequently empty or just the class name, so
+# _describe reaches for the fields that actually diagnose the call. Duck-typed
+# stand-ins here rather than the SDK's classes, matching how _describe reads
+# them and keeping these runnable without the sharepoint extra.
+# ---------------------------------------------------------------------------
+
+
+class _MainError:
+    def __init__(self, code=None, message=None):
+        self.code = code
+        self.message = message
+
+
+class _Headers:
+    """kiota's HeadersCollection returns a *set* of values per header."""
+
+    def __init__(self, values):
+        self._values = values
+
+    def get(self, name):
+        return self._values.get(name)
+
+
+class _ODataError(Exception):
+    def __init__(self, status=None, code=None, message=None, request_id=None):
+        super().__init__("")  # the SDK's own str() is routinely empty
+        self.response_status_code = status
+        self.error = _MainError(code, message)
+        self.response_headers = (
+            _Headers({"client-request-id": {request_id}}) if request_id else None
+        )
+
+
+def test_describe_unpacks_a_graph_error():
+    described = sharepoint._describe(
+        _ODataError(403, "accessDenied", "Access denied", "req-1")
+    )
+    assert "HTTP 403" in described
+    assert "accessDenied" in described
+    assert "Access denied" in described
+    assert "request-id=req-1" in described
+
+
+def test_describe_reports_a_throttling_response():
+    described = sharepoint._describe(_ODataError(429, "activityLimitReached", "Slow"))
+    assert "HTTP 429" in described
+    assert "activityLimitReached" in described
+
+
+def test_describe_falls_back_to_type_and_message_for_a_plain_error():
+    described = sharepoint._describe(OSError("network down"))
+    assert described == "OSError: network down"
+
+
+def test_describe_names_the_type_when_there_is_nothing_else():
+    class _Silent(Exception):
+        pass
+
+    assert sharepoint._describe(_Silent()) == "_Silent"
+
+
+def test_describe_survives_an_unexpected_header_bag():
+    class _Hostile(Exception):
+        response_status_code = 500
+        response_headers = "not a mapping"
+
+    assert "HTTP 500" in sharepoint._describe(_Hostile())
+
+
+def test_describe_does_not_repeat_the_message_twice():
+    """`error.message` and `str(exc)` are often the same string."""
+    exc = _ODataError(404, "itemNotFound", "The resource could not be found")
+    described = sharepoint._describe(exc)
+    assert described.count("The resource could not be found") == 1
+
+
+# ---------------------------------------------------------------------------
 # Path -> drive-item id addressing
 # ---------------------------------------------------------------------------
 
@@ -495,6 +575,25 @@ def test_list_directory_wraps_errors():
     client, _ = _client(item=_ItemBuilder(children=_Boom([_Collection([])])))
     with pytest.raises(sharepoint.SharePointError, match="could not list SharePoint"):
         client.list_directory("Reports")
+
+
+def test_a_wrapped_graph_error_carries_its_status_and_code():
+    """The wrap must not flatten a Graph failure into an unreadable repr: the
+    status and error code are what say whether this is consent, a wrong path,
+    or throttling."""
+
+    class _Boom(_ChildrenBuilder):
+        def _get(self, config=None):
+            raise _ODataError(403, "accessDenied", "Access denied", "req-42")
+
+    client, _ = _client(item=_ItemBuilder(children=_Boom([_Collection([])])))
+    with pytest.raises(sharepoint.SharePointError) as caught:
+        client.list_directory("Reports")
+
+    message = str(caught.value)
+    assert "HTTP 403" in message
+    assert "accessDenied" in message
+    assert "req-42" in message
 
 
 # ---------------------------------------------------------------------------
@@ -695,6 +794,55 @@ def test_no_default_library_raises():
         client.read_file("a.txt")
 
 
+# The operations whose Graph call is built *inside* the coroutine `_run` drives,
+# rather than in the argument expression before it. Resolving the drive there
+# has to `await`, because re-entering `_run` from within its own loop is refused
+# by design — which is what these operations used to do, so every one of them
+# failed whenever SHAREPOINT_DRIVE_ID was unset and the library had to be
+# resolved from the site. That is the default configuration, and list_directory
+# is the first call a conversion run makes.
+
+
+def _site_default_drive_client():
+    site = _SiteBuilder(drive_item=_DriveItem(id="SITE-DRV"))
+    children = _ChildrenBuilder([_Collection([_DriveItem(name="a.sas")])])
+    fake = _FakeGraphClient(item=_ItemBuilder(children=children), site=site)
+    config = sharepoint.SharePointConfig(site_id="SITE")  # no explicit drive_id
+    return sharepoint.SharePointClient(config, client=fake), fake
+
+
+def test_list_directory_resolves_the_drive_from_the_site():
+    client, fake = _site_default_drive_client()
+    assert [e["name"] for e in client.list_directory("Apps")] == ["a.sas"]
+    assert fake.drives.requested_ids == ["SITE-DRV"]
+
+
+def test_list_files_resolves_the_drive_from_the_site():
+    client, _ = _site_default_drive_client()
+    assert [f["path"] for f in client.list_files("Apps")] == ["Apps/a.sas"]
+
+
+@requires_msgraph  # _create_folder builds a DriveItem body from the SDK
+def test_create_folder_resolves_the_drive_from_the_site():
+    client, fake = _site_default_drive_client()
+    client.create_folder("Apps/out")
+    assert fake.drives.requested_ids == ["SITE-DRV", "SITE-DRV"]
+
+
+def test_the_drive_is_resolved_once_across_both_call_styles():
+    """A sync-built call and a coroutine-built one share the cached drive id."""
+    site = _SiteBuilder(drive_item=_DriveItem(id="SITE-DRV"))
+    children = _ChildrenBuilder([_Collection([])])
+    item = _ItemBuilder(content=_ContentBuilder(get_value=b"x"), children=children)
+    fake = _FakeGraphClient(item=item, site=site)
+    client = sharepoint.SharePointClient(
+        sharepoint.SharePointConfig(site_id="SITE"), client=fake
+    )
+    client.read_file("a.txt")  # resolves outside the loop
+    client.list_directory("Apps")  # would resolve inside it
+    assert site.drive.get.calls == [()]
+
+
 # ---------------------------------------------------------------------------
 # get_token (authentication)
 # ---------------------------------------------------------------------------
@@ -775,20 +923,70 @@ def test_missing_sdk_raises_helpful_error(monkeypatch, _isolated):
 
 
 # ---------------------------------------------------------------------------
-# Synchronous facade guardrail
+# Synchronous facade
+#
+# The blocking methods run on the client's own worker thread, which is what
+# lets them be called from a caller that already has an event loop running.
+# A Jupyter or Databricks notebook keeps a loop in its main thread for the
+# whole session, so a facade that refused those calls refused to work in the
+# deployment target this package exists to serve.
 # ---------------------------------------------------------------------------
 
 
-def test_calling_from_a_running_loop_raises():
-    client, _ = _client(item=_ItemBuilder(content=_ContentBuilder(get_value=b"x")))
+def test_a_call_from_a_running_loop_returns_the_same_result():
+    item = _ItemBuilder(content=_ContentBuilder(get_value=b"payload"))
+    client, _ = _client(item=item)
 
     async def _inside():
-        # Inside a running loop the blocking facade must refuse rather than
-        # nest and strand the httpx pool on another loop.
-        client.read_file("a.txt")
+        return client.read_file("a.txt")
 
-    with pytest.raises(sharepoint.SharePointError, match="running event loop"):
+    assert asyncio.run(_inside()) == b"payload"
+    # And the same client still works from ordinary synchronous code after.
+    assert client.read_file("a.txt") == b"payload"
+
+
+def test_an_error_from_a_running_loop_still_surfaces():
+    """The worker thread must re-raise, not swallow or wrap in a Future error."""
+
+    class _Boom(_ChildrenBuilder):
+        def _get(self, config=None):
+            raise OSError("network down")
+
+    client, _ = _client(item=_ItemBuilder(children=_Boom([_Collection([])])))
+
+    async def _inside():
+        client.list_directory("Reports")
+
+    with pytest.raises(sharepoint.SharePointError, match="could not list SharePoint"):
         asyncio.run(_inside())
+
+
+def test_the_worker_is_one_thread_and_is_reused():
+    seen: list[str] = []
+
+    class _Watching(_ChildrenBuilder):
+        def _get(self, config=None):
+            seen.append(threading.current_thread().name)
+            return super()._get(config)
+
+    client, _ = _client(item=_ItemBuilder(children=_Watching([_Collection([])] * 3)))
+    client.list_directory()
+    client.list_directory()
+
+    assert len(set(seen)) == 1  # one worker for the client's lifetime
+    assert seen[0] != threading.current_thread().name  # and not the caller's
+
+
+def test_close_shuts_the_worker_down_and_the_client_rebuilds():
+    item = _ItemBuilder(content=_ContentBuilder(get_value=b"x"))
+    client, _ = _client(item=item)
+    assert client.read_file("a.txt") == b"x"
+
+    client.close()
+
+    # Single-use is about the loop and thread, not the client object: the next
+    # call builds both again rather than failing.
+    assert client.read_file("a.txt") == b"x"
 
 
 # ---------------------------------------------------------------------------

@@ -76,6 +76,7 @@ from pathlib import Path
 from typing import Any
 
 import app_config
+from app_config.logging_setup import configure_logging
 from chunker import MultiFileBatcher, SasCorpus, SasSemanticChunker
 
 from .analyzer import ComplexityAnalyzer
@@ -263,7 +264,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Enable DEBUG logging.",
+        help="Enable DEBUG logging. The HTTP transport libraries stay at INFO; "
+        "add --trace-http for those.",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Also write the log to this file, appending to it. Secrets are "
+        "redacted, but treat the file as sensitive.",
+    )
+    parser.add_argument(
+        "--trace-http",
+        action="store_true",
+        help="Log every HTTP request the Graph SDK and the LLM client make. "
+        "Verbose by design — pair it with --log-file.",
     )
     return parser.parse_args(argv)
 
@@ -325,9 +339,8 @@ class _Sources:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    configure_logging(
+        debug=args.debug, log_file=args.log_file, trace_http=args.trace_http
     )
 
     problem = _argument_error(args)
