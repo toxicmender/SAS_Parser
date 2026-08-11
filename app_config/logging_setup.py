@@ -23,6 +23,14 @@ out — see its docstring for what "redacted" is and is not worth.
 session that has to be re-run at a different verbosity to get a usable file is
 a debugging session that lost its evidence.
 
+**A crash is part of the log.** Python's default hook prints an unhandled
+traceback straight to stderr, which is the one place ``--log-file`` cannot
+reach — so the captured file used to stop mid-run with nothing saying why,
+exactly when it mattered most. :func:`configure_logging` routes unhandled
+exceptions (on the main thread and on worker threads) through the handlers
+instead, so the traceback lands in the file, redacted, and still reaches the
+console once.
+
 Logger name: ``app_config.logging_setup``.
 """
 
@@ -30,7 +38,10 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
+import threading
 from pathlib import Path
+from types import TracebackType
 
 logger = logging.getLogger(__name__)
 
@@ -91,9 +102,15 @@ class RedactingFilter(logging.Filter):
     Filtering rewrites ``record.msg`` and drops ``record.args`` once the two
     are merged, which is safe here because these records are on their way to a
     handler and are not re-formatted afterwards.
+
+    The traceback is masked too, and separately: an exception's text is not
+    part of ``getMessage()``, so a token echoed in the ``str()`` of a Graph
+    error would otherwise reach the file untouched on exactly the crash path
+    the log is being captured for.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
+        self._redact_traceback(record)
         try:
             message = record.getMessage()
         except Exception:  # a broken format string is the caller's bug, not ours
@@ -103,6 +120,21 @@ class RedactingFilter(logging.Filter):
             record.msg = redacted
             record.args = ()
         return True
+
+    @staticmethod
+    def _redact_traceback(record: logging.LogRecord) -> None:
+        """Mask ``record.exc_text``, formatting it first if nothing has yet.
+
+        Caching the redacted text on the record is what makes this hold for
+        *every* handler: the formatter reuses ``exc_text`` once it is set, so
+        the console and the file get the same masked traceback, and re-running
+        the patterns over an already-masked string changes nothing.
+        """
+        if not record.exc_info:
+            return
+        if not record.exc_text:
+            record.exc_text = logging.Formatter().formatException(record.exc_info)
+        record.exc_text = redact(record.exc_text)
 
 
 def redact(text: str) -> str:
@@ -117,11 +149,56 @@ def redact(text: str) -> str:
     return text
 
 
+#: What the crash line says before the traceback. Distinctive so that "did the
+#: run finish?" is one grep against a captured file.
+_CRASH_MESSAGE = "unhandled exception; the run did not finish"
+
+
+def _log_crash(
+    exc_type: type[BaseException],
+    exc: BaseException,
+    tb: TracebackType | None,
+) -> None:
+    """Emit an unhandled exception through the handlers rather than to stderr.
+
+    ``KeyboardInterrupt`` is deferred to the default hook: a Ctrl-C is the
+    operator ending the run, not a failure, and a CRITICAL traceback for it
+    would be noise in the very file this exists to keep readable.
+    """
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc, tb)
+        return
+    logger.critical(_CRASH_MESSAGE, exc_info=(exc_type, exc, tb))
+
+
+def _install_crash_handlers() -> None:
+    """Point :mod:`sys` and :mod:`threading` at :func:`_log_crash`.
+
+    Assigned rather than chained, so configuring twice in one process leaves
+    one hook rather than a stack of them that print the same traceback twice.
+    The threading hook matters here specifically because the SharePoint client
+    drives its async Graph calls from a worker thread — a failure there would
+    otherwise reach stderr and never the file.
+    """
+    sys.excepthook = _log_crash
+
+    def _thread_hook(args: threading.ExceptHookArgs) -> None:
+        # SystemExit in a thread only ends that thread and is silent by
+        # default; keeping it silent here means no behaviour changes except
+        # that a real failure now reaches the file.
+        if issubclass(args.exc_type, SystemExit):
+            return
+        _log_crash(args.exc_type, args.exc_value or args.exc_type(), args.exc_traceback)
+
+    threading.excepthook = _thread_hook
+
+
 def configure_logging(
     *,
     debug: bool = False,
     log_file: str | Path | None = None,
     trace_http: bool = False,
+    capture_crashes: bool = True,
 ) -> None:
     """Install the console (and optionally file) handlers for a CLI run.
 
@@ -140,6 +217,11 @@ def configure_logging(
         which is what shows the individual Graph requests, their status codes,
         and the retries the SDK middleware performs on its own. Verbose by
         design; pair it with *log_file*.
+    capture_crashes : bool
+        Route unhandled exceptions through the handlers, so a traceback is
+        captured by *log_file* instead of going only to stderr. On by default
+        because that is what a CLI wants; a caller embedding this in a larger
+        process that owns its own :data:`sys.excepthook` passes ``False``.
 
     Replaces any existing handlers on the root logger, so calling this twice in
     one process (a test, an embedding caller) reconfigures rather than
@@ -169,6 +251,9 @@ def configure_logging(
     transport_level = logging.DEBUG if trace_http else logging.INFO
     for name in TRANSPORT_LOGGERS:
         logging.getLogger(name).setLevel(transport_level)
+
+    if capture_crashes:
+        _install_crash_handlers()
 
     if resolved is not None:
         logger.info(f"logging to '{resolved}'")

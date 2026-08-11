@@ -918,10 +918,15 @@ any of these silently changes behavior.
   `pipeline.prompting`, `pipeline.notebook`, `memory.store`,
   `memory.relevance`, `memory.summarize`, `llm_client.client`,
   `conversion.run`, `xref.pre`, `xref.sourcing`, `target_language`, and
-  `main` for the entry point. The CLI entry points configure logging through
+  `main` for the entry point. All four CLI entry points (`main`,
+  `python -m complexity`, `python -m validation`,
+  `python -m app_config.sharepoint_check`) configure logging through
   `app_config.logging_setup.configure_logging()` rather than calling
   `logging.basicConfig` themselves, which is what gives them `--log-file`,
-  `--trace-http`, and secret redaction uniformly.
+  `--debug`, `--trace-http`, and secret redaction uniformly. That call also
+  routes unhandled exceptions — main thread and worker threads — through the
+  handlers, so `--log-file` captures the traceback rather than losing it to
+  stderr; redaction covers the traceback text, not just the message.
 - **Names:** dataset/macro/libref names are lowercased at extraction;
   quoted physical paths keep a leading `'` so they can never collide with
   identifiers.

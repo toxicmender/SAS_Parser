@@ -777,7 +777,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--log-file",
         default=None,
-        help="Also write the log to this file (appended).",
+        help="Also write the log to this file, appending to it. Secrets are "
+        "redacted, but treat the file as sensitive.",
     )
     parser.add_argument(
         "--trace-http",
@@ -785,7 +786,10 @@ def main(argv: list[str] | None = None) -> int:
         help="Log every Graph request the SDK makes. Verbose; pair with --log-file.",
     )
     parser.add_argument(
-        "--debug", action="store_true", help="Enable DEBUG logging."
+        "--debug",
+        action="store_true",
+        help="Enable DEBUG logging. The HTTP transport libraries stay at INFO; "
+        "add --trace-http for those.",
     )
     args = parser.parse_args(argv)
 

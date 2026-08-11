@@ -190,8 +190,12 @@ HTTP transport libraries at INFO, so the pipeline's own lines stay readable;
 `--trace-http` is the opt-in for the wire. Bearer tokens and secret-shaped
 values are masked before anything reaches a handler, but a log file is still
 sensitive — the redaction covers the shapes these libraries emit, not every
-shape possible. All three flags work on `python -m complexity` and
-`python -m validation` too.
+shape possible. All three flags work on `python -m complexity`,
+`python -m validation` and `python -m app_config.sharepoint_check` too.
+
+If a run dies, the traceback is captured in the file as well as printed —
+including one raised on the Graph client's worker thread — so a log that ends
+mid-run says why. Grep `unhandled exception` to find it.
 
 ## Other entry points
 
