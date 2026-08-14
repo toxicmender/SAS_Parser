@@ -1,4 +1,4 @@
-"""Rewriting table names in *generated* code, after conversion.
+"""Rewriting table names and physical paths in *generated* code, after conversion.
 
 Two languages, two parsers, one rule.
 
@@ -13,6 +13,16 @@ PySpark
     SQL inside it is still SQL. Rewriting is done by **source-span
     substitution** rather than ``ast.unparse``, so comments, formatting and
     string quoting survive untouched; only the matched literals change.
+
+Paths, not just tables
+----------------------
+``xref.pre`` remaps a ``LIBNAME`` / ``INFILE`` / ``%INCLUDE`` path in the SAS
+source before conversion. A path can still reach the generated code — no mapping
+row covered it when ``pre`` ran, or the model wrote one of its own — so the post
+pass rewrites those too: :func:`rewrite_python_paths` over the reader/writer and
+``dbutils.fs`` calls, :func:`rewrite_sql_paths` over ``LOCATION`` and friends.
+Both resolve through :mod:`xref.mapping`, the same longest-prefix resolver
+``pre`` uses, so one path cannot come out of the two halves as two targets.
 
 The hard rule
 -------------
@@ -33,9 +43,12 @@ from __future__ import annotations
 
 import ast
 import logging
+import re
 
 import app_config
 from target_language import SPARKSQL
+
+from .mapping import map_path, ordered_keys
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +60,26 @@ _ON_PARSE_FAILURE = (ON_PARSE_FAILURE_WARN, ON_PARSE_FAILURE_ERROR)
 _TABLE_CALLS = frozenset({"table", "saveAsTable", "insertInto", "createOrReplaceTempView"})
 # Attribute calls whose first string argument is SQL to recurse into.
 _SQL_CALLS = frozenset({"sql"})
+
+# Attribute calls whose first string argument is a *path* rather than a table:
+# the DataFrame reader/writer formats, and the dbutils filesystem utilities.
+# ``head`` and ``text`` are also DataFrame methods that take something else —
+# the first-argument-is-a-string test and the mapping lookup both have to pass
+# before anything is rewritten, so a `df.head(5)` is never touched.
+_PATH_CALLS = frozenset(
+    {
+        # DataFrameReader / DataFrameWriter
+        "csv", "parquet", "json", "orc", "text", "load", "save",
+        # dbutils.fs
+        "ls", "cp", "mv", "rm", "mkdirs", "mount", "head", "put",
+    }
+)
+# Builtins taking a path as their first argument.
+_PATH_BUILTINS = frozenset({"open"})
+# ``.option("path", "<path>")`` — the one form whose path is the *second*
+# argument, so it needs its own branch rather than joining _PATH_CALLS.
+_OPTION_CALL = "option"
+_OPTION_PATH_KEYS = frozenset({"path"})
 
 
 class XrefRewriteError(RuntimeError):
@@ -215,18 +248,7 @@ def rewrite_python(
         _unparseable("PySpark", exc, on_failure)
         return source
 
-    lines = source.splitlines(keepends=True)
-    # Byte offset of the start of each 1-based line, for span arithmetic.
-    starts: list[int] = [0]
-    for line in lines:
-        starts.append(starts[-1] + len(line))
-
-    def offset(lineno: int, col: int) -> int:
-        # ast columns are utf-8 byte offsets into the line; the sources here
-        # are code, so encode the prefix rather than assume they agree.
-        line = lines[lineno - 1]
-        return starts[lineno - 1] + len(line.encode("utf-8")[:col].decode("utf-8"))
-
+    offset = _offsetter(source)
     # (start, end, replacement text), collected then applied back-to-front so
     # earlier spans keep their offsets.
     edits: list[tuple[int, int, str]] = []
@@ -247,7 +269,12 @@ def rewrite_python(
             target = _lookup(text, mapping)
             if target is None:
                 continue
-            new_text = repr(target)
+            # The literal's own quoting style, like the path half and the SQL
+            # branch below. ``repr`` is the fallback for a value whose style
+            # cannot be reproduced (it embeds the quote, or a backslash), not
+            # the default: normalising every rewritten "x" to 'x' put quoting
+            # churn in the diff of a file whose table name was the only change.
+            new_text = _requote(source, literal, target) or repr(target)
         elif name in _SQL_CALLS:
             rewritten = rewrite_sql(text, mapping, on_failure=on_failure)
             if rewritten == text:
@@ -269,10 +296,196 @@ def rewrite_python(
 
     if not edits:
         return source
+    logger.info(f"rewrite_python: rewrote {len(edits)} table reference(s)")
+    return _apply_edits(source, edits)
+
+
+def _offsetter(source: str):
+    """A ``(lineno, col) -> character offset`` function for *source*.
+
+    ``ast`` reports columns as utf-8 byte offsets into the line, so the prefix
+    is encoded and decoded rather than assumed to agree with the character
+    index. Built once per rewrite and shared by every span in it.
+    """
+    lines = source.splitlines(keepends=True)
+    starts: list[int] = [0]
+    for line in lines:
+        starts.append(starts[-1] + len(line))
+
+    def offset(lineno: int, col: int) -> int:
+        line = lines[lineno - 1]
+        return starts[lineno - 1] + len(line.encode("utf-8")[:col].decode("utf-8"))
+
+    return offset
+
+
+def _apply_edits(source: str, edits: list[tuple[int, int, str]]) -> str:
+    """*source* with each ``(start, end, replacement)`` span substituted.
+
+    Applied back-to-front so an earlier span's offsets are still valid when it
+    is reached. Everything outside the listed spans — comments, formatting,
+    quoting — comes through byte-identical, which is what makes this module's
+    hard rule (leave unparseable input alone) worth anything: a rewrite that
+    reformatted would be indistinguishable from a corruption.
+    """
     out = source
     for start, end, replacement in sorted(edits, reverse=True):
         out = out[:start] + replacement + out[end:]
-    logger.info(f"rewrite_python: rewrote {len(edits)} table reference(s)")
+    return out
+
+
+def _path_literal(node: ast.Call) -> ast.Constant | None:
+    """The string literal holding a path in *node*, or ``None``.
+
+    Three call shapes, in the order they are cheapest to reject:
+    ``dbutils.fs.ls("<path>")`` and the reader/writer formats
+    (:data:`_PATH_CALLS`), ``open("<path>")`` (:data:`_PATH_BUILTINS`, a bare
+    name rather than an attribute), and ``.option("path", "<path>")`` — the
+    only one whose path is not the first argument.
+    """
+    if not node.args:
+        return None
+    func = node.func
+    if isinstance(func, ast.Name):
+        if func.id not in _PATH_BUILTINS:
+            return None
+        found = _string_literal(node.args[0])
+        return found[0] if found else None
+    if not isinstance(func, ast.Attribute):
+        return None
+    if func.attr == _OPTION_CALL:
+        key = _string_literal(node.args[0])
+        if not key or key[1].strip().lower() not in _OPTION_PATH_KEYS:
+            return None
+        if len(node.args) < 2:
+            return None
+        found = _string_literal(node.args[1])
+        return found[0] if found else None
+    if func.attr not in _PATH_CALLS:
+        return None
+    found = _string_literal(node.args[0])
+    return found[0] if found else None
+
+
+def rewrite_python_paths(
+    source: str, by_path: dict[str, str], *, on_failure: str | None = None
+) -> str:
+    """
+    *source* with the physical paths in its Spark and filesystem calls remapped.
+
+    The path counterpart of :func:`rewrite_python`: same ``ast`` walk, same
+    source-span substitution, same hard rule — unparseable input comes back
+    exactly as the model wrote it. Only the literals in the recognised path
+    positions (:func:`_path_literal`) are considered, and only those a
+    ``by_path`` mapping actually addresses are changed, so a string that merely
+    looks like a path is left alone.
+
+    Resolution is :func:`xref.mapping.map_path`, shared with the pre pass, so
+    one path cannot be rewritten to two different targets by the two halves.
+    """
+    if not by_path or not source.strip():
+        return source
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        _unparseable("PySpark", exc, on_failure)
+        return source
+
+    keys = ordered_keys(by_path)
+    offset = _offsetter(source)
+    edits: list[tuple[int, int, str]] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        literal = _path_literal(node)
+        if literal is None or literal.end_lineno is None:
+            continue
+        if literal.end_col_offset is None or not isinstance(literal.value, str):
+            continue
+        target = map_path(literal.value, by_path, keys)
+        if target is None:
+            continue
+        new_text = _requote(source, literal, target)
+        if new_text is None:
+            continue
+        edits.append(
+            (
+                offset(literal.lineno, literal.col_offset),
+                offset(literal.end_lineno, literal.end_col_offset),
+                new_text,
+            )
+        )
+
+    if not edits:
+        return source
+    logger.info(f"rewrite_python_paths: rewrote {len(edits)} path(s)")
+    return _apply_edits(source, edits)
+
+
+# Where a physical path appears in generated Spark SQL. Named groups match
+# chunker.paths' convention — ``head`` is everything up to the opening quote,
+# ``q`` the quote, ``path`` the value — so the substitution is one helper for
+# every entry.
+#
+# Matched by *position* rather than by parsing, unlike the table rewriter above:
+# sqlglot regenerates a whole statement to change a node, which reformats
+# everything it touches. That is worth paying to re-emit a table as structured
+# identifiers; it is not worth paying to change a string literal.
+_SQL_PATH_POSITIONS: tuple[re.Pattern[str], ...] = (
+    # CREATE TABLE ... LOCATION '<path>'
+    re.compile(r"(?P<head>\blocation\s+)(?P<q>['\"])(?P<path>[^'\"\n]*)(?P=q)", re.I),
+    # OPTIONS ('path' = '<path>') — the quoted-key form, matched before the bare
+    # one so the key is consumed as part of `head` rather than being mistaken
+    # for the start of a bare `path` clause.
+    re.compile(
+        r"(?P<head>['\"]path['\"]\s*=\s*)(?P<q>['\"])(?P<path>[^'\"\n]*)(?P=q)", re.I
+    ),
+    # OPTIONS (path '<path>') and PATH = '<path>'. A separator is required, so
+    # this cannot latch onto the quoted key above and rewrite the ` = ` between
+    # them as though it were the value.
+    re.compile(
+        r"(?P<head>\bpath\s*(?:=\s*|\s+))(?P<q>['\"])(?P<path>[^'\"\n]*)(?P=q)", re.I
+    ),
+    # COPY INTO ... FROM '<path>' — a quoted literal in FROM position is a
+    # location, not a table name (a table there is an identifier).
+    re.compile(r"(?P<head>\bfrom\s+)(?P<q>['\"])(?P<path>[^'\"\n]*)(?P=q)", re.I),
+    # read_files('<path>')
+    re.compile(
+        r"(?P<head>\bread_files\s*\(\s*)(?P<q>['\"])(?P<path>[^'\"\n]*)(?P=q)", re.I
+    ),
+)
+
+
+def rewrite_sql_paths(sql: str, by_path: dict[str, str]) -> str:
+    """
+    *sql* with the paths in its location clauses remapped.
+
+    Needs no parser — see :data:`_SQL_PATH_POSITIONS` — so unlike
+    :func:`rewrite_sql` this does not degrade when ``sqlglot`` is absent, and
+    SQL it cannot make sense of is simply left untouched rather than
+    round-tripped.
+    """
+    if not by_path or not sql.strip():
+        return sql
+
+    keys = ordered_keys(by_path)
+    changed = 0
+
+    def _substitute(match: re.Match[str]) -> str:
+        nonlocal changed
+        target = map_path(match.group("path"), by_path, keys)
+        if target is None:
+            return match.group(0)
+        changed += 1
+        quote = match.group("q")
+        return f"{match.group('head')}{quote}{target}{quote}"
+
+    out = sql
+    for pattern in _SQL_PATH_POSITIONS:
+        out = pattern.sub(_substitute, out)
+    if changed:
+        logger.info(f"rewrite_sql_paths: rewrote {changed} path(s)")
     return out
 
 

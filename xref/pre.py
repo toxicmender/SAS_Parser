@@ -7,15 +7,10 @@ covers nothing else: :func:`chunker.batcher._map_ds` early-returns on quoted
 physical paths and on names still carrying a ``&``, because neither is a library
 member the dataset vocabulary can address.
 
-Three constructs therefore go untouched by it, and they are exactly where a
-*physical path* appears:
-
-``LIBNAME``
-    ``libname raw '/data/in';`` — the library's location, not a dataset.
-``INFILE`` / ``FILE``
-    ``infile '/data/in/customers.csv';`` — a flat file being read or written.
-``%INCLUDE``
-    ``%include '/code/macros/common.sas';`` — source pulled in from elsewhere.
+A whole family of constructs therefore goes untouched by it, and they are exactly
+where a *physical path* appears — ``LIBNAME``, ``FILENAME``, ``INFILE`` / ``FILE``,
+``%INCLUDE``, PROC IMPORT/EXPORT's ``datafile=`` / ``outfile=``, ODS destinations,
+and ``options sasautos=``.
 
 This module rewrites those, keyed off :attr:`~xref.sourcing.XrefMappings.by_path`
 — the slot XREF rows carrying a ``path`` marker in ``Title`` populate. It runs
@@ -23,6 +18,20 @@ over the **raw source text, before chunking**, which is both the same position
 the reference system applies its substitution at and the position that keeps
 ``chunker`` and ``pipeline`` free of any XREF knowledge: by the time the chunker
 sees the text, the paths are already the target's.
+
+Where the grammar lives
+-----------------------
+Not here. :mod:`chunker.paths` owns the definition of where a path appears in SAS
+syntax, because the chunker also *records* these paths as chunk metadata and two
+modules maintaining that grammar separately is the drift Architecture.md invariant
+12 exists to prevent. This module imports :data:`~chunker.paths.PATH_STATEMENTS`
+and supplies only the substitution. The import is lazy, matching
+:mod:`xref.apply`, so ``xref`` stays usable without pulling the chunker in.
+
+Only filesystem locations are rewritten. ``FILENAME`` shares its syntax with
+device forms — ``filename x pipe 'ls -l'``, ``filename m email 'to@host'`` — whose
+quoted argument is a command or an address, not somewhere an XREF path mapping
+could sensibly point.
 
 What this is not
 ----------------
@@ -32,8 +41,9 @@ are not paths at all — a table name inside a comment, a string that merely loo
 like one. This module matches **by statement** instead, so a rewrite only lands
 where SAS syntax says a path belongs. The one property of the reference's
 approach worth keeping is the ordering: a path is routinely a prefix of a longer
-path, so keys are tried longest-first (:func:`_ordered_keys`) and the most
-specific mapping wins.
+path, so keys are tried longest-first and the most specific mapping wins. That
+resolution lives in :mod:`xref.mapping`, shared with the post pass so the two
+halves can never rewrite one path to two different targets.
 
 Unresolved macro references (``libname raw "&root/in";``) are **not**
 substituted — the value is not knowable without running SAS — but they are
@@ -48,37 +58,18 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from functools import partial
 from typing import TYPE_CHECKING
 
+from .mapping import map_path, ordered_keys
+
 if TYPE_CHECKING:  # avoid a runtime import cycle with sourcing
+    from chunker.paths import PathSpec
+
     from .sourcing import XrefMappings
 
 logger = logging.getLogger(__name__)
 
-# Statements whose quoted argument is a physical path. Each pattern captures the
-# quote in group "q" and the path in group "path", so one substitution helper
-# serves all of them. Case-insensitive and DOTALL-free on purpose: a SAS
-# statement's quoted literal does not span lines.
-_PATH_STATEMENTS: dict[str, re.Pattern[str]] = {
-    # libname <libref> [<engine>] '<path>'
-    "LIBNAME": re.compile(
-        r"(?P<head>\blibname\s+[A-Za-z_]\w*\s+(?:[A-Za-z_]\w*\s+)?)"
-        r"(?P<q>['\"])(?P<path>[^'\"\n]*)(?P=q)",
-        re.IGNORECASE,
-    ),
-    # infile '<path>' / file '<path>'
-    "INFILE": re.compile(
-        r"(?P<head>\b(?:infile|file)\s+)"
-        r"(?P<q>['\"])(?P<path>[^'\"\n]*)(?P=q)",
-        re.IGNORECASE,
-    ),
-    # %include '<path>'
-    "%INCLUDE": re.compile(
-        r"(?P<head>%include\s+)"
-        r"(?P<q>['\"])(?P<path>[^'\"\n]*)(?P=q)",
-        re.IGNORECASE,
-    ),
-}
 
 
 @dataclass
@@ -104,41 +95,6 @@ class PreStats:
 
     def __bool__(self) -> bool:
         return bool(self.rewritten or self.unresolved)
-
-
-def _ordered_keys(by_path: dict[str, str]) -> list[str]:
-    """*by_path*'s keys, longest first.
-
-    A path is routinely a prefix of a longer path (``/data`` and
-    ``/data/inbound``), so trying the longest first is what makes the most
-    specific mapping win. Ties break alphabetically so the order is stable and
-    a run is reproducible.
-    """
-    return sorted(by_path, key=lambda k: (-len(k), k))
-
-
-def _map_path(value: str, by_path: dict[str, str], keys: list[str]) -> str | None:
-    """*value* remapped, or ``None`` when no mapping addresses it.
-
-    An exact match wins; failing that the longest key that *value* sits under
-    is treated as a directory prefix and replaced, so mapping one folder moves
-    everything beneath it. Comparison is case-insensitive because
-    :func:`xref.sourcing.classify` lowercases its keys, matching the repo-wide
-    "names lowercased at extraction" convention.
-    """
-    folded = value.strip().lower()
-    if not folded:
-        return None
-    exact = by_path.get(folded)
-    if exact is not None:
-        return exact
-    for key in keys:
-        # Directory prefix: the key must end at a path separator in `value`,
-        # so `/data/in` never matches `/data/inbound`.
-        if folded.startswith(key.rstrip("/") + "/"):
-            tail = value.strip()[len(key.rstrip("/")) :]
-            return f"{by_path[key].rstrip('/')}{tail}"
-    return None
 
 
 def rewrite_source_text(
@@ -170,16 +126,26 @@ def rewrite_source_text(
     if not by_path or not text:
         return text, PreStats()
 
-    keys = _ordered_keys(by_path)
+    # Lazy, like xref.apply's: this package stays importable without the chunker,
+    # and the cost lands only on a run that actually has path mappings to apply.
+    from chunker.models import PathLocation
+    from chunker.paths import PATH_STATEMENTS
+
+    keys = ordered_keys(by_path)
     stats = PreStats()
     label = source_id or "<inline>"
 
-    def _substitute(match: re.Match[str]) -> str:
+    def _substitute(match: re.Match[str], *, spec: "PathSpec") -> str:
+        # A device form's quoted argument is a command line or an address, not a
+        # location a path mapping can address. See the module docstring;
+        # classifying it is chunker.paths' call, not ours.
+        if spec.location_for(match) is not PathLocation.FILESYSTEM:
+            return match.group(0)
         raw = match.group("path")
         if "&" in raw:
             stats.unresolved.append(raw)
             return match.group(0)
-        mapped = _map_path(raw, by_path, keys)
+        mapped = map_path(raw, by_path, keys)
         if mapped is None:
             return match.group(0)
         stats.rewritten[raw] = mapped
@@ -187,11 +153,13 @@ def rewrite_source_text(
         return f"{match.group('head')}{quote}{mapped}{quote}"
 
     rewritten = text
-    for statement, pattern in _PATH_STATEMENTS.items():
+    for spec in PATH_STATEMENTS:
         before = rewritten
-        rewritten = pattern.sub(_substitute, rewritten)
+        rewritten = spec.pattern.sub(partial(_substitute, spec=spec), rewritten)
         if before != rewritten and logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"rewrite_source_text: {label}: {statement} path(s) remapped")
+            logger.debug(
+                f"rewrite_source_text: {label}: {spec.statement} path(s) remapped"
+            )
 
     if stats.rewritten:
         logger.info(

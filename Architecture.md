@@ -873,6 +873,24 @@ any of these silently changes behavior.
      `app_config.sharepoint` nowhere — `tests/test_xref.py` asserts this
      directly, because the failure mode is a network call appearing inside a
      package documented as network-free.
+   - **One path grammar.** `chunker/paths.py` owns where a physical path
+     appears in SAS syntax (`PATH_STATEMENTS`), because the chunker both
+     *records* those paths as `SasChunkMetadata.external_refs` and is the
+     package that owns SAS syntax. `xref/pre.py` imports it — lazily, like
+     `xref/apply.py` — and supplies only the substitution; `complexity` reports
+     what the chunker found. The table used to live in `xref/pre.py`, and a
+     second copy growing inside the chunker would mean the module that rewrites
+     paths and the module that inventories them disagreeing about what a path
+     is. Only `FILESYSTEM` refs are rewritten: a `FILENAME` device form's quoted
+     argument is a command line or a mail address, not a location a mapping can
+     address. Where a path appears in *generated* code is a separate grammar and
+     lives with the rewriter (`xref/rewrite.py`) — it is target syntax, not SAS.
+   - **One path resolver.** `xref/mapping.py` decides which `by_path` key wins
+     (exact match, then longest directory prefix) and what it rewrites to. Both
+     halves of the substitution import it: `xref/pre.py` on the way in,
+     `xref/rewrite.py` on the way out. A second copy would let a run in `"both"`
+     mode rewrite one path twice to two different targets, with the second
+     silently winning.
    - **One credential chain.** `LLMClientConfig.from_ai_gateway()` is the only
      way to build a gateway config. Assembling one by hand from
      `vault.ai_gateway_token()` looks equivalent and silently drops the
