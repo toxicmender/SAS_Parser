@@ -238,6 +238,11 @@ _META_FLAG_ATTRS: tuple[tuple[str, str], ...] = (
     ("component_object", "component_objects"),
     ("unclosed_block", "has_unclosed_block"),
     ("includes", "includes"),
+    # An item that names a filesystem location or reaches a remote service has
+    # a translation problem no construct key describes — the path itself has to
+    # become something on the target — so it gets its own scope token.
+    ("physical_paths", "physical_paths"),
+    ("remote_paths", "remote_paths"),
     ("defines_macros", "defines_macros"),
     ("invokes_macros", "invokes_macros"),
     ("produces_macrovars", "produces_macrovars"),

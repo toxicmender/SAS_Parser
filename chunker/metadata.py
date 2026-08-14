@@ -27,7 +27,8 @@ from .keywords import (
     _SAS_SUBSETTING_IF_RE,
     _SAS_SUM_STATEMENT_RE,
 )
-from .models import SasChunkKind, SasChunkMetadata
+from .models import SasChunkKind, SasChunkMetadata, SasPathRef, _path_ref_sort_key
+from .paths import extract_paths
 from .scanner import _blank_span, _sanitise
 
 logger = logging.getLogger(__name__)
@@ -71,7 +72,9 @@ def _function_scan_text(mt: str) -> str:
     return _GROUPED_INPUT_PUT_STMT_RE.sub(lambda m: " " * len(m.group(0)), mt)
 
 
-_INCLUDE_RE = re.compile(r"%\s*include\s+([^;]+)", re.IGNORECASE)
+# %INCLUDE paths are not scanned here: chunker.paths owns that grammar and
+# ``includes`` is derived from its output, so there is one definition of where
+# an include path lives rather than two that can disagree.
 _OPTIONS_RE = re.compile(r"\boptions\s+([^;]+)", re.IGNORECASE)
 _LABEL_RE = re.compile(r"\blabel\s+([A-Za-z_]\w*)\s*=", re.IGNORECASE)
 _PROC_RE = re.compile(r"\bproc\s+([A-Za-z_]\w*)", re.IGNORECASE)
@@ -440,11 +443,13 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
         }
         | set(defines_librefs)
     )
-    includes = (
-        [_nid(m.group(1)).strip("'\"") for m in _INCLUDE_RE.finditer(cf)]
-        if "include" in lowcf
-        else []
-    )
+    # Every external reference the chunk names — see chunker/paths.py, which
+    # owns the grammar this and xref.pre both read.
+    external_refs = extract_paths(cf)
+    # ``includes`` is the %INCLUDE slice of that same scan rather than a second
+    # definition of where an include path lives. It keeps its list[str] shape
+    # and its consumers (complexity.crossfile, the [meta: includes] flag).
+    includes = [r.path for r in external_refs if r.statement == "include"]
     options = (
         [_nid(p) for m in _OPTIONS_RE.finditer(mt) for p in m.group(1).split()]
         if "options" in low
@@ -635,6 +640,7 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
         produces_macrovars=sorted(set(produces_macrovars)),
         symput_scope_hazard=hazard,
         symput_hazard_vars=sorted(set(hazard_vars)),
+        external_refs=external_refs,
     )
 
 
@@ -657,6 +663,9 @@ def _merge_meta(parent: SasChunkMetadata, child: SasChunkMetadata) -> SasChunkMe
     merged by its type automatically instead of being silently dropped:
 
     - ``list[str]``   → sorted union of both sides;
+    - ``list[SasPathRef]`` → union of both sides, ordered by
+      :func:`~chunker.models._path_ref_sort_key` (the records are frozen, so a
+      set deduplicates them; the sort is what keeps output reproducible);
     - ``bool``        → OR (a flag raised anywhere in the region stays raised);
     - ``str | None``  → child's value, falling back to the parent's (the
       child is the more specific view of its own slice);
@@ -676,6 +685,8 @@ def _merge_meta(parent: SasChunkMetadata, child: SasChunkMetadata) -> SasChunkMe
             merged[name] = p or c
         elif field.annotation == list[str]:
             merged[name] = sorted({*p, *c})
+        elif field.annotation == list[SasPathRef]:
+            merged[name] = sorted({*p, *c}, key=_path_ref_sort_key)
         elif field.annotation is bool:
             merged[name] = p or c
         elif field.annotation == (str | None):

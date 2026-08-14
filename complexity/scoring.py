@@ -21,7 +21,7 @@ import re
 from typing import Iterable
 
 import app_config
-from chunker.models import SasChunk, SasChunkMetadata
+from chunker.models import SasChunk, SasChunkMetadata, SasPathRef, _path_ref_sort_key
 from chunker.scanner import _sanitise
 
 from .models import ChunkComplexity, ComplexitySignal, ComplexityTier, TranslationParity
@@ -98,6 +98,20 @@ def _file_datasets(
         [d for d in reads if d.lower() not in written],
         writes,
         [d for d in reads if d.lower() in written],
+    )
+
+
+def _file_paths(scored: list[ChunkComplexity]) -> list[SasPathRef]:
+    """One file's external references, rolled up from its chunks.
+
+    Deduplicated across chunks — a libref assigned once and read by five steps
+    is one location to provision — and ordered by
+    :func:`~chunker.models._path_ref_sort_key`, the same order the chunker's own
+    rollups use, so a file's list and a batch's list of the same corpus never
+    disagree about sequence.
+    """
+    return sorted(
+        {ref for c in scored for ref in c.external_refs}, key=_path_ref_sort_key
     )
 
 

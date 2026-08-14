@@ -14,6 +14,11 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field, computed_field
 
+# The chunker's record of one external location. Re-exported so a consumer
+# reading a complexity report never has to know which package first named it.
+from chunker.models import PathLocation as PathLocation
+from chunker.models import SasPathRef as SasPathRef
+
 # Re-exported, not merely used: this module is the import site every caller
 # already writes, and the split is an internal one.
 from .dependencies import DependencyEdge as DependencyEdge
@@ -127,6 +132,11 @@ class ChunkComplexity(_ComplexityBase):
     # are small, and a rollup needs them per chunk to be auditable.
     input_datasets: list[str] = Field(default_factory=list)
     output_datasets: list[str] = Field(default_factory=list)
+    # The external locations this chunk names — the filesystem paths, remote
+    # services and mailboxes behind its LIBNAME/FILENAME/INFILE/... statements.
+    # Carried up for the same reason as the datasets above: a file's path list
+    # has to be auditable against the chunks it was rolled up from.
+    external_refs: list[SasPathRef] = Field(default_factory=list)
 
     def __str__(self) -> str:
         return (
@@ -264,6 +274,10 @@ class FileComplexity(_ComplexityBase):
     input_datasets: list[str] = Field(default_factory=list)
     output_datasets: list[str] = Field(default_factory=list)
     intermediate_datasets: list[str] = Field(default_factory=list)
+    # Everywhere outside the SAS libraries this file reaches. Reported, never
+    # scored: like the dataset interface above it says what a migration has to
+    # provision, which is not the same question as how hard the code is.
+    external_refs: list[SasPathRef] = Field(default_factory=list)
     chunks: list[ChunkComplexity] = Field(default_factory=list)
     cross_file: CrossFileProfile | None = None
     # Batch ids inside this file, offered as cut points when it needs breaking

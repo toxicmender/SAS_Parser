@@ -90,7 +90,8 @@ For running the work items end-to-end through an LLM, see the
 
 | File | Role |
 |------|------|
-| `models.py` | Pydantic models: `SasChunk` (+`Kind`), `SasChunkMetadata`, `SasChunkResult`, `SasCorpus`, `SasBatch`, `SasBatchResult`, `SasDiagnostic` (+`Severity`). |
+| `models.py` | Pydantic models: `SasChunk` (+`Kind`), `SasChunkMetadata`, `SasChunkResult`, `SasCorpus`, `SasBatch`, `SasBatchResult`, `SasDiagnostic` (+`Severity`), `SasPathRef` (+`PathLocation`). |
+| `paths.py` | Where a physical path appears in SAS syntax — `PATH_STATEMENTS`, `classify_location`, `extract_paths`. The **single owner** of that grammar: `xref.pre` imports it to rewrite the same statements. |
 | `keywords.py` | SAS keyword catalogues transcribed from the SAS docs (reserved macro words, autocall macros, function / CALL-routine dictionaries, and `SAS_FUNCTION_CATEGORIES`) + the patterns compiled from them. Pure data; no package imports, no logging. |
 | `scanner.py` | Lexical layer: `_Unit` / `_Region` parse primitives, the statement classifier (`_classify`), text normalisation / sanitisation, line-offset helpers, and the `_Deadline` / `_ParseWatchdog` stuck-parser machinery. |
 | `metadata.py` | Per-chunk semantic extraction: `_metadata_for`, `_io_for` (directed dataset I/O), `_macro_body_io` (literal vs parameterised body refs), symput / SQL-INTO / CALL EXECUTE extractors, `_merge_meta`, and the extraction regex catalogue. |
@@ -138,7 +139,7 @@ this is a considered decision, not an accident.
 
 ### Metadata: stored vs computed
 
-`SasChunkMetadata` stores one field per concept. Two views are **computed
+`SasChunkMetadata` stores one field per concept. Five views are **computed
 fields** derived at access time, not stored:
 
 - `referenced_automatic_vars` — the `&sys*` subset of `referenced_macro_vars`
@@ -147,6 +148,8 @@ fields** derived at access time, not stored:
 - `consumes_macrovars` — `referenced_macro_vars` minus automatics minus the
   macro's own `macro_param_names` (call-site-resolved, so never a corpus-level
   dependency).
+- `physical_paths` / `remote_paths` / `email_refs` — the `external_refs` entries
+  whose `location` is `FILESYSTEM` / `REMOTE` / `EMAIL`.
 
 Both appear in `model_dump()` but are silently ignored as constructor kwargs,
 and they do not appear in `__str__`. `defines_macros` / `invokes_macros` are the
@@ -155,6 +158,23 @@ EXECUTE-invoked macros).
 
 Names are lowercased at extraction; quoted physical paths keep a leading `'` so
 they can never collide with identifiers.
+
+### External references
+
+`external_refs` is one stored list of `SasPathRef` records — every location a
+chunk's statements name, whatever kind of place it is. `paths.py` recognises
+`LIBNAME`, `FILENAME`, `INFILE` / `FILE`, `%INCLUDE`, PROC IMPORT/EXPORT's
+`datafile=` / `outfile=`, ODS `file=` / `path=`, and `options sasautos=`.
+
+A `FILENAME` device keyword redirects the same syntax somewhere that is not the
+filesystem, so each record carries a `PathLocation` — `FILESYSTEM`, `REMOTE`
+(FTP, URL, …), `EMAIL`, `PIPE` (a shell command), or `DEVICE` for a keyword this
+module does not know. An unknown device is never silently treated as a path.
+
+One list rather than one per kind: one scan to keep correct, one merge rule to
+keep honest, and the per-kind views above for consumers. `includes` is the
+`%INCLUDE` slice of the same scan, not a second definition of where an include
+path lives.
 
 ## Batching model
 
@@ -204,7 +224,8 @@ these silently changes behavior.
    dataset named" when resolving `_LAST_` / `_DATA_` / missing-`data=` references.
    (The list-merge in `_merge_meta` is the deliberate exception.)
 4. **Every `SasChunkMetadata` field must have a merge rule.** `_merge_meta`
-   dispatches on field annotation (`list[str]` → sorted union, `bool` → OR,
+   dispatches on field annotation (`list[str]` → sorted union,
+   `list[SasPathRef]` → union ordered by `_path_ref_sort_key`, `bool` → OR,
    `str | None` → child-or-parent, `_MERGE_PARENT_WINS` → parent's value) and
    raises `TypeError` for anything else. The default-instance test in
    `tests/test_chunker.py` trips the guard for every stored field, so a new field

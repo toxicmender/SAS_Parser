@@ -2856,5 +2856,65 @@ class TestPdfCLI(unittest.TestCase):
         self.assertEqual(list(out.glob("*.pdf")), [])
 
 
+class TestPathsSection(unittest.TestCase):
+    """The file's external references, beside its dataset interface.
+
+    Reported, never scored: like the datasets section this says what a migration
+    has to provision, which is a different question from how hard the code is.
+    """
+
+    SOURCE = (
+        "libname dataetl '/sasdata3/dataetl';\n"
+        "filename feed ftp 'rates.dat';\n"
+        "filename notify email 'ops@example.com';\n"
+        "\n"
+        "data dataetl.summary;\n"
+        "  infile '/data/in/cust.csv';\n"
+        "  set dataetl.raw;\n"
+        "run;\n"
+    )
+
+    def setUp(self):
+        self.file = _file(_analyze(self.SOURCE), "t.sas")
+        self.text = render_file_report(self.file, texts={})
+
+    def test_every_kind_is_reported(self):
+        paths = {r.path for r in self.file.external_refs}
+        self.assertEqual(
+            paths,
+            {"/sasdata3/dataetl", "rates.dat", "ops@example.com", "/data/in/cust.csv"},
+        )
+
+    def test_refs_are_grouped_by_location(self):
+        self.assertIn("## Paths", self.text)
+        self.assertIn("Filesystem (needs a volume or external location)", self.text)
+        self.assertIn("Remote services (needs network egress)", self.text)
+        self.assertIn("Email destinations", self.text)
+        # Provenance travels with the value: the libref is what a reader needs
+        # to find the statement again.
+        self.assertIn("`/sasdata3/dataetl` — libname `dataetl`", self.text)
+        self.assertIn("via ftp", self.text)
+
+    def test_a_file_touching_nothing_outside_gets_no_section(self):
+        # An empty heading says nothing the absence does not — the same rule
+        # the Datasets section follows.
+        plain = _file(_analyze("data work.a;\n  set work.b;\nrun;\n"), "t.sas")
+        self.assertEqual(plain.external_refs, [])
+        self.assertNotIn("## Paths", render_file_report(plain, texts={}))
+
+    def test_the_rollup_reconciles_against_its_chunks(self):
+        # What makes the section auditable: every path in the file list came
+        # from some chunk, and that chunk prints it too.
+        from_chunks = {r.path for c in self.file.chunks for r in c.external_refs}
+        self.assertEqual({r.path for r in self.file.external_refs}, from_chunks)
+        self.assertIn("- Paths:", self.text)
+
+    def test_an_unresolved_macro_reference_is_flagged(self):
+        scored = _file(_analyze('libname raw "&root/in";\n'), "t.sas")
+        self.assertIn(
+            "**(unresolved macro reference)**", render_file_report(scored, texts={})
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

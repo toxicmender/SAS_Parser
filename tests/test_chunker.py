@@ -545,6 +545,50 @@ class TestMergeMeta(unittest.TestCase):
         # own parameters stay excluded even for the child-slice reference
         self.assertEqual(merged.consumes_macrovars, ["cutoff", "region"])
 
+    def test_external_refs_merge_as_an_ordered_union(self):
+        """list[SasPathRef] → deduplicated union, in _path_ref_sort_key order.
+
+        The order matters as much as the dedup: set iteration is not stable
+        across runs, and batch output is pinned by tests (invariant 9).
+        """
+        from chunker.metadata import _merge_meta
+        from chunker.models import PathLocation, SasChunkMetadata, SasPathRef
+
+        shared = SasPathRef(
+            statement="libname",
+            location=PathLocation.FILESYSTEM,
+            path="/data/shared",
+            raw="/data/shared",
+            binds="shared",
+        )
+        remote = SasPathRef(
+            statement="filename",
+            location=PathLocation.REMOTE,
+            path="rates.dat",
+            raw="rates.dat",
+            binds="feed",
+            device="ftp",
+        )
+        child_only = SasPathRef(
+            statement="infile",
+            location=PathLocation.FILESYSTEM,
+            path="/data/in.csv",
+            raw="/data/in.csv",
+        )
+
+        merged = _merge_meta(
+            SasChunkMetadata(external_refs=[remote, shared]),
+            SasChunkMetadata(external_refs=[shared, child_only]),
+        )
+
+        # The ref both sides carry appears once; filesystem sorts before remote.
+        self.assertEqual(
+            merged.external_refs, [child_only, shared, remote]
+        )
+        # The computed views split the merged list by location.
+        self.assertEqual(merged.physical_paths, [child_only, shared])
+        self.assertEqual(merged.remote_paths, [remote])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

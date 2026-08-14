@@ -783,7 +783,8 @@ any of these silently changes behavior.
    and implicit resolution operates on unsplit metadata).
 
 4. **Every `SasChunkMetadata` field must have a merge rule.** `_merge_meta`
-   dispatches on field annotation (`list[str]` → sorted union, `bool` → OR,
+   dispatches on field annotation (`list[str]` → sorted union,
+   `list[SasPathRef]` → union ordered by `_path_ref_sort_key`, `bool` → OR,
    `str | None` → child-or-parent, `_MERGE_PARENT_WINS` → parent's value)
    and raises `TypeError` for anything else. The default-instance test in
    `tests/test_chunker.py` trips the guard for every stored field, so a new

@@ -757,6 +757,36 @@ contradict each other by construction.
 Every chunk that touches a dataset prints its own `Reads:` / `Writes:` line, so
 a reader who doubts a rollup can find the chunk that put each name in it.
 
+## Paths
+
+Beside the dataset interface, a file reports everywhere outside the SAS
+libraries it reaches — the locations behind its `LIBNAME`, `FILENAME`,
+`INFILE` / `FILE`, `%INCLUDE`, PROC IMPORT/EXPORT, ODS and `sasautos=`
+statements, recognised by `chunker/paths.py`:
+
+```
+## Paths
+
+- Filesystem (needs a volume or external location):
+  - `/sasdata3/dataetl` — libname `dataetl`
+  - `/data/in/customers.csv` — infile
+- Remote services (needs network egress):
+  - `rates.dat` — filename `feed` via ftp
+- Email destinations:
+  - `ops@example.com` — filename `notify` via email
+```
+
+Grouped by kind because the kinds need different answers: a filesystem path
+wants a volume or external location, an FTP reference wants egress and a
+credential, and a shell pipe wants somebody to decide what replaces it. A value
+carrying an unresolved `&macro` reference is flagged as such — it is not what
+SAS resolves at run time, so it cannot be mapped as written.
+
+Reported, never scored. Like the dataset interface, it says what a migration has
+to provision, which is a different question from how hard the code is. A file
+that reaches nothing outside gets no section, and every chunk that names a
+location prints its own `Paths:` line for the same audit trail as `Reads:`.
+
 ## The dependency graph
 
 `crossfile.py` answers "what does *this* file depend on?" one file at a time.
