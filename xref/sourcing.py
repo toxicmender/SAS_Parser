@@ -17,8 +17,7 @@ slots from the outset:
 ``by_libref``
     ``libref -> catalog.schema``, for a whole library at once.
 ``by_path``
-    A physical path to remap (``'/data/in.csv' -> ...``). **Populated but not
-    yet consumed** — see below.
+    A physical path to remap (``'/data/in.csv' -> ...``).
 
 A row whose ``Title`` is absent, empty, or unrecognised is a *table* mapping,
 which is what makes the marker backward-compatible: every existing row keeps
@@ -27,15 +26,21 @@ working and no backfill is needed. A recognised path marker
 *unrecognised* marker is warned about, so a mistyped row is visible now rather
 than silently becoming a table mapping later.
 
+Who reads which slot
+--------------------
 ``exact`` and ``by_libref`` are exactly the two key shapes
 :func:`chunker.batcher._split_databricks_mapping` already classifies — a
 dotted key is an exact dataset name, a bare one a libref prefix — so
 :func:`xref.apply.apply_pre` hands them straight to
 :func:`chunker.batcher.replace_dataset_names` and that module needs no change.
-Enabling ``by_path`` later needs only the quoted-literal guard in
-``chunker.batcher._map_ds`` lifted behind an argument, plus the rewriter
-extended to ``LIBNAME`` / ``INFILE`` / ``%include`` targets: no config, list
-schema, or transport change.
+:attr:`XrefMappings.dataset_mapping` is the flattened form both passes take.
+
+``by_path`` is read by both halves of the path substitution, which are the same
+mapping applied at two ends of the run: :func:`xref.pre.rewrite_source_text`
+over the SAS source before chunking, and
+:func:`xref.rewrite.rewrite_python_paths` / :func:`~xref.rewrite.rewrite_sql_paths`
+over the generated code after. Both resolve a key through :mod:`xref.mapping`,
+so one path cannot come out of the two as two different targets.
 
 Logger name: ``xref.sourcing``.
 """
@@ -78,8 +83,8 @@ class XrefMappings:
     by_libref : dict[str, str]
         ``libref -> catalog.schema``.
     by_path : dict[str, str]
-        Physical path remappings. Populated when marked rows appear;
-        **nothing consumes it yet** — see the module docstring.
+        Physical path remappings, populated when marked rows appear. Read by
+        both halves of the path substitution — see the module docstring.
     """
 
     exact: dict[str, str] = field(default_factory=dict)

@@ -50,6 +50,8 @@ from typing import Any, Iterable
 
 from target_language import (
     PROSE_FENCE_INFOS,
+    PYSPARK,
+    SPARKSQL,
     TargetLanguage,
     normalize_language,
     resolve_target_language,
@@ -331,12 +333,18 @@ def build_notebook(
     notebook and diffs stay readable.
     """
     target = _target_for(output_language)
+    cells = _host_mixed_languages(list(cells), target)
+    # A notebook whose cells are not all the target's needs a kernel that can
+    # host them. Python can run SQL through the %sql magic _host_mixed_languages
+    # adds; a SQL kernel cannot run Python at all, so the mixed case is always
+    # hosted by Python regardless of which target the run asked for.
+    kernel_target = PYSPARK if _has_language(cells, PYSPARK) else target
     stamped = []
     for index, cell in enumerate(cells):
         stamped.append({**cell, "id": f"cell-{index:04d}"})
     nb_metadata: dict[str, Any] = {
-        "kernelspec": dict(target.kernelspec),
-        "language_info": dict(target.language_info),
+        "kernelspec": dict(kernel_target.kernelspec),
+        "language_info": dict(kernel_target.language_info),
     }
     if output_language:
         # The canonical name, not the caller's spelling: a notebook records
@@ -351,6 +359,60 @@ def build_notebook(
         "nbformat": NBFORMAT,
         "nbformat_minor": NBFORMAT_MINOR,
     }
+
+
+#: The Databricks cell magic that runs one cell as SQL inside a Python
+#: notebook. Only ever prepended in a mixed notebook — see
+#: :func:`_host_mixed_languages`.
+_SQL_MAGIC = "%sql"
+
+
+def _has_language(cells: list[dict[str, Any]], target: TargetLanguage) -> bool:
+    """True when any code cell is tagged as *target*'s language."""
+    return any(
+        cell.get("cell_type") == "code"
+        and cell.get("metadata", {}).get("language") == target.cell_language
+        for cell in cells
+    )
+
+
+def _host_mixed_languages(
+    cells: list[dict[str, Any]], target: TargetLanguage
+) -> list[dict[str, Any]]:
+    """*cells* made runnable together when they are not all one language.
+
+    A Spark SQL run whose items fell back to PySpark (see
+    :mod:`complexity.fallback`) produces both kinds of code cell. The notebook
+    is hosted by the Python kernel, so its SQL cells are prefixed with the
+    ``%sql`` magic that tells Databricks to run them as SQL.
+
+    Returns *cells* **unchanged** when they are not mixed, which is the case for
+    every run today: an all-SQL or all-Python notebook is byte-identical to what
+    this module produced before the fallback existed, so nothing about the
+    common path moves.
+    """
+    if not (_has_language(cells, PYSPARK) and _has_language(cells, SPARKSQL)):
+        return cells
+    out: list[dict[str, Any]] = []
+    magicked = 0
+    for cell in cells:
+        metadata = cell.get("metadata", {})
+        source = str(cell.get("source", ""))
+        if (
+            cell.get("cell_type") == "code"
+            and metadata.get("language") == SPARKSQL.cell_language
+            and not source.lstrip().startswith(_SQL_MAGIC)
+        ):
+            out.append({**cell, "source": f"{_SQL_MAGIC}\n{source}"})
+            magicked += 1
+        else:
+            out.append(cell)
+    logger.info(
+        f"_host_mixed_languages: notebook mixes {SPARKSQL.display_name} and "
+        f"{PYSPARK.display_name}; hosting it on the Python kernel and marking "
+        f"{magicked} SQL cell(s) with {_SQL_MAGIC}"
+    )
+    return out
 
 
 def notebook_to_json(notebook: dict[str, Any]) -> str:
@@ -371,10 +433,17 @@ def item_cells(
     """Header + body cells for one pipeline output dict.
 
     Prefers the structured ``document`` the pipeline attached; falls back to
-    parsing ``response`` when there is none. *output_language* is the run's
-    target, used to tag code cells the model left untagged.
+    parsing ``response`` when there is none.
+
+    *output_language* is the **run's** target. The item's own wins when it has
+    one (``target_language``, set for every output by
+    :func:`pipeline.engine._target_fields`): an item that fell back to PySpark
+    is tagged, fenced and highlighted as PySpark, and its untagged cells default
+    to PySpark rather than to the run's SQL. Reading the run's target here is
+    what would put a ```sql``` fence around Python.
     """
     cells = [markdown_cell(_item_header_markdown(out))]
+    language = out.get("target_language") or output_language
     document = out.get("document")
     if document:
         try:
@@ -386,9 +455,9 @@ def item_cells(
                 exc_info=True,
             )
         else:
-            return cells + document_to_cells(doc, output_language=output_language)
+            return cells + document_to_cells(doc, output_language=language)
     return cells + markdown_to_cells(
-        str(out.get("response", "")), output_language=output_language
+        str(out.get("response", "")), output_language=language
     )
 
 
@@ -404,6 +473,16 @@ def _item_header_markdown(out: dict[str, Any]) -> str:
     chunk_ids = out.get("chunk_ids") or []
     if chunk_ids:
         lines.append(f"- Chunk(s): {', '.join(f'`{c}`' for c in chunk_ids)}")
+    # Only when the item did not stay on the run's target: a reader looking at
+    # Python in a Spark SQL notebook needs to know it was deliberate, and what
+    # forced it. An item that kept the run's target says nothing, because the
+    # notebook already records the run's language.
+    reasons = out.get("fallback_reasons") or []
+    if reasons:
+        lines.append(
+            f"- **Translated to {out.get('target_language', 'another target')}**: "
+            f"{'; '.join(reasons)}"
+        )
     verdict = out.get("validation")
     if verdict:
         status = "PASS" if verdict.get("passed") else "FAIL"

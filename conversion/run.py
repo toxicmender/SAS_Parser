@@ -42,6 +42,10 @@ from typing import Any, Callable
 import app_config
 from app_config.sharepoint import SharePointConfig, SharePointError
 
+# Mode names only — the xref functions themselves are imported lazily at each
+# call site, so this module stays importable without the rewriters' stack.
+from xref.apply import APPLY_BOTH, APPLY_POST, APPLY_PRE
+
 from .paths import validation as validation_folder
 from .requests import ConversionItem, ConversionRequest
 from .sources import load, source_files
@@ -177,6 +181,7 @@ def run_request(
     client: Any,
     config: SharePointConfig | None = None,
     xref_mappings: Any | None = None,
+    xref_mode: str | None = None,
     upload: bool = True,
     timestamp: str | None = None,
 ) -> RunOutcome:
@@ -195,9 +200,17 @@ def run_request(
     model : str
         The model id, already resolved by :func:`model_for`.
     xref_mappings : XrefMappings | None
-        Applied to the raw source text before chunking. The dataset half of
-        the substitution rides on the pipeline instead — the caller passes
-        ``mappings.dataset_mapping`` as ``databricks_mapping``.
+        The application's cross-reference rows. When and where they are applied
+        is *xref_mode*'s business. ``None`` disables the substitution entirely
+        (``--no-xref``), whatever the mode says.
+    xref_mode : str | None
+        ``"pre"``, ``"post"`` or ``"both"``; ``None`` reads
+        :func:`xref.apply.configured_mode` (``XREF_APPLY`` > ``config.json``
+        ``xref.apply`` > ``"pre"``). ``"pre"`` rewrites the SAS source before
+        chunking, ``"post"`` the generated code afterwards, ``"both"`` does
+        each and reports what only post reached. Under ``"pre"`` and
+        ``"both"`` the dataset half rides on the pipeline instead — the caller
+        passes ``mappings.dataset_mapping`` as ``databricks_mapping``.
     upload : bool
         ``False`` converts and reports but writes nothing back, and leaves the
         row's ``Status`` alone. The dry run.
@@ -228,7 +241,15 @@ def run_request(
             f"no source scripts under {application!r}/scripts_original",
         )
 
-    if xref_mappings is not None:
+    # Resolved once, before anything is converted: the mode decides both
+    # whether the source is rewritten now and whether the output is rewritten
+    # later, and reading it twice could straddle a config change mid-run.
+    mode = _resolve_xref_mode(xref_mode, xref_mappings)
+    sas_paths: list[Any] = []
+    if xref_mappings is not None and mode in (APPLY_PRE, APPLY_BOTH):
+        # Taken before the rewrite, so these are the SAS-side values — see
+        # _report_unmapped_paths on why that is the useful moment.
+        sas_paths = _sas_paths(sources)
         sources = _apply_xref(sources, xref_mappings)
 
     if upload:
@@ -247,6 +268,19 @@ def run_request(
         if upload:
             _set_status(request.item_id, STATUS_FAILED, client=client, config=config)
         return _failed(outcome, f"translation failed: {exc}")
+
+    if xref_mappings is not None and mode in (APPLY_POST, APPLY_BOTH):
+        _apply_xref_post(
+            outputs,
+            xref_mappings,
+            output_language=request.output_language or pipeline.output_language,
+            report_only_post=mode == APPLY_BOTH,
+        )
+    # After the post pass, so a path the post pass fixed is not reported as
+    # having escaped. Under "post" there is no SAS-side inventory to check
+    # against — nothing rewrote the source, so every path in the output is
+    # expected to be a SAS one until post has had its turn.
+    _report_unmapped_paths(outputs, sas_paths)
 
     log_item_summaries(outputs)
     log_token_usage(pipeline)
@@ -330,6 +364,185 @@ def _apply_xref(
     if total:
         logger.info(f"_apply_xref: remapped {total} physical path(s) across the corpus")
     return rewritten
+
+
+def _resolve_xref_mode(explicit: str | None, mappings: Any) -> str:
+    """When to apply the substitution, or :data:`APPLY_PRE` when it is moot.
+
+    *explicit* wins; otherwise :func:`xref.apply.configured_mode` reads
+    ``XREF_APPLY`` then ``config.json`` ``xref.apply``. With no mappings at all
+    the answer cannot matter, so the config is not consulted — a deployment
+    that does not cross-reference should not have to be configured for a mode
+    it never uses.
+    """
+    if mappings is None:
+        return APPLY_PRE
+    if explicit:
+        return explicit.strip().lower()
+    from xref.apply import configured_mode
+
+    return configured_mode()
+
+
+def _sas_paths(sources: list[tuple[str, str]]) -> list[Any]:
+    """Every filesystem location the SAS corpus names, before any rewriting.
+
+    Read straight off the text with :func:`chunker.paths.extract_paths` — no
+    chunking pass, since that function takes text — over the comments-blanked
+    form it documents as its input. Called *before* :func:`_apply_xref`, so
+    these are the SAS-side values; that is what makes them useful afterwards,
+    when one of them turning up in the generated code means no mapping reached
+    it (:func:`_report_unmapped_paths`).
+
+    Filesystem only: a ``PIPE`` command or an email address surviving into the
+    output is not a mapping failure.
+    """
+    from chunker.models import PathLocation
+    from chunker.paths import extract_paths
+    from chunker.scanner import _sanitise
+
+    seen: set[str] = set()
+    found: list[Any] = []
+    for _, text in sources:
+        for ref in extract_paths(_sanitise(text, blank_strings=False)):
+            if ref.location is not PathLocation.FILESYSTEM or ref.raw in seen:
+                continue
+            seen.add(ref.raw)
+            found.append(ref)
+    return found
+
+
+def _report_unmapped_paths(outputs: list[dict], sas_paths: list[Any]) -> list[str]:
+    """Warn about SAS paths that reached the generated code unmapped.
+
+    A SAS-side path in the output means one of two things, and neither is
+    visible without saying so: no XREF row covered it, or the model wrote it
+    back after ``pre`` had already rewritten its source. Either way the
+    notebook now names a location that does not exist on the target.
+
+    Reported, never fatal — the same rule the rest of this module follows: a
+    request list is a queue, and a wrong path is a fixable review finding
+    rather than a reason to fail a conversion that otherwise worked.
+    """
+    if not sas_paths:
+        return []
+    rendered = "\n".join(_generated_text(out) for out in outputs)
+    survivors = sorted({ref.raw for ref in sas_paths if ref.raw in rendered})
+    if survivors:
+        logger.warning(
+            f"_report_unmapped_paths: {len(survivors)} SAS path(s) reached the "
+            f"generated code unmapped ({', '.join(survivors[:5])}"
+            f"{', ...' if len(survivors) > 5 else ''}); no XREF path row "
+            f"addresses them, so the notebook names a location that will not "
+            f"exist on the target"
+        )
+    return survivors
+
+
+def _generated_text(out: dict) -> str:
+    """Everything one output holds as text, for a substring search.
+
+    The document when there is one, the raw response otherwise — the same
+    precedence :func:`pipeline.notebook.item_cells` uses.
+    """
+    document = out.get("document")
+    if document:
+        cells = document.get("cells") or []
+        return "\n".join(str(cell.get("source", "")) for cell in cells)
+    return str(out.get("response", ""))
+
+
+def _apply_xref_post(
+    outputs: list[dict], mappings: Any, *, output_language: str, report_only_post: bool
+) -> int:
+    """Rewrite each item's generated code in place. Returns the items changed.
+
+    Operates on the ``document`` — the structured
+    :class:`~pipeline.response_models.TranslationDocument` the notebooks are
+    built from — so a rewrite reaches the deliverable. Rewriting only the
+    Markdown ``response`` would leave the uploaded notebook untouched.
+
+    Dispatch is **per cell**, on the cell's own ``language``, not on the run's
+    target: a PySpark run routinely contains a ``sql`` cell, and handing that to
+    the Python parser would no-op under :mod:`xref.rewrite`'s hard rule — a
+    silent miss rather than a visible failure.
+    """
+    from xref.apply import apply_both, apply_post
+
+    changed = 0
+    for out in outputs:
+        document = out.get("document")
+        if not document:
+            # No structured document: fall back to the raw Markdown, which is
+            # what item_cells renders from in that case.
+            response = str(out.get("response", ""))
+            if not response.strip():
+                continue
+            rewritten = apply_post(response, output_language, mappings)
+            if rewritten != response:
+                out["response"] = rewritten
+                changed += 1
+            continue
+
+        cells = document.get("cells") or []
+        item_changed = False
+        for cell in cells:
+            if cell.get("kind") != "code":
+                continue
+            source = str(cell.get("source", ""))
+            if not source.strip():
+                continue
+            language = _cell_language(cell, output_language)
+            if language is None:
+                continue
+            if report_only_post:
+                outcome = apply_both(source, language, mappings)
+                rewritten = outcome.code
+            else:
+                rewritten = apply_post(source, language, mappings)
+            if rewritten != source:
+                cell["source"] = rewritten
+                item_changed = True
+        if item_changed:
+            changed += 1
+    if changed:
+        logger.info(f"_apply_xref_post: rewrote generated code in {changed} item(s)")
+    return changed
+
+
+def _cell_language(cell: dict, output_language: str) -> str | None:
+    """The target language *cell* should be parsed as, or ``None`` to skip it.
+
+    A run has one target; its cells do not. A ``sql`` cell in a PySpark run and
+    a ``python`` cell in a Spark SQL run each have to be read as what they
+    declare, because parsing one as the other does not fail loudly — it no-ops
+    under :mod:`xref.rewrite`'s hard rule, which is a silent miss.
+
+    The tag is resolved through :func:`target_language.resolve_target_language`
+    rather than a table kept here, so the spellings a cell may legitimately
+    carry (``sql``, ``databrickssql``, ``python``, ``py``, ...) are the ones the
+    rest of the run already accepts — invariant 11's "resolved once, and not
+    re-derived downstream" applied to the cell rather than the run.
+
+    An untagged cell is the run's target. A cell tagged with something no target
+    claims — ``scala``, ``r``, a typo — returns ``None``: guessing at the run's
+    target would parse it as a language it is not and report nothing, so it is
+    logged and left exactly as written instead.
+    """
+    from target_language import UnknownTargetLanguage, resolve_target_language
+
+    tag = str(cell.get("language") or "").strip()
+    if not tag:
+        return output_language
+    try:
+        return resolve_target_language(tag).display_name
+    except UnknownTargetLanguage:
+        logger.warning(
+            f"_cell_language: cell declares language {tag!r}, which is not a "
+            f"known target; leaving the cell as written rather than parsing it "
+            f"as {output_language}"
+        )
+        return None
 
 
 def _upload_outputs(

@@ -155,6 +155,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "path-marked rows, physical paths) before conversion.",
     )
     sharepoint.add_argument(
+        "--xref-apply",
+        choices=("pre", "post", "both"),
+        default=None,
+        help="When to apply the XREF substitution: 'pre' rewrites the SAS "
+        "source before conversion, 'post' rewrites the generated code after, "
+        "'both' does each and reports what only post reached. Overrides "
+        "XREF_APPLY and config.json xref.apply (default: pre). Ignored under "
+        "--no-xref, which turns the substitution off entirely.",
+    )
+    sharepoint.add_argument(
         "--check",
         action="store_true",
         help="Run the read-only SharePoint preflight and exit, converting "
@@ -287,6 +297,7 @@ _SHAREPOINT_ONLY = (
     "--all-rows",
     "--no-upload",
     "--no-xref",
+    "--xref-apply",
     "--check",
 )
 _LOCAL_ONLY = ("--out-dir", "--md", "--pdf")
@@ -306,6 +317,7 @@ def _argument_error(args: argparse.Namespace) -> str | None:
             ("--all-rows", args.all_rows),
             ("--no-upload", args.no_upload),
             ("--no-xref", args.no_xref),
+            ("--xref-apply", args.xref_apply),
             ("--check", args.check),
         ):
             if value:
@@ -536,6 +548,7 @@ def _run_sharepoint(args: argparse.Namespace) -> int:
             model=model,
             client=client,
             xref_mappings=None if args.no_xref else _xref_for(row, client=client),
+            xref_mode=args.xref_apply,
             upload=not args.no_upload,
         )
         if not outcome.ok:

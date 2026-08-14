@@ -1151,3 +1151,102 @@ def test_run_texts_uses_one_thread_for_the_whole_corpus():
 
 def test_run_texts_with_no_sources_does_nothing():
     assert _text_pipeline().run_texts([]) == []
+
+
+# ---------------------------------------------------------------------------
+# Per-item PySpark fallback
+#
+# A Spark SQL run cannot express a %MACRO definition, so that item is
+# translated into PySpark instead — announced per item, never in the system
+# prompt, which has to stay cacheable.
+# ---------------------------------------------------------------------------
+
+
+_MACRO_SAS = "%macro build(ds);\n  data &ds._out; set &ds; run;\n%mend;\n"
+_PLAIN_SAS = "proc sql;\n  create table work.a as select * from raw.b;\nquit;\n"
+
+
+def _sql_run(source: str, **kwargs):
+    """Run *source* through a Spark SQL pipeline and return (outputs, prompts)."""
+    pipeline = SasLLMPipeline(
+        llm_config=LLMClientConfig(model="unused"),
+        memory_setup=MemorySetup(memory=MemoryHub()),
+        llm=FakeListChatModel(responses=[f"r{i}" for i in range(10)]),
+        output_language="Spark SQL",
+        **kwargs,
+    )
+    outputs = pipeline.run_texts([("m.sas", source)], thread_id="t")
+    return outputs, pipeline
+
+
+def test_a_macro_definition_item_is_translated_into_pyspark():
+    outputs, _ = _sql_run(_MACRO_SAS)
+
+    assert [o["target_language"] for o in outputs] == ["PySpark"]
+    assert any("MACRO_DEFINITION" in r for r in outputs[0]["fallback_reasons"])
+    # The override reaches the model through the per-item message.
+    assert "## Target language for THIS item: PySpark" in outputs[0]["prompt"]
+    assert "```python" in outputs[0]["prompt"]
+
+
+def test_a_data_step_do_loop_is_translated_into_pyspark():
+    """The detector family, which chunk metadata cannot report.
+
+    An iterative DO is found by scanning source, not by naming an identifier,
+    so this only works because the routing runs complexity.detectors over the
+    item's chunks.
+    """
+    outputs, _ = _sql_run(
+        "data out;\n  set inp;\n  do i = 1 to 10;\n    t = t + i;\n  end;\nrun;\n"
+    )
+
+    assert [o["target_language"] for o in outputs] == ["PySpark"]
+    assert any("do_loop" in r for r in outputs[0]["fallback_reasons"])
+
+
+def test_a_do_until_stays_on_the_run_target():
+    # HARD against both targets: unbounded row-wise iteration is no easier in
+    # PySpark, so moving the item would buy nothing.
+    outputs, _ = _sql_run(
+        "data out;\n  set inp;\n  do until (done);\n    i + 1;\n  end;\nrun;\n"
+    )
+
+    assert [o["target_language"] for o in outputs] == ["Spark SQL"]
+
+
+def test_an_item_spark_sql_can_express_keeps_the_run_target():
+    outputs, _ = _sql_run(_PLAIN_SAS)
+
+    assert [o["target_language"] for o in outputs] == ["Spark SQL"]
+    assert outputs[0]["fallback_reasons"] == []
+    # No directive at all, so the batch context is what it always was.
+    assert "Target language for THIS item" not in outputs[0]["prompt"]
+
+
+def test_the_system_prompt_is_the_runs_target_whatever_the_items_do():
+    """The cached prefix must not vary per item (Architecture.md invariant 6).
+
+    A system prompt that named the item's target would miss the prompt cache on
+    every item — which is the whole reason the override is ephemeral context.
+    """
+    fallback_outputs, fallback_pipeline = _sql_run(_MACRO_SAS)
+    plain_outputs, plain_pipeline = _sql_run(_PLAIN_SAS)
+
+    assert fallback_outputs[0]["target_language"] == "PySpark"
+    assert fallback_pipeline._system_prompt == plain_pipeline._system_prompt
+    assert "SAS-to-Spark SQL" in fallback_pipeline._system_prompt
+    assert "PySpark" not in fallback_pipeline._system_prompt
+
+
+def test_the_fallback_can_be_switched_off(monkeypatch, tmp_path):
+    import app_config
+
+    config = tmp_path / "config.json"
+    config.write_text('{"pipeline": {"sql_fallback": false}}', encoding="utf-8")
+    monkeypatch.setenv(app_config.ENV_VAR, str(config))
+    app_config.clear_cache()
+
+    outputs, _ = _sql_run(_MACRO_SAS)
+
+    assert [o["target_language"] for o in outputs] == ["Spark SQL"]
+    assert "Target language for THIS item" not in outputs[0]["prompt"]

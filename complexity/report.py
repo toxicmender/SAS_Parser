@@ -48,6 +48,8 @@ from .models import (
     ComplexitySignal,
     CorpusComplexityReport,
     FileComplexity,
+    PathLocation,
+    SasPathRef,
 )
 from .naming import resolve_name
 
@@ -204,6 +206,60 @@ def _dataset_lines(file: FileComplexity) -> list[str]:
     return lines
 
 
+#: How each location kind is introduced in the Paths section, and the order the
+#: groups are printed in. Filesystem first because it is the common case and the
+#: one with an obvious target-side answer; pipe and device last because they need
+#: a decision rather than a mapping.
+_PATH_GROUPS: tuple[tuple[PathLocation, str], ...] = (
+    (PathLocation.FILESYSTEM, "Filesystem (needs a volume or external location)"),
+    (PathLocation.REMOTE, "Remote services (needs network egress)"),
+    (PathLocation.EMAIL, "Email destinations"),
+    (PathLocation.PIPE, "Shell pipes (a command, not a location)"),
+    (PathLocation.DEVICE, "Other devices"),
+)
+
+
+def _path_lines(file: FileComplexity) -> list[str]:
+    """Everywhere outside the SAS libraries this file reaches.
+
+    Grouped by kind because the kinds need different answers: a filesystem path
+    wants a volume, an FTP reference wants egress and a credential, and a shell
+    pipe wants somebody to decide what replaces it. A flat list would hide that.
+
+    A file that reaches nothing outside gets no section, the same rule
+    :func:`_dataset_lines` follows — an empty heading says nothing the absence
+    does not.
+    """
+    if not file.external_refs:
+        return []
+    lines = ["", "## Paths", ""]
+    for location, heading in _PATH_GROUPS:
+        refs = [r for r in file.external_refs if r.location is location]
+        if not refs:
+            continue
+        lines.append(f"- {heading}:")
+        lines += [f"  - {_fmt_path_ref(r)}" for r in refs]
+    return lines
+
+
+def _fmt_path_ref(ref: SasPathRef) -> str:
+    """One reference as a report line: the value as written, then its provenance.
+
+    ``raw`` rather than ``path`` because this is for a human to recognise in
+    their own source; the normalised form exists for matching, not for reading.
+    """
+    parts = [f"`{ref.raw}`", f"— {ref.statement}"]
+    if ref.binds:
+        parts.append(f"`{ref.binds}`")
+    if ref.device:
+        parts.append(f"via {ref.device}")
+    if ref.has_macro_ref:
+        # The one thing a reader must not miss: this value is not what SAS
+        # resolves at run time, so it cannot be mapped as written.
+        parts.append("**(unresolved macro reference)**")
+    return " ".join(parts)
+
+
 def _cross_file_lines(
     file: FileComplexity, names: Mapping[str, str] | None = None
 ) -> list[str]:
@@ -343,6 +399,7 @@ def render_file_report(
     # second only makes sense once the reader knows what the file reads and
     # writes.
     lines += _dataset_lines(file)
+    lines += _path_lines(file)
     lines += _cross_file_lines(file, names)
 
     lines += ["", f"## Drivers ({len(file.signals)})", ""]
@@ -391,6 +448,9 @@ def _chunk_section(
             f"- Reads: {_fmt_list(chunk.input_datasets)} · "
             f"Writes: {_fmt_list(chunk.output_datasets)}"
         )
+    if chunk.external_refs:
+        # The same audit trail for the Paths section above.
+        lines.append(f"- Paths: {_fmt_list(r.raw for r in chunk.external_refs)}")
     if chunk.signals:
         # Labelled and set apart, so the verdict bullets above and the
         # evidence bullets below do not read as one undifferentiated list.

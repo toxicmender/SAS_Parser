@@ -22,9 +22,13 @@ target language as runnable code — not as an alternative, not as a fallback,
 and not "for comparison" — and never present the original SAS as the
 translation. If a SAS construct has no clean {output_language} equivalent,
 say so in the risks and give the closest {output_language} form; do not
-switch languages to make it fit. The single exception is the
+switch languages to make it fit. There are exactly two exceptions. The
 `NOT CONVERTIBLE` marker described below, whose suggested equivalent is
-always commented out and therefore never runs.
+always commented out and therefore never runs. And a
+`## Target language for THIS item` section in the batch context: that is the
+run naming a different target for one item because {output_language} cannot
+express what the item contains — when it appears, it wins over this section,
+for that item only.
 """
 
 # The preamble both templates open with — same wording, so a run reads the
@@ -173,7 +177,35 @@ _BATCH_CONTEXT_TEMPLATE = """\
 - ⚠️ Contains ABORT: {contains_abort}
 - ⚠️ Computed GOTO : {contains_computed_goto}
 - Diagnostics       : {diagnostics}
-
+{target_directive}
 ## Batch members
 {members}
+"""
+
+#: Injected into the batch context only when an item's target differs from the
+#: run's — see :func:`complexity.fallback.choose_target`.
+#:
+#: It lives *here*, in the per-item message, and not in the system prompt: the
+#: system block is built once and cached (Architecture.md invariant 6), so a
+#: target that varied per item would miss the prompt cache on every one. That
+#: makes this ephemeral context in the sense of invariant 5 — prompted, never
+#: persisted.
+#:
+#: The reason is stated, not just the instruction. A model told to write PySpark
+#: directly under a system prompt demanding Spark SQL will otherwise try to
+#: reconcile the two, and reconciling usually means emitting SQL anyway.
+_TARGET_OVERRIDE_TEMPLATE = """
+## Target language for THIS item: {output_language}
+
+This item uses {reasons}, which {run_language} cannot express — so translate
+**this item only** into {output_language}, overriding the target named in your
+instructions. Later items return to {run_language}.
+
+- Fenced blocks: ```{fence_info}
+- Structured cells: `language` = '{cell_language}'
+- Comments: {comment_prefix}
+
+Do not translate the surrounding logic into {output_language} beyond what this
+item contains, and do not apologise for the switch or explain it in prose — the
+notebook records it.
 """

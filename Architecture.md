@@ -783,7 +783,8 @@ any of these silently changes behavior.
    and implicit resolution operates on unsplit metadata).
 
 4. **Every `SasChunkMetadata` field must have a merge rule.** `_merge_meta`
-   dispatches on field annotation (`list[str]` → sorted union, `bool` → OR,
+   dispatches on field annotation (`list[str]` → sorted union,
+   `list[SasPathRef]` → union ordered by `_path_ref_sort_key`, `bool` → OR,
    `str | None` → child-or-parent, `_MERGE_PARENT_WINS` → parent's value)
    and raises `TypeError` for anything else. The default-instance test in
    `tests/test_chunker.py` trips the guard for every stored field, so a new
@@ -851,15 +852,26 @@ any of these silently changes behavior.
    `_STANDARD_AUTOCALL_MACROS` — the three sets have distinct, citable
    identities and distinct consumers; do not fold them together.
 
-11. **The target output language is resolved once and passed as an object.**
-   `SasLLMPipeline.__init__` calls `resolve_target_language` and every later
-   stage takes the resulting `TargetLanguage` from `.target_language` — the
-   prompt, the `[lang: ...]` axis, the notebook kernel and fence tags, the
-   validation suite. Re-deriving it from a string downstream is what let the
-   layers disagree: the syntax metric checked Python on a Spark SQL run and
-   scored a correct translation 0.0. Metric *names* are also part of this
-   contract — `target_syntax` is the config, stored-verdict, and report key
-   for syntax checks of the selected target.
+11. **The target output language is resolved once *per item* and passed as an
+   object.** `SasLLMPipeline.__init__` calls `resolve_target_language` for the
+   run, and `pipeline.prompting.target_for_item` resolves each item against it
+   — an item whose constructs the run's target cannot express is translated
+   into the fallback target instead (`complexity.fallback`, invariant 15).
+   Every later stage takes a `TargetLanguage` **object** from the item's
+   `target_language`, falling back to the run's: the prompt, the `[lang: ...]`
+   axis, the notebook kernel and fence tags, the validation suite.
+
+   The object-not-string half is the part that has already broken once:
+   re-deriving the target from a string downstream let the layers disagree, and
+   the syntax metric checked Python on a Spark SQL run and scored a correct
+   translation 0.0. Metric *names* are also part of this contract —
+   `target_syntax` is the config, stored-verdict, and report key for syntax
+   checks of the selected target.
+
+   **The system prompt is built from the *run's* target and never the item's.**
+   It is the cached prefix (invariant 6), so a per-item target in it would miss
+   the prompt cache on every item. The override is ephemeral per-item context
+   (invariant 5), in the batch-context message.
 
 12. **One owner per cross-cutting concern, and the owner is not the caller.**
    Three of these, each of which regressed once by growing a second
@@ -872,6 +884,24 @@ any of these silently changes behavior.
      `app_config.sharepoint` nowhere — `tests/test_xref.py` asserts this
      directly, because the failure mode is a network call appearing inside a
      package documented as network-free.
+   - **One path grammar.** `chunker/paths.py` owns where a physical path
+     appears in SAS syntax (`PATH_STATEMENTS`), because the chunker both
+     *records* those paths as `SasChunkMetadata.external_refs` and is the
+     package that owns SAS syntax. `xref/pre.py` imports it — lazily, like
+     `xref/apply.py` — and supplies only the substitution; `complexity` reports
+     what the chunker found. The table used to live in `xref/pre.py`, and a
+     second copy growing inside the chunker would mean the module that rewrites
+     paths and the module that inventories them disagreeing about what a path
+     is. Only `FILESYSTEM` refs are rewritten: a `FILENAME` device form's quoted
+     argument is a command line or a mail address, not a location a mapping can
+     address. Where a path appears in *generated* code is a separate grammar and
+     lives with the rewriter (`xref/rewrite.py`) — it is target syntax, not SAS.
+   - **One path resolver.** `xref/mapping.py` decides which `by_path` key wins
+     (exact match, then longest directory prefix) and what it rewrites to. Both
+     halves of the substitution import it: `xref/pre.py` on the way in,
+     `xref/rewrite.py` on the way out. A second copy would let a run in `"both"`
+     mode rewrite one path twice to two different targets, with the second
+     silently winning.
    - **One credential chain.** `LLMClientConfig.from_ai_gateway()` is the only
      way to build a gateway config. Assembling one by hand from
      `vault.ai_gateway_token()` looks equivalent and silently drops the
@@ -906,6 +936,34 @@ any of these silently changes behavior.
     The failure is invisible to any test that pins a `drive_id`, so
     `tests/test_sharepoint.py` covers `list_directory`, `list_files` and
     `create_folder` against a site-resolved drive specifically.
+
+15. **The PySpark fallback is derived from the complexity profiles, never from
+    a list.** `complexity.fallback.choose_target` moves an item off the run's
+    target when one of its constructs is **not implementable** there — parity
+    `HARD` or `MANUAL` — *and* the fallback target rates it strictly better.
+    Both halves are load-bearing. Without "not implementable", `MACRO_CALL`
+    (`PARTIAL` → `SUPPORTED`) moves essentially every real SAS item and a Spark
+    SQL run silently becomes a PySpark run. Without "strictly better",
+    `do_until` (`HARD` in both) moves an item to trade one hard problem for the
+    identical hard problem in another language.
+
+    Against the shipped profiles that is ten constructs in two groups: the
+    macro facility (`%MACRO` definitions, macro control flow, `CALL EXECUTE`,
+    `DOSUBL`, `RESOLVE`, `SYMGET`, `CALL MODULE`, `PROC FCMP`), and the DATA
+    step's procedural core (`do_loop`, `link_return`). A second,
+    hand-maintained list of "things SQL cannot do" would drift from the profiles
+    CI and the reports are scored against — which is invariant 12 applied to
+    parity data. Only a SQL target has a fallback: PySpark expresses everything
+    Spark SQL does and more, so the reverse move could never help, and there is
+    deliberately no knob to configure one.
+
+    The constructs come from the caller, and the second group is why that
+    matters: `do_loop` and `link_return` are found by
+    `complexity.detectors.detect_constructs` scanning chunk source, not by
+    `SasChunkMetadata` naming an identifier, so
+    `pipeline.prompting._profile_constructs_for_item` runs that scan. It runs
+    **only on the fallback path**, so a PySpark run and a run with
+    `pipeline.sql_fallback` off pay nothing for it.
 
 ## Conventions
 

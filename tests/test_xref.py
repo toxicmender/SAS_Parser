@@ -9,6 +9,7 @@ code is worse than one that no-ops.
 
 from __future__ import annotations
 
+import ast
 import json
 import pathlib
 import sys
@@ -239,6 +240,9 @@ def test_apply_pre_with_no_mapping_is_a_no_op():
 
 
 _MAPPING = {"sales.orders": "cat.sales.orders"}
+# apply_post and friends take the whole XrefMappings, not a flat dict: the two
+# halves address different namespaces (dataset names, physical paths).
+_MAPPINGS = sourcing.XrefMappings(exact=dict(_MAPPING))
 
 
 def test_sql_table_reference_is_rewritten():
@@ -279,6 +283,27 @@ def test_pyspark_table_calls_are_rewritten():
     assert out.startswith("# read the orders\n")
 
 
+def test_pyspark_table_rewrite_keeps_the_original_quoting():
+    """A table rewrite must not churn quoting the way repr() did.
+
+    The path half preserves style, and a file whose only real change is a table
+    name should not also show every double-quoted literal turned single.
+    """
+    source = 'df = spark.table("sales.orders")\n'
+    assert rewrite.rewrite_python(source, _MAPPING) == (
+        'df = spark.table("cat.sales.orders")\n'
+    )
+
+
+def test_pyspark_table_rewrite_falls_back_when_style_cannot_be_reproduced():
+    # A target embedding the literal's own quote cannot be re-emitted in that
+    # style, so repr() takes over rather than producing broken source.
+    mapping = {"sales.orders": 'cat."sales".orders'}
+    out = rewrite.rewrite_python('df = spark.table("sales.orders")\n', mapping)
+    assert 'cat."sales".orders' in out
+    assert ast.parse(out)  # still valid Python, which is the point
+
+
 def test_pyspark_leaves_unrelated_strings_alone():
     source = 'label = "sales.orders"\nprint("sales.orders")\n'
     assert rewrite.rewrite_python(source, _MAPPING) == source
@@ -307,15 +332,160 @@ def test_unparseable_python_can_be_made_fatal():
         rewrite.rewrite_python(broken, _MAPPING, on_failure="error")
 
 
+# ---------------------------------------------------------------------------
+# post — the path half
+#
+# The counterpart of pre.py's statement rewriting, on the other side of the
+# conversion. Everything here is source-span substitution: what is NOT rewritten
+# matters as much as what is.
+# ---------------------------------------------------------------------------
+
+
+_PATHS = {"/sasdata3": "/Volumes/main/sas", "/data/in": "/Volumes/main/inbound"}
+
+
+@pytest.mark.parametrize(
+    "call, expected",
+    [
+        ('spark.read.csv("/sasdata3/a.csv")', '"/Volumes/main/sas/a.csv"'),
+        ('spark.read.parquet("/sasdata3/p")', '"/Volumes/main/sas/p"'),
+        ('spark.read.format("json").load("/data/in/j")', '"/Volumes/main/inbound/j"'),
+        ('df.write.save("/sasdata3/out")', '"/Volumes/main/sas/out"'),
+        ('dbutils.fs.ls("/sasdata3/dir")', '"/Volumes/main/sas/dir"'),
+        ('dbutils.fs.mkdirs("/data/in/new")', '"/Volumes/main/inbound/new"'),
+        ('open("/sasdata3/notes.txt")', '"/Volumes/main/sas/notes.txt"'),
+        # The one form whose path is the second argument.
+        ('df.write.option("path", "/sasdata3/o")', '"/Volumes/main/sas/o"'),
+    ],
+)
+def test_pyspark_path_calls_are_rewritten(call, expected):
+    assert expected in rewrite.rewrite_python_paths(call + "\n", _PATHS)
+
+
+def test_pyspark_paths_change_only_the_mapped_spans():
+    """The whole point of span substitution — assert on the full text."""
+    source = (
+        "# stage from /sasdata3, which this comment names\n"
+        'df = spark.read.csv("/sasdata3/a.csv", header=True)\n'
+        "label = '/sasdata3/a.csv'\n"  # a bare string, not a path position
+        "n = df.head(5)\n"
+    )
+    assert rewrite.rewrite_python_paths(source, _PATHS) == (
+        "# stage from /sasdata3, which this comment names\n"
+        'df = spark.read.csv("/Volumes/main/sas/a.csv", header=True)\n'
+        "label = '/sasdata3/a.csv'\n"
+        "n = df.head(5)\n"
+    )
+
+
+def test_pyspark_paths_preserve_the_original_quoting():
+    source = "df = spark.read.csv('/sasdata3/a.csv')\n"
+    assert "'/Volumes/main/sas/a.csv'" in rewrite.rewrite_python_paths(source, _PATHS)
+
+
+def test_pyspark_paths_leave_unmapped_values_alone():
+    source = 'df = spark.read.csv("/elsewhere/a.csv")\n'
+    assert rewrite.rewrite_python_paths(source, _PATHS) == source
+
+
+def test_unparseable_pyspark_paths_come_back_byte_identical(caplog):
+    import logging
+
+    broken = 'df = spark.read.csv("/sasdata3/a.csv"\n'
+    with caplog.at_level(logging.WARNING, logger="xref.rewrite"):
+        assert rewrite.rewrite_python_paths(broken, _PATHS) == broken
+
+
+def test_unparseable_pyspark_paths_can_be_made_fatal():
+    broken = 'df = spark.read.csv("/sasdata3/a.csv"\n'
+    with pytest.raises(rewrite.XrefRewriteError):
+        rewrite.rewrite_python_paths(broken, _PATHS, on_failure="error")
+
+
+@pytest.mark.parametrize(
+    "sql, expected",
+    [
+        ("CREATE TABLE t (a INT) LOCATION '/sasdata3/t'", "'/Volumes/main/sas/t'"),
+        ("COPY INTO t FROM '/data/in/land'", "'/Volumes/main/inbound/land'"),
+        ("SELECT * FROM read_files('/sasdata3/s')", "'/Volumes/main/sas/s'"),
+        ("CREATE TABLE u USING csv OPTIONS (path '/data/in/u')", "'/Volumes/main/inbound/u'"),
+    ],
+)
+def test_sql_path_positions_are_rewritten(sql, expected):
+    assert expected in rewrite.rewrite_sql_paths(sql, _PATHS)
+
+
+def test_sql_paths_leave_table_names_alone():
+    # A table in FROM position is an identifier, not a quoted literal.
+    sql = "SELECT * FROM sales.orders"
+    assert rewrite.rewrite_sql_paths(sql, _PATHS) == sql
+
+
+def test_sql_paths_handle_the_quoted_option_key_form():
+    # OPTIONS ('path' = '...'). The value is rewritten and the key is not —
+    # the failure this guards against is the pattern latching onto the key and
+    # rewriting the ` = ` between them as though it were the value.
+    sql = "CREATE TABLE u USING csv OPTIONS ('path' = '/data/in/u')"
+    assert rewrite.rewrite_sql_paths(sql, _PATHS) == (
+        "CREATE TABLE u USING csv OPTIONS ('path' = '/Volumes/main/inbound/u')"
+    )
+
+
+def test_sql_paths_need_no_sqlglot():
+    """Unlike rewrite_sql, the path half parses nothing, so it never degrades."""
+    assert "/Volumes/main/sas/t" in rewrite.rewrite_sql_paths(
+        "CREATE TABLE t LOCATION '/sasdata3/t'", _PATHS
+    )
+
+
+def test_pre_and_post_resolve_a_path_to_the_same_target():
+    """One resolver, both ends (Architecture.md invariant 12).
+
+    The longest-prefix case is the one that would drift: '/data' and '/data/in'
+    are both keys, and a second copy of the resolution rule picking the shorter
+    would rewrite the same location two ways depending on which half saw it.
+    """
+    mapping = {"/data": "/Volumes/main/other", "/data/in": "/Volumes/main/inbound"}
+    sas = "libname raw '/data/in/cust';\n"
+    generated = 'df = spark.read.csv("/data/in/cust")\n'
+
+    pre_out, _ = pre.rewrite_source_text(sas, _paths(**mapping))
+    post_out = rewrite.rewrite_python_paths(generated, mapping)
+
+    assert "/Volumes/main/inbound/cust" in pre_out
+    assert "/Volumes/main/inbound/cust" in post_out
+
+
+def test_apply_post_rewrites_tables_and_paths_together():
+    mappings = sourcing.XrefMappings(exact=dict(_MAPPING), by_path=dict(_PATHS))
+    source = (
+        'df = spark.table("sales.orders")\n'
+        'raw = spark.read.csv("/sasdata3/a.csv")\n'
+    )
+    out = xref_apply.apply_post(source, "PySpark", mappings)
+
+    assert "cat.sales.orders" in out
+    assert "/Volumes/main/sas/a.csv" in out
+
+
+def test_apply_both_reports_a_path_only_post_reached():
+    mappings = sourcing.XrefMappings(by_path=dict(_PATHS))
+    generated = 'df = spark.read.csv("/sasdata3/a.csv")\n'
+    outcome = xref_apply.apply_both(generated, "PySpark", mappings)
+
+    assert outcome.post_changed is True
+    assert outcome.only_post == ["/sasdata3"]
+
+
 def test_apply_post_dispatches_on_language():
     source = 'df = spark.table("sales.orders")\n'
-    assert "cat.sales.orders" in xref_apply.apply_post(source, "PySpark", _MAPPING)
+    assert "cat.sales.orders" in xref_apply.apply_post(source, "PySpark", _MAPPINGS)
 
 
 def test_apply_post_rejects_an_unsupported_language():
     source = 'val df = spark.table("sales.orders")'
     with pytest.raises(ValueError, match="unknown output language"):
-        xref_apply.apply_post(source, "Spark Scala", _MAPPING)
+        xref_apply.apply_post(source, "Spark Scala", _MAPPINGS)
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +497,7 @@ def test_both_reports_what_only_post_reached():
     # The pre pass left this reference alone, so post finding it is the
     # evidence that a dataset name escaped the metadata extraction.
     generated = 'df = spark.table("sales.orders")\n'
-    outcome = xref_apply.apply_both(generated, "PySpark", _MAPPING)
+    outcome = xref_apply.apply_both(generated, "PySpark", _MAPPINGS)
 
     assert outcome.post_changed is True
     assert outcome.only_post == ["sales.orders"]
@@ -336,7 +506,7 @@ def test_both_reports_what_only_post_reached():
 def test_both_reports_nothing_when_pre_already_did_it():
     already = 'df = spark.table("cat.sales.orders")\n'
     outcome = xref_apply.apply_both(
-        already, "PySpark", _MAPPING, pre_code=already
+        already, "PySpark", _MAPPINGS, pre_code=already
     )
 
     assert outcome.only_post == []
@@ -344,14 +514,14 @@ def test_both_reports_nothing_when_pre_already_did_it():
 
 def test_apply_dispatches_and_validates_its_inputs():
     result = _batch_result("sales.orders")
-    assert xref_apply.apply("pre", result=result, mapping=_MAPPING) is not result
+    assert xref_apply.apply("pre", result=result, mappings=_MAPPINGS) is not result
 
     with pytest.raises(ValueError, match="needs a batch result"):
-        xref_apply.apply("pre", mapping=_MAPPING)
+        xref_apply.apply("pre", mappings=_MAPPINGS)
     with pytest.raises(ValueError, match="needs code and language"):
-        xref_apply.apply("post", mapping=_MAPPING)
+        xref_apply.apply("post", mappings=_MAPPINGS)
     with pytest.raises(ValueError, match="unknown xref apply mode"):
-        xref_apply.apply("sideways", code="x", language="PySpark", mapping=_MAPPING)
+        xref_apply.apply("sideways", code="x", language="PySpark", mappings=_MAPPINGS)
 
 
 def test_apply_both_through_the_dispatcher_runs_the_pre_pass_too():
@@ -361,7 +531,7 @@ def test_apply_both_through_the_dispatcher_runs_the_pre_pass_too():
         result=result,
         code='df = spark.table("sales.orders")\n',
         language="PySpark",
-        mapping=_MAPPING,
+        mappings=_MAPPINGS,
     )
 
     assert outcome.pre_applied is True
@@ -462,6 +632,63 @@ def test_chunker_stays_network_free():
 
 def _paths(**by_path) -> sourcing.XrefMappings:
     return sourcing.XrefMappings(by_path=dict(by_path))
+
+
+def test_pre_uses_the_chunkers_path_grammar():
+    """One owner of "where a path appears in SAS" (Architecture.md invariant 12).
+
+    xref.pre rewrites those statements and the chunker inventories them. A
+    second copy of the grammar growing here would mean the two disagreeing
+    about what a path is — silently, since each would still pass its own tests.
+    """
+    from chunker.paths import PATH_STATEMENTS
+
+    source = pathlib.Path(pre.__file__).read_text(encoding="utf-8")
+    assert "chunker.paths" in source
+    # No local pattern table: the statement regexes must come from the chunker.
+    assert "_PATH_STATEMENTS" not in source
+    assert any(spec.statement == "libname" for spec in PATH_STATEMENTS)
+
+
+def test_pre_rewrites_the_wider_statement_set():
+    """The shared grammar reaches statements the old local table did not."""
+    src = (
+        "filename raw '/sas/in/a.txt';\n"
+        "proc import datafile='/sas/in/b.xlsx' out=work.b; run;\n"
+        "proc export data=work.b outfile='/sas/out/c.csv'; run;\n"
+        "ods html file='/sas/rep/d.html';\n"
+        "options sasautos='/sas/mac';\n"
+    )
+    out, stats = pre.rewrite_source_text(src, _paths(**{"/sas": "/Volumes/main/sas"}))
+
+    assert "/Volumes/main/sas/in/a.txt" in out
+    assert "/Volumes/main/sas/in/b.xlsx" in out
+    assert "/Volumes/main/sas/out/c.csv" in out
+    assert "/Volumes/main/sas/rep/d.html" in out
+    assert "/Volumes/main/sas/mac" in out
+    assert len(stats.rewritten) == 5
+
+
+def test_pre_leaves_device_filenames_alone():
+    """A device form's quoted argument is a command or an address, not a path.
+
+    Rewriting it would corrupt a working statement — ``pipe 'ls -l /sas'`` is a
+    shell command that happens to mention a directory.
+    """
+    src = (
+        "filename lister pipe 'ls -l /sas/in';\n"
+        "filename notify email 'ops@example.com';\n"
+        "filename feed ftp '/sas/in/rates.dat';\n"
+        "filename real '/sas/in/real.txt';\n"
+    )
+    out, stats = pre.rewrite_source_text(src, _paths(**{"/sas": "/Volumes/main/sas"}))
+
+    assert "pipe 'ls -l /sas/in'" in out
+    assert "email 'ops@example.com'" in out
+    assert "ftp '/sas/in/rates.dat'" in out
+    # Only the bare filesystem FILENAME is remapped.
+    assert "'/Volumes/main/sas/in/real.txt'" in out
+    assert list(stats.rewritten) == ["/sas/in/real.txt"]
 
 
 def test_pre_is_a_no_op_without_path_mappings():

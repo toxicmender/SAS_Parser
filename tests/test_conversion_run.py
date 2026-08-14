@@ -327,6 +327,172 @@ def test_xref_path_mappings_are_applied_to_the_source_text():
     assert "libname raw '/mnt/bronze';" in text
 
 
+# ---------------------------------------------------------------------------
+# xref.apply modes
+#
+# Each mode has to act at a different point in the run, and the config that
+# selects them went unread for a long time — so what is asserted here is mostly
+# that a mode does its own thing and *not* the other one's.
+# ---------------------------------------------------------------------------
+
+
+# The harness targets SparkSQL (_FakePipeline.output_language), so an untagged
+# response is read as SQL. Per-cell dispatch is exercised by the document test
+# below, which mixes a python cell into the same SparkSQL run.
+_GENERATED_SQL = "CREATE TABLE t LOCATION '/data/in/t'"
+
+
+def _xref_run(transport, mappings, mode, *, document=None):
+    """One run under *mode*, returning (outputs, source text the pipeline saw)."""
+    original = f"{BASE}/{APP}/scripts_original"
+    transport.texts[f"{original}/etl.sas"] = "libname raw '/data/in';\n"
+    outputs = [
+        {
+            "item_id": "item-0",
+            "source_files": [f"{original}/etl.sas"],
+            "response": _GENERATED_SQL,
+            **({"document": document} if document else {}),
+        }
+    ]
+    pipeline = _FakePipeline(outputs=outputs)
+    _run(transport, pipeline=pipeline, xref_mappings=mappings, xref_mode=mode)
+    return outputs, dict(pipeline.seen)[f"{original}/etl.sas"]
+
+
+def _by_path():
+    from xref.sourcing import XrefMappings
+
+    return XrefMappings(by_path={"/data/in": "/mnt/bronze"})
+
+
+def test_pre_rewrites_the_source_and_leaves_generated_code_alone():
+    outputs, text = _xref_run(_transport(), _by_path(), "pre")
+
+    assert "libname raw '/mnt/bronze';" in text
+    # The model's output is whatever the model wrote: pre never sees it.
+    assert outputs[0]["response"] == _GENERATED_SQL
+
+
+def test_post_rewrites_generated_code_and_leaves_the_source_alone():
+    outputs, text = _xref_run(_transport(), _by_path(), "post")
+
+    assert "libname raw '/data/in';" in text
+    assert "'/mnt/bronze/t'" in outputs[0]["response"]
+
+
+def test_both_rewrites_at_each_end():
+    outputs, text = _xref_run(_transport(), _by_path(), "both")
+
+    assert "libname raw '/mnt/bronze';" in text
+    assert "'/mnt/bronze/t'" in outputs[0]["response"]
+
+
+def test_post_rewrites_the_document_cells_the_notebook_is_built_from():
+    # Rewriting only the Markdown response would leave the uploaded notebook
+    # untouched, since notebooks_from_outputs prefers the document.
+    document = {
+        "analysis": "",
+        "cells": [
+            {"kind": "code", "language": "python",
+             "source": 'df = spark.read.csv("/data/in/a.csv")\n'},
+            {"kind": "code", "language": "sql",
+             "source": "CREATE TABLE t LOCATION '/data/in/t'"},
+            {"kind": "markdown", "source": "reads /data/in as before"},
+        ],
+    }
+    outputs, _ = _xref_run(_transport(), _by_path(), "post", document=document)
+
+    cells = outputs[0]["document"]["cells"]
+    # Dispatched on the cell's own language, not the run's target. This run
+    # targets SparkSQL, so a python cell parsed as the run's target would
+    # silently no-op under xref.rewrite's hard rule rather than fail.
+    assert '"/mnt/bronze/a.csv"' in cells[0]["source"]
+    assert "'/mnt/bronze/t'" in cells[1]["source"]
+    # Prose is left alone — no parser validates it.
+    assert cells[2]["source"] == "reads /data/in as before"
+
+
+def test_a_cell_language_alias_resolves_like_any_other_target_name():
+    # 'py' and 'databrickssql' are target_language aliases. The post pass reads
+    # a cell tag through the same resolver the run uses, so a legitimate
+    # spelling is not treated as unknown.
+    document = {
+        "analysis": "",
+        "cells": [
+            {"kind": "code", "language": "py",
+             "source": 'df = spark.read.csv("/data/in/a.csv")\n'},
+            {"kind": "code", "language": "databrickssql",
+             "source": "CREATE TABLE t LOCATION '/data/in/t'"},
+        ],
+    }
+    outputs, _ = _xref_run(_transport(), _by_path(), "post", document=document)
+
+    cells = outputs[0]["document"]["cells"]
+    assert '"/mnt/bronze/a.csv"' in cells[0]["source"]
+    assert "'/mnt/bronze/t'" in cells[1]["source"]
+
+
+def test_a_cell_in_an_unknown_language_is_left_alone_and_reported(caplog):
+    import logging
+
+    # Guessing at the run's target would parse Scala as Spark SQL, change
+    # nothing, and say nothing. Skipping it audibly is the honest outcome.
+    document = {
+        "analysis": "",
+        "cells": [
+            {"kind": "code", "language": "scala",
+             "source": 'val p = "/data/in/a.csv"'},
+        ],
+    }
+    with caplog.at_level(logging.WARNING, logger="conversion.run"):
+        outputs, _ = _xref_run(_transport(), _by_path(), "post", document=document)
+
+    assert outputs[0]["document"]["cells"][0]["source"] == 'val p = "/data/in/a.csv"'
+    assert "not a known target" in caplog.text
+
+
+def test_the_mode_comes_from_config_when_the_caller_names_none(monkeypatch):
+    monkeypatch.setenv("XREF_APPLY", "post")
+    app_config.clear_cache()
+    outputs, text = _xref_run(_transport(), _by_path(), None)
+
+    assert "libname raw '/data/in';" in text  # pre did not run
+    assert "'/mnt/bronze/t'" in outputs[0]["response"]
+
+
+def test_no_mappings_means_no_substitution_whatever_the_mode(monkeypatch):
+    monkeypatch.setenv("XREF_APPLY", "both")
+    app_config.clear_cache()
+    outputs, text = _xref_run(_transport(), None, None)
+
+    assert "libname raw '/data/in';" in text
+    assert outputs[0]["response"] == _GENERATED_SQL
+
+
+def test_an_unmapped_sas_path_reaching_the_output_is_reported(caplog):
+    import logging
+
+    # A mapping that covers nothing in this corpus: pre rewrites nothing, and
+    # the path the model emitted is still the SAS-side one.
+    from xref.sourcing import XrefMappings
+
+    mappings = XrefMappings(by_path={"/somewhere/else": "/mnt/x"})
+    with caplog.at_level(logging.WARNING, logger="conversion.run"):
+        _xref_run(_transport(), mappings, "pre")
+
+    assert "reached the generated code unmapped" in caplog.text
+    assert "/data/in" in caplog.text
+
+
+def test_a_mapped_path_is_not_reported_as_unmapped(caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="conversion.run"):
+        _xref_run(_transport(), _by_path(), "both")
+
+    assert "reached the generated code unmapped" not in caplog.text
+
+
 def test_select_requests_narrows_by_id_then_by_application():
     rows = [
         _request(item_id="1", application_name="Alpha"),

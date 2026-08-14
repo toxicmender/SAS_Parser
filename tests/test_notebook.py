@@ -561,5 +561,83 @@ class TestWriteNotebooks(unittest.TestCase):
             self.assertTrue((dest / "a.ipynb").is_file())
 
 
+class TestMixedLanguageNotebook(unittest.TestCase):
+    """A Spark SQL run whose items fell back to PySpark still has to run.
+
+    The kernel is the constraint: Python can host SQL through the %sql magic,
+    a SQL kernel cannot host Python at all.
+    """
+
+    def _cells(self, *specs):
+        """One output per (language, source) pair, as the pipeline emits them."""
+        return [
+            _output(
+                item_id=f"item-{i}",
+                document={
+                    "analysis": "",
+                    "cells": [{"kind": "code", "language": lang, "source": src}],
+                },
+                target_language="PySpark" if lang == "python" else "Spark SQL",
+                fallback_reasons=(
+                    ["kind:MACRO_DEFINITION rates MANUAL ... and HARD ..."]
+                    if lang == "python"
+                    else []
+                ),
+            )
+            for i, (lang, src) in enumerate(specs)
+        ]
+
+    def _notebook(self, *specs):
+        return notebooks_from_outputs(
+            self._cells(*specs), output_language="Spark SQL"
+        )["a"]
+
+    def _code_cells(self, notebook):
+        return [c for c in notebook["cells"] if c["cell_type"] == "code"]
+
+    def test_a_mixed_notebook_is_hosted_by_the_python_kernel(self):
+        notebook = self._notebook(("sql", "SELECT 1"), ("python", "x = 1"))
+        self.assertEqual(notebook["metadata"]["kernelspec"]["name"], "python3")
+        self.assertEqual(notebook["metadata"]["language_info"]["name"], "python")
+
+    def test_sql_cells_in_a_mixed_notebook_carry_the_magic(self):
+        notebook = self._notebook(("sql", "SELECT 1"), ("python", "x = 1"))
+        sql_cell, py_cell = self._code_cells(notebook)
+        self.assertEqual(sql_cell["source"], "%sql\nSELECT 1")
+        # The Python cell is untouched — the magic is only how SQL is hosted.
+        self.assertEqual(py_cell["source"], "x = 1")
+        # Per-cell language metadata still describes what each cell really is.
+        self.assertEqual(sql_cell["metadata"]["language"], "sql")
+        self.assertEqual(py_cell["metadata"]["language"], "python")
+
+    def test_an_all_sql_notebook_is_unchanged(self):
+        """The common path must not move: no magic, no kernel switch."""
+        notebook = self._notebook(("sql", "SELECT 1"), ("sql", "SELECT 2"))
+        self.assertEqual(notebook["metadata"]["kernelspec"]["name"], "sql")
+        self.assertEqual(
+            [c["source"] for c in self._code_cells(notebook)],
+            ["SELECT 1", "SELECT 2"],
+        )
+
+    def test_an_all_python_notebook_is_unchanged(self):
+        notebook = self._notebook(("python", "x = 1"))
+        self.assertEqual(notebook["metadata"]["kernelspec"]["name"], "python3")
+        self.assertEqual([c["source"] for c in self._code_cells(notebook)], ["x = 1"])
+
+    def test_the_fallback_reason_reaches_the_header_cell(self):
+        notebook = self._notebook(("sql", "SELECT 1"), ("python", "x = 1"))
+        markdown = "\n".join(
+            c["source"] for c in notebook["cells"] if c["cell_type"] == "markdown"
+        )
+        self.assertIn("**Translated to PySpark**", markdown)
+        self.assertIn("MACRO_DEFINITION", markdown)
+
+    def test_a_mixed_notebook_still_validates(self):
+        import nbformat
+
+        notebook = self._notebook(("sql", "SELECT 1"), ("python", "x = 1"))
+        nbformat.validate(nbformat.reads(notebook_to_json(notebook), as_version=4))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

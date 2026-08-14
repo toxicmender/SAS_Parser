@@ -48,6 +48,85 @@ class SasDiagnosticSeverity(StrEnum):
     ERROR = "ERROR"
 
 
+class PathLocation(StrEnum):
+    """What kind of place a :class:`SasPathRef` points at.
+
+    A SAS statement that takes a quoted argument does not always take a
+    *filesystem* path: ``FILENAME`` accepts a device keyword that redirects the
+    same syntax at an FTP server, a mailbox, or a shell pipe. Each is a real
+    external dependency of the corpus and each needs a different answer on the
+    target, so they are classified rather than collapsed — or, worse, silently
+    treated as directories somebody then tries to mount.
+
+    ``DEVICE`` is the deliberate catch-all: a device keyword this module does
+    not know must land somewhere visible instead of defaulting to
+    :attr:`FILESYSTEM`.
+    """
+
+    FILESYSTEM = "filesystem"
+    REMOTE = "remote"
+    EMAIL = "email"
+    PIPE = "pipe"
+    DEVICE = "device"
+
+
+class SasPathRef(BaseModel, frozen=True):
+    """One external reference a statement names, with its provenance.
+
+    Frozen so it is hashable: ``_merge_meta`` merges the containing list by set
+    union, which a mutable model could not do. (Same reason
+    :class:`prompt_builder.ConstructKey` is frozen.)
+
+    Attributes
+    ----------
+    statement
+        Which statement named it — ``libname``, ``filename``, ``infile``,
+        ``file``, ``include``, ``proc_import``, ``proc_export``, ``ods``,
+        ``sasautos``.
+    location
+        See :class:`PathLocation`.
+    path
+        Normalised for comparison: lowercased, backslashes turned to forward
+        slashes. Unlike the dataset vocabulary's quoted-path keys it carries no
+        quote wrapper — nothing here shares a namespace with identifiers.
+    raw
+        Exactly as written, before normalisation. A consumer that has to
+        *rewrite* the source needs the original spelling; a consumer that has to
+        *match* wants ``path``.
+    binds
+        The libref or fileref the statement assigns, when it assigns one.
+    device
+        The device keyword as written, when there was one.
+    has_macro_ref
+        The value contains a ``&`` reference, so its real value is not knowable
+        without running SAS. Recorded rather than dropped: a path that cannot be
+        resolved is exactly what a migration needs told about.
+    """
+
+    statement: str
+    location: PathLocation
+    path: str
+    raw: str
+    binds: str | None = None
+    device: str | None = None
+    has_macro_ref: bool = False
+
+    def __str__(self) -> str:
+        bound = f" {self.binds}" if self.binds else ""
+        return f"{self.statement}{bound} [{self.location}] {self.raw}"
+
+
+def _path_ref_sort_key(ref: SasPathRef) -> tuple[str, str, str, str]:
+    """Total order over :class:`SasPathRef`, defined once.
+
+    Both places that deduplicate these records through a set —
+    ``chunker.metadata._merge_meta`` and :attr:`SasBatch.external_refs` — sort
+    the result with this, because set iteration order is not stable across runs
+    and batch output is pinned by tests (invariant 9).
+    """
+    return (str(ref.location), ref.statement, ref.path, ref.binds or "")
+
+
 class SasDiagnostic(BaseModel):
     """A recoverable parsing or classification issue."""
 
@@ -142,6 +221,32 @@ class SasChunkMetadata(BaseModel):
     control_flow_op: str | None = None
     contains_abort: bool = False
     contains_computed_goto: bool = False
+
+    # Every external reference the chunk names, whatever kind of place it points
+    # at — see :class:`SasPathRef`. One stored list rather than one per kind, so
+    # there is one scan to keep correct and one merge rule to keep honest; the
+    # per-kind views below are computed from it.
+    external_refs: list[SasPathRef] = Field(default_factory=list)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def physical_paths(self) -> list[SasPathRef]:
+        """Refs pointing at a filesystem location — the ones a target has to
+        map to a volume or external location."""
+        return [r for r in self.external_refs if r.location is PathLocation.FILESYSTEM]
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def remote_paths(self) -> list[SasPathRef]:
+        """Refs reaching a remote service (FTP, URL, ...) — network egress, not
+        storage."""
+        return [r for r in self.external_refs if r.location is PathLocation.REMOTE]
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def email_refs(self) -> list[SasPathRef]:
+        """Refs addressing a mailbox."""
+        return [r for r in self.external_refs if r.location is PathLocation.EMAIL]
 
     def __str__(self) -> str:
         # Show only populated fields, so empty defaults don't drown out the rest.
@@ -393,6 +498,29 @@ class SasBatch(BaseModel):
             for c in self.chunks
             if c.metadata.global_statement_keyword
         }
+
+    @property
+    def external_refs(self) -> list[SasPathRef]:
+        """Every external reference the batch's chunks name, deduplicated.
+
+        A list rather than a set like its neighbours above: the records are
+        hashable, but a stable order is what makes batch output reproducible
+        (invariant 9), and a consumer rendering a report wants them ordered.
+        """
+        return sorted(
+            {r for c in self.chunks for r in c.metadata.external_refs},
+            key=_path_ref_sort_key,
+        )
+
+    @property
+    def physical_paths(self) -> list[SasPathRef]:
+        """:attr:`external_refs` narrowed to filesystem locations."""
+        return [r for r in self.external_refs if r.location is PathLocation.FILESYSTEM]
+
+    @property
+    def remote_paths(self) -> list[SasPathRef]:
+        """:attr:`external_refs` narrowed to remote services."""
+        return [r for r in self.external_refs if r.location is PathLocation.REMOTE]
 
     @property
     def has_symput_scope_hazard(self) -> bool:

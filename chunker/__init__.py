@@ -8,6 +8,7 @@ from .batcher import (
 )
 from .chunker import SasSemanticChunker
 from .models import (
+    PathLocation,
     SasBatch,
     SasBatchResult,
     SasChunk,
@@ -17,7 +18,9 @@ from .models import (
     SasCorpus,
     SasDiagnostic,
     SasDiagnosticSeverity,
+    SasPathRef,
 )
+from .paths import PATH_STATEMENTS, classify_location, extract_paths
 
 __all__ = [
     # chunker
@@ -41,4 +44,10 @@ __all__ = [
     "SasBatchResult",
     # models — multi-file input
     "SasCorpus",
+    # physical/remote path recognition — the grammar xref.pre also reads
+    "SasPathRef",
+    "PathLocation",
+    "PATH_STATEMENTS",
+    "classify_location",
+    "extract_paths",
 ]
