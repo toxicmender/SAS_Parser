@@ -50,7 +50,8 @@
   "pipeline": {
     "structured_output": null,
     "max_merged_tokens": null,
-    "output_language": null
+    "output_language": null,
+    "sql_fallback": true
   },
   "_memory_comment": "Durable conversation memory. Both Delta table names must be fully-qualified Unity Catalog identifiers in Catalog.Schema.Table form. delta_table enables the Delta-backed MemoryHub; null keeps the default in-memory backend. cdf_audit_table is the separate durable audit/checkpoint table used only when a per-worker MemorySetup.cdf_consumer_id is supplied; CDF audit data must not share the source table because VACUUM may remove source change records. Explicit MemorySetup table arguments override these values.",
   "memory": {

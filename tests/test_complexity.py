@@ -20,6 +20,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from chunker import MultiFileBatcher, SasChunkBatcher, SasSemanticChunker
 from chunker.models import SasCorpus
+from target_language import PYSPARK, SPARKSQL
 from complexity import (
     CROSS_FILE_CONSTRUCTS,
     ComplexityAnalyzer,
@@ -2914,6 +2915,122 @@ class TestPathsSection(unittest.TestCase):
         self.assertIn(
             "**(unresolved macro reference)**", render_file_report(scored, texts={})
         )
+
+
+class TestChooseTarget(unittest.TestCase):
+    """Which target an item is translated into, from the shipped profiles.
+
+    Asserted against the real `complexity/profiles/*.json`, never a fixture:
+    the whole value of deriving this from parity ratings is that it tracks the
+    reviewed data. A fixture would let the profiles and the routing drift apart
+    while both kept passing.
+    """
+
+    def _choose(self, constructs, run=None, fallback=None):
+        from complexity.fallback import choose_target
+
+        return choose_target(
+            constructs,
+            run_target=run or SPARKSQL,
+            fallback_to=PYSPARK if fallback is None else fallback,
+        )
+
+    def test_a_macro_definition_falls_back(self):
+        # MANUAL against Spark SQL, HARD against PySpark. The highest-value
+        # trigger: pure SQL has no macro processor at all.
+        choice = self._choose([("kind", "MACRO_DEFINITION")])
+        self.assertTrue(choice.fell_back)
+        self.assertIs(choice.target, PYSPARK)
+        self.assertEqual(choice.reasons[0].name, "MACRO_DEFINITION")
+
+    def test_the_macro_resolution_family_falls_back(self):
+        for kind, name in [
+            ("call_routine", "execute"),
+            ("call_routine", "module"),
+            ("function", "dosubl"),
+            ("function", "resolve"),
+            ("function", "symget"),
+            ("proc", "fcmp"),
+            ("kind", "MACRO_CONTROL_FLOW"),
+        ]:
+            with self.subTest(construct=f"{kind}:{name}"):
+                self.assertTrue(self._choose([(kind, name)]).fell_back)
+
+    def test_a_macro_call_does_not_fall_back(self):
+        """PARTIAL is implementable, and nearly every SAS program has one.
+
+        Without the not-implementable half of the rule this construct alone
+        (PARTIAL -> SUPPORTED) would move essentially every item, and a Spark
+        SQL run would quietly become a PySpark run.
+        """
+        self.assertFalse(self._choose([("kind", "MACRO_CALL")]).fell_back)
+
+    def test_equally_hard_in_both_does_not_fall_back(self):
+        # HARD against both. Moving would trade one hard problem for the
+        # identical hard problem in another language.
+        for kind, name in [
+            ("function", "lag"),
+            ("detector", "do_until"),
+            ("detector", "do_while"),
+            ("detector", "merge_no_by"),
+            ("detector", "data_goto"),
+            ("detector", "array"),
+            ("detector", "filename_pipe"),
+        ]:
+            with self.subTest(construct=f"{kind}:{name}"):
+                self.assertFalse(self._choose([(kind, name)]).fell_back)
+
+    def test_the_procedural_data_step_detectors_fall_back(self):
+        """An iterative DO becomes vectorised columns; LINK/RETURN a function.
+
+        Neither has a SQL form at all, which is why they rate HARD against
+        Spark SQL and PARTIAL against PySpark. These come from
+        complexity.detectors scanning source, not from chunk metadata.
+        """
+        for name in ["do_loop", "link_return"]:
+            with self.subTest(detector=name):
+                choice = self._choose([("detector", name)])
+                self.assertTrue(choice.fell_back)
+                self.assertIs(choice.target, PYSPARK)
+
+    def test_ordinary_sql_keeps_the_run_target(self):
+        choice = self._choose([("proc", "sql"), ("proc", "sort"), ("proc", "means")])
+        self.assertFalse(choice.fell_back)
+        self.assertIs(choice.target, SPARKSQL)
+        self.assertEqual(choice.reasons, ())
+
+    def test_a_pyspark_run_never_falls_back(self):
+        # PySpark expresses everything Spark SQL does and more, so there is
+        # nowhere better to go; the run's target is resolved to no fallback.
+        choice = self._choose(
+            [("kind", "MACRO_DEFINITION")], run=PYSPARK, fallback=SPARKSQL
+        )
+        self.assertFalse(choice.fell_back)
+        self.assertIs(choice.target, PYSPARK)
+
+    def test_the_fallback_can_be_switched_off(self):
+        from complexity.fallback import choose_target
+
+        choice = choose_target(
+            [("kind", "MACRO_DEFINITION")], run_target=SPARKSQL, fallback_to=None
+        )
+        self.assertIs(choice.target, SPARKSQL)
+        self.assertFalse(choice.fell_back)
+
+    def test_uncompared_kinds_are_ignored(self):
+        # The pipeline also emits statement/macro_statement/category keys,
+        # which no profile catalogues.
+        self.assertFalse(
+            self._choose([("statement", "merge"), ("category", "date_time")]).fell_back
+        )
+
+    def test_reasons_are_worst_first(self):
+        choice = self._choose(
+            [("kind", "MACRO_CONTROL_FLOW"), ("kind", "MACRO_DEFINITION")]
+        )
+        # MANUAL outranks HARD: the reason with the least chance of translating
+        # is the one the prompt and the notebook header show first.
+        self.assertEqual(choice.reasons[0].name, "MACRO_DEFINITION")
 
 
 if __name__ == "__main__":

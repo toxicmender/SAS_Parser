@@ -109,10 +109,41 @@ class LiveValidator:
                 "default_metrics(output_language=...) instead"
             )
         self._evaluator = Evaluator(metrics=metrics)
+        # Evaluators for the targets individual items fell back to, built on
+        # first use and kept: default_metrics() is not free, and a run that
+        # falls back once usually falls back several times.
+        self._evaluators_by_target: dict[str, Evaluator] = {}
         logger.info(
             "LiveValidator: metrics="
             f"[{', '.join(m.name for m in self._evaluator.metrics)}]"
         )
+
+    def _evaluator_for(
+        self, target: "TargetLanguage | None"
+    ) -> tuple[Evaluator, bool]:
+        """The evaluator that should score an item translated into *target*.
+
+        Returns ``(evaluator, is_override)``. The run's own evaluator whenever
+        *target* is absent or is already the run's — the common path, and the
+        one that must stay byte-for-byte what it was.
+
+        A caller who supplied explicit metrics gets its own suite back
+        regardless: this class cannot rebuild a suite it did not compose, and
+        silently swapping in the default one would score the run against
+        metrics its owner never chose.
+        """
+        if target is None or self._target is None or target.key == self._target.key:
+            return self._evaluator, False
+        cached = self._evaluators_by_target.get(target.key)
+        if cached is None:
+            cached = Evaluator(metrics=default_metrics(target))
+            self._evaluators_by_target[target.key] = cached
+            logger.info(
+                f"LiveValidator: scoring fallback item(s) against "
+                f"{target.display_name} rather than "
+                f"{self._target.display_name}"
+            )
+        return cached, True
 
     @property
     def target_language(self) -> TargetLanguage | None:
@@ -140,6 +171,7 @@ class LiveValidator:
         total: int | None = None,
         prompt: str | None = None,
         retrieval_context: Sequence[str] = (),
+        target_language: "TargetLanguage | None" = None,
     ) -> CaseResult:
         """Score one item's *response* and store the verdict in *kv*.
 
@@ -168,6 +200,13 @@ class LiveValidator:
             (``validation.rag_metrics`` and friends) score as ``input`` and
             retrieved context. Both optional: the deterministic default suite
             ignores them, and a judged metric with neither skips.
+        target_language
+            The target *this item* was actually translated into, when it is not
+            the run's — see :mod:`complexity.fallback`. Scoring a PySpark
+            fallback against the Spark SQL suite would find no SQL blocks and
+            return 0.0 on a correct translation, and fail ``language_compliance``
+            for code the run itself asked for. ``None`` (the default) scores
+            against the run's target, so every existing caller is unaffected.
         """
         item_id = _item_id(item)
         run = EvaluationRun(
@@ -182,7 +221,8 @@ class LiveValidator:
                 }
             ],
         )
-        result = self._evaluator.evaluate(run)
+        evaluator, is_override = self._evaluator_for(target_language)
+        result = evaluator.evaluate(run)
 
         fact = {
             **result.model_dump(),
@@ -190,6 +230,11 @@ class LiveValidator:
             "total": total,
             "ts": time.time(),
         }
+        if is_override and target_language is not None:
+            # Stored on the verdict so a report reading it back can say which
+            # language the score was against — a 1.0 for PySpark and a 1.0 for
+            # Spark SQL are not the same claim.
+            fact["target_language"] = target_language.display_name
         kv.set(
             _validation_key(thread_id, item_id),
             fact,

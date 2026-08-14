@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterable
+from typing import TYPE_CHECKING
 
 from chunker.keywords import SAS_FUNCTION_CATEGORIES
 from chunker.models import (
@@ -30,10 +31,15 @@ from chunker.models import (
 )
 import token_budget as tokens
 from prompt_builder import ConstructKey
+from target_language import TargetLanguage
+
+if TYPE_CHECKING:  # complexity is loaded lazily — see target_for_item
+    from complexity.fallback import TargetChoice
 
 from .constants import (
     _BATCH_CONTEXT_TEMPLATE,
     _BATCH_MEMBER_TEMPLATE,
+    _TARGET_OVERRIDE_TEMPLATE,
 )
 
 logger = logging.getLogger(__name__)
@@ -112,6 +118,78 @@ def _constructs_for_item(item: SasBatch) -> list[ConstructKey]:
         symput_hazard=item.has_symput_scope_hazard,
         computed_goto=item.has_computed_goto,
         abort=item.has_abort,
+    )
+
+
+def _profile_constructs_for_item(item: SasBatch) -> list[tuple[str, str]]:
+    """The item's constructs in the *complexity profiles'* vocabulary.
+
+    :func:`_constructs_for_item` names constructs for the instruction selector,
+    whose catalogue is titled per construct; the profiles' catalogue is keyed
+    ``{construct_kind: {name: spec}}``. The two vocabularies agree on ``proc``,
+    ``function``, ``call_routine``, ``component_object`` and
+    ``global_statement``, and :data:`complexity.fallback.COMPARED_KINDS` ignores
+    the rest.
+
+    Two kinds have no counterpart in the selector's vocabulary and are added
+    here:
+
+    ``kind``
+        The profiles rate a chunk *kind* (``MACRO_DEFINITION``) and
+        ``_construct_keys`` never emits one. It matters more than everything
+        else put together, because ``%MACRO`` is the construct pure SQL most
+        obviously cannot host.
+    ``detector``
+        The DATA step's imperative constructs — ``DO`` loops, ``LINK``/
+        ``RETURN``, ``MERGE`` without ``BY`` — which
+        :class:`~chunker.models.SasChunkMetadata` does not report because they
+        are found by scanning source text, not by naming an identifier. They are
+        why :mod:`complexity.detectors` exists, and two of them (``do_loop`` and
+        ``link_return``, both ``HARD`` against Spark SQL and ``PARTIAL`` against
+        PySpark) are exactly the "no SQL answer, but a Python one" case this
+        routing is for.
+
+    The detector scan is a sanitise pass plus gated regexes over each member
+    chunk. It runs only on the fallback path — :func:`target_for_item` returns
+    before calling this when there is nowhere to fall back to — so a PySpark run
+    and a run with ``pipeline.sql_fallback`` off pay nothing for it.
+    """
+    from complexity.detectors import detect_constructs
+
+    keys = [(k.kind, k.name) for k in _constructs_for_item(item)]
+    keys.extend(("kind", chunk.kind.value) for chunk in item.chunks)
+    # Deduplicated: one DO loop and five are the same routing decision, and the
+    # comparison is a dictionary lookup per entry.
+    detected = {
+        found.name for chunk in item.chunks for found in detect_constructs(chunk.text)
+    }
+    keys.extend(("detector", name) for name in sorted(detected))
+    return keys
+
+
+def target_for_item(
+    item: SasBatch,
+    run_target: TargetLanguage,
+    *,
+    fallback_to: TargetLanguage | None = None,
+) -> "TargetChoice":
+    """Which target *item* should be translated into — see
+    :func:`complexity.fallback.choose_target`.
+
+    Imported lazily: :mod:`complexity` is a sibling package the pipeline
+    otherwise does not need, and a run with the fallback disabled should not
+    pay to load its rule sets at all.
+    """
+    if fallback_to is None:
+        from complexity.fallback import TargetChoice
+
+        return TargetChoice(target=run_target)
+    from complexity.fallback import choose_target
+
+    return choose_target(
+        _profile_constructs_for_item(item),
+        run_target=run_target,
+        fallback_to=fallback_to,
     )
 
 
@@ -319,11 +397,35 @@ def prompt_cost_estimator(
     return cost
 
 
+def _format_target_directive(choice: "TargetChoice", run_target: TargetLanguage) -> str:
+    """The per-item target override, or ``""`` when the item keeps the run's.
+
+    Empty for every item of a run that never falls back, so the batch context is
+    byte-identical to what it was before the fallback existed.
+    """
+    if not choice.fell_back:
+        return ""
+    # The three worst reasons: enough for the model to recognise the construct
+    # it is looking at, short enough not to crowd the item itself.
+    named = ", ".join(f"`{r.name}`" for r in choice.reasons[:3])
+    if len(choice.reasons) > 3:
+        named += f" (and {len(choice.reasons) - 3} more)"
+    return _TARGET_OVERRIDE_TEMPLATE.format(
+        output_language=choice.target.display_name,
+        run_language=run_target.display_name,
+        reasons=named,
+        fence_info=choice.target.default_fence,
+        cell_language=choice.target.cell_language,
+        comment_prefix=choice.target.comment_prefix,
+    )
+
+
 def _format_batch_message(
     batch: SasBatch,
     index: int,
     total: int,
     diagnostics: list[SasDiagnostic],
+    target_directive: str = "",
 ) -> str:
     diags = _diagnostics_for_batch(batch, diagnostics)
     members = "\n".join(
@@ -366,6 +468,7 @@ def _format_batch_message(
         contains_abort="yes" if batch.has_abort else "no",
         contains_computed_goto="yes" if batch.has_computed_goto else "no",
         diagnostics="; ".join(f"[{d.code}] {d.message}" for d in diags) or "none",
+        target_directive=target_directive,
         members=members,
     )
     logger.debug(

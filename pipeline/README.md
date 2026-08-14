@@ -37,6 +37,35 @@ fraction of translated blocks actually in the target, and with
 `validation_retries > 0` an off-target answer is rolled back and re-prompted
 with a note naming the offending fence tag.
 
+### When Spark SQL cannot express an item
+
+Some SAS has no Spark SQL answer at all — a `%MACRO` definition, `CALL EXECUTE`,
+`PROC FCMP`. Asked for SQL anyway, a model produces something plausible, and the
+failure is silent: `target_syntax` parses it happily because it *is* valid SQL,
+just not equivalent SAS.
+
+So a Spark SQL run resolves the target **per item**. When an item's constructs
+rate `HARD` or `MANUAL` against Spark SQL and better against PySpark
+(`complexity.fallback`, Architecture.md invariant 15), that item is translated
+into PySpark instead. That covers the macro facility (`%MACRO`, `CALL EXECUTE`,
+`PROC FCMP`, …) and the DATA step's procedural core — an iterative `DO` loop and
+`LINK`/`RETURN`, both found by scanning source rather than from chunk metadata.
+When it fires:
+
+- the override is announced in the item's **batch context**, never the system
+  prompt — the system block is the cached prefix, and varying it per item would
+  miss the prompt cache every time;
+- the output carries `target_language` and `fallback_reasons`;
+- the notebook is hosted by the Python kernel and its SQL cells get the `%sql`
+  magic, because a SQL kernel cannot run Python;
+- the item is validated against *its* target, so a correct PySpark fallback is
+  not scored 0.0 for containing no SQL;
+- the item's notebook header says which construct forced it.
+
+An all-SQL run is unaffected — same prompts, same notebook, byte for byte. Set
+config.json `pipeline.sql_fallback` to `false` to keep every item on Spark SQL
+and see the failures instead.
+
 ## Quick start
 
 ```python

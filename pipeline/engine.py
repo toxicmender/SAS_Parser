@@ -14,7 +14,7 @@ import logging
 import time
 import warnings
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import app_config
 from langchain_core.messages import (
@@ -60,7 +60,10 @@ from memory.extractor import MemoryExtractor
 from memory.policy import TaskPolicy
 from memory.thread_mem import ThreadMemory
 from prompt_builder import PromptBuilder, UserInstructionSet
-from target_language import TargetLanguage, resolve_target_language
+from target_language import PYSPARK, TargetLanguage, resolve_target_language
+
+if TYPE_CHECKING:  # complexity is loaded lazily — see prompting.target_for_item
+    from complexity.fallback import TargetChoice
 
 from .constants import (
     _STRUCTURED_SYSTEM_PROMPT_TEMPLATE,
@@ -70,6 +73,8 @@ from .prompting import (
     _attribution_for_item,
     _constructs_for_item,
     _format_batch_message,
+    _format_target_directive,
+    target_for_item,
     _kinds_for_item,
     _meta_flags_for_item,
     _query_for_item,
@@ -98,6 +103,43 @@ def _is_anthropic_model(model: str) -> bool:
     ``claude-*`` name or an explicit LangChain ``anthropic:`` provider
     prefix. Gates provider-specific request features (prompt caching)."""
     return model.startswith("claude") or model.startswith("anthropic:")
+
+
+def _target_fields(choice: "TargetChoice") -> dict[str, Any]:
+    """The item's target and fallback reasons, for its output dict.
+
+    Every output carries ``target_language`` — not only the ones that fell back
+    — so a consumer (the notebook writer, the validator, ``conversion.run``)
+    reads one field instead of deciding whether to look at the run's target or
+    the item's. ``fallback_reasons`` is empty for an item that stayed put.
+    """
+    return {
+        "target_language": choice.target.display_name,
+        "fallback_reasons": [str(reason) for reason in choice.reasons],
+    }
+
+
+def _resolve_fallback_target(target: TargetLanguage) -> TargetLanguage | None:
+    """Where an item goes when *target* cannot express it, or ``None``.
+
+    Only a SQL target has somewhere to fall back *to*: PySpark can express
+    everything Spark SQL can and more, so the reverse move would never help.
+    That is why this is derived from the run's target rather than configured as
+    a pair — there is one sensible direction and inventing a second knob would
+    let an operator configure a fallback that makes translations worse.
+
+    ``pipeline.sql_fallback`` (default on) switches it off for an operator who
+    wants a strictly-Spark-SQL run and would rather see the failures.
+    """
+    if target.sqlglot_dialect is None:
+        return None
+    if not app_config.get_typed_value("pipeline", "sql_fallback", bool, True):
+        logger.info(
+            "SasLLMPipeline: pipeline.sql_fallback is off; every item stays on "
+            f"{target.display_name} even where it has no equivalent"
+        )
+        return None
+    return PYSPARK
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +492,10 @@ class SasLLMPipeline:
         self._requested_merged_tokens = max_merged_tokens
         self._target_language = target
         self._output_language = target.display_name
+        # Which target an item falls back to when this one cannot express it,
+        # or None to keep every item on the run's target. Resolved once, here,
+        # so a config edit mid-run cannot make two items disagree.
+        self._sql_fallback_target = _resolve_fallback_target(target)
         self._history_selector = history_selector
         self._prompt_builder = prompt_builder
         self._validator = validator
@@ -1267,6 +1313,7 @@ class SasLLMPipeline:
         user_msg: str,
         base_instructions: list[BaseMessage],
         retrieval_context: Sequence[str] = (),
+        item_target: TargetLanguage | None = None,
     ) -> tuple[str, dict[str, Any] | None, Any, int]:
         """Generate (and, if enabled, iteratively repair) one item's answer.
 
@@ -1320,6 +1367,7 @@ class SasLLMPipeline:
                         total=total,
                         prompt=user_msg,
                         retrieval_context=retrieval_context,
+                        target_language=item_target,
                     )
                 except Exception:
                     logger.warning(
@@ -1408,7 +1456,27 @@ class SasLLMPipeline:
         for idx, item in enumerate(items, start=1):
             item_id = item.batch_id
 
-            user_msg = _format_batch_message(item, idx, total, diagnostics)
+            # Which target *this* item is translated into. The run's, unless its
+            # constructs are ones the run's target cannot express — see
+            # complexity.fallback. Resolved before the resume check so a skipped
+            # item still reports the target it was translated under.
+            choice = target_for_item(
+                item, self._target_language, fallback_to=self._sql_fallback_target
+            )
+            if choice.fell_back:
+                logger.info(
+                    f"_process: item {idx}/{total}  id={item_id}  translating to "
+                    f"{choice.target.display_name} instead of "
+                    f"{self._target_language.display_name} — "
+                    f"{'; '.join(str(r) for r in choice.reasons[:3])}"
+                )
+            user_msg = _format_batch_message(
+                item,
+                idx,
+                total,
+                diagnostics,
+                _format_target_directive(choice, self._target_language),
+            )
             # Per-item guidance rides in the config, not the state, so it is
             # prompted without ever entering the persisted message history.
             # Both are derived above the resume check on purpose: a skipped
@@ -1441,6 +1509,7 @@ class SasLLMPipeline:
                         "validation": RunLedger.recovered_validation(
                             completed_validations.get(item_id)
                         ),
+                        **_target_fields(choice),
                     }
                 )
                 continue
@@ -1464,6 +1533,7 @@ class SasLLMPipeline:
                     user_msg=user_msg,
                     base_instructions=base_instructions,
                     retrieval_context=retrieval_context,
+                    item_target=choice.target,
                 )
             except Exception as exc:
                 logger.error(
@@ -1514,6 +1584,7 @@ class SasLLMPipeline:
                     "thread_id": thread_id,
                     "skipped": False,
                     "validation": result.model_dump() if result is not None else None,
+                    **_target_fields(choice),
                 }
             )
 

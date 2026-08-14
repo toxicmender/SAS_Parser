@@ -1029,6 +1029,49 @@ no `DETECTOR_RULES` entry, that is a wiring bug rather than a property of the
 SAS source, so the signal is dropped with a `WARNING` instead of being given an
 invented classification. A test asserts every detector name has an entry.
 
+## Parity also decides where an item is translated
+
+`fallback.py` is the one consumer of these ratings that is not a report. The
+pipeline asks it, per item, whether the run's target can express what the item
+contains — and a Spark SQL run translates that item into PySpark instead when it
+cannot (Architecture.md invariant 15).
+
+```python
+from complexity.fallback import choose_target
+from target_language import PYSPARK, SPARKSQL
+
+choose_target([("kind", "MACRO_DEFINITION")], run_target=SPARKSQL, fallback_to=PYSPARK)
+# TargetChoice(target=PySpark, fell_back=True, reasons=(...))
+```
+
+The rule is `HARD`/`MANUAL` against the run's target **and** strictly better
+against the fallback. Both halves matter: `MACRO_CALL` is `PARTIAL` against Spark
+SQL and `SUPPORTED` against PySpark, and moving on that alone would relocate
+essentially every SAS item; `do_until` is `HARD` against both, and moving buys
+nothing.
+
+Ten constructs qualify against the shipped profiles, in two groups:
+
+| Group | Constructs |
+|---|---|
+| The macro facility | `MACRO_DEFINITION`, `MACRO_CONTROL_FLOW`, `CALL EXECUTE`, `CALL MODULE`, `DOSUBL`, `RESOLVE`, `SYMGET`, `PROC FCMP` |
+| The DATA step's procedural core | `do_loop`, `link_return` |
+
+The second group is the `detector` family — constructs found by scanning source
+rather than by naming an identifier, so `SasChunkMetadata` cannot report them.
+The pipeline runs `detectors.detect_constructs` over the item's chunks to get
+them, and only on the fallback path: a PySpark run, or one with
+`pipeline.sql_fallback` off, never pays for the scan.
+
+Deliberately *not* qualifying: `do_until` / `do_while`, `merge_no_by`,
+`data_goto`, `array`, `filename_pipe`. All rate the same against both targets —
+the hard problem travels with the item, so it stays where it is.
+
+This is why a parity rating is not decoration. Changing one in a profile now
+changes where code is translated, not just what a report says — so an edit here
+needs the same grounding in `reference_docs/` that the profile descriptions
+already claim.
+
 ## Configuration
 
 `config.json`, section `complexity`:
