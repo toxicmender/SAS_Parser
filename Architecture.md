@@ -313,6 +313,38 @@ reporting/
                         the paging-loop cap. A leaf: imports nothing from this
                         repo.
 
+data_hydration/
+  models.py             Plan, item, source, outcome. All INERT: building one
+                        opens no connection and imports no driver, which is
+                        what lets complexity build a plan purely to print it.
+  config.py             HydrationConfig + from_env(). NO secret is a field
+                        here, so there is nowhere for one to be written to
+                        config.json by accident.
+  secrets.py            The one credential chain: Databricks secret scope ->
+                        Vault -> Entra ID (for storage, which has no password)
+                        -> DATA_HYDRATION_* env. EntraCredential duck-types the
+                        Azure SDK's TokenCredential over app_config.azure
+                        rather than growing a second MSAL login.
+  naming.py             The target-name template, <angle> placeholders. Renders
+                        catalog.schema.table; validates at PLAN time so a typo
+                        fails during --dry-run, not after data has moved.
+  planner.py            Refs -> plan. Pure. Chunker types are TYPE_CHECKING
+                        only, so importing this never imports chunker.
+  partition.py          Native (Oracle partitions / SPDE components) -> row
+                        range -> column range -> whole, each with the reason
+                        recorded. probe=None restricts it to what is knowable
+                        without a connection.
+  runner.py             Executes a plan; a failed item is recorded, not raised.
+  rawio.py              RangedRawIO: object storage as a seekable file object,
+                        with read-ahead. ONE implementation, two backends
+                        (Blob, ADLS). sFTP needs none -- paramiko's SFTPFile is
+                        already seekable.
+  sources/              One reader per system, every driver imported lazily.
+                        sas_files.py owns the .sas7bdat/.sas7bndx distinction;
+                        sas_session.py owns SPD Engine, which needs SAS.
+  sinks/delta.py        The managed-table writer. Needs pyspark; cannot run in
+                        the local .venv (databricks-connect shadows it).
+
 conversion/
   paths.py              The folder conventions one application's scripts live
                         under: scripts_original, scripts_converted,
@@ -896,6 +928,18 @@ any of these silently changes behavior.
      argument is a command line or a mail address, not a location a mapping can
      address. Where a path appears in *generated* code is a separate grammar and
      lives with the rewriter (`xref/rewrite.py`) — it is target syntax, not SAS.
+     The same rule covers the LIBNAME form that names **no** path:
+     `chunker/paths.py` also owns `ENGINE_LIBNAMES` / `extract_engine_refs`, for
+     `libname edwprod oracle path=... user=... pass=...`, which no `PathSpec`
+     can match because every one of them ends in a quoted value.
+     `data_hydration` *consumes* those records and never re-parses SAS — a
+     second connection grammar living with the module that connects would drift
+     from the one that inventories, and the corpus report and the load would
+     disagree about what the job reads. The engine on a *path* LIBNAME is
+     captured too (`SasPathRef.engine`), because `libname x spde '/p'` is
+     partitioned SPD Engine storage while `libname x '/p'` is an ordinary
+     directory — indistinguishable for as long as that group stayed
+     non-capturing, which it was until hydration needed to tell them apart.
    - **One path resolver.** `xref/mapping.py` decides which `by_path` key wins
      (exact match, then longest directory prefix) and what it rewrites to. Both
      halves of the substitution import it: `xref/pre.py` on the way in,
@@ -964,6 +1008,30 @@ any of these silently changes behavior.
     `pipeline.prompting._profile_constructs_for_item` runs that scan. It runs
     **only on the fallback path**, so a PySpark run and a run with
     `pipeline.sql_fallback` off pay nothing for it.
+
+16. **`data_hydration` imports only `app_config` at run time, and nothing
+    imports back into it.** Its chunker types are `TYPE_CHECKING`-only
+    annotations, so `import data_hydration` pulls in neither `chunker` nor any
+    driver; `tests/test_data_hydration.py` asserts that against `sys.modules`,
+    the same way `tests/test_xref.py` asserts the chunker never imports
+    `app_config.sharepoint`. The direction is one-way: `complexity` imports
+    `data_hydration` to *report* a plan, never the reverse.
+
+    Two consequences that are easy to break by accident:
+
+    - **Planning is pure, and that is what makes the report safe.**
+      `build_corpus_plan(..., probe=None)` opens no socket, so a report renderer
+      cannot reach a database. `complexity` always passes `probe=None`; a probe
+      exists only to refine what static inspection cannot know (Oracle partition
+      names, row counts) and belongs to a real run.
+    - **The plan reaches the report as a parameter, not a field.** Storing it on
+      `FileComplexity` would make `complexity.models` import
+      `data_hydration.models` at module scope, turning an optional capability
+      into a hard dependency of a package that ships in the wheel. It is passed
+      to `render_file_report` / `render_overall_report` / `write_reports`
+      alongside `names` and `graph_image`, and `None` (the default) renders
+      nothing at all — a run without `--hydration` produces byte-identical
+      reports.
 
 ## Conventions
 
