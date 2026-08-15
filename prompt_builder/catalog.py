@@ -83,7 +83,33 @@ class DocumentSpec(BaseModel):
     # Section-path substrings whose chunks the builder always injects (Phase 6);
     # stored as configuration here, unused until then.
     pinned_sections: list[str] = Field(default_factory=list)
+    # TOC-heading substrings to extract, case-insensitive; empty means the whole
+    # document. Applied *before* any page text is read, so a document whose
+    # relevant part is a small fraction of it costs a small fraction to index —
+    # which is what makes a 26,000-page reference usable at all. Requires a TOC:
+    # without one there is nothing to select on and the whole document is read.
+    include_sections: list[str] = Field(default_factory=list)
 
+
+#: TOC headings of ``azure-databricks.pdf`` worth indexing. That document is a
+#: full scrape of the Azure Databricks documentation — every page of it, product
+#: tours and release notes included — and only the reference material bears on
+#: translating SAS. Without this filter the whole thing is extracted; with it,
+#: the load is a fraction of the pages and the retrieved chunks are all
+#: migration-relevant rather than being drowned by tutorials.
+_AZURE_DATABRICKS_SECTIONS: tuple[str, ...] = (
+    "SQL language reference",
+    "Unity Catalog",
+    "Volumes",
+    "Lakehouse Federation",
+    "Auto Loader",
+    "COPY INTO",
+    "Delta Lake",
+    "Ingest data",
+    "Connect to data sources",
+    "Data types",
+    "Built-in functions",
+)
 
 # Bundled reference set. Section levels are pinned from each manual's TOC shape
 # (see the Phase-2 probe): the SAS manuals put one function/statement/PROC per
@@ -116,7 +142,24 @@ _DEFAULT_SPECS: tuple[tuple[str, str, DocRole, str, int | None], ...] = (
         "font",
         None,
     ),
+    # The target platform's own reference. "toc" rather than "auto" is load
+    # bearing: _AZURE_DATABRICKS_SECTIONS can only be applied against a table of
+    # contents, and this document is far too large to read without it.
+    (
+        "azure-databricks.pdf",
+        "azure_databricks",
+        DocRole.TARGET_GUIDE,
+        "toc",
+        3,
+    ),
 )
+
+#: Per-file :attr:`DocumentSpec.include_sections`, for the bundled documents that
+#: need one. A separate table rather than another column on ``_DEFAULT_SPECS``
+#: because exactly one document is big enough to need it.
+_DEFAULT_INCLUDE_SECTIONS: dict[str, tuple[str, ...]] = {
+    "azure-databricks.pdf": _AZURE_DATABRICKS_SECTIONS,
+}
 
 
 def default_catalog(
@@ -149,6 +192,9 @@ def default_catalog(
                     role=role,
                     strategy=strategy,
                     section_level=level,
+                    include_sections=list(
+                        _DEFAULT_INCLUDE_SECTIONS.get(filename, ())
+                    ),
                 )
             )
         else:
@@ -258,6 +304,7 @@ class CorpusLoader:
             role=spec.role,
             strategy=spec.strategy,
             section_level=spec.section_level,
+            include_sections=spec.include_sections,
         )
         chunks = self.chunker.chunk(sections, role=spec.role)
         if summary.diagnostics:
@@ -350,6 +397,7 @@ class CorpusLoader:
             f"role={spec.role}",
             f"strategy={spec.strategy}",
             f"level={spec.section_level}",
+            f"include={'|'.join(spec.include_sections)}",
             f"reader={self.reader.min_body_ratio},{self.reader.max_heading_words},"
             f"{self.reader.header_footer_threshold},{self.reader.min_page_chars},"
             f"{self.reader.max_heading_search_pages}",
