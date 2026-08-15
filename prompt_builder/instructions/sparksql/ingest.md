@@ -27,6 +27,14 @@ an `INPUT` statement or informats, state the schema explicitly in the `CREATE
 TABLE` rather than inferring — a column that silently arrives as `STRING`
 instead of `DOUBLE` breaks every arithmetic downstream.
 
+⚠️ **A source that was hydrated ahead of the run needs no ingestion at all.**
+Where the data has already been copied into the lakehouse — a `LIBNAME` on a
+database engine, or a SAS library migrated as tables — the translation reads
+`<catalog>.<schema>.<table>` directly and emits **no** `COPY INTO` and no
+`read_files`. Emitting a load for data that is already there re-ingests it, and
+against `COPY INTO`'s idempotence tracking the two disagree about what has been
+loaded. Ingest only what the SAS itself reads from a *file*.
+
 `PROC EXPORT` writes a dataset out. Prefer leaving the data as a table and
 letting the consumer read it; where a file genuinely must be produced, write to
 a volume path. ⚠️ Spark writes a *directory* of part files, not one file — if
