@@ -65,6 +65,33 @@ dev        = ["pytest>=8", "pytest-cov", "ruff", "nbformat>=5.10", "matplotlib>=
 # Markdown table, and render_png returns None (with a log line) when matplotlib
 # is absent — the picture is a supplement, never the only copy.
 graph      = ["matplotlib>=3.8"]
+# data_hydration's drivers, one extra per system it reads. Every one is
+# optional and imported inside the function that needs it, because the module's
+# main job — PLANNING a load, which is what `complexity --hydration` and
+# `python -m data_hydration --dry-run` do — needs none of them. A deployment
+# that only reads Oracle must not have to install paramiko to get a plan.
+oracle     = ["oracledb>=2.4"]
+sftp       = ["paramiko>=3.4"]
+# Blob and Data Lake ship together: they share the ranged-read adapter in
+# data_hydration.rawio, and a lake path routinely resolves to either endpoint.
+adls       = ["azure-storage-file-datalake>=12.14", "azure-storage-blob>=12.19"]
+# Reads .sas7bdat without a SAS installation. pandas arrives with it, which is
+# also the container every source hands rows back in.
+sasdata    = ["pyreadstat>=1.2"]
+# A live SAS session. Needed ONLY for SPD Engine libraries, whose component
+# files have no open-source reader — see data_hydration/sources/sas_session.py.
+saspy      = ["saspy>=5.100"]
+# Everything above, for a deployment that hydrates from more than one system.
+# Note it does NOT include `spark`: writing the Delta table needs that too, and
+# a Databricks cluster already has it.
+hydration  = [
+    "oracledb>=2.4",
+    "paramiko>=3.4",
+    "azure-storage-file-datalake>=12.14",
+    "azure-storage-blob>=12.19",
+    "pyreadstat>=1.2",
+    "saspy>=5.100",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -93,6 +120,10 @@ include = [
     "target_language*",
     # Markdown -> PDF for both report surfaces. A leaf, like target_language.
     "reporting*",
+    # Imports app_config and nothing else in this repo (its chunker types are
+    # TYPE_CHECKING-only), and complexity imports it to report the plan — so it
+    # ships wherever complexity does. Its drivers are all optional extras.
+    "data_hydration*",
 ]
 
 [tool.setuptools]
@@ -122,6 +153,7 @@ source = [
     "xref",
     "reporting",
     "target_language",
+    "data_hydration",
 ]
 
 [tool.pytest.ini_options]
@@ -152,6 +184,7 @@ include = [
     "prompt_builder",
     "target_language",
     "validation",
+    "data_hydration",
     "main.py",
 ]
 exclude = ["**/build/**", "**/.venv/**", "**/__pycache__/**"]
