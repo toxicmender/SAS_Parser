@@ -1842,6 +1842,109 @@ class TestChunkTexts(unittest.TestCase):
         self.assertEqual(len(texts), sum(f.chunk_count for f in report.files))
 
 
+class TestHydrationReporting(unittest.TestCase):
+    """The hydration plan, rendered through the complexity report.
+
+    Two properties matter more than the formatting. First, that omitting the
+    plan changes nothing at all — the section is opt-in, and a run without
+    ``--hydration`` must produce the reports it always did. Second, that
+    building the plan for a report never opens a connection: ``complexity``
+    passes ``probe=None``, and the planner's purity is what makes a report
+    renderer safe to run anywhere.
+    """
+
+    _SAS = (
+        "libname edwprod oracle path=EDWPRO schema=accounts;\n"
+        "proc sql;\n"
+        "  create table work.a as select * from edwprod.customers;\n"
+        "quit;\n"
+    )
+
+    def setUp(self):
+        self.report, self.texts = _batched(load=self._SAS)
+        self.file = _file(self.report, "load.sas")
+        from data_hydration.config import HydrationConfig
+        from data_hydration.planner import build_corpus_plan
+
+        self.plan = build_corpus_plan(
+            {"load.sas": (_engine_refs(self._SAS), ())},
+            config=HydrationConfig(catalog="main", schema="staging"),
+            probe=None,
+        )
+
+    def test_without_a_plan_no_hydration_section_is_rendered(self):
+        text = render_file_report(self.file, texts=self.texts)
+        self.assertNotIn("## Hydration", text)
+
+    def test_omitting_the_plan_leaves_the_report_byte_identical(self):
+        self.assertEqual(
+            render_file_report(self.file, texts=self.texts),
+            render_file_report(self.file, texts=self.texts, hydration=None),
+        )
+
+    def test_the_per_file_section_names_the_target_table(self):
+        text = render_file_report(
+            self.file, texts=self.texts, hydration=self.plan
+        )
+        self.assertIn("## Hydration", text)
+        self.assertIn("main.staging.accounts", text)
+
+    def test_a_file_with_no_items_gets_no_section(self):
+        # The rule _path_lines and _dataset_lines already follow: an empty
+        # heading says nothing the absence does not.
+        from data_hydration.models import HydrationPlan
+
+        text = render_file_report(
+            self.file, texts=self.texts, hydration=HydrationPlan()
+        )
+        self.assertNotIn("## Hydration", text)
+
+    def test_the_corpus_summary_counts_tables_and_blockers(self):
+        text = render_overall_report(self.report, hydration=self.plan)
+        self.assertIn("## Hydration", text)
+        self.assertIn("Target tables", text)
+        self.assertIn(self.plan.run_date, text)
+
+    def test_the_corpus_summary_is_absent_without_a_plan(self):
+        self.assertEqual(
+            render_overall_report(self.report),
+            render_overall_report(self.report, hydration=None),
+        )
+
+    def test_an_unresolved_macro_is_flagged_for_the_operator(self):
+        from data_hydration.config import HydrationConfig
+        from data_hydration.planner import build_corpus_plan
+
+        plan = build_corpus_plan(
+            {
+                "load.sas": (
+                    _engine_refs(
+                        "libname e oracle path=P schema=s "
+                        'user="&u." pass="&p.";'
+                    ),
+                    (),
+                )
+            },
+            config=HydrationConfig(catalog="main", schema="staging"),
+        )
+        text = render_file_report(self.file, texts=self.texts, hydration=plan)
+        self.assertIn("**Needs operator input:**", text)
+
+    def test_the_path_section_names_a_libname_engine(self):
+        # spde and a plain directory are the same statement but not the same
+        # thing, so the engine has to be visible in the report too.
+        report, texts = _batched(load="libname raw spde '/data/spde';\n")
+        text = render_file_report(_file(report, "load.sas"), texts=texts)
+        self.assertIn("engine `spde`", text)
+
+
+def _engine_refs(source: str):
+    """The engine LIBNAMEs *source* declares, via the real chunker grammar."""
+    from chunker.paths import extract_engine_refs
+
+    return extract_engine_refs(source)
+
+
 class TestFileReport(unittest.TestCase):
     """Per-source-file reports print the SAS behind every verdict."""
 
