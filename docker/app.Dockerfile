@@ -38,11 +38,15 @@ WORKDIR /app
 # Dependencies first, project second: editing repo code must not re-resolve
 # ~600 MB of wheels. Every extra is installed — the point of this image is that
 # the optional imports (pyspark, hvac, msal, databricks-sdk, msgraph, sqlglot,
-# matplotlib) all resolve, exactly like the CI `types` job.
+# matplotlib, and data_hydration's drivers via `hydration`) all resolve, exactly
+# like the CI `types` job. `hydration` is also what makes
+# tests/test_data_hydration_delta.py runnable here — the Delta sink is the one
+# module that cannot be tested against a fake.
 COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --locked --no-install-project \
       --extra dev --extra spark --extra sql --extra graph \
-      --extra vault --extra azure --extra databricks --extra sharepoint
+      --extra vault --extra azure --extra databricks --extra sharepoint \
+      --extra hydration
 
 COPY . .
 
@@ -51,7 +55,8 @@ COPY . .
 # without a rebuild.
 RUN uv sync --locked \
       --extra dev --extra spark --extra sql --extra graph \
-      --extra vault --extra azure --extra databricks --extra sharepoint
+      --extra vault --extra azure --extra databricks --extra sharepoint \
+      --extra hydration
 
 # Spark ships inside the pyspark wheel; no separate distribution to install.
 # The `test -x` makes a wrong path a build failure rather than a runtime one.
