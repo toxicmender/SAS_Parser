@@ -81,6 +81,44 @@ def test_pyspark_pin_is_consistent_across_compose() -> None:
     )
 
 
+def test_dockerfile_extras_exist_in_pyproject() -> None:
+    """Every ``--extra`` the images install is a real extra.
+
+    Not a style check. ``uv sync`` **exits 2** on an extra that is not in
+    ``optional-dependencies`` — it does not warn and carry on — so one stale
+    flag stops the image building at all. ``--extra sql`` outlived sqlglot
+    becoming a core dependency and did exactly that, silently, because nothing
+    in the suite builds an image.
+    """
+    pyproject = tomllib.loads(PYPROJECT_PATH.read_text(encoding="utf-8"))
+    declared = set(pyproject["project"].get("optional-dependencies", {}))
+
+    for dockerfile in sorted(Path(REPO_ROOT / "docker").glob("*.Dockerfile")):
+        used = set(re.findall(r"--extra\s+([A-Za-z0-9_.-]+)", dockerfile.read_text()))
+        unknown = sorted(used - declared)
+        assert not unknown, (
+            f"{dockerfile.name} installs undeclared extra(s) {unknown}; "
+            f"pyproject.toml declares {sorted(declared)}. uv sync exits 2 on "
+            f"these, so the image cannot build."
+        )
+
+
+def test_ci_extras_exist_in_pyproject() -> None:
+    """The same check for the workflow, which shares the failure mode."""
+    workflow = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+    if not workflow.exists():  # pragma: no cover - defensive
+        pytest.skip("no ci.yml")
+    pyproject = tomllib.loads(PYPROJECT_PATH.read_text(encoding="utf-8"))
+    declared = set(pyproject["project"].get("optional-dependencies", {}))
+
+    used = set(re.findall(r"--extra\s+([A-Za-z0-9_.-]+)", workflow.read_text()))
+    unknown = sorted(used - declared)
+    assert not unknown, (
+        f"ci.yml installs undeclared extra(s) {unknown}; pyproject.toml "
+        f"declares {sorted(declared)}."
+    )
+
+
 def test_compose_python_satisfies_requires_python() -> None:
     """The images' Python is not below ``pyproject.toml``'s floor."""
     pyproject = tomllib.loads(PYPROJECT_PATH.read_text(encoding="utf-8"))

@@ -226,6 +226,91 @@ class TestSasIndexHint:
         assert _clustering_columns(item, {"region", "amount"}) == ("region",)
 
 
+class TestSasDatasetReader:
+    """The .sas7bdat reader, against a fake pyreadstat.
+
+    A fake and not a real file, because **no Python library can write a
+    .sas7bdat** — pyreadstat writes dta/por/sav/xport, pandas writes none, and
+    the format is proprietary so ReadStat only reads it. A real fixture would
+    have to be produced by SAS itself.
+
+    What matters is testable without one: that the planner's row range reaches
+    the reader as row_offset/row_limit. If it did not, every partition of a
+    partitioned load would read the whole dataset — the load would "succeed"
+    with N times the rows.
+    """
+
+    def _fake_pyreadstat(self, monkeypatch):
+        """Install a stub pyreadstat and return the kwargs recorder."""
+        import sys
+        import types
+
+        calls: list[dict] = []
+        module = types.ModuleType("pyreadstat")
+
+        class _Meta:
+            number_rows = 10
+            column_names = ["id", "region"]
+
+        def read_sas7bdat(path, **kwargs):
+            calls.append({"path": path, **kwargs})
+            if kwargs.get("metadataonly"):
+                return None, _Meta()
+            return [{"id": 1}], _Meta()
+
+        module.read_sas7bdat = read_sas7bdat  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "pyreadstat", module)
+        return calls
+
+    def _reader(self, partition=None):
+        from data_hydration.models import HydrationItem, HydrationSource
+        from data_hydration.sources.sas_files import SasDatasetReader
+
+        item = HydrationItem(
+            source=HydrationSource(
+                kind=SourceKind.SAS_DATASET, locator="/data", object_name="sales"
+            ),
+            target_table="main.s.sales",
+            partition=partition,
+        )
+        return SasDatasetReader(item, _config())
+
+    def test_an_unpartitioned_read_passes_no_row_bounds(self, monkeypatch):
+        calls = self._fake_pyreadstat(monkeypatch)
+        list(self._reader().batches())
+        assert "row_offset" not in calls[0]
+        assert "row_limit" not in calls[0]
+
+    def test_a_row_range_partition_becomes_offset_and_limit(self, monkeypatch):
+        from data_hydration.models import Partition
+
+        calls = self._fake_pyreadstat(monkeypatch)
+        list(self._reader(Partition(name="r", row_offset=4, row_limit=6)).batches())
+        assert calls[0]["row_offset"] == 4
+        assert calls[0]["row_limit"] == 6
+
+    def test_info_reads_the_header_only(self, monkeypatch):
+        # metadataonly is what makes probing a 40 GB dataset free; without it
+        # planning would read every row of every source.
+        calls = self._fake_pyreadstat(monkeypatch)
+        info = self._reader().info()
+        assert calls[0]["metadataonly"] is True
+        assert info.rows == 10
+        assert info.columns == ("id", "region")
+
+    def test_the_path_is_the_dataset_not_the_directory(self, monkeypatch):
+        calls = self._fake_pyreadstat(monkeypatch)
+        self._reader().info()
+        assert calls[0]["path"].replace("\\", "/").endswith("/data/sales.sas7bdat")
+
+    def test_a_missing_driver_names_the_extra_to_install(self, monkeypatch):
+        import sys
+
+        monkeypatch.setitem(sys.modules, "pyreadstat", None)
+        with pytest.raises(ImportError, match="sasdata"):
+            self._reader().info()
+
+
 class TestTargetNaming:
     def test_the_schema_defaults_to_the_libref(self):
         plan = build_plan(

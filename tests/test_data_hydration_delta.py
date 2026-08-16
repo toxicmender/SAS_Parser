@@ -24,6 +24,15 @@ What is pinned, and why each one would fail silently otherwise:
 * **Clustering is intersected with real columns.** Index-column recovery from a
   ``.sas7bndx`` is best-effort, so a guessed name must never reach
   ``ALTER TABLE ... CLUSTER BY``.
+
+Sources are CSV throughout, deliberately. There is **no way to write a
+``.sas7bdat`` from Python** — pyreadstat writes ``dta``/``por``/``sav``/``xport``
+and pandas writes none, because the format is proprietary and ReadStat only
+reads it. An end-to-end SAS-dataset test would need a fixture produced by SAS
+itself. What is testable about that reader is that it forwards the planner's
+row range, and that is pinned with a fake pyreadstat in
+``test_data_hydration.py`` — no Spark required. The sink is what needed a real
+session, and it does not care which reader fed it.
 """
 
 from __future__ import annotations
@@ -78,7 +87,15 @@ def sink(delta_spark, monkeypatch, tmp_path):
 
     yield _Sink()
     for table in created:
-        delta_spark.sql(f"DROP TABLE IF EXISTS {table}")
+        # Tolerant by design: a table is registered before the write is
+        # attempted, so this list includes names whose write failed on purpose
+        # (the missing-catalog test). `IF EXISTS` does not help there — the
+        # name itself is unresolvable — and a teardown that raised would turn
+        # a passing test into an error.
+        try:
+            delta_spark.sql(f"DROP TABLE IF EXISTS {table}")
+        except Exception:
+            pass
 
 
 def _config(tmp_path, **overrides) -> HydrationConfig:
@@ -325,58 +342,3 @@ class TestThroughTheRunner:
         assert not report.ok
         assert report.outcomes[0].status is ItemStatus.FAILED
         assert "FileNotFoundError" in (report.outcomes[0].error or "")
-
-
-class TestSasDataset:
-    """The .sas7bdat path, which needs pyreadstat as well as Spark."""
-
-    def test_a_sas_dataset_lands_as_a_table(self, sink, tmp_path):
-        pyreadstat = pytest.importorskip("pyreadstat")
-        import pandas as pd
-
-        frame = pd.DataFrame({"id": [1, 2, 3], "region": ["n", "s", "e"]})
-        pyreadstat.write_sas7bdat(frame, str(tmp_path / "sales.sas7bdat"))
-
-        source = HydrationSource(
-            kind=SourceKind.SAS_DATASET,
-            locator=str(tmp_path),
-            object_name="sales",
-        )
-        table = f"{CATALOG}.{SCHEMA}.sas_dataset_check"
-        rows = sink.write(_item(source, table))
-
-        assert rows == 3
-        assert sink.rows(table) == 3
-        assert "region" in sink.columns(table)
-
-    def test_a_row_range_partition_writes_only_its_slice(self, sink, tmp_path):
-        pyreadstat = pytest.importorskip("pyreadstat")
-        import pandas as pd
-
-        from data_hydration.models import Partition
-
-        pyreadstat.write_sas7bdat(
-            pd.DataFrame({"id": list(range(10))}), str(tmp_path / "big.sas7bdat")
-        )
-        source = HydrationSource(
-            kind=SourceKind.SAS_DATASET, locator=str(tmp_path), object_name="big"
-        )
-        table = f"{CATALOG}.{SCHEMA}.row_range_check"
-
-        sink.write(
-            _item(
-                source,
-                table,
-                partition=Partition(name="rows_0_4", row_offset=0, row_limit=4),
-            )
-        )
-        sink.write(
-            _item(
-                source,
-                table,
-                write_mode=WriteMode.APPEND,
-                partition=Partition(name="rows_4_10", row_offset=4, row_limit=6),
-            )
-        )
-
-        assert sink.rows(table) == 10
