@@ -16,8 +16,10 @@ layers, each usable on its own:
    independent singletons are the only units prompted — and, with
    token-budgeted packing (on by default; `max_merged_tokens`, `0` to
    disable), adjacent small items share a call as `packed-NNN` batches
-   under a prompt-cost budget. The deliverable is a
-   **notebook** — one `.ipynb` per SAS source file (`pipeline.notebook`) —
+   under a prompt-cost budget. The deliverables are a
+   **notebook** — one `.ipynb` per SAS source file (`pipeline.notebook`) — and
+   one effective-prompt Markdown artifact per accepted model call
+   (`pipeline.artifacts`, under `prompts/`) —
    because the output is code and code should be runnable. Multi-source
    batches split back per file via per-cell `chunk_id` attribution (the
    structured prompt asks for it; all-or-nothing per item, falling back to
@@ -838,7 +840,10 @@ any of these silently changes behavior.
    is set, its SystemMessage is prepended after trimming/selection and its
    state lives under the KV `summary::` key. Both are re-derivable, would
    bloat the O(n) history, and must stay out of
-   `RelevantHistorySelector`'s scoring. A third kind joins them: (c)
+   `RelevantHistorySelector`'s scoring. This is a conversation-memory
+   invariant, not a ban on audit output: the final formatted role/content
+   message list is captured at the LLM-client boundary and written as an
+   explicit run artifact under `prompts/`. A third kind joins them: (c)
    short-term **thread notes** — when a `thread_memory` is set, its live
    notes for the thread are appended to the same `instructions` list — so
    *stored = the item message; prompted = policy (in the system block) +

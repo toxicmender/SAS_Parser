@@ -21,7 +21,7 @@ from typing import Any
 from app_config.sharepoint import SharePointConfig, resolve_client, upload_into
 from target_language import resolve_target_language
 
-from .paths import upload_target, validation
+from .paths import prompt_target, upload_target, validation
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +53,10 @@ def set_file_extension(file_name: str, file_type: str) -> str:
     a way that only shows up in the library listing.
     """
     extension = FILE_EXTENSIONS.get(file_type.strip().lower(), DEFAULT_EXTENSION)
-    stem = file_name.strip().rsplit(".", 1)[0] if "." in file_name.strip() else (
-        file_name.strip()
+    stem = (
+        file_name.strip().rsplit(".", 1)[0]
+        if "." in file_name.strip()
+        else (file_name.strip())
     )
     return f"{stem or 'output'}.{extension}"
 
@@ -97,11 +99,29 @@ def upload_converted_script(
     kind = file_type.strip().lower()
     folder = upload_target(application, model, timestamp, config=config)
     name = set_file_extension(file_name, kind)
-    contents = _as_notebook(file_contents, kind) if kind in NOTEBOOK_TYPES else (
-        file_contents
+    contents = (
+        _as_notebook(file_contents, kind) if kind in NOTEBOOK_TYPES else (file_contents)
     )
     path = upload_into(resolve_client(client), folder, name, contents)
     logger.info(f"upload_converted_script: wrote {path!r} ({kind})")
+    return path
+
+
+def upload_prompt_file(
+    application: str,
+    file_name: str,
+    file_contents: str,
+    model: str,
+    timestamp: str,
+    *,
+    client: Any | None = None,
+    config: SharePointConfig | None = None,
+) -> str:
+    """Upload one effective prompt under the run's ``prompts`` folder."""
+    folder = prompt_target(application, model, timestamp, config=config)
+    name = file_name if file_name.lower().endswith(".md") else f"{file_name}.md"
+    path = upload_into(resolve_client(client), folder, name, file_contents)
+    logger.info(f"upload_prompt_file: wrote {path!r}")
     return path
 
 

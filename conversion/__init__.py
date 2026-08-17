@@ -5,9 +5,11 @@ from __future__ import annotations
 from .paths import (
     converted_scripts,
     original_scripts,
+    prompt_target,
     upload_target,
     validation,
 )
+
 # Keep ``requests`` module-qualified to avoid shadowing ``conversion.requests``.
 from .requests import (
     ConversionItem,
@@ -20,7 +22,11 @@ from .requests import (
 )
 from .run import RunOutcome, model_for, run_request, select_requests, utc_stamp
 from .sources import load, source_files
-from .upload import upload_converted_script, upload_validation_file
+from .upload import (
+    upload_converted_script,
+    upload_prompt_file,
+    upload_validation_file,
+)
 
 __all__ = [
     "ConversionItem",
@@ -33,12 +39,14 @@ __all__ = [
     "load",
     "model_for",
     "original_scripts",
+    "prompt_target",
     "pending_requests",
     "run_request",
     "select_requests",
     "source_files",
     "update_request_status",
     "upload_converted_script",
+    "upload_prompt_file",
     "upload_target",
     "upload_validation_file",
     "utc_stamp",
