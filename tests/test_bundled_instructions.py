@@ -286,3 +286,19 @@ def test_pyspark_slice_is_scoped_to_pyspark(bundled):
         if c.doc_id.startswith("pyspark_") and "pyspark" not in langs_of(c)
     ]
     assert unscoped == [], f"pyspark sections not scoped to PySpark: {unscoped}"
+
+
+def test_proc_cas_guidance_exists_for_both_targets(bundled):
+    cas = [
+        chunk
+        for chunk in bundled.chunks
+        if any(
+            key.kind == "proc" and key.name == "cas"
+            for key in chunk.construct_keys
+        )
+    ]
+    assert {lang for chunk in cas for lang in langs_of(chunk)} == {
+        "pyspark",
+        "sparksql",
+    }
+    assert all("PROC_STEP" in kinds_of(chunk) for chunk in cas)

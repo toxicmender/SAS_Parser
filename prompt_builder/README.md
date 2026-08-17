@@ -68,6 +68,20 @@ caches to `.prompt_builder_cache/` (also gitignored); later loads are ~50×
 faster. To index a document not in the default set, build a `DocumentSpec` for
 it and pass it via `PromptBuilder.from_specs`.
 
+The bundled catalog covers the local SAS programmer's guide, DATA-step
+statements, functions and CALL routines, formats and informats, global
+statements, macro language, procedures, component objects, FedSQL, metadata
+interfaces, and the Base reference sheet. It also covers the Spark excerpt and
+selects only migration-relevant TOC sections from the much larger Azure
+Databricks reference.
+
+The coverage taxonomy is checked against SAS's programming-documentation
+indexes: [language elements by name, product, and category](https://documentation.sas.com/doc/en/pgmsascdc/9.4_3.5/allprodsle/titlepage.htm),
+[procedures by name and product](https://documentation.sas.com/doc/en/pgmsascdc/9.4_3.5/allprodsproc/procedures.htm),
+and [CAS actions and action sets by name and product](https://documentation.sas.com/doc/en/pgmsascdc/9.4_3.5/allprodsactions/actionsByName.htm).
+These indexes define what must be recognised; the local PDFs supply the text
+retrieved into an item's runtime prompt.
+
 ## PdfReader
 
 ```python
