@@ -25,6 +25,14 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
+      - name: Check v2 architecture boundaries
+        run: python scripts/check_v2_architecture.py
+
+      - name: Import v2 core with core dependencies only
+        run: >
+          uv run --isolated --no-project --with "pydantic>=2.13.4"
+          python scripts/smoke_v2_core.py
+
       # Build from the checkout, then install into an environment outside it.
       # Repo-root imports can hide packages and data omitted from a wheel.
       - name: Build wheel

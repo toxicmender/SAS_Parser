@@ -17,6 +17,8 @@ import sys
 REPOSITORY_ROOT = pathlib.Path(__file__).resolve().parents[1]
 REQUIRED_MODULES = (
     "main",
+    "sas_migrate",
+    "sas_migrate.core",
     "pipeline",
     "prompt_builder",
     "complexity",
@@ -32,6 +34,7 @@ REQUIRED_DISTRIBUTION_FILES = (
     "prompt_builder/instructions/_common/source_fidelity.md",
     "prompt_builder/instructions/pyspark/overview.md",
     "prompt_builder/instructions/sparksql/overview.md",
+    "sas_migrate/resources/contracts/schema-v2.json",
 )
 
 
@@ -85,6 +88,20 @@ def main() -> int:
         )
     if "sas-parser" not in help_result.stdout.lower():
         raise RuntimeError("installed CLI help did not identify sas-parser")
+
+    v2_help_result = subprocess.run(
+        [sys.executable, "-m", "sas_migrate.cli", "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if v2_help_result.returncode != 0:
+        raise RuntimeError(
+            "installed v2 CLI failed: "
+            f"stdout={v2_help_result.stdout!r}, stderr={v2_help_result.stderr!r}"
+        )
+    if "sas-migrate" not in v2_help_result.stdout.lower():
+        raise RuntimeError("installed v2 CLI help did not identify sas-migrate")
 
     print(
         f"installed-wheel smoke passed for sas-parser {distribution.version} "
