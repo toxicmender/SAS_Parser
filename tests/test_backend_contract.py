@@ -274,3 +274,62 @@ class TestDeltaContract(KVStoreContract):
         table = f"default.kv_contract_{uuid.uuid4().hex[:10]}"
         self._tables.append(table)
         return KVStore(spark=self._spark, table=table)
+
+    # ---- Change Data Feed setup -------------------------------------------
+
+    def test_a_new_table_gets_cdf_without_a_second_write(self):
+        """The CREATE enables CDF; the ALTER must not re-issue it.
+
+        Not a micro-optimisation. ``ALTER TABLE ... SET TBLPROPERTIES`` reaches
+        catalyst internals that a delta-spark built against an older Spark minor
+        cannot resolve, so re-setting a property the CREATE had already set made
+        every test in this class fail on a pairing where the backend otherwise
+        works perfectly. Issuing it only when the property is genuinely absent
+        is what keeps a fresh table off that code path.
+        """
+        store = self.make_store()
+        backend = store._backend  # the Delta backend under test
+
+        properties = {
+            row["key"]: row["value"]
+            for row in self._spark.sql(
+                f"SHOW TBLPROPERTIES {backend._table}"
+            ).collect()
+        }
+        assert properties.get("delta.enableChangeDataFeed") == "true"
+        assert backend._cdf_enabled() is True
+
+    def test_cdf_is_re_enabled_when_a_table_lacks_it(self):
+        """The upgrade path the ALTER exists for still works.
+
+        A table created without CDF — what a deployment predating it has — must
+        still get the property when the backend opens it. Skipped, not failed,
+        where the pairing cannot write properties at all: that is the known
+        limitation ``docker/spark/warmup.py`` warns about, and it is a
+        different defect from the one this test guards.
+        """
+        table = f"default.kv_precdf_{uuid.uuid4().hex[:10]}"
+        self._tables.append(table)
+        self._spark.sql(
+            f"CREATE TABLE {table} ("
+            " kv_key STRING NOT NULL, value STRING NOT NULL, tags STRING,"
+            " created_at DOUBLE, updated_at DOUBLE, source STRING"
+            ") USING DELTA"
+        )
+        try:
+            self._spark.sql(
+                f"ALTER TABLE {table} SET TBLPROPERTIES "
+                "('delta.enableChangeDataFeed' = 'true')"
+            )
+        except Exception as exc:
+            pytest.skip(
+                f"this pyspark/delta-spark pair cannot write table properties "
+                f"({type(exc).__name__}); the upgrade path is unavailable here"
+            )
+        self._spark.sql(
+            f"ALTER TABLE {table} UNSET TBLPROPERTIES "
+            "('delta.enableChangeDataFeed')"
+        )
+
+        store = KVStore(spark=self._spark, table=table)
+        assert store._backend._cdf_enabled() is True
