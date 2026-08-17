@@ -340,12 +340,44 @@ class _DeltaBackend:
         # CDF must be enabled explicitly for upgraded deployments. CDF only
         # captures writes after this point; startup validation makes that
         # boundary visible instead of silently running without coherence.
-        self._spark.sql(
-            f"ALTER TABLE {self._table} SET TBLPROPERTIES "
-            "('delta.enableChangeDataFeed' = 'true')"
-        )
+        #
+        # Only when it is actually missing, though. The CREATE above already
+        # sets the property on a table it creates, so on every fresh table this
+        # ALTER re-set a value that was already correct — and it is the one
+        # statement here that a delta-spark built against an older Spark cannot
+        # execute (ClassNotFoundException on an internal catalyst class), which
+        # made the whole Delta backend unusable for a write it never needed to
+        # issue. Reading first costs one metadata query per startup.
+        if not self._cdf_enabled():
+            self._spark.sql(
+                f"ALTER TABLE {self._table} SET TBLPROPERTIES "
+                "('delta.enableChangeDataFeed' = 'true')"
+            )
         self._migrate_schema()
         self._validate_schema()
+
+    def _cdf_enabled(self) -> bool:
+        """Whether the table already has Change Data Feed turned on.
+
+        Read through ``SHOW TBLPROPERTIES``, which reports the properties as
+        rows. A table that cannot be interrogated returns ``False`` so the
+        caller still attempts the ALTER: the failure mode to avoid is silently
+        *skipping* the upgrade, not attempting it once too often.
+        """
+        try:
+            rows = self._spark.sql(
+                f"SHOW TBLPROPERTIES {self._table}"
+            ).collect()
+        except Exception as exc:  # pragma: no cover - depends on the backend
+            logger.debug(
+                f"_cdf_enabled: could not read properties of {self._table_name}: "
+                f"{exc}"
+            )
+            return False
+        for row in rows:
+            if row["key"] == "delta.enableChangeDataFeed":
+                return str(row["value"]).strip().lower() == "true"
+        return False
 
     def _migrate_schema(self) -> None:
         """Apply safe additive migrations to legacy memory tables.
