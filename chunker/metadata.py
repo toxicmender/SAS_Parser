@@ -27,8 +27,15 @@ from .keywords import (
     _SAS_SUBSETTING_IF_RE,
     _SAS_SUM_STATEMENT_RE,
 )
-from .models import SasChunkKind, SasChunkMetadata, SasPathRef, _path_ref_sort_key
-from .paths import extract_paths
+from .models import (
+    SasChunkKind,
+    SasChunkMetadata,
+    SasEngineRef,
+    SasPathRef,
+    _engine_ref_sort_key,
+    _path_ref_sort_key,
+)
+from .paths import extract_engine_refs, extract_paths
 from .scanner import _blank_span, _sanitise
 
 logger = logging.getLogger(__name__)
@@ -446,6 +453,9 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
     # Every external reference the chunk names — see chunker/paths.py, which
     # owns the grammar this and xref.pre both read.
     external_refs = extract_paths(cf)
+    # The other half of that grammar: LIBNAMEs bound to a database engine, which
+    # name a connection rather than a place and so match none of PATH_STATEMENTS.
+    engine_refs = extract_engine_refs(cf)
     # ``includes`` is the %INCLUDE slice of that same scan rather than a second
     # definition of where an include path lives. It keeps its list[str] shape
     # and its consumers (complexity.crossfile, the [meta: includes] flag).
@@ -641,6 +651,7 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
         symput_scope_hazard=hazard,
         symput_hazard_vars=sorted(set(hazard_vars)),
         external_refs=external_refs,
+        engine_refs=engine_refs,
     )
 
 
@@ -666,6 +677,8 @@ def _merge_meta(parent: SasChunkMetadata, child: SasChunkMetadata) -> SasChunkMe
     - ``list[SasPathRef]`` → union of both sides, ordered by
       :func:`~chunker.models._path_ref_sort_key` (the records are frozen, so a
       set deduplicates them; the sort is what keeps output reproducible);
+    - ``list[SasEngineRef]`` → the same rule under
+      :func:`~chunker.models._engine_ref_sort_key`;
     - ``bool``        → OR (a flag raised anywhere in the region stays raised);
     - ``str | None``  → child's value, falling back to the parent's (the
       child is the more specific view of its own slice);
@@ -687,6 +700,8 @@ def _merge_meta(parent: SasChunkMetadata, child: SasChunkMetadata) -> SasChunkMe
             merged[name] = sorted({*p, *c})
         elif field.annotation == list[SasPathRef]:
             merged[name] = sorted({*p, *c}, key=_path_ref_sort_key)
+        elif field.annotation == list[SasEngineRef]:
+            merged[name] = sorted({*p, *c}, key=_engine_ref_sort_key)
         elif field.annotation is bool:
             merged[name] = p or c
         elif field.annotation == (str | None):

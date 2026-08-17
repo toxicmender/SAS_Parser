@@ -41,8 +41,10 @@ jobs:
           cache-dependency-glob: uv.lock
 
       # All extras so optional imports (pyspark, msal, hvac, delta,
-      # databricks, databricks-langchain, msgraph-sdk, ...) resolve; otherwise pyright reports them
-      # as missing and the counts drift from a local run. [tool.pyright]
+      # databricks, databricks-langchain, msgraph-sdk, oracledb, paramiko,
+      # pyreadstat, saspy, azure-storage-*, ...) resolve; otherwise pyright
+      # reports them as missing and the counts drift from a local run.
+      # `hydration` is the bundle of data_hydration's drivers. [tool.pyright]
       # points pyright at this .venv. The LLM client (langchain-openai) is a
       # core dependency now — every model is reached over the gateway's
       # OpenAI-compatible API — so there is no anthropic/openai extra to add.
@@ -51,7 +53,7 @@ jobs:
           uv sync --locked
           --extra dev --extra spark
           --extra vault --extra azure --extra databricks --extra databricks-ai
-          --extra sharepoint
+          --extra sharepoint --extra hydration
 
       # Pinned like ruff so local and CI agree on the exact diagnostics.
       # Pyright returns nonzero for every diagnostic.  The ratchet below is

@@ -33,7 +33,7 @@ import re
 # below, not only as an annotation.
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from chunker.models import (
     SasBatch,
@@ -52,6 +52,9 @@ from .models import (
     SasPathRef,
 )
 from .naming import resolve_name
+
+if TYPE_CHECKING:  # the real type for a checker, no import at run time
+    from data_hydration.models import HydrationPlan as _HydrationPlan  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -253,11 +256,53 @@ def _fmt_path_ref(ref: SasPathRef) -> str:
         parts.append(f"`{ref.binds}`")
     if ref.device:
         parts.append(f"via {ref.device}")
+    if ref.engine:
+        # An engine changes what the directory *is* — an `spde` library is
+        # partitioned storage, not a folder of datasets — so it belongs next to
+        # the path rather than being left for the reader to infer.
+        parts.append(f"engine `{ref.engine}`")
     if ref.has_macro_ref:
         # The one thing a reader must not miss: this value is not what SAS
         # resolves at run time, so it cannot be mapped as written.
         parts.append("**(unresolved macro reference)**")
     return " ".join(parts)
+
+
+def _hydration_lines(file: FileComplexity, plan: Any | None) -> list[str]:
+    """What hydrating this file's sources would do, or nothing without a plan.
+
+    *plan* is a :class:`data_hydration.models.HydrationPlan`, passed in by the
+    caller rather than stored on :class:`FileComplexity`: a stored field would
+    make :mod:`complexity.models` import :mod:`data_hydration` at module scope
+    and turn an optional capability into a hard dependency of a shipped package.
+    It is typed loosely here for the same reason — this module must not import
+    that one.
+
+    ``None`` (the default everywhere) renders nothing, so a report built without
+    ``--hydration`` is byte-identical to one from before this existed. A file
+    that hydrates nothing gets no heading either, the rule
+    :func:`_path_lines` and :func:`_dataset_lines` already follow.
+    """
+    if plan is None:
+        return []
+    items = plan.by_source_id(file.source_id)
+    if not items:
+        return []
+    lines = ["", "## Hydration", ""]
+    for item in items:
+        target = f"`{item.target_table}`"
+        lines.append(f"- {item.source} -> {target}")
+        detail = f"  - {item.strategy}"
+        if item.partition:
+            detail += f" — partition `{item.partition}`"
+        lines.append(f"{detail}: {item.strategy_reason}")
+        for note in item.notes:
+            lines.append(f"  - {note}")
+        for blocker in item.blockers:
+            # Bolded for the same reason an unresolved macro is bolded above:
+            # it is the line that decides whether this can run unattended.
+            lines.append(f"  - **Needs operator input:** {blocker}")
+    return lines
 
 
 def _cross_file_lines(
@@ -322,6 +367,7 @@ def render_file_report(
     max_source_lines: int = 0,
     overall_link: str | None = None,
     names: Mapping[str, str] | None = None,
+    hydration: Any | None = None,
 ) -> str:
     """Render one source file's own complexity report as Markdown.
 
@@ -338,6 +384,10 @@ def render_file_report(
     is coupled to; without one each falls back to its own file name. The full
     path is still printed once, under the title, since this report is the one
     place a reader may want to know where the file actually lives.
+
+    *hydration* is an optional ``data_hydration.HydrationPlan``; when given, the
+    loads this file's sources imply are printed after its paths. See
+    :func:`_hydration_lines`.
     """
     lines = [
         f"# Complexity report — {resolve_name(file.source_id, names)}",
@@ -400,6 +450,9 @@ def render_file_report(
     # writes.
     lines += _dataset_lines(file)
     lines += _path_lines(file)
+    # After the paths, because a hydration item is an answer to one of them: the
+    # reader has just seen what the file reaches, and this says what becomes of it.
+    lines += _hydration_lines(file, hydration)
     lines += _cross_file_lines(file, names)
 
     lines += ["", f"## Drivers ({len(file.signals)})", ""]
@@ -474,12 +527,43 @@ def _chunk_section(
 # ---------------------------------------------------------------------------
 
 
+def _hydration_summary(plan: Any | None) -> list[str]:
+    """The corpus-wide ingestion surface, or nothing without a plan.
+
+    The number an operator wants before signing off a migration: how many tables
+    move, how much of it is partitioned, and how much still needs a human.
+    """
+    if plan is None or not plan.items:
+        return []
+    kinds = ", ".join(f"{kind} ({count})" for kind, count in plan.counts_by_kind().items())
+    partitioned = sum(1 for item in plan.items if item.partition is not None)
+    lines = [
+        "",
+        "## Hydration",
+        "",
+        f"- Target tables: **{len(plan.target_tables)}** "
+        f"from {len(plan.items)} load item(s)",
+        f"- Sources: {kinds}",
+        f"- Partitioned items: {partitioned}",
+        f"- Run date stamped into target names: `{plan.run_date}`",
+    ]
+    if plan.blocked_count:
+        lines.append(
+            f"- ⚠️ **{plan.blocked_count} item(s) need operator input** before "
+            f"they can run — see the per-file reports."
+        )
+    else:
+        lines.append("- Every item can run unattended.")
+    return lines
+
+
 def render_overall_report(
     report: CorpusComplexityReport,
     *,
     top: int = 10,
     file_links: Mapping[str, str] | None = None,
     graph_image: str | None = None,
+    hydration: Any | None = None,
 ) -> str:
     """The corpus report, with an index of the individual reports appended.
 
@@ -489,8 +573,14 @@ def render_overall_report(
 
     *graph_image* is passed straight through: a path to a rendered dependency
     graph, relative to where this Markdown will be written.
+
+    *hydration* is an optional ``data_hydration.HydrationPlan``, summarised
+    before the file index. ``None`` renders nothing at all.
     """
     body = report.to_markdown(top=top, graph_image=graph_image)
+    summary = _hydration_summary(hydration)
+    if summary:
+        body = body.rstrip() + "\n" + "\n".join(summary) + "\n"
     if not file_links:
         return body
 
@@ -595,6 +685,7 @@ def write_reports(
     max_source_lines: int = 0,
     overall_name: str = OVERALL_REPORT_NAME,
     graph_image: bool = True,
+    hydration: Any | None = None,
 ) -> WrittenReports:
     """Write the overall report and one report per source file under *out_dir*.
 
@@ -605,6 +696,10 @@ def write_reports(
     ``out_dir/dependency-graph.png`` and linked from the overall report — when
     matplotlib is installed and there is a graph to draw. The report's edge
     table is written either way.
+
+    *hydration* is an optional ``data_hydration.HydrationPlan``: summarised in
+    the overall report and broken down per file. Omitting it (the default)
+    leaves every report exactly as it was before hydration existed.
     """
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=True)
@@ -627,6 +722,7 @@ def write_reports(
                 max_source_lines=max_source_lines,
                 overall_link=f"../{overall_name}",
                 names=names,
+                hydration=hydration,
             ),
             encoding="utf-8",
         )
@@ -658,6 +754,7 @@ def write_reports(
             graph_image=(
                 drawn.relative_to(directory).as_posix() if drawn else None
             ),
+            hydration=hydration,
         ),
         encoding="utf-8",
     )

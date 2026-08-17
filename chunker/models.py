@@ -97,6 +97,13 @@ class SasPathRef(BaseModel, frozen=True):
         The libref or fileref the statement assigns, when it assigns one.
     device
         The device keyword as written, when there was one.
+    engine
+        The LIBNAME engine as written, when the statement named one —
+        ``spde``, ``xport``, ``v9``, ... An engine changes what the quoted
+        directory *is*: ``libname x spde '/p'`` is a partitioned SPD Engine
+        library, not the ordinary directory ``libname x '/p'`` names, and
+        nothing downstream could tell them apart while this went unrecorded.
+        Engines that carry no path at all are :class:`SasEngineRef` instead.
     has_macro_ref
         The value contains a ``&`` reference, so its real value is not knowable
         without running SAS. Recorded rather than dropped: a path that cannot be
@@ -109,11 +116,13 @@ class SasPathRef(BaseModel, frozen=True):
     raw: str
     binds: str | None = None
     device: str | None = None
+    engine: str | None = None
     has_macro_ref: bool = False
 
     def __str__(self) -> str:
         bound = f" {self.binds}" if self.binds else ""
-        return f"{self.statement}{bound} [{self.location}] {self.raw}"
+        via = f" via {self.engine}" if self.engine else ""
+        return f"{self.statement}{bound}{via} [{self.location}] {self.raw}"
 
 
 def _path_ref_sort_key(ref: SasPathRef) -> tuple[str, str, str, str]:
@@ -125,6 +134,77 @@ def _path_ref_sort_key(ref: SasPathRef) -> tuple[str, str, str, str]:
     and batch output is pinned by tests (invariant 9).
     """
     return (str(ref.location), ref.statement, ref.path, ref.binds or "")
+
+
+class SasEngineRef(BaseModel, frozen=True):
+    """A ``LIBNAME`` bound to a database engine, with its connection options.
+
+    The sibling of :class:`SasPathRef`, for the LIBNAME form that names no path
+    at all::
+
+        libname edwprod oracle path=EDWPRO_READ_ONLY schema=fr_dm_pro
+                               user="&username." pass="&user_pass.";
+
+    That statement has no quoted directory, so :data:`chunker.paths.PATH_STATEMENTS`
+    — every entry of which ends in a quoted value — never matched it, and the
+    connection a migration has to reproduce went unrecorded. It is a *foreign
+    system*, not a place: whether it is federated or copied into the lakehouse is
+    a decision somebody makes downstream, and this records what the SAS declared
+    so that decision can be made at all.
+
+    Frozen so it is hashable, for the same reason :class:`SasPathRef` is —
+    ``_merge_meta`` merges the containing list by set union.
+
+    Attributes
+    ----------
+    engine
+        The engine keyword, lowercased: ``oracle``, ``odbc``, ``teradata``, ...
+        One of :data:`chunker.paths.ENGINE_LIBNAMES`.
+    binds
+        The libref the statement assigns, lowercased. Always present — a LIBNAME
+        without one does not parse.
+    options
+        The statement's ``key=value`` options, keys lowercased and values exactly
+        as written. A tuple of pairs rather than a ``dict`` because this model is
+        frozen *and hashable*, which a dict field would break; use
+        :attr:`option_map` to read it.
+
+        Values are **not** resolved: ``user="&username."`` is stored with the
+        macro reference intact. Credentials are the hydrating consumer's problem,
+        and the chunker has no way to resolve a macro variable anyway.
+    has_macro_ref
+        Some option value contains a ``&`` reference, so the connection is not
+        fully knowable without running SAS. Same meaning as the flag of the same
+        name on :class:`SasPathRef`.
+    raw
+        The statement as written, whitespace-collapsed — what a human needs to
+        recognise it in their own source.
+    """
+
+    engine: str
+    binds: str
+    options: tuple[tuple[str, str], ...] = ()
+    has_macro_ref: bool = False
+    raw: str = ""
+
+    @property
+    def option_map(self) -> dict[str, str]:
+        """:attr:`options` as a mapping. Later duplicates win, as SAS does."""
+        return dict(self.options)
+
+    def __str__(self) -> str:
+        opts = " ".join(f"{k}={v}" for k, v in self.options)
+        return f"libname {self.binds} {self.engine}{' ' + opts if opts else ''}"
+
+
+def _engine_ref_sort_key(ref: SasEngineRef) -> tuple[str, str]:
+    """Total order over :class:`SasEngineRef`, defined once.
+
+    The counterpart of :func:`_path_ref_sort_key`, and it exists for the same
+    reason: ``_merge_meta`` and :attr:`SasBatch.engine_refs` both deduplicate
+    through a set, whose iteration order is not stable across runs.
+    """
+    return (ref.engine, ref.binds)
 
 
 class SasDiagnostic(BaseModel):
@@ -227,6 +307,12 @@ class SasChunkMetadata(BaseModel):
     # there is one scan to keep correct and one merge rule to keep honest; the
     # per-kind views below are computed from it.
     external_refs: list[SasPathRef] = Field(default_factory=list)
+
+    # Database-engine LIBNAMEs — see :class:`SasEngineRef`. Kept separate from
+    # ``external_refs`` rather than folded in: those records answer "where is
+    # this file", these answer "what system is this, and how did the job log in
+    # to it", and the two have no field in common beyond the libref.
+    engine_refs: list[SasEngineRef] = Field(default_factory=list)
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -510,6 +596,17 @@ class SasBatch(BaseModel):
         return sorted(
             {r for c in self.chunks for r in c.metadata.external_refs},
             key=_path_ref_sort_key,
+        )
+
+    @property
+    def engine_refs(self) -> list[SasEngineRef]:
+        """Every database-engine LIBNAME the batch's chunks declare.
+
+        Deduplicated and ordered on the same grounds as :attr:`external_refs`.
+        """
+        return sorted(
+            {r for c in self.chunks for r in c.metadata.engine_refs},
+            key=_engine_ref_sort_key,
         )
 
     @property

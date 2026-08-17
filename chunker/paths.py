@@ -34,6 +34,17 @@ Known limit: ``options sasautos=('/a' '/b')`` reports only the first entry. The
 concatenation form needs a scan the ``head``/``path`` substitution shape cannot
 express, and reporting the first is better than reporting none.
 
+Not every LIBNAME names a place
+-------------------------------
+``libname edwprod oracle path=... user=... pass=...`` has no quoted directory, so
+none of :data:`PATH_STATEMENTS` — every entry of which ends in a quoted value —
+can see it, and the connection a migration has to reproduce went unrecorded.
+:func:`extract_engine_refs` is the second scan, for that form. It is deliberately
+*not* another :class:`PathSpec`: the ``head``/``q``/``path`` groups exist so
+:mod:`xref.pre` can substitute a quoted value, and there is no quoted value here
+to substitute. The two scans cannot both match one statement — one requires a
+quoted argument, the other requires the second token to be a database engine.
+
 Logger name: ``chunker.paths``.
 """
 
@@ -43,7 +54,7 @@ import logging
 import re
 from dataclasses import dataclass
 
-from .models import PathLocation, SasPathRef
+from .models import PathLocation, SasEngineRef, SasPathRef
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +146,7 @@ class PathSpec:
         if not raw:
             return None
         device = _group(match, "device")
+        engine = _group(match, "engine")
         return SasPathRef(
             statement=self.statement,
             location=classify_location(device),
@@ -142,6 +154,7 @@ class PathSpec:
             raw=raw,
             binds=(b.lower() if (b := _group(match, "binds")) else None),
             device=(device.lower() if device else None),
+            engine=(engine.lower() if engine else None),
             has_macro_ref="&" in raw,
         )
 
@@ -163,13 +176,16 @@ _VALUE = r"(?P<q>['\"])(?P<path>[^'\"\n]*)(?P=q)"
 #: Every statement form recognised, in scan order. Iterated by
 #: :func:`extract_paths` and by :func:`xref.pre.rewrite_source_text`.
 PATH_STATEMENTS: tuple[PathSpec, ...] = (
-    # libname <libref> [<engine>] '<path>'
+    # libname <libref> [<engine>] '<path>' — the engine group is *captured*
+    # because an engine changes what the directory is (see SasPathRef.engine):
+    # `libname x spde '/p'` is a partitioned SPD Engine library, not the plain
+    # directory `libname x '/p'` names.
     PathSpec(
         statement="libname",
         keyword="libname",
         pattern=re.compile(
             r"(?P<head>\blibname\s+(?P<binds>[A-Za-z_]\w*)\s+"
-            r"(?:[A-Za-z_]\w*\s+)?)" + _VALUE,
+            r"(?:(?P<engine>[A-Za-z_]\w*)\s+)?)" + _VALUE,
             re.IGNORECASE,
         ),
     ),
@@ -263,4 +279,111 @@ def extract_paths(text: str) -> list[SasPathRef]:
                 refs.append(ref)
     if refs and logger.isEnabledFor(logging.DEBUG):
         logger.debug(f"extract_paths: {len(refs)} external reference(s)")
+    return refs
+
+
+# ---------------------------------------------------------------------------
+# Database-engine LIBNAMEs
+# ---------------------------------------------------------------------------
+
+#: LIBNAME engines that reach a *database*, not a directory. Lowercased.
+#:
+#: ``spde`` is deliberately absent: the SPD Engine takes a quoted directory, so
+#: it is a path LIBNAME that :data:`PATH_STATEMENTS` already matches, and it is
+#: told apart from a plain one by :attr:`~chunker.models.SasPathRef.engine`.
+#: An engine here takes no path at all — its location is the connection.
+ENGINE_LIBNAMES: frozenset[str] = frozenset(
+    {
+        "oracle",
+        "odbc",
+        "teradata",
+        "sqlsvr",
+        "oledb",
+        "db2",
+        "postgres",
+        "mysql",
+        "netezza",
+        "snowflake",
+        "redshift",
+        "saphana",
+        "sybase",
+        "informix",
+        "hadoop",
+        "spark",
+        "bigquery",
+    }
+)
+
+# libname <libref> <engine> <options...>;
+#
+# The option tail is ``[^;]*``, which spans newlines by design — a connection
+# statement with a dozen options is routinely wrapped across lines, and the
+# terminator is the semicolon, not the line end.
+_ENGINE_LIBNAME_RE = re.compile(
+    r"\blibname\s+(?P<binds>[A-Za-z_]\w*)\s+(?P<engine>[A-Za-z_]\w*)\b(?P<opts>[^;]*);",
+    re.IGNORECASE,
+)
+
+# One ``key=value`` option. The value alternatives are ordered longest-form
+# first: a quoted value may contain spaces, a parenthesised one may contain
+# both, and only the bare form stops at whitespace.
+_ENGINE_OPTION_RE = re.compile(
+    r"(?P<key>[A-Za-z_]\w*)\s*=\s*"
+    r"(?P<value>\"[^\"\n]*\"|'[^'\n]*'|\([^)]*\)|[^\s;]+)"
+)
+
+
+def _option_value(raw: str) -> str:
+    """*raw* with one layer of surrounding quotes removed, else unchanged.
+
+    Parentheses are kept: ``connection=(a b)`` means something different from
+    ``connection=a b``, and no consumer of this can reconstruct the difference
+    once the brackets are gone.
+    """
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+        return raw[1:-1]
+    return raw
+
+
+def extract_engine_refs(text: str) -> list[SasEngineRef]:
+    """Every database-engine ``LIBNAME`` *text* declares, in reading order.
+
+    *text* must be the **comments-blanked, strings-intact** form, the same input
+    :func:`extract_paths` takes and for the same reason: option values live
+    inside string literals that the fully sanitised form has already blanked.
+
+    A LIBNAME whose second token is not in :data:`ENGINE_LIBNAMES` is skipped —
+    that covers path libraries, ``libname x clear;``, and ``libname _all_ list;``
+    in one test, without this scan having to know what any of them are.
+
+    Duplicates are dropped, keeping the first occurrence, exactly as
+    :func:`extract_paths` does: a chunk declaring one connection twice has one
+    dependency on it.
+    """
+    if not text or "libname" not in text.lower():
+        return []
+    seen: set[SasEngineRef] = set()
+    refs: list[SasEngineRef] = []
+    for match in _ENGINE_LIBNAME_RE.finditer(text):
+        engine = match.group("engine").lower()
+        if engine not in ENGINE_LIBNAMES:
+            continue
+        options = tuple(
+            (m.group("key").lower(), _option_value(m.group("value")))
+            for m in _ENGINE_OPTION_RE.finditer(match.group("opts"))
+        )
+        ref = SasEngineRef(
+            engine=engine,
+            binds=match.group("binds").lower(),
+            options=options,
+            # The whole statement, not just the values: an engine keyword can
+            # itself arrive through a macro reference.
+            has_macro_ref="&" in match.group(0),
+            raw=" ".join(match.group(0).split()),
+        )
+        if ref not in seen:
+            seen.add(ref)
+            refs.append(ref)
+    if refs and logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"extract_engine_refs: {len(refs)} engine LIBNAME(s)")
     return refs

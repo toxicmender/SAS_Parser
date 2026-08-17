@@ -20,7 +20,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import pytest
 
 from chunker.models import PathLocation
-from chunker.paths import classify_location, extract_paths, normalise_path
+from chunker.paths import (
+    ENGINE_LIBNAMES,
+    classify_location,
+    extract_engine_refs,
+    extract_paths,
+    normalise_path,
+)
 
 
 def _one(source: str):
@@ -42,10 +48,19 @@ class TestStatementForms:
 
     def test_libname_with_an_explicit_engine(self):
         # The engine sits between the libref and the path; the libref, not the
-        # engine, is what the statement binds.
+        # engine, is what the statement binds. The engine is recorded too:
+        # `spde` is SAS's own partitioned storage, and a consumer that mistook
+        # it for an ordinary directory would try to read files nothing outside
+        # SAS can read.
         ref = _one("libname raw spde '/data/spde';")
         assert ref.binds == "raw"
         assert ref.path == "/data/spde"
+        assert ref.engine == "spde"
+
+    def test_libname_without_an_engine_records_none(self):
+        # The pair to the test above: these two statements were indistinguishable
+        # until the engine group was captured, which is the whole point of it.
+        assert _one("libname raw '/data/spde';").engine is None
 
     def test_infile_and_file_are_distinct_statements(self):
         assert _one("infile '/data/in/cust.csv' dlm=',';").statement == "infile"
@@ -164,6 +179,98 @@ class TestValues:
         # not an implementation detail.
         ref = _one("libname a '/x';")
         assert len({ref, ref}) == 1
+
+
+class TestEngineLibnames:
+    """The LIBNAME form that names a connection instead of a place.
+
+    ``libname edwprod oracle path=... user=... pass=...`` has no quoted
+    directory, so none of PATH_STATEMENTS can match it — every one of them ends
+    in a quoted value. That is the gap this scan fills, and the pinned behaviour
+    is that it captures the connection *as written*, macro references included,
+    because resolving them is not something the chunker can or should do.
+    """
+
+    def _one_engine(self, source: str):
+        refs = extract_engine_refs(source)
+        assert len(refs) == 1, f"expected one ref, got {[str(r) for r in refs]}"
+        return refs[0]
+
+    def test_oracle_libname_captures_engine_libref_and_options(self):
+        ref = self._one_engine(
+            "libname edwprod oracle path=EDWPRO_READ_ONLY schema=FR_DM_Pro "
+            'user="&username." pass="&user_pass." connection=global;'
+        )
+        assert ref.engine == "oracle"
+        assert ref.binds == "edwprod"
+        assert ref.option_map == {
+            "path": "EDWPRO_READ_ONLY",
+            "schema": "FR_DM_Pro",
+            "user": "&username.",
+            "pass": "&user_pass.",
+            "connection": "global",
+        }
+        assert ref.has_macro_ref is True
+
+    def test_option_values_keep_their_case_but_keys_do_not(self):
+        # A schema name is data — `FR_DM_Pro` may be case-sensitive on the
+        # remote system — while the option keyword is syntax.
+        ref = self._one_engine("libname x oracle SCHEMA=MixedCase;")
+        assert ref.option_map == {"schema": "MixedCase"}
+
+    def test_a_statement_spanning_lines_is_one_ref(self):
+        # The option tail runs to the semicolon, not the line end: a connection
+        # with a dozen options is routinely wrapped.
+        ref = self._one_engine(
+            "libname edw teradata\n  server=tdprod\n  schema=marts\n  mode=teradata;"
+        )
+        assert ref.option_map["server"] == "tdprod"
+        assert ref.option_map["mode"] == "teradata"
+
+    def test_a_path_libname_is_not_an_engine_libname(self):
+        # The two scans partition the LIBNAME space: one needs a quoted value,
+        # the other needs a known engine. Neither statement may reach both.
+        assert extract_engine_refs("libname flat '/sasdata3/dataetl';") == []
+        assert extract_engine_refs("libname raw spde '/data/spde';") == []
+
+    def test_clear_and_list_forms_yield_nothing(self):
+        assert extract_engine_refs("libname old clear;") == []
+        assert extract_engine_refs("libname _all_ list;") == []
+
+    def test_an_unknown_engine_yields_nothing(self):
+        # ENGINE_LIBNAMES is a gate, not a guess: an unrecognised second token
+        # is far more likely to be syntax this scan does not model than a
+        # database nobody has heard of.
+        assert extract_engine_refs("libname x notadatabase foo=bar;") == []
+
+    def test_every_known_engine_is_lowercase(self):
+        # The scan lowercases before the membership test, so an upper-case
+        # entry in the set could never match.
+        assert all(e == e.lower() for e in ENGINE_LIBNAMES)
+
+    def test_engine_matching_is_case_insensitive(self):
+        assert self._one_engine("LIBNAME X ORACLE PATH=P;").engine == "oracle"
+
+    def test_quoted_and_parenthesised_values(self):
+        ref = self._one_engine(
+            "libname x odbc datasrc='My DSN' connection=(a b) schema=s;"
+        )
+        assert ref.option_map["datasrc"] == "My DSN"
+        # Brackets are kept: `connection=(a b)` means something different from
+        # `connection=a b`, and nothing downstream could recover the difference.
+        assert ref.option_map["connection"] == "(a b)"
+
+    def test_duplicates_collapse_and_records_are_hashable(self):
+        source = "libname a oracle path=p;\nlibname a oracle path=p;\n"
+        refs = extract_engine_refs(source)
+        assert len(refs) == 1
+        assert len({refs[0], refs[0]}) == 1
+
+    def test_no_macro_reference_when_there_is_none(self):
+        assert self._one_engine("libname x oracle path=p user=svc;").has_macro_ref is False
+
+    def test_empty_text(self):
+        assert extract_engine_refs("") == []
 
 
 class TestScanScope:

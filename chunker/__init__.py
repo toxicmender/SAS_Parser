@@ -18,9 +18,16 @@ from .models import (
     SasCorpus,
     SasDiagnostic,
     SasDiagnosticSeverity,
+    SasEngineRef,
     SasPathRef,
 )
-from .paths import PATH_STATEMENTS, classify_location, extract_paths
+from .paths import (
+    ENGINE_LIBNAMES,
+    PATH_STATEMENTS,
+    classify_location,
+    extract_engine_refs,
+    extract_paths,
+)
 
 __all__ = [
     # chunker
@@ -50,4 +57,8 @@ __all__ = [
     "PATH_STATEMENTS",
     "classify_location",
     "extract_paths",
+    # database-engine LIBNAME recognition — what data_hydration connects with
+    "SasEngineRef",
+    "ENGINE_LIBNAMES",
+    "extract_engine_refs",
 ]

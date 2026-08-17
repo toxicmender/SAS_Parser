@@ -207,6 +207,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "skipped without it.",
     )
     parser.add_argument(
+        "--hydration",
+        action="store_true",
+        help="Also report the data loads this corpus implies: every Oracle "
+        "table, sFTP file and SAS library it reads, and the Delta table each "
+        "would land in. Planning only — it opens no connection and needs no "
+        "database driver installed.",
+    )
+    parser.add_argument(
         "--llm-eval",
         action="store_true",
         help="Ask a model to evaluate each file against its static verdict — "
@@ -454,6 +462,39 @@ def _analyse(
     return report, texts, analyzer
 
 
+def _hydration_plan(args: argparse.Namespace, sources: _Sources):  # type: ignore[no-untyped-def]
+    """The hydration plan for *sources*, or ``None`` without ``--hydration``.
+
+    Built from the metadata the chunker already produced, with ``probe=None`` —
+    so this stays what the rest of ``complexity`` is: an offline read of the
+    corpus. A probe would mean a report renderer opening database connections.
+
+    :mod:`data_hydration` is imported here, not at module scope, so a run
+    without the flag never loads it. A configuration problem (a bad table
+    template) is reported and the rest of the report is still written: hydration
+    is an addition to the report, never a reason to lose it.
+    """
+    if not args.hydration:
+        return None
+    from data_hydration.naming import TableNameError
+    from data_hydration.planner import build_corpus_plan
+
+    by_source = {
+        result.source_id: (
+            [r for c in result.chunks for r in c.metadata.engine_refs],
+            [r for c in result.chunks for r in c.metadata.external_refs],
+        )
+        for result in sources.file_results
+    }
+    try:
+        return build_corpus_plan(by_source, probe=None)
+    except TableNameError as exc:
+        logger.error(
+            f"--hydration: {exc}; the complexity report is written without it"
+        )
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Delivery
 # ---------------------------------------------------------------------------
@@ -467,12 +508,15 @@ def _deliver(
     out_dir: Path | None,
     model: str | None = None,
     run_llm_eval: bool | None = None,
+    hydration: object | None = None,
 ) -> tuple[int, list[Path]]:
     """Write the reports, and return ``(exit status, written paths)``.
 
     *out_dir* is an explicit parameter rather than a read of ``args.out_dir``
     because the SharePoint flow stages into a temporary directory. The written
     paths come back so the caller can upload them; locally they are ignored.
+
+    *hydration* is the plan from :func:`_hydration_plan`, or ``None``.
     """
     include_source = not args.no_source_text
     written_paths: list[Path] = []
@@ -487,6 +531,7 @@ def _deliver(
             include_source=include_source,
             max_source_lines=args.max_chunk_lines,
             graph_image=not args.no_graph_image,
+            hydration=hydration,
         )
         written_paths = list(written.paths)
         print(f"wrote overall complexity report: {written.overall}")
@@ -507,7 +552,7 @@ def _deliver(
             if pdf_ok:
                 written_paths.append(written.overall.with_suffix(".pdf"))
     else:
-        markdown = render_overall_report(report, top=args.top)
+        markdown = render_overall_report(report, top=args.top, hydration=hydration)
         if args.out is not None:
             _write(args.out, markdown)
             print(f"wrote complexity report: {args.out}")
@@ -555,7 +600,13 @@ def _run_local(args: argparse.Namespace) -> int:
     if sources is None:
         return 1
     report, texts, _ = _analyse(args, sources, target=args.target)
-    status, _ = _deliver(args, report, texts, out_dir=args.out_dir)
+    status, _ = _deliver(
+        args,
+        report,
+        texts,
+        out_dir=args.out_dir,
+        hydration=_hydration_plan(args, sources),
+    )
     return status
 
 
@@ -679,6 +730,7 @@ def _run_request(args: argparse.Namespace, row: Any, *, client: Any) -> int:
             out_dir=staging,
             model=model,
             run_llm_eval=run_llm_eval,
+            hydration=_hydration_plan(args, sources),
         )
         summary = sp.render_run_summary(
             row,

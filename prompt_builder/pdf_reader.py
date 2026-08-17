@@ -223,6 +223,7 @@ class PdfReader:
         role: DocRole = DocRole.SAS_REFERENCE,
         strategy: ExtractionStrategy | str = "auto",
         section_level: int | None = None,
+        include_sections: list[str] | None = None,
     ) -> tuple[InstructionDoc, list[DocSection]]:
         """
         Read the PDF at *path* into an :class:`InstructionDoc` summary and its
@@ -232,6 +233,13 @@ class PdfReader:
         or an explicit :class:`ExtractionStrategy`. ``section_level`` pins the
         TOC depth to segment at; ``None`` auto-selects the most populated
         level.
+
+        ``include_sections`` restricts extraction to the TOC headings whose
+        titles contain one of those substrings (case-insensitive). The filter is
+        applied to the *table of contents*, which ``get_toc`` returns without
+        touching page content — so an unwanted page is never rendered to text at
+        all. That is the difference between indexing a 26,000-page reference and
+        not being able to.
         """
         doc_id = doc_id or path
         logger.info(f"PdfReader.read: doc_id='{doc_id}'  strategy={strategy}")
@@ -239,10 +247,22 @@ class PdfReader:
         doc = pymupdf.open(path)
         try:
             page_count = doc.page_count
+            wanted = (
+                self._selected_pages(doc, include_sections, doc_id, diagnostics)
+                if include_sections
+                else None
+            )
             # get_text's return shape follows its format argument; "text" is
             # always str, but the signature unions every format's shape.
+            #
+            # Skipped pages become "" rather than being dropped, so every later
+            # stage keeps indexing by real page number; the empty sections they
+            # produce are filtered out below with the genuinely blank ones.
             raw_pages = [
-                cast(str, doc[i].get_text("text")) for i in range(page_count)
+                cast(str, doc[i].get_text("text"))
+                if (wanted is None or i in wanted)
+                else ""
+                for i in range(page_count)
             ]
             self._flag_missing_text(raw_pages, doc_id, diagnostics)
             cleaned_pages = [
@@ -263,6 +283,21 @@ class PdfReader:
             doc.close()
 
         sections = [s for s in sections if s.text.strip()]
+        if wanted is not None:
+            # A heading that *starts* on a skipped page owns the pages after it
+            # until the next heading, so if any of those were selected it comes
+            # back carrying their text under its own — unrelated — title. The
+            # section path becomes the prompt's citation, so a wrong one is
+            # worse than a missing chunk: keep only sections whose own heading
+            # sits on a page that was deliberately chosen.
+            kept = [s for s in sections if (s.page_start - 1) in wanted]
+            if len(kept) != len(sections):
+                logger.info(
+                    f"PdfReader: doc_id='{doc_id}' dropped "
+                    f"{len(sections) - len(kept)} section(s) whose heading lies "
+                    f"outside include_sections"
+                )
+            sections = kept
         for s in sections:
             s.construct_key = parse_construct_key(s.title)
 
@@ -280,6 +315,79 @@ class PdfReader:
             f"{used}  {len(diagnostics)} diagnostic(s)"
         )
         return summary, sections
+
+    # ------------------------------------------------------------------
+    # Section selection
+    # ------------------------------------------------------------------
+
+    def _selected_pages(
+        self,
+        doc: Any,
+        include_sections: list[str],
+        doc_id: str,
+        diagnostics: list[InstructionDiagnostic],
+    ) -> set[int] | None:
+        """0-based page indices covered by the wanted TOC headings.
+
+        A heading's section runs from its own page up to the next entry at the
+        same or a shallower level — the same span rule :meth:`_read_toc` uses,
+        so what is extracted and what is segmented agree.
+
+        ``None`` means "no restriction": either the document has no TOC to
+        select on, or nothing matched. Both are reported as diagnostics and both
+        fall back to reading everything, because silently indexing an empty
+        corpus is worse than indexing a large one.
+        """
+        toc = doc.get_toc(simple=True)
+        if not toc:
+            diagnostics.append(
+                InstructionDiagnostic(
+                    doc_id=doc_id,
+                    code="include_sections_without_toc",
+                    message=(
+                        "include_sections was given but the document has no "
+                        "TOC to select on; reading every page"
+                    ),
+                )
+            )
+            return None
+
+        wanted = [s.lower() for s in include_sections if s.strip()]
+        page_count = doc.page_count
+        selected: set[int] = set()
+        for index, entry in enumerate(toc):
+            level, title, page = entry[0], entry[1], entry[2]
+            # A TOC entry whose destination did not resolve gets page -1. It is
+            # a grouping label, not a location: treating it as a start would
+            # select from page 0, and as an end would truncate the section
+            # before it to nothing.
+            if page < 1 or not any(w in title.lower() for w in wanted):
+                continue
+            start = page - 1
+            end = page_count
+            for next_entry in toc[index + 1 :]:
+                if next_entry[0] <= level and next_entry[2] >= 1:
+                    end = max(next_entry[2] - 1, start + 1)
+                    break
+            selected.update(range(start, min(end, page_count)))
+
+        if not selected:
+            diagnostics.append(
+                InstructionDiagnostic(
+                    doc_id=doc_id,
+                    code="include_sections_matched_nothing",
+                    message=(
+                        f"none of {include_sections} matched a TOC heading; "
+                        f"reading every page"
+                    ),
+                )
+            )
+            return None
+        logger.info(
+            f"PdfReader: doc_id='{doc_id}' include_sections selected "
+            f"{len(selected)} of {page_count} page(s)"
+        )
+        return selected
 
     # ------------------------------------------------------------------
     # Strategy selection
