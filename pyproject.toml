@@ -33,6 +33,9 @@ dependencies = [
 # main.py is the entry point: SharePoint-driven by default, local with a
 # positional source directory.
 sas-parser = "main:main"
+# V2 composition shell. Operational subcommands are added only as their use
+# cases move behind v2 application ports.
+sas-migrate = "sas_migrate.cli:main"
 
 [project.optional-dependencies]
 # Delta memory backend + validation tracking (Spark/JVM). The default
@@ -98,7 +101,7 @@ hydration  = [
 ]
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = [".", "src"]
 # pipeline/engine.py imports chunker, memory.store, llm_client, and
 # prompt_builder, so all five packages must ship — a wheel with pipeline
 # alone breaks `from pipeline import SasLLMPipeline`. app_config is the
@@ -113,6 +116,7 @@ where = ["."]
 # domain layers a real run is driven by, and add no required dependency of
 # their own (Graph is the optional `sharepoint` extra; sqlglot is core).
 include = [
+    "sas_migrate*",
     "pipeline*",
     "chunker*",
     "memory*",
@@ -152,6 +156,8 @@ complexity = ["profiles/*.json"]
 # Keep the directory structure because its first component scopes rules to a
 # target language (pyspark/, sparksql/, or _common/).
 prompt_builder = ["instructions/**/*.md"]
+# V2 contract schemas and future copied profile/instruction resources.
+sas_migrate = ["resources/**/*.json", "resources/**/*.md"]
 
 [tool.coverage.run]
 # Bare `--cov` (as CI passes it) measures exactly these packages; without this
@@ -174,6 +180,7 @@ source = [
     "data_hydration",
     "token_budget",
     "main",
+    "sas_migrate",
 ]
 
 [tool.pytest.ini_options]
@@ -207,6 +214,7 @@ include = [
     "data_hydration",
     "token_budget",
     "main.py",
+    "src/sas_migrate",
 ]
 exclude = ["**/build/**", "**/.venv/**", "**/__pycache__/**"]
 # Resolve the same interpreter and installed packages CI uses (uv's .venv),

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:sas-migrate:contracts:v2",
+  "title": "SAS Migrate v2 contract resources",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "const": 2
+    }
+  },
+  "required": [
+    "schema_version"
+  ],
+  "additionalProperties": true
+}

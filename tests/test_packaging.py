@@ -21,7 +21,7 @@ def test_build_backend_is_declared() -> None:
 def test_runtime_packages_are_explicitly_included() -> None:
     config = _project_config()
     included = set(config["tool"]["setuptools"]["packages"]["find"]["include"])
-    assert {"token_budget*", "validation*"} <= included
+    assert {"sas_migrate*", "token_budget*", "validation*"} <= included
     assert "main" in config["tool"]["setuptools"]["py-modules"]
 
 
@@ -29,6 +29,7 @@ def test_runtime_package_data_is_declared() -> None:
     package_data = _project_config()["tool"]["setuptools"]["package-data"]
     assert "profiles/*.json" in package_data["complexity"]
     assert "instructions/**/*.md" in package_data["prompt_builder"]
+    assert "resources/**/*.json" in package_data["sas_migrate"]
 
 
 def test_quality_gates_cover_new_runtime_modules() -> None:
@@ -36,5 +37,10 @@ def test_quality_gates_cover_new_runtime_modules() -> None:
     coverage = config["coverage"]["run"]
     assert coverage["branch"] is True
     assert coverage["relative_files"] is True
-    assert {"token_budget", "main"} <= set(coverage["source"])
-    assert "token_budget" in config["pyright"]["include"]
+    assert {"token_budget", "main", "sas_migrate"} <= set(coverage["source"])
+    assert {"token_budget", "src/sas_migrate"} <= set(config["pyright"]["include"])
+
+
+def test_v2_console_script_is_declared() -> None:
+    scripts = _project_config()["project"]["scripts"]
+    assert scripts["sas-migrate"] == "sas_migrate.cli:main"
