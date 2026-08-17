@@ -14,6 +14,32 @@ permissions:
   contents: read
 
 jobs:
+  package:
+    name: Build & installed-wheel smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # Build from the checkout, then install into an environment outside it.
+      # Repo-root imports can hide packages and data omitted from a wheel.
+      - name: Build wheel
+        run: uv build --wheel --out-dir /tmp/sas-parser-wheel
+
+      - name: Install wheel in a clean environment
+        run: |
+          uv venv /tmp/sas-parser-wheel-venv
+          uv pip install \
+            --python /tmp/sas-parser-wheel-venv/bin/python \
+            /tmp/sas-parser-wheel/*.whl
+
+      - name: Smoke installed wheel
+        run: /tmp/sas-parser-wheel-venv/bin/python scripts/smoke_wheel.py
+
   lint:
     name: Lint (ruff)
     runs-on: ubuntu-latest
