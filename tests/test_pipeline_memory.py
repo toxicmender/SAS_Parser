@@ -57,12 +57,23 @@ class _RecordingChatModel:
 # sites below are about is which memory wiring produces which prompt — and
 # spelling out three constructors at each of them would bury the point.
 _MEMORY_KEYS = (
-    "memory", "task_id", "task_policy", "thread_memory", "memory_extractor",
-    "chat_id", "spark", "delta_table", "window_k", "history_selector",
+    "memory",
+    "task_id",
+    "task_policy",
+    "thread_memory",
+    "memory_extractor",
+    "chat_id",
+    "spark",
+    "delta_table",
+    "window_k",
+    "history_selector",
     "summarizer",
 )
 _PROMPTING_KEYS = (
-    "system_prompt", "structured_output", "prompt_caching", "prompt_builder",
+    "system_prompt",
+    "structured_output",
+    "prompt_caching",
+    "prompt_builder",
     "user_instructions",
 )
 _VALIDATION_KEYS = ("validator", "retries")
@@ -89,6 +100,57 @@ def _pipeline(llm=None, **kwargs) -> SasLLMPipeline:
 
 def _system_texts(prompt) -> list[str]:
     return [str(m.content) for m in prompt if isinstance(m, SystemMessage)]
+
+
+class _RetryVerdict:
+    def __init__(self, passed: bool) -> None:
+        self.passed = passed
+        self.score = 1.0 if passed else 0.2
+        self.metrics = [
+            type(
+                "Metric",
+                (),
+                {
+                    "passed": passed,
+                    "skipped": False,
+                    "metric": "coverage",
+                    "score": self.score,
+                    "threshold": 0.7,
+                    "details": "missing translated statement",
+                },
+            )()
+        ]
+
+    def model_dump(self) -> dict[str, Any]:
+        return {"passed": self.passed, "score": self.score, "metrics": []}
+
+
+class _FailThenPassValidator:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def validate_item(self, *args, **kwargs) -> _RetryVerdict:
+        self.calls += 1
+        return _RetryVerdict(passed=self.calls > 1)
+
+
+def test_prompt_artifact_captures_the_final_validation_retry():
+    llm = _RecordingChatModel()
+    validator = _FailThenPassValidator()
+    pipeline = _pipeline(llm, validator=validator, retries=1)
+
+    (output,) = pipeline.run_text(SAS, source_id="retry.sas")
+
+    assert len(llm.prompts) == 2
+    assert output["prompt_messages"] == [
+        {"role": message.type, "content": message.content}
+        for message in llm.prompts[-1]
+    ]
+    final_prompt = "\n".join(
+        str(message["content"]) for message in output["prompt_messages"]
+    )
+    assert "Automated validation of your previous answer FAILED" in final_prompt
+    assert "missing translated statement" in final_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -260,9 +322,7 @@ class TestExtractionWiring:
         hub = MemoryHub()
         policy = TaskPolicy("sas", store=hub.kv)
         extractor = _extractor(_extraction("Always be explicit.", "permanent"))
-        pipeline = _pipeline(
-            memory=hub, task_policy=policy, memory_extractor=extractor
-        )
+        pipeline = _pipeline(memory=hub, task_policy=policy, memory_extractor=extractor)
         pipeline.run_text(SAS, thread_id="t1")
         assert policy.texts() == []
         (candidate,) = extractor.pending("t1")

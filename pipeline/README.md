@@ -107,6 +107,7 @@ gateway reports no usage block.
 | `constants.py` | Prompt templates — the Markdown-sections system prompt and its structured-output counterpart (importable without langchain installed). |
 | `response_models.py` | `TranslationDocument` (+ `TranslationCell`, `MappingEntry`, `RiskNote`): the structured answer the pipeline asks for, and `to_markdown()`, which renders it back to the four `##` sections that get persisted and scored. Pydantic only. |
 | `notebook.py` | Renders pipeline outputs as nbformat v4.5 notebooks — one `.ipynb` per SAS source file plus `_cross_file.ipynb` — from a `TranslationDocument`, or by parsing the Markdown response when there is none. Stdlib + `response_models`. |
+| `artifacts.py` | Renders each accepted model call's fully formatted role/content message list as Markdown and writes it under an output directory's `prompts/` subdirectory. |
 
 `SasLLMPipeline` is resolved lazily from the package root, so importing
 `pipeline.notebook` or `pipeline.response_models` never pulls in
@@ -171,13 +172,25 @@ per-item header, Analysis/Mapping, untagged prose, and Risks are duplicated
 into every participating notebook so each one stands alone.
 
 ```python
-from pipeline.notebook import write_notebooks
+from pipeline import write_notebooks, write_prompts
 
 outputs = pipe.run_files(sas_files)
 write_notebooks(outputs, "out", output_language=pipe.target_language)
+write_prompts(outputs, "out")
 # out/<source>.ipynb per file; out/_cross_file.ipynb only for items whose
 # cells could not be attributed per source
+# out/prompts/<item-id>.md per model call
 ```
+
+Each ordinary output carries both `prompt` (the raw item request retained for
+validation compatibility) and `prompt_messages` (the final formatted message
+list captured at the LLM-client boundary). The latter includes the system
+policy, selected history or summary, retrieved reference guidance, thread
+notes, validation-retry feedback, and the human item request in the order the
+accepted attempt received them. A resumed/skipped item has
+`prompt_messages=None`: the current process did not make its historical call,
+so `write_prompts` preserves an existing exact artifact when present and never
+labels a reconstructed request as effective.
 
 ## Load-bearing invariants
 
@@ -188,11 +201,14 @@ write_notebooks(outputs, "out", output_language=pipe.target_language)
   the Delta table) and duplicate the canonical store. One graph invocation is
   one conversational turn — the node prompts with, and persists, exactly the
   last state message.
-- **Ephemeral context is prompted but never persisted** — reference guidance,
-  the rolling summary, and short-term thread notes ride outside the `msg::`
-  history. See Architecture.md invariants 5–6 for the full statement.
+- **Ephemeral context is prompted but never persisted to conversation
+  history** — reference guidance, the rolling summary, and short-term thread
+  notes ride outside the `msg::` rows. They may still appear in the explicit
+  prompt audit artifact, which is a run deliverable rather than memory. See
+  Architecture.md invariants 5–6 for the full statement.
 
 ## Logging
 
 f-string messages everywhere (never lazy `%`-style). Logger names follow
-modules: `pipeline.engine`, `pipeline.prompting`, `pipeline.notebook`.
+modules: `pipeline.engine`, `pipeline.prompting`, `pipeline.notebook`,
+`pipeline.artifacts`.

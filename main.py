@@ -182,7 +182,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Write the translation as Jupyter notebooks under this directory "
         "— one .ipynb per SAS source file, plus _cross_file.ipynb for batches "
-        "spanning several files.",
+        "spanning several files — and one effective-prompt Markdown artifact "
+        "per item under its prompts/ subdirectory.",
     )
     local.add_argument(
         "--md",
@@ -460,15 +461,15 @@ def build_pipeline(
         )
 
     target = resolve_target_language(output_language)
-    validator = (
-        LiveValidator(output_language=target.display_name) if validate else None
-    )
+    validator = LiveValidator(output_language=target.display_name) if validate else None
     return SasLLMPipeline(
         llm_config=llm_config,
         memory_setup=MemorySetup(delta_table=args.delta_table),
         output_language=target.display_name,
         prompting=PromptingSetup(prompt_builder=builder),
-        validation=ValidationSetup(validator=validator, retries=args.validation_retries),
+        validation=ValidationSetup(
+            validator=validator, retries=args.validation_retries
+        ),
     )
 
 
@@ -643,12 +644,15 @@ def _run_local(args: argparse.Namespace) -> int:
         print(out["response"])
 
     if args.out_dir:
+        from pipeline.artifacts import write_prompts
         from pipeline.notebook import write_notebooks
 
         for path in write_notebooks(
             outputs, args.out_dir, output_language=pipeline.output_language
         ):
             print(f"wrote notebook: {path}")
+        for path in write_prompts(outputs, args.out_dir):
+            print(f"wrote prompt: {path}")
 
     if not validating:
         if args.md or args.pdf:
