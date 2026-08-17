@@ -3921,7 +3921,7 @@ wheels = [
 [[package]]
 name = "sas-parser"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "bm25s", extra = ["core"] },
     { name = "faiss-cpu" },

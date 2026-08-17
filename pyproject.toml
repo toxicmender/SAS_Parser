@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "sas-parser"
 version = "0.1.0"
@@ -101,8 +105,9 @@ where = ["."]
 # dependency-free config loader they all read defaults through. complexity
 # reads chunker's output and adds no *required* dependency of its own (its
 # dependency-graph image is the optional `graph` extra, and degrades to a
-# Markdown table without it), so it ships too — unlike validation, whose
-# Spark/MLflow tracking is dev-only tooling.
+# Markdown table without it), so it ships too. Validation also ships: its
+# Spark tracking path is optional, while LiveValidator is part of the normal
+# conversion pipeline and imports without Spark.
 # target_language is the leaf every one of them resolves the run's target
 # through, so it ships with all of them. conversion and xref are the SharePoint
 # domain layers a real run is driven by, and add no required dependency of
@@ -124,6 +129,13 @@ include = [
     # TYPE_CHECKING-only), and complexity imports it to report the plan — so it
     # ships wherever complexity does. Its drivers are all optional extras.
     "data_hydration*",
+    # Shared prompt-cost estimation is imported at module scope by both the
+    # LLM client and pipeline. Omitting it makes the installed console script
+    # fail before argument parsing even though editable/repo-root runs pass.
+    "token_budget*",
+    # Inline validation is part of every constructed conversion pipeline,
+    # including the installed console script's default workflow.
+    "validation*",
 ]
 
 [tool.setuptools]
@@ -136,10 +148,16 @@ py-modules = ["main"]
 # complexity/profiles/*.json IS the rule catalogue — the package scores nothing
 # without it, so the JSON must ship inside the wheel alongside the code.
 complexity = ["profiles/*.json"]
+# The configured starter instruction set is runtime input, not documentation.
+# Keep the directory structure because its first component scopes rules to a
+# target language (pyspark/, sparksql/, or _common/).
+prompt_builder = ["instructions/**/*.md"]
 
 [tool.coverage.run]
 # Bare `--cov` (as CI passes it) measures exactly these packages; without this
 # it would measure everything imported, tests included, inflating the total.
+branch = true
+relative_files = true
 source = [
     "pipeline",
     "chunker",
@@ -154,6 +172,8 @@ source = [
     "reporting",
     "target_language",
     "data_hydration",
+    "token_budget",
+    "main",
 ]
 
 [tool.pytest.ini_options]
@@ -185,6 +205,7 @@ include = [
     "target_language",
     "validation",
     "data_hydration",
+    "token_budget",
     "main.py",
 ]
 exclude = ["**/build/**", "**/.venv/**", "**/__pycache__/**"]
