@@ -141,6 +141,12 @@ class _FakePipeline:
             {
                 "item_id": f"item-{i}",
                 "source_files": [source_id],
+                "target_language": self.output_language,
+                "prompt": f"translate {source_id}",
+                "prompt_messages": [
+                    {"role": "system", "content": "Translate SAS."},
+                    {"role": "human", "content": f"translate {source_id}"},
+                ],
                 "response": "```sql\nSELECT 1\n```",
             }
             for i, (source_id, _text) in enumerate(sources)
@@ -212,11 +218,12 @@ def test_output_lands_under_model_and_timestamp():
     outcome, _ = _run(transport)
 
     target = f"{BASE}/{APP}/scripts_converted/{MODEL}/{STAMP}"
+    prompts = f"{target}/prompts"
     # upload_converted_script creates the folder before every write — Graph's
     # simple upload does not create missing parents, and create_folder is
-    # idempotent — so the folder recurs, but only ever this one.
-    assert set(transport.created) == {target}
-    assert all(folder == target for folder, _, _ in transport.uploaded)
+    # idempotent — so both output folders recur without conflicts.
+    assert set(transport.created) == {target, prompts}
+    assert all(folder in {target, prompts} for folder, _, _ in transport.uploaded)
     assert outcome.uploaded
     assert all(path.startswith(target) for path in outcome.uploaded)
 
@@ -225,8 +232,23 @@ def test_notebooks_are_named_after_the_source_files():
     transport = _transport()
     _run(transport)
 
-    names = sorted(name for _, name, _ in transport.uploaded)
+    target = f"{BASE}/{APP}/scripts_converted/{MODEL}/{STAMP}"
+    names = sorted(name for folder, name, _ in transport.uploaded if folder == target)
     assert names == ["etl.ipynb", "load.ipynb"]
+
+
+def test_prompts_are_uploaded_in_their_own_run_subdirectory():
+    transport = _transport()
+    _run(transport)
+
+    folder = f"{BASE}/{APP}/scripts_converted/{MODEL}/{STAMP}/prompts"
+    prompts = {
+        name: content
+        for uploaded_folder, name, content in transport.uploaded
+        if uploaded_folder == folder
+    }
+    assert sorted(prompts) == ["item-0.md", "item-1.md"]
+    assert all(content.startswith("# Effective prompt") for content in prompts.values())
 
 
 def test_status_is_written_running_then_completed():
@@ -393,10 +415,16 @@ def test_post_rewrites_the_document_cells_the_notebook_is_built_from():
     document = {
         "analysis": "",
         "cells": [
-            {"kind": "code", "language": "python",
-             "source": 'df = spark.read.csv("/data/in/a.csv")\n'},
-            {"kind": "code", "language": "sql",
-             "source": "CREATE TABLE t LOCATION '/data/in/t'"},
+            {
+                "kind": "code",
+                "language": "python",
+                "source": 'df = spark.read.csv("/data/in/a.csv")\n',
+            },
+            {
+                "kind": "code",
+                "language": "sql",
+                "source": "CREATE TABLE t LOCATION '/data/in/t'",
+            },
             {"kind": "markdown", "source": "reads /data/in as before"},
         ],
     }
@@ -419,10 +447,16 @@ def test_a_cell_language_alias_resolves_like_any_other_target_name():
     document = {
         "analysis": "",
         "cells": [
-            {"kind": "code", "language": "py",
-             "source": 'df = spark.read.csv("/data/in/a.csv")\n'},
-            {"kind": "code", "language": "databrickssql",
-             "source": "CREATE TABLE t LOCATION '/data/in/t'"},
+            {
+                "kind": "code",
+                "language": "py",
+                "source": 'df = spark.read.csv("/data/in/a.csv")\n',
+            },
+            {
+                "kind": "code",
+                "language": "databrickssql",
+                "source": "CREATE TABLE t LOCATION '/data/in/t'",
+            },
         ],
     }
     outputs, _ = _xref_run(_transport(), _by_path(), "post", document=document)
@@ -440,8 +474,7 @@ def test_a_cell_in_an_unknown_language_is_left_alone_and_reported(caplog):
     document = {
         "analysis": "",
         "cells": [
-            {"kind": "code", "language": "scala",
-             "source": 'val p = "/data/in/a.csv"'},
+            {"kind": "code", "language": "scala", "source": 'val p = "/data/in/a.csv"'},
         ],
     }
     with caplog.at_level(logging.WARNING, logger="conversion.run"):
@@ -503,9 +536,10 @@ def test_select_requests_narrows_by_id_then_by_application():
     assert [r.item_id for r in conv_run.select_requests(rows, request_id="2")] == ["2"]
     # Application matching folds case and strips, unlike the reference's exact
     # comparison, which a trailing space silently defeats.
-    assert [
-        r.item_id for r in conv_run.select_requests(rows, application="Beta")
-    ] == ["2", "3"]
+    assert [r.item_id for r in conv_run.select_requests(rows, application="Beta")] == [
+        "2",
+        "3",
+    ]
     assert len(conv_run.select_requests(rows)) == 3
 
 

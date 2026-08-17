@@ -20,8 +20,8 @@ The shape of a run
 3. Translate the whole application as **one corpus on one thread**, so
    cross-file dataset and macro edges resolve.
 4. Upload one file per source to
-   ``{base}/{app}/scripts_converted/{model}/{timestamp}``, and any validation
-   artefacts beside them.
+   ``{base}/{app}/scripts_converted/{model}/{timestamp}``, effective prompts
+   under its ``prompts/`` subdirectory, and any validation artefacts.
 5. Write the row's ``Status``, whichever way the run went.
 
 **No temporary directory.** ``run_texts`` takes the text and the drive-relative
@@ -49,7 +49,11 @@ from xref.apply import APPLY_BOTH, APPLY_POST, APPLY_PRE
 from .paths import validation as validation_folder
 from .requests import ConversionItem, ConversionRequest
 from .sources import load, source_files
-from .upload import upload_converted_script, upload_validation_file
+from .upload import (
+    upload_converted_script,
+    upload_prompt_file,
+    upload_validation_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -168,8 +172,7 @@ def _set_status(
         update_request_status(item_id, status, client=client, config=config)
     except SharePointError as exc:
         logger.warning(
-            f"_set_status: could not write Status={status!r} on row "
-            f"{item_id!r}: {exc}"
+            f"_set_status: could not write Status={status!r} on row {item_id!r}: {exc}"
         )
 
 
@@ -308,8 +311,7 @@ def run_request(
 
     _set_status(request.item_id, STATUS_DONE, client=client, config=config)
     logger.info(
-        f"run_request: {application!r} done — {len(outcome.uploaded)} file(s) "
-        f"uploaded"
+        f"run_request: {application!r} done — {len(outcome.uploaded)} file(s) uploaded"
     )
     return outcome
 
@@ -345,9 +347,7 @@ def _load_sources(
     return sources
 
 
-def _apply_xref(
-    sources: list[tuple[str, str]], mappings: Any
-) -> list[tuple[str, str]]:
+def _apply_xref(sources: list[tuple[str, str]], mappings: Any) -> list[tuple[str, str]]:
     """The physical-path half of the XREF substitution, over raw source text.
 
     The dataset half rides on the pipeline's ``databricks_mapping`` — see
@@ -556,7 +556,8 @@ def _upload_outputs(
     client: Any,
     config: SharePointConfig | None,
 ) -> list[str]:
-    """Write the notebooks, and the validation artefacts when there are any."""
+    """Write notebooks, effective prompts, and optional validation artifacts."""
+    from pipeline.artifacts import prompt_artifacts_from_outputs
     from pipeline.notebook import notebook_to_json, notebooks_from_outputs
 
     application = request.application_name
@@ -571,6 +572,19 @@ def _upload_outputs(
                 name,
                 output_language,
                 notebook_to_json(notebook),
+                model,
+                timestamp,
+                client=client,
+                config=config,
+            )
+        )
+
+    for name, contents in prompt_artifacts_from_outputs(outputs).items():
+        written.append(
+            upload_prompt_file(
+                application,
+                name,
+                contents,
                 model,
                 timestamp,
                 client=client,
@@ -778,9 +792,7 @@ def validation_summary(outputs: list[dict], *, token_usage: Any = None) -> dict:
     """The aggregate pass/fail summary uploaded alongside the run."""
     verdicts = [o["validation"] for o in outputs if o.get("validation")]
     passed = sum(1 for v in verdicts if v["passed"])
-    mean_score = (
-        sum(v["score"] for v in verdicts) / len(verdicts) if verdicts else None
-    )
+    mean_score = sum(v["score"] for v in verdicts) / len(verdicts) if verdicts else None
     return {
         "items": len(verdicts),
         "passed": passed,

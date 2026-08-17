@@ -16,6 +16,12 @@ from .notebook import (
     notebooks_from_outputs,
     write_notebooks,
 )
+from .artifacts import (
+    PROMPTS_FOLDER,
+    prompt_artifacts_from_outputs,
+    render_prompt_artifact,
+    write_prompts,
+)
 from .response_models import (
     MappingEntry,
     RiskNote,
@@ -40,6 +46,11 @@ __all__ = [
     "document_to_cells",
     "markdown_to_cells",
     "item_cells",
+    # prompt artifacts
+    "PROMPTS_FOLDER",
+    "render_prompt_artifact",
+    "prompt_artifacts_from_outputs",
+    "write_prompts",
 ]
 
 

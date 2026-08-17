@@ -116,9 +116,12 @@ def test_folder_conventions():
     assert paths.validation("MyApp", config=cfg) == (
         f"{BASE}/MyApp/scripts_converted/validation"
     )
-    assert paths.upload_target("MyApp", "claude-sonnet-4-5", "20260804", config=cfg) == (
-        f"{BASE}/MyApp/scripts_converted/claude-sonnet-4-5/20260804"
-    )
+    assert paths.upload_target(
+        "MyApp", "claude-sonnet-4-5", "20260804", config=cfg
+    ) == (f"{BASE}/MyApp/scripts_converted/claude-sonnet-4-5/20260804")
+    assert paths.prompt_target(
+        "MyApp", "claude-sonnet-4-5", "20260804", config=cfg
+    ) == (f"{BASE}/MyApp/scripts_converted/claude-sonnet-4-5/20260804/prompts")
 
 
 def test_paths_strip_the_document_library_prefix(_isolated):
@@ -183,8 +186,7 @@ def test_validation_flag_coercion(raw, expected):
         },
     }
     assert (
-        conv_requests.format_request_item_params(row).is_validation_required
-        is expected
+        conv_requests.format_request_item_params(row).is_validation_required is expected
     )
 
 
@@ -281,9 +283,7 @@ def test_update_request_status_needs_the_list_configured():
 
 def test_source_files_accepts_sas_and_txt():
     folder = f"{BASE}/MyApp/scripts_original"
-    transport = _FakeTransport(
-        files={folder: ["b.sas", "a.txt", "notes.pdf", "c.sas"]}
-    )
+    transport = _FakeTransport(files={folder: ["b.sas", "a.txt", "notes.pdf", "c.sas"]})
     found = sources.source_files("MyApp", client=transport, config=_config())
 
     # .txt counts: scripts arrive from systems that will not hand over a .sas.
@@ -363,6 +363,24 @@ def test_upload_converted_script_leaves_a_flat_type_alone():
 
     assert name == "etl.sql"
     assert content == "SELECT 1;"
+
+
+def test_upload_prompt_file_lands_in_the_runs_prompt_subdirectory():
+    transport = _FakeTransport()
+    path = upload.upload_prompt_file(
+        "MyApp",
+        "item-1.md",
+        "# Effective prompt",
+        "claude-sonnet-4-5",
+        "20260804",
+        client=transport,
+        config=_config(),
+    )
+    folder = f"{BASE}/MyApp/scripts_converted/claude-sonnet-4-5/20260804/prompts"
+
+    assert path == f"{folder}/item-1.md"
+    assert transport.created == [folder]
+    assert transport.uploaded == [(folder, "item-1.md", "# Effective prompt")]
 
 
 def test_upload_validation_file_lands_beside_the_converted_scripts():

@@ -119,6 +119,73 @@ def test_default_catalog_include_unknown_indexes_extra_pdfs(tmp_path):
     assert unknown.role is DocRole.SAS_REFERENCE
 
 
+def test_default_catalog_covers_the_shipped_reference_filenames(tmp_path):
+    expected = {
+        "Base_SAS.pdf": ("base_sas", DocRole.SAS_REFERENCE, 4),
+        "SAS Programmer's Guide - Essentials.pdf": (
+            "programmers_guide",
+            DocRole.SAS_REFERENCE,
+            4,
+        ),
+        "SAS_Functions_and_Call_Routines.pdf": (
+            "functions",
+            DocRole.SAS_REFERENCE,
+            4,
+        ),
+        "SAS_Data_Step.pdf": ("data_step_statements", DocRole.SAS_REFERENCE, 3),
+        "SAS_Format_Informat.pdf": (
+            "formats_informats",
+            DocRole.SAS_REFERENCE,
+            4,
+        ),
+        "SAS_Component_Objects.pdf": (
+            "component_objects",
+            DocRole.SAS_REFERENCE,
+            4,
+        ),
+        "SAS_FedSQL.pdf": ("fedsql", DocRole.SAS_REFERENCE, 4),
+        "SAS_Metadata.pdf": ("metadata_interfaces", DocRole.SAS_REFERENCE, 4),
+        "SAS_Global_Statements.pdf": (
+            "global_statements",
+            DocRole.SAS_REFERENCE,
+            3,
+        ),
+        "SAS_Macro_Language_Reference.pdf": (
+            "macro_language",
+            DocRole.SAS_REFERENCE,
+            4,
+        ),
+        "SAS_Procedures.pdf": ("procedures", DocRole.SAS_REFERENCE, 4),
+        "SAS_Base_Ref_Sheet.pdf": ("base_cheat_sheet", DocRole.CHEAT_SHEET, 1),
+        "Apache-Spark-The-Definitive-Guide-Excerpts-R1.pdf": (
+            "spark_guide",
+            DocRole.TARGET_GUIDE,
+            None,
+        ),
+        "azure-databricks.pdf": (
+            "azure_databricks",
+            DocRole.TARGET_GUIDE,
+            3,
+        ),
+    }
+    for filename in expected:
+        (tmp_path / filename).touch()
+
+    specs = default_catalog(str(tmp_path))
+    by_name = {pathlib.Path(spec.path).name: spec for spec in specs}
+
+    assert set(by_name) == set(expected)
+    for filename, (doc_id, role, level) in expected.items():
+        spec = by_name[filename]
+        assert (spec.doc_id, spec.role, spec.section_level) == (doc_id, role, level)
+    assert by_name["azure-databricks.pdf"].include_sections
+    assert all(
+        not spec.include_sections
+        for name, spec in by_name.items()
+        if name != "azure-databricks.pdf"
+    )
+
+
 # ---------------------------------------------------------------------------
 # CorpusLoader extraction + cache
 # ---------------------------------------------------------------------------

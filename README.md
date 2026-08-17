@@ -134,9 +134,10 @@ not upload notebooks or update request status.
 4. Converts the whole application as **one corpus on one thread**, so
    cross-file dataset and macro dependencies resolve.
 5. Uploads one notebook per source file to
-   `{base}/{app}/scripts_converted/{model}/{timestamp}`, plus validation
-   artefacts under `{base}/{app}/scripts_converted/validation` when the row
-   asks for them.
+   `{base}/{app}/scripts_converted/{model}/{timestamp}` and the effective
+   prompt for every model call under that run's `prompts/` subdirectory, plus
+   validation artefacts under `{base}/{app}/scripts_converted/validation` when
+   the row asks for them.
 6. Writes the row's `Status`.
 
 One row failing does not stop the others; the exit status is non-zero if any

@@ -14,6 +14,7 @@ import logging
 import time
 import warnings
 from collections.abc import Sequence
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
 import app_config
@@ -117,6 +118,20 @@ def _target_fields(choice: "TargetChoice") -> dict[str, Any]:
         "target_language": choice.target.display_name,
         "fallback_reasons": [str(reason) for reason in choice.reasons],
     }
+
+
+def _prompt_message_snapshot(messages: Sequence[BaseMessage]) -> list[dict[str, Any]]:
+    """A JSON-safe copy of the exact messages handed to the LLM client.
+
+    ``content`` deliberately remains structured when a provider-specific block
+    is present (for example Anthropic's ``cache_control`` system block).  The
+    artifact layer can render that content for people without discarding the
+    request metadata that made the prompt effective.
+    """
+    return [
+        {"role": message.type, "content": deepcopy(message.content)}
+        for message in messages
+    ]
 
 
 def _resolve_fallback_target(target: TargetLanguage) -> TargetLanguage | None:
@@ -456,9 +471,7 @@ class SasLLMPipeline:
                     user_instructions
                 )
         if prompt_caching is None:
-            prompt_caching = bool(
-                app_config.llm_client_value("prompt_caching", False)
-            )
+            prompt_caching = bool(app_config.llm_client_value("prompt_caching", False))
         self._prompt_caching = prompt_caching and _is_anthropic_model(model)
         if prompt_caching and not self._prompt_caching:
             logger.warning(
@@ -472,9 +485,7 @@ class SasLLMPipeline:
             f"prompt_caching={'on' if self._prompt_caching else 'off'}"
         )
         if max_merged_chunks < 1:
-            raise ValueError(
-                f"max_merged_chunks must be >= 1, got {max_merged_chunks}"
-            )
+            raise ValueError(f"max_merged_chunks must be >= 1, got {max_merged_chunks}")
         if max_merged_tokens is None:
             max_merged_tokens = app_config.get_typed_value(
                 "pipeline", "max_merged_tokens", int, None
@@ -501,9 +512,7 @@ class SasLLMPipeline:
         self._validator = validator
         # Validation-driven retry/resume is active only with both a validator
         # and a positive budget; otherwise validation stays observe-only.
-        self._validation_retries = (
-            validation_retries if validator is not None else 0
-        )
+        self._validation_retries = validation_retries if validator is not None else 0
 
         # SAS→Databricks dataset renaming, forwarded to both batchers, which
         # apply it as a post-pass after grouping. Sourcing one is the caller's
@@ -525,9 +534,7 @@ class SasLLMPipeline:
 
         if structured_output is None:
             structured_output = bool(
-                app_config.get_typed_value(
-                    "pipeline", "structured_output", bool, True
-                )
+                app_config.get_typed_value("pipeline", "structured_output", bool, True)
             )
         self._requested_structured_output = structured_output
 
@@ -693,9 +700,7 @@ class SasLLMPipeline:
             k = self.window_k
             if k is not None and len(history) > k * 2:
                 dropped = len(history) - k * 2
-                logger.debug(
-                    f"_trim: dropping {dropped} old message(s), window_k={k}"
-                )
+                logger.debug(f"_trim: dropping {dropped} old message(s), window_k={k}")
                 history = history[-(k * 2) :]
             return {
                 "input": inputs["input"],
@@ -704,14 +709,13 @@ class SasLLMPipeline:
             }
 
         prompt_chain = RunnableLambda(_trim) | prompt
-        chain = prompt_chain | self._llm_client.as_runnable()
+        model_runnable = self._llm_client.as_runnable()
         # Structured mode asks for a TranslationDocument; the envelope
         # (raw/parsed/parsing_error) is unpacked in _structured_response so a
         # schema the gateway will not honour degrades to the prose in `raw`
         # instead of failing the run.
-        structured_chain = (
-            prompt_chain
-            | self._llm_client.as_structured_runnable(TranslationDocument)
+        structured_runnable = (
+            self._llm_client.as_structured_runnable(TranslationDocument)
             if self._structured_output
             else None
         )
@@ -760,10 +764,16 @@ class SasLLMPipeline:
                 "instructions": instructions,
                 "summary": summary,
             }
-            if structured_chain is not None and self._structured_output:
+            formatted_prompt = prompt_chain.invoke(payload)
+            prompt_capture = configurable.get("prompt_capture")
+            if isinstance(prompt_capture, list):
+                prompt_capture[:] = _prompt_message_snapshot(
+                    formatted_prompt.to_messages()
+                )
+            if structured_runnable is not None and self._structured_output:
                 try:
                     response = self._structured_response(
-                        structured_chain.invoke(payload), thread_id
+                        structured_runnable.invoke(formatted_prompt), thread_id
                     )
                 except Exception:
                     # The gateway rejected the schema request itself (as
@@ -778,9 +788,9 @@ class SasLLMPipeline:
                         exc_info=True,
                     )
                     self._structured_output = False
-                    response = chain.invoke(payload)
+                    response = model_runnable.invoke(formatted_prompt)
             else:
-                response = chain.invoke(payload)
+                response = model_runnable.invoke(formatted_prompt)
             history.add_messages([input_message, response])
             return {"messages": [response]}
 
@@ -833,7 +843,9 @@ class SasLLMPipeline:
         ``resume`` behaves as in :meth:`run_file`.
         """
         label = source_id or "<inline>"
-        logger.info(f"run_text: source_id='{label}'  chars={len(source)}  resume={resume}")
+        logger.info(
+            f"run_text: source_id='{label}'  chars={len(source)}  resume={resume}"
+        )
         result = self.chunker.chunk_text(source, source_id=source_id)
         batch_result = self.batcher.batch(result)
         tid = thread_id or self._default_thread_id([result.source_id or label])
@@ -936,9 +948,7 @@ class SasLLMPipeline:
         forked history: rewind, edit, re-run — without a checkpointer.
         Returns the number of messages copied.
         """
-        copied = self._ledger.fork(
-            src_thread_id, dst_thread_id, upto_items=upto_items
-        )
+        copied = self._ledger.fork(src_thread_id, dst_thread_id, upto_items=upto_items)
         # Short-term notes travel with the branch: an exception the source
         # conversation was granted still holds on a rewind of it, and losing
         # it would silently change what the fork is allowed to do. (The
@@ -1266,9 +1276,7 @@ class SasLLMPipeline:
         # there is more than one member to tell apart. On a singleton every
         # label would name the same chunk, which is noise, so pass None and
         # render exactly what an unattributed build does.
-        attribution = (
-            _attribution_for_item(item) if len(item.chunks) > 1 else None
-        )
+        attribution = _attribution_for_item(item) if len(item.chunks) > 1 else None
         guidance = self._prompt_builder.build_from_picks(
             picks, constructs, attribution=attribution
         )
@@ -1314,7 +1322,7 @@ class SasLLMPipeline:
         base_instructions: list[BaseMessage],
         retrieval_context: Sequence[str] = (),
         item_target: TargetLanguage | None = None,
-    ) -> tuple[str, dict[str, Any] | None, Any, int]:
+    ) -> tuple[str, dict[str, Any] | None, Any, int, list[dict[str, Any]]]:
         """Generate (and, if enabled, iteratively repair) one item's answer.
 
         Sends *user_msg* on *thread_id*; when a validator is attached the
@@ -1326,7 +1334,9 @@ class SasLLMPipeline:
         :meth:`KVChatMessageHistory.truncate_to`) and re-prompts with a
         corrective note, up to the retry budget, so exactly one — the final —
         (human, AI) pair persists per item. Returns
-        ``(response_text, document, CaseResult | None, attempts)``, where
+        ``(response_text, document, CaseResult | None, attempts,
+        prompt_messages)``, where *prompt_messages* is the final accepted
+        attempt's fully formatted message list and
         *document* is the structured
         :class:`~pipeline.response_models.TranslationDocument` dump when
         structured output produced one and ``None`` otherwise; the
@@ -1338,6 +1348,7 @@ class SasLLMPipeline:
         history = self._memory.get_thread(thread_id)
         max_attempts = 1 + self._validation_retries
         feedback: list[BaseMessage] = []
+        prompt_messages: list[dict[str, Any]] = []
         attempt = 0
         while True:
             attempt += 1
@@ -1348,6 +1359,7 @@ class SasLLMPipeline:
                 "configurable": {
                     "thread_id": thread_id,
                     "instructions": base_instructions + feedback,
+                    "prompt_capture": prompt_messages,
                 }
             }
             state = self._graph.invoke({"messages": [HumanMessage(user_msg)]}, cfg)
@@ -1385,7 +1397,7 @@ class SasLLMPipeline:
                         f"thread={thread_id}"
                     )
                 self._extract_memories(thread_id, user_msg, str(ai_text))
-                return ai_text, document, result, attempt
+                return ai_text, document, result, attempt, prompt_messages
 
             # Reached only when `passed` is False, which needs a validator to
             # have produced a verdict — so `result` is set here. Spelled out
@@ -1443,8 +1455,8 @@ class SasLLMPipeline:
         completed_validations: dict[str, dict[str, Any]] = {}
         recovered: list[BaseMessage] = []
         if resume:
-            completed, completed_validations, recovered = (
-                self._ledger.resume_state(items, thread_id)
+            completed, completed_validations, recovered = self._ledger.resume_state(
+                items, thread_id
             )
 
         logger.info(
@@ -1496,11 +1508,14 @@ class SasLLMPipeline:
                         "item_id": item_id,
                         "chunk_ids": item.chunk_ids,
                         "chunk_sources": {
-                            c.chunk_id: c.source_id or "<inline>"
-                            for c in item.chunks
+                            c.chunk_id: c.source_id or "<inline>" for c in item.chunks
                         },
                         "source_files": item.source_files,
                         "prompt": user_msg,
+                        # A resumed item was not sent during this process.  Do
+                        # not claim a freshly reconstructed message list is the
+                        # historical request that produced its stored answer.
+                        "prompt_messages": None,
                         "retrieval_context": retrieval_context,
                         "response": RunLedger.recovered_response(recovered, fact),
                         "document": RunLedger.recovered_document(recovered, fact),
@@ -1525,15 +1540,17 @@ class SasLLMPipeline:
                 # repair — the answer. Scoring, the retry loop, and the
                 # roll-back of superseded attempts all live in _answer_item;
                 # exactly one (human, AI) pair persists per item.
-                ai_text, document, result, attempts = self._answer_item(
-                    item,
-                    idx,
-                    total,
-                    thread_id=thread_id,
-                    user_msg=user_msg,
-                    base_instructions=base_instructions,
-                    retrieval_context=retrieval_context,
-                    item_target=choice.target,
+                ai_text, document, result, attempts, prompt_messages = (
+                    self._answer_item(
+                        item,
+                        idx,
+                        total,
+                        thread_id=thread_id,
+                        user_msg=user_msg,
+                        base_instructions=base_instructions,
+                        retrieval_context=retrieval_context,
+                        item_target=choice.target,
+                    )
                 )
             except Exception as exc:
                 logger.error(
@@ -1573,11 +1590,11 @@ class SasLLMPipeline:
                     "item_id": item_id,
                     "chunk_ids": item.chunk_ids,
                     "chunk_sources": {
-                        c.chunk_id: c.source_id or "<inline>"
-                        for c in item.chunks
+                        c.chunk_id: c.source_id or "<inline>" for c in item.chunks
                     },
                     "source_files": item.source_files,
                     "prompt": user_msg,
+                    "prompt_messages": prompt_messages,
                     "retrieval_context": retrieval_context,
                     "response": ai_text,
                     "document": document,

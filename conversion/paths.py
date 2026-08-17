@@ -7,6 +7,7 @@ Four conventions, all relative to
     {base}/{application}/scripts_converted
     {base}/{application}/scripts_converted/validation
     {base}/{application}/scripts_converted/{model}/{timestamp}   <- upload
+    {base}/{application}/scripts_converted/{model}/{timestamp}/prompts
 
 They are functions rather than f-strings at the call sites so the layout is
 stated once: a deployment that renames a folder changes it here and nowhere
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 ORIGINAL_FOLDER = "scripts_original"
 CONVERTED_FOLDER = "scripts_converted"
 VALIDATION_FOLDER = "validation"
+PROMPTS_FOLDER = "prompts"
 
 
 def original_scripts(
@@ -70,4 +72,17 @@ def upload_target(
     """
     return resolve_config(config).drive_path(
         application, CONVERTED_FOLDER, model, timestamp
+    )
+
+
+def prompt_target(
+    application: str,
+    model: str,
+    timestamp: str,
+    *,
+    config: SharePointConfig | None = None,
+) -> str:
+    """Where one run's effective-prompt Markdown artifacts land."""
+    return resolve_config(config).drive_path(
+        application, CONVERTED_FOLDER, model, timestamp, PROMPTS_FOLDER
     )

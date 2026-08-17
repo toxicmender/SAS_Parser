@@ -168,7 +168,9 @@ def test_attribution_covers_every_key_the_batch_reports():
     """No construct may be selected on and then be unattributable — a batch
     rollup is by definition the union of its members."""
     batch = _batch(
-        _meta_chunk("c1", data_step_statements=["merge"], recognized_functions=["intnx"]),
+        _meta_chunk(
+            "c1", data_step_statements=["merge"], recognized_functions=["intnx"]
+        ),
         _meta_chunk("c2", kind=SasChunkKind.PROC_STEP, proc_name="sql"),
     )
     attribution = _attribution_for_item(batch)
@@ -285,7 +287,9 @@ def test_sasbatch_aggregates_member_metadata_as_sets():
         _meta_chunk("c1", recognized_functions=["intck", "intnx"]),
         _meta_chunk("c2", recognized_functions=["intnx"], component_objects=["hash"]),
         _meta_chunk("c3", kind=SasChunkKind.PROC_STEP, proc_name="sql"),
-        _meta_chunk("c4", recognized_call_routines=["symput"], symput_scope_hazard=True),
+        _meta_chunk(
+            "c4", recognized_call_routines=["symput"], symput_scope_hazard=True
+        ),
     )
     assert batch.recognized_functions == {"intck", "intnx"}  # deduped union
     assert batch.recognized_call_routines == {"symput"}
@@ -326,17 +330,16 @@ def test_instruction_injected_only_when_construct_present_in_batch():
     builder = PromptBuilder([], user_instructions=rules)
 
     intck_batch = _batch(_meta_chunk("c1", recognized_functions=["intck"]))
-    out = builder.build(
-        _query_for_item(intck_batch), _constructs_for_item(intck_batch)
-    )
+    out = builder.build(_query_for_item(intck_batch), _constructs_for_item(intck_batch))
     assert out is not None
     assert "INTCK rule" in out
     assert "INTNX rule" not in out  # not used by this batch -> not injected
 
     other_batch = _batch(_meta_chunk("c2", recognized_functions=["put"]))
-    assert builder.build(
-        _query_for_item(other_batch), _constructs_for_item(other_batch)
-    ) is None  # neither rule's construct present -> no guidance at all
+    assert (
+        builder.build(_query_for_item(other_batch), _constructs_for_item(other_batch))
+        is None
+    )  # neither rule's construct present -> no guidance at all
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +406,9 @@ def test_kind_and_meta_gate_instruction_injection_end_to_end():
 def test_guidance_is_prompted():
     llm = _RecordingChatModel()
     pipeline = _pipeline(llm, PromptBuilder(_guidance_corpus()))
-    pipeline._process(items=[_batch(_intnx_chunk())], diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(
+        items=[_batch(_intnx_chunk())], diagnostics=[], thread_id="run::etl.sas"
+    )
 
     prompted = "\n".join(str(m.content) for m in llm.prompts[0])
     assert GUIDANCE_MARKER in prompted  # guidance reached the LLM
@@ -412,7 +417,9 @@ def test_guidance_is_prompted():
 def test_guidance_is_not_persisted_to_history():
     llm = _RecordingChatModel()
     pipeline = _pipeline(llm, PromptBuilder(_guidance_corpus()))
-    pipeline._process(items=[_batch(_intnx_chunk())], diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(
+        items=[_batch(_intnx_chunk())], diagnostics=[], thread_id="run::etl.sas"
+    )
 
     stored = pipeline.get_thread_messages("run::etl.sas")
     stored_text = "\n".join(str(m.content) for m in stored)
@@ -423,7 +430,9 @@ def test_guidance_is_not_persisted_to_history():
 def test_no_prompt_builder_means_no_guidance_message():
     llm = _RecordingChatModel()
     pipeline = _pipeline(llm, None)
-    pipeline._process(items=[_batch(_intnx_chunk())], diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(
+        items=[_batch(_intnx_chunk())], diagnostics=[], thread_id="run::etl.sas"
+    )
 
     # system + (empty history) + (empty instructions) + human == 2 messages.
     assert len(llm.prompts[0]) == 2
@@ -447,7 +456,9 @@ def test_user_instructions_without_builder_prompted_not_persisted():
         llm=llm,
         prompting=PromptingSetup(user_instructions=f"## Output rules\n{USER_MARKER}."),
     )
-    pipeline._process(items=[_batch(_intnx_chunk())], diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(
+        items=[_batch(_intnx_chunk())], diagnostics=[], thread_id="run::etl.sas"
+    )
 
     # Prompted: system + instructions + human.
     assert len(llm.prompts[0]) == 3
@@ -466,9 +477,14 @@ def test_user_instructions_fold_into_given_builder():
         llm_config=LLMClientConfig(model="unused-because-llm-injected"),
         memory_setup=MemorySetup(memory=MemoryHub()),
         llm=llm,
-        prompting=PromptingSetup(prompt_builder=PromptBuilder(_guidance_corpus()), user_instructions=f"## Output rules\n{USER_MARKER}."),
+        prompting=PromptingSetup(
+            prompt_builder=PromptBuilder(_guidance_corpus()),
+            user_instructions=f"## Output rules\n{USER_MARKER}.",
+        ),
     )
-    pipeline._process(items=[_batch(_intnx_chunk())], diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(
+        items=[_batch(_intnx_chunk())], diagnostics=[], thread_id="run::etl.sas"
+    )
 
     instructions_msg = str(llm.prompts[0][1].content)
     assert USER_MARKER in instructions_msg  # operator rules present...
@@ -488,9 +504,13 @@ def test_pipeline_level_instructions_replace_builders_own():
         llm_config=LLMClientConfig(model="unused-because-llm-injected"),
         memory_setup=MemorySetup(memory=MemoryHub()),
         llm=llm,
-        prompting=PromptingSetup(prompt_builder=builder, user_instructions=f"## New\n{USER_MARKER}."),
+        prompting=PromptingSetup(
+            prompt_builder=builder, user_instructions=f"## New\n{USER_MARKER}."
+        ),
     )
-    pipeline._process(items=[_batch(_intnx_chunk())], diagnostics=[], thread_id="run::etl.sas")
+    pipeline._process(
+        items=[_batch(_intnx_chunk())], diagnostics=[], thread_id="run::etl.sas"
+    )
 
     prompted = "\n".join(str(m.content) for m in llm.prompts[0])
     assert USER_MARKER in prompted
@@ -507,7 +527,9 @@ def test_conditional_rule_scoped_end_to_end():
         llm_config=LLMClientConfig(model="unused-because-llm-injected"),
         memory_setup=MemorySetup(memory=MemoryHub()),
         llm=llm,
-        prompting=PromptingSetup(user_instructions=f"## [when: function:intnx] Date rules\n{USER_MARKER}."),
+        prompting=PromptingSetup(
+            user_instructions=f"## [when: function:intnx] Date rules\n{USER_MARKER}."
+        ),
     )
     intnx = _intnx_chunk()
     print_text = "proc print data=work.x; run;"
@@ -614,7 +636,8 @@ def test_irrelevant_item_injects_no_guidance():
 def test_outputs_carry_the_prompt_and_the_retrieved_chunks():
     """The picks that produced the guidance block also ride out on the output
     dict, so validation scores exactly the context the model was given."""
-    pipeline = _pipeline(_RecordingChatModel(), PromptBuilder(_guidance_corpus()))
+    llm = _RecordingChatModel()
+    pipeline = _pipeline(llm, PromptBuilder(_guidance_corpus()))
     (out,) = pipeline._process(
         items=[_batch(_intnx_chunk())], diagnostics=[], thread_id="run::etl.sas"
     )
@@ -623,6 +646,17 @@ def test_outputs_carry_the_prompt_and_the_retrieved_chunks():
     # The prompt is the item message the model actually answered.
     assert "intnx" in out["prompt"]
     assert "## Batch members" in out["prompt"]
+    # The audit artifact receives the complete, final request rather than only
+    # the raw item message above: system policy + guidance + human input.
+    assert out["prompt_messages"] == [
+        {"role": message.type, "content": message.content} for message in llm.prompts[0]
+    ]
+    assert [message["role"] for message in out["prompt_messages"]] == [
+        "system",
+        "system",
+        "human",
+    ]
+    assert GUIDANCE_MARKER in str(out["prompt_messages"][1]["content"])
 
 
 def test_outputs_carry_empty_retrieval_context_without_a_prompt_builder():
@@ -632,6 +666,10 @@ def test_outputs_carry_empty_retrieval_context_without_a_prompt_builder():
     )
     assert out["retrieval_context"] == []
     assert out["prompt"]
+    assert [message["role"] for message in out["prompt_messages"]] == [
+        "system",
+        "human",
+    ]
 
 
 def test_irrelevant_item_still_reports_what_was_retrieved():
