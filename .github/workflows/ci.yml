@@ -70,7 +70,7 @@ jobs:
           scripts/smoke_wheel.py scripts/v2_sas_test_adapter.py
           tests/test_v2_architecture.py tests/test_v2_contracts.py
           tests/test_v2_ports.py tests/test_v2_sas_core.py
-          tests/test_v2_sas_parity.py
+          tests/test_v2_sas_parity.py tests/test_v2_responses.py
           --output-format=github
 
   types:

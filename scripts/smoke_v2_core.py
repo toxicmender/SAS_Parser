@@ -8,7 +8,12 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from sas_migrate.core.responses import ResponseEnvelope, TranslationDocument
+from sas_migrate.core.responses import (
+    ResponseEnvelope,
+    ResponseTargetValidator,
+    TranslationDocument,
+    normalize_raw_response,
+)
 from sas_migrate.core.runs import RunEvent
 from sas_migrate.core.sas import SasSemanticChunker
 from sas_migrate.core.targets import ResolvedTarget, resolve_local_target
@@ -28,6 +33,8 @@ def main() -> int:
         raise RuntimeError("a v2 core wire contract lost schema_version=2")
     if resolve_local_target().target.value != "spark_sql":
         raise RuntimeError("the v2 default target is not Spark SQL")
+    if not callable(normalize_raw_response) or not callable(ResponseTargetValidator):
+        raise TypeError("the v2 response acceptance surface is not importable")
     parsed = SasSemanticChunker(timeout=None).chunk_text("data work.x; x=1; run;")
     if len(parsed.chunks) != 1:
         raise RuntimeError("v2 SAS core failed its dependency-light parse smoke")
