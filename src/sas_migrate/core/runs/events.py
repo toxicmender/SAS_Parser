@@ -18,6 +18,8 @@ class RunEventType(StrEnum):
     ATTEMPT_COMPLETED = "attempt_completed"
     ITEM_ACCEPTED = "item_accepted"
     ITEM_FAILED = "item_failed"
+    ITEM_REWOUND = "item_rewound"
+    RUN_FORKED = "run_forked"
     RUN_COMPLETED = "run_completed"
     RUN_FAILED = "run_failed"
 

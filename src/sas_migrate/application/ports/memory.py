@@ -23,3 +23,19 @@ class MemoryPort(Protocol):
         item_id: ItemId,
         response: ResponseEnvelope,
     ) -> None: ...
+
+    async def forget_accepted(
+        self,
+        run_id: RunId,
+        thread_id: ThreadId,
+        item_ids: tuple[ItemId, ...],
+    ) -> None: ...
+
+    async def fork_accepted(
+        self,
+        source_run_id: RunId,
+        source_thread_id: ThreadId,
+        destination_run_id: RunId,
+        destination_thread_id: ThreadId,
+        item_ids: tuple[ItemId, ...],
+    ) -> None: ...
