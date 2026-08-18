@@ -2,6 +2,7 @@
 
 from .artifact_repository import ArtifactRepository, ArtifactWrite
 from .clock import Clock
+from .conversation_memory import ConversationMemoryRepository, MemoryClassifier
 from .credential_provider import CredentialProvider, CredentialValue
 from .knowledge import KnowledgeRepository
 from .llm import LLMPort, ProviderResponse, ProviderTokenUsage
@@ -15,10 +16,12 @@ __all__ = [
     "ArtifactRepository",
     "ArtifactWrite",
     "Clock",
+    "ConversationMemoryRepository",
     "CredentialProvider",
     "CredentialValue",
     "KnowledgeRepository",
     "LLMPort",
+    "MemoryClassifier",
     "MemoryPort",
     "ProviderResponse",
     "ProviderTokenUsage",
