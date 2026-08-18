@@ -19,6 +19,7 @@ REQUIRED_MODULES = (
     "main",
     "sas_migrate",
     "sas_migrate.core",
+    "sas_migrate.core.sas",
     "pipeline",
     "prompt_builder",
     "complexity",
@@ -35,6 +36,9 @@ REQUIRED_DISTRIBUTION_FILES = (
     "prompt_builder/instructions/pyspark/overview.md",
     "prompt_builder/instructions/sparksql/overview.md",
     "sas_migrate/resources/contracts/schema-v2.json",
+    "sas_migrate/core/sas/chunking.py",
+    "sas_migrate/core/sas/metadata/extraction.py",
+    "sas_migrate/core/sas/dependencies/discovery.py",
 )
 
 
@@ -48,9 +52,12 @@ def _is_inside_repository(path: pathlib.Path) -> bool:
 
 def main() -> int:
     distribution = importlib.metadata.distribution("sas-parser")
-    installed_files = {str(path).replace("\\", "/") for path in distribution.files or ()}
+    installed_files: set[str] = {
+        str(path).replace("\\", "/") for path in distribution.files or ()
+    }
 
-    missing_files = sorted(set(REQUIRED_DISTRIBUTION_FILES) - installed_files)
+    required_files: set[str] = set(REQUIRED_DISTRIBUTION_FILES)
+    missing_files = sorted(required_files - installed_files)
     if missing_files:
         raise RuntimeError(f"wheel is missing runtime files: {missing_files}")
 

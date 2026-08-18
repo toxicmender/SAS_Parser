@@ -13,6 +13,16 @@ PACKAGE_ROOT = ROOT / "src" / "sas_migrate"
 TOP_LEVEL_AREAS = frozenset(
     {"core", "application", "adapters", "config", "observability", "cli"}
 )
+SAS_CORE_FORBIDDEN_IMPORTS = (
+    "app_config",
+    "conversion.sharepoint",
+    "langchain",
+    "llm_client",
+    "memory",
+    "msgraph",
+    "openai",
+    "sharepoint",
+)
 
 
 def _module_name(path: pathlib.Path) -> str:
@@ -23,7 +33,7 @@ def _module_name(path: pathlib.Path) -> str:
     return ".".join(("sas_migrate", *parts))
 
 
-def _absolute_imports(path: pathlib.Path) -> set[str]:
+def _imports(path: pathlib.Path) -> set[str]:
     tree = ast.parse(path.read_text("utf-8"), filename=str(path))
     module_parts = _module_name(path).split(".")
     package_parts = module_parts if path.name == "__init__.py" else module_parts[:-1]
@@ -42,7 +52,11 @@ def _absolute_imports(path: pathlib.Path) -> set[str]:
                 imports.add(".".join(imported_parts))
             elif node.module:
                 imports.add(node.module)
-    return {name for name in imports if name.startswith("sas_migrate.")}
+    return imports
+
+
+def _absolute_imports(path: pathlib.Path) -> set[str]:
+    return {name for name in _imports(path) if name.startswith("sas_migrate.")}
 
 
 def architecture_graph() -> dict[str, set[str]]:
@@ -83,6 +97,12 @@ def violations() -> list[str]:
         failures.append(f"core imports forbidden top-level area {dependency}")
     if "adapters" in graph["application"]:
         failures.append("application imports concrete adapters")
+
+    for path in (PACKAGE_ROOT / "core" / "sas").rglob("*.py"):
+        for imported in sorted(_imports(path)):
+            if imported.startswith(SAS_CORE_FORBIDDEN_IMPORTS):
+                relative = path.relative_to(ROOT)
+                failures.append(f"{relative} imports forbidden SAS-core dependency {imported}")
 
     adapter_edges: defaultdict[str, set[str]] = defaultdict(set)
     for path in (PACKAGE_ROOT / "adapters").rglob("*.py"):
