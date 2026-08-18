@@ -284,3 +284,22 @@ def test_schema_resource_is_bundled_and_versioned() -> None:
         "TranslationRunOutcome",
         "ArtifactLocator",
     ]
+    assert schema["x-contract-families"]["knowledge"] == [
+        "DocumentExtraction",
+        "KnowledgeSource",
+        "KnowledgeChunk",
+        "UserRule",
+        "RetrievalQuery",
+        "KnowledgeSelection",
+    ]
+    assert schema["x-contract-families"]["memory"] == [
+        "ChatMessage",
+        "TaskPolicySnapshot",
+        "ThreadNote",
+        "RollingSummary",
+        "PolicyProposal",
+        "MemoryAuditEvent",
+        "MemorySnapshot",
+        "MemoryContextResult",
+        "ExtractionResult",
+    ]

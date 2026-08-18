@@ -19,7 +19,10 @@ REQUIRED_MODULES = (
     "main",
     "sas_migrate",
     "sas_migrate.application",
+    "sas_migrate.application.knowledge",
+    "sas_migrate.application.memory",
     "sas_migrate.application.translation",
+    "sas_migrate.adapters.memory",
     "sas_migrate.core",
     "sas_migrate.core.responses",
     "sas_migrate.core.sas",
@@ -58,6 +61,15 @@ REQUIRED_DISTRIBUTION_FILES = (
     "sas_migrate/core/tokens/audit.py",
     "sas_migrate/core/tokens/counting.py",
     "sas_migrate/application/ports/run_events.py",
+    "sas_migrate/application/ports/knowledge.py",
+    "sas_migrate/application/ports/conversation_memory.py",
+    "sas_migrate/application/knowledge/ingestion.py",
+    "sas_migrate/application/knowledge/retrieval.py",
+    "sas_migrate/application/memory/services.py",
+    "sas_migrate/adapters/knowledge/pymupdf.py",
+    "sas_migrate/adapters/memory/in_memory.py",
+    "sas_migrate/adapters/memory/delta.py",
+    "sas_migrate/adapters/memory/delta_operations.py",
 )
 
 

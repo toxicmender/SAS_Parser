@@ -3,6 +3,25 @@
   "$id": "urn:sas-migrate:contracts:v2",
   "title": "SAS Migrate v2 contract resources",
   "x-contract-families": {
+    "knowledge": [
+      "DocumentExtraction",
+      "KnowledgeSource",
+      "KnowledgeChunk",
+      "UserRule",
+      "RetrievalQuery",
+      "KnowledgeSelection"
+    ],
+    "memory": [
+      "ChatMessage",
+      "TaskPolicySnapshot",
+      "ThreadNote",
+      "RollingSummary",
+      "PolicyProposal",
+      "MemoryAuditEvent",
+      "MemorySnapshot",
+      "MemoryContextResult",
+      "ExtractionResult"
+    ],
     "responses": [
       "ResponseEnvelope",
       "TranslationDocument"

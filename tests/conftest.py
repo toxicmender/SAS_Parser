@@ -22,6 +22,7 @@ doing nothing.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import shutil
 import sys
@@ -75,16 +76,31 @@ def delta_spark(tmp_path_factory):
     perfectly and fails every catalog statement, which is how an entirely broken
     Delta backend once sat behind a green suite reporting "skipped".
     """
-    pytest.importorskip("pyspark")
-    pytest.importorskip("delta", reason="delta-spark not installed")
+    require_delta = os.environ.get("REQUIRE_DELTA_TESTS") == "1"
+    if require_delta:
+        try:
+            __import__("pyspark")
+            __import__("delta")
+        except ImportError as exc:
+            pytest.fail(
+                "REQUIRE_DELTA_TESTS=1 but the Spark/Delta runtime is missing: "
+                f"{exc}"
+            )
+    else:
+        pytest.importorskip("pyspark")
+        pytest.importorskip("delta", reason="delta-spark not installed")
     # delta-spark isn't a project dependency (installed only where Delta is
     # actually exercised); the importorskip above guards this at runtime.
-    from delta import configure_spark_with_delta_pip  # pyright: ignore[reportMissingImports]
+    from delta import (
+        configure_spark_with_delta_pip,  # pyright: ignore[reportMissingImports]
+    )
     from pyspark.sql import SparkSession
 
     # Only a genuinely absent JVM is a skip. Anything else — delta imports,
     # java is here, and the session still will not build — is a real defect.
     if shutil.which("java") is None:
+        if require_delta:
+            pytest.fail("REQUIRE_DELTA_TESTS=1 but no JVM is available on PATH")
         pytest.skip("no JVM on PATH; Spark cannot start")
 
     warehouse = tmp_path_factory.mktemp("delta-warehouse")

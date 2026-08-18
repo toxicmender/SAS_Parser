@@ -72,6 +72,8 @@ jobs:
           tests/test_v2_ports.py tests/test_v2_sas_core.py
           tests/test_v2_sas_parity.py tests/test_v2_responses.py
           tests/test_v2_tokens.py tests/test_v2_translation.py
+          tests/test_v2_knowledge.py tests/test_v2_memory.py
+          tests/test_v2_memory_delta.py
           --output-format=github
 
   types:
@@ -186,3 +188,35 @@ jobs:
             junit.xml
             coverage.xml
           if-no-files-found: error
+
+  delta-memory:
+    name: Delta memory contracts (no skips)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install locked Spark environment
+        run: uv sync --locked --extra dev --extra spark
+
+      # Delta remains deployment-only rather than a default project extra.
+      # Install the Spark-4.1 line explicitly and let the live catalog probe
+      # reject an incompatible JVM pairing before any contract can be skipped.
+      - name: Install Delta Lake test runtime
+        run: uv pip install --python .venv/bin/python "delta-spark==4.1.0"
+
+      - name: Run real Delta memory contracts
+        env:
+          REQUIRE_DELTA_TESTS: "1"
+        run: >
+          .venv/bin/python -m pytest -v
+          tests/test_v2_memory_delta.py tests/test_backend_contract.py
