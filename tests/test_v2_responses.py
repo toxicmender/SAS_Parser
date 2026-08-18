@@ -191,6 +191,35 @@ def test_structured_syntax_error_is_rejected(
     assert TargetIssueCode.SYNTAX_ERROR in _codes(envelope.validation)
 
 
+def test_spark_sql_validation_uses_the_registered_databricks_dialect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlglot
+
+    reads: list[str | None] = []
+    real_parse = sqlglot.parse
+
+    def parse(source: str, *, read: str | None = None):
+        reads.append(read)
+        return real_parse(source, read=read)
+
+    monkeypatch.setattr(sqlglot, "parse", parse)
+    envelope = ResponseAcceptanceService().envelope(
+        ProviderResponse(
+            raw_message="structured",
+            structured_document=_document(
+                TargetId.SPARK_SQL,
+                "sql",
+                "SELECT * FROM source",
+            ),
+        ),
+        resolve_local_target("sql"),
+        known_chunk_ids={"chunk-1"},
+    )
+    assert envelope.validation.valid
+    assert reads == ["databricks"]
+
+
 @pytest.mark.parametrize(
     ("target_name", "target_id", "language", "source", "_bad", "_foreign"),
     CASES,

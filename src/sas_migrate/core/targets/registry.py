@@ -27,6 +27,7 @@ SPARK_SQL = TargetDefinition(
     ),
     canonical_language="sql",
     fence="sql",
+    sqlglot_dialect="databricks",
 )
 KNOWN_TARGETS: tuple[TargetDefinition, ...] = (PYSPARK, SPARK_SQL)
 

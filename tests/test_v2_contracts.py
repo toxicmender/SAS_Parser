@@ -25,6 +25,8 @@ from sas_migrate.core.responses import (
 )
 from sas_migrate.core.runs import RunEvent, RunEventType
 from sas_migrate.core.targets import (
+    PYSPARK,
+    SPARK_SQL,
     CompatibilityAssessment,
     TargetId,
     TargetSource,
@@ -53,6 +55,11 @@ def test_target_resolution_canonicalizes_spark_sql(value: str) -> None:
     assert resolved.target is TargetId.SPARK_SQL
     assert resolved.canonical_language == "sql"
     assert resolved.source is TargetSource.EXPLICIT
+
+
+def test_v2_registry_pins_sqlglot_to_databricks() -> None:
+    assert SPARK_SQL.sqlglot_dialect == "databricks"
+    assert PYSPARK.sqlglot_dialect is None
 
 
 @pytest.mark.parametrize("value", ["scala", "Spark Scala", "spark-scala", "java"])

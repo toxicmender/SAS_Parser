@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import Field, model_validator
 
@@ -34,6 +35,15 @@ class TargetDefinition(ContractModel):
     aliases: frozenset[str]
     canonical_language: str
     fence: str
+    sqlglot_dialect: Literal["databricks"] | None = None
+
+    @model_validator(mode="after")
+    def validate_sqlglot_dialect(self) -> TargetDefinition:
+        if self.target is TargetId.SPARK_SQL and self.sqlglot_dialect != "databricks":
+            raise ValueError("Spark SQL must use the Databricks SQLGlot dialect")
+        if self.target is TargetId.PYSPARK and self.sqlglot_dialect is not None:
+            raise ValueError("PySpark cannot declare a SQLGlot dialect")
+        return self
 
 
 class ResolvedTarget(VersionedContract):

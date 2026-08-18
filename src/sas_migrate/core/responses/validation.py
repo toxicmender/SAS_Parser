@@ -6,6 +6,7 @@ import ast
 from collections.abc import Collection
 
 from ..targets.models import ResolvedTarget
+from ..targets.registry import SPARK_SQL
 from ..targets.validation import (
     ResponseValidationResult,
     TargetIssueCode,
@@ -23,11 +24,15 @@ def _syntax_error(language: str, source: str) -> str | None:
             return f"{exc.msg} (line {exc.lineno})"
         return None
 
+    dialect = SPARK_SQL.sqlglot_dialect
+    if dialect is None:  # guarded by TargetDefinition, retained for type narrowing
+        raise RuntimeError("Spark SQL has no registered SQLGlot dialect")
+
     import sqlglot
     from sqlglot.errors import ParseError
 
     try:
-        statements = sqlglot.parse(source, read="databricks")
+        statements = sqlglot.parse(source, read=dialect)
     except ParseError as exc:
         return f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
     if not statements or any(statement is None for statement in statements):
