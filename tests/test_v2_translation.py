@@ -7,21 +7,33 @@ import pathlib
 import sys
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 SRC = pathlib.Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
 from sas_migrate.application import (
+    BudgetedResponseAttemptService,
     NotebookTranslation,
     PromptAssembler,
     PromptContext,
     RunStateService,
+    TokenAccountingService,
+    TokenAuditPersistenceService,
+    TokenBudgetEnforcer,
+    TranslateCorpus,
+    TranslateCorpusRequest,
     TranslationArtifactService,
     TranslationItem,
     TranslationPromptBuilder,
     render_effective_prompt,
     render_notebooks,
 )
-from sas_migrate.application.ports import ArtifactWrite
+from sas_migrate.application.ports import (
+    ArtifactWrite,
+    ProviderResponse,
+    ProviderTokenUsage,
+)
 from sas_migrate.core.responses import (
     ResponseEnvelope,
     ResponseMode,
@@ -29,14 +41,16 @@ from sas_migrate.core.responses import (
     TranslationCellKind,
     TranslationDocument,
 )
-from sas_migrate.core.runs import ItemStatus, RunEvent, RunStatus
+from sas_migrate.core.runs import ItemStatus, RunEvent, RunEventType, RunStatus
 from sas_migrate.core.sas import SasBatch, SasChunk, SasChunkKind
-from sas_migrate.core.targets import TargetId, resolve_local_target
+from sas_migrate.core.targets import ResolvedTarget, TargetId, resolve_local_target
 from sas_migrate.core.targets.validation import ResponseValidationResult
 from sas_migrate.core.tokens import (
     CallTokenRecord,
     MessageRole,
+    PromptAssembly,
     PromptComponentDraft,
+    TokenBudgetPolicy,
     TokenCategory,
     TokenEstimator,
 )
@@ -70,10 +84,13 @@ class _Events:
 class _Memory:
     def __init__(self) -> None:
         self.values: dict[tuple[str, str, str], ResponseEnvelope] = {}
+        self.remember_count = 0
+        self.read_count = 0
 
     async def accepted_response(
         self, run_id: str, thread_id: str, item_id: str
     ) -> ResponseEnvelope | None:
+        self.read_count += 1
         return self.values.get((run_id, thread_id, item_id))
 
     async def remember_accepted(
@@ -83,6 +100,7 @@ class _Memory:
         item_id: str,
         response: ResponseEnvelope,
     ) -> None:
+        self.remember_count += 1
         self.values[(run_id, thread_id, item_id)] = response
 
     async def forget_accepted(
@@ -129,6 +147,22 @@ class _Artifacts:
     async def write(self, run_id: str, artifact: ArtifactWrite) -> str:
         self.values.append(artifact)
         return f"memory://{run_id}/{artifact.artifact_id}"
+
+
+class _LLM:
+    def __init__(self, responses: list[ProviderResponse]) -> None:
+        self.responses = responses
+        self.calls: list[tuple[int, PromptAssembly, TargetId]] = []
+
+    async def invoke(
+        self,
+        prompt: PromptAssembly,
+        target: ResolvedTarget,
+        *,
+        attempt: int,
+    ) -> ProviderResponse:
+        self.calls.append((attempt, prompt, target.target))
+        return self.responses.pop(0)
 
 
 def _chunk(chunk_id: str, source_id: str) -> SasChunk:
@@ -203,6 +237,75 @@ def _prompt_builder() -> TranslationPromptBuilder:
         estimator="test",
     )
     return TranslationPromptBuilder(PromptAssembler(counter))
+
+
+def _document(target: TargetId) -> TranslationDocument:
+    is_sql = target is TargetId.SPARK_SQL
+    return TranslationDocument(
+        target=target,
+        analysis="Preserve row semantics.",
+        cells=(
+            TranslationCell(
+                kind=TranslationCellKind.CODE,
+                source="SELECT 1" if is_sql else "result = spark.range(1)",
+                language="sql" if is_sql else "python",
+                chunk_id="chunk-1",
+            ),
+        ),
+    )
+
+
+def _translation_service(
+    llm: _LLM,
+) -> tuple[TranslateCorpus, _Events, _Memory, _TokenRecords, _Artifacts]:
+    events = _Events()
+    memory = _Memory()
+    records = _TokenRecords()
+    artifacts = _Artifacts()
+    clock = _Clock()
+    counter = TokenEstimator(
+        encoding="characters",
+        text_counter=len,
+        estimator="test",
+    )
+    assembler = PromptAssembler(counter)
+    attempts = BudgetedResponseAttemptService(
+        llm=llm,
+        budgets=TokenBudgetEnforcer(assembler),
+        accounting=TokenAccountingService(counter),
+        audit=TokenAuditPersistenceService(records, artifacts),
+    )
+    service = TranslateCorpus(
+        attempts=attempts,
+        prompts=TranslationPromptBuilder(assembler),
+        artifacts=TranslationArtifactService(artifacts),
+        runs=RunStateService(
+            events=events,
+            memory=memory,
+            token_records=records,
+            clock=clock,
+            event_id=iter(f"event-{index}" for index in range(100)).__next__,
+        ),
+        memory=memory,
+        token_records=records,
+    )
+    return service, events, memory, records, artifacts
+
+
+def _request(target: str, *, resume: bool = False) -> TranslateCorpusRequest:
+    return TranslateCorpusRequest(
+        run_id="run-e2e",
+        thread_id="thread-e2e",
+        target=resolve_local_target(target),
+        items=(_translation_item(),),
+        policy=TokenBudgetPolicy(
+            max_input_tokens=100_000,
+            reserved_output_tokens=2_000,
+            safety_margin_tokens=500,
+        ),
+        max_attempts=2,
+        resume=resume,
+    )
 
 
 def _service() -> tuple[RunStateService, _Events, _Memory, _TokenRecords]:
@@ -463,3 +566,96 @@ def test_artifact_service_persists_attempt_canonical_and_notebooks() -> None:
         "canonical_translation",
         "notebook",
     ]
+
+
+@pytest.mark.parametrize(
+    ("requested", "target"),
+    [("sql", TargetId.SPARK_SQL), ("pyspark", TargetId.PYSPARK)],
+)
+def test_translate_corpus_end_to_end_for_both_targets(
+    requested: str,
+    target: TargetId,
+) -> None:
+    llm = _LLM(
+        [
+            ProviderResponse(
+                raw_message="structured",
+                structured_document=_document(target),
+                usage=ProviderTokenUsage(input_tokens=500, output_tokens=50),
+            )
+        ]
+    )
+    service, _, memory, records, artifacts = _translation_service(llm)
+    outcome = asyncio.run(service.run(_request(requested)))
+    assert outcome.state.status is RunStatus.COMPLETED
+    assert outcome.items[0].status is ItemStatus.ACCEPTED
+    assert outcome.items[0].target.target is target
+    assert len([record for record in records.values if record.accepted_attempt]) == 1
+    assert memory.remember_count == 1
+    assert [call[2] for call in llm.calls] == [target]
+    assert {artifact.metadata["kind"] for artifact in artifacts.values} >= {
+        "effective_prompt",
+        "response_envelope",
+        "canonical_translation",
+        "notebook",
+        "token_call_audit",
+    }
+
+
+def test_translate_corpus_retries_with_feedback_and_accepts_raw_fallback() -> None:
+    llm = _LLM(
+        [
+            ProviderResponse(
+                raw_message="wrong target",
+                structured_document=_document(TargetId.PYSPARK),
+                usage=ProviderTokenUsage(input_tokens=500, output_tokens=50),
+            ),
+            ProviderResponse(
+                raw_message=(
+                    "## Analysis\n\nPreserve semantics.\n\n"
+                    "## Mapping\n\n_No construct mapping reported._\n\n"
+                    "## Translation\n\n```sql\nSELECT 1\n```\n\n"
+                    "## Risks\n\n_No risks flagged._"
+                ),
+                structured_error="gateway does not support response schemas",
+                usage=ProviderTokenUsage(input_tokens=550, output_tokens=60),
+            ),
+        ]
+    )
+    service, _, memory, records, _ = _translation_service(llm)
+    outcome = asyncio.run(service.run(_request("sql")))
+    assert outcome.state.status is RunStatus.COMPLETED
+    assert outcome.items[0].attempts == 2
+    assert outcome.items[0].document is not None
+    assert [record.accepted_attempt for record in records.values] == [False, True]
+    assert memory.remember_count == 1
+    retry_categories = {
+        component.category for component in llm.calls[1][1].components
+    }
+    assert TokenCategory.RETRY_FEEDBACK in retry_categories
+
+
+def test_translate_corpus_resume_uses_memory_without_new_model_turn() -> None:
+    llm = _LLM(
+        [
+            ProviderResponse(
+                raw_message="structured",
+                structured_document=_document(TargetId.SPARK_SQL),
+                usage=ProviderTokenUsage(input_tokens=500, output_tokens=50),
+            )
+        ]
+    )
+    service, events, memory, records, _ = _translation_service(llm)
+    first = asyncio.run(service.run(_request("sql")))
+    resumed = asyncio.run(service.run(_request("sql", resume=True)))
+    assert first.state.status is RunStatus.COMPLETED
+    assert resumed.state.status is RunStatus.COMPLETED
+    assert resumed.items[0].recovered
+    assert len(llm.calls) == 1
+    assert memory.remember_count == 1
+    assert len(records.values) == 1
+    assert resumed.tokens.records[0].recovered
+    assert resumed.tokens.current_run_total_tokens == 0
+    assert sum(
+        event.event_type is RunEventType.RUN_COMPLETED for event in events.values
+    ) == 1

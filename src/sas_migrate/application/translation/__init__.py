@@ -10,6 +10,12 @@ from .artifacts import (
 from .attempts import BudgetedResponseAttempt, BudgetedResponseAttemptService
 from .budgeting import TokenBudgetEnforcer
 from .models import TranslationItem, TranslationMember, translation_items
+from .orchestration import (
+    TranslateCorpus,
+    TranslateCorpusRequest,
+    TranslationItemOutcome,
+    TranslationRunOutcome,
+)
 from .prompt_assembly import PromptAssembler
 from .prompting import PromptContext, TranslationPromptBuilder
 from .run_state import RunStateService
@@ -27,10 +33,14 @@ __all__ = [
     "TokenAccountingService",
     "TokenAuditPersistenceService",
     "TokenBudgetEnforcer",
+    "TranslateCorpus",
+    "TranslateCorpusRequest",
     "TranslationArtifactService",
     "TranslationItem",
+    "TranslationItemOutcome",
     "TranslationMember",
     "TranslationPromptBuilder",
+    "TranslationRunOutcome",
     "render_effective_prompt",
     "render_notebooks",
     "translation_items",
