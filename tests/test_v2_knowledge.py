@@ -112,6 +112,24 @@ def test_chunker_splits_large_units_and_preserves_overlap_budget() -> None:
     assert all(chunk.target is TargetId.SPARK_SQL for chunk in chunks)
 
 
+def test_chunker_validates_limits_and_splits_one_oversized_paragraph() -> None:
+    with pytest.raises(ValueError, match="overlap_tokens"):
+        InstructionChunker(_counter(), max_tokens=10, overlap_tokens=10)
+    with pytest.raises(ValueError, match="min_tokens"):
+        InstructionChunker(
+            _counter(), min_tokens=11, max_tokens=10, overlap_tokens=0
+        )
+
+    chunks = InstructionChunker(
+        _counter(), min_tokens=0, max_tokens=12, overlap_tokens=0
+    ).chunk(
+        (_section("Guide > Words", "alpha beta gamma delta epsilon"),),
+        role=KnowledgeRole.TARGET_GUIDE,
+    )
+    assert len(chunks) >= 2
+    assert all(chunk.text for chunk in chunks)
+
+
 def test_ingestion_sha_cache_reuses_unchanged_chunks() -> None:
     repository = InMemoryKnowledgeRepository()
     service = KnowledgeIngestionService(
@@ -183,6 +201,38 @@ Discuss repartitioning.
     ]
     pyspark = query.model_copy(update={"target": TargetId.PYSPARK})
     assert "Prefer explicit joins." not in [rule.text for rule in rules.select(pyspark)]
+
+
+def test_user_rules_cover_plain_empty_and_nonmatching_scopes() -> None:
+    assert UserRuleSet.from_markdown("   ").rules == ()
+    plain = UserRuleSet.from_markdown("Always retain comments.", source_id="plain")
+    assert plain.rules[0].text == "Always retain comments."
+    rules = UserRuleSet.from_markdown(
+        """## Empty
+
+## [when:proc:sql] Construct
+construct
+
+## [kind:data_step] Kind
+kind
+
+## [meta:uses_hash] Metadata
+metadata
+
+## [topic:partitioning] Topic
+topic
+"""
+    )
+    selected = rules.select(
+        RetrievalQuery(
+            text="unrelated",
+            target=TargetId.PYSPARK,
+            constructs=frozenset({"proc:sort"}),
+            chunk_kinds=frozenset({"macro"}),
+            metadata_flags=frozenset({"uses_arrays"}),
+        )
+    )
+    assert selected == ()
 
 
 def test_invalid_conditional_rule_is_rejected() -> None:

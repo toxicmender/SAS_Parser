@@ -66,7 +66,7 @@ REQUIRED_DISTRIBUTION_FILES = (
     "sas_migrate/application/knowledge/ingestion.py",
     "sas_migrate/application/knowledge/retrieval.py",
     "sas_migrate/application/memory/services.py",
-    "sas_migrate/adapters/knowledge/pymupdf.py",
+    "sas_migrate/adapters/knowledge/pdf.py",
     "sas_migrate/adapters/memory/in_memory.py",
     "sas_migrate/adapters/memory/delta.py",
     "sas_migrate/adapters/memory/delta_operations.py",

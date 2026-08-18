@@ -27,6 +27,8 @@ from sas_migrate.application.memory import (
     RelevantHistorySelector,
     RollingSummaryService,
     TaskPolicyService,
+    TaskPolicySnapshot,
+    ThreadNote,
     ThreadNoteService,
 )
 from sas_migrate.core.tokens import (
@@ -364,6 +366,107 @@ def test_broken_extractor_is_non_fatal() -> None:
         )
     )
     assert result.applied_notes == () and result.pending_proposals == ()
+
+
+def test_policy_remove_summary_edges_and_extraction_resolution_branches() -> None:
+    clock, repository, history, policy, notes, identifiers = _services()
+    selector = RelevantHistorySelector(_counter())
+    summaries = RollingSummaryService(repository, _counter(), clock)
+    classifier = _Classifier(
+        (MemoryCandidate(text="permanent", scope=MemoryScope.PERMANENT),)
+    )
+    extraction = MemoryExtractionService(
+        repository,
+        classifier,
+        policy,
+        notes,
+        clock,
+        identifier=identifiers.__next__,
+    )
+
+    async def scenario() -> None:
+        wrong = ChatMessage(
+            message_id="wrong",
+            thread_id="guards",
+            chat_id="chat",
+            sequence=2,
+            role=ChatRole.HUMAN,
+            content="wrong sequence",
+            created_at=clock.now(),
+        )
+        with pytest.raises(ValueError, match="sequence"):
+            await repository.append_message(wrong)
+        first_message = wrong.model_copy(update={"sequence": 1})
+        await repository.append_message(first_message)
+        with pytest.raises(ValueError, match="message id"):
+            await repository.append_message(first_message.model_copy(update={"sequence": 2}))
+        direct_policy = TaskPolicySnapshot(
+            task_id="direct",
+            version=1,
+            updated_at=clock.now(),
+        )
+        await repository.put_policy(direct_policy)
+        with pytest.raises(ValueError, match="version"):
+            await repository.put_policy(direct_policy)
+        expired = ThreadNote(
+            note_id="expired",
+            thread_id="guards",
+            text="expired",
+            created_at=clock.now(),
+            expires_at=clock.value - timedelta(seconds=1),
+        )
+        await repository.put_note(expired)
+        assert await repository.notes("guards", now=clock.now()) == ()
+        assert not await repository.delete_note("guards", "missing")
+
+        first = await policy.add("task", "first")
+        assert not await policy.remove("task", "missing")
+        assert await policy.remove("task", first.instruction_id)
+        assert not await policy.remove("task", first.instruction_id)
+
+        await history.record_accepted_turn(
+            thread_id="edges",
+            chat_id="chat",
+            item_id="item",
+            user_content="alpha beta gamma",
+            assistant_content="delta epsilon zeta",
+        )
+        assert await summaries.refresh("edges", trigger_tokens=10_000) is None
+        assert (
+            await summaries.refresh(
+                "edges",
+                trigger_tokens=1,
+                keep_recent_messages=10,
+            )
+            is None
+        )
+        summary = await summaries.refresh(
+            "edges",
+            trigger_tokens=1,
+            keep_recent_messages=0,
+            max_summary_tokens=12,
+        )
+        assert summary is not None
+        assert summary.token_count <= 12
+
+        messages = await repository.messages("edges")
+        assert selector.select(messages, "alpha", max_tokens=1) == ()
+        partial = messages[:1]
+        assert selector.select(partial, "alpha", max_tokens=100) == partial
+
+        result = await extraction.observe(
+            thread_id="edges",
+            task_id="task",
+            user_content="u",
+            assistant_content="a",
+        )
+        proposal_id = result.pending_proposals[0].proposal_id
+        assert await extraction.reject(proposal_id)
+        assert not await extraction.reject(proposal_id)
+        assert await extraction.approve(proposal_id) is None
+        assert await extraction.approve("missing") is None
+
+    asyncio.run(scenario())
 
 
 def test_in_memory_adapter_imports_without_spark() -> None:

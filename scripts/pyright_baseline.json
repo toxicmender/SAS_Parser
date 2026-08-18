@@ -99,7 +99,7 @@
     "src/sas_migrate/adapters/__init__.py": 0,
     "src/sas_migrate/adapters/knowledge/__init__.py": 0,
     "src/sas_migrate/adapters/knowledge/in_memory.py": 0,
-    "src/sas_migrate/adapters/knowledge/pymupdf.py": 0,
+    "src/sas_migrate/adapters/knowledge/pdf.py": 0,
     "src/sas_migrate/adapters/memory/__init__.py": 0,
     "src/sas_migrate/adapters/memory/delta.py": 0,
     "src/sas_migrate/adapters/memory/delta_operations.py": 0,

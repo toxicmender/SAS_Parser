@@ -25,12 +25,24 @@ from sas_migrate.adapters.memory import (
     quoted_table_name,
 )
 from sas_migrate.application.memory import (
+    ChatMessage,
+    ChatRole,
     ConversationMemoryService,
     PolicyInstruction,
+    PolicyProposal,
     RollingSummary,
     TaskPolicySnapshot,
     ThreadNote,
 )
+from sas_migrate.core.responses import (
+    ResponseEnvelope,
+    ResponseMode,
+    TranslationCell,
+    TranslationCellKind,
+    TranslationDocument,
+)
+from sas_migrate.core.targets import TargetId, resolve_local_target
+from sas_migrate.core.targets.validation import ResponseValidationResult
 
 
 class _Clock:
@@ -108,6 +120,26 @@ def _repository() -> tuple[_Clock, _Store, DeltaMemoryRepository]:
         identifier=identifiers.__next__,
     )
     return clock, store, repository
+
+
+def _envelope() -> ResponseEnvelope:
+    return ResponseEnvelope(
+        mode=ResponseMode.STRUCTURED,
+        raw_message="structured",
+        document=TranslationDocument(
+            target=TargetId.SPARK_SQL,
+            analysis="valid",
+            cells=(
+                TranslationCell(
+                    kind=TranslationCellKind.CODE,
+                    source="SELECT 1",
+                    language="sql",
+                ),
+            ),
+        ),
+        resolved_target=resolve_local_target("sql"),
+        validation=ResponseValidationResult.accepted(TargetId.SPARK_SQL),
+    )
 
 
 def test_delta_repository_persists_contracts_across_adapter_instances() -> None:
@@ -191,6 +223,73 @@ def test_delta_repository_supports_snapshot_rewind_fork_prune_and_cdf() -> None:
     result = repository.sync_cdf("memory-worker")
     assert result.checkpoint_version == 3
     assert store.cdf_consumers == ["memory-worker"]
+
+
+def test_delta_repository_covers_guards_proposals_ttl_and_accepted_responses() -> None:
+    clock, _, repository = _repository()
+
+    async def scenario() -> None:
+        message = ChatMessage(
+            message_id="message-1",
+            thread_id="guards",
+            chat_id="chat",
+            sequence=1,
+            role=ChatRole.HUMAN,
+            content="content",
+            created_at=clock.now(),
+        )
+        await repository.append_message(message)
+        with pytest.raises(ValueError, match="sequence"):
+            await repository.append_message(message)
+        with pytest.raises(ValueError, match="message id"):
+            await repository.append_message(message.model_copy(update={"sequence": 2}))
+
+        policy = TaskPolicySnapshot(
+            task_id="task",
+            version=1,
+            updated_at=clock.now(),
+        )
+        await repository.put_policy(policy)
+        with pytest.raises(ValueError, match="version"):
+            await repository.put_policy(policy)
+
+        expired = ThreadNote(
+            note_id="expired",
+            thread_id="guards",
+            text="expired",
+            created_at=clock.now(),
+            expires_at=clock.value - timedelta(seconds=1),
+        )
+        await repository.put_note(expired)
+        assert await repository.notes("guards", now=clock.now()) == ()
+        assert not await repository.delete_note("guards", "missing")
+
+        proposal = PolicyProposal(
+            proposal_id="proposal",
+            thread_id="guards",
+            task_id="task",
+            text="candidate",
+            created_at=clock.now(),
+        )
+        await repository.put_proposal(proposal)
+        assert await repository.proposal("proposal") == proposal
+        assert await repository.proposals("guards") == (proposal,)
+        assert await repository.proposals("other") == ()
+
+        response = _envelope()
+        await repository.remember_accepted("run", "guards", "item", response)
+        assert await repository.accepted_response("run", "guards", "item") == response
+        await repository.fork_accepted(
+            "run", "guards", "fork-run", "fork-thread", ("item", "missing")
+        )
+        assert (
+            await repository.accepted_response("fork-run", "fork-thread", "item")
+            == response
+        )
+        await repository.forget_accepted("run", "guards", ("item",))
+        assert await repository.accepted_response("run", "guards", "item") is None
+
+    asyncio.run(scenario())
 
 
 def test_delta_maintenance_validates_identifiers_retention_and_commands() -> None:
