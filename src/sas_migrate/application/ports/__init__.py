@@ -6,6 +6,7 @@ from .credential_provider import CredentialProvider, CredentialValue
 from .llm import LLMPort, ProviderResponse, ProviderTokenUsage
 from .memory import MemoryPort
 from .source_repository import SourceObject, SourceRepository
+from .token_records import TokenRecordRepository
 from .validation import ResponseValidator
 
 __all__ = [
@@ -21,4 +22,5 @@ __all__ = [
     "ResponseValidator",
     "SourceObject",
     "SourceRepository",
+    "TokenRecordRepository",
 ]

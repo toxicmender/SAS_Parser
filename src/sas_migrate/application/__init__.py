@@ -6,13 +6,24 @@ from .response_acceptance import (
     ResponseAcceptanceService,
     ResponseAttempt,
 )
-from .translation import PromptAssembler, TokenAccountingService
+from .translation import (
+    BudgetedResponseAttempt,
+    BudgetedResponseAttemptService,
+    PromptAssembler,
+    TokenAccountingService,
+    TokenAuditPersistenceService,
+    TokenBudgetEnforcer,
+)
 
 __all__ = [
     "AttemptProvider",
+    "BudgetedResponseAttempt",
+    "BudgetedResponseAttemptService",
     "PromptAssembler",
     "ResponseAcceptanceOutcome",
     "ResponseAcceptanceService",
     "ResponseAttempt",
     "TokenAccountingService",
+    "TokenAuditPersistenceService",
+    "TokenBudgetEnforcer",
 ]
