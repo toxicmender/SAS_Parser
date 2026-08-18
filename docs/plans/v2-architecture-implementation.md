@@ -1,7 +1,7 @@
 # SAS migration v2: consolidated architecture and implementation plan
 
-Status: implementation in progress. Phases 0 through 4 are implemented on the
-v2 migration branch; Phase 5 is the next implementation phase.
+Status: implementation in progress. Phases 0 through 5 are implemented on the
+v2 migration branch; Phase 6 is the next implementation phase.
 
 This is the authoritative plan for the fresh version of the application. It
 consolidates the architecture audit, the functional-parity review, the test

@@ -11,6 +11,13 @@
       "RunEvent",
       "RunState"
     ],
+    "translation": [
+      "TranslateCorpusRequest",
+      "TranslationItem",
+      "TranslationItemOutcome",
+      "TranslationRunOutcome",
+      "ArtifactLocator"
+    ],
     "tokens": [
       "PromptAssembly",
       "PromptBudgetDecision",

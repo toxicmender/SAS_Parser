@@ -277,3 +277,10 @@ def test_schema_resource_is_bundled_and_versioned() -> None:
         "TokenCallLedger",
         "TokenAuditArtifact",
     ]
+    assert schema["x-contract-families"]["translation"] == [
+        "TranslateCorpusRequest",
+        "TranslationItem",
+        "TranslationItemOutcome",
+        "TranslationRunOutcome",
+        "ArtifactLocator",
+    ]

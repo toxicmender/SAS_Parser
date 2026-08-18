@@ -41,8 +41,13 @@ REQUIRED_DISTRIBUTION_FILES = (
     "sas_migrate/resources/contracts/schema-v2.json",
     "sas_migrate/application/response_acceptance.py",
     "sas_migrate/application/translation/attempts.py",
+    "sas_migrate/application/translation/artifacts.py",
     "sas_migrate/application/translation/budgeting.py",
+    "sas_migrate/application/translation/models.py",
+    "sas_migrate/application/translation/orchestration.py",
     "sas_migrate/application/translation/prompt_assembly.py",
+    "sas_migrate/application/translation/prompting.py",
+    "sas_migrate/application/translation/run_state.py",
     "sas_migrate/application/translation/token_accounting.py",
     "sas_migrate/application/translation/token_audit.py",
     "sas_migrate/core/responses/normalization.py",
@@ -52,6 +57,7 @@ REQUIRED_DISTRIBUTION_FILES = (
     "sas_migrate/core/sas/dependencies/discovery.py",
     "sas_migrate/core/tokens/audit.py",
     "sas_migrate/core/tokens/counting.py",
+    "sas_migrate/application/ports/run_events.py",
 )
 
 
