@@ -71,6 +71,7 @@ jobs:
           tests/test_v2_architecture.py tests/test_v2_contracts.py
           tests/test_v2_ports.py tests/test_v2_sas_core.py
           tests/test_v2_sas_parity.py tests/test_v2_responses.py
+          tests/test_v2_tokens.py
           --output-format=github
 
   types:

@@ -2,6 +2,23 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:sas-migrate:contracts:v2",
   "title": "SAS Migrate v2 contract resources",
+  "x-contract-families": {
+    "responses": [
+      "ResponseEnvelope",
+      "TranslationDocument"
+    ],
+    "runs": [
+      "RunEvent",
+      "RunState"
+    ],
+    "tokens": [
+      "PromptAssembly",
+      "PromptBudgetDecision",
+      "CallTokenRecord",
+      "TokenCallLedger",
+      "TokenAuditArtifact"
+    ]
+  },
   "type": "object",
   "properties": {
     "schema_version": {

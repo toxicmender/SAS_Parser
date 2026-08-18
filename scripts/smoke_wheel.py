@@ -19,6 +19,7 @@ REQUIRED_MODULES = (
     "main",
     "sas_migrate",
     "sas_migrate.application",
+    "sas_migrate.application.translation",
     "sas_migrate.core",
     "sas_migrate.core.responses",
     "sas_migrate.core.sas",
@@ -39,11 +40,18 @@ REQUIRED_DISTRIBUTION_FILES = (
     "prompt_builder/instructions/sparksql/overview.md",
     "sas_migrate/resources/contracts/schema-v2.json",
     "sas_migrate/application/response_acceptance.py",
+    "sas_migrate/application/translation/attempts.py",
+    "sas_migrate/application/translation/budgeting.py",
+    "sas_migrate/application/translation/prompt_assembly.py",
+    "sas_migrate/application/translation/token_accounting.py",
+    "sas_migrate/application/translation/token_audit.py",
     "sas_migrate/core/responses/normalization.py",
     "sas_migrate/core/responses/validation.py",
     "sas_migrate/core/sas/chunking.py",
     "sas_migrate/core/sas/metadata/extraction.py",
     "sas_migrate/core/sas/dependencies/discovery.py",
+    "sas_migrate/core/tokens/audit.py",
+    "sas_migrate/core/tokens/counting.py",
 )
 
 

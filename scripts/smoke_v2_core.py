@@ -17,7 +17,13 @@ from sas_migrate.core.responses import (
 from sas_migrate.core.runs import RunEvent
 from sas_migrate.core.sas import SasSemanticChunker
 from sas_migrate.core.targets import ResolvedTarget, resolve_local_target
-from sas_migrate.core.tokens import CallTokenRecord, TokenBudgetPolicy
+from sas_migrate.core.tokens import (
+    CallTokenRecord,
+    TokenAuditArtifact,
+    TokenBudgetPolicy,
+    TokenCallLedger,
+    TokenEstimator,
+)
 
 
 def main() -> int:
@@ -26,7 +32,9 @@ def main() -> int:
         ResolvedTarget,
         ResponseEnvelope,
         RunEvent,
+        TokenAuditArtifact,
         TokenBudgetPolicy,
+        TokenCallLedger,
         TranslationDocument,
     )
     if any(contract.model_fields["schema_version"].default != 2 for contract in contracts):
@@ -35,6 +43,8 @@ def main() -> int:
         raise RuntimeError("the v2 default target is not Spark SQL")
     if not callable(normalize_raw_response) or not callable(ResponseTargetValidator):
         raise TypeError("the v2 response acceptance surface is not importable")
+    if not callable(TokenEstimator.approximate_for_model):
+        raise TypeError("the v2 offline token estimator is not importable")
     parsed = SasSemanticChunker(timeout=None).chunk_text("data work.x; x=1; run;")
     if len(parsed.chunks) != 1:
         raise RuntimeError("v2 SAS core failed its dependency-light parse smoke")

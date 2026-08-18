@@ -270,3 +270,10 @@ def test_schema_resource_is_bundled_and_versioned() -> None:
     )
     schema = json.loads(resource.read_text("utf-8"))
     assert schema["properties"]["schema_version"]["const"] == 2
+    assert schema["x-contract-families"]["tokens"] == [
+        "PromptAssembly",
+        "PromptBudgetDecision",
+        "CallTokenRecord",
+        "TokenCallLedger",
+        "TokenAuditArtifact",
+    ]
