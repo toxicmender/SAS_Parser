@@ -97,7 +97,7 @@ def default_dialect() -> str:
     reading it differently would silently return code un-rewritten (the hard
     rule above) on exactly the syntax the checker had just called valid.
 
-    A non-SQL target (PySpark, Spark Scala) has no dialect of its own, but this
+    The non-SQL target (PySpark) has no dialect of its own, but this
     module still reaches sqlglot for the SQL inside ``spark.sql("...")`` — so
     those fall back to the SQL target's dialect rather than to nothing.
     """

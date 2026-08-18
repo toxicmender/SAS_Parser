@@ -404,8 +404,9 @@ target_language/
                         syntax checker) + resolve_target_language(), which
                         folds spelling ("SparkSQL"/"spark sql"/"sql" are one
                         target) and raises UnknownTargetLanguage rather than
-                        degrading to a Python run. PySpark, Spark SQL, Spark
-                        Scala. A leaf package — stdlib only — imported by
+                        degrading to a Python run. PySpark and Spark SQL are
+                        the complete target set. A leaf package — stdlib only
+                        — imported by
                         pipeline, prompt_builder, validation, and complexity,
                         which is what keeps them agreeing on one target.
                         sqlglot core dependency for the SQL check.
