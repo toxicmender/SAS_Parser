@@ -116,8 +116,11 @@ def test_prompt_assembly_keeps_categories_while_rendering_shared_messages() -> N
     assert counts[TokenCategory.REFERENCE_GUIDANCE] == len("reference")
     assert counts[TokenCategory.PROJECT_INSTRUCTIONS] == len("project")
     assert counts[TokenCategory.SAS_SOURCE] == len("data x; run;")
-    assert counts[TokenCategory.CHAT_FRAMING] == 9
+    assert counts[TokenCategory.CHAT_FRAMING] == 13
     assert sum(counts.values()) == prompt.estimated_input_total
+    assert prompt.estimated_input_total == sum(
+        _counter().count_text(message.content) for message in messages
+    ) + _counter().framing_tokens(len(messages))
 
 
 def test_retry_feedback_is_counted_only_when_the_retry_contains_it() -> None:

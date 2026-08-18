@@ -37,13 +37,18 @@ class PromptAssembler:
             encoding=self._counter.encoding,
             approximate=self._counter.approximate,
         )
+        messages = provisional.render_messages()
+        rendered_tokens = sum(
+            self._counter.count_text(message.content) for message in messages
+        )
+        component_tokens = sum(component.token_count for component in components)
+        composition_tokens = max(0, rendered_tokens - component_tokens)
         framing = PromptComponent(
             category=TokenCategory.CHAT_FRAMING,
             text="",
             message_role=MessageRole.SYSTEM,
-            token_count=self._counter.framing_tokens(
-                len(provisional.render_messages())
-            ),
+            token_count=self._counter.framing_tokens(len(messages))
+            + composition_tokens,
             source_id="chat_framing",
         )
         return PromptAssembly(
