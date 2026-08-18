@@ -59,12 +59,12 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
-      # Same ruff version as uv.lock so local and CI results agree.
+      # Same Ruff version as uv.lock so local and CI results agree.
       # Legacy packages have a known backlog. Gate every migration-owned file
       # now; expand this list as each later phase moves another package.
       - name: Ruff lint (v2 migration surface)
         run: >
-          uvx ruff@0.15.20 check
+          uvx ruff@0.16.0 check
           src/sas_migrate
           scripts/check_v2_architecture.py scripts/smoke_v2_core.py
           scripts/smoke_wheel.py scripts/v2_sas_test_adapter.py
@@ -159,7 +159,7 @@ jobs:
       # without adding a production dependency from v2 back to legacy modules.
       - name: Run legacy SAS suites against v2 core
         run: >
-          uv run pytest -q -p scripts.v2_sas_test_adapter
+          uv run python -m pytest -q -p scripts.v2_sas_test_adapter
           tests/test_chunker.py tests/test_batcher.py tests/test_multifile.py
           tests/test_paths.py tests/test_function_detection.py
           tests/test_library_handling.py tests/test_macro_body_resolution.py
