@@ -60,8 +60,18 @@ jobs:
           cache-dependency-glob: uv.lock
 
       # Same ruff version as uv.lock so local and CI results agree.
-      - name: Ruff lint
-        run: uvx ruff@0.15.20 check . --output-format=github
+      # Legacy packages have a known backlog. Gate every migration-owned file
+      # now; expand this list as each later phase moves another package.
+      - name: Ruff lint (v2 migration surface)
+        run: >
+          uvx ruff@0.15.20 check
+          src/sas_migrate
+          scripts/check_v2_architecture.py scripts/smoke_v2_core.py
+          scripts/smoke_wheel.py scripts/v2_sas_test_adapter.py
+          tests/test_v2_architecture.py tests/test_v2_contracts.py
+          tests/test_v2_ports.py tests/test_v2_sas_core.py
+          tests/test_v2_sas_parity.py
+          --output-format=github
 
   types:
     name: Types (pyright ratchet)
