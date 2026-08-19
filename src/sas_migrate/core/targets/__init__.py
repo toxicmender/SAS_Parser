@@ -9,6 +9,11 @@ from .registry import (
     resolve_local_target,
     resolve_sharepoint_target,
 )
+from .validation import (
+    ResponseValidationResult,
+    TargetIssueCode,
+    TargetValidationIssue,
+)
 
 __all__ = [
     "KNOWN_TARGETS",
@@ -16,9 +21,12 @@ __all__ = [
     "SPARK_SQL",
     "CompatibilityAssessment",
     "ResolvedTarget",
+    "ResponseValidationResult",
     "TargetDefinition",
     "TargetId",
+    "TargetIssueCode",
     "TargetSource",
+    "TargetValidationIssue",
     "choose_item_target",
     "resolve_local_target",
     "resolve_sharepoint_target",
