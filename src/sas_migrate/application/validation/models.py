@@ -24,6 +24,16 @@ class ValidationUnit(ContractModel):
     target_validation: ResponseValidationResult | None = None
 
 
+class ValidationCase(ContractModel):
+    case_id: str = Field(min_length=1)
+    target: TargetId
+    sas_source: str
+    description: str = ""
+    reference_translation: str | None = None
+    required_terms: tuple[str, ...] = ()
+    prompt_instructions: tuple[str, ...] = ()
+
+
 class EvaluationRun(VersionedContract):
     """Conversation-sized validation input, independent of its producer."""
 
@@ -148,6 +158,7 @@ __all__ = [
     "MetricResult",
     "TokenBudgetPolicy",
     "TokenBudgetReport",
+    "ValidationCase",
     "ValidationReport",
     "ValidationUnit",
 ]
