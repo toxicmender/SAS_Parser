@@ -1,6 +1,6 @@
 # V2 consolidated gap register
 
-Status: authoritative as of Phase 7. The machine-readable source is
+Status: authoritative as of Phase 8. The machine-readable source is
 [`v2-gap-legacy-inventory.json`](v2-gap-legacy-inventory.json); CI checks its
 package counts, v2 import allowlist, ownership, references, and exit gates.
 PR descriptions and phase migration notes summarize this register but do not
@@ -27,9 +27,6 @@ define separate gap lists.
 
 | ID | Owner | Gap | Exit gate |
 |---|---:|---|---|
-| G-007 | Phase 8 | Validation metrics, evaluator, conversation reconstruction, tracking, and reports remain legacy-only. | V2 validation application and adapter suites pass. |
-| G-008 | Phase 8 | Validation reports lack component token budgets and `token_budget_compliance`. | Markdown, PDF, JSON, and tracking keep translation and judge budgets separate. |
-| G-009 | Phase 8 | Assessment, sizing, cross-file analysis, review, profiles, and reports remain legacy-only. | V2 assessment golden and profile-inheritance tests pass. |
 | G-010 | Phase 9 | Local/SharePoint conversion and request lifecycle remain legacy-only. | V2 fake-repository workflows pass with per-row isolation. |
 | G-011 | Phase 9 | Hydration planning, credentials, drivers, ranged I/O, and Delta sink remain legacy-only. | Pure planning and optional-driver matrix pass. |
 | G-012 | Phase 9 | Configuration, auth, SharePoint loop ownership, and observability are not migrated. | V2 config/infrastructure suites pass with lazy extras and secret-free models. |
@@ -51,6 +48,9 @@ define separate gap lists.
 | ID | Closed | Replacement | Evidence |
 |---|---:|---|---|
 | G-006 | Phase 7 | `sas_migrate.application.xref` and `sas_migrate.adapters.xref` | V2/legacy characterization, Databricks SQLGlot dialect, lazy adapter, architecture, type, wheel, and CI gates. |
+| G-007 | Phase 8 | `sas_migrate.application.validation` and `sas_migrate.adapters.validation` | Deterministic/judged/memory metric, transcript, inline/offline, tracking, PDF, architecture, and parity gates. |
+| G-008 | Phase 8 | Validation token-budget contracts and report presenters | Markdown/PDF/JSON/tracking expose input components and separate translation/judge compliance. |
+| G-009 | Phase 8 | `sas_migrate.application.assessment` and `sas_migrate.adapters.assessment` | Profile inheritance, target scoring, sizing, cross-file dependency, review, golden report, PDF, and legacy parity gates. |
 
 ## Closure protocol
 

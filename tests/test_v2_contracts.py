@@ -270,6 +270,12 @@ def test_schema_resource_is_bundled_and_versioned() -> None:
     )
     schema = json.loads(resource.read_text("utf-8"))
     assert schema["properties"]["schema_version"]["const"] == 2
+    assert schema["x-contract-families"]["assessment"] == [
+        "AssessmentProfile",
+        "AssessmentUnit",
+        "FileAssessment",
+        "AssessmentReport",
+    ]
     assert schema["x-contract-families"]["tokens"] == [
         "PromptAssembly",
         "PromptBudgetDecision",
@@ -308,4 +314,11 @@ def test_schema_resource_is_bundled_and_versioned() -> None:
         "XrefMappings",
         "PreRewriteReport",
         "BothRewriteResult",
+    ]
+    assert schema["x-contract-families"]["validation"] == [
+        "ValidationCase",
+        "EvaluationRun",
+        "MetricResult",
+        "TokenBudgetReport",
+        "ValidationReport",
     ]

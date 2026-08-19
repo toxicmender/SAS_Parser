@@ -12,7 +12,7 @@ replacement and cutover gates. The authoritative machine inventory is
 |---|---:|---:|---|
 | `app_config/` | 8 | Phase 9 | `sas_migrate.config` and infrastructure adapters; not migrated |
 | `chunker/` | 9 | Phase 2/10 | `sas_migrate.core.sas` exists; compatibility package retained until cutover |
-| `complexity/` | 18 | Phase 8 | assessment application; not migrated |
+| `complexity/` | 18 | Phase 8/10 | v2 assessment replacement exists; compatibility package retained |
 | `conversion/` | 6 | Phase 9 | conversion application; not migrated |
 | `data_hydration/` | 20 | Phase 9 | hydration application/adapters; not migrated |
 | `llm_client/` | 2 | Phase 9 | application port exists; gateway adapter pending |
@@ -22,11 +22,11 @@ replacement and cutover gates. The authoritative machine inventory is
 | `reporting/` | 2 | Phase 10 | presenters/document adapters pending |
 | `target_language/` | 1 | Phase 3/10 | `sas_migrate.core.targets` exists; compatibility package retained |
 | `token_budget/` | 1 | Phase 4/8/10 | core tokens exist; validation reporting and cutover remain |
-| `validation/` | 17 | Phase 8 | validation application/adapters pending |
+| `validation/` | 17 | Phase 8/10 | v2 validation replacement exists; compatibility package retained |
 | `xref/` | 6 | Phase 7/10 | v2 replacement exists; compatibility package retained until cutover |
 | `main.py` | 1 module | Phase 10 | active `sas-parser` entry point; replaced by operational `sas-migrate` commands |
 
-Total: 14 packages, 118 package Python files, 168 tracked package files
+Total: 14 packages, 118 package Python files, 166 tracked package files
 (including instruction/profile resources), and one top-level entry module.
 
 ## V2 dependencies on legacy code

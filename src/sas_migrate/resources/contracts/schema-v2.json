@@ -3,6 +3,12 @@
   "$id": "urn:sas-migrate:contracts:v2",
   "title": "SAS Migrate v2 contract resources",
   "x-contract-families": {
+    "assessment": [
+      "AssessmentProfile",
+      "AssessmentUnit",
+      "FileAssessment",
+      "AssessmentReport"
+    ],
     "knowledge": [
       "DocumentExtraction",
       "KnowledgeSource",
@@ -43,6 +49,13 @@
       "CallTokenRecord",
       "TokenCallLedger",
       "TokenAuditArtifact"
+    ],
+    "validation": [
+      "ValidationCase",
+      "EvaluationRun",
+      "MetricResult",
+      "TokenBudgetReport",
+      "ValidationReport"
     ],
     "xref": [
       "XrefRow",

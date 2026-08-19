@@ -29,7 +29,7 @@ def test_inventory_has_complete_ownership_and_exit_gates() -> None:
     assert inventory["schema_version"] == 1
     assert len(inventory["legacy_packages"]) == 14
     assert sum(entry["python_files"] for entry in inventory["legacy_packages"]) == 118
-    assert sum(entry["tracked_files"] for entry in inventory["legacy_packages"]) == 168
+    assert sum(entry["tracked_files"] for entry in inventory["legacy_packages"]) == 166
     assert {entry["owner_phase"] for entry in inventory["legacy_packages"]} <= {
         2,
         3,
@@ -44,5 +44,6 @@ def test_inventory_has_complete_ownership_and_exit_gates() -> None:
     assert {gap["status"] for gap in inventory["gaps"]} <= {"open", "closed"}
     gap_status = {gap["id"]: gap["status"] for gap in inventory["gaps"]}
     assert gap_status["G-006"] == "closed"
+    assert all(gap_status[f"G-00{number}"] == "closed" for number in range(7, 10))
     assert all(gap["exit_gate"] for gap in inventory["gaps"])
     assert importlib.util.find_spec("sas_migrate") is not None

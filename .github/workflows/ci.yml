@@ -80,6 +80,8 @@ jobs:
           tests/test_v2_memory_delta.py
           tests/test_v2_legacy_inventory.py
           tests/test_v2_xref.py
+          tests/test_v2_validation.py tests/test_v2_validation_workflows.py
+          tests/test_v2_assessment.py
           --output-format=github
 
   types:
@@ -161,6 +163,20 @@ jobs:
           --cov=sas_migrate.application.xref
           --cov=sas_migrate.application.ports.xref
           --cov=sas_migrate.adapters.xref
+          --cov-branch --cov-report=term-missing
+          --cov-fail-under=90
+
+      - name: Phase 8 validation and assessment line and branch coverage gate
+        run: >
+          uv run pytest -q
+          tests/test_v2_validation.py tests/test_v2_validation_workflows.py
+          tests/test_v2_assessment.py
+          --cov=sas_migrate.application.validation
+          --cov=sas_migrate.application.assessment
+          --cov=sas_migrate.application.ports.validation
+          --cov=sas_migrate.application.ports.assessment
+          --cov=sas_migrate.adapters.validation
+          --cov=sas_migrate.adapters.assessment
           --cov-branch --cov-report=term-missing
           --cov-fail-under=90
 

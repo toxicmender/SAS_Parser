@@ -149,9 +149,9 @@ include = [
 py-modules = ["main"]
 
 [tool.setuptools.package-data]
-# complexity/profiles/*.json IS the rule catalogue — the package scores nothing
-# without it, so the JSON must ship inside the wheel alongside the code.
-complexity = ["profiles/*.json"]
+# The assessment rule catalogue moved from complexity/profiles into the v2
+# resources tree in Phase 8. Legacy complexity resolves this single packaged
+# source until its CLI compatibility surface is removed in Phase 10.
 # The configured starter instruction set is runtime input, not documentation.
 # Keep the directory structure because its first component scopes rules to a
 # target language (pyspark/, sparksql/, or _common/).

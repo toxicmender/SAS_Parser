@@ -3,7 +3,7 @@
   "legacy_packages": [
     {"name": "app_config", "python_files": 8, "tracked_files": 9, "owner_phase": 9, "replacement": "sas_migrate.config plus auth/sharepoint adapters", "status": "not_migrated"},
     {"name": "chunker", "python_files": 9, "tracked_files": 10, "owner_phase": 2, "replacement": "sas_migrate.core.sas", "status": "replacement_present"},
-    {"name": "complexity", "python_files": 18, "tracked_files": 21, "owner_phase": 8, "replacement": "sas_migrate.application.assessment", "status": "not_migrated"},
+    {"name": "complexity", "python_files": 18, "tracked_files": 19, "owner_phase": 8, "replacement": "sas_migrate.application.assessment plus sas_migrate.adapters.assessment", "status": "replacement_present"},
     {"name": "conversion", "python_files": 6, "tracked_files": 7, "owner_phase": 9, "replacement": "sas_migrate.application.conversion", "status": "not_migrated"},
     {"name": "data_hydration", "python_files": 20, "tracked_files": 21, "owner_phase": 9, "replacement": "sas_migrate.application.hydration plus adapters", "status": "not_migrated"},
     {"name": "llm_client", "python_files": 2, "tracked_files": 3, "owner_phase": 9, "replacement": "sas_migrate application LLM port plus gateway adapter", "status": "port_only"},
@@ -13,7 +13,7 @@
     {"name": "reporting", "python_files": 2, "tracked_files": 3, "owner_phase": 10, "replacement": "sas_migrate application presenters and document adapters", "status": "not_migrated"},
     {"name": "target_language", "python_files": 1, "tracked_files": 2, "owner_phase": 3, "replacement": "sas_migrate.core.targets", "status": "replacement_present"},
     {"name": "token_budget", "python_files": 1, "tracked_files": 2, "owner_phase": 4, "replacement": "sas_migrate.core.tokens", "status": "replacement_present"},
-    {"name": "validation", "python_files": 17, "tracked_files": 20, "owner_phase": 8, "replacement": "sas_migrate.application.validation", "status": "port_only"},
+    {"name": "validation", "python_files": 17, "tracked_files": 20, "owner_phase": 8, "replacement": "sas_migrate.application.validation plus sas_migrate.adapters.validation", "status": "replacement_present"},
     {"name": "xref", "python_files": 6, "tracked_files": 7, "owner_phase": 7, "replacement": "sas_migrate.application.xref plus sas_migrate.adapters.xref", "status": "replacement_present"}
   ],
   "legacy_modules": [
@@ -46,6 +46,7 @@
       "docs/migrations/v2-translation-contracts.md",
       "docs/migrations/v2-knowledge-memory-contracts.md",
       "docs/migrations/v2-xref-contracts.md",
+      "docs/migrations/v2-validation-assessment-contracts.md",
       "docs/plans/pipeline-decoupling-tiktoken.md"
     ],
     "broad_reference_roots": ["tests", "docker"]
@@ -57,9 +58,9 @@
     {"id": "G-004", "area": "memory", "owner_phase": 9, "status": "open", "summary": "The v2 Delta memory adapter delegates physical MERGE and CDF operations to legacy memory.store.KVStore.", "exit_gate": "The adapter owns its Delta implementation and allowed_v2_legacy_imports is empty."},
     {"id": "G-005", "area": "memory", "owner_phase": 9, "status": "open", "summary": "Databricks chat and embedding factories remain in legacy memory.databricks_ai.", "exit_gate": "Lazy v2 Databricks AI adapters pass install/import contracts."},
     {"id": "G-006", "area": "xref", "owner_phase": 7, "status": "closed", "summary": "XREF models, path resolution, SAS rewriting, target rewriting, and mapping-source adapters are implemented in v2.", "exit_gate": "Phase 7 characterization and adapter contracts pass with no Scala dispatch."},
-    {"id": "G-007", "area": "validation", "owner_phase": 8, "status": "open", "summary": "Validation metrics, evaluator, conversation reconstruction, tracking, and reports remain legacy-only.", "exit_gate": "V2 validation application and adapter suites pass."},
-    {"id": "G-008", "area": "token_reporting", "owner_phase": 8, "status": "open", "summary": "Validation reports do not yet render component token budgets or token_budget_compliance.", "exit_gate": "Markdown, PDF, JSON, and tracking outputs expose translation and judge budgets separately."},
-    {"id": "G-009", "area": "assessment", "owner_phase": 8, "status": "open", "summary": "Complexity assessment, sizing, cross-file analysis, LLM review, profiles, and reports remain legacy-only.", "exit_gate": "V2 assessment golden and profile-inheritance tests pass."},
+    {"id": "G-007", "area": "validation", "owner_phase": 8, "status": "closed", "summary": "V2 validation owns deterministic and judged metrics, evaluator, transcript reconstruction, inline/offline workflows, tracking, and reports.", "exit_gate": "V2 validation application and adapter suites pass."},
+    {"id": "G-008", "area": "token_reporting", "owner_phase": 8, "status": "closed", "summary": "Validation Markdown, PDF, JSON, and tracking contracts expose component budgets and token_budget_compliance with translation and judge usage separated.", "exit_gate": "Markdown, PDF, JSON, and tracking outputs expose translation and judge budgets separately."},
+    {"id": "G-009", "area": "assessment", "owner_phase": 8, "status": "closed", "summary": "V2 assessment owns profile inheritance, target scoring, sizing, cross-file dependencies, review, and reports.", "exit_gate": "V2 assessment golden and profile-inheritance tests pass."},
     {"id": "G-010", "area": "conversion", "owner_phase": 9, "status": "open", "summary": "Local and SharePoint conversion workflows and request lifecycle remain legacy-only.", "exit_gate": "V2 fake-repository end-to-end workflows pass with per-row isolation."},
     {"id": "G-011", "area": "hydration", "owner_phase": 9, "status": "open", "summary": "Hydration planning, credentials, source drivers, ranged I/O, and Delta sink remain top-level legacy packages.", "exit_gate": "Pure v2 planning and optional-driver contract matrix pass."},
     {"id": "G-012", "area": "infrastructure", "owner_phase": 9, "status": "open", "summary": "Typed configuration, Azure/Vault/Databricks/SharePoint auth, worker-loop ownership, and observability are not migrated.", "exit_gate": "V2 config and infrastructure adapter suites pass with secret-free models and lazy extras."},
