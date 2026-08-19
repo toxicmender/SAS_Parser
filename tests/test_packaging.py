@@ -27,9 +27,11 @@ def test_runtime_packages_are_explicitly_included() -> None:
 
 def test_runtime_package_data_is_declared() -> None:
     package_data = _project_config()["tool"]["setuptools"]["package-data"]
-    assert "profiles/*.json" in package_data["complexity"]
+    assert "complexity" not in package_data
     assert "instructions/**/*.md" in package_data["prompt_builder"]
     assert "resources/**/*.json" in package_data["sas_migrate"]
+    assert (ROOT / "src/sas_migrate/resources/assessment/pyspark.json").is_file()
+    assert (ROOT / "src/sas_migrate/resources/assessment/sparksql.json").is_file()
 
 
 def test_quality_gates_cover_new_runtime_modules() -> None:
