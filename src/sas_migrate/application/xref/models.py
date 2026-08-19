@@ -7,6 +7,7 @@ from enum import StrEnum
 from pydantic import Field, field_validator
 
 from sas_migrate.core.models import ContractModel
+from sas_migrate.core.sas import SasBatchResult
 
 
 class XrefApplyMode(StrEnum):
@@ -75,6 +76,7 @@ class PreRewriteReport(ContractModel):
 
 class BothRewriteResult(ContractModel):
     code: str
+    result: SasBatchResult | None = None
     pre_applied: bool = False
     post_changed: bool = False
     only_post: tuple[str, ...] = ()

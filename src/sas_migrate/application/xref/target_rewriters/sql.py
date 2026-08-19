@@ -43,14 +43,25 @@ def rewrite_sql_tables(
 ) -> str:
     """Rewrite structured table nodes using the Databricks SQLGlot dialect."""
 
+    return _rewrite_sql_tables(sql, mapping, on_failure=on_failure)[0]
+
+
+def _rewrite_sql_tables(
+    sql: str,
+    mapping: dict[str, str],
+    *,
+    on_failure: ParseFailureMode,
+) -> tuple[str, bool]:
+    """Return rewritten SQL and whether parsing was safe for a path pass."""
+
     if not mapping or not sql.strip():
-        return sql
+        return sql, True
     try:
         import sqlglot
         from sqlglot import exp
     except ImportError:
         logger.warning("sqlglot is unavailable; leaving generated SQL unchanged")
-        return sql
+        return sql, False
 
     dialect = SPARK_SQL.sqlglot_dialect
     if dialect != "databricks":
@@ -59,7 +70,7 @@ def rewrite_sql_tables(
         statements = sqlglot.parse(sql, read=dialect)
     except Exception as exc:  # noqa: BLE001 - sqlglot raises unrelated parser types
         _parse_failure("Spark SQL", exc, on_failure)
-        return sql
+        return sql, False
 
     changed = False
     for statement in statements:
@@ -87,7 +98,7 @@ def rewrite_sql_tables(
             )
             changed = True
     if not changed:
-        return sql
+        return sql, True
     output = ";\n".join(
         statement.sql(dialect=dialect)
         for statement in statements
@@ -95,7 +106,7 @@ def rewrite_sql_tables(
     )
     if sql.rstrip().endswith(";"):
         output += ";"
-    return output
+    return output, True
 
 
 _SQL_PATH_POSITIONS: tuple[re.Pattern[str], ...] = (
@@ -142,4 +153,28 @@ def rewrite_sql_paths(sql: str, by_path: dict[str, str]) -> str:
     return output
 
 
-__all__ = ["XrefRewriteError", "rewrite_sql_paths", "rewrite_sql_tables"]
+def rewrite_sql_target(
+    sql: str,
+    table_mapping: dict[str, str],
+    path_mapping: dict[str, str],
+    *,
+    on_failure: ParseFailureMode = ParseFailureMode.WARN,
+) -> str:
+    """Rewrite a complete SQL target, preserving it on any parse failure."""
+
+    output, parse_succeeded = _rewrite_sql_tables(
+        sql,
+        table_mapping,
+        on_failure=on_failure,
+    )
+    if not parse_succeeded:
+        return sql
+    return rewrite_sql_paths(output, path_mapping)
+
+
+__all__ = [
+    "XrefRewriteError",
+    "rewrite_sql_paths",
+    "rewrite_sql_tables",
+    "rewrite_sql_target",
+]

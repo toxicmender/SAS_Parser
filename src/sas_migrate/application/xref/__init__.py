@@ -10,13 +10,14 @@ from .models import (
     XrefRow,
 )
 from .sas_rewriter import rewrite_datasets, rewrite_source_text
-from .service import apply_both, apply_post, apply_pre
+from .service import apply, apply_both, apply_post, apply_pre
 from .target_rewriters import (
     XrefRewriteError,
     rewrite_pyspark_paths,
     rewrite_pyspark_tables,
     rewrite_sql_paths,
     rewrite_sql_tables,
+    rewrite_sql_target,
 )
 
 __all__ = [
@@ -27,6 +28,7 @@ __all__ = [
     "XrefMappings",
     "XrefRewriteError",
     "XrefRow",
+    "apply",
     "apply_both",
     "apply_post",
     "apply_pre",
@@ -39,4 +41,5 @@ __all__ = [
     "rewrite_source_text",
     "rewrite_sql_paths",
     "rewrite_sql_tables",
+    "rewrite_sql_target",
 ]

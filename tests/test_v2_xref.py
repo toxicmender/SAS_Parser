@@ -13,10 +13,13 @@ from sas_migrate.adapters.xref import (
     TransportCsvXrefSource,
 )
 from sas_migrate.application.xref import (
+    BothRewriteResult,
     ParseFailureMode,
+    XrefApplyMode,
     XrefMappings,
     XrefRewriteError,
     XrefRow,
+    apply,
     apply_both,
     apply_post,
     apply_pre,
@@ -117,19 +120,21 @@ PATHS = {"/sasdata3": "/Volumes/main/sas"}
 
 def test_sql_rewriter_uses_databricks_for_read_and_write(monkeypatch: pytest.MonkeyPatch) -> None:
     import sqlglot
-    from sqlglot import exp
+    from sqlglot.expressions import (
+        Expression,  # pyright: ignore[reportPrivateImportUsage]
+    )
 
     parsed_with: list[str | None] = []
     emitted_with: list[str | None] = []
     real_parse = sqlglot.parse
-    real_sql = exp.Expression.sql
+    real_sql = Expression.sql
 
     def capture_parse(source: str, *, read: Any = None, **kwargs: Any) -> Any:
         parsed_with.append(read)
         return real_parse(source, read=read, **kwargs)
 
     def capture_sql(
-        self: exp.Expression,
+        self: Expression,
         dialect: Any = None,
         **kwargs: Any,
     ) -> str:
@@ -137,7 +142,7 @@ def test_sql_rewriter_uses_databricks_for_read_and_write(monkeypatch: pytest.Mon
         return real_sql(self, dialect=dialect, **kwargs)
 
     monkeypatch.setattr(sqlglot, "parse", capture_parse)
-    monkeypatch.setattr(exp.Expression, "sql", capture_sql)
+    monkeypatch.setattr(Expression, "sql", capture_sql)
 
     assert "main.sales.orders" in rewrite_sql_tables(
         "SELECT * FROM sales.orders", TABLES
@@ -351,6 +356,16 @@ def test_unparseable_sql_is_byte_identical_or_fatal() -> None:
         )
 
 
+def test_post_sql_parse_failure_blocks_the_entire_path_pass() -> None:
+    broken = "SELECT * FROM ( LOCATION '/sasdata3/a'"
+    output = apply_post(
+        broken,
+        resolve_local_target("Spark SQL"),
+        XrefMappings(exact=TABLES, by_path=PATHS),
+    )
+    assert output == broken
+
+
 @pytest.mark.parametrize(
     "call",
     [
@@ -416,6 +431,41 @@ def test_both_mode_marks_a_supplied_pre_baseline() -> None:
     assert outcome.pre_applied
     assert not outcome.post_changed
     assert outcome.only_post == ()
+
+
+def test_mode_dispatch_preserves_pre_post_and_both_contracts() -> None:
+    result = SasBatchResult(source_ids=["a.sas"])
+    mappings = XrefMappings(exact=TABLES)
+    target = resolve_local_target("PySpark")
+    pre_result = apply(XrefApplyMode.PRE, mappings=mappings, result=result)
+    assert isinstance(pre_result, SasBatchResult)
+
+    post_result = apply(
+        XrefApplyMode.POST,
+        mappings=mappings,
+        code='spark.table("sales.orders")\n',
+        target=target,
+    )
+    assert isinstance(post_result, str)
+    assert "main.sales.orders" in post_result
+
+    both_result = apply(
+        XrefApplyMode.BOTH,
+        mappings=mappings,
+        result=result,
+        code='spark.table("sales.orders")\n',
+        target=target,
+    )
+    assert isinstance(both_result, BothRewriteResult)
+    assert both_result.pre_applied
+    assert both_result.result is not None
+
+
+def test_mode_dispatch_validates_required_inputs() -> None:
+    with pytest.raises(ValueError, match="requires a batch result"):
+        apply(XrefApplyMode.PRE, mappings=XrefMappings())
+    with pytest.raises(ValueError, match="requires code and a resolved target"):
+        apply(XrefApplyMode.POST, mappings=XrefMappings())
 
 
 def test_sharepoint_source_skips_malformed_and_half_filled_items() -> None:
