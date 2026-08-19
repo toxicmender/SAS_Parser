@@ -1,4 +1,5 @@
 {
+  "schema_version": 2,
   "target": "sparksql",
   "display_name": "Spark SQL",
   "description": "SAS -> Spark SQL translation complexity. Tier follows the project brief (LOW: simple SQL and macro variables; MEDIUM: hashing, merge, SFTP, mail; HIGH: arrays, DO loops, %MACRO definitions). Parity ratings are grounded in reference_docs/ and the Spark SQL built-in function reference.",

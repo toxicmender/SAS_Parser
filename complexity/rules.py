@@ -45,18 +45,15 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
 import app_config
 from target_language import resolve_target_language
 
-from .models import ComplexityTier, TShirtSize, TranslationParity
+from .models import ComplexityTier, TranslationParity, TShirtSize
 from .sizing import (
-    CONSTRUCT_KINDS,
-    DEFAULT_ANCHOR_RAW,
-    DIMENSIONS,
-    SizeModel,
     _DEFAULT_DIMENSION_BOUNDS,
     _DEFAULT_DIMENSION_WEIGHTS,
     _DEFAULT_PARITY_WEIGHTS,
@@ -65,11 +62,18 @@ from .sizing import (
     _DEFAULT_UNCERTAINTY_WEIGHTS,
     _DEFAULT_VOLUME_WEIGHTS,
     _DEFAULT_WEIGHTS,
+    CONSTRUCT_KINDS,
+    DEFAULT_ANCHOR_RAW,
+    DIMENSIONS,
+    SizeModel,
 )
 
 logger = logging.getLogger(__name__)
 
-PROFILE_DIR = Path(__file__).parent / "profiles"
+# Phase 8 moved the single profile catalogue into the v2 distribution.  The
+# legacy analyzer reads the same files until the Phase 10 CLI cutover, so
+# profile fixes cannot diverge between two package trees.
+PROFILE_DIR = Path(str(files("sas_migrate") / "resources" / "assessment"))
 DEFAULT_TARGET = "sparksql"
 _CONFIG_SECTION = "complexity"
 
