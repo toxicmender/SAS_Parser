@@ -7,6 +7,11 @@ from typing import Any
 
 import pytest
 
+from sas_migrate.adapters.xref import (
+    CsvXrefSource,
+    SharePointXrefSource,
+    TransportCsvXrefSource,
+)
 from sas_migrate.application.xref import (
     ParseFailureMode,
     XrefMappings,
@@ -207,3 +212,93 @@ def test_xref_application_has_no_scala_dispatch_or_network_imports() -> None:
     assert "scala" not in source.casefold()
     assert "sharepoint" not in source.casefold()
     assert "requests" not in source.casefold()
+
+
+MAPPING_CSV = (
+    b"sas_name,databricks_name\n"
+    b"work,dev.staging\n"
+    b"sales.orders,main.sales.orders\n"
+)
+
+
+class FakeListTransport:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def list_items(self, list_id: str) -> list[dict[str, object]]:
+        self.calls.append(list_id)
+        return [
+            {
+                "fields": {
+                    "Title": "table",
+                    "Application": "Billing",
+                    "OriginalValue": "sales.orders",
+                    "NewValue": "main.sales.orders",
+                }
+            },
+            {
+                "fields": {
+                    "Title": "path",
+                    "Application": "Billing",
+                    "OriginalValue": "/sas/in",
+                    "NewValue": "/Volumes/main/in",
+                }
+            },
+            {
+                "fields": {
+                    "Application": "Other",
+                    "OriginalValue": "other.table",
+                    "NewValue": "ignored.table",
+                }
+            },
+        ]
+
+
+class FakeFileTransport:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def read_file(self, path: str) -> bytes:
+        self.calls.append(path)
+        return MAPPING_CSV
+
+
+def test_sharepoint_source_does_no_io_until_invoked_and_filters_application() -> None:
+    transport = FakeListTransport()
+    source = SharePointXrefSource(transport, "xref-list")
+    assert transport.calls == []
+
+    mappings = source.load("billing")
+    assert transport.calls == ["xref-list"]
+    assert mappings.exact == {"sales.orders": "main.sales.orders"}
+    assert mappings.by_path == {"/sas/in": "/Volumes/main/in"}
+
+
+def test_transport_csv_source_does_no_io_until_invoked() -> None:
+    transport = FakeFileTransport()
+    source = TransportCsvXrefSource(transport, "maps/xref.csv")
+    assert transport.calls == []
+
+    mappings = source.load("billing")
+    assert transport.calls == ["maps/xref.csv"]
+    assert mappings.by_libref == {"work": "dev.staging"}
+    assert mappings.exact == {"sales.orders": "main.sales.orders"}
+
+
+def test_local_csv_source_is_lazy_and_strips_an_excel_bom(tmp_path: pathlib.Path) -> None:
+    path = tmp_path / "mapping.csv"
+    path.write_bytes(b"\xef\xbb\xbf" + MAPPING_CSV)
+    source = CsvXrefSource(path)
+    assert source.load("billing").dataset_mapping == {
+        "work": "dev.staging",
+        "sales.orders": "main.sales.orders",
+    }
+
+
+def test_empty_csv_source_fails_instead_of_silently_skipping_mapping() -> None:
+    source = CsvXrefSource(
+        "unused.csv",
+        read_bytes=lambda _: b"sas_name,databricks_name\n",
+    )
+    with pytest.raises(ValueError, match="zero entries"):
+        source.load("billing")

@@ -31,3 +31,6 @@ __all__ = [
     "SourceRepository",
     "TokenRecordRepository",
 ]
+from .xref import XrefFileTransport, XrefListTransport, XrefMappingSource
+
+__all__ = ["XrefFileTransport", "XrefListTransport", "XrefMappingSource"]
