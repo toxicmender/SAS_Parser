@@ -116,8 +116,16 @@ def _assess_file(
     raw += len(unit.unresolved_references) * _number(uncertainty, "unresolved_ref", 3.0)
     raw += len(unit.diagnostics) * _number(uncertainty, "diagnostic", 1.5)
     story_points, size = _size(raw, profile.sizes)
-    tier = max((signal.tier for signal in signals), key=_TIER_ORDER.get, default=ComplexityTier.LOW)
-    parity = max((signal.parity for signal in signals), key=_PARITY_ORDER.get, default=TranslationParity.DIRECT)
+    tier = max(
+        (signal.tier for signal in signals),
+        key=lambda value: _TIER_ORDER[value],
+        default=ComplexityTier.LOW,
+    )
+    parity = max(
+        (signal.parity for signal in signals),
+        key=lambda value: _PARITY_ORDER[value],
+        default=TranslationParity.DIRECT,
+    )
     return FileAssessment(
         source_id=unit.source_id,
         raw_score=round(raw, 2),

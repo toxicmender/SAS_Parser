@@ -9,6 +9,7 @@ from collections import Counter
 from collections.abc import Iterable
 
 import sqlglot
+from sqlglot.errors import ParseError
 
 from sas_migrate.core.targets import TargetId
 
@@ -147,7 +148,7 @@ class TargetSyntaxMetric(ValidationMetric):
                     ast.parse(body)
                 else:
                     sqlglot.parse(body, read="databricks")
-            except (SyntaxError, sqlglot.errors.ParseError):
+            except (SyntaxError, ParseError):
                 continue
             valid += 1
         return self.result(valid / len(bodies), f"{valid}/{len(bodies)} target blocks parse")
