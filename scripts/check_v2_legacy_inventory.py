@@ -133,7 +133,8 @@ def main() -> int:
         "v2 legacy inventory passed: "
         f"{len(inventory['legacy_packages'])} packages, "
         f"{len(inventory['allowed_v2_legacy_imports'])} allowed v2 import, "
-        f"{len(inventory['gaps'])} open gaps"
+        f"{sum(gap['status'] == 'open' for gap in inventory['gaps'])} open gaps, "
+        f"{sum(gap['status'] == 'closed' for gap in inventory['gaps'])} closed gap(s)"
     )
     return 0
 

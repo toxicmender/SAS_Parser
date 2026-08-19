@@ -43,6 +43,12 @@
       "CallTokenRecord",
       "TokenCallLedger",
       "TokenAuditArtifact"
+    ],
+    "xref": [
+      "XrefRow",
+      "XrefMappings",
+      "PreRewriteReport",
+      "BothRewriteResult"
     ]
   },
   "type": "object",

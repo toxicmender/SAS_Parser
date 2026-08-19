@@ -19,6 +19,7 @@ from sas_migrate.application.xref import (
     XrefRow,
     apply_both,
     apply_post,
+    apply_pre,
     classify_rows,
     resolve_path,
     rewrite_pyspark_paths,
@@ -27,6 +28,7 @@ from sas_migrate.application.xref import (
     rewrite_sql_paths,
     rewrite_sql_tables,
 )
+from sas_migrate.core.sas import SasBatchResult
 from sas_migrate.core.targets import resolve_local_target
 
 
@@ -302,3 +304,145 @@ def test_empty_csv_source_fails_instead_of_silently_skipping_mapping() -> None:
     )
     with pytest.raises(ValueError, match="zero entries"):
         source.load("billing")
+
+
+def test_mapping_edge_cases_are_deterministic(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level("WARNING"):
+        mappings = classify_rows(
+            [XrefRow(source="WORK", target="main.staging", marker="typo")]
+        )
+    assert mappings.by_libref == {"work": "main.staging"}
+    assert "unrecognised marker" in caplog.text
+    assert resolve_path("   ", PATHS) is None
+    assert bool(mappings)
+    assert len(mappings) == 1
+    assert not XrefMappings()
+
+
+def test_pre_dataset_application_is_pure_and_handles_empty_mapping() -> None:
+    result = SasBatchResult(source_ids=["a.sas"])
+    mappings = XrefMappings(by_libref={"work": "main.staging"})
+    assert apply_pre(result, XrefMappings()) is result
+    mapped = apply_pre(result, mappings)
+    assert mapped is not result
+    assert mapped.source_ids == result.source_ids
+
+
+def test_sql_rewriter_preserves_no_match_and_statement_terminator() -> None:
+    untouched = "SELECT * FROM other.table"
+    assert rewrite_sql_tables(untouched, TABLES) == untouched
+    output = rewrite_sql_tables(
+        "SELECT * FROM sales.orders; SELECT * FROM sales.orders;",
+        TABLES,
+    )
+    assert output.endswith(";")
+    assert output.count("main.sales.orders") == 2
+    assert rewrite_sql_paths("SELECT 1", PATHS) == "SELECT 1"
+
+
+def test_unparseable_sql_is_byte_identical_or_fatal() -> None:
+    broken = "SELECT * FROM ("
+    assert rewrite_sql_tables(broken, TABLES) == broken
+    with pytest.raises(XrefRewriteError):
+        rewrite_sql_tables(
+            broken,
+            TABLES,
+            on_failure=ParseFailureMode.ERROR,
+        )
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        'df.write.saveAsTable("sales.orders")',
+        'df.write.insertInto("sales.orders")',
+        'df.createOrReplaceTempView("sales.orders")',
+    ],
+)
+def test_pyspark_table_call_variants_are_rewritten(call: str) -> None:
+    assert "main.sales.orders" in rewrite_pyspark_tables(call + "\n", TABLES)
+
+
+def test_pyspark_table_rewriter_leaves_unrelated_shapes_untouched() -> None:
+    source = (
+        'label = "sales.orders"\n'
+        "df = spark.table(dynamic_name)\n"
+        "plain_call('sales.orders')\n"
+    )
+    assert rewrite_pyspark_tables(source, TABLES) == source
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        'open("/sasdata3/a.txt")',
+        'df.write.option("path", "/sasdata3/out")',
+        'dbutils.fs.mkdirs("/sasdata3/new")',
+    ],
+)
+def test_pyspark_path_call_variants_are_rewritten(call: str) -> None:
+    assert "/Volumes/main/sas" in rewrite_pyspark_paths(call + "\n", PATHS)
+
+
+def test_pyspark_path_rewriter_leaves_unknown_shapes_untouched() -> None:
+    source = (
+        'label = "/sasdata3/a.csv"\n'
+        "open(dynamic_path)\n"
+        'df.option("format", "/sasdata3/a.csv")\n'
+        'custom.read("/sasdata3/a.csv")\n'
+    )
+    assert rewrite_pyspark_paths(source, PATHS) == source
+
+
+def test_unparseable_pyspark_path_is_byte_identical_or_fatal() -> None:
+    broken = 'spark.read.csv("/sasdata3/a.csv"\n'
+    assert rewrite_pyspark_paths(broken, PATHS) == broken
+    with pytest.raises(XrefRewriteError):
+        rewrite_pyspark_paths(
+            broken,
+            PATHS,
+            on_failure=ParseFailureMode.ERROR,
+        )
+
+
+def test_both_mode_marks_a_supplied_pre_baseline() -> None:
+    code = 'df = spark.table("main.sales.orders")\n'
+    outcome = apply_both(
+        code,
+        resolve_local_target("PySpark"),
+        XrefMappings(exact=TABLES),
+        pre_code=code,
+    )
+    assert outcome.pre_applied
+    assert not outcome.post_changed
+    assert outcome.only_post == ()
+
+
+def test_sharepoint_source_skips_malformed_and_half_filled_items() -> None:
+    class MalformedTransport:
+        def list_items(self, list_id: str) -> list[dict[str, object]]:
+            assert list_id == "xref-list"
+            return [
+                {},
+                {"fields": "wrong-shape"},
+                {
+                    "fields": {
+                        "Application": "billing",
+                        "OriginalValue": "sales.orders",
+                    }
+                },
+            ]
+
+    assert not SharePointXrefSource(MalformedTransport(), "xref-list").load(
+        "billing"
+    )
+
+
+def test_transport_csv_source_rejects_an_empty_mapping() -> None:
+    class EmptyTransport:
+        def read_file(self, path: str) -> bytes:
+            assert path == "empty.csv"
+            return b"sas_name,databricks_name\n"
+
+    with pytest.raises(ValueError, match="zero entries"):
+        TransportCsvXrefSource(EmptyTransport(), "empty.csv").load("billing")

@@ -23,7 +23,7 @@ replacement and cutover gates. The authoritative machine inventory is
 | `target_language/` | 1 | Phase 3/10 | `sas_migrate.core.targets` exists; compatibility package retained |
 | `token_budget/` | 1 | Phase 4/8/10 | core tokens exist; validation reporting and cutover remain |
 | `validation/` | 17 | Phase 8 | validation application/adapters pending |
-| `xref/` | 6 | Phase 7 | next migration phase |
+| `xref/` | 6 | Phase 7/10 | v2 replacement exists; compatibility package retained until cutover |
 | `main.py` | 1 module | Phase 10 | active `sas-parser` entry point; replaced by operational `sas-migrate` commands |
 
 Total: 14 packages, 118 package Python files, 168 tracked package files

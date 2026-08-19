@@ -79,6 +79,7 @@ jobs:
           tests/test_v2_knowledge.py tests/test_v2_memory.py
           tests/test_v2_memory_delta.py
           tests/test_v2_legacy_inventory.py
+          tests/test_v2_xref.py
           --output-format=github
 
   types:
@@ -153,6 +154,15 @@ jobs:
       # the Databricks dialect.
       - name: Install dependencies
         run: uv sync --locked --extra dev --extra spark
+
+      - name: Phase 7 XREF line and branch coverage gate
+        run: >
+          uv run pytest -q tests/test_v2_xref.py
+          --cov=sas_migrate.application.xref
+          --cov=sas_migrate.application.ports.xref
+          --cov=sas_migrate.adapters.xref
+          --cov-branch --cov-report=term-missing
+          --cov-fail-under=90
 
       # Slow end-to-end tests skip themselves automatically: they need the
       # user-provided reference_docs/ PDFs, which are gitignored and absent here.

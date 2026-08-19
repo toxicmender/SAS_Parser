@@ -22,7 +22,9 @@ REQUIRED_MODULES = (
     "sas_migrate.application.knowledge",
     "sas_migrate.application.memory",
     "sas_migrate.application.translation",
+    "sas_migrate.application.xref",
     "sas_migrate.adapters.memory",
+    "sas_migrate.adapters.xref",
     "sas_migrate.core",
     "sas_migrate.core.responses",
     "sas_migrate.core.sas",
@@ -66,10 +68,16 @@ REQUIRED_DISTRIBUTION_FILES = (
     "sas_migrate/application/knowledge/ingestion.py",
     "sas_migrate/application/knowledge/retrieval.py",
     "sas_migrate/application/memory/services.py",
+    "sas_migrate/application/xref/service.py",
+    "sas_migrate/application/xref/sas_rewriter.py",
+    "sas_migrate/application/xref/target_rewriters/pyspark.py",
+    "sas_migrate/application/xref/target_rewriters/sql.py",
     "sas_migrate/adapters/knowledge/pdf.py",
     "sas_migrate/adapters/memory/in_memory.py",
     "sas_migrate/adapters/memory/delta.py",
     "sas_migrate/adapters/memory/delta_operations.py",
+    "sas_migrate/adapters/xref/csv.py",
+    "sas_migrate/adapters/xref/sharepoint.py",
 )
 
 

@@ -303,3 +303,9 @@ def test_schema_resource_is_bundled_and_versioned() -> None:
         "MemoryContextResult",
         "ExtractionResult",
     ]
+    assert schema["x-contract-families"]["xref"] == [
+        "XrefRow",
+        "XrefMappings",
+        "PreRewriteReport",
+        "BothRewriteResult",
+    ]

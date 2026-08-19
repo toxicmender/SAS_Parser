@@ -41,6 +41,8 @@ def test_inventory_has_complete_ownership_and_exit_gates() -> None:
         9,
         10,
     }
-    assert all(gap["status"] == "open" for gap in inventory["gaps"])
+    assert {gap["status"] for gap in inventory["gaps"]} <= {"open", "closed"}
+    gap_status = {gap["id"]: gap["status"] for gap in inventory["gaps"]}
+    assert gap_status["G-006"] == "closed"
     assert all(gap["exit_gate"] for gap in inventory["gaps"])
     assert importlib.util.find_spec("sas_migrate") is not None

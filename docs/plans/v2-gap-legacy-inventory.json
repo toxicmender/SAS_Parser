@@ -14,7 +14,7 @@
     {"name": "target_language", "python_files": 1, "tracked_files": 2, "owner_phase": 3, "replacement": "sas_migrate.core.targets", "status": "replacement_present"},
     {"name": "token_budget", "python_files": 1, "tracked_files": 2, "owner_phase": 4, "replacement": "sas_migrate.core.tokens", "status": "replacement_present"},
     {"name": "validation", "python_files": 17, "tracked_files": 20, "owner_phase": 8, "replacement": "sas_migrate.application.validation", "status": "port_only"},
-    {"name": "xref", "python_files": 6, "tracked_files": 7, "owner_phase": 7, "replacement": "sas_migrate.application.xref", "status": "next_phase"}
+    {"name": "xref", "python_files": 6, "tracked_files": 7, "owner_phase": 7, "replacement": "sas_migrate.application.xref plus sas_migrate.adapters.xref", "status": "replacement_present"}
   ],
   "legacy_modules": [
     {"path": "main.py", "owner_phase": 10, "replacement": "sas_migrate.cli", "status": "active_entry_point"}
@@ -45,6 +45,7 @@
       "docs/migrations/v2-token-contracts.md",
       "docs/migrations/v2-translation-contracts.md",
       "docs/migrations/v2-knowledge-memory-contracts.md",
+      "docs/migrations/v2-xref-contracts.md",
       "docs/plans/pipeline-decoupling-tiktoken.md"
     ],
     "broad_reference_roots": ["tests", "docker"]
@@ -55,7 +56,7 @@
     {"id": "G-003", "area": "knowledge", "owner_phase": 9, "status": "open", "summary": "Optional dense retrieval, RRF/reranking, and embedding caches remain in legacy prompt_builder.", "exit_gate": "V2 ports and lazy adapters cover lexical, dense, fusion, reranking, and cache contracts."},
     {"id": "G-004", "area": "memory", "owner_phase": 9, "status": "open", "summary": "The v2 Delta memory adapter delegates physical MERGE and CDF operations to legacy memory.store.KVStore.", "exit_gate": "The adapter owns its Delta implementation and allowed_v2_legacy_imports is empty."},
     {"id": "G-005", "area": "memory", "owner_phase": 9, "status": "open", "summary": "Databricks chat and embedding factories remain in legacy memory.databricks_ai.", "exit_gate": "Lazy v2 Databricks AI adapters pass install/import contracts."},
-    {"id": "G-006", "area": "xref", "owner_phase": 7, "status": "open", "summary": "XREF models, path resolution, SAS rewriting, target rewriting, and mapping-source adapters are not in v2.", "exit_gate": "Phase 7 characterization and adapter contracts pass with no Scala dispatch."},
+    {"id": "G-006", "area": "xref", "owner_phase": 7, "status": "closed", "summary": "XREF models, path resolution, SAS rewriting, target rewriting, and mapping-source adapters are implemented in v2.", "exit_gate": "Phase 7 characterization and adapter contracts pass with no Scala dispatch."},
     {"id": "G-007", "area": "validation", "owner_phase": 8, "status": "open", "summary": "Validation metrics, evaluator, conversation reconstruction, tracking, and reports remain legacy-only.", "exit_gate": "V2 validation application and adapter suites pass."},
     {"id": "G-008", "area": "token_reporting", "owner_phase": 8, "status": "open", "summary": "Validation reports do not yet render component token budgets or token_budget_compliance.", "exit_gate": "Markdown, PDF, JSON, and tracking outputs expose translation and judge budgets separately."},
     {"id": "G-009", "area": "assessment", "owner_phase": 8, "status": "open", "summary": "Complexity assessment, sizing, cross-file analysis, LLM review, profiles, and reports remain legacy-only.", "exit_gate": "V2 assessment golden and profile-inheritance tests pass."},
