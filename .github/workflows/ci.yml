@@ -28,6 +28,9 @@ jobs:
       - name: Check v2 architecture boundaries
         run: python scripts/check_v2_architecture.py
 
+      - name: Check consolidated gap and legacy inventory
+        run: python scripts/check_v2_legacy_inventory.py
+
       - name: Import v2 core with core dependencies only
         run: >
           uv run --isolated --no-project --with "pydantic>=2.13.4"
@@ -66,7 +69,8 @@ jobs:
         run: >
           uvx ruff@0.16.0 check
           src/sas_migrate
-          scripts/check_v2_architecture.py scripts/smoke_v2_core.py
+          scripts/check_v2_architecture.py scripts/check_v2_legacy_inventory.py
+          scripts/smoke_v2_core.py
           scripts/smoke_wheel.py scripts/v2_sas_test_adapter.py
           tests/test_v2_architecture.py tests/test_v2_contracts.py
           tests/test_v2_ports.py tests/test_v2_sas_core.py
@@ -74,6 +78,7 @@ jobs:
           tests/test_v2_tokens.py tests/test_v2_translation.py
           tests/test_v2_knowledge.py tests/test_v2_memory.py
           tests/test_v2_memory_delta.py
+          tests/test_v2_legacy_inventory.py
           --output-format=github
 
   types:
