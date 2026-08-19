@@ -3,16 +3,26 @@
 from __future__ import annotations
 
 import pathlib
+from typing import Any
 
 import pytest
 
 from sas_migrate.application.xref import (
+    ParseFailureMode,
     XrefMappings,
+    XrefRewriteError,
     XrefRow,
+    apply_both,
+    apply_post,
     classify_rows,
     resolve_path,
+    rewrite_pyspark_paths,
+    rewrite_pyspark_tables,
     rewrite_source_text,
+    rewrite_sql_paths,
+    rewrite_sql_tables,
 )
+from sas_migrate.core.targets import resolve_local_target
 
 
 def test_rows_are_classified_into_exact_libref_and_path_namespaces() -> None:
@@ -92,3 +102,108 @@ def test_sas_pre_rewriter_is_byte_identical_when_no_path_matches() -> None:
     )
     assert output == source
     assert not report
+
+
+TABLES = {"sales.orders": "main.sales.orders"}
+PATHS = {"/sasdata3": "/Volumes/main/sas"}
+
+
+def test_sql_rewriter_uses_databricks_for_read_and_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sqlglot
+    from sqlglot import exp
+
+    parsed_with: list[str | None] = []
+    emitted_with: list[str | None] = []
+    real_parse = sqlglot.parse
+    real_sql = exp.Expression.sql
+
+    def capture_parse(source: str, *, read: Any = None, **kwargs: Any) -> Any:
+        parsed_with.append(read)
+        return real_parse(source, read=read, **kwargs)
+
+    def capture_sql(
+        self: exp.Expression,
+        dialect: Any = None,
+        **kwargs: Any,
+    ) -> str:
+        emitted_with.append(dialect)
+        return real_sql(self, dialect=dialect, **kwargs)
+
+    monkeypatch.setattr(sqlglot, "parse", capture_parse)
+    monkeypatch.setattr(exp.Expression, "sql", capture_sql)
+
+    assert "main.sales.orders" in rewrite_sql_tables(
+        "SELECT * FROM sales.orders", TABLES
+    )
+    assert parsed_with == ["databricks"]
+    assert emitted_with and set(emitted_with) == {"databricks"}
+
+
+def test_sql_table_and_path_rewriters_cover_databricks_positions() -> None:
+    sql = "CREATE TABLE sales.orders USING csv LOCATION '/sasdata3/orders'"
+    output = rewrite_sql_paths(rewrite_sql_tables(sql, TABLES), PATHS)
+    assert "main.sales.orders" in output
+    assert "'/Volumes/main/sas/orders'" in output
+
+
+def test_pyspark_rewriters_preserve_comments_formatting_and_quote_style() -> None:
+    source = (
+        "# retain this comment\n"
+        'df = spark.table("sales.orders")\n'
+        "raw = spark.read.csv('/sasdata3/a.csv')\n"
+        "label = '/sasdata3/a.csv'\n"
+    )
+    output = rewrite_pyspark_paths(rewrite_pyspark_tables(source, TABLES), PATHS)
+    assert output == (
+        "# retain this comment\n"
+        'df = spark.table("main.sales.orders")\n'
+        "raw = spark.read.csv('/Volumes/main/sas/a.csv')\n"
+        "label = '/sasdata3/a.csv'\n"
+    )
+
+
+def test_pyspark_rewriter_recurses_into_spark_sql_under_databricks() -> None:
+    source = 'df = spark.sql("SELECT * FROM sales.orders")\n'
+    assert "main.sales.orders" in rewrite_pyspark_tables(source, TABLES)
+
+
+def test_unparseable_pyspark_is_byte_identical_or_fatal() -> None:
+    broken = 'df = spark.table("sales.orders"\n'
+    assert rewrite_pyspark_tables(broken, TABLES) == broken
+    with pytest.raises(XrefRewriteError):
+        rewrite_pyspark_tables(
+            broken,
+            TABLES,
+            on_failure=ParseFailureMode.ERROR,
+        )
+
+
+@pytest.mark.parametrize("target_name", ["Spark SQL", "PySpark"])
+def test_application_dispatch_covers_only_registered_targets(target_name: str) -> None:
+    target = resolve_local_target(target_name)
+    code = (
+        "SELECT * FROM sales.orders"
+        if target_name == "Spark SQL"
+        else 'df = spark.table("sales.orders")\n'
+    )
+    output = apply_post(code, target, XrefMappings(exact=TABLES))
+    assert "main.sales.orders" in output
+
+
+def test_both_mode_reports_names_reached_only_after_conversion() -> None:
+    mappings = XrefMappings(exact=TABLES, by_path=PATHS)
+    outcome = apply_both(
+        'df = spark.table("sales.orders")\n',
+        resolve_local_target("PySpark"),
+        mappings,
+    )
+    assert outcome.post_changed
+    assert outcome.only_post == ("sales.orders",)
+
+
+def test_xref_application_has_no_scala_dispatch_or_network_imports() -> None:
+    package = pathlib.Path(__file__).resolve().parents[1] / "src" / "sas_migrate" / "application" / "xref"
+    source = "\n".join(path.read_text("utf-8") for path in package.rglob("*.py"))
+    assert "scala" not in source.casefold()
+    assert "sharepoint" not in source.casefold()
+    assert "requests" not in source.casefold()
