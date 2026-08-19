@@ -19,6 +19,13 @@ coverage findings, and the following product decisions:
 The older plan in `docs/plans/pipeline-decoupling-tiktoken.md` remains useful
 as historical context but does not govern v2 implementation.
 
+The authoritative open-work ledger is
+[`v2-gap-register.md`](v2-gap-register.md), backed by the machine-checked
+[`v2-gap-legacy-inventory.json`](v2-gap-legacy-inventory.json). The complete
+legacy code and reference index is [`../legacy/README.md`](../legacy/README.md).
+Phase sections below define implementation order; they do not create separate
+gap or legacy inventories.
+
 ## 1. Outcomes
 
 The v2 implementation will deliver:

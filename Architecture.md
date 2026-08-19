@@ -1,5 +1,11 @@
 # Architecture
 
+> **Legacy runtime architecture:** this document describes the active v1
+> composition. The v2 target and phase order are defined in the
+> [v2 implementation plan](docs/plans/v2-architecture-implementation.md). Use
+> the consolidated [gap register](docs/plans/v2-gap-register.md) and
+> [legacy code/reference index](docs/legacy/README.md) for migration status.
+
 SAS_Parser turns Base SAS source into LLM-ready work items. It has three
 layers, each usable on its own:
 

@@ -1,5 +1,11 @@
 # SAS Parser
 
+> **Migration status:** this README documents the active legacy `sas-parser`
+> runtime while v2 is implemented. The target architecture is in the
+> [v2 implementation plan](docs/plans/v2-architecture-implementation.md), with
+> one [gap register](docs/plans/v2-gap-register.md) and one
+> [legacy code/reference index](docs/legacy/README.md).
+
 Translate SAS programs into a Databricks target — PySpark or Spark SQL
 — with the corpus chunked semantically, batched by its real dependency graph,
 and converted through an LLM behind an AI Gateway.

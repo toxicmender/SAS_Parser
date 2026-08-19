@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "legacy_packages": [
+    {"name": "app_config", "python_files": 8, "tracked_files": 9, "owner_phase": 9, "replacement": "sas_migrate.config plus auth/sharepoint adapters", "status": "not_migrated"},
+    {"name": "chunker", "python_files": 9, "tracked_files": 10, "owner_phase": 2, "replacement": "sas_migrate.core.sas", "status": "replacement_present"},
+    {"name": "complexity", "python_files": 18, "tracked_files": 21, "owner_phase": 8, "replacement": "sas_migrate.application.assessment", "status": "not_migrated"},
+    {"name": "conversion", "python_files": 6, "tracked_files": 7, "owner_phase": 9, "replacement": "sas_migrate.application.conversion", "status": "not_migrated"},
+    {"name": "data_hydration", "python_files": 20, "tracked_files": 21, "owner_phase": 9, "replacement": "sas_migrate.application.hydration plus adapters", "status": "not_migrated"},
+    {"name": "llm_client", "python_files": 2, "tracked_files": 3, "owner_phase": 9, "replacement": "sas_migrate application LLM port plus gateway adapter", "status": "port_only"},
+    {"name": "memory", "python_files": 11, "tracked_files": 12, "owner_phase": 6, "replacement": "sas_migrate.application.memory plus adapters.memory", "status": "transition_dependency"},
+    {"name": "pipeline", "python_files": 9, "tracked_files": 10, "owner_phase": 5, "replacement": "sas_migrate.application.translation", "status": "replacement_present"},
+    {"name": "prompt_builder", "python_files": 8, "tracked_files": 41, "owner_phase": 6, "replacement": "sas_migrate.application.knowledge", "status": "advanced_adapters_pending"},
+    {"name": "reporting", "python_files": 2, "tracked_files": 3, "owner_phase": 10, "replacement": "sas_migrate application presenters and document adapters", "status": "not_migrated"},
+    {"name": "target_language", "python_files": 1, "tracked_files": 2, "owner_phase": 3, "replacement": "sas_migrate.core.targets", "status": "replacement_present"},
+    {"name": "token_budget", "python_files": 1, "tracked_files": 2, "owner_phase": 4, "replacement": "sas_migrate.core.tokens", "status": "replacement_present"},
+    {"name": "validation", "python_files": 17, "tracked_files": 20, "owner_phase": 8, "replacement": "sas_migrate.application.validation", "status": "port_only"},
+    {"name": "xref", "python_files": 6, "tracked_files": 7, "owner_phase": 7, "replacement": "sas_migrate.application.xref", "status": "next_phase"}
+  ],
+  "legacy_modules": [
+    {"path": "main.py", "owner_phase": 10, "replacement": "sas_migrate.cli", "status": "active_entry_point"}
+  ],
+  "allowed_v2_legacy_imports": [
+    {
+      "file": "src/sas_migrate/adapters/memory/delta.py",
+      "module": "memory.store",
+      "reason": "Temporary reuse of the hardened MERGE/CDF engine until the physical Delta adapter is moved during infrastructure cutover."
+    }
+  ],
+  "reference_surfaces": {
+    "runtime_documentation": ["README.md", "Architecture.md"],
+    "active_configuration": ["config.json", ".env.example"],
+    "legacy_package_documentation": [
+      "app_config/README.md", "chunker/README.md", "complexity/README.md",
+      "conversion/README.md", "data_hydration/README.md", "llm_client/README.md",
+      "memory/README.md", "pipeline/README.md", "prompt_builder/README.md",
+      "reporting/README.md", "target_language/README.md", "token_budget/README.md",
+      "validation/README.md", "xref/README.md"
+    ],
+    "build_test_and_ci": [
+      "pyproject.toml", ".github/workflows/ci.yml", "scripts/smoke_wheel.py",
+      "scripts/v2_sas_test_adapter.py", "tests/test_v2_sas_parity.py"
+    ],
+    "deployment": ["docker-compose.yml", "docker/README.md", "docker/spark/install_delta.sh", "docker/spark/warmup.py"],
+    "historical_migration_notes": [
+      "docs/migrations/v2-token-contracts.md",
+      "docs/migrations/v2-translation-contracts.md",
+      "docs/migrations/v2-knowledge-memory-contracts.md",
+      "docs/plans/pipeline-decoupling-tiktoken.md"
+    ],
+    "broad_reference_roots": ["tests", "docker"]
+  },
+  "gaps": [
+    {"id": "G-001", "area": "coverage", "owner_phase": 2, "status": "open", "summary": "V2 SAS core remains below the final 95% line and 90% branch policy.", "exit_gate": "Package-level core coverage thresholds pass."},
+    {"id": "G-002", "area": "coverage", "owner_phase": 5, "status": "open", "summary": "Translation orchestration, budgeting, artifacts, models, and run-state guard/error branches remain below the application target.", "exit_gate": "Every Phase 5 application module reaches 90% line and 85% branch coverage."},
+    {"id": "G-003", "area": "knowledge", "owner_phase": 9, "status": "open", "summary": "Optional dense retrieval, RRF/reranking, and embedding caches remain in legacy prompt_builder.", "exit_gate": "V2 ports and lazy adapters cover lexical, dense, fusion, reranking, and cache contracts."},
+    {"id": "G-004", "area": "memory", "owner_phase": 9, "status": "open", "summary": "The v2 Delta memory adapter delegates physical MERGE and CDF operations to legacy memory.store.KVStore.", "exit_gate": "The adapter owns its Delta implementation and allowed_v2_legacy_imports is empty."},
+    {"id": "G-005", "area": "memory", "owner_phase": 9, "status": "open", "summary": "Databricks chat and embedding factories remain in legacy memory.databricks_ai.", "exit_gate": "Lazy v2 Databricks AI adapters pass install/import contracts."},
+    {"id": "G-006", "area": "xref", "owner_phase": 7, "status": "open", "summary": "XREF models, path resolution, SAS rewriting, target rewriting, and mapping-source adapters are not in v2.", "exit_gate": "Phase 7 characterization and adapter contracts pass with no Scala dispatch."},
+    {"id": "G-007", "area": "validation", "owner_phase": 8, "status": "open", "summary": "Validation metrics, evaluator, conversation reconstruction, tracking, and reports remain legacy-only.", "exit_gate": "V2 validation application and adapter suites pass."},
+    {"id": "G-008", "area": "token_reporting", "owner_phase": 8, "status": "open", "summary": "Validation reports do not yet render component token budgets or token_budget_compliance.", "exit_gate": "Markdown, PDF, JSON, and tracking outputs expose translation and judge budgets separately."},
+    {"id": "G-009", "area": "assessment", "owner_phase": 8, "status": "open", "summary": "Complexity assessment, sizing, cross-file analysis, LLM review, profiles, and reports remain legacy-only.", "exit_gate": "V2 assessment golden and profile-inheritance tests pass."},
+    {"id": "G-010", "area": "conversion", "owner_phase": 9, "status": "open", "summary": "Local and SharePoint conversion workflows and request lifecycle remain legacy-only.", "exit_gate": "V2 fake-repository end-to-end workflows pass with per-row isolation."},
+    {"id": "G-011", "area": "hydration", "owner_phase": 9, "status": "open", "summary": "Hydration planning, credentials, source drivers, ranged I/O, and Delta sink remain top-level legacy packages.", "exit_gate": "Pure v2 planning and optional-driver contract matrix pass."},
+    {"id": "G-012", "area": "infrastructure", "owner_phase": 9, "status": "open", "summary": "Typed configuration, Azure/Vault/Databricks/SharePoint auth, worker-loop ownership, and observability are not migrated.", "exit_gate": "V2 config and infrastructure adapter suites pass with secret-free models and lazy extras."},
+    {"id": "G-013", "area": "cli", "owner_phase": 10, "status": "open", "summary": "sas-migrate is still a shell; operational subcommands remain on the legacy sas-parser/main.py entry point.", "exit_gate": "Every planned v2 subcommand runs from the installed wheel and sas-parser is removed."},
+    {"id": "G-014", "area": "artifacts", "owner_phase": 10, "status": "open", "summary": "Markdown/PDF presenters and SharePoint publication adapters remain legacy-only.", "exit_gate": "V2 report visual/golden and publication adapter tests pass."},
+    {"id": "G-015", "area": "deployment", "owner_phase": 10, "status": "open", "summary": "Docker, Compose, Spark/Delta warmup, and operator commands still compose legacy entry points.", "exit_gate": "V2 container and Spark/Delta smoke tests pass."},
+    {"id": "G-016", "area": "documentation", "owner_phase": 10, "status": "open", "summary": "README.md and Architecture.md primarily document the active legacy application rather than the v2 target.", "exit_gate": "V2 overview, configuration, API, operator, and cutover guides replace legacy runtime documentation."},
+    {"id": "G-017", "area": "ci", "owner_phase": 9, "status": "open", "summary": "Mandatory SharePoint/Graph, Databricks/auth, and hydration optional-extra jobs are not present.", "exit_gate": "Each adapter extra has an install/import/contract CI job where unexpected skips fail."},
+    {"id": "G-018", "area": "ci", "owner_phase": 10, "status": "open", "summary": "Docker build/warmup and scheduled real-model quality evaluation jobs are not present.", "exit_gate": "Deployment smoke and budgeted scheduled evaluation jobs pass."},
+    {"id": "G-019", "area": "quality", "owner_phase": 10, "status": "open", "summary": "Repository-wide Ruff is not clean; CI gates only the expanding migration-owned surface.", "exit_gate": "Ruff gates the whole repository with zero diagnostics."},
+    {"id": "G-020", "area": "test_data", "owner_phase": 10, "status": "open", "summary": "Reference-document and live external-service tests remain conditional outside their provisioned jobs.", "exit_gate": "Required corpora are versioned or generated and production-critical integrations have no-skip jobs."},
+    {"id": "G-021", "area": "cutover", "owner_phase": 10, "status": "open", "summary": "Fourteen top-level legacy packages, main.py, dual entry points, compatibility tests, and packaging references remain shipped.", "exit_gate": "The legacy package/module inventory and all compatibility references are empty or archived outside the wheel."}
+  ]
+}
