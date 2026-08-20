@@ -312,3 +312,46 @@ def test_active_session_survives_a_broken_pyspark(monkeypatch):
     broken.SparkSession = _Boom  # pyright: ignore[reportAttributeAccessIssue]
     monkeypatch.setitem(sys.modules, "pyspark.sql", broken)
     assert dc._active_session() is None
+
+
+# ---------------------------------------------------------------------------
+# The early warning main() emits, so a child process says so before it fails
+# ---------------------------------------------------------------------------
+
+
+def test_main_entry_point_warns_on_a_child_process(on_cluster, monkeypatch, caplog):
+    import logging
+
+    import main as cli
+
+    _session(monkeypatch, None)
+    with caplog.at_level(logging.WARNING):
+        cli._warn_if_databricks_child_process()
+    assert "child process" in caplog.text
+    assert "%sh" in caplog.text
+
+
+def test_main_entry_point_is_quiet_in_the_notebook(on_cluster, monkeypatch, caplog):
+    import logging
+
+    import main as cli
+
+    _session(monkeypatch, _Session())
+    with caplog.at_level(logging.WARNING):
+        cli._warn_if_databricks_child_process()
+    assert caplog.text == ""
+
+
+def test_main_entry_point_never_blocks_a_run(off_cluster, monkeypatch, caplog):
+    """Advice must not be able to break the command it is advising about."""
+    import logging
+
+    import main as cli
+
+    def boom() -> None:
+        raise RuntimeError("preflight itself is broken")
+
+    monkeypatch.setattr(dc, "check_runtime", boom)
+    with caplog.at_level(logging.WARNING):
+        cli._warn_if_databricks_child_process()
+    assert caplog.text == ""
