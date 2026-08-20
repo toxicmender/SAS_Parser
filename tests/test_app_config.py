@@ -14,6 +14,7 @@ import json
 import logging
 import pathlib
 import sys
+import types
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -576,6 +577,90 @@ def test_spark_master_wrong_type_degrades(_isolated_config, caplog):
     with caplog.at_level(logging.WARNING):
         assert master_url() == "local[*]"
     assert "spark.master" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# active_or_new_session — reuse the runtime's session, never rebuild it
+# ---------------------------------------------------------------------------
+
+
+class _FakeBuilder:
+    """Records what a caller asked for, so the test can assert it never asked."""
+
+    def __init__(self, sink: dict) -> None:
+        self.sink = sink
+
+    def master(self, value):
+        self.sink["master"] = value
+        return self
+
+    def appName(self, value):  # noqa: N802 - pyspark's own spelling
+        self.sink["appName"] = value
+        return self
+
+    def getOrCreate(self):  # noqa: N802 - pyspark's own spelling
+        self.sink["built"] = True
+        return "built-session"
+
+
+def _fake_pyspark(monkeypatch, active, sink):
+    """Install a pyspark.sql stand-in exposing getActiveSession and builder."""
+    module = types.ModuleType("pyspark.sql")
+
+    class _SparkSession:
+        builder = _FakeBuilder(sink)
+
+        @staticmethod
+        def getActiveSession():  # noqa: N802 - pyspark's own spelling
+            return active
+
+    module.SparkSession = _SparkSession  # pyright: ignore[reportAttributeAccessIssue]
+    monkeypatch.setitem(sys.modules, "pyspark.sql", module)
+
+
+def test_active_session_is_reused_and_nothing_is_built(_isolated_config, monkeypatch):
+    """The Databricks case: a session exists, so no master is ever requested."""
+    from app_config.spark import active_or_new_session
+
+    sink: dict = {}
+    _fake_pyspark(monkeypatch, active="runtime-session", sink=sink)
+    assert active_or_new_session("chunker_pipeline") == "runtime-session"
+    # The whole point: builder.master() is what raises under Spark Connect.
+    assert sink == {}
+
+
+def test_a_session_is_built_when_none_is_active(_isolated_config, monkeypatch):
+    """Off Databricks nothing is active, so the configured master is used."""
+    from app_config.spark import active_or_new_session
+
+    sink: dict = {}
+    _fake_pyspark(monkeypatch, active=None, sink=sink)
+    _set(_isolated_config, {"spark": {"master": "spark://configured:7077"}})
+    assert active_or_new_session("validation_tracking") == "built-session"
+    assert sink == {
+        "master": "spark://configured:7077",
+        "appName": "validation_tracking",
+        "built": True,
+    }
+
+
+def test_an_explicit_master_still_wins_when_building(_isolated_config, monkeypatch):
+    from app_config.spark import active_or_new_session
+
+    sink: dict = {}
+    _fake_pyspark(monkeypatch, active=None, sink=sink)
+    active_or_new_session("x", master="local[2]")
+    assert sink["master"] == "local[2]"
+
+
+def test_missing_pyspark_names_the_extra(_isolated_config, monkeypatch):
+    """Invariant 8: app_config imports without pyspark; only this call needs it."""
+    from app_config.spark import active_or_new_session
+
+    monkeypatch.setitem(sys.modules, "pyspark", None)
+    monkeypatch.setitem(sys.modules, "pyspark.sql", None)
+    with pytest.raises(ImportError, match=r"sas-parser\[spark\]"):
+        active_or_new_session("chunker_pipeline")
 
 
 def test_spark_module_does_not_import_pyspark():

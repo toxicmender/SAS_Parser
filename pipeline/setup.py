@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import app_config
-from app_config.spark import describe_master, master_url
+from app_config.spark import active_or_new_session
 from memory.context import MemoryContext
 from memory.extractor import MemoryExtractor
 from memory.policy import TaskPolicy
@@ -180,18 +180,10 @@ class MemorySetup:
             )
             return MemoryHub(spark=spark, table=None)
         if spark is None:
-            from pyspark.sql import SparkSession
-
-            master = master_url()
-            logger.info(
-                f"MemorySetup: no SparkSession provided, building one against "
-                f"{describe_master(master)}"
-            )
-            spark = (
-                SparkSession.builder.master(master)
-                .appName("chunker_pipeline")
-                .getOrCreate()
-            )
+            # Reuses the runtime's session on Databricks; builds one against
+            # app_config.spark's master everywhere else. See
+            # app_config.spark.active_or_new_session.
+            spark = active_or_new_session("chunker_pipeline")
         return MemoryHub(
             spark=spark,
             table=delta_table,

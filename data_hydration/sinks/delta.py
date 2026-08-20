@@ -33,27 +33,16 @@ logger = logging.getLogger(__name__)
 
 
 def get_session() -> Any:
-    """The active :class:`SparkSession`, or a new local one.
+    """The active :class:`SparkSession`, or a new one against the configured master.
 
-    ``getOrCreate`` on purpose: inside a Databricks job the session already
-    exists and must be reused, and outside one this is what a local test cluster
-    gets. ``app_config.spark`` owns the master URL.
+    Inside a Databricks job the session already exists and must be reused;
+    outside one this is what a local test cluster gets. ``app_config.spark``
+    owns both halves of that decision — see
+    :func:`app_config.spark.active_or_new_session`.
     """
-    try:
-        from pyspark.sql import SparkSession
-    except ImportError as exc:  # pragma: no cover - depends on the extra
-        raise ImportError(
-            "pyspark is required to write Delta tables; install it with "
-            "'pip install \"sas-parser[spark]\"'"
-        ) from exc
+    from app_config.spark import active_or_new_session
 
-    from app_config import get_value
-
-    builder = SparkSession.builder.appName("sas-parser-hydration")
-    master = get_value("spark", "master")
-    if master:
-        builder = builder.master(master)
-    return builder.getOrCreate()
+    return active_or_new_session("sas-parser-hydration")
 
 
 def _ensure_schema(spark: Any, table: str) -> None:
