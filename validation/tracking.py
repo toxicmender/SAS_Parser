@@ -43,7 +43,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import app_config
-from app_config.spark import describe_master, master_url
+from app_config.spark import active_or_new_session
 
 from .models import ValidationReport
 
@@ -92,18 +92,9 @@ _SCHEMA_DDL = ", ".join(f"{name} {sql_type}" for name, sql_type in _COLUMNS)
 def _ensure_spark(spark: "SparkSession | None") -> "SparkSession":
     if spark is not None:
         return spark
-    from pyspark.sql import SparkSession
-
-    master = master_url()
-    logger.info(
-        f"_ensure_spark: no SparkSession provided, building one against "
-        f"{describe_master(master)}"
-    )
-    return (
-        SparkSession.builder.master(master)
-        .appName("validation_tracking")
-        .getOrCreate()
-    )
+    # Reuses the runtime's session on Databricks; builds one against
+    # app_config.spark's master everywhere else.
+    return active_or_new_session("validation_tracking")
 
 
 def _resolve_target(table: str | None, path: str | None) -> tuple[str, str]:

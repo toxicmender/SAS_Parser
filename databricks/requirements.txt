@@ -1,0 +1,92 @@
+# Compute-scoped library set for Databricks Runtime 19 (Spark 4.2.0, Python 3.12.3).
+#
+# Point a cluster's Libraries tab (or a job's `libraries` block) at this file:
+#     { "requirements": "/Volumes/<catalog>/<schema>/sas_parser/requirements.txt" }
+#
+# DERIVED, NOT HAND-WRITTEN. Regenerate after any `uv lock` change:
+#
+#     uv export --frozen --no-dev --no-hashes --no-emit-project --no-annotate #         --no-header --extra sharepoint --extra vault --extra azure
+#
+# then drop every package Databricks Runtime 19 already ships at a version the
+# lock is happy with. What remains is this file. `constraints-dbr19.txt` beside
+# it records the dropped set at its runtime version, so the result can be
+# re-verified against a stock cluster without one:
+#
+#     uv pip compile databricks/requirements.txt -c databricks/constraints-dbr19.txt #         --python-version 3.12 --python-platform linux
+#
+# Verified blast radius: 51 packages added, and exactly three runtime packages
+# change --- pydantic 2.13.3 -> 2.13.4, pydantic-core 2.46.3 -> 2.46.4, and
+# markdown-it-py 2.2.0 -> 4.2.0. All three are the repo's own declared floors
+# (pyproject.toml), not incidental resolver drift. numpy, pandas, pyarrow,
+# requests, urllib3, cryptography, typing-extensions and packaging are all left
+# at their runtime versions.
+#
+# DELIBERATELY ABSENT --- do not add:
+#   pyspark, delta-spark      the runtime IS Spark 4.2.0 / Delta 4.2.0. The
+#                             `spark` extra pins pyspark>=4.1.2,<4.2 for laptops
+#                             and the Docker stack; installing it here puts a
+#                             4.1.x Python client under a 4.2.0 JVM.
+#   databricks-sql-connector  in the `databricks` extra, but unused on a cluster:
+#                             its only consumer, sql_connect_params(), builds
+#                             kwargs for callers OUTSIDE a notebook and raises on
+#                             a cluster.
+#   databricks-sdk, msal      already satisfied by the runtime (0.108.0 / 1.36.0).
+#   tiktoken, python-dotenv   already satisfied (0.13.0 / 1.2.2).
+#
+# `colorama` carries a win32 marker from the universal lock and is inert here.
+
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.3
+aiosignal==1.4.0
+attrs==26.1.0
+bm25s==0.3.10
+colorama==0.4.6 ; sys_platform == 'win32'
+distro==1.9.0
+faiss-cpu==1.14.3
+frozenlist==1.8.0
+h2==4.4.0
+hpack==4.2.0
+httpcore==1.0.9
+httpx==0.28.1
+hvac==2.4.0
+hyperframe==6.1.0
+jiter==0.16.0
+jsonpatch==1.33
+jsonpointer==3.1.1
+langchain==1.3.14
+langchain-core==1.5.2
+langchain-openai==1.4.1
+langchain-protocol==0.0.18
+langgraph==1.2.10
+langgraph-checkpoint==4.1.1
+langgraph-prebuilt==1.1.0
+langgraph-sdk==0.4.2
+langsmith==0.10.12
+llvmlite==0.48.0
+markdown-it-py==4.2.0
+microsoft-kiota-abstractions==1.11.7
+microsoft-kiota-authentication-azure==1.11.7
+microsoft-kiota-http==1.11.7
+microsoft-kiota-serialization-form==1.11.7
+microsoft-kiota-serialization-json==1.11.7
+microsoft-kiota-serialization-multipart==1.11.7
+microsoft-kiota-serialization-text==1.11.7
+msgraph-core==1.5.1
+msgraph-sdk==1.60.0
+multidict==6.7.1
+numba==0.66.0
+openai==2.50.0
+orjson==3.11.9
+ormsgpack==1.12.2
+propcache==0.5.2
+pydantic==2.13.4
+pydantic-core==2.46.4
+pymupdf==1.28.0
+pystemmer==3.1.0
+requests-toolbelt==1.0.0
+sqlglot==30.14.0
+std-uritemplate==2.0.12
+uuid-utils==0.17.0
+websockets==15.0.1
+xxhash==3.8.1
+yarl==1.24.5

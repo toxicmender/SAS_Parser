@@ -700,9 +700,20 @@ def run_checks(*, offline: bool = False, client: Any | None = None) -> list[Chec
     return results
 
 
-def render(results: list[CheckResult], *, verbose: bool = False) -> str:
-    """The results as the human-readable report."""
-    lines: list[str] = ["SharePoint preflight", "=" * 20, ""]
+def render(
+    results: list[CheckResult],
+    *,
+    verbose: bool = False,
+    title: str = "SharePoint preflight",
+    passed: str = "PASSED: SharePoint is reachable and configured",
+) -> str:
+    """The results as the human-readable report.
+
+    *title* and *passed* are parameters so the sibling preflights
+    (:mod:`app_config.databricks_check`) render identically rather than growing
+    a second, subtly different reporter.
+    """
+    lines: list[str] = [title, "=" * len(title), ""]
     for result in results:
         lines.append(f"{_MARKS.get(result.status, '[ ?? ]')} {result.name}: {result.summary}")
         show_detail = verbose or result.status in (FAIL, WARN)
@@ -725,7 +736,7 @@ def render(results: list[CheckResult], *, verbose: bool = False) -> str:
             f"({', '.join(r.name for r in warnings)})"
         )
     else:
-        lines.append("PASSED: SharePoint is reachable and configured")
+        lines.append(passed)
     if not verbose and not failures and not warnings:
         lines.append("(re-run with --verbose to see what each check resolved)")
     return "\n".join(lines)
