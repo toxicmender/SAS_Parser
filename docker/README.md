@@ -14,7 +14,8 @@ paths (`memory.store`'s Delta backend and `validation.tracking`).
 
 Files: [`../docker-compose.yml`](../docker-compose.yml),
 [`app.Dockerfile`](app.Dockerfile), [`spark.Dockerfile`](spark.Dockerfile),
-[`vault.Dockerfile`](vault.Dockerfile).
+[`vault.Dockerfile`](vault.Dockerfile), and the focused
+[`ci.spark-delta.Dockerfile`](ci.spark-delta.Dockerfile) used by CI.
 
 Requires Docker Compose ≥ 2.24 (the `env_file: { required: false }` form).
 
@@ -54,6 +55,27 @@ Use `docker compose exec`, not `docker compose run`, for anything that starts a
 Spark session against the cluster: `run` containers do not get the service's
 network alias, so the executors cannot call the driver back. If you need a
 one-off container anyway, `docker compose run --rm --use-aliases app ...`.
+
+### Spark and Delta CI image
+
+The `PySpark & DeltaTable container contracts` job builds the focused CI image
+on a standard GitHub-hosted Ubuntu runner. It uses the locked PySpark wheel,
+Java 17, a pinned Delta Lake package, and the same Maven-jar warmup script as
+the deployment images. The job then runs direct PySpark DataFrame and Python
+`DeltaTable` merge/update/delete tests plus both application memory suites with
+`REQUIRE_DELTA_TESTS=1`, so a missing runtime is a failure rather than a skip.
+
+The repository is public, so standard hosted-runner execution does not consume
+paid Actions minutes. A private fork uses its account's included Actions quota.
+Docker's official Buildx actions persist layers in GitHub's Actions cache; no
+third-party Spark service or privileged Docker-in-Docker runner is required.
+
+Run the same image locally:
+
+```bash
+docker build -f docker/ci.spark-delta.Dockerfile -t sas-parser/spark-delta-ci .
+docker run --rm --shm-size=2g -e REQUIRE_DELTA_TESTS=1 sas-parser/spark-delta-ci
+```
 
 ### Smoke test
 
@@ -161,7 +183,7 @@ and silently — an explicit `.master()` call outranks `spark.master` in
 ### Version pinning
 
 Spark comes from the **pyspark wheel** — no separate distribution — pinned to
-the version `uv.lock` pins for the app (`PYSPARK_VERSION`, currently 4.2.0). A
+the version `uv.lock` pins for the app (`PYSPARK_VERSION`, currently 4.1.1). A
 driver and a cluster on different Spark versions fail at handshake, so both
 images take the version from the same variable. The app image installs the
 *locked* version while the cluster images build the *compose* one, so the two
@@ -245,7 +267,7 @@ also loads it as an env-file (optional — no `.env`, no error). Service-level
 | `DEV_VAULT_SECRET_ID`    | `2222…` | AppRole secret_id, likewise (dev constant, not a secret) |
 | `VAULT_PORT`             | `8200`  | host port for Vault                           |
 | `VAULT_VERSION`          | `1.18`  | `hashicorp/vault` image tag                   |
-| `PYSPARK_VERSION`        | `4.2.0` | Spark version for the cluster image; must equal `uv.lock` (enforced by `tests/test_docker_pins.py`) |
+| `PYSPARK_VERSION`        | `4.1.1` | Spark version for the cluster image; must equal `uv.lock` (enforced by `tests/test_docker_pins.py`) |
 | `SPARK_MASTER_URL`       | set by compose | which cluster the app builds sessions against (`app_config.spark`) |
 | `PYTHON_VERSION`         | `3.12`  | base image Python                             |
 | `SPARK_WORKER_CORES`     | `2`     | per worker                                    |

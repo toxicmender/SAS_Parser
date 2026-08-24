@@ -27,6 +27,8 @@ legacy records.
 Delta OPTIMIZE and VACUUM are intentionally separate from request handling.
 Table identifiers are validated and quoted, retention remains between one week
 and four months, and retention must exceed the maximum expected CDF outage.
-The dedicated CI job installs Delta Lake, exercises a real catalog-backed
-repository, and treats a missing or incompatible Spark/Delta runtime as a
-failure rather than a skip.
+The dedicated CI job builds the repository-owned Spark/Delta image, exercises
+direct PySpark DataFrame and Python ``DeltaTable`` mutations plus a real
+catalog-backed repository, and treats a missing or incompatible runtime as a
+failure rather than a skip. Its locked PySpark and Delta versions are also the
+versions used by Compose and the standalone Spark image.

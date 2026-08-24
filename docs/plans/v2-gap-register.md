@@ -40,7 +40,7 @@ define separate gap lists.
 | G-015 | Phase 10 | Docker, Compose, warmup, and operator commands compose legacy entry points. | V2 container and Spark/Delta smoke tests pass. |
 | G-016 | Phase 10 | Top-level README and Architecture primarily describe the active legacy runtime. | V2 overview, config, API, operator, and cutover guides replace them. |
 | G-017 | Phase 9 | SharePoint/Graph, Databricks/auth, and hydration extra jobs are absent. | Each optional adapter gets an install/import/contract job with unexpected skips failing. |
-| G-018 | Phase 10 | Docker smoke and scheduled real-model evaluation jobs are absent. | Deployment smoke and budgeted scheduled evaluations pass. |
+| G-018 | Phase 10 | Containerized PySpark/Delta build, warmup, and no-skip contracts are present; v2 deployment smoke and scheduled real-model evaluation remain absent. | Deployment smoke and budgeted scheduled evaluations pass. |
 | G-021 | Phase 10 | Fourteen legacy packages, `main.py`, dual entry points, compatibility tests, and packaging references are shipped. | The legacy inventory and compatibility references are empty or archived outside the wheel. |
 
 ## Closed gates

@@ -78,6 +78,7 @@ jobs:
           tests/test_v2_tokens.py tests/test_v2_translation.py
           tests/test_v2_knowledge.py tests/test_v2_memory.py
           tests/test_v2_memory_delta.py
+          tests/test_spark_delta_runtime.py
           tests/test_v2_legacy_inventory.py
           tests/test_v2_xref.py
           tests/test_v2_validation.py tests/test_v2_validation_workflows.py
@@ -221,33 +222,45 @@ jobs:
           if-no-files-found: error
 
   delta-memory:
-    name: Delta memory contracts (no skips)
+    name: PySpark & DeltaTable container contracts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v4
+      # A repository-owned image keeps Java, the locked PySpark wheel, Delta's
+      # Python package, and its Maven jars together. BuildKit's GitHub cache
+      # avoids rebuilding the ~450 MB PySpark layer on every source-only push.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Spark and Delta test image
+        uses: docker/build-push-action@v6
         with:
-          distribution: temurin
-          java-version: "17"
+          context: .
+          file: docker/ci.spark-delta.Dockerfile
+          load: true
+          tags: sas-parser/spark-delta-ci:${{ github.sha }}
+          cache-from: type=gha,scope=spark-delta-ci
+          cache-to: type=gha,mode=max,scope=spark-delta-ci
+          provenance: false
 
-      - uses: astral-sh/setup-uv@v6
+      - name: Run real PySpark and Delta contracts
+        run: |
+          mkdir -p test-results/spark-delta
+          docker run --rm --shm-size=2g \
+            -e REQUIRE_DELTA_TESTS=1 \
+            -v "$PWD/test-results/spark-delta:/test-results" \
+            "sas-parser/spark-delta-ci:${{ github.sha }}" \
+            python -m pytest -v \
+              --junitxml=/test-results/junit.xml \
+              tests/test_spark_delta_runtime.py \
+              tests/test_v2_memory_delta.py \
+              tests/test_backend_contract.py
+
+      - name: Upload Spark and Delta test report
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          enable-cache: true
-          cache-dependency-glob: uv.lock
-
-      - name: Install locked Spark environment
-        run: uv sync --locked --extra dev --extra spark
-
-      # Delta remains deployment-only rather than a default project extra.
-      # Install the Spark-4.1 line explicitly and let the live catalog probe
-      # reject an incompatible JVM pairing before any contract can be skipped.
-      - name: Install Delta Lake test runtime
-        run: uv pip install --python .venv/bin/python "delta-spark==4.1.0"
-
-      - name: Run real Delta memory contracts
-        env:
-          REQUIRE_DELTA_TESTS: "1"
-        run: >
-          .venv/bin/python -m pytest -v
-          tests/test_v2_memory_delta.py tests/test_backend_contract.py
+          name: spark-delta-test-report
+          path: test-results/spark-delta/junit.xml
+          if-no-files-found: error
