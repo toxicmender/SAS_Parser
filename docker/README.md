@@ -154,6 +154,28 @@ To point the stack at a **real Vault** instead, drop the `vault` and
 service's environment. Nothing else changes: `app_config.vault` reads the same
 standard variables either way.
 
+## Wheel-only v2 deployment smoke
+
+`docker/v2.Dockerfile` is the deployment boundary for the v2 application. It
+builds a wheel in one stage and copies only the installed virtual environment
+into a non-root runtime stage; the repository checkout and build tooling are
+not present in the final image.
+
+```bash
+docker build -f docker/v2.Dockerfile -t sas-parser/v2-deployment:local .
+docker run --rm --read-only \
+  --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+  --cap-drop=ALL --security-opt=no-new-privileges \
+  sas-parser/v2-deployment:local
+```
+
+The image runs `sas-migrate smoke --require-wheel --require-non-root --json`.
+The command checks the packaged schema and an offline v2 parse, Databricks SQL
+target-validation, and token-budget reporting flow. It needs no secrets or
+external services. See
+[`docs/migrations/v2-deployment-smoke.md`](../docs/migrations/v2-deployment-smoke.md)
+for the exact contract and CI evidence.
+
 ## Spark, and the Databricks question
 
 **Databricks cannot be run locally** — there is no self-hostable image of it; a

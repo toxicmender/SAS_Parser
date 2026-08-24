@@ -1,4 +1,4 @@
-"""Phase 1 import graph and CLI-shell gates."""
+"""V2 import graph and migrated CLI-command gates."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def test_v2_architecture_graph_is_acyclic_and_obeys_boundaries() -> None:
     assert graph["application"] == ["core"]
 
 
-def test_v2_cli_shell_has_no_operational_subcommands() -> None:
+def test_v2_cli_exposes_smoke_but_not_unmigrated_commands() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "sas_migrate.cli", "--help"],
         cwd=SRC,
@@ -44,5 +44,5 @@ def test_v2_cli_shell_has_no_operational_subcommands() -> None:
         text=True,
     )
     assert result.returncode == 0, result.stderr
-    assert "operational commands are not enabled yet" in result.stdout
+    assert "smoke" in result.stdout
     assert "convert" not in result.stdout

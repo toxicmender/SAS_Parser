@@ -51,6 +51,45 @@ jobs:
       - name: Smoke installed wheel
         run: /tmp/sas-parser-wheel-venv/bin/python scripts/smoke_wheel.py
 
+  deployment-smoke:
+    name: V2 deployment smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build wheel-only v2 deployment image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/v2.Dockerfile
+          load: true
+          tags: sas-parser/v2-deployment:${{ github.sha }}
+          cache-from: type=gha,scope=v2-deployment
+          cache-to: type=gha,mode=max,scope=v2-deployment
+          provenance: false
+
+      - name: Run v2 smoke as the deployed identity
+        run: |
+          mkdir -p test-results/deployment
+          docker run --rm --read-only \
+            --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges \
+            "sas-parser/v2-deployment:${{ github.sha }}" \
+            > test-results/deployment/report.json
+          python -m json.tool test-results/deployment/report.json
+
+      - name: Upload v2 deployment smoke report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2-deployment-smoke-report
+          path: test-results/deployment/report.json
+          if-no-files-found: error
+
   lint:
     name: Lint (ruff)
     runs-on: ubuntu-latest
@@ -73,6 +112,7 @@ jobs:
           scripts/smoke_v2_core.py
           scripts/smoke_wheel.py scripts/v2_sas_test_adapter.py
           tests/test_v2_architecture.py tests/test_v2_contracts.py
+          tests/test_v2_deployment.py
           tests/test_v2_ports.py tests/test_v2_sas_core.py
           tests/test_v2_sas_parity.py tests/test_v2_responses.py
           tests/test_v2_tokens.py tests/test_v2_translation.py

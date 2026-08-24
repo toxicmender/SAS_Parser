@@ -1,5 +1,10 @@
 """V2 use-case layer; concrete infrastructure belongs in adapters."""
 
+from .deployment import (
+    DeploymentSmokeCheck,
+    DeploymentSmokeReport,
+    run_deployment_smoke,
+)
 from .knowledge import (
     ConstructKey,
     DocumentExtraction,
@@ -81,6 +86,8 @@ __all__ = [
     "ChatRole",
     "ConstructKey",
     "ConversationMemoryService",
+    "DeploymentSmokeCheck",
+    "DeploymentSmokeReport",
     "DocumentExtraction",
     "DocumentSection",
     "ExtractionDiagnostic",
@@ -135,5 +142,6 @@ __all__ = [
     "UserRuleSet",
     "render_effective_prompt",
     "render_notebooks",
+    "run_deployment_smoke",
     "translation_items",
 ]

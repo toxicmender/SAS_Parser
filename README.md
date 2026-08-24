@@ -207,11 +207,16 @@ mid-run says why. Grep `unhandled exception` to find it.
 ## Other entry points
 
 ```bash
+uv run sas-migrate smoke --json                       # offline v2 deployment contract
 python -m complexity path/to/sas --out-dir reports/   # offline complexity + sizing
 python -m complexity --sharepoint --app "MyApp"       # from the complexity list
 python -m validation --help                           # the offline validation suite
 python -m app_config.sharepoint_check                 # read-only SharePoint preflight
 ```
+
+CI also runs the strict form from a wheel-only, non-root, read-only container:
+`sas-migrate smoke --require-wheel --require-non-root --json`. See the
+[v2 deployment smoke contract](docs/migrations/v2-deployment-smoke.md).
 
 ## Configuration
 

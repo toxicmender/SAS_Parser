@@ -68,12 +68,12 @@ def test_provider_response_keeps_usage_optional_and_separate() -> None:
     assert response.structured_document is None
 
 
-def test_cli_shell_parses_version_and_has_no_subcommands(capsys) -> None:
+def test_cli_parses_version_and_exposes_only_migrated_commands(capsys) -> None:
     parser = build_parser()
     assert parser.prog == "sas-migrate"
     assert main([]) == 0
     output = capsys.readouterr().out
-    assert "operational commands are not enabled yet" in output
+    assert "smoke" in output
     assert "{convert" not in output
 
     with pytest.raises(SystemExit) as version_exit:

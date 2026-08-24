@@ -37,10 +37,10 @@ define separate gap lists.
 |---|---:|---|---|
 | G-013 | Phase 10 | `sas-migrate` is a shell; operations remain on `sas-parser`/`main.py`. | All v2 subcommands run from the wheel and `sas-parser` is removed. |
 | G-014 | Phase 10 | Report presenters and SharePoint publication remain legacy-only. | V2 visual/golden and publication contracts pass. |
-| G-015 | Phase 10 | Docker, Compose, warmup, and operator commands compose legacy entry points. | V2 container and Spark/Delta smoke tests pass. |
+| G-015 | Phase 10 | A wheel-only non-root v2 image is gated, but Compose, warmup, and operator commands still compose legacy entry points. | Compose and operator commands cut over to the verified v2 image. |
 | G-016 | Phase 10 | Top-level README and Architecture primarily describe the active legacy runtime. | V2 overview, config, API, operator, and cutover guides replace them. |
 | G-017 | Phase 9 | SharePoint/Graph, Databricks/auth, and hydration extra jobs are absent. | Each optional adapter gets an install/import/contract job with unexpected skips failing. |
-| G-018 | Phase 10 | Containerized PySpark/Delta build, warmup, and no-skip contracts are present; v2 deployment smoke and scheduled real-model evaluation remain absent. | Deployment smoke and budgeted scheduled evaluations pass. |
+| G-018 | Phase 10 | Containerized PySpark/Delta and wheel-only v2 deployment smoke jobs are present; scheduled real-model quality evaluation remains absent. | Budgeted scheduled real-model evaluation passes. |
 | G-021 | Phase 10 | Fourteen legacy packages, `main.py`, dual entry points, compatibility tests, and packaging references are shipped. | The legacy inventory and compatibility references are empty or archived outside the wheel. |
 
 ## Closed gates
@@ -51,6 +51,11 @@ define separate gap lists.
 | G-007 | Phase 8 | `sas_migrate.application.validation` and `sas_migrate.adapters.validation` | Deterministic/judged/memory metric, transcript, inline/offline, tracking, PDF, architecture, and parity gates. |
 | G-008 | Phase 8 | Validation token-budget contracts and report presenters | Markdown/PDF/JSON/tracking expose input components and separate translation/judge compliance. |
 | G-009 | Phase 8 | `sas_migrate.application.assessment` and `sas_migrate.adapters.assessment` | Profile inheritance, target scoring, sizing, cross-file dependency, review, golden report, PDF, and legacy parity gates. |
+
+The deployment portion of G-018 is executable in the `V2 deployment smoke`
+job. It builds `docker/v2.Dockerfile`, then runs the installed `sas-migrate
+smoke` command as a non-root user with a read-only filesystem. G-018 remains
+open only for its scheduled real-model quality gate.
 
 ## Closure protocol
 

@@ -40,13 +40,14 @@
       "pyproject.toml", ".github/workflows/ci.yml", "scripts/smoke_wheel.py",
       "scripts/v2_sas_test_adapter.py", "tests/test_v2_sas_parity.py"
     ],
-    "deployment": ["docker-compose.yml", "docker/README.md", "docker/spark/install_delta.sh", "docker/spark/warmup.py"],
+    "deployment": ["docker-compose.yml", "docker/README.md", "docker/v2.Dockerfile", "docker/spark/install_delta.sh", "docker/spark/warmup.py"],
     "historical_migration_notes": [
       "docs/migrations/v2-token-contracts.md",
       "docs/migrations/v2-translation-contracts.md",
       "docs/migrations/v2-knowledge-memory-contracts.md",
       "docs/migrations/v2-xref-contracts.md",
       "docs/migrations/v2-validation-assessment-contracts.md",
+      "docs/migrations/v2-deployment-smoke.md",
       "docs/plans/pipeline-decoupling-tiktoken.md"
     ],
     "broad_reference_roots": ["tests", "docker"]
@@ -66,10 +67,10 @@
     {"id": "G-012", "area": "infrastructure", "owner_phase": 9, "status": "open", "summary": "Typed configuration, Azure/Vault/Databricks/SharePoint auth, worker-loop ownership, and observability are not migrated.", "exit_gate": "V2 config and infrastructure adapter suites pass with secret-free models and lazy extras."},
     {"id": "G-013", "area": "cli", "owner_phase": 10, "status": "open", "summary": "sas-migrate is still a shell; operational subcommands remain on the legacy sas-parser/main.py entry point.", "exit_gate": "Every planned v2 subcommand runs from the installed wheel and sas-parser is removed."},
     {"id": "G-014", "area": "artifacts", "owner_phase": 10, "status": "open", "summary": "Markdown/PDF presenters and SharePoint publication adapters remain legacy-only.", "exit_gate": "V2 report visual/golden and publication adapter tests pass."},
-    {"id": "G-015", "area": "deployment", "owner_phase": 10, "status": "open", "summary": "Docker, Compose, Spark/Delta warmup, and operator commands still compose legacy entry points.", "exit_gate": "V2 container and Spark/Delta smoke tests pass."},
+    {"id": "G-015", "area": "deployment", "owner_phase": 10, "status": "open", "summary": "A wheel-only non-root v2 image is CI-gated, but Compose, warmup, and operator commands still compose legacy entry points.", "exit_gate": "Compose and operator commands cut over to the verified v2 image."},
     {"id": "G-016", "area": "documentation", "owner_phase": 10, "status": "open", "summary": "README.md and Architecture.md primarily document the active legacy application rather than the v2 target.", "exit_gate": "V2 overview, configuration, API, operator, and cutover guides replace legacy runtime documentation."},
     {"id": "G-017", "area": "ci", "owner_phase": 9, "status": "open", "summary": "Mandatory SharePoint/Graph, Databricks/auth, and hydration optional-extra jobs are not present.", "exit_gate": "Each adapter extra has an install/import/contract CI job where unexpected skips fail."},
-    {"id": "G-018", "area": "ci", "owner_phase": 10, "status": "open", "summary": "Containerized PySpark/Delta build, warmup, and no-skip contracts are present; v2 deployment smoke and scheduled real-model quality evaluation remain absent.", "exit_gate": "Deployment smoke and budgeted scheduled evaluation jobs pass."},
+    {"id": "G-018", "area": "ci", "owner_phase": 10, "status": "open", "summary": "Containerized PySpark/Delta and wheel-only v2 deployment smoke jobs are present; scheduled real-model quality evaluation remains absent.", "exit_gate": "Budgeted scheduled real-model evaluation passes."},
     {"id": "G-019", "area": "quality", "owner_phase": 10, "status": "open", "summary": "Repository-wide Ruff is not clean; CI gates only the expanding migration-owned surface.", "exit_gate": "Ruff gates the whole repository with zero diagnostics."},
     {"id": "G-020", "area": "test_data", "owner_phase": 10, "status": "open", "summary": "Reference-document and live external-service tests remain conditional outside their provisioned jobs.", "exit_gate": "Required corpora are versioned or generated and production-critical integrations have no-skip jobs."},
     {"id": "G-021", "area": "cutover", "owner_phase": 10, "status": "open", "summary": "Fourteen top-level legacy packages, main.py, dual entry points, compatibility tests, and packaging references remain shipped.", "exit_gate": "The legacy package/module inventory and all compatibility references are empty or archived outside the wheel."}

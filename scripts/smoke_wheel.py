@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.metadata
+import json
 import pathlib
 import subprocess
 import sys
@@ -19,6 +20,7 @@ REQUIRED_MODULES = (
     "main",
     "sas_migrate",
     "sas_migrate.application",
+    "sas_migrate.application.deployment",
     "sas_migrate.application.knowledge",
     "sas_migrate.application.memory",
     "sas_migrate.application.assessment",
@@ -32,6 +34,7 @@ REQUIRED_MODULES = (
     "sas_migrate.core",
     "sas_migrate.core.responses",
     "sas_migrate.core.sas",
+    "sas_migrate.cli",
     "pipeline",
     "prompt_builder",
     "complexity",
@@ -49,6 +52,9 @@ REQUIRED_DISTRIBUTION_FILES = (
     "prompt_builder/instructions/sparksql/overview.md",
     "sas_migrate/resources/contracts/schema-v2.json",
     "sas_migrate/application/response_acceptance.py",
+    "sas_migrate/application/deployment.py",
+    "sas_migrate/cli/__init__.py",
+    "sas_migrate/cli/__main__.py",
     "sas_migrate/application/translation/attempts.py",
     "sas_migrate/application/translation/artifacts.py",
     "sas_migrate/application/translation/budgeting.py",
@@ -118,11 +124,15 @@ def main() -> int:
         for entry in distribution.entry_points
         if entry.group == "console_scripts"
     }
-    entry_point = entry_points.get("sas-parser")
-    if entry_point is None:
-        raise RuntimeError("wheel does not define the sas-parser console script")
-    if not callable(entry_point.load()):
-        raise TypeError("sas-parser console entry point is not callable")
+    expected_entry_points = {"sas-parser", "sas-migrate"}
+    missing_entry_points = sorted(expected_entry_points - entry_points.keys())
+    if missing_entry_points:
+        raise RuntimeError(
+            f"wheel does not define console scripts: {missing_entry_points}"
+        )
+    for name in sorted(expected_entry_points):
+        if not callable(entry_points[name].load()):
+            raise TypeError(f"{name} console entry point is not callable")
 
     for module_name in REQUIRED_MODULES:
         module = importlib.import_module(module_name)
@@ -161,6 +171,30 @@ def main() -> int:
         )
     if "sas-migrate" not in v2_help_result.stdout.lower():
         raise RuntimeError("installed v2 CLI help did not identify sas-migrate")
+
+    v2_smoke_result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "sas_migrate.cli",
+            "smoke",
+            "--require-wheel",
+            "--json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if v2_smoke_result.returncode != 0:
+        raise RuntimeError(
+            "installed v2 deployment smoke failed: "
+            f"stdout={v2_smoke_result.stdout!r}, stderr={v2_smoke_result.stderr!r}"
+        )
+    smoke_report = json.loads(v2_smoke_result.stdout)
+    if not smoke_report.get("passed"):
+        raise RuntimeError("installed v2 deployment smoke reported a failure")
+    if smoke_report.get("sqlglot_dialect") != "databricks":
+        raise RuntimeError("installed v2 deployment smoke used the wrong SQL dialect")
 
     print(
         f"installed-wheel smoke passed for sas-parser {distribution.version} "
