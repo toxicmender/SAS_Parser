@@ -108,6 +108,11 @@ def delta_spark(tmp_path_factory):
         SparkSession.builder.master("local[1]")
         .appName("sas-parser-tests")
         .config("spark.ui.enabled", "false")
+        # These are tiny contract tables. Delta defaults snapshot work to 50
+        # partitions, which adds minutes of scheduler overhead on local[1]
+        # without exercising a different code path.
+        .config("spark.sql.shuffle.partitions", "1")
+        .config("spark.databricks.delta.snapshotPartitions", "1")
         .config("spark.sql.warehouse.dir", str(warehouse))
         .config(
             "spark.sql.extensions",
@@ -122,6 +127,8 @@ def delta_spark(tmp_path_factory):
         spark = configure_spark_with_delta_pip(builder).getOrCreate()
     except Exception as exc:
         raise AssertionError(_delta_broken("could not start a Delta session")) from exc
+
+    spark.sparkContext.setLogLevel("WARN")
 
     # Both suites create tables through the session catalog. Probe that API here
     # so an incompatible delta-spark is named plainly once, instead of surfacing

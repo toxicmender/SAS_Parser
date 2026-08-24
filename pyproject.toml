@@ -42,15 +42,14 @@ sas-migrate = "sas_migrate.cli:main"
 # in-memory mode must import and run without pyspark (Architecture.md
 # invariant 8), so it is an extra, not a core dependency.
 #
-# Upper bound is Delta Lake's, not ours: no published delta-spark supports
-# Spark 4.2 (4.2.0 and 4.3.1 both declare `pyspark<=4.1.1`, and 4.1.0 declares
-# no upper bound at all, so it installs against 4.2 and then dies at runtime
-# on `NoSuchMethodError: CatalogStorageFormat.copy` for every CREATE TABLE).
-# Without this bound a routine `uv lock --upgrade` silently breaks
-# memory.store's Delta backend and validation tracking. Raise it only once a
-# delta-spark release declares support for the newer Spark; the Docker build
-# verifies the pairing for real (docker/spark/warmup.py).
-spark      = ["pyspark>=4.1.2,<4.2"]
+# Upper bound is Delta Lake's, not ours. Published Delta releases on this line
+# declare support through PySpark 4.1.1. Delta 4.1.0's metadata omits that upper
+# bound, so a resolver accepts 4.1.2/4.1.3 even though the Python DeltaTable API
+# and ALTER TABLE property path then fail on the removed Catalyst
+# ``IgnoreCachedData`` class. Keep the runtime on the compatible 4.1.0/4.1.1
+# patch line until a Delta release explicitly supports a newer Spark runtime.
+# The Docker build and direct DeltaTable contracts verify the pairing for real.
+spark      = ["pyspark>=4.1,<4.1.2"]
 vault      = ["hvac>=2.0"]
 azure      = ["msal>=1.28"]
 databricks = ["databricks-sdk>=0.30", "databricks-sql-connector>=3.0"]
@@ -186,6 +185,7 @@ source = [
 [tool.pytest.ini_options]
 markers = [
     "slow: end-to-end tests over the real reference_docs corpus; skipped when the PDFs are absent",
+    "spark_delta: requires the containerized PySpark, JVM, and Delta Lake runtime",
 ]
 filterwarnings = [
     # langgraph-internal deserialisation with the default `allowed_objects`

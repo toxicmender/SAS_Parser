@@ -17,7 +17,7 @@ FROM python:${PYTHON_VERSION}-slim-bookworm
 ARG PYTHON_VERSION
 # Keep in step with uv.lock's pyspark. Compose passes it in from
 # PYSPARK_VERSION so both images move together.
-ARG PYSPARK_VERSION=4.1.2
+ARG PYSPARK_VERSION=4.1.1
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
