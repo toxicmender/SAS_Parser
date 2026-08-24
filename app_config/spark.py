@@ -19,13 +19,23 @@ setting it here is what lets the same code reach the real cluster without a
 flag or a code change — the same "change env vars, change nothing else" rule
 that points the app at a real Vault.
 
-Why this is not a session factory
----------------------------------
-This module returns a *string*. Building the ``SparkSession`` stays at the
-call sites, because :mod:`app_config` is the dependency-free leaf every other
-package imports (see the package docstring) and must never import pyspark —
-Architecture.md invariant 8 requires the in-memory paths to import and run
-with no pyspark installed at all.
+Why the session factory lives here after all
+--------------------------------------------
+This module used to return only a *string*, leaving every caller to build its
+own ``SparkSession`` — on the grounds that :mod:`app_config` is the
+dependency-free leaf every other package imports and must never import
+pyspark. The rule was right; the conclusion was not. Four call sites
+(:meth:`pipeline.setup.MemorySetup._default_hub`,
+:func:`validation.tracking._ensure_spark`, ``validation.__main__``, and
+:func:`data_hydration.sinks.delta.get_session`) each grew their own copy of
+``SparkSession.builder.master(master_url()).getOrCreate()``, and all four were
+wrong in the same place: **on Databricks there is already a session, and
+asking for one by master is at best ignored and at worst refused.**
+
+:func:`active_or_new_session` is that decision made once. The pyspark import is
+*inside* the function, so Architecture.md invariant 8 still holds exactly as
+written: ``import app_config.spark`` costs nothing, and the in-memory paths —
+which never call this — import and run with no pyspark installed at all.
 
 A note on ``spark-defaults.conf``
 ---------------------------------
@@ -42,6 +52,7 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import Any
 
 from . import get_typed_value
 
@@ -81,3 +92,65 @@ def master_url(explicit: str | None = None) -> str:
 def describe_master(master: str) -> str:
     """A short phrase naming what *master* points at, for one log line."""
     return "a local in-process cluster" if master.startswith("local") else master
+
+
+def active_or_new_session(app_name: str, *, master: str | None = None) -> Any:
+    """The SparkSession to use: the active one, else a newly built one.
+
+    **Reusing the active session is the whole point.** Inside a Databricks
+    notebook or job the runtime has already built one, and it is the only
+    session that can reach the workspace's catalogs and credentials. Building
+    another by master is wrong there in three separate ways: on classic
+    Dedicated compute the ``master`` argument is silently dropped (harmless,
+    but every log line then claims a local cluster that is not what ran), and
+    on Spark Connect — serverless, and classic *Standard* access mode since
+    DBR 14.0 — ``master`` is not supported at all and the call raises.
+
+    Off Databricks nothing is active, so a session is built against
+    :func:`master_url` exactly as before: ``local[*]`` on a laptop, whatever
+    ``SPARK_MASTER_URL`` says inside the Docker stack.
+
+    Parameters
+    ----------
+    app_name : str
+        ``appName`` for a session this call creates. Ignored when an active
+        session is reused — renaming a running application is not possible,
+        and pretending otherwise would put a fictional name in the logs.
+    master : str | None
+        Master URL for a session this call creates, resolved through
+        :func:`master_url` when omitted. Also ignored when reusing.
+
+    Returns
+    -------
+    pyspark.sql.SparkSession
+
+    Raises
+    ------
+    ImportError
+        pyspark is not installed. Only the Delta-backed paths reach this, so
+        the message names the extra that provides it.
+    """
+    try:
+        from pyspark.sql import SparkSession
+    except ImportError as exc:  # pragma: no cover - depends on the extra
+        raise ImportError(
+            f"pyspark is required to build the '{app_name}' Spark session; "
+            "install it with 'pip install \"sas-parser[spark]\"'. On a "
+            "Databricks cluster it is already provided by the runtime — do "
+            "not install the extra there."
+        ) from exc
+
+    active = SparkSession.getActiveSession()
+    if active is not None:
+        logger.info(
+            f"active_or_new_session: reusing the active SparkSession for "
+            f"'{app_name}' (the runtime's own, on Databricks)"
+        )
+        return active
+
+    resolved = master_url(master)
+    logger.info(
+        f"active_or_new_session: no active session, building '{app_name}' "
+        f"against {describe_master(resolved)}"
+    )
+    return SparkSession.builder.master(resolved).appName(app_name).getOrCreate()

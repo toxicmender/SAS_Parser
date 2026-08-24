@@ -42,7 +42,7 @@ import sys
 from pathlib import Path
 
 from app_config.logging_setup import configure_logging
-from app_config.spark import describe_master, master_url
+from app_config.spark import active_or_new_session
 from pipeline import SasLLMPipeline
 from llm_client import LLMClient, LLMClientConfig, TokenUsage
 from target_language import resolve_target_language
@@ -67,17 +67,10 @@ def _validate_thread(
 ) -> ValidationReport:
     """Post-hoc mode: score one existing thread from a Delta-backed store."""
     from memory.store import MemoryHub
-    from pyspark.sql import SparkSession
 
-    master = master_url()
-    logger.info(
-        f"_validate_thread: building a session against {describe_master(master)}"
-    )
-    spark = (
-        SparkSession.builder.master(master)
-        .appName("validation_thread")
-        .getOrCreate()
-    )
+    # Reuses the runtime's session on Databricks; builds one against
+    # app_config.spark's master everywhere else.
+    spark = active_or_new_session("validation_thread")
     hub = MemoryHub(spark=spark, table=args.delta_table)
     result = validate_thread(hub, args.thread, metrics=metrics)
     # The pipeline model that produced the thread is not recorded in the

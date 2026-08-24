@@ -10,7 +10,7 @@ replacement and cutover gates. The authoritative machine inventory is
 
 | Surface | Python files | Owner | V2 replacement/status |
 |---|---:|---:|---|
-| `app_config/` | 8 | Phase 9 | `sas_migrate.config` and infrastructure adapters; not migrated |
+| `app_config/` | 9 | Phase 9 | `sas_migrate.config` and infrastructure adapters; not migrated |
 | `chunker/` | 9 | Phase 2/10 | `sas_migrate.core.sas` exists; compatibility package retained until cutover |
 | `complexity/` | 18 | Phase 8/10 | v2 assessment replacement exists; compatibility package retained |
 | `conversion/` | 6 | Phase 9 | conversion application; not migrated |

@@ -28,8 +28,8 @@ def test_inventory_has_complete_ownership_and_exit_gates() -> None:
     inventory = json.loads(INVENTORY.read_text("utf-8"))
     assert inventory["schema_version"] == 1
     assert len(inventory["legacy_packages"]) == 14
-    assert sum(entry["python_files"] for entry in inventory["legacy_packages"]) == 118
-    assert sum(entry["tracked_files"] for entry in inventory["legacy_packages"]) == 166
+    assert sum(entry["python_files"] for entry in inventory["legacy_packages"]) == 119
+    assert sum(entry["tracked_files"] for entry in inventory["legacy_packages"]) == 167
     assert {entry["owner_phase"] for entry in inventory["legacy_packages"]} <= {
         2,
         3,

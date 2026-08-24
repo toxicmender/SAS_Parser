@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "legacy_packages": [
-    {"name": "app_config", "python_files": 8, "tracked_files": 9, "owner_phase": 9, "replacement": "sas_migrate.config plus auth/sharepoint adapters", "status": "not_migrated"},
+    {"name": "app_config", "python_files": 9, "tracked_files": 10, "owner_phase": 9, "replacement": "sas_migrate.config plus auth/sharepoint adapters", "status": "not_migrated"},
     {"name": "chunker", "python_files": 9, "tracked_files": 10, "owner_phase": 2, "replacement": "sas_migrate.core.sas", "status": "replacement_present"},
     {"name": "complexity", "python_files": 18, "tracked_files": 19, "owner_phase": 8, "replacement": "sas_migrate.application.assessment plus sas_migrate.adapters.assessment", "status": "replacement_present"},
     {"name": "conversion", "python_files": 6, "tracked_files": 7, "owner_phase": 9, "replacement": "sas_migrate.application.conversion", "status": "not_migrated"},

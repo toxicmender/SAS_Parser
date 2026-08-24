@@ -692,6 +692,29 @@ def _fail(message: str) -> int:
     return 1
 
 
+def _warn_if_databricks_child_process() -> None:
+    """Say so early when this looks like a ``%sh``/subprocess cell on a cluster.
+
+    Left to itself the run gets a long way in before the shape of the process
+    matters — and then fails on the secret-scope read with an error about the
+    Azure CLI, which names nothing real. The preflight's ``runtime`` stage
+    already knows how to spot it, so this is one call and a WARNING rather than
+    a second copy of the reasoning.
+
+    A warning, not a refusal: a child process with ``DATABRICKS_TOKEN`` set is
+    a legitimate setup, and the check cannot see that from here.
+    """
+    try:
+        from app_config.databricks_check import FAIL, check_runtime
+
+        result = check_runtime()
+    except Exception as exc:  # pragma: no cover - never block a run on advice
+        logger.debug(f"runtime preflight skipped: {type(exc).__name__}: {exc}")
+        return
+    if result.status == FAIL:
+        logger.warning(f"{result.summary} - {result.fix}")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
@@ -701,6 +724,7 @@ def main(argv: list[str] | None = None) -> int:
     # Before anything reads it: the Vault credentials, OPENAI_API_KEY, and the
     # SharePoint/Azure settings all live there. The real shell environment wins.
     _load_dotenv()
+    _warn_if_databricks_child_process()
 
     problem = _argument_error(args)
     if problem is not None:

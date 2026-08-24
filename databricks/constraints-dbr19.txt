@@ -1,0 +1,45 @@
+# Databricks Runtime 19's own versions of every package that appears in the
+# project's `uv export` but is NOT installed by databricks/requirements.txt.
+#
+# Not a library file --- never point a cluster at this. It exists so the
+# requirement set can be re-resolved against a stock DBR 19 environment without
+# having a cluster to hand:
+#
+#     uv pip compile databricks/requirements.txt -c databricks/constraints-dbr19.txt #         --python-version 3.12 --python-platform linux
+#
+# A failure here means something in the set now demands a package newer than the
+# runtime ships, and the install would silently upgrade it cluster-wide. That is
+# the signal to look, not to widen the constraint.
+
+annotated-types==0.7.0
+anyio==4.10.0
+azure-core==1.41.0
+azure-identity==1.25.3
+certifi==2025.11.12
+cffi==2.0.0
+charset-normalizer==3.4.4
+cryptography==46.0.3
+h11==0.16.0
+idna==3.11
+mdurl==0.1.2
+msal-extensions==1.3.1
+msal==1.36.0
+numpy==2.3.4
+opentelemetry-api==1.42.1
+opentelemetry-sdk==1.42.1
+opentelemetry-semantic-conventions==0.63b1
+packaging==25.0
+pycparser==2.23
+pyjwt==2.10.1
+python-dotenv==1.2.2
+pyyaml==6.0.3
+regex==2025.9.1
+requests==2.32.5
+sniffio==1.3.0
+tenacity==9.1.2
+tiktoken==0.13.0
+tqdm==4.67.1
+typing-extensions==4.15.0
+typing-inspection==0.4.2
+urllib3==2.5.0
+zstandard==0.25.0
