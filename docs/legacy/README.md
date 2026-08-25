@@ -14,7 +14,7 @@ replacement and cutover gates. The authoritative machine inventory is
 | `chunker/` | 9 | Phase 2/10 | `sas_migrate.core.sas` exists; compatibility package retained until cutover |
 | `complexity/` | 18 | Phase 8/10 | v2 assessment replacement exists; compatibility package retained |
 | `conversion/` | 6 | Phase 9/10 | v2 conversion application/adapters exist; compatibility package and publication path retained until cutover |
-| `data_hydration/` | 20 | Phase 9 | hydration application/adapters; not migrated |
+| `data_hydration/` | 20 | Phase 9/10 | v2 application/adapters exist; compatibility CLI/config composition retained |
 | `llm_client/` | 2 | Phase 9 | application port exists; gateway adapter pending |
 | `memory/` | 11 | Phase 6/9 | services moved; physical Delta/CDF and Databricks AI transition remains |
 | `pipeline/` | 9 | Phase 5/10 | translation orchestration exists; active CLI compatibility remains |
@@ -68,6 +68,12 @@ target/model selection, lifecycle transitions, dry-run behavior, and queue
 isolation. The top-level `conversion/` package remains shipped only because the
 legacy CLI still composes it and because SharePoint deliverable publication is
 part of the Phase 10 presenter/cutover gate.
+
+The Phase 9 hydration replacement now owns pure planning, versioned work and
+report contracts, partition probes, lazy source-driver boundaries, ranged I/O,
+failure-isolated execution, and managed Delta writes. The top-level
+`data_hydration/` package remains shipped for the legacy CLI and its environment
+and credential composition; those dependencies move with G-012 and Phase 10.
 
 ## Removal order
 

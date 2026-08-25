@@ -114,6 +114,8 @@ jobs:
           tests/test_v2_architecture.py tests/test_v2_contracts.py
           tests/test_v2_deployment.py
           tests/test_v2_conversion.py
+          tests/test_v2_hydration.py tests/test_v2_hydration_optional.py
+          tests/test_v2_hydration_delta.py
           tests/test_v2_ports.py tests/test_v2_sas_core.py
           tests/test_v2_sas_parity.py tests/test_v2_responses.py
           tests/test_v2_tokens.py tests/test_v2_translation.py
@@ -231,6 +233,15 @@ jobs:
           --cov-branch --cov-report=term-missing
           --cov-fail-under=90
 
+      - name: Phase 9 hydration line and branch coverage gate
+        run: >
+          uv run pytest -q tests/test_v2_hydration.py
+          --cov=sas_migrate.application.hydration
+          --cov=sas_migrate.application.ports.hydration
+          --cov=sas_migrate.adapters.hydration
+          --cov-branch --cov-report=term-missing
+          --cov-fail-under=90
+
       # Slow end-to-end tests skip themselves automatically: they need the
       # user-provided reference_docs/ PDFs, which are gitignored and absent here.
       - name: Run tests
@@ -305,6 +316,7 @@ jobs:
               --junitxml=/test-results/junit.xml \
               tests/test_spark_delta_runtime.py \
               tests/test_v2_memory_delta.py \
+              tests/test_v2_hydration_delta.py \
               tests/test_backend_contract.py
 
       - name: Upload Spark and Delta test report
@@ -314,3 +326,20 @@ jobs:
           name: spark-delta-test-report
           path: test-results/spark-delta/junit.xml
           if-no-files-found: error
+
+  hydration-drivers:
+    name: Hydration optional driver matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install every hydration source extra
+        run: uv sync --locked --extra dev --extra hydration
+
+      - name: Require every optional driver import
+        run: uv run pytest -q tests/test_v2_hydration_optional.py
