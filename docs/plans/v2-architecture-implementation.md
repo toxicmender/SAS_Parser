@@ -1,7 +1,8 @@
 # SAS migration v2: consolidated architecture and implementation plan
 
-Status: implementation in progress. Phases 0 through 8 are implemented on the
-v2 migration branch; Phase 9 is the next implementation phase.
+Status: implementation in progress. Phases 0 through 8 and the Phase 9
+conversion slice are implemented on the v2 migration branch. Phase 9 hydration
+and infrastructure adapters are next.
 
 This is the authoritative plan for the fresh version of the application. It
 consolidates the architecture audit, the functional-parity review, the test
@@ -768,8 +769,11 @@ Tests/gates:
 
 Deliverables:
 
-1. Move local and SharePoint conversion workflows onto repositories/ports.
-2. Move request status lifecycle, model selection, paths and upload behavior.
+1. **Implemented:** move local and SharePoint conversion workflows onto
+   repositories/ports.
+2. **Partially implemented:** request status lifecycle, model/target selection,
+   and source paths are v2-owned. SharePoint publication remains with the
+   Phase 10 presenter/publication cutover gate.
 3. Move hydration planning into application code and all drivers/sinks into
    adapters.
 4. Split settings from Azure/Vault/Databricks/SharePoint infrastructure.

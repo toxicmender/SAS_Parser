@@ -13,7 +13,7 @@ replacement and cutover gates. The authoritative machine inventory is
 | `app_config/` | 9 | Phase 9 | `sas_migrate.config` and infrastructure adapters; not migrated |
 | `chunker/` | 9 | Phase 2/10 | `sas_migrate.core.sas` exists; compatibility package retained until cutover |
 | `complexity/` | 18 | Phase 8/10 | v2 assessment replacement exists; compatibility package retained |
-| `conversion/` | 6 | Phase 9 | conversion application; not migrated |
+| `conversion/` | 6 | Phase 9/10 | v2 conversion application/adapters exist; compatibility package and publication path retained until cutover |
 | `data_hydration/` | 20 | Phase 9 | hydration application/adapters; not migrated |
 | `llm_client/` | 2 | Phase 9 | application port exists; gateway adapter pending |
 | `memory/` | 11 | Phase 6/9 | services moved; physical Delta/CDF and Databricks AI transition remains |
@@ -62,6 +62,12 @@ Legacy references are intentionally grouped by purpose:
 Historical migration notes remain valid evidence and are not rewritten to look
 like current APIs. Runtime documents carry a banner linking back to the v2 plan
 and consolidated registers.
+
+The Phase 9 conversion replacement now owns request and source boundaries,
+target/model selection, lifecycle transitions, dry-run behavior, and queue
+isolation. The top-level `conversion/` package remains shipped only because the
+legacy CLI still composes it and because SharePoint deliverable publication is
+part of the Phase 10 presenter/cutover gate.
 
 ## Removal order
 

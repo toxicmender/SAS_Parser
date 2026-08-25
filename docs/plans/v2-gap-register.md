@@ -1,6 +1,6 @@
 # V2 consolidated gap register
 
-Status: authoritative as of Phase 8. The machine-readable source is
+Status: authoritative during Phase 9. The machine-readable source is
 [`v2-gap-legacy-inventory.json`](v2-gap-legacy-inventory.json); CI checks its
 package counts, v2 import allowlist, ownership, references, and exit gates.
 PR descriptions and phase migration notes summarize this register but do not
@@ -27,9 +27,14 @@ define separate gap lists.
 
 | ID | Owner | Gap | Exit gate |
 |---|---:|---|---|
-| G-010 | Phase 9 | Local/SharePoint conversion and request lifecycle remain legacy-only. | V2 fake-repository workflows pass with per-row isolation. |
 | G-011 | Phase 9 | Hydration planning, credentials, drivers, ranged I/O, and Delta sink remain legacy-only. | Pure planning and optional-driver matrix pass. |
 | G-012 | Phase 9 | Configuration, auth, SharePoint loop ownership, and observability are not migrated. | V2 config/infrastructure suites pass with lazy extras and secret-free models. |
+
+## Closed Phase 9 replacements
+
+| ID | Owner | Replacement | Evidence |
+|---|---:|---|---|
+| G-010 | Phase 9 | Local and SharePoint conversion requests, target/model selection, lifecycle state, source adapters, and per-row isolation are v2-owned. | Fake local and SharePoint end-to-end contracts pass at 98% combined line/branch coverage. |
 
 ## Cutover, operations, and documentation
 

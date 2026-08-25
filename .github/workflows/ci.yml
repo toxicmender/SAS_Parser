@@ -113,6 +113,7 @@ jobs:
           scripts/smoke_wheel.py scripts/v2_sas_test_adapter.py
           tests/test_v2_architecture.py tests/test_v2_contracts.py
           tests/test_v2_deployment.py
+          tests/test_v2_conversion.py
           tests/test_v2_ports.py tests/test_v2_sas_core.py
           tests/test_v2_sas_parity.py tests/test_v2_responses.py
           tests/test_v2_tokens.py tests/test_v2_translation.py
@@ -218,6 +219,15 @@ jobs:
           --cov=sas_migrate.application.ports.assessment
           --cov=sas_migrate.adapters.validation
           --cov=sas_migrate.adapters.assessment
+          --cov-branch --cov-report=term-missing
+          --cov-fail-under=90
+
+      - name: Phase 9 conversion line and branch coverage gate
+        run: >
+          uv run pytest -q tests/test_v2_conversion.py
+          --cov=sas_migrate.application.conversion
+          --cov=sas_migrate.application.ports.conversion
+          --cov=sas_migrate.adapters.conversion
           --cov-branch --cov-report=term-missing
           --cov-fail-under=90
 

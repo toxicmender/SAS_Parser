@@ -4,7 +4,7 @@
     {"name": "app_config", "python_files": 9, "tracked_files": 10, "owner_phase": 9, "replacement": "sas_migrate.config plus auth/sharepoint adapters", "status": "not_migrated"},
     {"name": "chunker", "python_files": 9, "tracked_files": 10, "owner_phase": 2, "replacement": "sas_migrate.core.sas", "status": "replacement_present"},
     {"name": "complexity", "python_files": 18, "tracked_files": 19, "owner_phase": 8, "replacement": "sas_migrate.application.assessment plus sas_migrate.adapters.assessment", "status": "replacement_present"},
-    {"name": "conversion", "python_files": 6, "tracked_files": 7, "owner_phase": 9, "replacement": "sas_migrate.application.conversion", "status": "not_migrated"},
+    {"name": "conversion", "python_files": 6, "tracked_files": 7, "owner_phase": 9, "replacement": "sas_migrate.application.conversion plus sas_migrate.adapters.conversion", "status": "replacement_present"},
     {"name": "data_hydration", "python_files": 20, "tracked_files": 21, "owner_phase": 9, "replacement": "sas_migrate.application.hydration plus adapters", "status": "not_migrated"},
     {"name": "llm_client", "python_files": 2, "tracked_files": 3, "owner_phase": 9, "replacement": "sas_migrate application LLM port plus gateway adapter", "status": "port_only"},
     {"name": "memory", "python_files": 11, "tracked_files": 12, "owner_phase": 6, "replacement": "sas_migrate.application.memory plus adapters.memory", "status": "transition_dependency"},
@@ -48,6 +48,7 @@
       "docs/migrations/v2-xref-contracts.md",
       "docs/migrations/v2-validation-assessment-contracts.md",
       "docs/migrations/v2-deployment-smoke.md",
+      "docs/migrations/v2-conversion-contracts.md",
       "docs/plans/pipeline-decoupling-tiktoken.md"
     ],
     "broad_reference_roots": ["tests", "docker"]
@@ -62,7 +63,7 @@
     {"id": "G-007", "area": "validation", "owner_phase": 8, "status": "closed", "summary": "V2 validation owns deterministic and judged metrics, evaluator, transcript reconstruction, inline/offline workflows, tracking, and reports.", "exit_gate": "V2 validation application and adapter suites pass."},
     {"id": "G-008", "area": "token_reporting", "owner_phase": 8, "status": "closed", "summary": "Validation Markdown, PDF, JSON, and tracking contracts expose component budgets and token_budget_compliance with translation and judge usage separated.", "exit_gate": "Markdown, PDF, JSON, and tracking outputs expose translation and judge budgets separately."},
     {"id": "G-009", "area": "assessment", "owner_phase": 8, "status": "closed", "summary": "V2 assessment owns profile inheritance, target scoring, sizing, cross-file dependencies, review, and reports.", "exit_gate": "V2 assessment golden and profile-inheritance tests pass."},
-    {"id": "G-010", "area": "conversion", "owner_phase": 9, "status": "open", "summary": "Local and SharePoint conversion workflows and request lifecycle remain legacy-only.", "exit_gate": "V2 fake-repository end-to-end workflows pass with per-row isolation."},
+    {"id": "G-010", "area": "conversion", "owner_phase": 9, "status": "closed", "summary": "V2 local and SharePoint conversion workflows own request selection, model and target resolution, source retrieval, lifecycle status, and per-row isolation behind ports.", "exit_gate": "V2 fake-repository end-to-end workflows pass with per-row isolation."},
     {"id": "G-011", "area": "hydration", "owner_phase": 9, "status": "open", "summary": "Hydration planning, credentials, source drivers, ranged I/O, and Delta sink remain top-level legacy packages.", "exit_gate": "Pure v2 planning and optional-driver contract matrix pass."},
     {"id": "G-012", "area": "infrastructure", "owner_phase": 9, "status": "open", "summary": "Typed configuration, Azure/Vault/Databricks/SharePoint auth, worker-loop ownership, and observability are not migrated.", "exit_gate": "V2 config and infrastructure adapter suites pass with secret-free models and lazy extras."},
     {"id": "G-013", "area": "cli", "owner_phase": 10, "status": "open", "summary": "sas-migrate is still a shell; operational subcommands remain on the legacy sas-parser/main.py entry point.", "exit_gate": "Every planned v2 subcommand runs from the installed wheel and sas-parser is removed."},
