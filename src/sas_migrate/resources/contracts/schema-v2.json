@@ -11,6 +11,15 @@
       "ConversionOutcome",
       "ConversionBatchOutcome"
     ],
+    "hydration": [
+      "HydrationSettings",
+      "HydrationSource",
+      "HydrationPartition",
+      "HydrationItem",
+      "HydrationPlan",
+      "HydrationItemOutcome",
+      "HydrationReport"
+    ],
     "assessment": [
       "AssessmentProfile",
       "AssessmentUnit",

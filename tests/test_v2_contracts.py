@@ -278,6 +278,15 @@ def test_schema_resource_is_bundled_and_versioned() -> None:
         "ConversionOutcome",
         "ConversionBatchOutcome",
     ]
+    assert schema["x-contract-families"]["hydration"] == [
+        "HydrationSettings",
+        "HydrationSource",
+        "HydrationPartition",
+        "HydrationItem",
+        "HydrationPlan",
+        "HydrationItemOutcome",
+        "HydrationReport",
+    ]
     assert schema["x-contract-families"]["assessment"] == [
         "AssessmentProfile",
         "AssessmentUnit",

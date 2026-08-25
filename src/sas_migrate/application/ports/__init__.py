@@ -9,6 +9,12 @@ from .conversion import (
     ConversionTranslationPort,
 )
 from .credential_provider import CredentialProvider, CredentialValue
+from .hydration import (
+    HydrationDriverRegistry,
+    HydrationSink,
+    HydrationSourceDriver,
+    HydrationSourceProbe,
+)
 from .knowledge import KnowledgeRepository
 from .llm import LLMPort, ProviderResponse, ProviderTokenUsage
 from .memory import MemoryPort
@@ -28,6 +34,10 @@ __all__ = [
     "ConversionTranslationPort",
     "CredentialProvider",
     "CredentialValue",
+    "HydrationDriverRegistry",
+    "HydrationSink",
+    "HydrationSourceDriver",
+    "HydrationSourceProbe",
     "KnowledgeRepository",
     "LLMPort",
     "MemoryClassifier",
