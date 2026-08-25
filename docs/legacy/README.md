@@ -26,7 +26,7 @@ replacement and cutover gates. The authoritative machine inventory is
 | `xref/` | 6 | Phase 7/10 | v2 replacement exists; compatibility package retained until cutover |
 | `main.py` | 1 module | Phase 10 | active `sas-parser` entry point; replaced by operational `sas-migrate` commands |
 
-Total: 14 packages, 118 package Python files, 166 tracked package files
+Total: 14 packages, 119 package Python files, 167 tracked package files
 (including instruction/profile resources), and one top-level entry module.
 
 ## V2 dependencies on legacy code
