@@ -81,9 +81,10 @@ sftp       = ["paramiko>=3.4"]
 # Blob and Data Lake ship together: they share the ranged-read adapter in
 # data_hydration.rawio, and a lake path routinely resolves to either endpoint.
 adls       = ["azure-storage-file-datalake>=12.14", "azure-storage-blob>=12.19"]
-# Reads .sas7bdat without a SAS installation. pandas arrives with it, which is
-# also the container every source hands rows back in.
-sasdata    = ["pyreadstat>=1.2"]
+# Reads .sas7bdat without a SAS installation. pandas is explicit: current
+# pyreadstat releases no longer install it transitively, while both SAS and
+# ordinary file drivers exchange pandas DataFrames with the Delta sink.
+sasdata    = ["pyreadstat>=1.2", "pandas>=2.2"]
 # A live SAS session. Needed ONLY for SPD Engine libraries, whose component
 # files have no open-source reader — see data_hydration/sources/sas_session.py.
 saspy      = ["saspy>=5.100"]
@@ -96,6 +97,7 @@ hydration  = [
     "azure-storage-file-datalake>=12.14",
     "azure-storage-blob>=12.19",
     "pyreadstat>=1.2",
+    "pandas>=2.2",
     "saspy>=5.100",
 ]
 

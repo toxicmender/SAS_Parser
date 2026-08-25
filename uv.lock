@@ -3965,6 +3965,7 @@ hydration = [
     { name = "azure-storage-blob" },
     { name = "azure-storage-file-datalake" },
     { name = "oracledb" },
+    { name = "pandas" },
     { name = "paramiko" },
     { name = "pyreadstat" },
     { name = "saspy" },
@@ -3973,6 +3974,7 @@ oracle = [
     { name = "oracledb" },
 ]
 sasdata = [
+    { name = "pandas" },
     { name = "pyreadstat" },
 ]
 saspy = [
@@ -4016,6 +4018,8 @@ requires-dist = [
     { name = "nbformat", marker = "extra == 'dev'", specifier = ">=5.10" },
     { name = "oracledb", marker = "extra == 'hydration'", specifier = ">=2.4" },
     { name = "oracledb", marker = "extra == 'oracle'", specifier = ">=2.4" },
+    { name = "pandas", marker = "extra == 'hydration'", specifier = ">=2.2" },
+    { name = "pandas", marker = "extra == 'sasdata'", specifier = ">=2.2" },
     { name = "paramiko", marker = "extra == 'hydration'", specifier = ">=3.4" },
     { name = "paramiko", marker = "extra == 'sftp'", specifier = ">=3.4" },
     { name = "pydantic", specifier = ">=2.13.4" },
