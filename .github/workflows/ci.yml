@@ -196,10 +196,12 @@ jobs:
       # if uv.lock is out of sync with pyproject.toml instead of re-resolving.
       # pyspark is an extra (in-memory mode is Spark-free); CI installs it so
       # the Spark-backed tests (Delta contract, tracking) keep running here.
+      # The hydration bundle is also installed because the full discovery run
+      # includes the mandatory no-skip optional-driver import matrix.
       # sqlglot is a core dependency, so Spark SQL syntax checks always use
       # the Databricks dialect.
       - name: Install dependencies
-        run: uv sync --locked --extra dev --extra spark
+        run: uv sync --locked --extra dev --extra spark --extra hydration
 
       - name: Phase 7 XREF line and branch coverage gate
         run: >
