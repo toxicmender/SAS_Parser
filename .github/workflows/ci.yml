@@ -111,6 +111,7 @@ jobs:
           scripts/check_v2_architecture.py scripts/check_v2_legacy_inventory.py
           scripts/smoke_v2_core.py
           scripts/smoke_wheel.py scripts/v2_sas_test_adapter.py
+          tests/test_databricks_bundle.py
           tests/test_v2_architecture.py tests/test_v2_contracts.py
           tests/test_v2_deployment.py
           tests/test_v2_conversion.py
@@ -202,6 +203,11 @@ jobs:
       # the Databricks dialect.
       - name: Install dependencies
         run: uv sync --locked --extra dev --extra spark --extra hydration
+
+      - name: Validate Lakeflow Job and DBR 18 LTS contracts
+        run: >
+          uv run pytest -q
+          tests/test_databricks_bundle.py tests/test_databricks_check.py
 
       - name: Phase 7 XREF line and branch coverage gate
         run: >

@@ -218,6 +218,10 @@ CI also runs the strict form from a wheel-only, non-root, read-only container:
 `sas-migrate smoke --require-wheel --require-non-root --json`. See the
 [v2 deployment smoke contract](docs/migrations/v2-deployment-smoke.md).
 
+The current SharePoint workflow can also be deployed as a Databricks Lakeflow
+Job on an existing general-purpose cluster running DBR 18 LTS. See the
+[Lakeflow Job deployment guide](docs/deployment/databricks-lakeflow-job.md).
+
 ## Configuration
 
 Start with [`config.json`](config.json) for non-secret defaults and

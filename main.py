@@ -485,7 +485,8 @@ def _run_sharepoint(args: argparse.Namespace) -> int:
     transaction — but the exit status is non-zero if any did.
     """
     from app_config.sharepoint import SharePointError, get_sharepoint_client
-    from conversion import requests as conv_requests, run as conv_run
+    from conversion import requests as conv_requests
+    from conversion import run as conv_run
 
     try:
         client = get_sharepoint_client()
@@ -735,6 +736,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.sas_dir is not None:
         return _run_local(args)
     return _run_sharepoint(args)
+
+
+def lakeflow_main() -> None:
+    """Lakeflow wheel entry point that turns application failures into task failures."""
+
+    exit_code = main()
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 def _run_check(args: argparse.Namespace) -> int:

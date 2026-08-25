@@ -62,6 +62,13 @@ job. It builds `docker/v2.Dockerfile`, then runs the installed `sas-migrate
 smoke` command as a non-root user with a read-only filesystem. G-018 remains
 open only for its scheduled real-model quality gate.
 
+The workspace deployment is also executable through the root Databricks
+bundle. It deploys a two-task Lakeflow Job onto an explicitly supplied existing
+general-purpose cluster, requires DBR 18 LTS before conversion starts, and runs
+the current SharePoint entry point. The remaining operational cutover is still
+tracked by G-013 through G-015: the job must switch to the v2 CLI and presenter
+once those commands are implemented.
+
 ## Closure protocol
 
 A gap closes only when its exit gate is executable and green. The implementing

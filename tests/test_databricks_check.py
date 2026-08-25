@@ -77,6 +77,29 @@ def test_runtime_passes_in_the_notebook(on_cluster, monkeypatch):
     assert result.detail["active SparkSession"] == "yes"
 
 
+def test_runtime_accepts_dbr_18_lts_maintenance_version(monkeypatch):
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "18.2.x-scala2.13")
+    _session(monkeypatch, _Session(version="4.1.0"))
+    result = dc.check_runtime("18")
+    assert result.status == PASS
+    assert result.detail["expected runtime family"] == "18"
+
+
+def test_runtime_rejects_a_different_release_family(on_cluster, monkeypatch):
+    _session(monkeypatch, _Session())
+    result = dc.check_runtime("18")
+    assert result.status == FAIL
+    assert "19.0" in result.summary and "18" in result.summary
+    assert result.fix is not None and "general-purpose cluster" in result.fix
+
+
+def test_expected_runtime_fails_off_databricks(off_cluster, monkeypatch):
+    _session(monkeypatch, None)
+    result = dc.check_runtime("18")
+    assert result.status == FAIL
+    assert "no Databricks runtime" in result.summary
+
+
 def test_runtime_detects_a_child_process(on_cluster, monkeypatch):
     """The env var says cluster, but nothing built a session: a %sh child."""
     _session(monkeypatch, None)
@@ -262,6 +285,13 @@ def test_run_checks_adds_the_secret_stage_on_request(off_cluster, monkeypatch):
         dc, "check_secret_scope", lambda: dc.CheckResult("secrets", SKIP, "stubbed")
     )
     assert [r.name for r in dc.run_checks(check_secrets=True)][-1] == "secrets"
+
+
+def test_run_checks_forwards_expected_runtime(on_cluster, monkeypatch):
+    _session(monkeypatch, _Session())
+    results = dc.run_checks(expected_runtime="18")
+    assert results[0].name == "runtime"
+    assert results[0].status == FAIL
 
 
 def test_main_exits_non_zero_when_a_stage_fails(on_cluster, monkeypatch, capsys):

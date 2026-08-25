@@ -37,6 +37,13 @@ sas-parser = "main:main"
 # cases move behind v2 application ports.
 sas-migrate = "sas_migrate.cli:main"
 
+[project.entry-points.databricks_jobs]
+# Lakeflow Jobs resolves Python wheel tasks through this standard entry-point
+# group. The preflight is a hard dependency of the conversion task in
+# databricks.yml, so the application never starts on the wrong DBR family.
+databricks_preflight = "app_config.databricks_check:lakeflow_main"
+sas_parser = "main:lakeflow_main"
+
 [project.optional-dependencies]
 # Delta memory backend + validation tracking (Spark/JVM). The default
 # in-memory mode must import and run without pyspark (Architecture.md
@@ -65,7 +72,14 @@ sharepoint = ["msgraph-sdk>=1.5", "msal>=1.28"]
 # itself (the schema is small and stable, and the runtime should not grow a
 # jupyter dependency to emit JSON), and tests/test_notebook.py validates what
 # it emits against the real published schema.
-dev        = ["pytest>=8", "pytest-cov", "ruff", "nbformat>=5.10", "matplotlib>=3.8"]
+dev        = [
+    "pytest>=8",
+    "pytest-cov",
+    "ruff",
+    "nbformat>=5.10",
+    "matplotlib>=3.8",
+    "PyYAML>=6.0",
+]
 # Draws complexity's corpus dependency graph as a PNG beside the Markdown
 # report. Optional: complexity.graph always renders the same edges as a
 # Markdown table, and render_png returns None (with a log line) when matplotlib

@@ -3956,6 +3956,7 @@ dev = [
     { name = "nbformat" },
     { name = "pytest" },
     { name = "pytest-cov" },
+    { name = "pyyaml" },
     { name = "ruff" },
 ]
 graph = [
@@ -4030,6 +4031,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest-cov", marker = "extra == 'dev'" },
     { name = "python-dotenv", specifier = ">=1.0" },
+    { name = "pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "saspy", marker = "extra == 'hydration'", specifier = ">=5.100" },
     { name = "saspy", marker = "extra == 'saspy'", specifier = ">=5.100" },

@@ -51,6 +51,7 @@ Usage
     python -m app_config.databricks_check                 # the full preflight
     python -m app_config.databricks_check --json          # machine-readable
     python -m app_config.databricks_check --check-secrets # + read the scope
+    python -m app_config.databricks_check --expected-runtime 18  # require DBR 18.x
 
 From a notebook, import it rather than shelling out — shelling out is the very
 thing the ``runtime`` stage exists to catch::
@@ -167,7 +168,13 @@ def _satisfies(version: str, specifier: Any) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def check_runtime() -> CheckResult:
+def _runtime_family(version: str) -> str:
+    """Return the numeric Databricks Runtime release family from a version."""
+
+    return version.strip().split(".", maxsplit=1)[0]
+
+
+def check_runtime(expected_runtime: str | None = None) -> CheckResult:
     """Are we on a Databricks cluster, and in the notebook's own Python?
 
     The child-process case is the one worth catching: it looks exactly like a
@@ -180,16 +187,45 @@ def check_runtime() -> CheckResult:
     version = os.environ.get("DATABRICKS_RUNTIME_VERSION")
     detail: dict[str, Any] = {
         "DATABRICKS_RUNTIME_VERSION": version or "unset",
+        "expected runtime family": expected_runtime or "not enforced",
         "python": sys.version.split()[0],
         "executable": sys.executable,
     }
 
     if not in_databricks_runtime():
+        if expected_runtime is not None:
+            return CheckResult(
+                "runtime",
+                FAIL,
+                f"Databricks Runtime {expected_runtime} is required but no "
+                "Databricks runtime was detected",
+                detail,
+                fix=(
+                    "Run the preflight as the Lakeflow wheel task on the "
+                    "configured general-purpose cluster, not on the deployment host."
+                ),
+            )
         return CheckResult(
             "runtime",
             SKIP,
             "not running on a Databricks cluster",
             detail,
+        )
+
+    if expected_runtime is not None and (
+        version is None
+        or _runtime_family(version) != _runtime_family(expected_runtime)
+    ):
+        return CheckResult(
+            "runtime",
+            FAIL,
+            f"Databricks Runtime {version or 'unknown'} does not match required "
+            f"family {expected_runtime}",
+            detail,
+            fix=(
+                "Attach the Lakeflow Job to a general-purpose cluster running "
+                f"Databricks Runtime {expected_runtime} LTS, then restart the run."
+            ),
         )
 
     active = _active_session()
@@ -511,14 +547,18 @@ def _release(version: str) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 
-def run_checks(*, check_secrets: bool = False) -> list[CheckResult]:
+def run_checks(
+    *,
+    check_secrets: bool = False,
+    expected_runtime: str | None = None,
+) -> list[CheckResult]:
     """Every stage, in dependency order.
 
     Offline by default: nothing here contacts the workspace unless
     *check_secrets* asks for the one stage that does.
     """
     results = [
-        check_runtime(),
+        check_runtime(expected_runtime),
         check_session(),
         check_pyspark(),
         check_packages(),
@@ -550,6 +590,13 @@ def main(argv: list[str] | None = None) -> int:
         "network stage). Needs the cluster's own credential or a PAT.",
     )
     parser.add_argument(
+        "--expected-runtime",
+        default=None,
+        metavar="FAMILY",
+        help="Fail unless DATABRICKS_RUNTIME_VERSION is in this release family "
+        "(for example, 18 accepts any DBR 18 LTS maintenance update).",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         dest="as_json",
@@ -576,7 +623,10 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging(debug=args.debug, log_file=args.log_file)
     load_dotenv_file()
 
-    results = run_checks(check_secrets=args.check_secrets)
+    results = run_checks(
+        check_secrets=args.check_secrets,
+        expected_runtime=args.expected_runtime,
+    )
     if args.as_json:
         print(to_json(results))
     else:
@@ -589,6 +639,14 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
     return 1 if any(r.status == FAIL for r in results) else 0
+
+
+def lakeflow_main() -> None:
+    """Lakeflow wheel entry point that preserves the preflight exit status."""
+
+    exit_code = main()
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":

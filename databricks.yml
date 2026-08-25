@@ -1,0 +1,58 @@
+bundle:
+  name: sas-parser
+  databricks_cli_version: ">=0.258.0"
+
+artifacts:
+  default:
+    type: whl
+    build: uv build --wheel
+    dynamic_version: true
+
+variables:
+  general_purpose_cluster_id:
+    description: >-
+      ID of an existing general-purpose (all-purpose) cluster configured with
+      Databricks Runtime 18 LTS.
+  databricks_runtime_family:
+    description: Databricks Runtime release family required by the preflight task.
+    default: "18"
+
+resources:
+  jobs:
+    sas_parser:
+      name: sas-parser-${bundle.target}
+      description: >-
+        Process pending SAS conversion requests after validating the attached
+        general-purpose compute runtime.
+      max_concurrent_runs: 1
+      tasks:
+        - task_key: runtime_preflight
+          existing_cluster_id: ${var.general_purpose_cluster_id}
+          python_wheel_task:
+            package_name: sas_parser
+            entry_point: databricks_preflight
+            parameters:
+              - --expected-runtime
+              - ${var.databricks_runtime_family}
+              - --json
+          libraries:
+            - whl: ./dist/*.whl
+            - requirements: ./databricks/requirements.txt
+
+        - task_key: convert_pending_requests
+          depends_on:
+            - task_key: runtime_preflight
+          existing_cluster_id: ${var.general_purpose_cluster_id}
+          python_wheel_task:
+            package_name: sas_parser
+            entry_point: sas_parser
+          libraries:
+            - whl: ./dist/*.whl
+            - requirements: ./databricks/requirements.txt
+
+targets:
+  dev:
+    mode: development
+    default: true
+  prod:
+    mode: production

@@ -1,37 +1,40 @@
-# Compute-scoped library set for Databricks Runtime 19 (Spark 4.2.0, Python 3.12.3).
+# Compute-scoped library set for Databricks Runtime 18 LTS
+# (Spark 4.1.0, Python 3.12.3).
 #
 # Point a cluster's Libraries tab (or a job's `libraries` block) at this file:
 #     { "requirements": "/Volumes/<catalog>/<schema>/sas_parser/requirements.txt" }
 #
 # DERIVED, NOT HAND-WRITTEN. Regenerate after any `uv lock` change:
 #
-#     uv export --frozen --no-dev --no-hashes --no-emit-project --no-annotate #         --no-header --extra sharepoint --extra vault --extra azure
+#     uv export --frozen --no-dev --no-hashes --no-emit-project --no-annotate \
+#         --no-header --extra sharepoint --extra vault --extra azure
 #
-# then drop every package Databricks Runtime 19 already ships at a version the
-# lock is happy with. What remains is this file. `constraints-dbr19.txt` beside
+# then drop every package Databricks Runtime 18 LTS already ships at a version
+# the lock is happy with. What remains is this file. `constraints-dbr18.txt` beside
 # it records the dropped set at its runtime version, so the result can be
 # re-verified against a stock cluster without one:
 #
-#     uv pip compile databricks/requirements.txt -c databricks/constraints-dbr19.txt #         --python-version 3.12 --python-platform linux
+#     uv pip compile databricks/requirements.txt \
+#         -c databricks/constraints-dbr18.txt \
+#         --python-version 3.12 --python-platform linux
 #
-# Verified blast radius: 51 packages added, and exactly three runtime packages
-# change --- pydantic 2.13.3 -> 2.13.4, pydantic-core 2.46.3 -> 2.46.4, and
-# markdown-it-py 2.2.0 -> 4.2.0. All three are the repo's own declared floors
-# (pyproject.toml), not incidental resolver drift. numpy, pandas, pyarrow,
-# requests, urllib3, cryptography, typing-extensions and packaging are all left
-# at their runtime versions.
+# The requirements intentionally upgrade libraries whose DBR 18 versions do not
+# meet the project's lock or declared floors (including pydantic and the
+# LangChain/OpenAI stack). `typing-extensions` is explicit because DBR 18's
+# 4.12.2 is below langchain-protocol's >=4.13 floor. The adjacent constraints
+# file keeps compatible runtime-provided libraries at their stock DBR 18
+# versions during verification.
 #
 # DELIBERATELY ABSENT --- do not add:
-#   pyspark, delta-spark      the runtime IS Spark 4.2.0 / Delta 4.2.0. The
-#                             `spark` extra pins pyspark>=4.1.2,<4.2 for laptops
-#                             and the Docker stack; installing it here puts a
-#                             4.1.x Python client under a 4.2.0 JVM.
+#   pyspark, delta-spark      DBR 18 provides Spark 4.1.0 and its built-in Delta
+#                             runtime. Installing the local `spark` extra here
+#                             can shadow the runtime's matched Python client.
 #   databricks-sql-connector  in the `databricks` extra, but unused on a cluster:
 #                             its only consumer, sql_connect_params(), builds
 #                             kwargs for callers OUTSIDE a notebook and raises on
 #                             a cluster.
-#   databricks-sdk, msal      already satisfied by the runtime (0.108.0 / 1.36.0).
-#   tiktoken, python-dotenv   already satisfied (0.13.0 / 1.2.2).
+#   databricks-sdk, msal      already satisfied by DBR 18 (0.67.0 / 1.34.0).
+#   tiktoken, python-dotenv   already satisfied (0.12.0 / 1.2.1).
 #
 # `colorama` carries a win32 marker from the universal lock and is inert here.
 
@@ -86,6 +89,8 @@ pystemmer==3.1.0
 requests-toolbelt==1.0.0
 sqlglot==30.14.0
 std-uritemplate==2.0.12
+typing-extensions==4.15.0
+typing-inspection==0.4.2
 uuid-utils==0.17.0
 websockets==15.0.1
 xxhash==3.8.1
