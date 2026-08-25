@@ -3,6 +3,14 @@
   "$id": "urn:sas-migrate:contracts:v2",
   "title": "SAS Migrate v2 contract resources",
   "x-contract-families": {
+    "conversion": [
+      "ConversionRequest",
+      "ConversionModelPreference",
+      "ConversionTranslationCommand",
+      "ConversionTranslationResult",
+      "ConversionOutcome",
+      "ConversionBatchOutcome"
+    ],
     "assessment": [
       "AssessmentProfile",
       "AssessmentUnit",

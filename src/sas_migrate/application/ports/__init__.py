@@ -3,6 +3,11 @@
 from .artifact_repository import ArtifactRepository, ArtifactWrite
 from .clock import Clock
 from .conversation_memory import ConversationMemoryRepository, MemoryClassifier
+from .conversion import (
+    ConversionRequestRepository,
+    ConversionSourceRepository,
+    ConversionTranslationPort,
+)
 from .credential_provider import CredentialProvider, CredentialValue
 from .knowledge import KnowledgeRepository
 from .llm import LLMPort, ProviderResponse, ProviderTokenUsage
@@ -11,12 +16,16 @@ from .run_events import RunEventRepository
 from .source_repository import SourceObject, SourceRepository
 from .token_records import TokenRecordRepository
 from .validation import ResponseValidator
+from .xref import XrefFileTransport, XrefListTransport, XrefMappingSource
 
 __all__ = [
     "ArtifactRepository",
     "ArtifactWrite",
     "Clock",
     "ConversationMemoryRepository",
+    "ConversionRequestRepository",
+    "ConversionSourceRepository",
+    "ConversionTranslationPort",
     "CredentialProvider",
     "CredentialValue",
     "KnowledgeRepository",
@@ -30,7 +39,7 @@ __all__ = [
     "SourceObject",
     "SourceRepository",
     "TokenRecordRepository",
+    "XrefFileTransport",
+    "XrefListTransport",
+    "XrefMappingSource",
 ]
-from .xref import XrefFileTransport, XrefListTransport, XrefMappingSource
-
-__all__ = ["XrefFileTransport", "XrefListTransport", "XrefMappingSource"]

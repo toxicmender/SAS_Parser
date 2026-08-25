@@ -1,5 +1,17 @@
 """V2 use-case layer; concrete infrastructure belongs in adapters."""
 
+from .conversion import (
+    ConversionBatchOutcome,
+    ConversionModelPreference,
+    ConversionOutcome,
+    ConversionRequest,
+    ConversionStatus,
+    ConversionTranslationCommand,
+    ConversionTranslationResult,
+    ConversionWorkflow,
+    model_for,
+    select_requests,
+)
 from .deployment import (
     DeploymentSmokeCheck,
     DeploymentSmokeReport,
@@ -86,6 +98,14 @@ __all__ = [
     "ChatRole",
     "ConstructKey",
     "ConversationMemoryService",
+    "ConversionBatchOutcome",
+    "ConversionModelPreference",
+    "ConversionOutcome",
+    "ConversionRequest",
+    "ConversionStatus",
+    "ConversionTranslationCommand",
+    "ConversionTranslationResult",
+    "ConversionWorkflow",
     "DeploymentSmokeCheck",
     "DeploymentSmokeReport",
     "DocumentExtraction",
@@ -140,8 +160,10 @@ __all__ = [
     "TranslationRunOutcome",
     "UserRule",
     "UserRuleSet",
+    "model_for",
     "render_effective_prompt",
     "render_notebooks",
     "run_deployment_smoke",
+    "select_requests",
     "translation_items",
 ]
