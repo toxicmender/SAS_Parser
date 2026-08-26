@@ -20,6 +20,9 @@
       "HydrationItemOutcome",
       "HydrationReport"
     ],
+    "infrastructure": [
+      "InfrastructureSettings"
+    ],
     "assessment": [
       "AssessmentProfile",
       "AssessmentUnit",

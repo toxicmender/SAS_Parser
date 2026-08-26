@@ -287,6 +287,9 @@ def test_schema_resource_is_bundled_and_versioned() -> None:
         "HydrationItemOutcome",
         "HydrationReport",
     ]
+    assert schema["x-contract-families"]["infrastructure"] == [
+        "InfrastructureSettings",
+    ]
     assert schema["x-contract-families"]["assessment"] == [
         "AssessmentProfile",
         "AssessmentUnit",

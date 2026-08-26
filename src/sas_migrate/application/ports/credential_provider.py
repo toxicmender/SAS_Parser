@@ -9,6 +9,10 @@ from pydantic import SecretStr
 from sas_migrate.core.models import ContractModel
 
 
+class CredentialProviderUnavailable(RuntimeError):
+    """A configured credential backend cannot service the request."""
+
+
 class CredentialValue(ContractModel):
     name: str
     value: SecretStr
@@ -17,3 +21,10 @@ class CredentialValue(ContractModel):
 
 class CredentialProvider(Protocol):
     async def get(self, name: str) -> CredentialValue | None: ...
+
+
+__all__ = [
+    "CredentialProvider",
+    "CredentialProviderUnavailable",
+    "CredentialValue",
+]

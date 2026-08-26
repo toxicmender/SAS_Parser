@@ -1,5 +1,6 @@
 """Dependency-inversion ports implemented by v2 adapters."""
 
+from .access_token import AccessToken, AccessTokenProvider
 from .artifact_repository import ArtifactRepository, ArtifactWrite
 from .clock import Clock
 from .conversation_memory import ConversationMemoryRepository, MemoryClassifier
@@ -8,7 +9,11 @@ from .conversion import (
     ConversionSourceRepository,
     ConversionTranslationPort,
 )
-from .credential_provider import CredentialProvider, CredentialValue
+from .credential_provider import (
+    CredentialProvider,
+    CredentialProviderUnavailable,
+    CredentialValue,
+)
 from .hydration import (
     HydrationDriverRegistry,
     HydrationSink,
@@ -25,6 +30,8 @@ from .validation import ResponseValidator
 from .xref import XrefFileTransport, XrefListTransport, XrefMappingSource
 
 __all__ = [
+    "AccessToken",
+    "AccessTokenProvider",
     "ArtifactRepository",
     "ArtifactWrite",
     "Clock",
@@ -33,6 +40,7 @@ __all__ = [
     "ConversionSourceRepository",
     "ConversionTranslationPort",
     "CredentialProvider",
+    "CredentialProviderUnavailable",
     "CredentialValue",
     "HydrationDriverRegistry",
     "HydrationSink",
