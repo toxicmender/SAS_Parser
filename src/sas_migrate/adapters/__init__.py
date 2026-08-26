@@ -16,12 +16,19 @@ from .credentials import (
 )
 from .knowledge import InMemoryKnowledgeRepository, PyMuPdfInstructionReader
 from .memory import DeltaMemoryRepository, InMemoryMemoryRepository
+from .sharepoint import (
+    GraphSdkGateway,
+    SharePointGraphTransport,
+    SharePointPreflight,
+    SharePointPreflightReport,
+)
 
 __all__ = [
     "ChainedCredentialProvider",
     "DatabricksSecretCredentialProvider",
     "DeltaMemoryRepository",
     "EnvironmentCredentialProvider",
+    "GraphSdkGateway",
     "InMemoryKnowledgeRepository",
     "InMemoryMemoryRepository",
     "LocalConversionRequestRepository",
@@ -31,5 +38,8 @@ __all__ = [
     "SharePointConversionConfig",
     "SharePointConversionRequestRepository",
     "SharePointConversionSourceRepository",
+    "SharePointGraphTransport",
+    "SharePointPreflight",
+    "SharePointPreflightReport",
     "VaultCredentialProvider",
 ]
