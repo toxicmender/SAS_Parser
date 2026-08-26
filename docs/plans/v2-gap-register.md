@@ -19,13 +19,13 @@ define separate gap lists.
 
 | ID | Owner | Gap | Exit gate |
 |---|---:|---|---|
-| G-004 | Phase 9 | V2 Delta memory delegates physical MERGE/CDF work to `memory.store.KVStore`. | The v2 adapter owns Delta persistence and the legacy-import allowlist becomes empty. |
 | G-005 | Phase 9 | Databricks chat and embedding factories remain in `memory.databricks_ai`. | Lazy v2 Databricks AI adapter jobs pass. |
 
 ## Closed Phase 9 replacements
 
 | ID | Owner | Replacement | Evidence |
 |---|---:|---|---|
+| G-004 | Phase 9 | Native v2 Delta KV persistence owns schema upgrade, MERGE/delete, write retry, CDF, checkpoint, audit, and diagnostics behavior. | Real PySpark/Delta reopen, update-preservation, literal-key deletion, schema-upgrade, CDF-tail, and idempotent-checkpoint contracts combine with offline failure paths at a 90% CI threshold; the v2 legacy-import allowlist is empty. |
 | G-003 | Phase 9 | V2 ports and lazy adapters own BM25, FAISS dense retrieval, provider-scoped embedding caches, reciprocal-rank fusion, and reranking. | Lexical/dense/fusion/reranker, corruption, dimension, namespace isolation, lazy-import, and application-integration contracts pass at 95% combined line/branch coverage. |
 | G-010 | Phase 9 | Local and SharePoint conversion requests, target/model selection, lifecycle state, source adapters, and per-row isolation are v2-owned. | Fake local and SharePoint end-to-end contracts pass at 98% combined line/branch coverage. |
 | G-011 | Phase 9 | Pure hydration planning, versioned contracts, driver/sink ports, lazy adapters, ranged I/O, and managed Delta writes are v2-owned. | Parity and failure contracts pass at 95% combined coverage; optional imports are no-skip and the Delta sink runs in the real Spark/Delta container. |

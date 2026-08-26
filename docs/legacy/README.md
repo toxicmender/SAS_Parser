@@ -16,7 +16,7 @@ replacement and cutover gates. The authoritative machine inventory is
 | `conversion/` | 6 | Phase 9/10 | v2 conversion application/adapters exist; compatibility package and publication path retained until cutover |
 | `data_hydration/` | 20 | Phase 9/10 | v2 application/adapters exist; compatibility CLI/config composition retained |
 | `llm_client/` | 2 | Phase 9 | application port exists; gateway adapter pending |
-| `memory/` | 11 | Phase 6/9 | services moved; physical Delta/CDF and Databricks AI transition remains |
+| `memory/` | 11 | Phase 6/9/10 | services and physical Delta/CDF moved; Databricks AI and active legacy composition remain |
 | `pipeline/` | 9 | Phase 5/10 | translation orchestration exists; active CLI compatibility remains |
 | `prompt_builder/` | 8 | Phase 6/10 | v2 ingestion and advanced retrieval replacements exist; compatibility package retained until cutover |
 | `reporting/` | 2 | Phase 10 | presenters/document adapters pending |
@@ -31,11 +31,10 @@ Total: 14 packages, 119 package Python files, 167 tracked package files
 
 ## V2 dependencies on legacy code
 
-Only one production import is permitted:
-
-| V2 importer | Legacy dependency | Removal gate |
-|---|---|---|
-| `src/sas_migrate/adapters/memory/delta.py` | `memory.store.KVStore` | V2 owns physical Delta MERGE, CDF, checkpoint, and audit implementation |
+No production import from `src/sas_migrate` into a top-level legacy package is
+permitted. The previous `memory.store.KVStore` allowance was removed when v2
+took ownership of Delta schema upgrades, MERGE/delete persistence, CDF,
+checkpoint, audit, retry, and diagnostics behavior.
 
 CI rejects any new v2-to-legacy import or any unrecorded change to this
 allowlist. Test-only SAS aliases in `scripts/v2_sas_test_adapter.py` are parity
@@ -87,6 +86,12 @@ provider-scoped in-memory and atomic disk embedding caches. `prompt_builder`
 and its shared `memory.relevance` helper remain shipped only because the legacy
 pipeline still composes them; their removal is part of G-021, not an open
 knowledge-functionality gap.
+
+The Phase 9 memory persistence replacement now owns the physical Delta table
+contract and has no import back to `memory.store`. The top-level `memory/`
+package remains shipped because the active legacy pipeline still composes its
+history services and because Databricks AI factories remain G-005; physical
+Delta persistence is no longer a transition dependency.
 
 ## Removal order
 

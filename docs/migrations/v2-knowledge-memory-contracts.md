@@ -27,18 +27,23 @@ and memory extraction. Temporary extracted memories become TTL notes. Permanent
 memories remain pending policy proposals until explicitly approved. Classifier
 failures do not fail an accepted translation.
 
-The in-memory adapter imports and runs without Spark. The Delta adapter writes
-the same contracts through the existing CDF-enabled Delta KV engine while that
-engine is migrated out of the legacy namespace. It persists audit events,
-supports snapshots, restore, rewind, fork, retention, accepted-response state,
-and exposes CDF synchronization. A fresh v2 prefix prevents collision with
-legacy records.
+The in-memory adapter imports and runs without Spark. The v2 Delta adapter now
+owns the CDF-enabled physical KV engine: compatible schema upgrades,
+MERGE-based upserts and exact-key deletes, bounded conflict retries, durable
+consumer checkpoints, idempotent audit records, and table diagnostics. It
+persists audit events, supports snapshots, restore, rewind, fork, retention,
+accepted-response state, and exposes CDF synchronization. A fresh v2 prefix
+prevents collision with legacy records, while the unchanged physical columns
+allow existing v2 tables to reopen in place.
 
 Delta OPTIMIZE and VACUUM are intentionally separate from request handling.
 Table identifiers are validated and quoted, retention remains between one week
 and four months, and retention must exceed the maximum expected CDF outage.
 The dedicated CI job builds the repository-owned Spark/Delta image, exercises
 direct PySpark DataFrame and Python ``DeltaTable`` mutations plus a real
-catalog-backed repository, and treats a missing or incompatible runtime as a
-failure rather than a skip. Its locked PySpark and Delta versions are also the
-versions used by Compose and the standalone Spark image.
+catalog-backed repository, schema upgrade, literal-key deletion, incremental
+CDF tail, and durable checkpoint. Offline contracts cover metadata failures,
+schema rejection, and retry exhaustion; the job enforces 90% combined line and
+branch coverage and treats a missing or incompatible runtime as a failure
+rather than a skip. Its locked PySpark and Delta versions are also the versions
+used by Compose and the standalone Spark image.

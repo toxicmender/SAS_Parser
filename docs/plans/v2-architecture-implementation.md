@@ -2,9 +2,9 @@
 
 Status: implementation in progress. Phases 0 through 8 and the Phase 9
 conversion, hydration, infrastructure, SharePoint Graph, and advanced
-knowledge-retrieval slices are implemented on the v2 migration branch. Native
-Delta memory persistence and Databricks AI adapters remain in Phase 9 before
-the Phase 10 operational cutover.
+knowledge-retrieval and native Delta-memory slices are implemented on the v2
+migration branch. Databricks AI adapters remain in Phase 9 before the Phase 10
+operational cutover.
 
 This is the authoritative plan for the fresh version of the application. It
 consolidates the architecture audit, the functional-parity review, the test
@@ -787,8 +787,9 @@ Deliverables:
 7. **Implemented:** move BM25/FAISS knowledge ranking, reciprocal-rank fusion,
    reranking, and provider-scoped memory/disk embedding caches behind lazy v2
    ports and adapters.
-8. **Pending:** move physical Delta memory MERGE/CDF behavior out of
-   `memory.store`.
+8. **Implemented:** move physical Delta memory schema upgrades, MERGE/delete,
+   conflict retry, CDF, durable checkpoint, audit, and diagnostics behavior
+   out of `memory.store` and remove the final v2-to-legacy import.
 9. **Pending:** move Databricks chat and embedding factories out of
    `memory.databricks_ai`.
 
@@ -801,6 +802,8 @@ Tests/gates:
 - SharePoint site-resolved drive tests run with no pinned drive id.
 - advanced knowledge retrieval passes lexical, dense, fusion, reranking,
   cache persistence/corruption, lazy-import, and application integration gates.
+- native Delta memory passes real Spark/Delta data, schema-upgrade, CDF and
+  checkpoint contracts plus offline failure paths at 90% combined coverage.
 
 ### Phase 10 - CLI, reporting, deployment and cutover
 
