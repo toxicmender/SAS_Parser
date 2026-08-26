@@ -114,6 +114,7 @@ jobs:
           tests/test_databricks_bundle.py
           tests/test_v2_architecture.py tests/test_v2_contracts.py
           tests/test_v2_deployment.py
+          tests/test_v2_delta_store.py
           tests/test_v2_conversion.py
           tests/test_v2_hydration.py tests/test_v2_hydration_optional.py
           tests/test_v2_hydration_delta.py
@@ -357,8 +358,14 @@ jobs:
             "sas-parser/spark-delta-ci:${{ github.sha }}" \
             python -m pytest -v \
               --junitxml=/test-results/junit.xml \
+              --cov=sas_migrate.adapters.memory.delta \
+              --cov=sas_migrate.adapters.memory.delta_store \
+              --cov=sas_migrate.adapters.memory.delta_operations \
+              --cov-branch --cov-report=term-missing \
+              --cov-fail-under=90 \
               tests/test_spark_delta_runtime.py \
               tests/test_v2_memory_delta.py \
+              tests/test_v2_delta_store.py \
               tests/test_v2_hydration_delta.py \
               tests/test_backend_contract.py
 

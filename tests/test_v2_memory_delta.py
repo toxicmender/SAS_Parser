@@ -19,6 +19,7 @@ sys.path.insert(0, str(SRC))
 
 from sas_migrate.adapters.memory import (
     MIN_VACUUM_HOURS,
+    DeltaKVStore,
     DeltaMemoryMaintenance,
     DeltaMemoryRepository,
     VacuumPolicy,
@@ -363,10 +364,59 @@ def test_real_delta_memory_adapter_contract(delta_spark: Any) -> None:
         )
         assert len(await reopened.messages("delta-thread")) == 2
         baseline = reopened.sync_cdf("phase-6-test")
+        assert baseline.baseline is True
         assert baseline.checkpoint_version is not None
+
+        note = ThreadNote(
+            note_id="delta-note",
+            thread_id="delta-thread",
+            text="native persistence",
+            created_at=clock.now(),
+        )
+        await reopened.put_note(note)
+        tail = reopened.sync_cdf("phase-6-test")
+        assert tail.baseline is False
+        assert tail.checkpoint_version is not None
+        assert tail.checkpoint_version > baseline.checkpoint_version
+        assert any(event["key"].endswith("delta-note") for event in tail.events)
+        assert reopened.sync_cdf("phase-6-test").events == ()
+
+        raw_store = reopened._store
+        key = "v2::literal::o'brien::%_"
+        raw_store.set(key, {"revision": 1}, tags=["original"], source="test")
+        original = dict(raw_store.all_records("v2::literal::"))[key]
+        raw_store.set(key, {"revision": 2})
+        updated = dict(raw_store.all_records("v2::literal::"))[key]
+        assert updated["created_at"] == original["created_at"]
+        assert updated["tags"] == ["original"]
+        assert updated["source"] == "test"
+        assert raw_store.delete(key)
+        assert not raw_store.delete(key)
 
     try:
         asyncio.run(scenario())
+    finally:
+        delta_spark.sql(f"DROP TABLE IF EXISTS `{table}`")
+        delta_spark.sql(f"DROP TABLE IF EXISTS `{audit}`")
+
+
+def test_real_delta_memory_upgrades_legacy_schema(delta_spark: Any) -> None:
+    """An existing pre-provenance table is upgraded without replacing data."""
+
+    suffix = uuid4().hex
+    table = f"v2_memory_legacy_{suffix}"
+    audit = f"v2_memory_legacy_audit_{suffix}"
+    delta_spark.sql(
+        f"CREATE TABLE `{table}` ("
+        "kv_key STRING NOT NULL, value STRING NOT NULL, tags STRING, "
+        "created_at DOUBLE, updated_at DOUBLE) USING DELTA "
+        "TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')"
+    )
+    try:
+        store = DeltaKVStore(delta_spark, table, audit_table=audit)
+        assert "source" in delta_spark.table(f"`{table}`").schema.fieldNames()
+        store.set("v2::upgrade", {"preserved": True}, source="migration")
+        assert store.get("v2::upgrade") == {"preserved": True}
     finally:
         delta_spark.sql(f"DROP TABLE IF EXISTS `{table}`")
         delta_spark.sql(f"DROP TABLE IF EXISTS `{audit}`")
