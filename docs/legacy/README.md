@@ -10,7 +10,7 @@ replacement and cutover gates. The authoritative machine inventory is
 
 | Surface | Python files | Owner | V2 replacement/status |
 |---|---:|---:|---|
-| `app_config/` | 9 | Phase 9 | `sas_migrate.config` and infrastructure adapters; not migrated |
+| `app_config/` | 9 | Phase 9/10 | v2 settings, credentials, auth, and observability exist; Graph worker/preflight and active composition remain |
 | `chunker/` | 9 | Phase 2/10 | `sas_migrate.core.sas` exists; compatibility package retained until cutover |
 | `complexity/` | 18 | Phase 8/10 | v2 assessment replacement exists; compatibility package retained |
 | `conversion/` | 6 | Phase 9/10 | v2 conversion application/adapters exist; compatibility package and publication path retained until cutover |
@@ -74,6 +74,12 @@ report contracts, partition probes, lazy source-driver boundaries, ranged I/O,
 failure-isolated execution, and managed Delta writes. The top-level
 `data_hydration/` package remains shipped for the legacy CLI and its environment
 and credential composition; those dependencies move with G-012 and Phase 10.
+
+The Phase 9 infrastructure foundation now owns strict non-secret settings,
+credential and token ports, lazy environment/Databricks/Vault/MSAL adapters,
+and redacted logging/HTTP tracing. `app_config` remains active only for the
+concrete Graph transport, its single-loop worker/preflight behavior, and the
+legacy composition roots; G-012 tracks that narrower remainder.
 
 ## Removal order
 

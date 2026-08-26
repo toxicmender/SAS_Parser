@@ -23,11 +23,11 @@ define separate gap lists.
 | G-004 | Phase 9 | V2 Delta memory delegates physical MERGE/CDF work to `memory.store.KVStore`. | The v2 adapter owns Delta persistence and the legacy-import allowlist becomes empty. |
 | G-005 | Phase 9 | Databricks chat and embedding factories remain in `memory.databricks_ai`. | Lazy v2 Databricks AI adapter jobs pass. |
 
-## Unmigrated feature families
+## Partially migrated infrastructure
 
 | ID | Owner | Gap | Exit gate |
 |---|---:|---|---|
-| G-012 | Phase 9 | Configuration, auth, SharePoint loop ownership, and observability are not migrated. | V2 config/infrastructure suites pass with lazy extras and secret-free models. |
+| G-012 | Phase 9 | Secret-free settings, environment/Databricks/Vault credentials, MSAL tokens, redaction, and HTTP tracing are v2-owned. The concrete Graph transport, single-loop worker, and preflight remain in `app_config`. | V2 Graph adapter preserves loop ownership and site-resolved drive preflight behavior without importing `app_config`. |
 
 ## Closed Phase 9 replacements
 
@@ -35,6 +35,7 @@ define separate gap lists.
 |---|---:|---|---|
 | G-010 | Phase 9 | Local and SharePoint conversion requests, target/model selection, lifecycle state, source adapters, and per-row isolation are v2-owned. | Fake local and SharePoint end-to-end contracts pass at 98% combined line/branch coverage. |
 | G-011 | Phase 9 | Pure hydration planning, versioned contracts, driver/sink ports, lazy adapters, ranged I/O, and managed Delta writes are v2-owned. | Parity and failure contracts pass at 95% combined coverage; optional imports are no-skip and the Delta sink runs in the real Spark/Delta container. |
+| G-017 | Phase 9 | Hydration and infrastructure optional-adapter CI matrices. | Real SDK imports cannot skip; settings/auth/credential/observability contracts pass above 90% combined coverage. |
 
 ## Cutover, operations, and documentation
 
@@ -44,7 +45,6 @@ define separate gap lists.
 | G-014 | Phase 10 | Report presenters and SharePoint publication remain legacy-only. | V2 visual/golden and publication contracts pass. |
 | G-015 | Phase 10 | A wheel-only non-root v2 image is gated, but Compose, warmup, and operator commands still compose legacy entry points. | Compose and operator commands cut over to the verified v2 image. |
 | G-016 | Phase 10 | Top-level README and Architecture primarily describe the active legacy runtime. | V2 overview, config, API, operator, and cutover guides replace them. |
-| G-017 | Phase 9 | The hydration extra job is present; SharePoint/Graph and Databricks/auth no-skip jobs remain absent. | Each optional adapter gets an install/import/contract job with unexpected skips failing. |
 | G-018 | Phase 10 | Containerized PySpark/Delta and wheel-only v2 deployment smoke jobs are present; scheduled real-model quality evaluation remains absent. | Budgeted scheduled real-model evaluation passes. |
 | G-021 | Phase 10 | Fourteen legacy packages, `main.py`, dual entry points, compatibility tests, and packaging references are shipped. | The legacy inventory and compatibility references are empty or archived outside the wheel. |
 

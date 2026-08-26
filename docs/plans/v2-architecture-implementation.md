@@ -1,8 +1,9 @@
 # SAS migration v2: consolidated architecture and implementation plan
 
 Status: implementation in progress. Phases 0 through 8 and the Phase 9
-conversion and hydration slices are implemented on the v2 migration branch.
-Phase 9 infrastructure adapters are next.
+conversion, hydration, and infrastructure settings/auth/observability slices
+are implemented on the v2 migration branch. The concrete Graph worker and
+preflight adapter are the remaining Phase 9 infrastructure boundary.
 
 This is the authoritative plan for the fresh version of the application. It
 consolidates the architecture audit, the functional-parity review, the test
@@ -776,10 +777,11 @@ Deliverables:
    Phase 10 presenter/publication cutover gate.
 3. **Implemented:** move hydration planning into application code and all
    driver/sink boundaries into adapters, including ranged I/O and Delta.
-4. **Next:** split settings from Azure/Vault/Databricks/SharePoint
-   infrastructure.
-5. Preserve SharePoint worker-loop ownership and preflight diagnostics.
-6. Move logging/redaction and HTTP tracing to observability.
+4. **Implemented:** split secret-free settings from Azure/Vault/Databricks/
+   SharePoint infrastructure and place credentials behind ports.
+5. **Next:** move the concrete Graph transport while preserving SharePoint
+   worker-loop ownership and preflight diagnostics.
+6. **Implemented:** move logging/redaction and HTTP tracing to observability.
 
 Tests/gates:
 

@@ -117,6 +117,8 @@ jobs:
           tests/test_v2_conversion.py
           tests/test_v2_hydration.py tests/test_v2_hydration_optional.py
           tests/test_v2_hydration_delta.py
+          tests/test_v2_infrastructure.py
+          tests/test_v2_infrastructure_optional.py
           tests/test_v2_ports.py tests/test_v2_sas_core.py
           tests/test_v2_sas_parity.py tests/test_v2_responses.py
           tests/test_v2_tokens.py tests/test_v2_translation.py
@@ -250,6 +252,18 @@ jobs:
           --cov-branch --cov-report=term-missing
           --cov-fail-under=90
 
+      - name: Phase 9 infrastructure line and branch coverage gate
+        run: >
+          uv run pytest -q tests/test_v2_infrastructure.py
+          --cov=sas_migrate.config
+          --cov=sas_migrate.application.ports.access_token
+          --cov=sas_migrate.application.ports.credential_provider
+          --cov=sas_migrate.adapters.auth
+          --cov=sas_migrate.adapters.credentials
+          --cov=sas_migrate.observability
+          --cov-branch --cov-report=term-missing
+          --cov-fail-under=90
+
       # Slow end-to-end tests skip themselves automatically: they need the
       # user-provided reference_docs/ PDFs, which are gitignored and absent here.
       - name: Run tests
@@ -351,3 +365,27 @@ jobs:
 
       - name: Require every optional driver import
         run: uv run pytest -q tests/test_v2_hydration_optional.py
+
+  infrastructure-adapters:
+    name: Infrastructure optional adapter matrix
+    runs-on: ubuntu-latest
+    env:
+      REQUIRE_INFRASTRUCTURE_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install every infrastructure adapter extra
+        run: >
+          uv sync --locked --extra dev
+          --extra azure --extra vault --extra databricks --extra sharepoint
+
+      - name: Require every optional SDK and adapter contract
+        run: >
+          uv run pytest -q
+          tests/test_v2_infrastructure.py
+          tests/test_v2_infrastructure_optional.py
