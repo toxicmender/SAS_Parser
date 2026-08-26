@@ -316,6 +316,7 @@ def test_schema_resource_is_bundled_and_versioned() -> None:
         "KnowledgeChunk",
         "UserRule",
         "RetrievalQuery",
+        "KnowledgeRanking",
         "KnowledgeSelection",
     ]
     assert schema["x-contract-families"]["memory"] == [

@@ -123,7 +123,8 @@ jobs:
           tests/test_v2_ports.py tests/test_v2_sas_core.py
           tests/test_v2_sas_parity.py tests/test_v2_responses.py
           tests/test_v2_tokens.py tests/test_v2_translation.py
-          tests/test_v2_knowledge.py tests/test_v2_memory.py
+          tests/test_v2_knowledge.py tests/test_v2_knowledge_retrieval.py
+          tests/test_v2_memory.py
           tests/test_v2_memory_delta.py
           tests/test_spark_delta_runtime.py
           tests/test_v2_legacy_inventory.py
@@ -243,6 +244,16 @@ jobs:
           --cov=sas_migrate.application.conversion
           --cov=sas_migrate.application.ports.conversion
           --cov=sas_migrate.adapters.conversion
+          --cov-branch --cov-report=term-missing
+          --cov-fail-under=90
+
+      - name: Phase 9 knowledge retrieval line and branch coverage gate
+        run: >
+          uv run pytest -q
+          tests/test_v2_knowledge.py tests/test_v2_knowledge_retrieval.py
+          --cov=sas_migrate.application.knowledge
+          --cov=sas_migrate.application.ports.knowledge
+          --cov=sas_migrate.adapters.knowledge
           --cov-branch --cov-report=term-missing
           --cov-fail-under=90
 
