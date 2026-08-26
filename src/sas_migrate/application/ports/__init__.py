@@ -20,7 +20,14 @@ from .hydration import (
     HydrationSourceDriver,
     HydrationSourceProbe,
 )
-from .knowledge import KnowledgeRepository
+from .knowledge import (
+    EmbeddingCache,
+    EmbeddingProvider,
+    EmbeddingVector,
+    KnowledgeRanker,
+    KnowledgeRepository,
+    KnowledgeReranker,
+)
 from .llm import LLMPort, ProviderResponse, ProviderTokenUsage
 from .memory import MemoryPort
 from .run_events import RunEventRepository
@@ -42,11 +49,16 @@ __all__ = [
     "CredentialProvider",
     "CredentialProviderUnavailable",
     "CredentialValue",
+    "EmbeddingCache",
+    "EmbeddingProvider",
+    "EmbeddingVector",
     "HydrationDriverRegistry",
     "HydrationSink",
     "HydrationSourceDriver",
     "HydrationSourceProbe",
+    "KnowledgeRanker",
     "KnowledgeRepository",
+    "KnowledgeReranker",
     "LLMPort",
     "MemoryClassifier",
     "MemoryPort",

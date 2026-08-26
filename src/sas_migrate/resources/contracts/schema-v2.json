@@ -35,6 +35,7 @@
       "KnowledgeChunk",
       "UserRule",
       "RetrievalQuery",
+      "KnowledgeRanking",
       "KnowledgeSelection"
     ],
     "memory": [

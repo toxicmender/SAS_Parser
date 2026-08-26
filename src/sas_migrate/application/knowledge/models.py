@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from enum import StrEnum
 
 from pydantic import Field, field_validator, model_validator
@@ -26,6 +27,12 @@ class RetrievalTier(StrEnum):
     CONSTRUCT = "construct"
     USER_TOPIC = "user_topic"
     TOPICAL = "topical"
+
+
+class RetrievalSignal(StrEnum):
+    LEXICAL = "lexical"
+    DENSE = "dense"
+    RERANKER = "reranker"
 
 
 class RuleScope(StrEnum):
@@ -167,6 +174,23 @@ class RetrievedKnowledge(VersionedContract):
         )
 
 
+class KnowledgeRanking(VersionedContract):
+    chunk_id: str = Field(min_length=1)
+    score: float = Field(ge=0)
+    reciprocal_rank_score: float = Field(ge=0)
+    lexical_rank: int | None = Field(default=None, ge=1)
+    dense_rank: int | None = Field(default=None, ge=1)
+    reranker_score: float | None = None
+    signals: tuple[RetrievalSignal, ...] = Field(min_length=1)
+
+    @field_validator("score", "reciprocal_rank_score", "reranker_score")
+    @classmethod
+    def finite_scores(cls, value: float | None) -> float | None:
+        if value is not None and not math.isfinite(value):
+            raise ValueError("knowledge ranking scores must be finite")
+        return value
+
+
 class KnowledgeSelection(VersionedContract):
     query: RetrievalQuery
     results: tuple[RetrievedKnowledge, ...]
@@ -180,10 +204,12 @@ __all__ = [
     "DocumentSection",
     "ExtractionDiagnostic",
     "KnowledgeChunk",
+    "KnowledgeRanking",
     "KnowledgeRole",
     "KnowledgeSelection",
     "KnowledgeSource",
     "RetrievalQuery",
+    "RetrievalSignal",
     "RetrievalTier",
     "RetrievedKnowledge",
     "RuleScope",

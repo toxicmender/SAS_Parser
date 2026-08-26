@@ -6,7 +6,7 @@ import math
 import re
 from collections import Counter
 
-from sas_migrate.application.ports.knowledge import KnowledgeRepository
+from sas_migrate.application.ports.knowledge import KnowledgeRanker, KnowledgeRepository
 
 from .models import (
     KnowledgeChunk,
@@ -33,9 +33,11 @@ class KnowledgeRetriever:
         repository: KnowledgeRepository,
         *,
         user_rules: UserRuleSet | None = None,
+        topical_ranker: KnowledgeRanker | None = None,
     ) -> None:
         self._repository = repository
         self._user_rules = user_rules or UserRuleSet()
+        self._topical_ranker = topical_ranker
 
     async def select(self, query: RetrievalQuery) -> KnowledgeSelection:
         corpus = tuple(
@@ -112,6 +114,31 @@ class KnowledgeRetriever:
         corpus: tuple[KnowledgeChunk, ...],
         query: RetrievalQuery,
     ) -> tuple[RetrievedKnowledge, ...]:
+        if self._topical_ranker is not None:
+            limit = max(4 * query.max_results, query.max_results)
+            rankings = self._topical_ranker.rank(
+                " ".join((query.text, *sorted(query.topics))),
+                corpus,
+                limit=limit or None,
+            )
+            chunks = {chunk.chunk_id: chunk for chunk in corpus}
+            return tuple(
+                RetrievedKnowledge(
+                    chunk=chunks[ranking.chunk_id],
+                    tier=(
+                        RetrievalTier.USER_TOPIC
+                        if chunks[ranking.chunk_id].role
+                        is KnowledgeRole.USER_INSTRUCTION
+                        else RetrievalTier.TOPICAL
+                    ),
+                    score=ranking.score,
+                    reasons=tuple(
+                        f"topical {signal.value} match" for signal in ranking.signals
+                    ),
+                )
+                for ranking in rankings
+                if ranking.chunk_id in chunks
+            )
         query_tokens = _tokens(" ".join((query.text, *query.topics)))
         if not query_tokens or not corpus:
             return ()
