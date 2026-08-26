@@ -119,6 +119,7 @@ jobs:
           tests/test_v2_hydration_delta.py
           tests/test_v2_infrastructure.py
           tests/test_v2_infrastructure_optional.py
+          tests/test_v2_sharepoint.py
           tests/test_v2_ports.py tests/test_v2_sas_core.py
           tests/test_v2_sas_parity.py tests/test_v2_responses.py
           tests/test_v2_tokens.py tests/test_v2_translation.py
@@ -204,7 +205,9 @@ jobs:
       # sqlglot is a core dependency, so Spark SQL syntax checks always use
       # the Databricks dialect.
       - name: Install dependencies
-        run: uv sync --locked --extra dev --extra spark --extra hydration
+        run: >
+          uv sync --locked --extra dev --extra spark --extra hydration
+          --extra sharepoint
 
       - name: Validate Lakeflow Job and DBR 18 LTS contracts
         run: >
@@ -261,6 +264,13 @@ jobs:
           --cov=sas_migrate.adapters.auth
           --cov=sas_migrate.adapters.credentials
           --cov=sas_migrate.observability
+          --cov-branch --cov-report=term-missing
+          --cov-fail-under=90
+
+      - name: Phase 9 SharePoint line and branch coverage gate
+        run: >
+          uv run pytest -q tests/test_v2_sharepoint.py
+          --cov=sas_migrate.adapters.sharepoint
           --cov-branch --cov-report=term-missing
           --cov-fail-under=90
 
@@ -389,3 +399,4 @@ jobs:
           uv run pytest -q
           tests/test_v2_infrastructure.py
           tests/test_v2_infrastructure_optional.py
+          tests/test_v2_sharepoint.py
