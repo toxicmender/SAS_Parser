@@ -11,6 +11,16 @@ application services remain independent of document libraries. Retrieval and
 scoped user rules return attributed prompt components and keep reference
 guidance separate from project instructions in token reports.
 
+Phase 9 completes the advanced retrieval boundary. `KnowledgeRanker`,
+`EmbeddingProvider`, `EmbeddingCache`, and `KnowledgeReranker` ports keep the
+application layer free of numerical and model SDKs. The hybrid adapter imports
+BM25 and FAISS only when ranking executes, combines lexical and optional dense
+rankings with reciprocal-rank fusion, and can rerank a bounded fused window.
+Embedding caches are keyed by both provider namespace and content digest;
+the disk adapter writes atomically and treats unreadable cache files as misses.
+The original deterministic lexical selector remains the default when no
+advanced ranker is injected.
+
 Conversation memory now has explicit services for accepted history, relevant
 turn selection, rolling summaries, task policy, thread notes, context assembly,
 and memory extraction. Temporary extracted memories become TTL notes. Permanent

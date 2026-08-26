@@ -9,7 +9,7 @@
     {"name": "llm_client", "python_files": 2, "tracked_files": 3, "owner_phase": 9, "replacement": "sas_migrate application LLM port plus gateway adapter", "status": "port_only"},
     {"name": "memory", "python_files": 11, "tracked_files": 12, "owner_phase": 6, "replacement": "sas_migrate.application.memory plus adapters.memory", "status": "transition_dependency"},
     {"name": "pipeline", "python_files": 9, "tracked_files": 10, "owner_phase": 5, "replacement": "sas_migrate.application.translation", "status": "replacement_present"},
-    {"name": "prompt_builder", "python_files": 8, "tracked_files": 41, "owner_phase": 6, "replacement": "sas_migrate.application.knowledge", "status": "advanced_adapters_pending"},
+    {"name": "prompt_builder", "python_files": 8, "tracked_files": 41, "owner_phase": 6, "replacement": "sas_migrate.application.knowledge plus sas_migrate.adapters.knowledge", "status": "replacement_present"},
     {"name": "reporting", "python_files": 2, "tracked_files": 3, "owner_phase": 10, "replacement": "sas_migrate application presenters and document adapters", "status": "not_migrated"},
     {"name": "target_language", "python_files": 1, "tracked_files": 2, "owner_phase": 3, "replacement": "sas_migrate.core.targets", "status": "replacement_present"},
     {"name": "token_budget", "python_files": 1, "tracked_files": 2, "owner_phase": 4, "replacement": "sas_migrate.core.tokens", "status": "replacement_present"},
@@ -58,7 +58,7 @@
   "gaps": [
     {"id": "G-001", "area": "coverage", "owner_phase": 2, "status": "open", "summary": "V2 SAS core remains below the final 95% line and 90% branch policy.", "exit_gate": "Package-level core coverage thresholds pass."},
     {"id": "G-002", "area": "coverage", "owner_phase": 5, "status": "open", "summary": "Translation orchestration, budgeting, artifacts, models, and run-state guard/error branches remain below the application target.", "exit_gate": "Every Phase 5 application module reaches 90% line and 85% branch coverage."},
-    {"id": "G-003", "area": "knowledge", "owner_phase": 9, "status": "open", "summary": "Optional dense retrieval, RRF/reranking, and embedding caches remain in legacy prompt_builder.", "exit_gate": "V2 ports and lazy adapters cover lexical, dense, fusion, reranking, and cache contracts."},
+    {"id": "G-003", "area": "knowledge", "owner_phase": 9, "status": "closed", "summary": "V2 knowledge owns optional BM25 and FAISS retrieval, reciprocal-rank fusion, reranking, and provider-scoped memory/disk embedding caches.", "exit_gate": "V2 ports and lazy adapters cover lexical, dense, fusion, reranking, and cache contracts."},
     {"id": "G-004", "area": "memory", "owner_phase": 9, "status": "open", "summary": "The v2 Delta memory adapter delegates physical MERGE and CDF operations to legacy memory.store.KVStore.", "exit_gate": "The adapter owns its Delta implementation and allowed_v2_legacy_imports is empty."},
     {"id": "G-005", "area": "memory", "owner_phase": 9, "status": "open", "summary": "Databricks chat and embedding factories remain in legacy memory.databricks_ai.", "exit_gate": "Lazy v2 Databricks AI adapters pass install/import contracts."},
     {"id": "G-006", "area": "xref", "owner_phase": 7, "status": "closed", "summary": "XREF models, path resolution, SAS rewriting, target rewriting, and mapping-source adapters are implemented in v2.", "exit_gate": "Phase 7 characterization and adapter contracts pass with no Scala dispatch."},

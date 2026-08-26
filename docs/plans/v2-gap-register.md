@@ -19,7 +19,6 @@ define separate gap lists.
 
 | ID | Owner | Gap | Exit gate |
 |---|---:|---|---|
-| G-003 | Phase 9 | Dense retrieval, fusion/reranking, and embedding caches remain in `prompt_builder`. | V2 lazy adapters cover lexical, dense, fusion, reranking, and cache contracts. |
 | G-004 | Phase 9 | V2 Delta memory delegates physical MERGE/CDF work to `memory.store.KVStore`. | The v2 adapter owns Delta persistence and the legacy-import allowlist becomes empty. |
 | G-005 | Phase 9 | Databricks chat and embedding factories remain in `memory.databricks_ai`. | Lazy v2 Databricks AI adapter jobs pass. |
 
@@ -27,6 +26,7 @@ define separate gap lists.
 
 | ID | Owner | Replacement | Evidence |
 |---|---:|---|---|
+| G-003 | Phase 9 | V2 ports and lazy adapters own BM25, FAISS dense retrieval, provider-scoped embedding caches, reciprocal-rank fusion, and reranking. | Lexical/dense/fusion/reranker, corruption, dimension, namespace isolation, lazy-import, and application-integration contracts pass at 95% combined line/branch coverage. |
 | G-010 | Phase 9 | Local and SharePoint conversion requests, target/model selection, lifecycle state, source adapters, and per-row isolation are v2-owned. | Fake local and SharePoint end-to-end contracts pass at 98% combined line/branch coverage. |
 | G-011 | Phase 9 | Pure hydration planning, versioned contracts, driver/sink ports, lazy adapters, ranged I/O, and managed Delta writes are v2-owned. | Parity and failure contracts pass at 95% combined coverage; optional imports are no-skip and the Delta sink runs in the real Spark/Delta container. |
 | G-012 | Phase 9 | Lazy Graph SDK gateway, one-thread/one-loop transport, site/default-drive resolution, and versioned read-only deployment preflight are v2-owned. | File/list parity, running-loop safety, dependency ordering, redaction, and no-write preflight contracts pass at 96% combined line/branch coverage; the real SDK is constructed in the no-skip infrastructure job. |

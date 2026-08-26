@@ -10,7 +10,7 @@ replacement and cutover gates. The authoritative machine inventory is
 
 | Surface | Python files | Owner | V2 replacement/status |
 |---|---:|---:|---|
-| `app_config/` | 9 | Phase 9/10 | v2 settings, credentials, auth, and observability exist; Graph worker/preflight and active composition remain |
+| `app_config/` | 9 | Phase 9/10 | v2 settings, credentials, auth, observability, Graph worker, and preflight exist; active legacy composition remains |
 | `chunker/` | 9 | Phase 2/10 | `sas_migrate.core.sas` exists; compatibility package retained until cutover |
 | `complexity/` | 18 | Phase 8/10 | v2 assessment replacement exists; compatibility package retained |
 | `conversion/` | 6 | Phase 9/10 | v2 conversion application/adapters exist; compatibility package and publication path retained until cutover |
@@ -18,7 +18,7 @@ replacement and cutover gates. The authoritative machine inventory is
 | `llm_client/` | 2 | Phase 9 | application port exists; gateway adapter pending |
 | `memory/` | 11 | Phase 6/9 | services moved; physical Delta/CDF and Databricks AI transition remains |
 | `pipeline/` | 9 | Phase 5/10 | translation orchestration exists; active CLI compatibility remains |
-| `prompt_builder/` | 8 | Phase 6/9 | base knowledge moved; advanced retrieval adapters remain |
+| `prompt_builder/` | 8 | Phase 6/10 | v2 ingestion and advanced retrieval replacements exist; compatibility package retained until cutover |
 | `reporting/` | 2 | Phase 10 | presenters/document adapters pending |
 | `target_language/` | 1 | Phase 3/10 | `sas_migrate.core.targets` exists; compatibility package retained |
 | `token_budget/` | 1 | Phase 4/8/10 | core tokens exist; validation reporting and cutover remain |
@@ -77,9 +77,16 @@ and credential composition; those dependencies move with G-012 and Phase 10.
 
 The Phase 9 infrastructure foundation now owns strict non-secret settings,
 credential and token ports, lazy environment/Databricks/Vault/MSAL adapters,
-and redacted logging/HTTP tracing. `app_config` remains active only for the
-concrete Graph transport, its single-loop worker/preflight behavior, and the
-legacy composition roots; G-012 tracks that narrower remainder.
+redacted logging/HTTP tracing, and the concrete Graph single-loop worker and
+read-only preflight. `app_config` remains active only for legacy composition
+roots and is removed with the Phase 10 cutover.
+
+The Phase 9 knowledge replacement now owns deterministic lexical retrieval,
+lazy BM25/FAISS hybrid ranking, reciprocal-rank fusion, reranking, and
+provider-scoped in-memory and atomic disk embedding caches. `prompt_builder`
+and its shared `memory.relevance` helper remain shipped only because the legacy
+pipeline still composes them; their removal is part of G-021, not an open
+knowledge-functionality gap.
 
 ## Removal order
 

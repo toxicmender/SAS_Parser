@@ -1,11 +1,10 @@
 # SAS migration v2: consolidated architecture and implementation plan
 
 Status: implementation in progress. Phases 0 through 8 and the Phase 9
-conversion, hydration, and infrastructure settings/auth/observability slices
-are implemented on the v2 migration branch. The concrete Graph transport,
-single-loop worker, and preflight boundary are also implemented. Advanced
-knowledge and memory adapters remain in Phase 9 before the Phase 10 operational
-cutover.
+conversion, hydration, infrastructure, SharePoint Graph, and advanced
+knowledge-retrieval slices are implemented on the v2 migration branch. Native
+Delta memory persistence and Databricks AI adapters remain in Phase 9 before
+the Phase 10 operational cutover.
 
 This is the authoritative plan for the fresh version of the application. It
 consolidates the architecture audit, the functional-parity review, the test
@@ -785,6 +784,13 @@ Deliverables:
    SharePoint worker-loop ownership and versioned read-only preflight
    diagnostics.
 6. **Implemented:** move logging/redaction and HTTP tracing to observability.
+7. **Implemented:** move BM25/FAISS knowledge ranking, reciprocal-rank fusion,
+   reranking, and provider-scoped memory/disk embedding caches behind lazy v2
+   ports and adapters.
+8. **Pending:** move physical Delta memory MERGE/CDF behavior out of
+   `memory.store`.
+9. **Pending:** move Databricks chat and embedding factories out of
+   `memory.databricks_ai`.
 
 Tests/gates:
 
@@ -793,6 +799,8 @@ Tests/gates:
 - hydration planning is pure and driver imports remain lazy;
 - adapter extras each get an install/import/contract CI job;
 - SharePoint site-resolved drive tests run with no pinned drive id.
+- advanced knowledge retrieval passes lexical, dense, fusion, reranking,
+  cache persistence/corruption, lazy-import, and application integration gates.
 
 ### Phase 10 - CLI, reporting, deployment and cutover
 
