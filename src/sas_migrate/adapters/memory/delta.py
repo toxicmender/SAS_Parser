@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 from uuid import uuid4
 
 from pydantic import BaseModel
@@ -21,6 +21,8 @@ from sas_migrate.application.memory.models import (
 from sas_migrate.application.ports import Clock
 from sas_migrate.core.ids import ItemId, RunId, ThreadId
 from sas_migrate.core.responses import ResponseEnvelope
+
+from .delta_store import DeltaKVStore
 
 
 class MemoryKVStore(Protocol):
@@ -78,15 +80,13 @@ class DeltaMemoryRepository:
     ) -> DeltaMemoryRepository:
         """Create the adapter without importing Spark on in-memory code paths."""
 
-        from memory.store import KVStore
-
-        store = KVStore(
+        store = DeltaKVStore(
             spark,
             table,
             audit_table=audit_table,
             max_write_retries=max_write_retries,
         )
-        return cls(cast(MemoryKVStore, store), clock, identifier=identifier)
+        return cls(store, clock, identifier=identifier)
 
     @staticmethod
     def _message_prefix(thread_id: str) -> str:

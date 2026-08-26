@@ -8,11 +8,14 @@ from .delta_operations import (
     VacuumPolicy,
     quoted_table_name,
 )
+from .delta_store import CDFSyncResult, DeltaKVStore
 from .in_memory import InMemoryMemoryRepository
 
 __all__ = [
     "MAX_VACUUM_HOURS",
     "MIN_VACUUM_HOURS",
+    "CDFSyncResult",
+    "DeltaKVStore",
     "DeltaMemoryMaintenance",
     "DeltaMemoryRepository",
     "InMemoryMemoryRepository",
