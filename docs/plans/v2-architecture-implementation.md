@@ -2,8 +2,10 @@
 
 Status: implementation in progress. Phases 0 through 8 and the Phase 9
 conversion, hydration, and infrastructure settings/auth/observability slices
-are implemented on the v2 migration branch. The concrete Graph worker and
-preflight adapter are the remaining Phase 9 infrastructure boundary.
+are implemented on the v2 migration branch. The concrete Graph transport,
+single-loop worker, and preflight boundary are also implemented. Advanced
+knowledge and memory adapters remain in Phase 9 before the Phase 10 operational
+cutover.
 
 This is the authoritative plan for the fresh version of the application. It
 consolidates the architecture audit, the functional-parity review, the test
@@ -779,8 +781,9 @@ Deliverables:
    driver/sink boundaries into adapters, including ranged I/O and Delta.
 4. **Implemented:** split secret-free settings from Azure/Vault/Databricks/
    SharePoint infrastructure and place credentials behind ports.
-5. **Next:** move the concrete Graph transport while preserving SharePoint
-   worker-loop ownership and preflight diagnostics.
+5. **Implemented:** move the concrete Graph transport while preserving
+   SharePoint worker-loop ownership and versioned read-only preflight
+   diagnostics.
 6. **Implemented:** move logging/redaction and HTTP tracing to observability.
 
 Tests/gates:

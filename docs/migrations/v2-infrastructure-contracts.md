@@ -11,19 +11,25 @@ This slice moves the safe half of runtime composition into final v2 owners:
   Vault KV, and ordered fallback adapters;
 - `sas_migrate.adapters.auth` owns lazy MSAL client-credential token issuance;
 - `sas_migrate.observability` owns shared message/traceback redaction and HTTP
-  transport log policy.
+  transport log policy;
+- `sas_migrate.adapters.sharepoint` owns the lazy Graph SDK gateway, a blocking
+  facade backed by one persistent event loop and worker thread, and the
+  versioned read-only deployment preflight.
 
 Credential values use Pydantic `SecretStr`, so their representation and JSON
 serialization are masked. The adapters still treat logs and diagnostic output
 as sensitive: redaction is a safety net, not permission to publish them.
 
-The main test job holds the combined settings/auth/observability implementation
+The main test job holds the combined settings/auth/observability/SharePoint implementation
 above 90% line-and-branch coverage. A separate no-skip job installs and imports
 the real `azure`, `vault`, `databricks`, and `sharepoint` extras, then reruns the
 adapter contracts. This closes G-017.
 
-G-012 remains open, but is narrower. The active application still composes the
-legacy `app_config` Graph transport, its single-event-loop worker, and the
-deployment preflight. Those pieces move together so the v2 SharePoint adapter
-does not accidentally run Kiota clients on multiple event loops. Phase 10 will
-then switch operational entry points after the concrete adapter is green.
+G-012 is closed. File, folder, and list operations now satisfy the conversion
+and XREF transport shapes directly, calls made from notebook or Databricks
+event-loop threads remain pinned to one private loop, and Graph errors are
+normalized through v2 redaction. The preflight runs configuration, optional
+dependency, token-role, site/default-drive, base-directory, and configured-list
+checks in dependency order and exposes only read operations. The compatibility
+runtime still uses `app_config` until the Phase 10 entry-point cutover; it is no
+longer the only owner of this infrastructure behavior.
