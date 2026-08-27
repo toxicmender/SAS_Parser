@@ -1,5 +1,6 @@
 """Concrete infrastructure implementations for application ports."""
 
+from .ai import DatabricksEmbeddingProvider, create_chat_model, create_embedding_model
 from .auth import MsalAccessTokenProvider
 from .conversion import (
     LocalConversionRequestRepository,
@@ -25,6 +26,7 @@ from .sharepoint import (
 
 __all__ = [
     "ChainedCredentialProvider",
+    "DatabricksEmbeddingProvider",
     "DatabricksSecretCredentialProvider",
     "DeltaMemoryRepository",
     "EnvironmentCredentialProvider",
@@ -42,4 +44,6 @@ __all__ = [
     "SharePointPreflight",
     "SharePointPreflightReport",
     "VaultCredentialProvider",
+    "create_chat_model",
+    "create_embedding_model",
 ]
