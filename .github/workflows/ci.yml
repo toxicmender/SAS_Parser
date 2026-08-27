@@ -114,6 +114,8 @@ jobs:
           tests/test_databricks_bundle.py
           tests/test_v2_architecture.py tests/test_v2_contracts.py
           tests/test_v2_deployment.py
+          tests/test_v2_databricks_ai.py
+          tests/test_v2_databricks_ai_optional.py
           tests/test_v2_delta_store.py
           tests/test_v2_conversion.py
           tests/test_v2_hydration.py tests/test_v2_hydration_optional.py
@@ -255,6 +257,13 @@ jobs:
           --cov=sas_migrate.application.knowledge
           --cov=sas_migrate.application.ports.knowledge
           --cov=sas_migrate.adapters.knowledge
+          --cov-branch --cov-report=term-missing
+          --cov-fail-under=90
+
+      - name: Phase 9 Databricks AI line and branch coverage gate
+        run: >
+          uv run pytest -q tests/test_v2_databricks_ai.py
+          --cov=sas_migrate.adapters.ai
           --cov-branch --cov-report=term-missing
           --cov-fail-under=90
 
@@ -417,4 +426,5 @@ jobs:
           uv run pytest -q
           tests/test_v2_infrastructure.py
           tests/test_v2_infrastructure_optional.py
+          tests/test_v2_databricks_ai_optional.py
           tests/test_v2_sharepoint.py
