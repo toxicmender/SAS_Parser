@@ -114,6 +114,7 @@ jobs:
           tests/test_databricks_bundle.py
           tests/test_v2_architecture.py tests/test_v2_contracts.py
           tests/test_v2_deployment.py
+          tests/test_v2_cli.py
           tests/test_v2_databricks_ai.py
           tests/test_v2_databricks_ai_optional.py
           tests/test_v2_delta_store.py
@@ -292,6 +293,14 @@ jobs:
         run: >
           uv run pytest -q tests/test_v2_sharepoint.py
           --cov=sas_migrate.adapters.sharepoint
+          --cov-branch --cov-report=term-missing
+          --cov-fail-under=90
+
+      - name: Phase 10 operational CLI line and branch coverage gate
+        run: >
+          uv run pytest -q
+          tests/test_v2_cli.py tests/test_v2_ports.py tests/test_v2_deployment.py
+          --cov=sas_migrate.cli
           --cov-branch --cov-report=term-missing
           --cov-fail-under=90
 

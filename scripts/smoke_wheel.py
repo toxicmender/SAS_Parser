@@ -14,6 +14,7 @@ import json
 import pathlib
 import subprocess
 import sys
+import tempfile
 
 REPOSITORY_ROOT = pathlib.Path(__file__).resolve().parents[1]
 REQUIRED_MODULES = (
@@ -77,6 +78,7 @@ REQUIRED_DISTRIBUTION_FILES = (
     "sas_migrate/application/deployment.py",
     "sas_migrate/cli/__init__.py",
     "sas_migrate/cli/__main__.py",
+    "sas_migrate/cli/commands.py",
     "sas_migrate/application/translation/attempts.py",
     "sas_migrate/application/translation/artifacts.py",
     "sas_migrate/application/translation/budgeting.py",
@@ -233,6 +235,83 @@ def main() -> int:
         raise RuntimeError("installed v2 deployment smoke reported a failure")
     if smoke_report.get("sqlglot_dialect") != "databricks":
         raise RuntimeError("installed v2 deployment smoke used the wrong SQL dialect")
+
+    with tempfile.TemporaryDirectory(prefix="sas-migrate-cli-") as directory:
+        root = pathlib.Path(directory)
+        assessment_input = root / "assessment.json"
+        assessment_input.write_text(
+            json.dumps(
+                [
+                    {
+                        "source_id": "wheel.sas",
+                        "line_count": 4,
+                        "chunk_count": 1,
+                        "step_count": 1,
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        assessment = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sas_migrate.cli",
+                "assess",
+                str(assessment_input),
+                "--target",
+                "pyspark",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if assessment.returncode != 0:
+            raise RuntimeError(
+                "installed assessment CLI failed: "
+                f"stdout={assessment.stdout!r}, stderr={assessment.stderr!r}"
+            )
+        if json.loads(assessment.stdout).get("target") != "pyspark":
+            raise RuntimeError("installed assessment CLI resolved the wrong target")
+
+        validation_input = root / "validation.json"
+        validation_input.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "run_id": "wheel-validation",
+                    "target": "spark_sql",
+                    "units": [
+                        {
+                            "unit_id": "unit-1",
+                            "response": "```sql\nSELECT 1\n```",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        validation = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sas_migrate.cli",
+                "validate",
+                str(validation_input),
+                "--model",
+                "wheel-smoke",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if validation.returncode != 0:
+            raise RuntimeError(
+                "installed validation CLI failed: "
+                f"stdout={validation.stdout!r}, stderr={validation.stderr!r}"
+            )
+        if json.loads(validation.stdout).get("model") != "wheel-smoke":
+            raise RuntimeError("installed validation CLI lost the model label")
 
     print(
         f"installed-wheel smoke passed for sas-parser {distribution.version} "
