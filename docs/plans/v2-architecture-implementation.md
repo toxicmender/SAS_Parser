@@ -3,7 +3,9 @@
 Status: implementation in progress. Phases 0 through 9 are implemented on the
 v2 migration branch, including conversion, hydration, infrastructure,
 SharePoint Graph, advanced knowledge retrieval, native Delta memory, and lazy
-Databricks AI adapters. Phase 10 is the remaining operational cutover.
+Databricks AI adapters. Phase 10 is underway: offline assessment and validation
+now run through the installed v2 CLI; the remaining operational cutover is
+tracked in G-013 through G-021.
 
 This is the authoritative plan for the fresh version of the application. It
 consolidates the architecture audit, the functional-parity review, the test
@@ -814,8 +816,8 @@ Deliverables:
 1. Implement subcommands:
    - `sas-migrate convert local`;
    - `sas-migrate convert sharepoint`;
-   - `sas-migrate assess`;
-   - `sas-migrate validate`;
+   - `sas-migrate assess` (implemented for JSON/Markdown/PDF output);
+   - `sas-migrate validate` (implemented with separate translation/judge budgets);
    - `sas-migrate hydrate`;
    - `sas-migrate check sharepoint`;
    - `sas-migrate memory status|optimize|vacuum`.
@@ -833,6 +835,13 @@ Tests/gates:
 - Docker app and Spark/Delta smoke tests pass;
 - repository contains no stale application-target claim for Spark Scala;
 - old packages are absent from the wheel.
+
+Implemented Phase 10 CLI evidence: `assess` accepts an array of strict
+`AssessmentUnit` values and resolves only `pyspark` or `spark_sql`; `validate`
+accepts `EvaluationRun` plus optional `TokenCallLedger` and
+`TokenBudgetPolicy` files. Both execute from the clean-wheel smoke and their
+composition modules pass a 90% combined line/branch CI gate. G-013 remains open
+for the other commands and removal of the `sas-parser` entry point.
 
 ## 8. Test and CI design
 

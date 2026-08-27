@@ -24,7 +24,7 @@ replacement and cutover gates. The authoritative machine inventory is
 | `token_budget/` | 1 | Phase 4/8/10 | core tokens exist; validation reporting and cutover remain |
 | `validation/` | 17 | Phase 8/10 | v2 validation replacement exists; compatibility package retained |
 | `xref/` | 6 | Phase 7/10 | v2 replacement exists; compatibility package retained until cutover |
-| `main.py` | 1 module | Phase 10 | active `sas-parser` entry point; replaced by operational `sas-migrate` commands |
+| `main.py` | 1 module | Phase 10 | active `sas-parser` conversion entry point; v2 `assess` and `validate` are operational, remaining commands pending |
 
 Total: 14 packages, 119 package Python files, 167 tracked package files
 (including instruction/profile resources), and one top-level entry module.
@@ -92,6 +92,13 @@ lazy Databricks chat/embedding construction, with no import back to
 `memory.store` or `memory.databricks_ai`. The top-level `memory/` package
 remains shipped only because the active legacy pipeline still composes its
 history services; its removal is part of the Phase 10 cutover.
+
+Phase 10 now routes offline assessment and validation through
+`sas-migrate assess` and `sas-migrate validate`. Their JSON, Markdown, and PDF
+outputs use only v2 application presenters/adapters and run from an installed
+wheel. This does not remove `main.py`: conversion, hydration, SharePoint
+preflight, memory maintenance, and the default Lakeflow workflow still require
+their Phase 10 composition slices.
 
 ## Removal order
 
