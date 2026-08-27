@@ -419,7 +419,8 @@ jobs:
       - name: Install every infrastructure adapter extra
         run: >
           uv sync --locked --extra dev
-          --extra azure --extra vault --extra databricks --extra sharepoint
+          --extra azure --extra vault --extra databricks --extra databricks-ai
+          --extra sharepoint
 
       - name: Require every optional SDK and adapter contract
         run: >
