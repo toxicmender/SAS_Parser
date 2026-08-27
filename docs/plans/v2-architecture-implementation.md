@@ -1,10 +1,9 @@
 # SAS migration v2: consolidated architecture and implementation plan
 
-Status: implementation in progress. Phases 0 through 8 and the Phase 9
-conversion, hydration, infrastructure, SharePoint Graph, and advanced
-knowledge-retrieval and native Delta-memory slices are implemented on the v2
-migration branch. Databricks AI adapters remain in Phase 9 before the Phase 10
-operational cutover.
+Status: implementation in progress. Phases 0 through 9 are implemented on the
+v2 migration branch, including conversion, hydration, infrastructure,
+SharePoint Graph, advanced knowledge retrieval, native Delta memory, and lazy
+Databricks AI adapters. Phase 10 is the remaining operational cutover.
 
 This is the authoritative plan for the fresh version of the application. It
 consolidates the architecture audit, the functional-parity review, the test
@@ -790,8 +789,9 @@ Deliverables:
 8. **Implemented:** move physical Delta memory schema upgrades, MERGE/delete,
    conflict retry, CDF, durable checkpoint, audit, and diagnostics behavior
    out of `memory.store` and remove the final v2-to-legacy import.
-9. **Pending:** move Databricks chat and embedding factories out of
-   `memory.databricks_ai`.
+9. **Implemented:** move lazy Databricks chat and embedding factories out of
+   `memory.databricks_ai`, adapt provider vectors to immutable v2 contracts,
+   and gate the real optional package without credentials or network access.
 
 Tests/gates:
 
@@ -804,6 +804,8 @@ Tests/gates:
   cache persistence/corruption, lazy-import, and application integration gates.
 - native Delta memory passes real Spark/Delta data, schema-upgrade, CDF and
   checkpoint contracts plus offline failure paths at 90% combined coverage.
+- Databricks AI factories and embedding-port conversion pass focused tests at
+  100% combined coverage and a real installed-package no-skip import contract.
 
 ### Phase 10 - CLI, reporting, deployment and cutover
 

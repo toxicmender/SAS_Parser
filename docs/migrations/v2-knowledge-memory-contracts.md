@@ -21,6 +21,15 @@ the disk adapter writes atomically and treats unreadable cache files as misses.
 The original deterministic lexical selector remains the default when no
 advanced ranker is injected.
 
+Phase 9 also moves the optional Databricks Model Serving boundary into
+`sas_migrate.adapters.ai`. Chat and embedding factories preserve endpoint,
+workspace-client, generation, retry, timeout, target-URI, and instruction
+parameters while importing `databricks_langchain` only on explicit selection.
+`DatabricksEmbeddingProvider` converts the SDK's mutable list vectors into the
+immutable tuple contract consumed by v2 ranking. Focused tests enforce 100%
+combined line/branch coverage, and the infrastructure matrix imports the real
+locked optional package without credentials or network access.
+
 Conversation memory now has explicit services for accepted history, relevant
 turn selection, rolling summaries, task policy, thread notes, context assembly,
 and memory extraction. Temporary extracted memories become TTL notes. Permanent

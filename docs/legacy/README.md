@@ -16,7 +16,7 @@ replacement and cutover gates. The authoritative machine inventory is
 | `conversion/` | 6 | Phase 9/10 | v2 conversion application/adapters exist; compatibility package and publication path retained until cutover |
 | `data_hydration/` | 20 | Phase 9/10 | v2 application/adapters exist; compatibility CLI/config composition retained |
 | `llm_client/` | 2 | Phase 9 | application port exists; gateway adapter pending |
-| `memory/` | 11 | Phase 6/9/10 | services and physical Delta/CDF moved; Databricks AI and active legacy composition remain |
+| `memory/` | 11 | Phase 6/9/10 | services, physical Delta/CDF, and Databricks AI adapters moved; active legacy composition remains until cutover |
 | `pipeline/` | 9 | Phase 5/10 | translation orchestration exists; active CLI compatibility remains |
 | `prompt_builder/` | 8 | Phase 6/10 | v2 ingestion and advanced retrieval replacements exist; compatibility package retained until cutover |
 | `reporting/` | 2 | Phase 10 | presenters/document adapters pending |
@@ -87,11 +87,11 @@ and its shared `memory.relevance` helper remain shipped only because the legacy
 pipeline still composes them; their removal is part of G-021, not an open
 knowledge-functionality gap.
 
-The Phase 9 memory persistence replacement now owns the physical Delta table
-contract and has no import back to `memory.store`. The top-level `memory/`
-package remains shipped because the active legacy pipeline still composes its
-history services and because Databricks AI factories remain G-005; physical
-Delta persistence is no longer a transition dependency.
+The Phase 9 memory replacement now owns the physical Delta table contract and
+lazy Databricks chat/embedding construction, with no import back to
+`memory.store` or `memory.databricks_ai`. The top-level `memory/` package
+remains shipped only because the active legacy pipeline still composes its
+history services; its removal is part of the Phase 10 cutover.
 
 ## Removal order
 

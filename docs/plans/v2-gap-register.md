@@ -19,12 +19,13 @@ define separate gap lists.
 
 | ID | Owner | Gap | Exit gate |
 |---|---:|---|---|
-| G-005 | Phase 9 | Databricks chat and embedding factories remain in `memory.databricks_ai`. | Lazy v2 Databricks AI adapter jobs pass. |
+No Phase 9 knowledge or memory replacement gaps remain open.
 
 ## Closed Phase 9 replacements
 
 | ID | Owner | Replacement | Evidence |
 |---|---:|---|---|
+| G-005 | Phase 9 | Lazy v2 Databricks chat/embedding factories and an immutable `EmbeddingProvider` adapter. | Settings/omission, missing-extra, vector-conversion, lazy-import, and real installed-package contracts pass at 100% combined line/branch coverage. |
 | G-004 | Phase 9 | Native v2 Delta KV persistence owns schema upgrade, MERGE/delete, write retry, CDF, checkpoint, audit, and diagnostics behavior. | Real PySpark/Delta reopen, update-preservation, literal-key deletion, schema-upgrade, CDF-tail, and idempotent-checkpoint contracts combine with offline failure paths at a 90% CI threshold; the v2 legacy-import allowlist is empty. |
 | G-003 | Phase 9 | V2 ports and lazy adapters own BM25, FAISS dense retrieval, provider-scoped embedding caches, reciprocal-rank fusion, and reranking. | Lexical/dense/fusion/reranker, corruption, dimension, namespace isolation, lazy-import, and application-integration contracts pass at 95% combined line/branch coverage. |
 | G-010 | Phase 9 | Local and SharePoint conversion requests, target/model selection, lifecycle state, source adapters, and per-row isolation are v2-owned. | Fake local and SharePoint end-to-end contracts pass at 98% combined line/branch coverage. |
