@@ -3,6 +3,14 @@
 from __future__ import annotations
 
 import importlib
+import os
+
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("REQUIRE_INFRASTRUCTURE_TESTS") != "1",
+    reason="requires the dedicated infrastructure-adapter environment",
+)
 
 
 def test_databricks_ai_dependency_is_installed_and_exports_required_models() -> None:
