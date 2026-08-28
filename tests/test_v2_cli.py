@@ -67,6 +67,18 @@ def test_parser_exposes_operational_commands_and_only_supported_targets() -> Non
         parser.parse_args(["assess", "units.json", "--target", "spark-scala"])
     assert unsupported.value.code == 2
 
+    local = parser.parse_args(
+        ["convert", "local", "source", "--target", "spark_sql", "--dry-run"]
+    )
+    assert local.command == "convert"
+    assert local.convert_command == "local"
+    assert local.target == "spark_sql"
+    with pytest.raises(SystemExit) as scala:
+        parser.parse_args(
+            ["convert", "local", "source", "--target", "spark-scala"]
+        )
+    assert scala.value.code == 2
+
 
 def test_assess_emits_json_and_markdown_from_packaged_profiles(
     tmp_path: Path,
@@ -256,3 +268,145 @@ def test_smoke_human_and_quiet_presentations(capsys: pytest.CaptureFixture[str])
 
     assert main(["smoke", "--quiet"]) == 0
     assert capsys.readouterr().out == ""
+
+
+def test_convert_local_dry_run_needs_no_credential_and_records_dialect(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "program.sas").write_text("proc sql; select 1; quit;", encoding="utf-8")
+    output = tmp_path / "artifacts"
+
+    assert (
+        main(
+            [
+                "convert",
+                "local",
+                str(source),
+                "--output-dir",
+                str(output),
+                "--target",
+                "spark_sql",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+    result = json.loads(capsys.readouterr().out)
+    assert result["outcomes"][0]["status"] == "Completed"
+    plan_path = Path(result["outcomes"][0]["artifacts"][0]["location"])
+    plan = json.loads(plan_path.read_text("utf-8"))
+    assert plan["sqlglot_dialect"] == "databricks"
+    assert plan["token_policy"]["max_input_tokens"] == 128_000
+
+
+def test_convert_local_live_uses_gateway_port_and_validates_output(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sas_migrate.adapters.ai as ai_adapters
+    from sas_migrate.application.ports import ProviderResponse, ProviderTokenUsage
+    from sas_migrate.core.responses import (
+        TranslationCell,
+        TranslationCellKind,
+        TranslationDocument,
+    )
+
+    class _Gateway:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def invoke(self, _prompt, target, *, attempt: int) -> ProviderResponse:
+            del attempt
+            document = TranslationDocument(
+                target=target.target,
+                analysis="Preserve semantics.",
+                cells=(
+                    TranslationCell(
+                        kind=TranslationCellKind.CODE,
+                        source="SELECT 1",
+                        language="sql",
+                    ),
+                ),
+            )
+            return ProviderResponse(
+                raw_message=document.model_dump_json(),
+                structured_document=document,
+                usage=ProviderTokenUsage(input_tokens=100, output_tokens=20),
+            )
+
+    monkeypatch.setattr(ai_adapters, "OpenAICompatibleLLM", _Gateway)
+    monkeypatch.setenv("TEST_GATEWAY_TOKEN", "secret")
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "program.sas").write_text("proc sql; select 1; quit;", encoding="utf-8")
+    output = tmp_path / "artifacts"
+
+    assert (
+        main(
+            [
+                "convert",
+                "local",
+                str(source),
+                "--output-dir",
+                str(output),
+                "--api-key-env",
+                "TEST_GATEWAY_TOKEN",
+                "--gateway-base-url",
+                "https://gateway.example/v1",
+            ]
+        )
+        == 0
+    )
+    result = json.loads(capsys.readouterr().out)
+    artifacts = result["outcomes"][0]["artifacts"]
+    assert any(artifact["kind"] == "notebook" for artifact in artifacts)
+    assert any(artifact["kind"] == "conversion_run_summary" for artifact in artifacts)
+
+
+def test_convert_local_reports_operator_configuration_errors(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    missing = tmp_path / "missing"
+    assert main(["convert", "local", str(missing), "--dry-run"]) == 2
+    assert "source directory does not exist" in capsys.readouterr().err
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "program.sas").write_text("data out; run;", encoding="utf-8")
+    monkeypatch.delenv("MISSING_GATEWAY_TOKEN", raising=False)
+    assert (
+        main(
+            [
+                "convert",
+                "local",
+                str(source),
+                "--api-key-env",
+                "MISSING_GATEWAY_TOKEN",
+            ]
+        )
+        == 2
+    )
+    assert "gateway credential is not set" in capsys.readouterr().err
+
+    assert (
+        main(
+            [
+                "convert",
+                "local",
+                str(source),
+                "--dry-run",
+                "--max-input-tokens",
+                "100",
+                "--reserved-output-tokens",
+                "100",
+            ]
+        )
+        == 2
+    )
+    assert "invalid local conversion settings" in capsys.readouterr().err

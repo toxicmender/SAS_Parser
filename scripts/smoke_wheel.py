@@ -31,6 +31,7 @@ REQUIRED_MODULES = (
     "sas_migrate.application.validation",
     "sas_migrate.application.xref",
     "sas_migrate.adapters.memory",
+    "sas_migrate.adapters.ai",
     "sas_migrate.adapters.conversion",
     "sas_migrate.adapters.hydration",
     "sas_migrate.adapters.knowledge",
@@ -68,6 +69,9 @@ REQUIRED_DISTRIBUTION_FILES = (
     "sas_migrate/application/ports/conversion.py",
     "sas_migrate/adapters/conversion/local.py",
     "sas_migrate/adapters/conversion/sharepoint.py",
+    "sas_migrate/adapters/conversion/runtime.py",
+    "sas_migrate/adapters/conversion/translation.py",
+    "sas_migrate/adapters/ai/openai_compatible.py",
     "sas_migrate/application/hydration/models.py",
     "sas_migrate/application/hydration/planner.py",
     "sas_migrate/application/hydration/service.py",
@@ -312,6 +316,44 @@ def main() -> int:
             )
         if json.loads(validation.stdout).get("model") != "wheel-smoke":
             raise RuntimeError("installed validation CLI lost the model label")
+
+        conversion_source = root / "conversion-source"
+        conversion_source.mkdir()
+        (conversion_source / "wheel.sas").write_text(
+            "proc sql; select 1; quit;",
+            encoding="utf-8",
+        )
+        conversion_output = root / "conversion-output"
+        conversion = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sas_migrate.cli",
+                "convert",
+                "local",
+                str(conversion_source),
+                "--output-dir",
+                str(conversion_output),
+                "--target",
+                "spark_sql",
+                "--dry-run",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if conversion.returncode != 0:
+            raise RuntimeError(
+                "installed local conversion CLI failed: "
+                f"stdout={conversion.stdout!r}, stderr={conversion.stderr!r}"
+            )
+        conversion_result = json.loads(conversion.stdout)
+        conversion_plan = pathlib.Path(
+            conversion_result["outcomes"][0]["artifacts"][0]["location"]
+        )
+        plan = json.loads(conversion_plan.read_text("utf-8"))
+        if plan.get("sqlglot_dialect") != "databricks":
+            raise RuntimeError("installed local conversion used the wrong SQL dialect")
 
     print(
         f"installed-wheel smoke passed for sas-parser {distribution.version} "

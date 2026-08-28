@@ -52,6 +52,7 @@ def test_settings_are_versioned_immutable_and_secret_free() -> None:
 
     assert settings.schema_version == 2
     assert settings.azure.authority_host == "https://login.microsoftonline.com"
+    assert settings.gateway.api_key_env == "SAS_MIGRATE_GATEWAY_API_KEY"
     assert settings.sharepoint.scopes == ("https://graph.microsoft.com/.default",)
     payload = settings.model_dump_json()
     assert '"client_secret":' not in payload
@@ -65,6 +66,10 @@ def test_environment_overrides_document_and_inherits_safe_shared_settings() -> N
         document={
             "azure": {"timeout": 5, "verify": True},
             "vault": {"verify": False},
+            "gateway": {
+                "base_url": "https://gateway.document/v1",
+                "gateway_version": "document",
+            },
             "databricks": {"secret_scope": "shared-scope", "schema": "bronze"},
             "sharepoint": {
                 "site_hostname": "contoso.sharepoint.com",
@@ -78,12 +83,18 @@ def test_environment_overrides_document_and_inherits_safe_shared_settings() -> N
             "AZURE_SCOPES": "scope-a, scope-b",
             "SHAREPOINT_DRIVE_ID": "drive-1",
             "SAS_MIGRATE_TRACE_HTTP": "yes",
+            "SAS_MIGRATE_GATEWAY_BASE_URL": "https://gateway.environment/v1",
+            "SAS_MIGRATE_GATEWAY_VERSION": "environment",
+            "SAS_MIGRATE_GATEWAY_MAX_RETRIES": "4",
         },
     )
 
     assert settings.azure.timeout == 12.5
     assert settings.azure.scopes == ("scope-a", "scope-b")
     assert settings.azure.verify is True
+    assert settings.gateway.base_url == "https://gateway.environment/v1"
+    assert settings.gateway.gateway_version == "environment"
+    assert settings.gateway.max_retries == 4
     assert settings.databricks.schema_name == "bronze"
     assert settings.sharepoint.site_path == "/sites/Engineering"
     assert settings.sharepoint.file_server_base_path == "Apps"
@@ -113,6 +124,7 @@ def test_vault_tls_environment_precedence_and_azure_inheritance() -> None:
     ("document", "message"),
     [
         ({"azure": {"client_secret": "forbidden"}}, "credential"),
+        ({"gateway": {"api_key": "forbidden"}}, "credential"),
         ({"vault": []}, "must be a JSON object"),
         ({"azure": {"unknown": "value"}}, "extra_forbidden"),
     ],

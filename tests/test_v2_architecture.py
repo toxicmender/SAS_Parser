@@ -35,7 +35,7 @@ def test_v2_architecture_graph_is_acyclic_and_obeys_boundaries() -> None:
     assert graph["application"] == ["core"]
 
 
-def test_v2_cli_exposes_smoke_but_not_unmigrated_commands() -> None:
+def test_v2_cli_exposes_smoke_and_local_conversion() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "sas_migrate.cli", "--help"],
         cwd=SRC,
@@ -45,4 +45,13 @@ def test_v2_cli_exposes_smoke_but_not_unmigrated_commands() -> None:
     )
     assert result.returncode == 0, result.stderr
     assert "smoke" in result.stdout
-    assert "convert" not in result.stdout
+    assert "convert" in result.stdout
+    local = subprocess.run(
+        [sys.executable, "-m", "sas_migrate.cli", "convert", "local", "--help"],
+        cwd=SRC,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert local.returncode == 0, local.stderr
+    assert "--target {pyspark,spark_sql}" in local.stdout
