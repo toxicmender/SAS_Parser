@@ -71,6 +71,23 @@ class VaultSettings(ContractModel):
     )(_clean)
 
 
+class GatewaySettings(ContractModel):
+    """Secret-free OpenAI-compatible gateway transport settings."""
+
+    base_url: str | None = None
+    api_key_env: str = "SAS_MIGRATE_GATEWAY_API_KEY"
+    gateway_version: str | None = None
+    timeout: float = Field(default=120.0, gt=0)
+    max_retries: int = Field(default=2, ge=0)
+
+    _strip_strings = field_validator(
+        "base_url",
+        "api_key_env",
+        "gateway_version",
+        mode="before",
+    )(_clean)
+
+
 class DatabricksSettings(ContractModel):
     model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
 
@@ -187,6 +204,7 @@ class ObservabilitySettings(ContractModel):
 class InfrastructureSettings(VersionedContract):
     azure: AzureSettings = Field(default_factory=AzureSettings)
     vault: VaultSettings = Field(default_factory=VaultSettings)
+    gateway: GatewaySettings = Field(default_factory=GatewaySettings)
     databricks: DatabricksSettings = Field(default_factory=DatabricksSettings)
     sharepoint: SharePointSettings = Field(default_factory=SharePointSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
@@ -198,6 +216,7 @@ __all__ = [
     "GRAPH_DEFAULT_SCOPE",
     "AzureSettings",
     "DatabricksSettings",
+    "GatewaySettings",
     "InfrastructureSettings",
     "ObservabilitySettings",
     "SharePointSettings",

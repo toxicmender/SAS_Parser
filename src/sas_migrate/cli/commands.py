@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import os
 import sys
 from enum import StrEnum
 from pathlib import Path
@@ -35,6 +37,7 @@ from sas_migrate.application.validation import (
     render_markdown as render_validation_markdown,
 )
 from sas_migrate.core.targets import TargetId
+from sas_migrate.core.tokens import TokenBudgetPolicy as TranslationTokenBudgetPolicy
 from sas_migrate.core.tokens import TokenCallLedger
 
 
@@ -146,9 +149,83 @@ def run_validate(args: argparse.Namespace) -> int:
     return 0 if report.passed else 1
 
 
+def run_convert_local(args: argparse.Namespace) -> int:
+    from sas_migrate.adapters.ai import OpenAICompatibleLLM
+    from sas_migrate.adapters.conversion import (
+        LocalConversionRequestRepository,
+        LocalConversionSourceRepository,
+        LocalConversionTranslator,
+    )
+    from sas_migrate.adapters.credentials import EnvironmentCredentialProvider
+    from sas_migrate.application.conversion import ConversionRequest, ConversionWorkflow
+    from sas_migrate.config import GatewaySettings
+
+    if not args.source_dir.is_dir():
+        raise CommandError(f"source directory does not exist: {args.source_dir}")
+    try:
+        policy = TranslationTokenBudgetPolicy(
+            max_input_tokens=args.max_input_tokens,
+            reserved_output_tokens=args.reserved_output_tokens,
+            safety_margin_tokens=args.safety_margin_tokens,
+            max_run_tokens=args.max_run_tokens,
+        )
+        settings = GatewaySettings(
+            base_url=args.gateway_base_url
+            or os.environ.get("SAS_MIGRATE_GATEWAY_BASE_URL"),
+            api_key_env=args.api_key_env,
+            gateway_version=args.gateway_version,
+        )
+    except ValueError as exc:
+        raise CommandError(f"invalid local conversion settings: {exc}") from exc
+
+    async def execute() -> int:
+        credential = None
+        if not args.dry_run:
+            credentials = EnvironmentCredentialProvider(
+                {"gateway": settings.api_key_env}
+            )
+            credential = await credentials.get("gateway")
+            if credential is None:
+                raise CommandError(
+                    f"gateway credential is not set in {settings.api_key_env}"
+                )
+
+        def llm_factory(model: str) -> OpenAICompatibleLLM:
+            if credential is None:
+                raise RuntimeError("dry-run unexpectedly requested an LLM client")
+            return OpenAICompatibleLLM(
+                settings=settings,
+                credential=credential,
+                model=model,
+            )
+
+        request = ConversionRequest(
+            request_id=args.request_id,
+            application_name=args.application_name or args.source_dir.name,
+            output_language=args.target,
+            status="New",
+        )
+        outcome = await ConversionWorkflow(
+            requests=LocalConversionRequestRepository(request),
+            sources=LocalConversionSourceRepository(args.source_dir),
+            translator=LocalConversionTranslator(
+                output_dir=args.output_dir,
+                llm_factory=llm_factory,
+                policy=policy,
+                max_attempts=args.max_attempts,
+            ),
+            default_model=args.model,
+        ).run(dry_run=args.dry_run)
+        print(outcome.model_dump_json(indent=2))
+        return outcome.exit_code
+
+    return asyncio.run(execute())
+
+
 __all__ = [
     "CommandError",
     "ReportFormat",
     "run_assess",
+    "run_convert_local",
     "run_validate",
 ]

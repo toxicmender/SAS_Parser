@@ -11,7 +11,13 @@ from sas_migrate import __version__
 from sas_migrate.application.deployment import run_deployment_smoke
 from sas_migrate.core.targets import TargetId
 
-from .commands import CommandError, ReportFormat, run_assess, run_validate
+from .commands import (
+    CommandError,
+    ReportFormat,
+    run_assess,
+    run_convert_local,
+    run_validate,
+)
 
 
 def _report_arguments(parser: argparse.ArgumentParser) -> None:
@@ -44,6 +50,46 @@ def build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="emit the versioned machine-readable smoke report",
+    )
+
+    convert = commands.add_parser("convert", help="run a v2 conversion workflow")
+    convert_commands = convert.add_subparsers(dest="convert_command", metavar="SOURCE")
+    convert_local = convert_commands.add_parser(
+        "local",
+        help="translate SAS files from a local directory",
+    )
+    convert_local.add_argument("source_dir", type=Path)
+    convert_local.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("sas-migrate-output"),
+        help="artifact directory (default: sas-migrate-output)",
+    )
+    convert_local.add_argument(
+        "--target",
+        choices=tuple(target.value for target in TargetId),
+        default=TargetId.SPARK_SQL.value,
+        help="migration target (default: spark_sql)",
+    )
+    convert_local.add_argument("--model", default="gpt-5.4")
+    convert_local.add_argument("--application-name")
+    convert_local.add_argument("--request-id", default="local")
+    convert_local.add_argument("--gateway-base-url")
+    convert_local.add_argument(
+        "--api-key-env",
+        default="SAS_MIGRATE_GATEWAY_API_KEY",
+        help="environment variable containing the gateway credential",
+    )
+    convert_local.add_argument("--gateway-version")
+    convert_local.add_argument("--max-input-tokens", type=int, default=128_000)
+    convert_local.add_argument("--reserved-output-tokens", type=int, default=16_000)
+    convert_local.add_argument("--safety-margin-tokens", type=int, default=2_000)
+    convert_local.add_argument("--max-run-tokens", type=int)
+    convert_local.add_argument("--max-attempts", type=int, default=2)
+    convert_local.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="parse inputs and write a plan without invoking the gateway",
     )
     smoke.add_argument(
         "--quiet",
@@ -120,6 +166,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return run_assess(args)
         if args.command == "validate":
             return run_validate(args)
+        if args.command == "convert" and args.convert_command == "local":
+            return run_convert_local(args)
     except CommandError as exc:
         parser.print_usage(sys.stderr)
         print(f"sas-migrate: error: {exc}", file=sys.stderr)

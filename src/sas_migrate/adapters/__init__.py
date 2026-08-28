@@ -1,10 +1,17 @@
 """Concrete infrastructure implementations for application ports."""
 
-from .ai import DatabricksEmbeddingProvider, create_chat_model, create_embedding_model
+from .ai import (
+    DatabricksEmbeddingProvider,
+    GatewayLLMError,
+    OpenAICompatibleLLM,
+    create_chat_model,
+    create_embedding_model,
+)
 from .auth import MsalAccessTokenProvider
 from .conversion import (
     LocalConversionRequestRepository,
     LocalConversionSourceRepository,
+    LocalConversionTranslator,
     SharePointConversionConfig,
     SharePointConversionRequestRepository,
     SharePointConversionSourceRepository,
@@ -30,12 +37,15 @@ __all__ = [
     "DatabricksSecretCredentialProvider",
     "DeltaMemoryRepository",
     "EnvironmentCredentialProvider",
+    "GatewayLLMError",
     "GraphSdkGateway",
     "InMemoryKnowledgeRepository",
     "InMemoryMemoryRepository",
     "LocalConversionRequestRepository",
     "LocalConversionSourceRepository",
+    "LocalConversionTranslator",
     "MsalAccessTokenProvider",
+    "OpenAICompatibleLLM",
     "PyMuPdfInstructionReader",
     "SharePointConversionConfig",
     "SharePointConversionRequestRepository",

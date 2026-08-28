@@ -13,7 +13,14 @@ from pydantic import ValidationError
 from .models import InfrastructureSettings
 
 CONFIG_PATH_ENV = "SAS_PARSER_CONFIG"
-_SECTIONS = ("azure", "vault", "databricks", "sharepoint", "observability")
+_SECTIONS = (
+    "azure",
+    "vault",
+    "gateway",
+    "databricks",
+    "sharepoint",
+    "observability",
+)
 _FORBIDDEN_FILE_FIELDS = {
     ("azure", "client_secret"),
     ("databricks", "token"),
@@ -21,6 +28,7 @@ _FORBIDDEN_FILE_FIELDS = {
     ("vault", "token"),
     ("vault", "role_id"),
     ("vault", "secret_id"),
+    ("gateway", "api_key"),
     ("sharepoint", "client_secret"),
 }
 
@@ -93,6 +101,13 @@ _ENV: dict[str, dict[str, EnvSpec]] = {
         "azure_scopes": ("VAULT_AZURE_SCOPES", _scopes),
         "ai_gateway_path": ("VAULT_AI_GATEWAY_PATH", _text),
         "ai_gateway_key": ("VAULT_AI_GATEWAY_KEY", _text),
+    },
+    "gateway": {
+        "base_url": ("SAS_MIGRATE_GATEWAY_BASE_URL", _text),
+        "api_key_env": ("SAS_MIGRATE_GATEWAY_API_KEY_ENV", _text),
+        "gateway_version": ("SAS_MIGRATE_GATEWAY_VERSION", _text),
+        "timeout": ("SAS_MIGRATE_GATEWAY_TIMEOUT", _number),
+        "max_retries": ("SAS_MIGRATE_GATEWAY_MAX_RETRIES", _integer),
     },
     "databricks": {
         "host": ("DATABRICKS_HOST", _text),

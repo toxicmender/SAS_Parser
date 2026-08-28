@@ -4,6 +4,7 @@ from .loader import ConfigurationError, load_settings, load_settings_file
 from .models import (
     AzureSettings,
     DatabricksSettings,
+    GatewaySettings,
     InfrastructureSettings,
     ObservabilitySettings,
     SharePointSettings,
@@ -14,6 +15,7 @@ __all__ = [
     "AzureSettings",
     "ConfigurationError",
     "DatabricksSettings",
+    "GatewaySettings",
     "InfrastructureSettings",
     "ObservabilitySettings",
     "SharePointSettings",
