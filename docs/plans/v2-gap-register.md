@@ -38,7 +38,7 @@ No Phase 9 knowledge or memory replacement gaps remain open.
 | ID | Owner | Gap | Exit gate |
 |---|---:|---|---|
 | G-013 | Phase 10 | `sas-migrate assess` and `sas-migrate validate` are operational from the wheel; conversion, hydration, SharePoint preflight, memory maintenance, and the active default workflow remain on `sas-parser`/`main.py`. | All v2 subcommands run from the wheel and `sas-parser` is removed. |
-| G-014 | Phase 10 | Report presenters and SharePoint publication remain legacy-only. | V2 visual/golden and publication contracts pass. |
+| G-014 | Phase 10 | V2 feature presenters exist, but SharePoint publication and final visual/golden cutover remain. | V2 visual/golden and publication contracts pass. |
 | G-015 | Phase 10 | A wheel-only non-root v2 image is gated, but Compose, warmup, and operator commands still compose legacy entry points. | Compose and operator commands cut over to the verified v2 image. |
 | G-016 | Phase 10 | Top-level README and Architecture primarily describe the active legacy runtime. | V2 overview, config, API, operator, and cutover guides replace them. |
 | G-018 | Phase 10 | Containerized PySpark/Delta and wheel-only v2 deployment smoke jobs are present; scheduled real-model quality evaluation remains absent. | Budgeted scheduled real-model evaluation passes. |
@@ -58,13 +58,14 @@ job. It builds `docker/v2.Dockerfile`, then runs the installed `sas-migrate
 smoke` command as a non-root user with a read-only filesystem. G-018 remains
 open only for its scheduled real-model quality gate.
 
-Phase 10 CLI cutover has started with the two fully offline report workflows.
-`assess` consumes the existing `AssessmentUnit` array contract and uses the
-packaged PySpark or Spark SQL profile. `validate` consumes `EvaluationRun` and
-optional translation/judge ledgers and policies, preserving separate token
-budget reports. Both commands emit JSON, Markdown, or PDF and execute from a
-clean installed wheel. G-013 remains open until the remaining operational
-commands replace `sas-parser`.
+Phase 10 CLI cutover now includes local conversion and the two fully offline
+report workflows. `convert local` composes the v2 SAS core, budgeted translation
+service, OpenAI-compatible gateway port, mandatory target acceptance, and local
+artifacts; its credential-free dry-run is exercised from the clean wheel.
+`assess` consumes `AssessmentUnit` values and `validate` consumes
+`EvaluationRun` plus separate translation/judge ledgers and policies. G-013
+remains open until SharePoint conversion, hydration, preflight, memory
+maintenance, and the default workflow replace `sas-parser`.
 
 The workspace deployment is also executable through the root Databricks
 bundle. It deploys a two-task Lakeflow Job onto an explicitly supplied existing

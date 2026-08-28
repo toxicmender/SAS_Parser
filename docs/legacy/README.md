@@ -15,16 +15,16 @@ replacement and cutover gates. The authoritative machine inventory is
 | `complexity/` | 18 | Phase 8/10 | v2 assessment replacement exists; compatibility package retained |
 | `conversion/` | 6 | Phase 9/10 | v2 conversion application/adapters exist; compatibility package and publication path retained until cutover |
 | `data_hydration/` | 20 | Phase 9/10 | v2 application/adapters exist; compatibility CLI/config composition retained |
-| `llm_client/` | 2 | Phase 9 | application port exists; gateway adapter pending |
+| `llm_client/` | 2 | Phase 10 | v2 OpenAI-compatible gateway adapter exists; legacy client retained for `main.py` |
 | `memory/` | 11 | Phase 6/9/10 | services, physical Delta/CDF, and Databricks AI adapters moved; active legacy composition remains until cutover |
 | `pipeline/` | 9 | Phase 5/10 | translation orchestration exists; active CLI compatibility remains |
 | `prompt_builder/` | 8 | Phase 6/10 | v2 ingestion and advanced retrieval replacements exist; compatibility package retained until cutover |
-| `reporting/` | 2 | Phase 10 | presenters/document adapters pending |
+| `reporting/` | 2 | Phase 10 | v2 feature presenters exist; legacy aggregate compatibility and publication cutover remain |
 | `target_language/` | 1 | Phase 3/10 | `sas_migrate.core.targets` exists; compatibility package retained |
 | `token_budget/` | 1 | Phase 4/8/10 | core tokens exist; validation reporting and cutover remain |
 | `validation/` | 17 | Phase 8/10 | v2 validation replacement exists; compatibility package retained |
 | `xref/` | 6 | Phase 7/10 | v2 replacement exists; compatibility package retained until cutover |
-| `main.py` | 1 module | Phase 10 | active `sas-parser` conversion entry point; v2 `assess` and `validate` are operational, remaining commands pending |
+| `main.py` | 1 module | Phase 10 | active `sas-parser` SharePoint/default entry point; v2 local conversion, assessment, and validation are operational |
 
 Total: 14 packages, 119 package Python files, 167 tracked package files
 (including instruction/profile resources), and one top-level entry module.
@@ -93,12 +93,13 @@ lazy Databricks chat/embedding construction, with no import back to
 remains shipped only because the active legacy pipeline still composes its
 history services; its removal is part of the Phase 10 cutover.
 
-Phase 10 now routes offline assessment and validation through
-`sas-migrate assess` and `sas-migrate validate`. Their JSON, Markdown, and PDF
-outputs use only v2 application presenters/adapters and run from an installed
-wheel. This does not remove `main.py`: conversion, hydration, SharePoint
-preflight, memory maintenance, and the default Lakeflow workflow still require
-their Phase 10 composition slices.
+Phase 10 now routes local conversion, offline assessment, and offline validation
+through `sas-migrate`. Local conversion owns gateway invocation, structured/raw
+response acceptance, token audit, and filesystem notebooks/artifacts; its
+dry-run executes from an installed wheel without credentials. Assessment and
+validation retain their JSON, Markdown, and PDF outputs. This does not remove
+`main.py`: SharePoint conversion/publication, hydration, preflight, memory
+maintenance, and the default Lakeflow workflow still require cutover slices.
 
 ## Removal order
 

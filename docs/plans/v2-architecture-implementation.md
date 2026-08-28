@@ -814,7 +814,7 @@ Tests/gates:
 Deliverables:
 
 1. Implement subcommands:
-   - `sas-migrate convert local`;
+   - `sas-migrate convert local` (implemented with live gateway and dry-run modes);
    - `sas-migrate convert sharepoint`;
    - `sas-migrate assess` (implemented for JSON/Markdown/PDF output);
    - `sas-migrate validate` (implemented with separate translation/judge budgets);
@@ -836,12 +836,14 @@ Tests/gates:
 - repository contains no stale application-target claim for Spark Scala;
 - old packages are absent from the wheel.
 
-Implemented Phase 10 CLI evidence: `assess` accepts an array of strict
-`AssessmentUnit` values and resolves only `pyspark` or `spark_sql`; `validate`
-accepts `EvaluationRun` plus optional `TokenCallLedger` and
-`TokenBudgetPolicy` files. Both execute from the clean-wheel smoke and their
-composition modules pass a 90% combined line/branch CI gate. G-013 remains open
-for the other commands and removal of the `sas-parser` entry point.
+Implemented Phase 10 CLI evidence: `convert local` uses v2 parsing, batching,
+budgeted provider invocation, structured/raw-fallback validation, token audit,
+and notebook/artifact persistence; its credential-free dry-run executes from
+the clean-wheel smoke. `assess` accepts strict `AssessmentUnit` values and
+`validate` accepts `EvaluationRun` plus optional separate translation/judge
+ledgers and policies. The CLI composition gate remains above 90% combined
+line/branch coverage. G-013 stays open for the other commands and removal of
+the `sas-parser` entry point.
 
 ## 8. Test and CI design
 

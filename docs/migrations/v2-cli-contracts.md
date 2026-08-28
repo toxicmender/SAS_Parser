@@ -1,8 +1,40 @@
 # V2 operational CLI contracts
 
 Phase 10 moves operations onto the `sas-migrate` console script in bounded
-slices. The first slice exposes the two offline report workflows without
-loading Spark, Graph, Databricks Model Serving, or credentials.
+slices. The offline report workflows do not load Spark, Graph, Databricks Model
+Serving, or credentials. Local conversion adds the first live provider path.
+
+## Local conversion
+
+```text
+sas-migrate convert local SOURCE_DIRECTORY \
+  [--output-dir ARTIFACT_DIRECTORY] \
+  [--target pyspark|spark_sql] [--model MODEL] \
+  [--gateway-base-url URL] [--gateway-version VERSION] \
+  [--api-key-env ENVIRONMENT_VARIABLE] \
+  [--max-input-tokens N] [--reserved-output-tokens N] \
+  [--safety-margin-tokens N] [--max-run-tokens N] \
+  [--max-attempts N] [--dry-run]
+```
+
+The command discovers `.sas` and `.txt` files, runs the migrated semantic
+chunker and cross-file batcher, invokes an OpenAI-compatible gateway through
+the v2 `LLMPort`, and applies the same structured/raw-fallback target validator
+before writing canonical Markdown, notebooks, attempt audits, token records,
+and a run summary. Spark SQL validation uses SQLGlot's `databricks` dialect.
+
+The gateway credential is read only at runtime from
+`SAS_MIGRATE_GATEWAY_API_KEY`, or the variable named by `--api-key-env`.
+Settings documents may contain the variable name, gateway URL, version,
+timeout, and retry count, but reject an `api_key` value. The adapter requests
+the versioned `TranslationDocument` JSON schema while retaining raw output for
+the mandatory fallback validator when a gateway ignores structured output.
+
+`--dry-run` resolves no credential and constructs no provider client. It writes
+a versioned `conversion-plan.json` containing source names, target identity,
+SQLGlot dialect, model, and the complete token policy. Live and dry-run results
+use the existing `ConversionBatchOutcome` contract and return status 1 when a
+request fails; invalid operator configuration returns status 2.
 
 ## Assessment
 
@@ -46,6 +78,6 @@ repository imports. Focused unit tests cover successful and failed validation,
 unsupported targets, token budgets, all report formats, invalid contracts,
 and I/O failures at a 90% combined line/branch CI threshold.
 
-G-013 remains open. Later Phase 10 slices add conversion, hydration,
+G-013 remains open. Later Phase 10 slices add SharePoint conversion, hydration,
 SharePoint preflight, memory maintenance, and remove the legacy `sas-parser`
 entry point.
