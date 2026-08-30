@@ -31,7 +31,13 @@ class SharePointPreflightProbe(Protocol):
     def list_directory(self, path: str = "") -> list[dict[str, Any]]: ...
 
     def list_items(
-        self, list_id: str, *, top: int | None = None, **options: Any
+        self,
+        list_id: str,
+        *,
+        select: list[str] | None = None,
+        expand: str = "fields",
+        top: int | None = None,
+        filter: str | None = None,
     ) -> list[dict[str, Any]]: ...
 
 

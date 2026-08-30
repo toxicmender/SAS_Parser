@@ -15,6 +15,7 @@ from .commands import (
     CommandError,
     ReportFormat,
     run_assess,
+    run_check_sharepoint,
     run_convert_local,
     run_validate,
 )
@@ -90,6 +91,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="parse inputs and write a plan without invoking the gateway",
+    )
+
+    check = commands.add_parser("check", help="run a read-only deployment check")
+    check_commands = check.add_subparsers(dest="check_command", metavar="RESOURCE")
+    check_sharepoint = check_commands.add_parser(
+        "sharepoint",
+        help="validate SharePoint configuration and read access",
+    )
+    check_sharepoint.add_argument(
+        "--config",
+        type=Path,
+        help="optional v2 JSON settings document; environment values override it",
+    )
+    check_sharepoint.add_argument(
+        "--offline",
+        action="store_true",
+        help="check configuration and installed SDKs without credentials or network I/O",
+    )
+    check_sharepoint.add_argument(
+        "--output",
+        type=Path,
+        help="write the versioned JSON report to PATH instead of stdout",
     )
     smoke.add_argument(
         "--quiet",
@@ -168,6 +191,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return run_validate(args)
         if args.command == "convert" and args.convert_command == "local":
             return run_convert_local(args)
+        if args.command == "check" and args.check_command == "sharepoint":
+            return run_check_sharepoint(args)
     except CommandError as exc:
         parser.print_usage(sys.stderr)
         print(f"sas-migrate: error: {exc}", file=sys.stderr)

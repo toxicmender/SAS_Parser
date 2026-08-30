@@ -222,10 +222,59 @@ def run_convert_local(args: argparse.Namespace) -> int:
     return asyncio.run(execute())
 
 
+def run_check_sharepoint(args: argparse.Namespace) -> int:
+    from sas_migrate.adapters.sharepoint import (
+        SharePointGraphTransport,
+        SharePointPreflight,
+    )
+    from sas_migrate.config import (
+        ConfigurationError,
+        load_settings,
+        load_settings_file,
+    )
+    from sas_migrate.observability import redact_text
+
+    from .sharepoint import sharepoint_token_provider
+
+    try:
+        settings = (
+            load_settings_file(args.config)
+            if args.config is not None
+            else load_settings()
+        )
+    except ConfigurationError as exc:
+        raise CommandError(f"invalid v2 settings: {exc}") from exc
+
+    if args.offline:
+        report = SharePointPreflight(settings.sharepoint).run(offline=True)
+    else:
+        try:
+            with SharePointGraphTransport(
+                settings.sharepoint,
+                sharepoint_token_provider(settings),
+            ) as transport:
+                report = SharePointPreflight(
+                    settings.sharepoint,
+                    transport,
+                ).run()
+        except Exception as exc:
+            raise CommandError(
+                "could not run SharePoint preflight: " + redact_text(str(exc))
+            ) from exc
+
+    _emit(
+        report.model_dump_json(indent=2) + "\n",
+        args.output,
+        ReportFormat.JSON,
+    )
+    return report.exit_code
+
+
 __all__ = [
     "CommandError",
     "ReportFormat",
     "run_assess",
+    "run_check_sharepoint",
     "run_convert_local",
     "run_validate",
 ]
