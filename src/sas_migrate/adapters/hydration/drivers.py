@@ -21,6 +21,10 @@ OPTIONAL_DEPENDENCIES: dict[SourceKind, tuple[str, str]] = {
     SourceKind.SAS_SESSION: ("saspy", "hydration"),
 }
 
+# Keep this explicit until every source kind has a concrete v2 driver. The
+# optional-dependency matrix alone is not evidence that a driver exists.
+CONCRETE_DRIVER_KINDS = frozenset({SourceKind.FILE, SourceKind.SAS_DATASET})
+
 
 class HydrationDriverUnavailable(RuntimeError):
     pass
@@ -98,6 +102,7 @@ class LocalFileDriver:
 
 
 __all__ = [
+    "CONCRETE_DRIVER_KINDS",
     "OPTIONAL_DEPENDENCIES",
     "HydrationDriverUnavailable",
     "LazyHydrationDriverRegistry",

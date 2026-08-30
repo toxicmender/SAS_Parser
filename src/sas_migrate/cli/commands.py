@@ -222,6 +222,38 @@ def run_convert_local(args: argparse.Namespace) -> int:
     return asyncio.run(execute())
 
 
+def run_hydrate(args: argparse.Namespace) -> int:
+    from sas_migrate.application.hydration import HydrationPlan, HydrationWorkflow
+
+    from .hydration import hydration_delta_sink, hydration_driver_registry
+
+    try:
+        plan = HydrationPlan.model_validate_json(_read(args.input))
+    except ValueError as exc:
+        raise CommandError(f"invalid HydrationPlan in {args.input}: {exc}") from exc
+    if not plan.items:
+        raise CommandError("hydration plan must contain at least one item")
+    if args.batch_rows < 1:
+        raise CommandError("--batch-rows must be at least 1")
+
+    report = HydrationWorkflow(
+        drivers=hydration_driver_registry(batch_rows=args.batch_rows),
+        sink=hydration_delta_sink(
+            apply_index_clustering=args.apply_index_clustering,
+        ),
+    ).run(
+        plan,
+        dry_run=args.dry_run,
+        on_error=args.on_error,
+    )
+    _emit(
+        report.model_dump_json(indent=2) + "\n",
+        args.output,
+        ReportFormat.JSON,
+    )
+    return 0 if report.ok else 1
+
+
 def run_check_sharepoint(args: argparse.Namespace) -> int:
     from sas_migrate.adapters.sharepoint import (
         SharePointGraphTransport,
@@ -276,5 +308,6 @@ __all__ = [
     "run_assess",
     "run_check_sharepoint",
     "run_convert_local",
+    "run_hydrate",
     "run_validate",
 ]

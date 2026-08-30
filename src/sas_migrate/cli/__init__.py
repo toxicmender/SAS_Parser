@@ -17,6 +17,7 @@ from .commands import (
     run_assess,
     run_check_sharepoint,
     run_convert_local,
+    run_hydrate,
     run_validate,
 )
 
@@ -114,6 +115,39 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="write the versioned JSON report to PATH instead of stdout",
     )
+
+    hydrate = commands.add_parser(
+        "hydrate",
+        help="execute a versioned hydration plan against managed Delta tables",
+    )
+    hydrate.add_argument("input", type=Path, help="HydrationPlan JSON document")
+    hydrate.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate and report the plan without loading drivers or Spark",
+    )
+    hydrate.add_argument(
+        "--on-error",
+        choices=("continue", "stop"),
+        default="continue",
+        help="continue after an item failure or stop immediately (default: continue)",
+    )
+    hydrate.add_argument(
+        "--batch-rows",
+        type=int,
+        default=10_000,
+        help="rows per local-file read batch (default: 10000)",
+    )
+    hydrate.add_argument(
+        "--apply-index-clustering",
+        action="store_true",
+        help="apply available index-derived clustering after Delta writes",
+    )
+    hydrate.add_argument(
+        "--output",
+        type=Path,
+        help="write the versioned JSON report to PATH instead of stdout",
+    )
     smoke.add_argument(
         "--quiet",
         action="store_true",
@@ -189,6 +223,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return run_assess(args)
         if args.command == "validate":
             return run_validate(args)
+        if args.command == "hydrate":
+            return run_hydrate(args)
         if args.command == "convert" and args.convert_command == "local":
             return run_convert_local(args)
         if args.command == "check" and args.check_command == "sharepoint":
