@@ -83,6 +83,7 @@ REQUIRED_DISTRIBUTION_FILES = (
     "sas_migrate/cli/__init__.py",
     "sas_migrate/cli/__main__.py",
     "sas_migrate/cli/commands.py",
+    "sas_migrate/cli/sharepoint.py",
     "sas_migrate/application/translation/attempts.py",
     "sas_migrate/application/translation/artifacts.py",
     "sas_migrate/application/translation/budgeting.py",
@@ -354,6 +355,50 @@ def main() -> int:
         plan = json.loads(conversion_plan.read_text("utf-8"))
         if plan.get("sqlglot_dialect") != "databricks":
             raise RuntimeError("installed local conversion used the wrong SQL dialect")
+
+        sharepoint_config = root / "sharepoint-settings.json"
+        sharepoint_config.write_text(
+            json.dumps(
+                {
+                    "sharepoint": {
+                        "site_id": "example.sharepoint.com,site-id,web-id",
+                        "drive_id": "drive-1",
+                        "file_server_base_path": "Applications",
+                        "list_id_sas_requests": "requests",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        sharepoint_check = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sas_migrate.cli",
+                "check",
+                "sharepoint",
+                "--config",
+                str(sharepoint_config),
+                "--offline",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if sharepoint_check.returncode != 1:
+            raise RuntimeError(
+                "installed SharePoint preflight did not report the missing optional SDK: "
+                f"stdout={sharepoint_check.stdout!r}, "
+                f"stderr={sharepoint_check.stderr!r}"
+            )
+        preflight = json.loads(sharepoint_check.stdout)
+        if not preflight.get("offline"):
+            raise RuntimeError("installed SharePoint preflight performed a live check")
+        checks = {check["name"]: check for check in preflight.get("checks", [])}
+        if checks.get("config", {}).get("status") != "pass":
+            raise RuntimeError("installed SharePoint preflight rejected valid settings")
+        if checks.get("imports", {}).get("status") != "fail":
+            raise RuntimeError("installed SharePoint preflight hid its missing optional SDK")
 
     print(
         f"installed-wheel smoke passed for sas-parser {distribution.version} "

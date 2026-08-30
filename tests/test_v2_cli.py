@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
+from typing import Self
 
 import pytest
 
@@ -78,6 +80,11 @@ def test_parser_exposes_operational_commands_and_only_supported_targets() -> Non
             ["convert", "local", "source", "--target", "spark-scala"]
         )
     assert scala.value.code == 2
+
+    check = parser.parse_args(["check", "sharepoint", "--offline"])
+    assert check.command == "check"
+    assert check.check_command == "sharepoint"
+    assert check.offline is True
 
 
 def test_assess_emits_json_and_markdown_from_packaged_profiles(
@@ -410,3 +417,303 @@ def test_convert_local_reports_operator_configuration_errors(
         == 2
     )
     assert "invalid local conversion settings" in capsys.readouterr().err
+
+
+def _sharepoint_config(path: Path, **sharepoint: object) -> Path:
+    values = {
+        "site_id": "example.sharepoint.com,site-id,web-id",
+        "drive_id": "drive-1",
+        "file_server_base_path": "Applications",
+        "list_id_sas_requests": "requests",
+        **sharepoint,
+    }
+    return _write_json(
+        path,
+        {
+            "azure": {
+                "tenant_id": "tenant-1",
+                "client_id": "client-1",
+            },
+            "sharepoint": values,
+        },
+    )
+
+
+def _jwt(payload: dict[str, object]) -> str:
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+    return f"header.{encoded.rstrip('=')}.signature"
+
+
+def test_check_sharepoint_offline_emits_versioned_report(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = _sharepoint_config(tmp_path / "settings.json")
+    output = tmp_path / "preflight.json"
+
+    assert (
+        main(
+            [
+                "check",
+                "sharepoint",
+                "--config",
+                str(config),
+                "--offline",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert capsys.readouterr().out == ""
+    report = json.loads(output.read_text("utf-8"))
+    assert report["schema_version"] == 2
+    assert report["offline"] is True
+    assert [check["name"] for check in report["checks"]] == ["config", "imports"]
+    assert all(check["status"] == "pass" for check in report["checks"])
+
+
+def test_check_sharepoint_live_is_read_only_and_redacts_token(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pydantic import SecretStr
+
+    import sas_migrate.adapters.sharepoint as sharepoint_adapters
+    from sas_migrate.application.ports import AccessToken
+
+    calls: list[tuple[object, ...]] = []
+
+    class _Transport:
+        def __init__(self, settings: object, token_provider: object) -> None:
+            calls.append(("init", settings, token_provider))
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            calls.append(("close",))
+
+        def access_token(self) -> AccessToken:
+            calls.append(("token",))
+            return AccessToken(
+                value=SecretStr(
+                    _jwt(
+                        {
+                            "aud": "graph",
+                            "tid": "tenant-1",
+                            "appid": "client-1",
+                            "roles": ["Sites.ReadWrite.All"],
+                        }
+                    )
+                ),
+                source="test:sharepoint",
+                expires_at_epoch=9999,
+            )
+
+        def resolve_drive_id(self) -> str:
+            calls.append(("drive",))
+            return "drive-1"
+
+        def list_directory(self, path: str = "") -> list[dict[str, object]]:
+            calls.append(("directory", path))
+            return [{"name": "Application A"}]
+
+        def list_items(
+            self,
+            list_id: str,
+            *,
+            top: int | None = None,
+            **_options: object,
+        ) -> list[dict[str, object]]:
+            calls.append(("list", list_id, top))
+            return [{"fields": {"Application Name": "Application A"}}]
+
+    monkeypatch.setattr(
+        sharepoint_adapters,
+        "SharePointGraphTransport",
+        _Transport,
+    )
+    config = _sharepoint_config(tmp_path / "settings.json")
+
+    assert main(["check", "sharepoint", "--config", str(config)]) == 0
+    report_text = capsys.readouterr().out
+    report = json.loads(report_text)
+    assert [check["status"] for check in report["checks"]] == [
+        "pass",
+        "pass",
+        "pass",
+        "pass",
+        "pass",
+        "pass",
+    ]
+    assert "signature" not in report_text
+    assert calls[-1] == ("close",)
+    assert all(call[0] not in {"write", "update", "mkdir"} for call in calls)
+
+
+def test_check_sharepoint_reports_config_and_output_errors(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert (
+        main(
+            [
+                "check",
+                "sharepoint",
+                "--config",
+                str(tmp_path / "missing.json"),
+                "--offline",
+            ]
+        )
+        == 2
+    )
+    assert "invalid v2 settings" in capsys.readouterr().err
+
+    incomplete = _write_json(tmp_path / "incomplete.json", {})
+    assert (
+        main(
+            ["check", "sharepoint", "--config", str(incomplete), "--offline"]
+        )
+        == 1
+    )
+    report = json.loads(capsys.readouterr().out)
+    assert report["checks"][0]["status"] == "fail"
+
+    config = _sharepoint_config(tmp_path / "settings.json")
+    assert (
+        main(
+            [
+                "check",
+                "sharepoint",
+                "--config",
+                str(config),
+                "--offline",
+                "--output",
+                str(tmp_path / "missing" / "report.json"),
+            ]
+        )
+        == 2
+    )
+    assert "could not write report" in capsys.readouterr().err
+
+
+def test_sharepoint_token_provider_selects_environment_or_secret_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from pydantic import SecretStr
+
+    import sas_migrate.adapters.auth as auth_adapters
+    import sas_migrate.adapters.credentials as credential_adapters
+    from sas_migrate.application.ports import (
+        AccessToken,
+        CredentialProviderUnavailable,
+        CredentialValue,
+    )
+    from sas_migrate.cli.sharepoint import (
+        DatabricksSharePointTokenProvider,
+        sharepoint_token_provider,
+    )
+    from sas_migrate.config import InfrastructureSettings
+
+    environment = sharepoint_token_provider(
+        InfrastructureSettings.model_validate(
+            {
+                "azure": {"tenant_id": "tenant", "client_id": "client"},
+                "sharepoint": {"list_id_sas_requests": "requests"},
+            }
+        ),
+        environ={"AZURE_CLIENT_SECRET": "environment-secret"},
+    )
+    assert type(environment).__name__ == "MsalAccessTokenProvider"
+
+    fetched: list[str] = []
+
+    class _Secrets:
+        def __init__(self, references: object) -> None:
+            assert references
+
+        async def get(self, name: str) -> CredentialValue | None:
+            fetched.append(name)
+            values = {
+                "sharepoint_tenant_id": "tenant-from-scope",
+                "sharepoint_client_id": "client-from-scope",
+                "sharepoint_client_secret": "secret-from-scope",
+            }
+            return CredentialValue(
+                name=name,
+                value=SecretStr(values[name]),
+                source="test:scope",
+            )
+
+    class _Msal:
+        def __init__(
+            self,
+            settings: object,
+            credentials: object,
+            *,
+            credential_name: str,
+        ) -> None:
+            assert settings.tenant_id == "tenant-from-scope"  # type: ignore[attr-defined]
+            assert settings.client_id == "client-from-scope"  # type: ignore[attr-defined]
+            assert credential_name == "sharepoint_client_secret"
+            self.credentials = credentials
+
+        async def get_token(self, scopes: tuple[str, ...] = ()) -> AccessToken:
+            credential = await self.credentials.get("sharepoint_client_secret")
+            assert credential is not None
+            return AccessToken(value=credential.value, source="test:msal")
+
+    monkeypatch.setattr(
+        credential_adapters,
+        "DatabricksSecretCredentialProvider",
+        _Secrets,
+    )
+    monkeypatch.setattr(auth_adapters, "MsalAccessTokenProvider", _Msal)
+    scoped_settings = InfrastructureSettings.model_validate(
+        {
+            "sharepoint": {
+                "secret_scope": "sharepoint-scope",
+                "list_id_sas_requests": "requests",
+            }
+        }
+    )
+    scoped = sharepoint_token_provider(scoped_settings)
+    assert isinstance(scoped, DatabricksSharePointTokenProvider)
+    assert asyncio.run(scoped.get_token()).source == "test:msal"
+    assert asyncio.run(scoped.get_token(("custom-scope",))).source == "test:msal"
+    assert fetched == [
+        "sharepoint_tenant_id",
+        "sharepoint_client_id",
+        "sharepoint_client_secret",
+        "sharepoint_client_secret",
+    ]
+
+    unconfigured = DatabricksSharePointTokenProvider(
+        InfrastructureSettings.model_validate(
+            {"sharepoint": {"list_id_sas_requests": "requests"}}
+        )
+    )
+    with pytest.raises(CredentialProviderUnavailable, match="not configured"):
+        asyncio.run(unconfigured.get_token())
+
+    class _MissingSecrets(_Secrets):
+        async def get(self, name: str) -> CredentialValue | None:
+            if name in {"sharepoint_tenant_id", "sharepoint_client_id"}:
+                return None
+            return await super().get(name)
+
+    monkeypatch.setattr(
+        credential_adapters,
+        "DatabricksSecretCredentialProvider",
+        _MissingSecrets,
+    )
+    missing = DatabricksSharePointTokenProvider(scoped_settings)
+    with pytest.raises(
+        CredentialProviderUnavailable,
+        match="lacks tenant id and client id",
+    ):
+        asyncio.run(missing.get_token())
