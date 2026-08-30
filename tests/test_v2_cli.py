@@ -59,6 +59,29 @@ def _evaluation_run(path: Path, *, response: str = "```sql\nSELECT 1\n```") -> P
     )
 
 
+def _hydration_plan(path: Path, *, kind: str = "file") -> Path:
+    return _write_json(
+        path,
+        {
+            "schema_version": 2,
+            "run_date": "20260830",
+            "items": [
+                {
+                    "schema_version": 2,
+                    "source": {
+                        "schema_version": 2,
+                        "kind": kind,
+                        "locator": str(path.parent),
+                        "object_name": "customers",
+                        "source_name": "customers.csv",
+                    },
+                    "target_table": "main.bronze.customers",
+                }
+            ],
+        },
+    )
+
+
 def test_parser_exposes_operational_commands_and_only_supported_targets() -> None:
     parser = build_parser()
     args = parser.parse_args(["assess", "units.json", "--target", "pyspark"])
@@ -85,6 +108,11 @@ def test_parser_exposes_operational_commands_and_only_supported_targets() -> Non
     assert check.command == "check"
     assert check.check_command == "sharepoint"
     assert check.offline is True
+
+    hydrate = parser.parse_args(["hydrate", "plan.json", "--dry-run"])
+    assert hydrate.command == "hydrate"
+    assert hydrate.dry_run is True
+    assert hydrate.on_error == "continue"
 
 
 def test_assess_emits_json_and_markdown_from_packaged_profiles(
@@ -419,6 +447,137 @@ def test_convert_local_reports_operator_configuration_errors(
     assert "invalid local conversion settings" in capsys.readouterr().err
 
 
+def test_hydrate_dry_run_is_versioned_and_resolves_no_runtime(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plan = _hydration_plan(tmp_path / "plan.json", kind="oracle")
+    output = tmp_path / "report.json"
+
+    assert (
+        main(
+            [
+                "hydrate",
+                str(plan),
+                "--dry-run",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert capsys.readouterr().out == ""
+    report = json.loads(output.read_text("utf-8"))
+    assert report["schema_version"] == 2
+    assert report["dry_run"] is True
+    assert report["outcomes"][0]["status"] == "skipped"
+    assert report["outcomes"][0]["error"] == "dry run"
+
+
+def test_hydrate_live_composes_driver_and_delta_sink(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sas_migrate.cli.hydration as hydration_cli
+
+    calls: list[tuple[object, ...]] = []
+
+    class _Driver:
+        def batches(self, item: object) -> tuple[list[int], ...]:
+            calls.append(("batches", item))
+            return ([1, 2, 3],)
+
+        def close(self) -> None:
+            calls.append(("close",))
+
+    class _Registry:
+        def driver_for(self, kind: object) -> _Driver:
+            calls.append(("driver", kind))
+            return _Driver()
+
+    class _Sink:
+        def write(self, item: object, batches: object) -> int:
+            calls.append(("write", item, tuple(batches)))  # type: ignore[arg-type]
+            return 3
+
+    def registry(*, batch_rows: int) -> _Registry:
+        calls.append(("registry", batch_rows))
+        return _Registry()
+
+    def sink(*, apply_index_clustering: bool) -> _Sink:
+        calls.append(("sink", apply_index_clustering))
+        return _Sink()
+
+    monkeypatch.setattr(hydration_cli, "hydration_driver_registry", registry)
+    monkeypatch.setattr(hydration_cli, "hydration_delta_sink", sink)
+    plan = _hydration_plan(tmp_path / "plan.json")
+
+    assert (
+        main(
+            [
+                "hydrate",
+                str(plan),
+                "--batch-rows",
+                "25",
+                "--apply-index-clustering",
+                "--on-error",
+                "stop",
+            ]
+        )
+        == 0
+    )
+    report = json.loads(capsys.readouterr().out)
+    assert report["outcomes"][0]["status"] == "written"
+    assert report["outcomes"][0]["rows"] == 3
+    assert calls[0:2] == [("registry", 25), ("sink", True)]
+    assert calls[-1] == ("close",)
+
+
+def test_hydrate_reports_unconfigured_driver_as_item_failure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plan = _hydration_plan(tmp_path / "plan.json", kind="sftp")
+
+    assert main(["hydrate", str(plan)]) == 1
+    report = json.loads(capsys.readouterr().out)
+    outcome = report["outcomes"][0]
+    assert outcome["status"] == "failed"
+    assert "no sftp hydration driver is configured" in outcome["error"]
+
+
+def test_hydrate_reports_invalid_plan_batch_size_and_output(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    invalid = _write_json(tmp_path / "invalid.json", {"items": "invalid"})
+    assert main(["hydrate", str(invalid), "--dry-run"]) == 2
+    assert "invalid HydrationPlan" in capsys.readouterr().err
+
+    empty = _write_json(tmp_path / "empty.json", {"schema_version": 2, "items": []})
+    assert main(["hydrate", str(empty), "--dry-run"]) == 2
+    assert "at least one item" in capsys.readouterr().err
+
+    plan = _hydration_plan(tmp_path / "plan.json")
+    assert main(["hydrate", str(plan), "--dry-run", "--batch-rows", "0"]) == 2
+    assert "--batch-rows must be at least 1" in capsys.readouterr().err
+
+    assert (
+        main(
+            [
+                "hydrate",
+                str(plan),
+                "--dry-run",
+                "--output",
+                str(tmp_path / "missing" / "report.json"),
+            ]
+        )
+        == 2
+    )
+    assert "could not write report" in capsys.readouterr().err
+
+
 def _sharepoint_config(path: Path, **sharepoint: object) -> Path:
     values = {
         "site_id": "example.sharepoint.com,site-id,web-id",
@@ -653,7 +812,7 @@ def test_sharepoint_token_provider_selects_environment_or_secret_scope(
         def __init__(
             self,
             settings: object,
-            credentials: object,
+            credentials: _Secrets,
             *,
             credential_name: str,
         ) -> None:

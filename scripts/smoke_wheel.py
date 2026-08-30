@@ -83,6 +83,7 @@ REQUIRED_DISTRIBUTION_FILES = (
     "sas_migrate/cli/__init__.py",
     "sas_migrate/cli/__main__.py",
     "sas_migrate/cli/commands.py",
+    "sas_migrate/cli/hydration.py",
     "sas_migrate/cli/sharepoint.py",
     "sas_migrate/application/translation/attempts.py",
     "sas_migrate/application/translation/artifacts.py",
@@ -399,6 +400,53 @@ def main() -> int:
             raise RuntimeError("installed SharePoint preflight rejected valid settings")
         if checks.get("imports", {}).get("status") != "fail":
             raise RuntimeError("installed SharePoint preflight hid its missing optional SDK")
+
+        hydration_input = root / "hydration-plan.json"
+        hydration_input.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "run_date": "20260830",
+                    "items": [
+                        {
+                            "schema_version": 2,
+                            "source": {
+                                "schema_version": 2,
+                                "kind": "file",
+                                "locator": str(root),
+                                "object_name": "customers",
+                                "source_name": "customers.csv",
+                            },
+                            "target_table": "main.bronze.customers",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        hydration = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sas_migrate.cli",
+                "hydrate",
+                str(hydration_input),
+                "--dry-run",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if hydration.returncode != 0:
+            raise RuntimeError(
+                "installed hydration CLI dry-run failed: "
+                f"stdout={hydration.stdout!r}, stderr={hydration.stderr!r}"
+            )
+        hydration_report = json.loads(hydration.stdout)
+        if not hydration_report.get("dry_run"):
+            raise RuntimeError("installed hydration CLI did not preserve dry-run mode")
+        if hydration_report.get("outcomes", [{}])[0].get("status") != "skipped":
+            raise RuntimeError("installed hydration CLI unexpectedly executed the plan")
 
     print(
         f"installed-wheel smoke passed for sas-parser {distribution.version} "

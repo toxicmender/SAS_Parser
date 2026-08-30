@@ -15,6 +15,7 @@ import pytest
 from pydantic import ValidationError
 
 from sas_migrate.adapters.hydration import (
+    CONCRETE_DRIVER_KINDS,
     DeltaHydrationSink,
     FilesystemSpdeProbe,
     HydrationDriverUnavailable,
@@ -355,6 +356,10 @@ def test_lazy_registry_constructs_only_requested_factory() -> None:
     assert calls == ["file"]
     with pytest.raises(HydrationDriverUnavailable, match=r"sas-parser\[hydration\]"):
         registry.driver_for(SourceKind.SFTP)
+
+
+def test_concrete_driver_inventory_does_not_confuse_imports_with_adapters() -> None:
+    assert CONCRETE_DRIVER_KINDS == {SourceKind.FILE, SourceKind.SAS_DATASET}
 
 
 def test_optional_dependency_error_names_kind_and_extra(monkeypatch: pytest.MonkeyPatch) -> None:
