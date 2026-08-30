@@ -3,9 +3,10 @@
 Status: implementation in progress. Phases 0 through 9 are implemented on the
 v2 migration branch, including conversion, hydration, infrastructure,
 SharePoint Graph, advanced knowledge retrieval, native Delta memory, and lazy
-Databricks AI adapters. Phase 10 is underway: offline assessment and validation
-now run through the installed v2 CLI; the remaining operational cutover is
-tracked in G-013 through G-021.
+Databricks AI adapters. Phase 10 is underway: local conversion, offline
+assessment/validation, and read-only SharePoint preflight now run through the
+installed v2 CLI; the remaining operational cutover is tracked in G-013
+through G-021.
 
 This is the authoritative plan for the fresh version of the application. It
 consolidates the architecture audit, the functional-parity review, the test
@@ -819,7 +820,7 @@ Deliverables:
    - `sas-migrate assess` (implemented for JSON/Markdown/PDF output);
    - `sas-migrate validate` (implemented with separate translation/judge budgets);
    - `sas-migrate hydrate`;
-   - `sas-migrate check sharepoint`;
+   - `sas-migrate check sharepoint` (implemented for offline and live checks);
    - `sas-migrate memory status|optimize|vacuum`.
 2. Move Markdown/PDF/notebook presenters and SharePoint publication adapters.
 3. Update Docker images, Compose files and Spark/Delta warmup.
@@ -841,9 +842,13 @@ budgeted provider invocation, structured/raw-fallback validation, token audit,
 and notebook/artifact persistence; its credential-free dry-run executes from
 the clean-wheel smoke. `assess` accepts strict `AssessmentUnit` values and
 `validate` accepts `EvaluationRun` plus optional separate translation/judge
-ledgers and policies. The CLI composition gate remains above 90% combined
-line/branch coverage. G-013 stays open for the other commands and removal of
-the `sas-parser` entry point.
+ledgers and policies. `check sharepoint` emits the schema-v2 read-only preflight
+for either configuration/import-only offline checks or live token, site/drive,
+base-directory, and list reads. It composes local environment credentials or a
+dedicated principal from a Databricks secret scope without serializing secrets.
+The CLI composition gate remains above 90% combined line/branch coverage.
+G-013 stays open for the other commands and removal of the `sas-parser` entry
+point.
 
 ## 8. Test and CI design
 

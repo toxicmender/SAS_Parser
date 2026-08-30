@@ -78,6 +78,26 @@ repository imports. Focused unit tests cover successful and failed validation,
 unsupported targets, token budgets, all report formats, invalid contracts,
 and I/O failures at a 90% combined line/branch CI threshold.
 
+## SharePoint preflight
+
+```text
+sas-migrate check sharepoint [--config SETTINGS.json] [--offline]
+                             [--output REPORT.json]
+```
+
+The command emits the existing schema-v2 `SharePointPreflightReport`. Offline
+mode checks only non-secret configuration and installed optional SDKs and does
+not construct credentials or a Graph client. Live mode additionally reads a
+Graph token, resolves the site/default drive, samples the base directory, and
+reads one item from every configured list; the probe exposes no write method.
+
+Local and CI composition uses `azure.tenant_id`, `azure.client_id`, and
+`AZURE_CLIENT_SECRET`. When `sharepoint.secret_scope` is configured, the
+dedicated SharePoint tenant, client, and secret are fetched lazily from the
+configured Databricks secret keys. Neither credentials nor JWT values appear
+in the JSON report. Failed checks return status 1; invalid settings or report
+paths return status 2. The clean-wheel smoke executes offline mode without the
+optional Graph SDK and requires the imports check to fail explicitly.
+
 G-013 remains open. Later Phase 10 slices add SharePoint conversion, hydration,
-SharePoint preflight, memory maintenance, and remove the legacy `sas-parser`
-entry point.
+memory maintenance, and remove the legacy `sas-parser` entry point.

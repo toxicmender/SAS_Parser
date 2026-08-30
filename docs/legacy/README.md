@@ -24,7 +24,7 @@ replacement and cutover gates. The authoritative machine inventory is
 | `token_budget/` | 1 | Phase 4/8/10 | core tokens exist; validation reporting and cutover remain |
 | `validation/` | 17 | Phase 8/10 | v2 validation replacement exists; compatibility package retained |
 | `xref/` | 6 | Phase 7/10 | v2 replacement exists; compatibility package retained until cutover |
-| `main.py` | 1 module | Phase 10 | active `sas-parser` SharePoint/default entry point; v2 local conversion, assessment, and validation are operational |
+| `main.py` | 1 module | Phase 10 | active `sas-parser` SharePoint/default entry point; v2 local conversion, assessment, validation, and SharePoint preflight are operational |
 
 Total: 14 packages, 119 package Python files, 167 tracked package files
 (including instruction/profile resources), and one top-level entry module.
@@ -93,13 +93,16 @@ lazy Databricks chat/embedding construction, with no import back to
 remains shipped only because the active legacy pipeline still composes its
 history services; its removal is part of the Phase 10 cutover.
 
-Phase 10 now routes local conversion, offline assessment, and offline validation
-through `sas-migrate`. Local conversion owns gateway invocation, structured/raw
-response acceptance, token audit, and filesystem notebooks/artifacts; its
-dry-run executes from an installed wheel without credentials. Assessment and
-validation retain their JSON, Markdown, and PDF outputs. This does not remove
-`main.py`: SharePoint conversion/publication, hydration, preflight, memory
-maintenance, and the default Lakeflow workflow still require cutover slices.
+Phase 10 now routes local conversion, offline assessment/validation, and
+read-only SharePoint preflight through `sas-migrate`. Local conversion owns
+gateway invocation, structured/raw response acceptance, token audit, and
+filesystem notebooks/artifacts; its dry-run executes from an installed wheel
+without credentials. Assessment and validation retain their JSON, Markdown,
+and PDF outputs. SharePoint preflight validates configuration/imports offline
+or token, site/drive, base path, and lists live while exposing no mutation
+method. This does not remove `main.py`: SharePoint conversion/publication,
+hydration, memory maintenance, and the default Lakeflow workflow still require
+cutover slices.
 
 ## Removal order
 

@@ -33,7 +33,18 @@ CI evidence:
   import;
 - the installed-wheel smoke requires all three SharePoint implementation files.
 
-The Phase 10 CLI cutover will compose this transport for `convert sharepoint`
-and expose the preflight through `check sharepoint`. Until then, the legacy
-entry point remains a compatibility consumer, not an architectural dependency
-of v2.
+Phase 10 now exposes the preflight as:
+
+```text
+sas-migrate check sharepoint [--config SETTINGS.json] [--offline]
+                             [--output REPORT.json]
+```
+
+Offline mode constructs neither an access-token provider nor a Graph client.
+Live mode composes the Graph transport with `AZURE_CLIENT_SECRET` for the local
+Entra principal, or lazily reads the dedicated tenant/client/secret keys from
+`sharepoint.secret_scope` on Databricks. The versioned JSON report is written
+to stdout unless `--output` is supplied, and the command exits 1 for a failed
+check or 2 for invalid operator input. `convert sharepoint` remains the next
+SharePoint CLI cutover; the legacy entry point is still a compatibility
+consumer, not an architectural dependency of v2.
