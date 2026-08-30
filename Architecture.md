@@ -1,5 +1,11 @@
 # Architecture
 
+> **Legacy runtime architecture:** this document describes the active v1
+> composition. The v2 target and phase order are defined in the
+> [v2 implementation plan](docs/plans/v2-architecture-implementation.md). Use
+> the consolidated [gap register](docs/plans/v2-gap-register.md) and
+> [legacy code/reference index](docs/legacy/README.md) for migration status.
+
 SAS_Parser turns Base SAS source into LLM-ready work items. It has three
 layers, each usable on its own:
 
@@ -404,8 +410,9 @@ target_language/
                         syntax checker) + resolve_target_language(), which
                         folds spelling ("SparkSQL"/"spark sql"/"sql" are one
                         target) and raises UnknownTargetLanguage rather than
-                        degrading to a Python run. PySpark, Spark SQL, Spark
-                        Scala. A leaf package — stdlib only — imported by
+                        degrading to a Python run. PySpark and Spark SQL are
+                        the complete target set. A leaf package — stdlib only
+                        — imported by
                         pipeline, prompt_builder, validation, and complexity,
                         which is what keeps them agreeing on one target.
                         sqlglot core dependency for the SQL check.

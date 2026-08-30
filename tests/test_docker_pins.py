@@ -30,6 +30,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 LOCK_PATH = REPO_ROOT / "uv.lock"
 COMPOSE_PATH = REPO_ROOT / "docker-compose.yml"
 PYPROJECT_PATH = REPO_ROOT / "pyproject.toml"
+CI_DOCKERFILE_PATH = REPO_ROOT / "docker" / "ci.spark-delta.Dockerfile"
+CI_DOCKERIGNORE_PATH = REPO_ROOT / "docker" / "ci.spark-delta.Dockerfile.dockerignore"
+CI_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
 # Matches compose's shell-style substitution defaults: ${NAME:-default}. The
 # file is read as text rather than parsed as YAML because the default lives
@@ -105,7 +108,7 @@ def test_dockerfile_extras_exist_in_pyproject() -> None:
 
 def test_ci_extras_exist_in_pyproject() -> None:
     """The same check for the workflow, which shares the failure mode."""
-    workflow = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+    workflow = CI_WORKFLOW_PATH
     if not workflow.exists():  # pragma: no cover - defensive
         pytest.skip("no ci.yml")
     pyproject = tomllib.loads(PYPROJECT_PATH.read_text(encoding="utf-8"))
@@ -117,6 +120,29 @@ def test_ci_extras_exist_in_pyproject() -> None:
         f"ci.yml installs undeclared extra(s) {unknown}; pyproject.toml "
         f"declares {sorted(declared)}."
     )
+
+
+def test_spark_delta_ci_uses_a_locked_repository_image() -> None:
+    """The mandatory live runtime job builds our pinned Docker definition."""
+    workflow = CI_WORKFLOW_PATH.read_text(encoding="utf-8")
+    dockerfile = CI_DOCKERFILE_PATH.read_text(encoding="utf-8")
+    dockerignore = CI_DOCKERIGNORE_PATH.read_text(encoding="utf-8")
+
+    assert "docker/build-push-action@v6" in workflow
+    assert "file: docker/ci.spark-delta.Dockerfile" in workflow
+    assert "REQUIRE_DELTA_TESTS=1" in workflow
+    assert "tests/test_spark_delta_runtime.py" in workflow
+    assert "uv sync --locked --no-install-project --extra dev --extra spark" in dockerfile
+    assert "uv pip install --python /opt/venv --no-deps --editable ." in dockerfile
+    assert re.search(r"ARG DELTA_SPARK_VERSION=\d+\.\d+\.\d+", dockerfile)
+    assert not re.search(
+        r"^COPY --from=ghcr\.io/astral-sh/uv:latest\b", dockerfile, re.MULTILINE
+    )
+    assert "**" in dockerignore.splitlines()
+    assert "!src/**" in dockerignore
+    assert "!tests/**" in dockerignore
+    assert "!.git/**" not in dockerignore
+    assert "!.claude/**" not in dockerignore
 
 
 def test_compose_python_satisfies_requires_python() -> None:

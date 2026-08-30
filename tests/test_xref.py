@@ -17,10 +17,14 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import pytest
+import sqlglot
+from sqlglot.expressions import Expression
 
 import app_config
 from app_config.sharepoint import SharePointConfig, SharePointError
-from xref import apply as xref_apply, pre, rewrite, sourcing
+from xref import apply as xref_apply
+from xref import pre, rewrite, sourcing
+
 
 @pytest.fixture(autouse=True)
 def _isolated(monkeypatch, tmp_path):
@@ -249,6 +253,32 @@ def test_sql_table_reference_is_rewritten():
     out = rewrite.rewrite_sql("SELECT * FROM sales.orders", _MAPPING)
     assert "cat.sales.orders" in out
     assert "FROM sales.orders" not in out
+
+
+def test_sql_rewriter_parses_and_renders_with_registered_databricks_dialect(
+    monkeypatch,
+):
+    parse_dialects: list[str | None] = []
+    render_dialects: list[str | None] = []
+    real_parse = sqlglot.parse
+    real_sql = Expression.sql
+
+    def parse(source: str, *, read: str | None = None):
+        parse_dialects.append(read)
+        return real_parse(source, read=read)
+
+    def render(self, *args, dialect: str | None = None, **kwargs):
+        render_dialects.append(dialect)
+        return real_sql(self, *args, dialect=dialect, **kwargs)
+
+    monkeypatch.setattr(sqlglot, "parse", parse)
+    monkeypatch.setattr(Expression, "sql", render)
+
+    assert rewrite.default_dialect() == "databricks"
+    out = rewrite.rewrite_sql("SELECT * FROM sales.orders", _MAPPING)
+    assert "cat.sales.orders" in out
+    assert parse_dialects == ["databricks"]
+    assert render_dialects == ["databricks"]
 
 
 def test_sql_leaves_unmapped_tables_alone():

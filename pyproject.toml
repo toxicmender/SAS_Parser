@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "sas-parser"
 version = "0.1.0"
@@ -29,25 +33,34 @@ dependencies = [
 # main.py is the entry point: SharePoint-driven by default, local with a
 # positional source directory.
 sas-parser = "main:main"
+# V2 composition shell. Operational subcommands are added only as their use
+# cases move behind v2 application ports.
+sas-migrate = "sas_migrate.cli:main"
+
+[project.entry-points.databricks_jobs]
+# Lakeflow Jobs resolves Python wheel tasks through this standard entry-point
+# group. The preflight is a hard dependency of the conversion task in
+# databricks.yml, so the application never starts on the wrong DBR family.
+databricks_preflight = "app_config.databricks_check:lakeflow_main"
+sas_parser = "main:lakeflow_main"
 
 [project.optional-dependencies]
 # Delta memory backend + validation tracking (Spark/JVM). The default
 # in-memory mode must import and run without pyspark (Architecture.md
 # invariant 8), so it is an extra, not a core dependency.
 #
-# Upper bound is Delta Lake's, not ours: no published delta-spark supports
-# Spark 4.2 (4.2.0 and 4.3.1 both declare `pyspark<=4.1.1`, and 4.1.0 declares
-# no upper bound at all, so it installs against 4.2 and then dies at runtime
-# on `NoSuchMethodError: CatalogStorageFormat.copy` for every CREATE TABLE).
-# Without this bound a routine `uv lock --upgrade` silently breaks
-# memory.store's Delta backend and validation tracking. Raise it only once a
-# delta-spark release declares support for the newer Spark; the Docker build
-# verifies the pairing for real (docker/spark/warmup.py).
-spark      = ["pyspark>=4.1.2,<4.2"]
+# Upper bound is Delta Lake's, not ours. Published Delta releases on this line
+# declare support through PySpark 4.1.1. Delta 4.1.0's metadata omits that upper
+# bound, so a resolver accepts 4.1.2/4.1.3 even though the Python DeltaTable API
+# and ALTER TABLE property path then fail on the removed Catalyst
+# ``IgnoreCachedData`` class. Keep the runtime on the compatible 4.1.0/4.1.1
+# patch line until a Delta release explicitly supports a newer Spark runtime.
+# The Docker build and direct DeltaTable contracts verify the pairing for real.
+spark      = ["pyspark>=4.1,<4.1.2"]
 vault      = ["hvac>=2.0"]
 azure      = ["msal>=1.28"]
 databricks = ["databricks-sdk>=0.30", "databricks-sql-connector>=3.0"]
-# Optional Databricks Model Serving adapters used by memory.databricks_ai.
+# Optional Databricks Model Serving adapters used by sas_migrate.adapters.ai.
 # It is intentionally separate from the workspace/SQL SDK extra and never a
 # core dependency: plain memory, tests, and local development remain offline.
 databricks-ai = ["databricks-langchain>=0.15"]
@@ -59,7 +72,14 @@ sharepoint = ["msgraph-sdk>=1.5", "msal>=1.28"]
 # itself (the schema is small and stable, and the runtime should not grow a
 # jupyter dependency to emit JSON), and tests/test_notebook.py validates what
 # it emits against the real published schema.
-dev        = ["pytest>=8", "pytest-cov", "ruff", "nbformat>=5.10", "matplotlib>=3.8"]
+dev        = [
+    "pytest>=8",
+    "pytest-cov",
+    "ruff",
+    "nbformat>=5.10",
+    "matplotlib>=3.8",
+    "PyYAML>=6.0",
+]
 # Draws complexity's corpus dependency graph as a PNG beside the Markdown
 # report. Optional: complexity.graph always renders the same edges as a
 # Markdown table, and render_png returns None (with a log line) when matplotlib
@@ -75,9 +95,10 @@ sftp       = ["paramiko>=3.4"]
 # Blob and Data Lake ship together: they share the ranged-read adapter in
 # data_hydration.rawio, and a lake path routinely resolves to either endpoint.
 adls       = ["azure-storage-file-datalake>=12.14", "azure-storage-blob>=12.19"]
-# Reads .sas7bdat without a SAS installation. pandas arrives with it, which is
-# also the container every source hands rows back in.
-sasdata    = ["pyreadstat>=1.2"]
+# Reads .sas7bdat without a SAS installation. pandas is explicit: current
+# pyreadstat releases no longer install it transitively, while both SAS and
+# ordinary file drivers exchange pandas DataFrames with the Delta sink.
+sasdata    = ["pyreadstat>=1.2", "pandas>=2.2"]
 # A live SAS session. Needed ONLY for SPD Engine libraries, whose component
 # files have no open-source reader — see data_hydration/sources/sas_session.py.
 saspy      = ["saspy>=5.100"]
@@ -90,24 +111,27 @@ hydration  = [
     "azure-storage-file-datalake>=12.14",
     "azure-storage-blob>=12.19",
     "pyreadstat>=1.2",
+    "pandas>=2.2",
     "saspy>=5.100",
 ]
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = [".", "src"]
 # pipeline/engine.py imports chunker, memory.store, llm_client, and
 # prompt_builder, so all five packages must ship — a wheel with pipeline
 # alone breaks `from pipeline import SasLLMPipeline`. app_config is the
 # dependency-free config loader they all read defaults through. complexity
 # reads chunker's output and adds no *required* dependency of its own (its
 # dependency-graph image is the optional `graph` extra, and degrades to a
-# Markdown table without it), so it ships too — unlike validation, whose
-# Spark/MLflow tracking is dev-only tooling.
+# Markdown table without it), so it ships too. Validation also ships: its
+# Spark tracking path is optional, while LiveValidator is part of the normal
+# conversion pipeline and imports without Spark.
 # target_language is the leaf every one of them resolves the run's target
 # through, so it ships with all of them. conversion and xref are the SharePoint
 # domain layers a real run is driven by, and add no required dependency of
 # their own (Graph is the optional `sharepoint` extra; sqlglot is core).
 include = [
+    "sas_migrate*",
     "pipeline*",
     "chunker*",
     "memory*",
@@ -124,6 +148,13 @@ include = [
     # TYPE_CHECKING-only), and complexity imports it to report the plan — so it
     # ships wherever complexity does. Its drivers are all optional extras.
     "data_hydration*",
+    # Shared prompt-cost estimation is imported at module scope by both the
+    # LLM client and pipeline. Omitting it makes the installed console script
+    # fail before argument parsing even though editable/repo-root runs pass.
+    "token_budget*",
+    # Inline validation is part of every constructed conversion pipeline,
+    # including the installed console script's default workflow.
+    "validation*",
 ]
 
 [tool.setuptools]
@@ -133,13 +164,21 @@ include = [
 py-modules = ["main"]
 
 [tool.setuptools.package-data]
-# complexity/profiles/*.json IS the rule catalogue — the package scores nothing
-# without it, so the JSON must ship inside the wheel alongside the code.
-complexity = ["profiles/*.json"]
+# The assessment rule catalogue moved from complexity/profiles into the v2
+# resources tree in Phase 8. Legacy complexity resolves this single packaged
+# source until its CLI compatibility surface is removed in Phase 10.
+# The configured starter instruction set is runtime input, not documentation.
+# Keep the directory structure because its first component scopes rules to a
+# target language (pyspark/, sparksql/, or _common/).
+prompt_builder = ["instructions/**/*.md"]
+# V2 contract schemas and future copied profile/instruction resources.
+sas_migrate = ["resources/**/*.json", "resources/**/*.md"]
 
 [tool.coverage.run]
 # Bare `--cov` (as CI passes it) measures exactly these packages; without this
 # it would measure everything imported, tests included, inflating the total.
+branch = true
+relative_files = true
 source = [
     "pipeline",
     "chunker",
@@ -154,11 +193,15 @@ source = [
     "reporting",
     "target_language",
     "data_hydration",
+    "token_budget",
+    "main",
+    "sas_migrate",
 ]
 
 [tool.pytest.ini_options]
 markers = [
     "slow: end-to-end tests over the real reference_docs corpus; skipped when the PDFs are absent",
+    "spark_delta: requires the containerized PySpark, JVM, and Delta Lake runtime",
 ]
 filterwarnings = [
     # langgraph-internal deserialisation with the default `allowed_objects`
@@ -185,7 +228,9 @@ include = [
     "target_language",
     "validation",
     "data_hydration",
+    "token_budget",
     "main.py",
+    "src/sas_migrate",
 ]
 exclude = ["**/build/**", "**/.venv/**", "**/__pycache__/**"]
 # Resolve the same interpreter and installed packages CI uses (uv's .venv),

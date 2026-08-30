@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:sas-migrate:contracts:v2",
+  "title": "SAS Migrate v2 contract resources",
+  "x-contract-families": {
+    "conversion": [
+      "ConversionRequest",
+      "ConversionModelPreference",
+      "ConversionTranslationCommand",
+      "ConversionTranslationResult",
+      "ConversionOutcome",
+      "ConversionBatchOutcome"
+    ],
+    "hydration": [
+      "HydrationSettings",
+      "HydrationSource",
+      "HydrationPartition",
+      "HydrationItem",
+      "HydrationPlan",
+      "HydrationItemOutcome",
+      "HydrationReport"
+    ],
+    "infrastructure": [
+      "InfrastructureSettings"
+    ],
+    "assessment": [
+      "AssessmentProfile",
+      "AssessmentUnit",
+      "FileAssessment",
+      "AssessmentReport"
+    ],
+    "knowledge": [
+      "DocumentExtraction",
+      "KnowledgeSource",
+      "KnowledgeChunk",
+      "UserRule",
+      "RetrievalQuery",
+      "KnowledgeRanking",
+      "KnowledgeSelection"
+    ],
+    "memory": [
+      "ChatMessage",
+      "TaskPolicySnapshot",
+      "ThreadNote",
+      "RollingSummary",
+      "PolicyProposal",
+      "MemoryAuditEvent",
+      "MemorySnapshot",
+      "MemoryContextResult",
+      "ExtractionResult"
+    ],
+    "responses": [
+      "ResponseEnvelope",
+      "TranslationDocument"
+    ],
+    "runs": [
+      "RunEvent",
+      "RunState"
+    ],
+    "translation": [
+      "TranslateCorpusRequest",
+      "TranslationItem",
+      "TranslationItemOutcome",
+      "TranslationRunOutcome",
+      "ArtifactLocator"
+    ],
+    "tokens": [
+      "PromptAssembly",
+      "PromptBudgetDecision",
+      "CallTokenRecord",
+      "TokenCallLedger",
+      "TokenAuditArtifact"
+    ],
+    "validation": [
+      "ValidationCase",
+      "EvaluationRun",
+      "MetricResult",
+      "TokenBudgetReport",
+      "ValidationReport"
+    ],
+    "xref": [
+      "XrefRow",
+      "XrefMappings",
+      "PreRewriteReport",
+      "BothRewriteResult"
+    ]
+  },
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "const": 2
+    }
+  },
+  "required": [
+    "schema_version"
+  ],
+  "additionalProperties": true
+}

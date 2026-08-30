@@ -1,0 +1,154 @@
+{
+  "sources": {
+    "01_build.sas": "options mprint;\n%let region=west;\n%macro build(src,out);\ndata &out.;\n  set &src.;\n  if amount > 0;\nrun;\n%mend build;\ndata work.raw;\n  set ext.orders;\nrun;\n%build(src=work.raw,out=work.clean);\n",
+    "02_report.sas": "proc sort data=work.clean out=work.sorted;\n  by id;\nrun;\ndata work.report;\n  merge work.sorted work.lookup;\n  by id;\nrun;\nproc print data=work.report;\nrun;\n"
+  },
+  "chunks": {
+    "01_build.sas": [
+      {
+        "chunk_id": "chunk-0001",
+        "kind": "OPTIONS",
+        "start_char": 0,
+        "end_char": 16,
+        "start_line": 1,
+        "end_line": 1,
+        "input_datasets": [],
+        "output_datasets": [],
+        "defines_macros": [],
+        "invokes_macros": [],
+        "produces_macrovars": [],
+        "consumes_macrovars": [],
+        "declared_macro_vars": []
+      },
+      {
+        "chunk_id": "chunk-0002",
+        "kind": "GLOBAL_STATEMENT",
+        "start_char": 16,
+        "end_char": 34,
+        "start_line": 2,
+        "end_line": 2,
+        "input_datasets": [],
+        "output_datasets": [],
+        "defines_macros": [],
+        "invokes_macros": [],
+        "produces_macrovars": [],
+        "consumes_macrovars": [],
+        "declared_macro_vars": ["region"]
+      },
+      {
+        "chunk_id": "chunk-0003",
+        "kind": "MACRO_DEFINITION",
+        "start_char": 34,
+        "end_char": 117,
+        "start_line": 3,
+        "end_line": 8,
+        "input_datasets": [],
+        "output_datasets": [],
+        "defines_macros": ["build"],
+        "invokes_macros": [],
+        "produces_macrovars": [],
+        "consumes_macrovars": [],
+        "declared_macro_vars": []
+      },
+      {
+        "chunk_id": "chunk-0004",
+        "kind": "DATA_STEP",
+        "start_char": 117,
+        "end_char": 155,
+        "start_line": 9,
+        "end_line": 11,
+        "input_datasets": ["ext.orders"],
+        "output_datasets": ["work.raw"],
+        "defines_macros": [],
+        "invokes_macros": [],
+        "produces_macrovars": [],
+        "consumes_macrovars": [],
+        "declared_macro_vars": []
+      },
+      {
+        "chunk_id": "chunk-0005",
+        "kind": "MACRO_CALL",
+        "start_char": 155,
+        "end_char": 192,
+        "start_line": 12,
+        "end_line": 12,
+        "input_datasets": [],
+        "output_datasets": [],
+        "defines_macros": [],
+        "invokes_macros": ["build"],
+        "produces_macrovars": [],
+        "consumes_macrovars": [],
+        "declared_macro_vars": []
+      }
+    ],
+    "02_report.sas": [
+      {
+        "chunk_id": "chunk-0001",
+        "kind": "PROC_STEP",
+        "start_char": 0,
+        "end_char": 57,
+        "start_line": 1,
+        "end_line": 3,
+        "input_datasets": ["work.clean"],
+        "output_datasets": ["work.sorted"],
+        "defines_macros": [],
+        "invokes_macros": [],
+        "produces_macrovars": [],
+        "consumes_macrovars": [],
+        "declared_macro_vars": []
+      },
+      {
+        "chunk_id": "chunk-0002",
+        "kind": "DATA_STEP",
+        "start_char": 57,
+        "end_char": 122,
+        "start_line": 4,
+        "end_line": 7,
+        "input_datasets": ["work.sorted", "work.lookup"],
+        "output_datasets": ["work.report"],
+        "defines_macros": [],
+        "invokes_macros": [],
+        "produces_macrovars": [],
+        "consumes_macrovars": [],
+        "declared_macro_vars": []
+      },
+      {
+        "chunk_id": "chunk-0003",
+        "kind": "PROC_STEP",
+        "start_char": 122,
+        "end_char": 156,
+        "start_line": 8,
+        "end_line": 9,
+        "input_datasets": ["work.report"],
+        "output_datasets": [],
+        "defines_macros": [],
+        "invokes_macros": [],
+        "produces_macrovars": [],
+        "consumes_macrovars": [],
+        "declared_macro_vars": []
+      }
+    ]
+  },
+  "edges": [
+    {"kind": "macro_invocation", "from": "f1-chunk-0003", "to": "f1-chunk-0005", "reason": "%build", "cross_file": false},
+    {"kind": "macro_arg_dataset", "from": "f1-chunk-0004", "to": "f1-chunk-0005", "reason": "work.raw", "cross_file": false},
+    {"kind": "macro_body_dataset", "from": "f1-chunk-0004", "to": "f1-chunk-0005", "reason": "work.raw", "cross_file": false},
+    {"kind": "dataset_flow", "from": "f1-chunk-0005", "to": "f2-chunk-0001", "reason": "work.clean", "cross_file": true},
+    {"kind": "dataset_flow", "from": "f2-chunk-0001", "to": "f2-chunk-0002", "reason": "work.sorted", "cross_file": false},
+    {"kind": "dataset_flow", "from": "f2-chunk-0002", "to": "f2-chunk-0003", "reason": "work.report", "cross_file": false}
+  ],
+  "batches": [
+    {
+      "batch_id": "batch-001",
+      "chunk_ids": ["f1-chunk-0001", "f1-chunk-0002", "f1-chunk-0003", "f1-chunk-0004", "f1-chunk-0005", "f2-chunk-0001", "f2-chunk-0002", "f2-chunk-0003"],
+      "reason": "macro_invocation(%build): f1-chunk-0003 → f1-chunk-0005; macro_arg_dataset(work.raw): f1-chunk-0004 → f1-chunk-0005; macro_body_dataset(work.raw): f1-chunk-0004 → f1-chunk-0005; dataset_flow(work.clean) [cross-file]: f1-chunk-0005 → f2-chunk-0001; dataset_flow(work.sorted): f2-chunk-0001 → f2-chunk-0002; dataset_flow(work.report): f2-chunk-0002 → f2-chunk-0003; options_context([options_context]): f1-chunk-0001 → f1-chunk-0003; options_context([options_context]): f1-chunk-0002 → f1-chunk-0003",
+      "source_files": ["01_build.sas", "02_report.sas"],
+      "input_datasets": ["ext.orders", "work.lookup"],
+      "output_datasets": ["work.clean", "work.raw", "work.report", "work.sorted"],
+      "is_cross_file": true,
+      "is_global_context": false
+    }
+  ],
+  "singletons": [],
+  "ordered_items": ["batch-001"]
+}

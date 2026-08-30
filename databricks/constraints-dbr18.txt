@@ -1,0 +1,45 @@
+# Databricks Runtime 18 LTS versions of packages exported by this project but
+# intentionally not installed by databricks/requirements.txt.
+#
+# Not a library file -- never point a cluster at this. It exists so the
+# requirement set can be resolved against a stock DBR 18 environment without a
+# live cluster:
+#
+#     uv pip compile databricks/requirements.txt \
+#         -c databricks/constraints-dbr18.txt \
+#         --python-version 3.12 --python-platform linux
+#
+# A failure means a project dependency now requires a package newer than the
+# runtime provides. Review the conflict rather than widening this constraint.
+# Versions are taken from the published DBR 18 LTS system-environment table.
+
+annotated-types==0.7.0
+anyio==4.7.0
+azure-core==1.37.0
+azure-identity==1.20.0
+certifi==2025.4.26
+cffi==1.17.1
+charset-normalizer==3.3.2
+cryptography==44.0.1
+h11==0.16.0
+idna==3.7
+mdurl==0.1.0
+msal-extensions==1.3.1
+msal==1.34.0
+numpy==2.1.3
+opentelemetry-api==1.39.1
+opentelemetry-sdk==1.39.1
+opentelemetry-semantic-conventions==0.60b1
+packaging==24.2
+pycparser==2.21
+pyjwt==2.10.1
+python-dotenv==1.2.1
+pyyaml==6.0.2
+regex==2024.11.6
+requests==2.32.3
+sniffio==1.3.0
+tenacity==9.0.0
+tiktoken==0.12.0
+tqdm==4.67.1
+urllib3==2.3.0
+zstandard==0.23.0

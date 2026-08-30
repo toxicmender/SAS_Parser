@@ -1,0 +1,13 @@
+# Dockerfile-specific allowlist. This takes precedence over the repository's
+# general .dockerignore when ci.spark-delta.Dockerfile is built.
+**
+!pyproject.toml
+!uv.lock
+!README.md
+!main.py
+!src/**
+!app_config/**
+!memory/**
+!tests/**
+!docker/spark/install_delta.sh
+!docker/spark/warmup.py

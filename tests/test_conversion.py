@@ -315,6 +315,7 @@ def test_load_returns_the_text():
         ("etl.sas", "sparksql", "etl.ipynb"),
         ("etl", "python", "etl.py"),
         ("etl.sas", "sql", "etl.sql"),
+        ("etl.sas", "scala", "etl.txt"),
         ("etl.sas", "unheard-of", "etl.txt"),
     ],
 )

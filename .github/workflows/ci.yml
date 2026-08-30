@@ -14,6 +14,82 @@ permissions:
   contents: read
 
 jobs:
+  package:
+    name: Build & installed-wheel smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Check v2 architecture boundaries
+        run: python scripts/check_v2_architecture.py
+
+      - name: Check consolidated gap and legacy inventory
+        run: python scripts/check_v2_legacy_inventory.py
+
+      - name: Import v2 core with core dependencies only
+        run: >
+          uv run --isolated --no-project --with "pydantic>=2.13.4"
+          python scripts/smoke_v2_core.py
+
+      # Build from the checkout, then install into an environment outside it.
+      # Repo-root imports can hide packages and data omitted from a wheel.
+      - name: Build wheel
+        run: uv build --wheel --out-dir /tmp/sas-parser-wheel
+
+      - name: Install wheel in a clean environment
+        run: |
+          uv venv /tmp/sas-parser-wheel-venv
+          uv pip install \
+            --python /tmp/sas-parser-wheel-venv/bin/python \
+            /tmp/sas-parser-wheel/*.whl
+
+      - name: Smoke installed wheel
+        run: /tmp/sas-parser-wheel-venv/bin/python scripts/smoke_wheel.py
+
+  deployment-smoke:
+    name: V2 deployment smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build wheel-only v2 deployment image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/v2.Dockerfile
+          load: true
+          tags: sas-parser/v2-deployment:${{ github.sha }}
+          cache-from: type=gha,scope=v2-deployment
+          cache-to: type=gha,mode=max,scope=v2-deployment
+          provenance: false
+
+      - name: Run v2 smoke as the deployed identity
+        run: |
+          mkdir -p test-results/deployment
+          docker run --rm --read-only \
+            --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges \
+            "sas-parser/v2-deployment:${{ github.sha }}" \
+            > test-results/deployment/report.json
+          python -m json.tool test-results/deployment/report.json
+
+      - name: Upload v2 deployment smoke report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2-deployment-smoke-report
+          path: test-results/deployment/report.json
+          if-no-files-found: error
+
   lint:
     name: Lint (ruff)
     runs-on: ubuntu-latest
@@ -25,9 +101,42 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
-      # Same ruff version as uv.lock so local and CI results agree.
-      - name: Ruff lint
-        run: uvx ruff@0.15.20 check . --output-format=github
+      # Same Ruff version as uv.lock so local and CI results agree.
+      # Legacy packages have a known backlog. Gate every migration-owned file
+      # now; expand this list as each later phase moves another package.
+      - name: Ruff lint (v2 migration surface)
+        run: >
+          uvx ruff@0.16.0 check
+          src/sas_migrate
+          scripts/check_v2_architecture.py scripts/check_v2_legacy_inventory.py
+          scripts/smoke_v2_core.py
+          scripts/smoke_wheel.py scripts/v2_sas_test_adapter.py
+          tests/test_databricks_bundle.py
+          tests/test_v2_architecture.py tests/test_v2_contracts.py
+          tests/test_v2_deployment.py
+          tests/test_v2_cli.py
+          tests/test_v2_gateway.py
+          tests/test_v2_databricks_ai.py
+          tests/test_v2_databricks_ai_optional.py
+          tests/test_v2_delta_store.py
+          tests/test_v2_conversion.py
+          tests/test_v2_hydration.py tests/test_v2_hydration_optional.py
+          tests/test_v2_hydration_delta.py
+          tests/test_v2_infrastructure.py
+          tests/test_v2_infrastructure_optional.py
+          tests/test_v2_sharepoint.py
+          tests/test_v2_ports.py tests/test_v2_sas_core.py
+          tests/test_v2_sas_parity.py tests/test_v2_responses.py
+          tests/test_v2_tokens.py tests/test_v2_translation.py
+          tests/test_v2_knowledge.py tests/test_v2_knowledge_retrieval.py
+          tests/test_v2_memory.py
+          tests/test_v2_memory_delta.py
+          tests/test_spark_delta_runtime.py
+          tests/test_v2_legacy_inventory.py
+          tests/test_v2_xref.py
+          tests/test_v2_validation.py tests/test_v2_validation_workflows.py
+          tests/test_v2_assessment.py
+          --output-format=github
 
   types:
     name: Types (pyright ratchet)
@@ -97,10 +206,105 @@ jobs:
       # if uv.lock is out of sync with pyproject.toml instead of re-resolving.
       # pyspark is an extra (in-memory mode is Spark-free); CI installs it so
       # the Spark-backed tests (Delta contract, tracking) keep running here.
+      # The hydration bundle is also installed because the full discovery run
+      # includes the mandatory no-skip optional-driver import matrix.
       # sqlglot is a core dependency, so Spark SQL syntax checks always use
       # the Databricks dialect.
       - name: Install dependencies
-        run: uv sync --locked --extra dev --extra spark
+        run: >
+          uv sync --locked --extra dev --extra spark --extra hydration
+          --extra sharepoint
+
+      - name: Validate Lakeflow Job and DBR 18 LTS contracts
+        run: >
+          uv run pytest -q
+          tests/test_databricks_bundle.py tests/test_databricks_check.py
+
+      - name: Phase 7 XREF line and branch coverage gate
+        run: >
+          uv run pytest -q tests/test_v2_xref.py
+          --cov=sas_migrate.application.xref
+          --cov=sas_migrate.application.ports.xref
+          --cov=sas_migrate.adapters.xref
+          --cov-branch --cov-report=term-missing
+          --cov-fail-under=90
+
+      - name: Phase 8 validation and assessment line and branch coverage gate
+        run: >
+          uv run pytest -q
+          tests/test_v2_validation.py tests/test_v2_validation_workflows.py
+          tests/test_v2_assessment.py
+          --cov=sas_migrate.application.validation
+          --cov=sas_migrate.application.assessment
+          --cov=sas_migrate.application.ports.validation
+          --cov=sas_migrate.application.ports.assessment
+          --cov=sas_migrate.adapters.validation
+          --cov=sas_migrate.adapters.assessment
+          --cov-branch --cov-report=term-missing
+          --cov-fail-under=90
+
+      - name: Phase 9 conversion line and branch coverage gate
+        run: >
+          uv run pytest -q tests/test_v2_conversion.py tests/test_v2_gateway.py
+          --cov=sas_migrate.application.conversion
+          --cov=sas_migrate.application.ports.conversion
+          --cov=sas_migrate.adapters.conversion
+          --cov-branch --cov-report=term-missing
+          --cov-fail-under=90
+
+      - name: Phase 9 knowledge retrieval line and branch coverage gate
+        run: >
+          uv run pytest -q
+          tests/test_v2_knowledge.py tests/test_v2_knowledge_retrieval.py
+          --cov=sas_migrate.application.knowledge
+          --cov=sas_migrate.application.ports.knowledge
+          --cov=sas_migrate.adapters.knowledge
+          --cov-branch --cov-report=term-missing
+          --cov-fail-under=90
+
+      - name: Phase 9 Databricks AI line and branch coverage gate
+        run: >
+          uv run pytest -q tests/test_v2_databricks_ai.py tests/test_v2_gateway.py
+          --cov=sas_migrate.adapters.ai
+          --cov-branch --cov-report=term-missing
+          --cov-fail-under=90
+
+      - name: Phase 9 hydration line and branch coverage gate
+        run: >
+          uv run pytest -q tests/test_v2_hydration.py
+          --cov=sas_migrate.application.hydration
+          --cov=sas_migrate.application.ports.hydration
+          --cov=sas_migrate.adapters.hydration
+          --cov-branch --cov-report=term-missing
+          --cov-fail-under=90
+
+      - name: Phase 9 infrastructure line and branch coverage gate
+        run: >
+          uv run pytest -q tests/test_v2_infrastructure.py
+          --cov=sas_migrate.config
+          --cov=sas_migrate.application.ports.access_token
+          --cov=sas_migrate.application.ports.credential_provider
+          --cov=sas_migrate.adapters.auth
+          --cov=sas_migrate.adapters.credentials
+          --cov=sas_migrate.observability
+          --cov-branch --cov-report=term-missing
+          --cov-fail-under=90
+
+      - name: Phase 9 SharePoint line and branch coverage gate
+        run: >
+          uv run pytest -q tests/test_v2_sharepoint.py
+          --cov=sas_migrate.adapters.sharepoint
+          --cov-branch --cov-report=term-missing
+          --cov-fail-under=90
+
+      - name: Phase 10 operational CLI line and branch coverage gate
+        run: >
+          uv run pytest -q
+          tests/test_v2_cli.py tests/test_v2_gateway.py
+          tests/test_v2_ports.py tests/test_v2_deployment.py
+          --cov=sas_migrate.cli
+          --cov-branch --cov-report=term-missing
+          --cov-fail-under=90
 
       # Slow end-to-end tests skip themselves automatically: they need the
       # user-provided reference_docs/ PDFs, which are gitignored and absent here.
@@ -109,6 +313,22 @@ jobs:
           uv run pytest -v
           --junitxml=junit.xml
           --cov --cov-report=xml --cov-report=term-missing:skip-covered
+
+      # Test-only namespace aliases rerun the mature parser/batcher corpus
+      # against sas_migrate.core.sas. This preserves differential coverage
+      # without adding a production dependency from v2 back to legacy modules.
+      - name: Run legacy SAS suites against v2 core
+        run: >
+          uv run python -m pytest -q -p scripts.v2_sas_test_adapter
+          tests/test_chunker.py tests/test_batcher.py tests/test_multifile.py
+          tests/test_paths.py tests/test_function_detection.py
+          tests/test_library_handling.py tests/test_macro_body_resolution.py
+          tests/test_macro_classification.py tests/test_macro_var_flow.py
+          tests/test_bundled_instructions.py tests/test_complexity.py
+          tests/test_pipeline_guidance.py tests/test_pipeline.py
+          tests/test_validation_judged.py
+          --cov=sas_migrate.core.sas --cov-append
+          --cov-report=xml --cov-report=term-missing:skip-covered
 
       - name: Coverage summary
         if: always()
@@ -125,3 +345,98 @@ jobs:
             junit.xml
             coverage.xml
           if-no-files-found: error
+
+  delta-memory:
+    name: PySpark & DeltaTable container contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A repository-owned image keeps Java, the locked PySpark wheel, Delta's
+      # Python package, and its Maven jars together. BuildKit's GitHub cache
+      # avoids rebuilding the ~450 MB PySpark layer on every source-only push.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Spark and Delta test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/ci.spark-delta.Dockerfile
+          load: true
+          tags: sas-parser/spark-delta-ci:${{ github.sha }}
+          cache-from: type=gha,scope=spark-delta-ci
+          cache-to: type=gha,mode=max,scope=spark-delta-ci
+          provenance: false
+
+      - name: Run real PySpark and Delta contracts
+        run: |
+          mkdir -p test-results/spark-delta
+          docker run --rm --shm-size=2g \
+            -e REQUIRE_DELTA_TESTS=1 \
+            -v "$PWD/test-results/spark-delta:/test-results" \
+            "sas-parser/spark-delta-ci:${{ github.sha }}" \
+            python -m pytest -v \
+              --junitxml=/test-results/junit.xml \
+              --cov=sas_migrate.adapters.memory.delta \
+              --cov=sas_migrate.adapters.memory.delta_store \
+              --cov=sas_migrate.adapters.memory.delta_operations \
+              --cov-branch --cov-report=term-missing \
+              --cov-fail-under=90 \
+              tests/test_spark_delta_runtime.py \
+              tests/test_v2_memory_delta.py \
+              tests/test_v2_delta_store.py \
+              tests/test_v2_hydration_delta.py \
+              tests/test_backend_contract.py
+
+      - name: Upload Spark and Delta test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spark-delta-test-report
+          path: test-results/spark-delta/junit.xml
+          if-no-files-found: error
+
+  hydration-drivers:
+    name: Hydration optional driver matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install every hydration source extra
+        run: uv sync --locked --extra dev --extra hydration
+
+      - name: Require every optional driver import
+        run: uv run pytest -q tests/test_v2_hydration_optional.py
+
+  infrastructure-adapters:
+    name: Infrastructure optional adapter matrix
+    runs-on: ubuntu-latest
+    env:
+      REQUIRE_INFRASTRUCTURE_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install every infrastructure adapter extra
+        run: >
+          uv sync --locked --extra dev
+          --extra azure --extra vault --extra databricks --extra databricks-ai
+          --extra sharepoint
+
+      - name: Require every optional SDK and adapter contract
+        run: >
+          uv run pytest -q
+          tests/test_v2_infrastructure.py
+          tests/test_v2_infrastructure_optional.py
+          tests/test_v2_databricks_ai_optional.py
+          tests/test_v2_sharepoint.py

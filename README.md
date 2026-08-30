@@ -1,5 +1,11 @@
 # SAS Parser
 
+> **Migration status:** this README documents the active legacy `sas-parser`
+> runtime while v2 is implemented. The target architecture is in the
+> [v2 implementation plan](docs/plans/v2-architecture-implementation.md), with
+> one [gap register](docs/plans/v2-gap-register.md) and one
+> [legacy code/reference index](docs/legacy/README.md).
+
 Translate SAS programs into a Databricks target — PySpark or Spark SQL
 — with the corpus chunked semantically, batched by its real dependency graph,
 and converted through an LLM behind an AI Gateway.
@@ -201,11 +207,20 @@ mid-run says why. Grep `unhandled exception` to find it.
 ## Other entry points
 
 ```bash
+uv run sas-migrate smoke --json                       # offline v2 deployment contract
 python -m complexity path/to/sas --out-dir reports/   # offline complexity + sizing
 python -m complexity --sharepoint --app "MyApp"       # from the complexity list
 python -m validation --help                           # the offline validation suite
 python -m app_config.sharepoint_check                 # read-only SharePoint preflight
 ```
+
+CI also runs the strict form from a wheel-only, non-root, read-only container:
+`sas-migrate smoke --require-wheel --require-non-root --json`. See the
+[v2 deployment smoke contract](docs/migrations/v2-deployment-smoke.md).
+
+The current SharePoint workflow can also be deployed as a Databricks Lakeflow
+Job on an existing general-purpose cluster running DBR 18 LTS. See the
+[Lakeflow Job deployment guide](docs/deployment/databricks-lakeflow-job.md).
 
 ## Configuration
 

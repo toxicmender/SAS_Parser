@@ -33,7 +33,6 @@ FILE_EXTENSIONS: dict[str, str] = {
     "python": "py",
     "py": "py",
     "sql": "sql",
-    "scala": "scala",
     "txt": "txt",
 }
 

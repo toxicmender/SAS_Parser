@@ -16,6 +16,7 @@ wheels/
 .coverage
 coverage.xml
 junit.xml
+test-results/
 htmlcov/
 
 # Pyright report consumed by the ratchet (scripts/pyright_ratchet.py)

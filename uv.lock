@@ -3483,12 +3483,12 @@ wheels = [
 
 [[package]]
 name = "pyspark"
-version = "4.1.3"
+version = "4.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "py4j" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a7/ae/33e589ae3cf03c2e9bb78139de00bdfbdc083ebc45b9a4c282f5e33efe70/pyspark-4.1.3.tar.gz", hash = "sha256:b600238e771e45618a58beaf9d63cfd9aa06f61ce193244cedf890a04a4409f7", size = 455504008, upload-time = "2026-07-15T10:39:01.647Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/19/bf/58ee13add151469c25825b7125bbf62c3bdcec05eec4d458fcb5c5516066/pyspark-4.1.1.tar.gz", hash = "sha256:77f78984aa84fbe865c717dd37b49913b4e5c97d76ef6824f932f1aefa6621ec", size = 455359625, upload-time = "2026-01-09T09:38:38.28Z" }
 
 [[package]]
 name = "pystemmer"
@@ -3921,7 +3921,7 @@ wheels = [
 [[package]]
 name = "sas-parser"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "bm25s", extra = ["core"] },
     { name = "faiss-cpu" },
@@ -3956,6 +3956,7 @@ dev = [
     { name = "nbformat" },
     { name = "pytest" },
     { name = "pytest-cov" },
+    { name = "pyyaml" },
     { name = "ruff" },
 ]
 graph = [
@@ -3965,6 +3966,7 @@ hydration = [
     { name = "azure-storage-blob" },
     { name = "azure-storage-file-datalake" },
     { name = "oracledb" },
+    { name = "pandas" },
     { name = "paramiko" },
     { name = "pyreadstat" },
     { name = "saspy" },
@@ -3973,6 +3975,7 @@ oracle = [
     { name = "oracledb" },
 ]
 sasdata = [
+    { name = "pandas" },
     { name = "pyreadstat" },
 ]
 saspy = [
@@ -4016,16 +4019,19 @@ requires-dist = [
     { name = "nbformat", marker = "extra == 'dev'", specifier = ">=5.10" },
     { name = "oracledb", marker = "extra == 'hydration'", specifier = ">=2.4" },
     { name = "oracledb", marker = "extra == 'oracle'", specifier = ">=2.4" },
+    { name = "pandas", marker = "extra == 'hydration'", specifier = ">=2.2" },
+    { name = "pandas", marker = "extra == 'sasdata'", specifier = ">=2.2" },
     { name = "paramiko", marker = "extra == 'hydration'", specifier = ">=3.4" },
     { name = "paramiko", marker = "extra == 'sftp'", specifier = ">=3.4" },
     { name = "pydantic", specifier = ">=2.13.4" },
     { name = "pymupdf", specifier = ">=1.28.0" },
     { name = "pyreadstat", marker = "extra == 'hydration'", specifier = ">=1.2" },
     { name = "pyreadstat", marker = "extra == 'sasdata'", specifier = ">=1.2" },
-    { name = "pyspark", marker = "extra == 'spark'", specifier = ">=4.1.2,<4.2" },
+    { name = "pyspark", marker = "extra == 'spark'", specifier = ">=4.1,<4.1.2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest-cov", marker = "extra == 'dev'" },
     { name = "python-dotenv", specifier = ">=1.0" },
+    { name = "pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "saspy", marker = "extra == 'hydration'", specifier = ">=5.100" },
     { name = "saspy", marker = "extra == 'saspy'", specifier = ">=5.100" },

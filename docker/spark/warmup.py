@@ -25,8 +25,8 @@ installed pyspark can serve path-based writes perfectly while every catalog
 statement dies on ``NoSuchMethodError: CatalogStorageFormat.copy``; proving
 only the path API is what let exactly that ship.
 
-The properties half is here for the same reason, learned the same way: with
-pyspark 4.1.3 and delta-spark 4.1.0 both halves above pass and
+The properties half is here for the same reason, learned the same way: with an
+unsupported pyspark 4.1.3 / delta-spark 4.1.0 pair both halves above pass and
 ``ALTER TABLE ... SET TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')``
 dies on ``ClassNotFoundException:
 org.apache.spark.sql.catalyst.plans.logical.IgnoreCachedData`` — a trait Spark
@@ -73,7 +73,7 @@ def _check_property_writes(spark: SparkSession) -> None:
             f"ALTER TABLE {_TABLE} SET TBLPROPERTIES "
             "('delta.enableChangeDataFeed' = 'true')"
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - surface any JVM/Py4J limitation
         print(
             f"delta warmup: WARNING — ALTER TABLE SET TBLPROPERTIES failed "
             f"({type(exc).__name__}). This pyspark/delta-spark pair cannot "
@@ -110,6 +110,7 @@ def main() -> None:
             .getOrCreate()
         )
         try:
+            spark.sparkContext.setLogLevel("WARN")
             path = f"{tmp}/warmup"
             spark.range(1).write.format("delta").mode("overwrite").save(path)
             count = spark.read.format("delta").load(path).count()

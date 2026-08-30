@@ -26,6 +26,7 @@ wheels/
 .coverage
 coverage.xml
 junit.xml
+test-results/
 htmlcov/
 pyright.json
 

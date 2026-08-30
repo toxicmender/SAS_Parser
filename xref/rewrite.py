@@ -97,11 +97,14 @@ def default_dialect() -> str:
     reading it differently would silently return code un-rewritten (the hard
     rule above) on exactly the syntax the checker had just called valid.
 
-    A non-SQL target (PySpark, Spark Scala) has no dialect of its own, but this
+    The non-SQL target (PySpark) has no dialect of its own, but this
     module still reaches sqlglot for the SQL inside ``spark.sql("...")`` — so
     those fall back to the SQL target's dialect rather than to nothing.
     """
-    return SPARKSQL.sqlglot_dialect or "databricks"
+    dialect = SPARKSQL.sqlglot_dialect
+    if dialect is None:
+        raise RuntimeError("Spark SQL has no registered SQLGlot dialect")
+    return dialect
 
 def on_parse_failure() -> str:
     """What to do with unparseable generated code (``xref.on_parse_failure``).
@@ -174,7 +177,7 @@ def rewrite_sql(
         )
         return sql
 
-    read = SPARKSQL.sqlglot_dialect or "databricks"
+    read = default_dialect()
     try:
         statements = sqlglot.parse(sql, read=read)
     except Exception as exc:  # sqlglot raises several unrelated types

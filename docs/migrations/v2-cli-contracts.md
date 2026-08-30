@@ -1,0 +1,124 @@
+# V2 operational CLI contracts
+
+Phase 10 moves operations onto the `sas-migrate` console script in bounded
+slices. The offline report workflows do not load Spark, Graph, Databricks Model
+Serving, or credentials. Local conversion adds the first live provider path.
+
+## Local conversion
+
+```text
+sas-migrate convert local SOURCE_DIRECTORY \
+  [--output-dir ARTIFACT_DIRECTORY] \
+  [--target pyspark|spark_sql] [--model MODEL] \
+  [--gateway-base-url URL] [--gateway-version VERSION] \
+  [--api-key-env ENVIRONMENT_VARIABLE] \
+  [--max-input-tokens N] [--reserved-output-tokens N] \
+  [--safety-margin-tokens N] [--max-run-tokens N] \
+  [--max-attempts N] [--dry-run]
+```
+
+The command discovers `.sas` and `.txt` files, runs the migrated semantic
+chunker and cross-file batcher, invokes an OpenAI-compatible gateway through
+the v2 `LLMPort`, and applies the same structured/raw-fallback target validator
+before writing canonical Markdown, notebooks, attempt audits, token records,
+and a run summary. Spark SQL validation uses SQLGlot's `databricks` dialect.
+
+The gateway credential is read only at runtime from
+`SAS_MIGRATE_GATEWAY_API_KEY`, or the variable named by `--api-key-env`.
+Settings documents may contain the variable name, gateway URL, version,
+timeout, and retry count, but reject an `api_key` value. The adapter requests
+the versioned `TranslationDocument` JSON schema while retaining raw output for
+the mandatory fallback validator when a gateway ignores structured output.
+
+`--dry-run` resolves no credential and constructs no provider client. It writes
+a versioned `conversion-plan.json` containing source names, target identity,
+SQLGlot dialect, model, and the complete token policy. Live and dry-run results
+use the existing `ConversionBatchOutcome` contract and return status 1 when a
+request fails; invalid operator configuration returns status 2.
+
+## Assessment
+
+```text
+sas-migrate assess UNITS.json \
+  --target pyspark|spark_sql \
+  --format json|markdown|pdf \
+  [--output REPORT] [--profiles DIRECTORY]
+```
+
+`UNITS.json` is a JSON array of existing `AssessmentUnit` contracts. The
+default target is `spark_sql`; Spark Scala is not accepted. Packaged profiles
+are used unless `--profiles` points to a directory containing `pyspark.json`
+and `sparksql.json`.
+
+## Validation
+
+```text
+sas-migrate validate RUN.json \
+  [--model LABEL] \
+  [--translation-ledger LEDGER.json] \
+  [--judge-ledger LEDGER.json] \
+  [--translation-policy POLICY.json] \
+  [--judge-policy POLICY.json] \
+  --format json|markdown|pdf [--output REPORT]
+```
+
+`RUN.json` is the existing versioned `EvaluationRun` contract. Optional token
+files use `TokenCallLedger` and validation `TokenBudgetPolicy`; translation and
+judge accounting remain separate in every report. Validation exits zero only
+when deterministic metrics, target-resolution validation, and supplied budget
+policies pass. It still writes the report when validation fails.
+
+JSON is the default and may be written to stdout. Markdown may be written to
+stdout or a file. PDF requires `--output` so binary data is never emitted to a
+terminal. Invalid contracts and filesystem errors return status 2 with an
+operator-facing diagnostic.
+
+The clean-wheel smoke executes both commands with packaged profiles and no
+repository imports. Focused unit tests cover successful and failed validation,
+unsupported targets, token budgets, all report formats, invalid contracts,
+and I/O failures at a 90% combined line/branch CI threshold.
+
+## Hydration
+
+```text
+sas-migrate hydrate PLAN.json [--dry-run] [--on-error continue|stop]
+                    [--batch-rows N] [--apply-index-clustering]
+                    [--output REPORT.json]
+```
+
+`PLAN.json` is the existing schema-v2 `HydrationPlan`. Dry-run validates and
+reports every item without resolving a source driver or Spark. Live execution
+currently composes the concrete local-file and SAS-dataset readers with the
+managed Delta sink; plans using another source kind return a versioned failed
+item rather than importing a legacy implementation. Per-item failures respect
+`--on-error`, and the process exits 1 when any executed item fails. Invalid or
+empty plans, invalid batch sizes, and filesystem errors return status 2.
+
+The installed-wheel smoke runs an offline local-file plan and requires every
+outcome to remain skipped. G-011 tracks the concrete Oracle, SFTP, ADLS, Blob,
+SPDE, and SAS-session adapters that the optional SDK import matrix previously
+mistook for completed runtime coverage.
+
+## SharePoint preflight
+
+```text
+sas-migrate check sharepoint [--config SETTINGS.json] [--offline]
+                             [--output REPORT.json]
+```
+
+The command emits the existing schema-v2 `SharePointPreflightReport`. Offline
+mode checks only non-secret configuration and installed optional SDKs and does
+not construct credentials or a Graph client. Live mode additionally reads a
+Graph token, resolves the site/default drive, samples the base directory, and
+reads one item from every configured list; the probe exposes no write method.
+
+Local and CI composition uses `azure.tenant_id`, `azure.client_id`, and
+`AZURE_CLIENT_SECRET`. When `sharepoint.secret_scope` is configured, the
+dedicated SharePoint tenant, client, and secret are fetched lazily from the
+configured Databricks secret keys. Neither credentials nor JWT values appear
+in the JSON report. Failed checks return status 1; invalid settings or report
+paths return status 2. The clean-wheel smoke executes offline mode without the
+optional Graph SDK and requires the imports check to fail explicitly.
+
+G-013 remains open. Later Phase 10 slices add SharePoint conversion, memory
+maintenance, and remove the legacy `sas-parser` entry point.
