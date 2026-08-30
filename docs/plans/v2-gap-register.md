@@ -15,6 +15,12 @@ define separate gap lists.
 | G-019 | Phase 10 | Repository-wide Ruff is not clean; CI gates the migration surface. | Ruff gates the complete repository at zero diagnostics. |
 | G-020 | Phase 10 | Reference-document and live-service tests remain conditional outside provisioned jobs. | Required corpora are reproducible and production-critical integrations have no-skip jobs. |
 
+## Hydration
+
+| ID | Owner | Gap | Exit gate |
+|---|---:|---|---|
+| G-011 | Phase 9 | V2 owns planning, contracts, ports, ranged I/O, local-file and SAS-dataset drivers, and managed Delta writes. Concrete Oracle, SFTP, ADLS, Blob, SPDE, and SAS-session drivers are absent; the current optional matrix proves SDK imports only. | Every `SourceKind` has a concrete lazy v2 driver with offline contracts, and the optional matrix exercises driver construction rather than imports alone. |
+
 ## Knowledge and memory
 
 | ID | Owner | Gap | Exit gate |
@@ -29,7 +35,6 @@ No Phase 9 knowledge or memory replacement gaps remain open.
 | G-004 | Phase 9 | Native v2 Delta KV persistence owns schema upgrade, MERGE/delete, write retry, CDF, checkpoint, audit, and diagnostics behavior. | Real PySpark/Delta reopen, update-preservation, literal-key deletion, schema-upgrade, CDF-tail, and idempotent-checkpoint contracts combine with offline failure paths at a 90% CI threshold; the v2 legacy-import allowlist is empty. |
 | G-003 | Phase 9 | V2 ports and lazy adapters own BM25, FAISS dense retrieval, provider-scoped embedding caches, reciprocal-rank fusion, and reranking. | Lexical/dense/fusion/reranker, corruption, dimension, namespace isolation, lazy-import, and application-integration contracts pass at 95% combined line/branch coverage. |
 | G-010 | Phase 9 | Local and SharePoint conversion requests, target/model selection, lifecycle state, source adapters, and per-row isolation are v2-owned. | Fake local and SharePoint end-to-end contracts pass at 98% combined line/branch coverage. |
-| G-011 | Phase 9 | Pure hydration planning, versioned contracts, driver/sink ports, lazy adapters, ranged I/O, and managed Delta writes are v2-owned. | Parity and failure contracts pass at 95% combined coverage; optional imports are no-skip and the Delta sink runs in the real Spark/Delta container. |
 | G-012 | Phase 9 | Lazy Graph SDK gateway, one-thread/one-loop transport, site/default-drive resolution, and versioned read-only deployment preflight are v2-owned. | File/list parity, running-loop safety, dependency ordering, redaction, and no-write preflight contracts pass at 96% combined line/branch coverage; the real SDK is constructed in the no-skip infrastructure job. |
 | G-017 | Phase 9 | Hydration and infrastructure optional-adapter CI matrices. | Real SDK imports cannot skip; settings/auth/credential/observability contracts pass above 90% combined coverage. |
 
@@ -37,7 +42,7 @@ No Phase 9 knowledge or memory replacement gaps remain open.
 
 | ID | Owner | Gap | Exit gate |
 |---|---:|---|---|
-| G-013 | Phase 10 | `sas-migrate convert local`, `assess`, `validate`, and `check sharepoint` are operational from the wheel; SharePoint conversion, hydration, memory maintenance, and the active default workflow remain on `sas-parser`/`main.py`. | All v2 subcommands run from the wheel and `sas-parser` is removed. |
+| G-013 | Phase 10 | `sas-migrate convert local`, `assess`, `validate`, `hydrate`, and `check sharepoint` are operational from the wheel; SharePoint conversion, memory maintenance, and the active default workflow remain on `sas-parser`/`main.py`. | All v2 subcommands run from the wheel and `sas-parser` is removed. |
 | G-014 | Phase 10 | V2 feature presenters exist, but SharePoint publication and final visual/golden cutover remain. | V2 visual/golden and publication contracts pass. |
 | G-015 | Phase 10 | A wheel-only non-root v2 image is gated, but Compose, warmup, and operator commands still compose legacy entry points. | Compose and operator commands cut over to the verified v2 image. |
 | G-016 | Phase 10 | Top-level README and Architecture primarily describe the active legacy runtime. | V2 overview, config, API, operator, and cutover guides replace them. |
@@ -59,7 +64,8 @@ smoke` command as a non-root user with a read-only filesystem. G-018 remains
 open only for its scheduled real-model quality gate.
 
 Phase 10 CLI cutover now includes local conversion, the two fully offline report
-workflows, and read-only SharePoint preflight. `convert local` composes the v2
+workflows, versioned hydration-plan execution, and read-only SharePoint
+preflight. `convert local` composes the v2
 SAS core, budgeted translation service, OpenAI-compatible gateway port,
 mandatory target acceptance, and local artifacts; its credential-free dry-run
 is exercised from the clean wheel. `assess` consumes `AssessmentUnit` values and
@@ -67,8 +73,15 @@ is exercised from the clean wheel. `assess` consumes `AssessmentUnit` values and
 policies. `check sharepoint` runs configuration/import-only checks offline or
 composes the Graph transport with environment or Databricks-secret-scope
 credentials for live read checks. G-013 remains open until SharePoint
-conversion, hydration, memory maintenance, and the default workflow replace
+conversion, memory maintenance, and the default workflow replace
 `sas-parser`.
+
+The hydration review reopened G-011. `sas-migrate hydrate --dry-run` is fully
+operational without optional dependencies, and live local-file/SAS-dataset
+plans compose the managed Delta sink. Importing all optional SDKs does not prove
+that Oracle, SFTP, ADLS, Blob, SPDE, or SAS-session drivers exist, so those
+adapters remain explicit implementation work instead of being hidden by the
+no-skip import matrix.
 
 The workspace deployment is also executable through the root Databricks
 bundle. It deploys a two-task Lakeflow Job onto an explicitly supplied existing

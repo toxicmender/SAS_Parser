@@ -1,11 +1,12 @@
 # SAS migration v2: consolidated architecture and implementation plan
 
-Status: implementation in progress. Phases 0 through 9 are implemented on the
-v2 migration branch, including conversion, hydration, infrastructure,
-SharePoint Graph, advanced knowledge retrieval, native Delta memory, and lazy
-Databricks AI adapters. Phase 10 is underway: local conversion, offline
-assessment/validation, and read-only SharePoint preflight now run through the
-installed v2 CLI; the remaining operational cutover is tracked in G-013
+Status: implementation in progress. The primary slices through Phase 9 are
+implemented on the v2 migration branch, including conversion, hydration
+planning/local readers, infrastructure, SharePoint Graph, advanced knowledge
+retrieval, native Delta memory, and lazy Databricks AI adapters. The gap review
+reopened G-011 for six missing concrete hydration drivers. Phase 10 is underway: local conversion, offline
+assessment/validation, hydration plans, and read-only SharePoint preflight now
+run through the installed v2 CLI; the remaining operational cutover is tracked in G-011 and G-013
 through G-021.
 
 This is the authoritative plan for the fresh version of the application. It
@@ -778,8 +779,9 @@ Deliverables:
 2. **Partially implemented:** request status lifecycle, model/target selection,
    and source paths are v2-owned. SharePoint publication remains with the
    Phase 10 presenter/publication cutover gate.
-3. **Implemented:** move hydration planning into application code and all
-   driver/sink boundaries into adapters, including ranged I/O and Delta.
+3. **Partially implemented:** hydration planning, contracts, ports, ranged I/O,
+   local-file/SAS-dataset readers, and Delta writes are v2-owned. Oracle, SFTP,
+   ADLS, Blob, SPDE, and SAS-session drivers remain open under G-011.
 4. **Implemented:** split secret-free settings from Azure/Vault/Databricks/
    SharePoint infrastructure and place credentials behind ports.
 5. **Implemented:** move the concrete Graph transport while preserving
@@ -819,7 +821,8 @@ Deliverables:
    - `sas-migrate convert sharepoint`;
    - `sas-migrate assess` (implemented for JSON/Markdown/PDF output);
    - `sas-migrate validate` (implemented with separate translation/judge budgets);
-   - `sas-migrate hydrate`;
+   - `sas-migrate hydrate` (implemented for versioned dry-run and live
+     local-file/SAS-dataset plans);
    - `sas-migrate check sharepoint` (implemented for offline and live checks);
    - `sas-migrate memory status|optimize|vacuum`.
 2. Move Markdown/PDF/notebook presenters and SharePoint publication adapters.
@@ -846,9 +849,14 @@ ledgers and policies. `check sharepoint` emits the schema-v2 read-only preflight
 for either configuration/import-only offline checks or live token, site/drive,
 base-directory, and list reads. It composes local environment credentials or a
 dedicated principal from a Databricks secret scope without serializing secrets.
+`hydrate` validates a versioned plan without loading optional drivers in
+dry-run mode and composes v2 local-file/SAS-dataset readers with the managed
+Delta sink for live execution. The G-011 audit explicitly records the six
+source kinds whose SDKs are installed in CI but whose concrete v2 drivers are
+not implemented.
 The CLI composition gate remains above 90% combined line/branch coverage.
-G-013 stays open for the other commands and removal of the `sas-parser` entry
-point.
+G-013 stays open for SharePoint conversion, memory commands, default workflow,
+and removal of the `sas-parser` entry point.
 
 ## 8. Test and CI design
 

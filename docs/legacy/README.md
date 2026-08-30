@@ -14,7 +14,7 @@ replacement and cutover gates. The authoritative machine inventory is
 | `chunker/` | 9 | Phase 2/10 | `sas_migrate.core.sas` exists; compatibility package retained until cutover |
 | `complexity/` | 18 | Phase 8/10 | v2 assessment replacement exists; compatibility package retained |
 | `conversion/` | 6 | Phase 9/10 | v2 conversion application/adapters exist; compatibility package and publication path retained until cutover |
-| `data_hydration/` | 20 | Phase 9/10 | v2 application/adapters exist; compatibility CLI/config composition retained |
+| `data_hydration/` | 20 | Phase 9/10 | v2 planning, CLI, local/SAS readers, and Delta sink exist; six concrete source drivers and compatibility config remain |
 | `llm_client/` | 2 | Phase 10 | v2 OpenAI-compatible gateway adapter exists; legacy client retained for `main.py` |
 | `memory/` | 11 | Phase 6/9/10 | services, physical Delta/CDF, and Databricks AI adapters moved; active legacy composition remains until cutover |
 | `pipeline/` | 9 | Phase 5/10 | translation orchestration exists; active CLI compatibility remains |
@@ -24,7 +24,7 @@ replacement and cutover gates. The authoritative machine inventory is
 | `token_budget/` | 1 | Phase 4/8/10 | core tokens exist; validation reporting and cutover remain |
 | `validation/` | 17 | Phase 8/10 | v2 validation replacement exists; compatibility package retained |
 | `xref/` | 6 | Phase 7/10 | v2 replacement exists; compatibility package retained until cutover |
-| `main.py` | 1 module | Phase 10 | active `sas-parser` SharePoint/default entry point; v2 local conversion, assessment, validation, and SharePoint preflight are operational |
+| `main.py` | 1 module | Phase 10 | active `sas-parser` SharePoint/default entry point; v2 local conversion, assessment, validation, hydration, and SharePoint preflight are operational |
 
 Total: 14 packages, 119 package Python files, 167 tracked package files
 (including instruction/profile resources), and one top-level entry module.
@@ -68,11 +68,14 @@ isolation. The top-level `conversion/` package remains shipped only because the
 legacy CLI still composes it and because SharePoint deliverable publication is
 part of the Phase 10 presenter/cutover gate.
 
-The Phase 9 hydration replacement now owns pure planning, versioned work and
-report contracts, partition probes, lazy source-driver boundaries, ranged I/O,
-failure-isolated execution, and managed Delta writes. The top-level
-`data_hydration/` package remains shipped for the legacy CLI and its environment
-and credential composition; those dependencies move with G-012 and Phase 10.
+The hydration replacement owns pure planning, versioned work/report contracts,
+partition probes, lazy source-driver boundaries, ranged I/O, failure-isolated
+execution, concrete local-file/SAS-dataset readers, managed Delta writes, and
+the operational v2 command. The gap review reopened G-011 because optional SDK
+imports had been counted as concrete Oracle, SFTP, ADLS, Blob, SPDE, and
+SAS-session adapters when those classes do not yet exist. The top-level
+`data_hydration/` package remains shipped for those drivers plus legacy
+environment and credential composition.
 
 The Phase 9 infrastructure foundation now owns strict non-secret settings,
 credential and token ports, lazy environment/Databricks/Vault/MSAL adapters,
@@ -93,15 +96,16 @@ lazy Databricks chat/embedding construction, with no import back to
 remains shipped only because the active legacy pipeline still composes its
 history services; its removal is part of the Phase 10 cutover.
 
-Phase 10 now routes local conversion, offline assessment/validation, and
-read-only SharePoint preflight through `sas-migrate`. Local conversion owns
+Phase 10 now routes local conversion, offline assessment/validation, hydration
+plan execution, and read-only SharePoint preflight through `sas-migrate`. Local conversion owns
 gateway invocation, structured/raw response acceptance, token audit, and
 filesystem notebooks/artifacts; its dry-run executes from an installed wheel
 without credentials. Assessment and validation retain their JSON, Markdown,
 and PDF outputs. SharePoint preflight validates configuration/imports offline
 or token, site/drive, base path, and lists live while exposing no mutation
-method. This does not remove `main.py`: SharePoint conversion/publication,
-hydration, memory maintenance, and the default Lakeflow workflow still require
+method. Hydration dry-run is dependency-free; live local/SAS inputs write
+through the v2 Delta sink. This does not remove `main.py`: SharePoint
+conversion/publication, memory maintenance, and the default Lakeflow workflow still require
 cutover slices.
 
 ## Removal order

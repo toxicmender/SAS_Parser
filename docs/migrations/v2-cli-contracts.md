@@ -78,6 +78,27 @@ repository imports. Focused unit tests cover successful and failed validation,
 unsupported targets, token budgets, all report formats, invalid contracts,
 and I/O failures at a 90% combined line/branch CI threshold.
 
+## Hydration
+
+```text
+sas-migrate hydrate PLAN.json [--dry-run] [--on-error continue|stop]
+                    [--batch-rows N] [--apply-index-clustering]
+                    [--output REPORT.json]
+```
+
+`PLAN.json` is the existing schema-v2 `HydrationPlan`. Dry-run validates and
+reports every item without resolving a source driver or Spark. Live execution
+currently composes the concrete local-file and SAS-dataset readers with the
+managed Delta sink; plans using another source kind return a versioned failed
+item rather than importing a legacy implementation. Per-item failures respect
+`--on-error`, and the process exits 1 when any executed item fails. Invalid or
+empty plans, invalid batch sizes, and filesystem errors return status 2.
+
+The installed-wheel smoke runs an offline local-file plan and requires every
+outcome to remain skipped. G-011 tracks the concrete Oracle, SFTP, ADLS, Blob,
+SPDE, and SAS-session adapters that the optional SDK import matrix previously
+mistook for completed runtime coverage.
+
 ## SharePoint preflight
 
 ```text
@@ -99,5 +120,5 @@ in the JSON report. Failed checks return status 1; invalid settings or report
 paths return status 2. The clean-wheel smoke executes offline mode without the
 optional Graph SDK and requires the imports check to fail explicitly.
 
-G-013 remains open. Later Phase 10 slices add SharePoint conversion, hydration,
-memory maintenance, and remove the legacy `sas-parser` entry point.
+G-013 remains open. Later Phase 10 slices add SharePoint conversion, memory
+maintenance, and remove the legacy `sas-parser` entry point.
