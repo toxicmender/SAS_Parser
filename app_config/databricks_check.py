@@ -278,15 +278,27 @@ def check_runtime() -> CheckResult:
 
 def check_session() -> CheckResult:
     """Report the live SparkSession and the master actually in force."""
-    from .databricks import in_databricks_runtime
+    from .databricks import PROCESS_CHILD, in_databricks_runtime, process_shape
 
     active = _active_session()
     if active is None:
-        if in_databricks_runtime():
+        # These two used to be one branch, because "on a cluster with no
+        # session" meant "a child process" back when the runtime stage
+        # discriminated that way. It does not any more: the notebook's own
+        # Python legitimately has no session until something touches Spark, so
+        # pointing at the runtime stage there would send a reader to a check
+        # that passes.
+        if process_shape() == PROCESS_CHILD:
             return CheckResult(
                 "session",
                 SKIP,
                 "no active SparkSession (see the runtime stage)",
+            )
+        if in_databricks_runtime():
+            return CheckResult(
+                "session",
+                SKIP,
+                "no active SparkSession yet - the runtime builds one on demand",
             )
         return CheckResult(
             "session",

@@ -205,7 +205,23 @@ python -m complexity path/to/sas --out-dir reports/   # offline complexity + siz
 python -m complexity --sharepoint --app "MyApp"       # from the complexity list
 python -m validation --help                           # the offline validation suite
 python -m app_config.sharepoint_check                 # read-only SharePoint preflight
+python -m app_config.databricks_check                 # read-only cluster preflight
+python -m app_config.auth_check                       # credential-chain dry run (offline)
+python -m app_config.auth_check --live                # ... with the reads and mints performed
 ```
+
+On a Databricks cluster, run the conversion from a **cell**, never from
+`!python main.py ...` — a child process inherits the runtime marker but not
+the notebook's credential, and fails the secret-scope read with a message
+about something else entirely:
+
+```python
+import main
+main.run_in_notebook("--reference-dir '/Workspace/.../reference_docs' --request-id 80")
+```
+
+[`databricks/run_conversion.py`](databricks/run_conversion.py) is that plus the
+two preflights, as a notebook you can import into the workspace.
 
 ## Configuration
 

@@ -541,3 +541,29 @@ def test_the_library_sets_and_their_constraints_are_disjoint():
         runtime = path.stem.removeprefix("requirements-dbr")
         overlap = _names(path) & _names(directory / f"constraints-dbr{runtime}.txt")
         assert not overlap, f"DBR {runtime}: in both files: {sorted(overlap)}"
+
+
+def test_session_skip_stops_pointing_at_a_passing_runtime_stage(
+    on_cluster, in_repl, monkeypatch
+):
+    """The two used to be one branch, and decoupling them changed the message.
+
+    "On a cluster with no session" meant "a child process" only while the
+    runtime stage discriminated that way. In the notebook there is legitimately
+    no session until something touches Spark, and sending a reader to a check
+    that passes is the sort of dead end this rewrite exists to remove.
+    """
+    _session(monkeypatch, None)
+    assert dc.check_runtime().status == PASS
+
+    result = dc.check_session()
+
+    assert result.status == SKIP
+    assert "see the runtime stage" not in result.summary
+
+
+def test_session_skip_still_points_at_the_runtime_stage_for_a_child(
+    on_cluster, monkeypatch
+):
+    _session(monkeypatch, None)
+    assert "see the runtime stage" in dc.check_session().summary
