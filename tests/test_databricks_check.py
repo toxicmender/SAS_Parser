@@ -9,6 +9,7 @@ cluster, and none needs pyspark installed.
 from __future__ import annotations
 
 import json
+import pathlib
 import sys
 import types
 
@@ -324,7 +325,14 @@ def test_extras_reports_which_are_installed(off_cluster, tmp_path, monkeypatch):
 def test_run_checks_is_offline_by_default(off_cluster, monkeypatch):
     _session(monkeypatch, None)
     names = [r.name for r in dc.run_checks()]
-    assert names == ["runtime", "session", "pyspark", "packages", "extras"]
+    assert names == [
+        "runtime",
+        "session",
+        "pyspark",
+        "packages",
+        "extras",
+        "libraries",
+    ]
     assert "secrets" not in names
 
 
@@ -363,6 +371,7 @@ def test_main_json_is_machine_readable(off_cluster, monkeypatch, capsys):
         "pyspark",
         "packages",
         "extras",
+        "libraries",
     }
 
 
@@ -440,3 +449,95 @@ def test_main_entry_point_never_blocks_a_run(off_cluster, monkeypatch, caplog):
     with caplog.at_level(logging.WARNING):
         cli._warn_if_databricks_child_process()
     assert caplog.text == ""
+
+
+# ---------------------------------------------------------------------------
+# libraries — hazard: the library set was resolved against another runtime
+# ---------------------------------------------------------------------------
+
+
+def _library_set(tmp_path, *runtimes: int):
+    """A fake checkout carrying a tagged requirements file per runtime."""
+    (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    directory = tmp_path / "databricks"
+    directory.mkdir()
+    for runtime in runtimes:
+        (directory / f"requirements-dbr{runtime}.txt").write_text(
+            f"# header\n# databricks-runtime: {runtime}\nhvac==2.4.0\n",
+            encoding="utf-8",
+        )
+    return tmp_path / "pyproject.toml"
+
+
+def test_libraries_skips_off_cluster(off_cluster, tmp_path):
+    assert dc.check_libraries(_library_set(tmp_path, 19)).status == SKIP
+
+
+def test_libraries_passes_when_a_set_matches(on_cluster, tmp_path):
+    result = dc.check_libraries(_library_set(tmp_path, 18, 19))
+    assert result.status == PASS
+    assert "requirements-dbr19.txt" in result.summary
+
+
+def test_libraries_warns_when_the_running_runtime_has_no_set(
+    on_cluster, monkeypatch, tmp_path
+):
+    """The user's case: an 18 LTS cluster against a set resolved for DBR 19."""
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "18.3")
+    result = dc.check_libraries(_library_set(tmp_path, 19))
+    assert result.status == WARN
+    assert "DBR 18.3" in result.summary and "DBR 19" in result.summary
+    assert result.fix is not None and "silently upgraded" in result.fix
+
+
+def test_libraries_reads_the_runtime_from_the_file_not_the_filename(
+    on_cluster, monkeypatch, tmp_path
+):
+    """The tag is the source of truth, so adding a set is adding files only."""
+    pyproject = _library_set(tmp_path, 19)
+    stray = tmp_path / "databricks" / "requirements-dbr21.txt"
+    stray.write_text("# no tag here\nhvac==2.4.0\n", encoding="utf-8")
+
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "21.0")
+
+    result = dc.check_libraries(pyproject)
+    assert result.status == WARN  # the untagged file does not count as a set
+
+
+def test_libraries_skips_without_a_databricks_directory(on_cluster, tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    result = dc.check_libraries(tmp_path / "pyproject.toml")
+    assert result.status == SKIP
+
+
+def test_the_repo_ships_a_tagged_set_for_every_requirements_file():
+    """Guards the real files: a set is a *pair*, and both carry the same tag."""
+    directory = pathlib.Path(__file__).resolve().parents[1] / "databricks"
+    requirements = sorted(directory.glob("requirements-dbr*.txt"))
+    assert requirements, "no compute library sets found"
+    for path in requirements:
+        runtime = path.stem.removeprefix("requirements-dbr")
+        constraints = directory / f"constraints-dbr{runtime}.txt"
+        assert constraints.is_file(), f"{path.name} has no constraints sibling"
+        for file in (path, constraints):
+            match = dc._RUNTIME_TAG.search(file.read_text(encoding="utf-8"))
+            assert match, f"{file.name} has no '# databricks-runtime:' tag"
+            assert match.group(1) == runtime, f"{file.name} is tagged {match.group(1)}"
+
+
+def test_the_library_sets_and_their_constraints_are_disjoint():
+    """A package is either shipped by the runtime or installed over it, not both."""
+    directory = pathlib.Path(__file__).resolve().parents[1] / "databricks"
+
+    def _names(path):
+        names = set()
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.split("#")[0].split(";")[0].strip()
+            if "==" in line:
+                names.add(line.split("==")[0].strip().lower())
+        return names
+
+    for path in sorted(directory.glob("requirements-dbr*.txt")):
+        runtime = path.stem.removeprefix("requirements-dbr")
+        overlap = _names(path) & _names(directory / f"constraints-dbr{runtime}.txt")
+        assert not overlap, f"DBR {runtime}: in both files: {sorted(overlap)}"

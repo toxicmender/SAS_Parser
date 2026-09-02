@@ -11,6 +11,7 @@ expensive precisely because none of them says what it is::
     pyspark   does the installed Python client match the JVM it is talking to?
     packages  is every declared dependency installed, at or above its floor?
     extras    which optional extras are present — and is `spark` wrongly among them?
+    libraries does this repo ship a compute library set for the running DBR?
 
 Nothing here writes, starts a session, or costs an LLM call. Every stage runs
 offline; ``--check-secrets`` adds the one network stage, a real read of the
@@ -76,6 +77,7 @@ import argparse
 import importlib.metadata as importlib_metadata
 import logging
 import os
+import re
 import sys
 import tomllib
 from pathlib import Path
@@ -435,7 +437,7 @@ def check_packages(pyproject: Path | None = None) -> CheckResult:
                 "On a cluster this is a failed library install - the Libraries "
                 "tab shows FAILED while the notebook attaches anyway. Check "
                 "the cluster event log, and that the compute library points at "
-                "databricks/requirements.txt."
+                "databricks/requirements-dbr<N>.txt."
             ),
         )
     return CheckResult(
@@ -491,6 +493,91 @@ def check_extras(pyproject: Path | None = None) -> CheckResult:
         "extras",
         PASS,
         "optional extras resolved" + (" (on a cluster)" if on_cluster else ""),
+        detail,
+    )
+
+
+#: Line the library-set files carry so this stage reads the runtime they were
+#: resolved against out of the file rather than out of a constant here, which
+#: would drift the moment a set is added. Same reasoning as `check_packages`
+#: reading pyproject.toml instead of a copied list.
+_RUNTIME_TAG = re.compile(r"^#\s*databricks-runtime:\s*(\d+)", re.MULTILINE)
+
+
+def check_libraries(pyproject: Path | None = None) -> CheckResult:
+    """Does this repo ship a compute library set for the runtime we are on?
+
+    A *different* question from ``packages``, and neither answers the other.
+    The Libraries tab points at a path outside this process — a Volume or a
+    Workspace file — so nothing here can know which file was actually
+    installed. This stage answers "is there a set for this runtime at all",
+    which is what catches a cluster upgraded to a DBR the repo has never been
+    resolved against; ``packages`` answers "is what *is* installed sufficient",
+    by reading pyproject against the installed distributions. Together they are
+    the answer; alone, neither is.
+
+    A WARN, never a FAIL: an unlisted runtime may work perfectly well. It is
+    the silence that is expensive, not the mismatch.
+    """
+    from .databricks import in_databricks_runtime
+
+    version = os.environ.get("DATABRICKS_RUNTIME_VERSION")
+    if not in_databricks_runtime():
+        return CheckResult(
+            "libraries", SKIP, "not running on a Databricks cluster"
+        )
+
+    found = pyproject or find_pyproject()
+    directory = (found.parent / "databricks") if found else None
+    if directory is None or not directory.is_dir():
+        return CheckResult(
+            "libraries",
+            SKIP,
+            "no databricks/ directory above this module (an installed wheel?)",
+        )
+
+    shipped: dict[str, str] = {}
+    for path in sorted(directory.glob("requirements-dbr*.txt")):
+        match = _RUNTIME_TAG.search(path.read_text(encoding="utf-8"))
+        if match:
+            shipped[match.group(1)] = path.name
+
+    running = version.split(".")[0] if version else ""
+    detail: dict[str, Any] = {
+        "running": version or "unset",
+        "library sets": ", ".join(
+            f"DBR {major} ({name})" for major, name in sorted(shipped.items())
+        )
+        or "none found",
+        "directory": str(directory),
+    }
+
+    if not shipped:
+        return CheckResult(
+            "libraries",
+            SKIP,
+            "no tagged library sets found",
+            detail,
+            fix="Each requirements-dbr<N>.txt needs a '# databricks-runtime: <N>' line.",
+        )
+    if running not in shipped:
+        return CheckResult(
+            "libraries",
+            WARN,
+            f"running DBR {version}, but this repo ships sets for "
+            f"DBR {', '.join(sorted(shipped))} only",
+            detail,
+            fix=(
+                "The installed libraries were resolved against a different "
+                "runtime, so a version this one already ships may have been "
+                "silently upgraded cluster-wide. See databricks/README.md for "
+                "how to resolve a set against this runtime."
+            ),
+        )
+    return CheckResult(
+        "libraries",
+        PASS,
+        f"a library set for DBR {running} is checked in ({shipped[running]})",
         detail,
     )
 
@@ -579,6 +666,7 @@ def run_checks(*, check_secrets: bool = False) -> list[CheckResult]:
         check_pyspark(),
         check_packages(),
         check_extras(),
+        check_libraries(),
     ]
     if check_secrets:
         results.append(check_secret_scope())

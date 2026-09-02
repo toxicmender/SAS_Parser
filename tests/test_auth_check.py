@@ -106,6 +106,19 @@ def _by_name(results: list[Any]) -> dict[str, Any]:
     return {result.name: result for result in results}
 
 
+@pytest.fixture
+def extras_installed(monkeypatch):
+    """Report every optional auth dependency as present.
+
+    CI's test job installs neither `databricks`, `azure` nor `sharepoint` — the
+    in-memory paths need none of them — so without this the whole chain would
+    stop at "databricks-sdk is not installed" and these tests would assert the
+    venv rather than the logic. Owning the fact here also means the *absence*
+    branch gets a test of its own instead of being whatever the environment did.
+    """
+    monkeypatch.setattr(auth_check, "_installed", lambda _distribution: True)
+
+
 # ---------------------------------------------------------------------------
 # Offline is offline
 # ---------------------------------------------------------------------------
@@ -126,7 +139,7 @@ def no_network(monkeypatch):
     monkeypatch.setattr(vault, "get_ai_gateway_secret", _forbidden)
 
 
-def test_the_dry_run_contacts_nothing(no_network, child_process, monkeypatch):
+def test_the_dry_run_contacts_nothing(extras_installed, no_network, child_process, monkeypatch):
     """The headline property, with the chain fully configured so it is tempted."""
     monkeypatch.setenv("VAULT_ADDR", "https://vault.example:8200")
     monkeypatch.setenv("VAULT_APP_NAME", "sas-parser")
@@ -136,7 +149,7 @@ def test_the_dry_run_contacts_nothing(no_network, child_process, monkeypatch):
     assert len(results) == 8
 
 
-def test_the_dry_run_reproduces_the_incident(no_network, child_process):
+def test_the_dry_run_reproduces_the_incident(extras_installed, no_network, child_process):
     """The whole point: the offline report names the cause of the real failure.
 
     A `!python main.py ...` cell on a cluster, with the scope configured and
@@ -156,7 +169,7 @@ def test_the_dry_run_reproduces_the_incident(no_network, child_process):
 
 
 def test_the_same_deployment_is_clean_from_the_notebook(
-    no_network, child_process, in_repl
+    extras_installed, no_network, child_process, in_repl
 ):
     """One thing differs — the process — and three hops change verdict."""
     stages = _by_name(auth_check.run_checks())
@@ -167,7 +180,7 @@ def test_the_same_deployment_is_clean_from_the_notebook(
     assert "the cluster runtime's own" in stages["bootstrap"].summary
 
 
-def test_a_pat_makes_a_child_process_workable(no_network, child_process, monkeypatch):
+def test_a_pat_makes_a_child_process_workable(extras_installed, no_network, child_process, monkeypatch):
     monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-child")
 
     stages = _by_name(auth_check.run_checks())
@@ -178,7 +191,7 @@ def test_a_pat_makes_a_child_process_workable(no_network, child_process, monkeyp
     assert stages["bootstrap"].detail["bootstrap credential"] == "DATABRICKS_TOKEN"
 
 
-def test_provenance_names_which_source_won(no_network, monkeypatch, tmp_path):
+def test_provenance_names_which_source_won(extras_installed, no_network, monkeypatch, tmp_path):
     """A value right in config.json and stale in the environment looks the same."""
     cfg = tmp_path / "config.json"
     cfg.write_text(
@@ -213,12 +226,43 @@ def test_secret_shaped_settings_are_reported_as_presence_only(no_network, monkey
     assert "the-actual-arm-secret" not in auth_check.render(results, verbose=True)
 
 
+def test_a_missing_sdk_fails_the_bootstrap_hop(no_network, child_process, monkeypatch):
+    """Without databricks-sdk the scope cannot be read, and saying so is the job.
+
+    A cluster always has it. Off one, a checkout without the `databricks` extra
+    is a normal state — the in-memory paths need none of it — so this must
+    report a missing dependency rather than a missing credential, which is the
+    conclusion the SDK's own ImportError would lead someone to.
+    """
+    monkeypatch.setattr(
+        auth_check, "_installed", lambda distribution: distribution != "databricks.sdk"
+    )
+
+    stages = _by_name(auth_check.run_checks())
+
+    assert stages["bootstrap"].status == FAIL
+    assert "databricks-sdk is not installed" in stages["bootstrap"].summary
+    assert stages["bootstrap"].detail["databricks-sdk"] == "missing"
+
+
+def test_a_missing_msal_skips_the_graph_hop(live_chain, monkeypatch):
+    """No msal, no token — but that is a skip, not a failed credential."""
+    monkeypatch.setattr(
+        auth_check, "_installed", lambda distribution: distribution != "msal"
+    )
+
+    graph = _by_name(auth_check.run_checks(live=True))["graph"]
+
+    assert graph.status == SKIP
+    assert "msal is not installed" in graph.summary
+
+
 # ---------------------------------------------------------------------------
 # Gating — what a failed hop does to the ones after it
 # ---------------------------------------------------------------------------
 
 
-def test_a_failed_bootstrap_skips_everything_downstream(no_network, monkeypatch):
+def test_a_failed_bootstrap_skips_everything_downstream(extras_installed, no_network, monkeypatch):
     """No credential can authenticate the scope read, so nothing after it can run."""
     monkeypatch.setenv("DATABRICKS_HOST", "https://adb-1.net")
     monkeypatch.setenv("DATABRICKS_SECRET_SCOPE", SCOPE)
@@ -231,7 +275,7 @@ def test_a_failed_bootstrap_skips_everything_downstream(no_network, monkeypatch)
         assert "bootstrap" in stages[name].summary
 
 
-def test_the_two_principals_fail_independently(no_network, child_process, in_repl):
+def test_the_two_principals_fail_independently(extras_installed, no_network, child_process, in_repl):
     """One scope, two principals under different keys.
 
     When `sp-hsv-*` resolves and `saact-hsv-*` does not, running both is what
@@ -276,7 +320,7 @@ class _FakeAzureClient:
 
 
 @pytest.fixture
-def live_chain(monkeypatch, child_process, in_repl):
+def live_chain(monkeypatch, extras_installed, child_process, in_repl):
     """Every credential readable, faked at app_config's own seams."""
     monkeypatch.setenv("VAULT_ADDR", "https://vault.example:8200")
     monkeypatch.setenv("VAULT_APP_NAME", "sas-parser")
@@ -368,7 +412,7 @@ def test_a_failed_scope_read_fails_the_bootstrap_hop(live_chain, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_the_report_is_ascii(no_network, child_process):
+def test_the_report_is_ascii(extras_installed, no_network, child_process):
     """Read over RDP to a Windows host as often as in a modern terminal.
 
     Asserted over the stages this module authors. The `sharepoint` hop is
@@ -386,14 +430,14 @@ def test_the_report_is_ascii(no_network, child_process):
     assert "Credential chain dry run" in report
 
 
-def test_the_cli_is_offline_by_default(no_network, child_process, capsys):
+def test_the_cli_is_offline_by_default(extras_installed, no_network, child_process, capsys):
     code = auth_check.main([])
 
     assert code == 1  # the child-process FAIL
     assert "child process" in capsys.readouterr().out
 
 
-def test_the_cli_emits_json(no_network, child_process, capsys):
+def test_the_cli_emits_json(extras_installed, no_network, child_process, capsys):
     import json
 
     auth_check.main(["--json"])
@@ -406,5 +450,5 @@ def test_the_cli_emits_json(no_network, child_process, capsys):
     ]
 
 
-def test_the_cli_returns_zero_when_nothing_failed(no_network, child_process, in_repl):
+def test_the_cli_returns_zero_when_nothing_failed(extras_installed, no_network, child_process, in_repl):
     assert auth_check.main([]) == 0
