@@ -652,13 +652,14 @@ def test_detection_imports_nothing(monkeypatch, _isolated):
     for name in ("dbruntime", "dbruntime.databricks_repl_context", "IPython"):
         monkeypatch.delitem(sys.modules, name, raising=False)
 
+    # The delta, not the absolute set: another test in the session may
+    # legitimately have imported pyspark, and that is not this call's doing.
+    before = set(sys.modules)
     databricks.process_shape()
     databricks.notebook_evidence()
+    imported = set(sys.modules) - before
 
-    assert "dbruntime" not in sys.modules
-    assert "dbruntime.databricks_repl_context" not in sys.modules
-    assert "IPython" not in sys.modules
-    assert "pyspark" not in sys.modules
+    assert imported == set(), f"detection imported {sorted(imported)}"
 
 
 def test_notebook_evidence_whitelists_the_repl_context(monkeypatch, _isolated):

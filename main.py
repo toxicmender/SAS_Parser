@@ -26,8 +26,26 @@ Usage
     python main.py --app "MyApp"                # one application's rows
     python main.py --no-upload                  # dry run: convert, write nothing
     python main.py --check                      # preflight only: read, convert nothing
+    python main.py --check-auth                 # resolve the credential chain, offline
     python main.py path/to/sas --out-dir out/   # the local fallback
     python main.py path/to/sas --md report.md --pdf report.pdf
+
+On a Databricks cluster
+-----------------------
+Run it from a **cell**, not from ``!python main.py …``::
+
+    import main
+    main.run_in_notebook("--reference-dir '/Workspace/…/reference_docs' --request-id 80")
+
+The two are not equivalent. A ``!python`` or ``%sh`` cell is a child process,
+and on a cluster it inherits ``DATABRICKS_RUNTIME_VERSION`` but *not* the
+notebook's workspace credential — so it detects Databricks, takes the notebook
+auth path, and dies on the Databricks secret-scope read with a message about
+the Azure CLI or ``'NoneType' object has no attribute 'parent_header'``.
+:func:`run_in_notebook` runs in the notebook's own Python, where the credential
+is simply present, and refuses outright rather than warning when it is not.
+``databricks/run_conversion.py`` is the same three cells as an importable
+notebook.
 
 Debugging a SharePoint deployment
 ---------------------------------
@@ -38,6 +56,14 @@ registration, then reads the library and each configured list — writing
 nothing and paying no LLM. ``python -m app_config.sharepoint_check`` is the
 same preflight standalone, and takes ``--offline`` to check the configuration
 with no network at all.
+
+``--check-auth`` is the one to start with when the failure is a *credential*
+rather than a path: it walks the whole chain — process shape, workspace
+credential, secret-scope bootstrap, both service principals in the scope, the
+Graph token, the Vault login, the gateway secret — and reports where every
+value came from, contacting nothing.
+``python -m app_config.auth_check --live`` is the same walk with the reads and
+token mints actually performed.
 
 ``--log-file`` captures a run (secrets redacted), and ``--trace-http`` adds the
 individual Graph requests. Plain ``--debug`` deliberately leaves the transport
@@ -174,6 +200,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "each configured list. Writes nothing. Same as "
         "'python -m app_config.sharepoint_check'.",
     )
+    sharepoint.add_argument(
+        "--check-auth",
+        action="store_true",
+        dest="check_auth",
+        help="Run the credential-chain dry run and exit: resolve every hop "
+        "from the process shape through the Databricks secret scope to the "
+        "Graph, Vault and AI-gateway credentials, reporting where each value "
+        "came from. Contacts nothing. Add --live to actually read the scope "
+        "and mint the tokens: 'python -m app_config.auth_check --live'.",
+    )
 
     local = parser.add_argument_group("Local mode (with a source directory)")
     local.add_argument(
@@ -300,6 +336,7 @@ _SHAREPOINT_ONLY = (
     "--no-xref",
     "--xref-apply",
     "--check",
+    "--check-auth",
 )
 _LOCAL_ONLY = ("--out-dir", "--md", "--pdf")
 
@@ -320,6 +357,7 @@ def _argument_error(args: argparse.Namespace) -> str | None:
             ("--no-xref", args.no_xref),
             ("--xref-apply", args.xref_apply),
             ("--check", args.check),
+            ("--check-auth", args.check_auth),
         ):
             if value:
                 return (
@@ -343,9 +381,12 @@ def _argument_error(args: argparse.Namespace) -> str | None:
                 )
         if args.request_id and args.app:
             return "--request-id and --app both narrow the row set; give one"
-        if args.check and (args.request_id or args.app or args.all_rows):
+        if (args.check or args.check_auth) and (
+            args.request_id or args.app or args.all_rows
+        ):
+            flag = "--check" if args.check else "--check-auth"
             return (
-                "--check inspects the deployment rather than any particular "
+                f"{flag} inspects the deployment rather than any particular "
                 "row; drop the row filter."
             )
     if args.validation_retries < 0:
@@ -354,7 +395,7 @@ def _argument_error(args: argparse.Namespace) -> str | None:
     # model. Requiring them would make the diagnostic unusable on exactly the
     # machine it exists to diagnose — a fresh checkout where reference_docs/ is
     # gitignored and absent.
-    if not args.check and not args.reference_dir.is_dir():
+    if not (args.check or args.check_auth) and not args.reference_dir.is_dir():
         return f"reference_dir is not a directory: {args.reference_dir}"
     return None
 
@@ -715,11 +756,23 @@ def _warn_if_databricks_child_process() -> None:
         logger.warning(f"{result.summary} - {result.fix}")
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None, *, capture_crashes: bool = True
+) -> int:
+    """Run one invocation and return its exit status.
+
+    *capture_crashes* is threaded to :func:`~app_config.logging_setup.configure_logging`
+    so an embedding caller — :func:`run_in_notebook`, a test — can keep its own
+    :data:`sys.excepthook` and :data:`threading.excepthook`. A command line
+    wants the default; a notebook session that must survive the call does not.
+    """
     args = parse_args(argv)
 
     configure_logging(
-        debug=args.debug, log_file=args.log_file, trace_http=args.trace_http
+        debug=args.debug,
+        log_file=args.log_file,
+        trace_http=args.trace_http,
+        capture_crashes=capture_crashes,
     )
     # Before anything reads it: the Vault credentials, OPENAI_API_KEY, and the
     # SharePoint/Azure settings all live there. The real shell environment wins.
@@ -730,11 +783,119 @@ def main(argv: list[str] | None = None) -> int:
     if problem is not None:
         return _fail(problem)
 
+    if args.check_auth:
+        return _run_auth_check(args)
     if args.check:
         return _run_check(args)
     if args.sas_dir is not None:
         return _run_local(args)
     return _run_sharepoint(args)
+
+
+def run_in_notebook(
+    argv: list[str] | str | None = None,
+    *,
+    require_repl: bool = True,
+    reset_caches: bool = False,
+) -> int:
+    """Run a conversion from inside a Databricks notebook's own Python.
+
+    The replacement for a ``!python main.py …`` cell, and the reason it exists
+    is that the two are *not* equivalent on a cluster. A ``!python`` /
+    ``%sh`` / :mod:`subprocess` cell is a child process: it inherits
+    ``DATABRICKS_RUNTIME_VERSION`` but not the notebook's workspace credential,
+    so it detects Databricks, takes the notebook auth path, and then fails the
+    Databricks secret-scope read from inside the SDK with a message that names
+    the Azure CLI or ``'NoneType' object has no attribute 'parent_header'`` —
+    neither of which is about the actual problem. Called from a real cell this
+    function is the same process as the notebook, so the credential is simply
+    there.
+
+    It is a thin wrapper on purpose. :func:`main` still parses and dispatches
+    (Architecture.md invariant 12, "One entry point"): a second flow that grew
+    its own argument handling would drift from the CLI's, and the two would
+    disagree about the very deployment this is meant to make reachable.
+    Calling the blocking SharePoint facade from a REPL that owns an event loop
+    is already supported — ``SharePointClient`` runs its Graph calls on its own
+    worker thread precisely because SharePoint mode is deployed in a notebook
+    (invariant 13) — so there is nothing async to arrange here.
+
+    Parameters
+    ----------
+    argv : list[str] | str | None
+        The arguments :func:`main` would take. A **string** is split with
+        :func:`shlex.split`, so the tail of an existing ``!python main.py …``
+        command can be pasted across unchanged, quoting and all. ``None``
+        means no arguments: every pending request row.
+    require_repl : bool
+        Refuse to run when this is not the notebook's own Python. On by
+        default, and the one place refusing is right — :func:`main` warns and
+        continues, which is what lets the misleading failure happen forty
+        seconds later. A child process carrying ``DATABRICKS_TOKEN`` has a
+        credential of its own and is allowed through with a warning. Pass
+        ``False`` for a deployment that knows better.
+    reset_caches : bool
+        Drop every cached config and credential first. Off by default: the
+        credential chain is walked once per invocation and reused deliberately
+        (invariant 12, "One credential chain"). Pass ``True`` after editing
+        environment variables in a cell above, which is the case a long-lived
+        notebook process has and a command line does not.
+
+    Returns
+    -------
+    int
+        :func:`main`'s exit status. Returned, never raised as ``SystemExit``,
+        so a failed run does not take the REPL down with it.
+
+    Raises
+    ------
+    RuntimeError
+        *require_repl* is set and this is a child process on a cluster. The
+        message is the preflight's own, so it reads identically here, in
+        ``python -m app_config.databricks_check``, and in the log line
+        :func:`main` emits.
+    """
+    import shlex
+
+    from app_config.databricks_check import FAIL, WARN, check_runtime
+
+    if argv is None:
+        arguments: list[str] = []
+    elif isinstance(argv, str):
+        arguments = shlex.split(argv)
+    else:
+        arguments = list(argv)
+
+    result = check_runtime()
+    if result.status == FAIL and require_repl:
+        raise RuntimeError(f"{result.summary} — {result.fix}")
+    if result.status == FAIL:
+        logger.warning(f"{result.summary} - {result.fix} (require_repl=False)")
+    elif result.status == WARN:
+        logger.warning(f"{result.summary} - {result.fix}")
+
+    if reset_caches:
+        _clear_caches()
+
+    status = main(arguments, capture_crashes=False)
+    if status:
+        logger.error(f"run_in_notebook: exit status {status}")
+    return status
+
+
+def _clear_caches() -> None:
+    """Drop every per-process config and credential cache.
+
+    Each module owns its own, and they are separate because they expire for
+    different reasons; there is no single call, so this is the list. Imported
+    lazily for the same reason the rest of the credential path is: none of
+    these modules should be pulled in by a run that never authenticates.
+    """
+    from app_config import azure, databricks, sharepoint, vault
+
+    app_config.clear_cache()
+    for module in (azure, databricks, sharepoint, vault):
+        module.clear_cache()
 
 
 def _run_check(args: argparse.Namespace) -> int:
@@ -744,6 +905,19 @@ def _run_check(args: argparse.Namespace) -> int:
     results = sharepoint_check.run_checks()
     print(sharepoint_check.render(results, verbose=args.debug))
     return 1 if any(r.status == sharepoint_check.FAIL for r in results) else 0
+
+
+def _run_auth_check(args: argparse.Namespace) -> int:
+    """Run the offline credential-chain dry run and print its report.
+
+    Offline only. The live form spends real credentials, and one way to do
+    that is enough: ``python -m app_config.auth_check --live``.
+    """
+    from app_config import auth_check
+
+    results = auth_check.run_checks()
+    print(auth_check.render(results, verbose=args.debug))
+    return 1 if any(r.status == auth_check.FAIL for r in results) else 0
 
 
 if __name__ == "__main__":
