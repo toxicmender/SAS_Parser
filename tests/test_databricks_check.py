@@ -42,15 +42,34 @@ class _Session:
         return _Ctx(self._master)
 
 
+class _Shell:
+    """An IPython shell stand-in. Its identity is all the detector reads."""
+
+
 @pytest.fixture
 def on_cluster(monkeypatch):
     """Make :func:`in_databricks_runtime` report a cluster."""
     monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "19.0")
+    monkeypatch.delenv("DATABRICKS_TOKEN", raising=False)
 
 
 @pytest.fixture
 def off_cluster(monkeypatch):
     monkeypatch.delenv("DATABRICKS_RUNTIME_VERSION", raising=False)
+
+
+@pytest.fixture
+def in_repl(monkeypatch):
+    """Put an IPython shell in ``sys.modules`` — i.e. be the notebook's Python.
+
+    IPython is not installed here and does not need to be: the detector only
+    ever *looks* in ``sys.modules``, deliberately, so that finding out whether
+    this is the notebook cannot import the modules whose import is the problem.
+    That design choice is what makes every process shape fakeable in-process.
+    """
+    monkeypatch.setitem(
+        sys.modules, "IPython", types.SimpleNamespace(get_ipython=lambda: _Shell())
+    )
 
 
 def _session(monkeypatch, session):
@@ -69,16 +88,23 @@ def test_runtime_skips_off_cluster(off_cluster, monkeypatch):
     assert "not running on a Databricks cluster" in result.summary
 
 
-def test_runtime_passes_in_the_notebook(on_cluster, monkeypatch):
+def test_runtime_passes_in_the_notebook(on_cluster, in_repl, monkeypatch):
     _session(monkeypatch, _Session())
     result = dc.check_runtime()
     assert result.status == PASS
     assert "19.0" in result.summary
+    assert result.detail["notebook REPL"].startswith("yes")
     assert result.detail["active SparkSession"] == "yes"
 
 
+def test_runtime_passes_in_the_notebook_without_a_session(on_cluster, in_repl, monkeypatch):
+    """A session is no longer required for a pass, either — it never meant this."""
+    _session(monkeypatch, None)
+    assert dc.check_runtime().status == PASS
+
+
 def test_runtime_detects_a_child_process(on_cluster, monkeypatch):
-    """The env var says cluster, but nothing built a session: a %sh child."""
+    """The env var says cluster, but there is no REPL: a %sh child."""
     _session(monkeypatch, None)
     result = dc.check_runtime()
     assert result.status == FAIL
@@ -86,6 +112,52 @@ def test_runtime_detects_a_child_process(on_cluster, monkeypatch):
     # The fix must name the actual cause, not restate the symptom.
     assert result.fix is not None
     assert "%sh" in result.fix and "DATABRICKS_TOKEN" in result.fix
+
+
+def test_runtime_detects_a_child_process_that_has_a_session(on_cluster, monkeypatch):
+    """The regression this stage was rewritten for.
+
+    A child process acquires a SparkSession as a *side effect* of the failure
+    being diagnosed: the SDK's ``runtime`` auth strategy imports ``dbruntime``
+    on its way to raising, and that import attaches Py4J to the driver's JVM.
+    The old session-based discriminator therefore reported a pass for every
+    caller that ran after the first failed secret read. The REPL is the signal
+    with no such lag.
+    """
+    _session(monkeypatch, _Session())
+    result = dc.check_runtime()
+    assert result.status == FAIL
+    assert "child process" in result.summary
+    assert result.detail["active SparkSession"] == "yes"
+    assert result.detail["notebook REPL"].startswith("no")
+
+
+def test_runtime_warns_for_a_child_process_carrying_a_pat(on_cluster, monkeypatch):
+    """A child with its own credential is a supported setup, not a failure."""
+    monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-child")
+    _session(monkeypatch, None)
+    result = dc.check_runtime()
+    assert result.status == WARN
+    assert "DATABRICKS_TOKEN" in result.summary
+    assert result.detail["workspace credential"] == "DATABRICKS_TOKEN is set"
+
+
+def test_runtime_reports_the_repl_context_without_the_token(on_cluster, in_repl, monkeypatch):
+    """The REPL context carries apiToken. It must never reach the report."""
+    context = types.SimpleNamespace(
+        notebookId="4321", clusterId="0101-x-abcd", apiToken="dapi-SECRET-VALUE"
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "dbruntime.databricks_repl_context",
+        types.SimpleNamespace(get_context=lambda: context),
+    )
+    _session(monkeypatch, _Session())
+    result = dc.check_runtime()
+    assert result.status == PASS
+    assert "notebookId=4321" in result.detail["REPL context"]
+    assert "dapi-SECRET-VALUE" not in json.dumps(result.detail)
+    assert "dapi-SECRET-VALUE" not in dc.to_json([result])
 
 
 # ---------------------------------------------------------------------------
@@ -331,12 +403,25 @@ def test_main_entry_point_warns_on_a_child_process(on_cluster, monkeypatch, capl
     assert "%sh" in caplog.text
 
 
-def test_main_entry_point_is_quiet_in_the_notebook(on_cluster, monkeypatch, caplog):
+def test_main_entry_point_is_quiet_in_the_notebook(on_cluster, in_repl, monkeypatch, caplog):
     import logging
 
     import main as cli
 
     _session(monkeypatch, _Session())
+    with caplog.at_level(logging.WARNING):
+        cli._warn_if_databricks_child_process()
+    assert caplog.text == ""
+
+
+def test_main_entry_point_is_quiet_for_a_child_with_a_pat(on_cluster, monkeypatch, caplog):
+    """It logs only on FAIL, and a PAT-carrying child is a WARN."""
+    import logging
+
+    import main as cli
+
+    monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-child")
+    _session(monkeypatch, None)
     with caplog.at_level(logging.WARNING):
         cli._warn_if_databricks_child_process()
     assert caplog.text == ""

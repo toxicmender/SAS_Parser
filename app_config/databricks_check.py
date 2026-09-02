@@ -22,12 +22,21 @@ The three failures
 inherited by every child of a cluster process, but the workspace *credential*
 lives in the REPL, not the environment. So a ``%sh python main.py ...`` cell
 detects "I am on Databricks", takes the notebook auth path, and fails the
-secret read — whereupon the SDK walks its whole auth chain and reports
-something about ``az account show`` that names nothing real. The ``runtime``
-stage detects the shape of that process directly, before any credential is
-touched, and says so in one line. See
-:func:`app_config.databricks.read_workspace_secrets`, whose ``_subprocess_hint``
-is the same diagnosis delivered too late to be cheap.
+secret read — whereupon the SDK walks its whole auth chain and reports either
+something about ``az account show`` or, when its ``runtime`` strategy gets far
+enough to reach for the REPL context, ``'NoneType' object has no attribute
+'parent_header'``. Neither names anything real. The ``runtime`` stage detects
+the shape of that process directly, before any credential is touched, and says
+so in one line. See :func:`app_config.databricks.read_workspace_secrets`, whose
+``_subprocess_hint`` is the same diagnosis delivered too late to be cheap.
+
+It discriminates on the notebook REPL
+(:func:`app_config.databricks.in_notebook_repl`), not on an active
+SparkSession. The session was the original signal and it is a *lagging* one:
+the SDK's ``runtime`` strategy imports ``dbruntime`` on its way to failing,
+that import attaches Py4J to the driver's JVM, and the child therefore acquires
+a session moments after being refused a credential. Anything that asked the old
+question after the first failed secret read got a pass.
 
 **The cluster already has a session.** Building one by master is wrong on
 Databricks — silently ignored on classic Dedicated compute, and refused
@@ -172,19 +181,38 @@ def check_runtime() -> CheckResult:
 
     The child-process case is the one worth catching: it looks exactly like a
     cluster to every environment check, and exactly like an Azure CLI problem
-    to the credential chain. An active SparkSession is the discriminator - the
-    notebook REPL has one, a ``%sh``/``subprocess`` child does not.
+    to the credential chain.
+
+    The discriminator is the **notebook REPL**, not an active SparkSession.
+    A session used to stand in for one, and it does not: a child process
+    acquires a session as a *side effect* of the very failure this stage
+    predicts — the SDK's ``runtime`` auth strategy imports ``dbruntime`` on its
+    way to failing, and that import attaches Py4J to the driver's JVM. So the
+    session appears moments after the credential is refused, and any run of
+    this stage after the first failed secret read would have reported a pass.
+    :func:`app_config.databricks.in_notebook_repl` has no such lag: its
+    ``False`` is the same missing ``get_ipython()`` the SDK reports as
+    ``'NoneType' object has no attribute 'parent_header'``.
     """
-    from .databricks import in_databricks_runtime
+    from .databricks import (
+        PROCESS_CHILD,
+        PROCESS_OFF_CLUSTER,
+        notebook_evidence,
+        process_shape,
+    )
 
     version = os.environ.get("DATABRICKS_RUNTIME_VERSION")
     detail: dict[str, Any] = {
         "DATABRICKS_RUNTIME_VERSION": version or "unset",
         "python": sys.version.split()[0],
         "executable": sys.executable,
+        # The pid the runtime's own "Connection to spark using Py4J from PID
+        # N" line names, so a report and a stray log line can be tied together.
+        "pid": os.getpid(),
     }
 
-    if not in_databricks_runtime():
+    shape = process_shape()
+    if shape == PROCESS_OFF_CLUSTER:
         return CheckResult(
             "runtime",
             SKIP,
@@ -192,9 +220,35 @@ def check_runtime() -> CheckResult:
             detail,
         )
 
-    active = _active_session()
-    detail["active SparkSession"] = "yes" if active is not None else "no"
-    if active is None:
+    detail.update(notebook_evidence())
+    # Reported, never decisive - see this function's docstring. Kept below the
+    # in_databricks_runtime() branch above so an off-cluster run still never
+    # imports pyspark (Architecture.md invariant 8).
+    detail["active SparkSession"] = "yes" if _active_session() is not None else "no"
+    detail["workspace credential"] = (
+        "DATABRICKS_TOKEN is set"
+        if os.environ.get("DATABRICKS_TOKEN")
+        else "the cluster runtime's own"
+    )
+
+    if shape == PROCESS_CHILD:
+        if os.environ.get("DATABRICKS_TOKEN"):
+            # The one legitimate child: it carries a credential of its own.
+            # _subprocess_hint makes the same exemption, and this stays a WARN
+            # so main's child-process warning (which logs only on FAIL) is
+            # silent for a setup that works.
+            return CheckResult(
+                "runtime",
+                WARN,
+                "a Databricks child process, authenticating with DATABRICKS_TOKEN",
+                detail,
+                fix=(
+                    "That is a supported setup - the secret-scope read will "
+                    "use the PAT rather than the notebook's credential. "
+                    "Nothing to change unless you expected the run to act as "
+                    "the notebook's own identity."
+                ),
+            )
         return CheckResult(
             "runtime",
             FAIL,
@@ -207,7 +261,9 @@ def check_runtime() -> CheckResult:
                 "misleading Azure CLI error. Run this in the notebook's own "
                 "Python (import the module and call it, or %run) instead of "
                 "'%sh python ...', '!python ...' or subprocess. If a child "
-                "process is genuinely intended, set DATABRICKS_TOKEN for it."
+                "process is genuinely intended, set DATABRICKS_TOKEN for it. "
+                "The notebook form of a run is: import main; "
+                "main.run_in_notebook('--request-id 80')."
             ),
         )
     return CheckResult(
