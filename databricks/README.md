@@ -20,6 +20,32 @@ a cluster whose major version has no set, it WARNs — the installed libraries
 were resolved against a different runtime, and a package that runtime already
 ships may have been silently upgraded cluster-wide.
 
+## Deploying the code to a cluster
+
+However the code gets onto the cluster, **what you copy decides what the
+preflight can check.** `app_config.databricks_check` walks up from its own
+location looking for a checkout, and falls back to the installed
+distribution's metadata; a deployment that provides neither gets three honest
+skips rather than three green checks — see the `runtime` stage's `app_config:`
+line for where it is actually running from.
+
+| You copy / install | `packages`, `extras` | `libraries` | `main.run_in_notebook` |
+|---|---|---|---|
+| The repo (Git folder, or the whole tree) | ✅ pyproject | ✅ | ✅ |
+| Package folders **+ `pyproject.toml`** | ✅ pyproject | only with `databricks/` too | needs `main.py` |
+| `%pip install` the built wheel | ✅ distribution metadata | ❌ excluded from the wheel | ✅ |
+| Package folders alone | ❌ skip | ❌ skip | needs `main.py` |
+
+Three things are easy to leave behind when copying folders:
+
+- **`pyproject.toml`** — one file, and `packages` and `extras` start working.
+- **`databricks/`** — the library sets, which `[tool.setuptools.packages.find]`
+  deliberately excludes from the wheel, so installing one never brings them.
+- **`main.py`** — a top-level *module*, not a package
+  (`[tool.setuptools] py-modules = ["main"]`), so a copy that took only the
+  package directories will not have it and `main.run_in_notebook(...)` fails on
+  `import main`.
+
 ## Pointing a cluster at one
 
 ```json

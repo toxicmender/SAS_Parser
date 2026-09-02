@@ -17,6 +17,14 @@ Nothing here writes, starts a session, or costs an LLM call. Every stage runs
 offline; ``--check-secrets`` adds the one network stage, a real read of the
 Databricks secret scope.
 
+A stage that cannot establish its answer reports ``SKIP`` and names what it
+could not read -- never ``PASS``. ``extras`` did once return a pass having
+opened nothing at all, which is the same defect as the ``runtime`` stage's old
+discriminator and worse than a failure, because it is believed. The
+``packages`` and ``extras`` stages resolve the requirement set through
+:func:`requirement_sources`: the checkout's ``pyproject.toml`` first, then the
+installed distribution's own metadata, then neither and a skip that says so.
+
 The three failures
 ------------------
 **A child process is not the notebook.** ``DATABRICKS_RUNTIME_VERSION`` is
@@ -68,6 +76,12 @@ thing the ``runtime`` stage exists to catch::
     from app_config.databricks_check import run_checks, render
     print(render(run_checks()))
 
+Use *this* module's :func:`render`, which the line above imports. It exists
+because a bare re-export of :func:`app_config.sharepoint_check.render` gave
+that documented call SharePoint's title and all-clear line over a Databricks
+report, while ``main()`` passed the right ones at its own call site and so
+never showed it.
+
 Logger name: ``app_config.databricks_check``.
 """
 
@@ -85,9 +99,18 @@ from typing import Any
 
 from . import load_dotenv_file
 from .logging_setup import configure_logging
-from .sharepoint_check import FAIL, PASS, SKIP, WARN, CheckResult, render, to_json
+from .sharepoint_check import FAIL, PASS, SKIP, WARN, CheckResult, to_json
+from .sharepoint_check import render as _render
 
 logger = logging.getLogger(__name__)
+
+#: The report's title and its all-clear line. They live here, not at main()'s
+#: call site, because the module docstring tells notebook users to import
+#: `render` directly -- and while this module simply re-exported
+#: sharepoint_check's, that documented form printed "SharePoint preflight" and
+#: "PASSED: SharePoint is reachable and configured" over a Databricks report.
+_TITLE = "Databricks runtime preflight"
+_PASSED = "PASSED: the runtime environment matches what the code expects"
 
 #: Extras that a Databricks deployment may legitimately have installed. Absence
 #: is not a failure - a local-mode run needs none of them - so these are
@@ -99,6 +122,13 @@ _FORBIDDEN_EXTRA = "spark"
 
 #: Distributions the `spark` extra brings, by the name pip files them under.
 _FORBIDDEN_DISTRIBUTIONS = ("pyspark", "delta-spark")
+
+#: This project, as pip files it. The fallback source for the requirement set
+#: when there is no checkout above this module.
+_DISTRIBUTION = "sas-parser"
+
+#: `Requires-Dist: hvac>=2.0; extra == "vault"` -> "vault".
+_EXTRA_MARKER = re.compile(r"""extra\s*==\s*['"]([^'"]+)['"]""")
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +193,84 @@ def _installed_version(distribution: str) -> str | None:
         return None
 
 
+def _requirements_from_metadata() -> tuple[list[str], dict[str, list[str]]] | None:
+    """This project's requirements out of its *installed distribution*.
+
+    The second source for the same question ``pyproject.toml`` answers, and
+    deliberately the one that exists when the file does not: a wheel carries
+    ``Requires-Dist`` (with ``; extra == "vault"`` markers) and
+    ``Provides-Extra``, which is the requirement set in another spelling. So a
+    deployment installed rather than checked out still gets a dependency check
+    instead of a stage that quietly passes.
+
+    ``None`` when this project is not an installed distribution either --
+    running from a source tree, or from package folders copied somewhere
+    without their pyproject. The caller must skip, not pass.
+    """
+    try:
+        meta = importlib_metadata.metadata(_DISTRIBUTION)
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+    core: list[str] = []
+    extras: dict[str, list[str]] = {
+        name: [] for name in (meta.get_all("Provides-Extra") or [])
+    }
+    for spec in meta.get_all("Requires-Dist") or []:
+        requirement, _, marker = str(spec).partition(";")
+        extra = _EXTRA_MARKER.search(marker)
+        if extra is None:
+            core.append(requirement.strip())
+        else:
+            extras.setdefault(extra.group(1), []).append(requirement.strip())
+    return core, extras
+
+
+def requirement_sources(
+    pyproject: Path | None = None,
+) -> tuple[list[str], dict[str, list[str]], str] | None:
+    """``(core, extras, where_it_came_from)``, or ``None`` when nothing declares them.
+
+    One resolution order, shared by :func:`check_packages` and
+    :func:`check_extras`, so the two cannot disagree about whether they are
+    able to check anything -- which is how one of them ended up reporting a
+    pass while having read nothing at all.
+    """
+    path = pyproject or find_pyproject()
+    if path is not None:
+        core, extras = _read_requirements(path)
+        return core, extras, str(path)
+
+    resolved = _requirements_from_metadata()
+    if resolved is not None:
+        return resolved[0], resolved[1], f"the installed {_DISTRIBUTION} distribution"
+    return None
+
+
+def _nothing_declares_them(stage: str) -> CheckResult:
+    """The shared skip for "there is nothing here to check against".
+
+    Names both sources and where it looked, because on a cluster this is
+    normally a *deployment* fact -- package folders copied without their
+    pyproject -- and the report is the only place that is visible.
+    """
+    return CheckResult(
+        stage,
+        SKIP,
+        f"nothing declares this project's dependencies; {stage} cannot be checked",
+        {
+            "pyproject.toml": "not found above this module",
+            "installed distribution": f"{_DISTRIBUTION} is not installed",
+            "app_config": str(Path(__file__).resolve().parent),
+        },
+        fix=(
+            "Copy pyproject.toml alongside the package folders, or install the "
+            "built wheel, so there is something to check against. See "
+            "databricks/README.md."
+        ),
+    )
+
+
 def _satisfies(version: str, specifier: Any) -> bool:
     """Whether *version* meets *specifier* (``True`` when there is no specifier)."""
     if specifier is None:
@@ -211,6 +319,12 @@ def check_runtime() -> CheckResult:
         # The pid the runtime's own "Connection to spark using Py4J from PID
         # N" line names, so a report and a stray log line can be tied together.
         "pid": os.getpid(),
+        # Which copy of this code is running. `executable` names the
+        # interpreter, not the package, and on a cluster those routinely come
+        # from different places -- a notebook-scoped env plus a Workspace
+        # folder. It is also the single fact that explains what the packages,
+        # extras and libraries stages below were and were not able to read.
+        "app_config": str(Path(__file__).resolve().parent),
     }
 
     shape = process_shape()
@@ -357,10 +471,34 @@ def check_pyspark() -> CheckResult:
     """
     client = _installed_version("pyspark")
     if client is None:
+        # No pip-installed pyspark. What that MEANS depends entirely on whether
+        # Spark is running, and reporting one answer for both cases is how this
+        # stage came to print "correct for an in-memory run" directly above a
+        # live Spark 4.1.0 session on a cluster.
+        #
+        # On a cluster the runtime's own pyspark has no dist-info visible from
+        # the notebook-scoped environment, so absence here is not absence of
+        # pyspark -- it is the absence of a pip install shadowing the runtime's,
+        # which is exactly the state this stage exists to confirm.
+        running = _active_session()
+        if running is None:
+            return CheckResult(
+                "pyspark",
+                SKIP,
+                "pyspark is not installed (correct for an in-memory run)",
+            )
+        try:
+            server = running.version
+        except Exception:  # pragma: no cover - depends on the session type
+            server = "unknown"
         return CheckResult(
             "pyspark",
-            SKIP,
-            "pyspark is not installed (correct for an in-memory run)",
+            PASS,
+            f"no pip-installed pyspark is shadowing the runtime's Spark {server}",
+            {
+                "client (pyspark)": "no distribution metadata (the runtime's own)",
+                "server Spark": server,
+            },
         )
 
     detail: dict[str, Any] = {"client (pyspark)": client}
@@ -411,18 +549,14 @@ def check_packages(pyproject: Path | None = None) -> CheckResult:
     Reads ``pyproject.toml`` rather than a copied list, so this cannot drift
     from what the code actually requires.
     """
-    path = pyproject or find_pyproject()
-    if path is None:
-        return CheckResult(
-            "packages",
-            SKIP,
-            "no pyproject.toml above this module; nothing to check against",
-        )
+    sources = requirement_sources(pyproject)
+    if sources is None:
+        return _nothing_declares_them("packages")
 
-    core, _ = _read_requirements(path)
+    core, _, declared_by = sources
     missing: list[str] = []
     outdated: list[str] = []
-    detail: dict[str, Any] = {"pyproject": str(path)}
+    detail: dict[str, Any] = {"declared by": declared_by}
 
     for spec in core:
         name, specifier = _parse_requirement(spec)
@@ -461,26 +595,36 @@ def check_packages(pyproject: Path | None = None) -> CheckResult:
 
 
 def check_extras(pyproject: Path | None = None) -> CheckResult:
-    """Which optional extras are present - and is ``spark`` wrongly among them?"""
+    """Which optional extras are present - and is ``spark`` wrongly among them?
+
+    This used to guard its whole body on having found a ``pyproject.toml`` and
+    then return PASS regardless, so a deployment with no checkout above it got
+    ``[ ok ] optional extras resolved`` having read nothing and resolved
+    nothing. A green check that did not check is the same defect this module's
+    ``runtime`` stage was rewritten for, one size down: it is worse than a red
+    one, because it is believed.
+    """
     from .databricks import in_databricks_runtime
 
-    detail: dict[str, Any] = {}
-    path = pyproject or find_pyproject()
-    if path is not None:
-        _, extras = _read_requirements(path)
-        for extra in _OPTIONAL_EXTRAS:
-            specs = extras.get(extra)
-            if not specs:
-                continue
-            names = [_parse_requirement(s)[0] for s in specs]
-            present = [n for n in names if _installed_version(n) is not None]
-            detail[extra] = (
-                "installed"
-                if len(present) == len(names)
-                else f"partial ({', '.join(present)})"
-                if present
-                else "not installed"
-            )
+    sources = requirement_sources(pyproject)
+    if sources is None:
+        return _nothing_declares_them("extras")
+
+    _, extras, declared_by = sources
+    detail: dict[str, Any] = {"declared by": declared_by}
+    for extra in _OPTIONAL_EXTRAS:
+        specs = extras.get(extra)
+        if not specs:
+            continue
+        names = [_parse_requirement(s)[0] for s in specs]
+        present = [n for n in names if _installed_version(n) is not None]
+        detail[extra] = (
+            "installed"
+            if len(present) == len(names)
+            else f"partial ({', '.join(present)})"
+            if present
+            else "not installed"
+        )
 
     on_cluster = in_databricks_runtime()
     installed = {d: _installed_version(d) for d in _FORBIDDEN_DISTRIBUTIONS}
@@ -542,10 +686,22 @@ def check_libraries(pyproject: Path | None = None) -> CheckResult:
     found = pyproject or find_pyproject()
     directory = (found.parent / "databricks") if found else None
     if directory is None or not directory.is_dir():
+        # Unlike packages/extras there is no second source to fall back to:
+        # databricks/ is excluded from the wheel by [tool.setuptools.packages
+        # .find], so an installed deployment has no library sets to compare
+        # against however it was installed. Only a checkout does.
         return CheckResult(
             "libraries",
             SKIP,
-            "no databricks/ directory above this module (an installed wheel?)",
+            "no databricks/ directory above this module; the shipped library "
+            "sets cannot be read",
+            {"app_config": str(Path(__file__).resolve().parent)},
+            fix=(
+                "Copy databricks/ (and pyproject.toml) alongside the package "
+                "folders to compare the running runtime against the sets this "
+                "repo ships. It is excluded from the wheel, so installing one "
+                "does not bring it. See databricks/README.md."
+            ),
         )
 
     shipped: dict[str, str] = {}
@@ -689,6 +845,20 @@ def run_checks(*, check_secrets: bool = False) -> list[CheckResult]:
     return results
 
 
+def render(results: list[CheckResult], *, verbose: bool = False) -> str:
+    """The results as the human-readable report, under this preflight's title.
+
+    A wrapper rather than a re-export of :func:`sharepoint_check.render`, whose
+    defaults name SharePoint. The module docstring documents importing this
+    from a notebook, and for as long as the re-export stood, that documented
+    call printed a SharePoint heading and "PASSED: SharePoint is reachable and
+    configured" over a Databricks report. ``main()`` supplied the right strings
+    at its own call site, which is exactly why nobody running the CLI ever saw
+    it.
+    """
+    return _render(results, verbose=verbose, title=_TITLE, passed=_PASSED)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the preflight from the command line. Non-zero if any stage failed."""
     parser = argparse.ArgumentParser(
@@ -737,12 +907,7 @@ def main(argv: list[str] | None = None) -> int:
         print(to_json(results))
     else:
         print(
-            render(
-                results,
-                verbose=args.verbose,
-                title="Databricks runtime preflight",
-                passed="PASSED: the runtime environment matches what the code expects",
-            )
+            render(results, verbose=args.verbose)
         )
     return 1 if any(r.status == FAIL for r in results) else 0
 

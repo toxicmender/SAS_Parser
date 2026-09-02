@@ -567,3 +567,240 @@ def test_session_skip_still_points_at_the_runtime_stage_for_a_child(
 ):
     _session(monkeypatch, None)
     assert "see the runtime stage" in dc.check_session().summary
+
+
+# ---------------------------------------------------------------------------
+# The report names its own product
+# ---------------------------------------------------------------------------
+
+
+def test_render_names_databricks_not_sharepoint(off_cluster, monkeypatch):
+    """The regression a cluster report surfaced.
+
+    This module re-exported ``sharepoint_check.render``, whose defaults name
+    SharePoint. ``main()`` overrode them at its call site, so the CLI was fine
+    and the form the module docstring documents for notebooks -- ``from
+    app_config.databricks_check import render`` -- printed "SharePoint
+    preflight" and "PASSED: SharePoint is reachable and configured" over a
+    Databricks report.
+    """
+    _session(monkeypatch, None)
+    report = dc.render(dc.run_checks())
+
+    assert report.splitlines()[0] == "Databricks runtime preflight"
+    assert "SharePoint" not in report
+
+
+def test_render_all_clear_line_names_the_runtime(off_cluster, monkeypatch):
+    _session(monkeypatch, None)
+    passing = [dc.CheckResult("runtime", PASS, "fine")]
+
+    assert "the runtime environment" in dc.render(passing)
+    assert "SharePoint is reachable" not in dc.render(passing)
+
+
+def test_main_and_render_agree(on_cluster, in_repl, monkeypatch, capsys):
+    """One source for the strings, so the CLI and the notebook cannot diverge."""
+    _session(monkeypatch, _Session(master="spark://x:7077"))
+    dc.main([])
+    assert capsys.readouterr().out.splitlines()[0] == "Databricks runtime preflight"
+
+
+# ---------------------------------------------------------------------------
+# A check that cannot check must not pass
+# ---------------------------------------------------------------------------
+
+
+def _no_checkout(monkeypatch):
+    """No pyproject.toml above the module: package folders copied somewhere."""
+    monkeypatch.setattr(dc, "find_pyproject", lambda start=None: None)
+
+
+def _no_distribution(monkeypatch):
+    def _missing(_name):
+        raise dc.importlib_metadata.PackageNotFoundError(_name)
+
+    monkeypatch.setattr(dc.importlib_metadata, "metadata", _missing)
+
+
+def _distribution(monkeypatch, text: str):
+    from email import message_from_string
+
+    monkeypatch.setattr(
+        dc.importlib_metadata, "metadata", lambda _name: message_from_string(text)
+    )
+
+
+_WHEEL_METADATA = """\
+Metadata-Version: 2.1
+Name: sas-parser
+Provides-Extra: vault
+Provides-Extra: sharepoint
+Requires-Dist: pydantic>=2.13.4
+Requires-Dist: hvac>=2.0; extra == "vault"
+Requires-Dist: msgraph-sdk>=1.5; extra == "sharepoint"
+Requires-Dist: definitely-not-installed>=1.0; extra == "sharepoint"
+"""
+
+
+def test_extras_skips_rather_than_passing_when_nothing_declares_them(
+    on_cluster, monkeypatch
+):
+    """The defect a cluster report surfaced: [ ok ] having opened nothing.
+
+    A green check that did not check is worse than a red one, because it is
+    believed. This is the same shape as the runtime stage's old discriminator.
+    """
+    _no_checkout(monkeypatch)
+    _no_distribution(monkeypatch)
+
+    result = dc.check_extras()
+
+    assert result.status == SKIP
+    assert result.status != PASS
+    assert "cannot be checked" in result.summary
+    assert result.detail["pyproject.toml"] == "not found above this module"
+    assert result.fix is not None and "pyproject.toml" in result.fix
+
+
+def test_packages_skips_on_the_same_condition(on_cluster, monkeypatch):
+    _no_checkout(monkeypatch)
+    _no_distribution(monkeypatch)
+
+    result = dc.check_packages()
+
+    assert result.status == SKIP
+    assert "cannot be checked" in result.summary
+
+
+def _installed(monkeypatch, *present: str):
+    """Own which distributions exist, rather than inheriting the venv's.
+
+    CI's test job installs neither `vault` nor `sharepoint` -- the in-memory
+    paths need none of them -- so a test that read the real environment here
+    would be asserting which extras this checkout happens to carry instead of
+    whether the metadata fallback parses and resolves them.
+    """
+    # Above every declared floor, so "present" means present rather than
+    # accidentally testing the version comparison as well.
+    monkeypatch.setattr(
+        dc, "_installed_version", lambda d: "99.0" if d in present else None
+    )
+
+
+def test_extras_falls_back_to_the_installed_distribution(on_cluster, monkeypatch):
+    """A wheel carries the same requirement set in another spelling."""
+    _no_checkout(monkeypatch)
+    _distribution(monkeypatch, _WHEEL_METADATA)
+    _installed(monkeypatch, "hvac", "msgraph-sdk")
+
+    result = dc.check_extras()
+
+    assert result.status == PASS
+    assert "distribution" in result.detail["declared by"]
+    # The extra == "..." markers were read back off Requires-Dist.
+    assert result.detail["vault"] == "installed"
+    # sharepoint declares two, one of which is absent.
+    assert result.detail["sharepoint"] == "partial (msgraph-sdk)"
+
+
+def test_packages_falls_back_to_the_installed_distribution(on_cluster, monkeypatch):
+    _no_checkout(monkeypatch)
+    _distribution(monkeypatch, _WHEEL_METADATA)
+    _installed(monkeypatch, "pydantic")
+
+    result = dc.check_packages()
+
+    assert result.status == PASS
+    assert result.detail["declared"] == 1  # only the unmarked Requires-Dist
+    assert "distribution" in result.detail["declared by"]
+
+
+def test_packages_fails_on_a_missing_core_dependency_from_metadata(
+    on_cluster, monkeypatch
+):
+    """The fallback is a real check, not a formality: it can fail."""
+    _no_checkout(monkeypatch)
+    _distribution(monkeypatch, _WHEEL_METADATA)
+    _installed(monkeypatch)  # nothing installed
+
+    result = dc.check_packages()
+
+    assert result.status == FAIL
+    assert result.detail["missing"] == "pydantic"
+
+
+def test_the_checkout_wins_over_the_distribution(on_cluster, monkeypatch, tmp_path):
+    """Both present: the source tree is what the code was resolved against."""
+    pyproject = _library_set(tmp_path, 19)
+    pyproject.write_text(
+        '[project]\ndependencies = ["hvac>=2.0"]\n', encoding="utf-8"
+    )
+    _distribution(monkeypatch, _WHEEL_METADATA)
+
+    _, _, declared_by = dc.requirement_sources(pyproject)
+
+    assert declared_by == str(pyproject)
+
+
+def test_requirement_sources_is_none_when_neither_exists(monkeypatch):
+    _no_checkout(monkeypatch)
+    _no_distribution(monkeypatch)
+
+    assert dc.requirement_sources() is None
+
+
+# ---------------------------------------------------------------------------
+# pyspark on a cluster, where its dist-info is not visible
+# ---------------------------------------------------------------------------
+
+
+def test_pyspark_passes_when_nothing_shadows_the_runtime(on_cluster, monkeypatch):
+    """The stage was inert on the one platform it exists for.
+
+    On DBR the runtime's pyspark has no dist-info in the notebook-scoped env,
+    so the client lookup returns None -- and the stage reported "correct for an
+    in-memory run" directly above a live Spark session. Absence of dist-info
+    with a session running does not mean pyspark is absent; it means no pip
+    install is shadowing the runtime's, which is the state this stage exists to
+    confirm.
+    """
+    monkeypatch.setattr(dc, "_installed_version", lambda d: None)
+    _session(monkeypatch, _Session(version="4.1.0"))
+
+    result = dc.check_pyspark()
+
+    assert result.status == PASS
+    assert "shadowing" in result.summary and "4.1.0" in result.summary
+    assert "in-memory" not in result.summary
+    assert result.detail["server Spark"] == "4.1.0"
+
+
+def test_pyspark_still_skips_for_a_real_in_memory_run(off_cluster, monkeypatch):
+    """No pyspark and no session: the message was right for this case all along."""
+    monkeypatch.setattr(dc, "_installed_version", lambda d: None)
+    _session(monkeypatch, None)
+
+    result = dc.check_pyspark()
+
+    assert result.status == SKIP
+    assert "correct for an in-memory run" in result.summary
+
+
+# ---------------------------------------------------------------------------
+# Where is this code actually running from
+# ---------------------------------------------------------------------------
+
+
+def test_runtime_reports_where_app_config_was_imported_from(on_cluster, monkeypatch):
+    """`executable` names the interpreter, not the package.
+
+    On a cluster those routinely come from different places, and which copy of
+    app_config is running is the fact that explains what the packages, extras
+    and libraries stages were able to read.
+    """
+    _session(monkeypatch, None)
+    location = dc.check_runtime().detail["app_config"]
+
+    assert location.endswith("app_config")
+    assert pathlib.Path(location).is_dir()
