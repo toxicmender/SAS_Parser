@@ -298,6 +298,33 @@ app_config/
                         permissions — the 403 diagnosis), then reads the
                         library and each configured list. Writes nothing and
                         calls no model. --offline stops after the config.
+  databricks_check.py   Read-only preflight for running ON a cluster
+                        (`python -m app_config.databricks_check`): the process
+                        shape, the Spark session, the pyspark/JVM pairing, the
+                        installed dependencies, and whether this repo ships a
+                        compute library set for the running DBR. Its `runtime`
+                        stage discriminates on the notebook REPL, NOT on an
+                        active SparkSession: a child process acquires one as a
+                        side effect of the credential failure being diagnosed
+                        (the SDK's `runtime` strategy imports dbruntime on its
+                        way to raising, and that attaches Py4J), so a session
+                        is a lagging indicator of the very thing it was being
+                        asked about. --check-secrets adds the one network stage.
+  auth_check.py         Dry run of the WHOLE credential chain
+                        (`python -m app_config.auth_check`, or
+                        `sas-parser --check-auth`): process shape, workspace
+                        credential, secret-scope bootstrap, both principals in
+                        the scope, Graph token, Vault login, gateway secret --
+                        eight hops, each reporting WHERE ITS VALUES CAME FROM.
+                        Offline by default (the inversion of sharepoint_check
+                        --offline: this runs where credentials are in doubt);
+                        --live performs the reads and mints. Reuses the sibling
+                        stages rather than restating them, and reads the
+                        gateway credential through vault.py rather than
+                        building an LLMClientConfig -- app_config is a leaf,
+                        and from_ai_gateway() owns that construction
+                        (invariant 12), so this verifies the CREDENTIAL, not
+                        the client. No stage puts a secret in its result.
   logging_setup.py      Console/file logging for the three CLI entry points.
                         --debug does NOT raise the HTTP transport libraries
                         (TRANSPORT_LOGGERS) to DEBUG; --trace-http is the
