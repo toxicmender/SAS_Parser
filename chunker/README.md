@@ -249,7 +249,18 @@ these silently changes behavior.
    is `prompt_builder`'s `[when: statement:...]` scope, which is what lets
    guidance fire on the steps that raise a problem instead of on every step.
    `SAS_DATA_STEP_STATEMENT_TOKENS` publishes the full vocabulary.
-8. **`SAS_FUNCTION_CATEGORIES` is advisory and deliberately partial.** It maps
+8. **`global_statement_keyword` names the statement that opened the chunk.**
+   `SAS_GLOBAL_STATEMENT_TOKENS` publishes its full vocabulary, for the same
+   reason: it is what `[when: global_statement:...]` scopes on. Alongside the
+   macro-variable and output statements it carries the **host-command escapes**
+   (`SAS_HOST_COMMAND_TOKENS`: `x`, `systask`, `sysexec`, `waitfor`), which are
+   grouped by the translation question they raise rather than by syntax class —
+   `%SYSEXEC` is a macro statement and `SYSTASK`/`WAITFOR` are host-documented,
+   but they all concern handing a string to the operating system and waiting on
+   it. ⚠️ `X` is recognised only with its quoted
+   argument or as the whole bare statement, because `x` is also one of the
+   commonest SAS variable names; `x = 1;` and `x + 1;` must stay DATA step body.
+9. **`SAS_FUNCTION_CATEGORIES` is advisory and deliberately partial.** It maps
    a function or routine name to its family in *SAS Functions and CALL Routines
    by Category*, and its only consumer is `prompt_builder`'s `[category: ...]`
    instruction scope (reached via `pipeline.prompting._constructs_for_item`, so

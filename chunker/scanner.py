@@ -205,6 +205,15 @@ _CLS_PROC_RE = re.compile(r"proc\b")
 _CLS_MACRO_RE = re.compile(r"%\s*macro\b")
 _CLS_INCLUDE_RE = re.compile(r"%\s*include\b")
 _CLS_MACROVAR_RE = re.compile(r"%\s*(?:let|put|global|local)\b")
+# Host-command escapes -> GLOBAL_STATEMENT. `X` needs care: it is also one of
+# the commonest SAS variable names, so the command form must be followed by its
+# quoted argument, and the argument-less form (which opens an interactive
+# shell) must be the *whole* statement — `_norm` has already stripped the
+# trailing `;`, so `x;` arrives here as bare `x`. That rejects `x = 1` and
+# `x + 1` while keeping both documented spellings of the statement.
+_CLS_HOSTCMD_RE = re.compile(
+    r"(?:x\s*(?:['\"]|$)|systask\b|waitfor\b|%\s*sysexec\b)"
+)
 _CLS_CTRLFLOW_RE = re.compile(r"%\s*(?:if|else|do|end|return|goto|abort)\b")
 _CLS_MACROCALL_RE = re.compile(r"%[A-Za-z_]\w*\b")
 _CLS_STEP_RE = re.compile(r"(?:run|quit)\b")
@@ -250,6 +259,10 @@ def _classify_normed(n: str) -> SasChunkKind | None:
     if _CLS_INCLUDE_RE.match(n):
         return SasChunkKind.INCLUDE
     if _CLS_MACROVAR_RE.match(n):
+        return SasChunkKind.GLOBAL_STATEMENT
+    # Before the macro-call branch: %SYSEXEC would otherwise be swept up as an
+    # ordinary macro invocation and lose its identity.
+    if _CLS_HOSTCMD_RE.match(n):
         return SasChunkKind.GLOBAL_STATEMENT
     if _CLS_CTRLFLOW_RE.match(n):
         return SasChunkKind.MACRO_CONTROL_FLOW

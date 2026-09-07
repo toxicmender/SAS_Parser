@@ -34,6 +34,7 @@ from chunker.keywords import (
     _SAS_FUNCTIONS,
     SAS_DATA_STEP_STATEMENT_TOKENS,
     SAS_FUNCTION_CATEGORIES,
+    SAS_GLOBAL_STATEMENT_TOKENS,
 )
 from chunker.models import SasChunkKind
 from pipeline.prompting import _META_FLAG_ATTRS
@@ -168,6 +169,8 @@ def test_every_directive_key_is_reachable(bundled):
                 ok = key.name in set(SAS_FUNCTION_CATEGORIES.values())
             elif key.kind == "statement":
                 ok = key.name in SAS_DATA_STEP_STATEMENT_TOKENS
+            elif key.kind == "global_statement":
+                ok = key.name in SAS_GLOBAL_STATEMENT_TOKENS
             else:
                 ok = True
             if not ok:
