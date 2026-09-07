@@ -531,7 +531,8 @@ instructions/
     datetime.md        epoch, INTNX/INTCK, date parts, date literals
     hashing.md         MD5 / SHA256 / HASHING family
     regex.md           PRX family
-    dataset_ops.md     SORT / APPEND / SET-union / dataset options
+    dataset_ops.md     SORT (as an ordered view) / APPEND / SET-union / dataset options
+    layout.md          stored sort order and indexes -> CLUSTER BY, not OPTIMIZE
     datastep.md        RETAIN, ARRAY, OUTPUT, sequential-IF consolidation
     formats.md         PROC FORMAT and PUT with a user-defined format
     lookup.md          hash-object lookups (the join they really are)
