@@ -147,7 +147,7 @@
   },
   "_sharepoint_comment": "Non-secret SharePoint (Microsoft Graph) settings only. There is no secret here. Identify the site with site_id, or site_hostname + site_path; drive_id targets a specific document library (default: the site's). Every key is also read from its SHAREPOINT_* env var, which wins over this file.",
   "_sharepoint_auth_comment": "SharePoint authenticates as its OWN service principal, not the 'azure' one that reaches Vault: same Databricks secret scope, different keys. secret_scope defaults to databricks.secret_scope, and tenant_id_key/client_id_key/client_secret_key default to saact-hsv-tenantid/saact-hsv-appid/saact-hsv-secret. Leave all four null unless the deployment files that principal somewhere else. When no scope is configured at all, the 'azure' identity is used instead, which is the local/dev path.",
-  "_sharepoint_paths_comment": "file_server_base_path is the applications root, DRIVE-relative: a leading 'Shared Documents/' is stripped on load, because Graph addresses items inside the library and a literal folder of that name does not exist. The four list ids drive the run -- requests, conversions, the XREF table, and complexity requests. A flow that needs an id which is not set fails naming the key rather than sending null to Graph.",
+  "_sharepoint_paths_comment": "file_server_base_path is the applications root, DRIVE-relative: a leading 'Shared Documents/' is stripped on load, because Graph addresses items inside the library and a literal folder of that name does not exist. kit_base_path is the KIT root one level above it, for output filed by analysis area rather than under an application -- complexity writes to {kit}/ComplexityAnalysis/Application/{application}/{label}/{timestamp}, a sibling of the applications tree. Changing either moves only future uploads; nothing migrates what is already there. The four list ids drive the run -- requests, conversions, the XREF table, and complexity requests. A flow that needs an id which is not set fails naming the key rather than sending null to Graph.",
   "sharepoint": {
     "site_hostname": null,
     "site_path": null,
@@ -156,6 +156,7 @@
     "scopes": null,
     "timeout": null,
     "file_server_base_path": null,
+    "kit_base_path": null,
     "secret_scope": null,
     "tenant_id_key": null,
     "client_id_key": null,
