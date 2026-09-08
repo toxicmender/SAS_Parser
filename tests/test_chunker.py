@@ -289,6 +289,68 @@ class TestSasSemanticChunker(unittest.TestCase):
         self.assertIn(SasChunkKind.GLOBAL_STATEMENT, kinds)
         self.assertIn(SasChunkKind.DATA_STEP, kinds)
 
+    def test_host_command_escapes_are_recognised(self):
+        # X / SYSTASK / %SYSEXEC hand a string to the operating system. Each is
+        # its own GLOBAL_STATEMENT so guidance can be scoped at it by name;
+        # before this they fell into UNKNOWN_STATEMENT_GROUP (X, SYSTASK) or
+        # were swept up as an ordinary macro call (%SYSEXEC), emitting no
+        # construct key at all.
+        source = (
+            "x 'cp /data/in.csv /data/archive/in.csv';\n"
+            'x "mkdir -p /data/out/&yyyymm";\n'
+            'systask command "aws s3 cp /out/ s3://b/" taskname=t1;\n'
+            "waitfor _all_ t1;\n"
+            "%sysexec rm -f /tmp/scratch.dat;\n"
+            "x;\n"
+        )
+        result = SasSemanticChunker().chunk_text(source)
+        self.assertEqual(
+            [c.kind for c in result.chunks],
+            [SasChunkKind.GLOBAL_STATEMENT] * 6,
+        )
+        self.assertEqual(
+            [c.metadata.global_statement_keyword for c in result.chunks],
+            ["x", "x", "systask", "waitfor", "sysexec", "x"],
+        )
+
+    def test_x_statement_does_not_swallow_variables_named_x(self):
+        # `x` is one of the commonest SAS variable names, so the X statement is
+        # recognised only with its quoted argument or as the whole (bare)
+        # statement. An assignment, a sum statement, and an x-prefixed name
+        # must all stay ordinary DATA step body.
+        source = (
+            "data work.a;\n"
+            "  set work.b;\n"
+            "  x = 1;\n"
+            "  x + 1;\n"
+            "  xtab = 3;\n"
+            "run;\n"
+        )
+        result = SasSemanticChunker().chunk_text(source)
+        self.assertEqual(
+            [c.kind for c in result.chunks], [SasChunkKind.DATA_STEP]
+        )
+
+    def test_host_command_tokens_are_in_the_published_vocabulary(self):
+        # The other end of the `[when: global_statement:x]` contract: a token
+        # the scanner can emit but the vocabulary omits is one no instruction
+        # is allowed to name.
+        from chunker.keywords import (
+            SAS_GLOBAL_STATEMENT_TOKENS,
+            SAS_HOST_COMMAND_TOKENS,
+        )
+
+        source = (
+            "x 'cp a b';\n"
+            'systask command "c" taskname=t1;\n'
+            "waitfor _all_ t1;\n"
+            "%sysexec rm -f /tmp/f;\n"
+        )
+        result = SasSemanticChunker().chunk_text(source)
+        emitted = {c.metadata.global_statement_keyword for c in result.chunks}
+        self.assertEqual(emitted, set(SAS_HOST_COMMAND_TOKENS))
+        self.assertTrue(emitted <= SAS_GLOBAL_STATEMENT_TOKENS)
+
     def test_libname_with_stray_run_is_recognised(self):
         # A multi-line LIBNAME (SAS/ACCESS engine, quoted &macro refs) followed
         # by a stray, no-op RUN;.  The LIBNAME is its own GLOBAL_STATEMENT and

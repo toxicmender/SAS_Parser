@@ -1,11 +1,59 @@
 ## [when: proc:sort] [kind: PROC_STEP] PROC SORT
-A bare `PROC SORT` with no `NODUPKEY`/`NODUPRECS` only orders rows. Spark is
-unordered, so a sort that merely feeds the next step usually **translates to
-nothing** — carry the intent into the consuming query's `ORDER BY` (or the
-`ORDER BY` of a window) instead of emitting a standalone sorted view, which
-Spark is free to reorder anyway.
+A `PROC SORT` names a dataset, so translate it to a named object: a view whose
+definition carries the `ORDER BY`. The step keeps its identity in the DAG, and
+the sort keys stay written down once instead of being copied into every
+consumer.
 
-De-duplication is the part that carries meaning:
+```sql
+-- proc sort data=work.txns out=work.txns_ord; by cust_id descending txn_dt;
+CREATE OR REPLACE TEMP VIEW txns_ord AS
+SELECT * FROM txns ORDER BY cust_id, txn_dt DESC;
+```
+
+`work.*` gives a `TEMP VIEW`, a permanent libref a
+`CREATE OR REPLACE VIEW <catalog>.mylib.txns_ord` — a view either way, since
+PROC SORT adds no columns and computes nothing.
+
+- `BY DESCENDING v` flips *that* column only: `by a descending b` is
+  `ORDER BY a, b DESC`, never `ORDER BY a DESC, b DESC`.
+- **Never invent a row-order column.** The ordered view is what preserves SAS
+  observation order; a synthetic `_row_id` or `MONOTONICALLY_INCREASING_ID()` is
+  neither reproducible nor equivalent. Where a later step needs the position,
+  take it from a `ROW_NUMBER()` over the *same* keys this view orders by.
+- ⚠️ **A view's `ORDER BY` orders that view, not its consumers.** An outer query
+  that joins, groups or unions over it may return rows in any order. So wherever
+  the order is load-bearing — a window frame, a `FIRST.`/`LAST.` emulation, a
+  `LIMIT`, a report — restate it there. The view tells you what to write in that
+  `ORDER BY`; it does not excuse it. A sort that merely feeds a following `BY`
+  step is exactly this case: emit the view, and let the join or window state its
+  own keys.
+- ⚠️ **In-place sort (no `OUT=`)**: input and output are the same dataset. Never
+  emit `CREATE OR REPLACE VIEW x AS SELECT * FROM x ORDER BY ...` — a view
+  cannot select from itself. Name the ordered view differently and repoint the
+  consumers, or use `CREATE OR REPLACE TABLE x AS SELECT ...` where the SAS
+  genuinely replaced a stored dataset, and say which under Risks.
+
+Ordering semantics to preserve:
+
+- **Missing values.** SAS sorts a missing numeric below every number, and
+  Spark's defaults already agree (`ASC` is `NULLS FIRST`, `DESC` is
+  `NULLS LAST`). ⚠️ Do not add `NULLS LAST` to an ascending sort "to be safe" —
+  that changes which rows come first, and under `NODUPKEY` which row survives.
+- **Stability.** `EQUALS` is the default, so SAS is a *stable* sort: rows tied
+  on the BY keys keep input order. Spark has neither stability nor an input
+  order to keep, so where ties decide an outcome add the tiebreaker to the
+  `ORDER BY` rather than assuming one. `NOEQUALS` says the SAS gave that
+  guarantee up already.
+- **Collation.** SAS's default on Windows and UNIX is ASCII, which Spark's
+  binary `STRING` comparison reproduces. ⚠️ `SORTSEQ=LINGUISTIC`, a `SORTSEQ=`
+  translation table, `EBCDIC` (the z/OS default), and
+  `DANISH`/`SWEDISH`/`NATIONAL`/`REVERSE` do not — those need a `COLLATE`
+  clause, so flag them rather than emitting a binary sort in their place.
+- `THREADS`/`NOTHREADS`, `SORTSIZE=`, `TAGSORT`, `PRESORTED`, `FORCE`,
+  `OVERWRITE`, `DATECOPY` tune the SAS sort, not its result. They translate to
+  **nothing**: note the drop once under Risks and emit no substitute.
+
+De-duplication is the part that changes the rows:
 
 - **`NODUPKEY`** keeps the first row per `BY` key. That is a window dedup, not
   `DISTINCT`:
@@ -24,6 +72,17 @@ De-duplication is the part that carries meaning:
   difference rather than assuming they agree.
 - `DUPOUT=` names a dataset of the removed rows: the same window with
   `QUALIFY ROW_NUMBER() OVER (...) > 1`.
+- **`NOUNIQUEKEY`** (alias `NOUNIKEY`) is the opposite operation, and is often
+  mistranslated as a dedup. It drops every BY group holding **exactly one** row
+  and keeps the surviving groups *whole* — BY-group integrity, not one row per
+  key. That is a count, not a row number:
+  `QUALIFY COUNT(*) OVER (PARTITION BY cust_id) > 1`. `UNIQUEOUT=` is the
+  complement (`= 1`). ⚠️ It cannot be combined with `NODUPKEY`, and `DUPOUT=`
+  pairs only with `NODUPKEY` — re-read any step that appears to mix them.
+
+Where de-duplication is present the sort chooses the surviving row, so fold the
+`ORDER BY` into the window rather than ordering a view and de-duplicating
+separately: **one** statement for the step.
 
 ⚠️ **Preserve de-duplication; never invent or remove it.** Keep every
 `DISTINCT` the SAS specifies, and add none it does not. Where a `DISTINCT`

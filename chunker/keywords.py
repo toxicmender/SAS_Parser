@@ -412,6 +412,35 @@ SAS_DATA_STEP_STATEMENT_TOKENS: frozenset[str] = frozenset(
     _SAS_DATA_STEP_STATEMENTS
 ) | {"set_multi", "subsetting_if", "dataset_option"}
 
+# Host-command escapes: statements that hand a string to the operating system,
+# plus the one that waits on it. `X` is a global statement proper (SAS Global
+# Statements: Reference, "X Statement" — it "issues an operating-system command
+# from within a SAS session"); `%SYSEXEC` is a macro statement, and
+# `SYSTASK`/`WAITFOR` are documented per operating environment in the SAS
+# Companions. They are grouped because they raise one translation question, not
+# because they share a syntax class — `%LET` and friends are likewise carried as
+# GLOBAL_STATEMENT already. `WAITFOR` is here because a `SYSTASK` without `WAIT`
+# is asynchronous and `WAITFOR` is what joins it: the pair decides whether the
+# translation blocks, so guidance must reach a lone `WAITFOR` too.
+SAS_HOST_COMMAND_TOKENS: frozenset[str] = frozenset(
+    {"x", "systask", "sysexec", "waitfor"}
+)
+
+# Every token `SasChunkMetadata.global_statement_keyword` can hold. Public for
+# the same reason as the DATA-step vocabulary above: it is what an instruction
+# scopes on (`[when: global_statement:x]`), and a rule naming anything outside
+# it can never fire. `title`/`footnote` are recorded without their optional
+# occurrence digit, so `title2` is `title`.
+SAS_GLOBAL_STATEMENT_TOKENS: frozenset[str] = (
+    frozenset(
+        {
+            "let", "put", "global", "local",
+            "libname", "filename", "title", "footnote", "ods",
+        }
+    )
+    | SAS_HOST_COMMAND_TOKENS
+)
+
 # A function call is ``name(`` where the name is not glued to a preceding ``%``,
 # ``&``, or ``.``; a CALL routine is ``CALL name`` at a word boundary. Both
 # scans capture the *generic* identifier token and leave the "is it a known

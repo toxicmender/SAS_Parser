@@ -122,6 +122,37 @@ every later step sees the final accumulated value, not a running one. The
 `CROSS JOIN` against a one-row view reproduces that read-after-write ordering
 explicitly. Passing `grand_total` as a bound parameter is equally correct.
 
+## [example: proc:sort] PROC SORT as an ordered view
+SAS:
+```sas
+proc sort data=work.txns out=work.txns_ord;
+  by cust_id descending txn_dt;
+run;
+
+proc sort data=mylib.accounts;
+  by acct_id;
+run;
+```
+
+Databricks SQL:
+```sql
+-- work.* output: the ordered view names what the next step consumes.
+CREATE OR REPLACE TEMP VIEW txns_ord AS
+SELECT * FROM txns ORDER BY cust_id, txn_dt DESC;
+
+-- In-place sort of a permanent dataset: layout intent, not a view. The rows
+-- are unchanged, so declare the layout instead of rewriting them.
+ALTER TABLE main.mylib.accounts CLUSTER BY (acct_id);
+OPTIMIZE FULL main.mylib.accounts;
+```
+Notes: `descending txn_dt` flips that column only. ⚠️ The view's `ORDER BY`
+orders the view, not whatever selects from it — a consumer that depends on the
+order must restate it. The second step has no `OUT=`, so input and output are
+the same permanent table: `CREATE OR REPLACE VIEW accounts AS SELECT * FROM
+accounts` would be self-referential, and `CLUSTER BY` is what "stored in
+`acct_id` order" means here. ⚠️ Clustering colocates rows for skipping; it does
+not make reads come back sorted.
+
 ## [example: proc:sort] PROC SORT NODUPKEY
 SAS:
 ```sas

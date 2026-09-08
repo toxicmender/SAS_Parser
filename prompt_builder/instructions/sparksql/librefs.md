@@ -43,7 +43,10 @@ filesystem path becomes a **Unity Catalog volume** path
 (`/Volumes/<catalog>/<schema>/<volume>/...`), which is where a governed
 workspace keeps non-tabular files; state the volume you assumed.
 
-⚠️ `filename x pipe '...'` runs an operating-system command. There is no SQL
-equivalent, and it is the SAS construct most likely to be doing something the
-lakehouse deliberately cannot — emit the non-convertible marker rather than
-guessing an intent. The same goes for `filename x url|email|ftp`.
+⚠️ `filename x pipe|url|email|ftp` leaves the SQL surface entirely: it runs an
+operating-system command or reaches off the cluster, and none of it has a SQL
+equivalent. `email` and `pipe` have Python translations — see the host-command
+and mail guidance — so emit those as a clearly separated Python block and say
+why the step is not SQL. For `url` and `ftp`, prefer expressing the transfer as
+a table or volume read; emit the non-convertible marker rather than guessing an
+intent.

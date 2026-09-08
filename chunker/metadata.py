@@ -26,6 +26,7 @@ from .keywords import (
     _SAS_SET_MULTI_RE,
     _SAS_SUBSETTING_IF_RE,
     _SAS_SUM_STATEMENT_RE,
+    SAS_GLOBAL_STATEMENT_TOKENS,
 )
 from .models import (
     SasChunkKind,
@@ -103,9 +104,14 @@ def _nid(value: str) -> str:
 _MACRO_VAR_OP_RE = re.compile(r"%\s*(let|global|local|put)\b", re.IGNORECASE)
 
 # Leading statement keyword of a GLOBAL_STATEMENT chunk. ``title``/``footnote``
-# capture without their optional occurrence digit (title2 -> title).
+# capture without their optional occurrence digit (title2 -> title). Built from
+# the published vocabulary so the tokens an instruction may scope on and the
+# tokens this can emit cannot drift apart. Longest-first so no token masks
+# another it prefixes.
 _GLOBAL_STMT_KW_RE = re.compile(
-    r"%?\s*(let|put|global|local|libname|filename|title|footnote|ods)\b",
+    r"%?\s*("
+    + "|".join(sorted(SAS_GLOBAL_STATEMENT_TOKENS, key=len, reverse=True))
+    + r")\b",
     re.IGNORECASE,
 )
 

@@ -27,5 +27,8 @@ A filesystem path becomes a **Unity Catalog volume** path
 (`/Volumes/<catalog>/<schema>/<volume>/...`); state the volume you assumed.
 
 ⚠️ `filename x pipe '...'` runs an operating-system command, and
-`url`/`email`/`ftp` reach off the cluster. There is no DataFrame equivalent for
-any of them — emit the non-convertible marker rather than guessing an intent.
+`url`/`email`/`ftp` reach off the cluster. None has a DataFrame equivalent, but
+`pipe` and `email` do have Python ones — see the host-command and mail guidance
+— so emit those as plain Python alongside the DataFrame code. For `url` and
+`ftp`, prefer expressing the transfer as a table or volume read; emit the
+non-convertible marker rather than guessing an intent.
