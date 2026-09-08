@@ -386,3 +386,245 @@ def test_the_credential_chain_is_walked_once_per_run(monkeypatch, reference_dir)
     assert len(calls) == 1
     assert [c.model for c in per_row] == ["gpt-5.4", "gpt-5.4"]
     assert all(c.api_key is not None for c in per_row)
+
+
+# ---------------------------------------------------------------------------
+# --check-auth, the credential-chain dry run
+# ---------------------------------------------------------------------------
+
+
+def test_check_auth_dispatches_to_the_dry_run_and_converts_nothing(
+    monkeypatch, reference_dir
+):
+    from app_config import auth_check
+
+    taken: list[str] = []
+    monkeypatch.setattr(
+        main_mod, "_run_sharepoint", lambda args: taken.append("sharepoint") or 0
+    )
+    monkeypatch.setattr(main_mod, "_run_local", lambda args: taken.append("local") or 0)
+    monkeypatch.setattr(
+        main_mod, "_run_check", lambda args: taken.append("check") or 0
+    )
+    monkeypatch.setattr(
+        auth_check,
+        "run_checks",
+        lambda **_kwargs: [auth_check.CheckResult("process", "pass", "the notebook")],
+    )
+
+    code = main_mod.main(["--check-auth", "--reference-dir", str(reference_dir)])
+
+    assert code == 0
+    assert taken == []  # neither conversion flow, and not the SharePoint preflight
+
+
+def test_check_auth_exits_non_zero_when_a_hop_failed(
+    monkeypatch, reference_dir, capsys
+):
+    from app_config import auth_check
+
+    monkeypatch.setattr(
+        auth_check,
+        "run_checks",
+        lambda **_kwargs: [
+            auth_check.CheckResult(
+                "bootstrap", "fail", "no credential", fix="set DATABRICKS_TOKEN"
+            )
+        ],
+    )
+
+    code = main_mod.main(["--check-auth", "--reference-dir", str(reference_dir)])
+
+    assert code == 1
+    assert "set DATABRICKS_TOKEN" in capsys.readouterr().out
+
+
+def test_check_auth_does_not_require_the_reference_directory(tmp_path):
+    args = main_mod.parse_args(
+        ["--check-auth", "--reference-dir", str(tmp_path / "nope")]
+    )
+
+    assert main_mod._argument_error(args) is None
+
+
+@pytest.mark.parametrize(
+    "flag, value", [("--request-id", "42"), ("--app", "MyApp"), ("--all-rows", None)]
+)
+def test_check_auth_rejects_a_row_filter(reference_dir, flag, value):
+    extra = [flag] if value is None else [flag, value]
+    args = _args(reference_dir, "--check-auth", *extra)
+
+    problem = main_mod._argument_error(args)
+
+    assert problem is not None and "--check-auth" in problem
+
+
+def test_check_auth_is_rejected_in_local_mode(reference_dir, tmp_path):
+    args = _args(reference_dir, "--check-auth", sas_dir=str(tmp_path))
+
+    problem = main_mod._argument_error(args)
+
+    assert problem is not None and "--check-auth" in problem
+
+
+# ---------------------------------------------------------------------------
+# run_in_notebook — the Databricks cell entry point
+# ---------------------------------------------------------------------------
+
+
+class _Shell:
+    """An IPython shell stand-in; only its non-None-ness is read."""
+
+
+@pytest.fixture
+def on_cluster(monkeypatch):
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "18.3")
+    monkeypatch.delenv("DATABRICKS_TOKEN", raising=False)
+
+
+@pytest.fixture
+def in_repl(monkeypatch):
+    """Be the notebook's own Python, without installing IPython.
+
+    The detector only looks in ``sys.modules`` — deliberately, so that finding
+    out whether this is the notebook cannot import the modules whose import is
+    the problem — which is exactly what makes this fakeable in-process.
+    """
+    import types
+
+    monkeypatch.setitem(
+        sys.modules, "IPython", types.SimpleNamespace(get_ipython=lambda: _Shell())
+    )
+
+
+def _captured_main(monkeypatch) -> list[Any]:
+    """Replace ``main`` with a recorder, returning the list it records into."""
+    seen: list[Any] = []
+
+    def _fake(argv=None, **kwargs):
+        seen.append((argv, kwargs))
+        return 0
+
+    monkeypatch.setattr(main_mod, "main", _fake)
+    return seen
+
+
+def test_run_in_notebook_splits_a_command_string(monkeypatch, in_repl, on_cluster):
+    """The tail of an existing `!python main.py …` cell pastes across whole."""
+    seen = _captured_main(monkeypatch)
+
+    main_mod.run_in_notebook(
+        "--reference-dir '/Workspace/Users/a b/reference_docs' --request-id 80"
+    )
+
+    argv, kwargs = seen[0]
+    assert argv == [
+        "--reference-dir",
+        "/Workspace/Users/a b/reference_docs",
+        "--request-id",
+        "80",
+    ]
+    # An embedding caller keeps its own excepthook: replacing the notebook's
+    # for the life of the session is not this function's business.
+    assert kwargs == {"capture_crashes": False}
+
+
+def test_run_in_notebook_passes_a_list_through(monkeypatch, in_repl, on_cluster):
+    seen = _captured_main(monkeypatch)
+
+    main_mod.run_in_notebook(["--request-id", "80"])
+
+    assert seen[0][0] == ["--request-id", "80"]
+
+
+def test_run_in_notebook_defaults_to_no_arguments(monkeypatch, in_repl, on_cluster):
+    seen = _captured_main(monkeypatch)
+
+    main_mod.run_in_notebook()
+
+    assert seen[0][0] == []
+
+
+def test_run_in_notebook_returns_the_status_rather_than_exiting(
+    monkeypatch, in_repl, on_cluster
+):
+    monkeypatch.setattr(main_mod, "main", lambda argv=None, **_kwargs: 3)
+
+    assert main_mod.run_in_notebook("--request-id 80") == 3
+
+
+def test_run_in_notebook_refuses_a_child_process(monkeypatch, on_cluster):
+    """The one place refusing is right: main() warns and then fails obscurely."""
+    seen = _captured_main(monkeypatch)
+
+    with pytest.raises(RuntimeError) as caught:
+        main_mod.run_in_notebook("--request-id 80")
+
+    assert "child process" in str(caught.value)
+    assert "DATABRICKS_TOKEN" in str(caught.value)
+    assert seen == []  # nothing ran
+
+
+def test_run_in_notebook_allows_a_child_process_carrying_a_pat(
+    monkeypatch, on_cluster
+):
+    monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-child")
+    seen = _captured_main(monkeypatch)
+
+    assert main_mod.run_in_notebook("--request-id 80") == 0
+    assert seen[0][0] == ["--request-id", "80"]
+
+
+def test_run_in_notebook_can_be_forced(monkeypatch, on_cluster):
+    seen = _captured_main(monkeypatch)
+
+    assert main_mod.run_in_notebook("--request-id 80", require_repl=False) == 0
+    assert seen[0][0] == ["--request-id", "80"]
+
+
+def test_run_in_notebook_works_off_databricks(monkeypatch):
+    """A laptop Jupyter kernel is not a child process and must not be refused."""
+    monkeypatch.delenv("DATABRICKS_RUNTIME_VERSION", raising=False)
+    seen = _captured_main(monkeypatch)
+
+    assert main_mod.run_in_notebook("--request-id 80") == 0
+    assert len(seen) == 1
+
+
+def test_run_in_notebook_resets_the_caches_when_asked(
+    monkeypatch, in_repl, on_cluster
+):
+    """A notebook process outlives the environment it first resolved."""
+    from app_config import azure, databricks, sharepoint, vault
+
+    cleared: list[str] = []
+    monkeypatch.setattr(app_config, "clear_cache", lambda: cleared.append("app_config"))
+    for module in (azure, databricks, sharepoint, vault):
+        name = module.__name__
+        monkeypatch.setattr(
+            module, "clear_cache", lambda name=name: cleared.append(name)
+        )
+    _captured_main(monkeypatch)
+
+    main_mod.run_in_notebook("--request-id 80", reset_caches=True)
+
+    assert cleared == [
+        "app_config",
+        "app_config.azure",
+        "app_config.databricks",
+        "app_config.sharepoint",
+        "app_config.vault",
+    ]
+
+
+def test_run_in_notebook_leaves_the_caches_alone_by_default(
+    monkeypatch, in_repl, on_cluster
+):
+    """The credential chain is walked once per invocation on purpose."""
+    cleared: list[str] = []
+    monkeypatch.setattr(app_config, "clear_cache", lambda: cleared.append("app_config"))
+    _captured_main(monkeypatch)
+
+    main_mod.run_in_notebook("--request-id 80")
+
+    assert cleared == []

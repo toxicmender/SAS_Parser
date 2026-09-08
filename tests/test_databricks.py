@@ -555,6 +555,135 @@ def test_the_subprocess_hint_is_absent_off_cluster(monkeypatch, _isolated):
     assert "!python" not in str(caught.value)
 
 
+def test_the_subprocess_hint_is_replaced_inside_the_notebook(monkeypatch, _isolated):
+    """In the REPL the credential is present, so the subprocess advice is wrong.
+
+    A scope read that fails here is a grant or a key name, and saying "stop
+    using a subprocess" to someone who is not using one costs them the
+    afternoon this hint exists to save.
+    """
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "15.4")
+    _in_repl(monkeypatch)
+    _patched_secrets(monkeypatch, {})
+    cfg = databricks.DatabricksConfig(secret_scope="kv")
+
+    with pytest.raises(databricks.DatabricksError) as caught:
+        databricks.read_workspace_secret("kv", "sp-hsv-appid", config=cfg)
+
+    message = str(caught.value)
+    assert "!python" not in message
+    assert "READ on the scope" in message
+
+
+# ---------------------------------------------------------------------------
+# Which shape of process — the discriminator itself
+# ---------------------------------------------------------------------------
+
+
+class _Shell:
+    """An IPython shell stand-in; only its non-None-ness is read."""
+
+
+def _in_repl(monkeypatch, shell: Any | None = None) -> None:
+    """Install a fake IPython whose ``get_ipython`` returns *shell*."""
+    monkeypatch.setitem(
+        sys.modules,
+        "IPython",
+        _ns(get_ipython=lambda: _Shell() if shell is None else shell),
+    )
+
+
+def _ns(**kwargs: Any) -> Any:
+    import types
+
+    return types.SimpleNamespace(**kwargs)
+
+
+def test_process_shape_off_cluster(monkeypatch, _isolated):
+    assert databricks.process_shape() == databricks.PROCESS_OFF_CLUSTER
+    assert databricks.in_notebook_repl() is False
+
+
+def test_process_shape_in_the_notebook(monkeypatch, _isolated):
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "15.4")
+    _in_repl(monkeypatch)
+    assert databricks.process_shape() == databricks.PROCESS_NOTEBOOK
+    assert databricks.in_notebook_repl() is True
+
+
+def test_process_shape_in_a_child(monkeypatch, _isolated):
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "15.4")
+    assert databricks.process_shape() == databricks.PROCESS_CHILD
+
+
+def test_a_shell_injected_into_builtins_counts(monkeypatch, _isolated):
+    """IPython also binds ``get_ipython`` in builtins for an interactive shell."""
+    import builtins
+
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "15.4")
+    monkeypatch.setattr(builtins, "get_ipython", lambda: _Shell(), raising=False)
+    assert databricks.process_shape() == databricks.PROCESS_NOTEBOOK
+
+
+def test_detection_never_raises(monkeypatch, _isolated):
+    """A probe that explodes must yield a verdict, not propagate."""
+
+    def _boom():
+        raise RuntimeError("no kernel")
+
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "15.4")
+    monkeypatch.setitem(sys.modules, "IPython", _ns(get_ipython=_boom))
+    monkeypatch.setitem(
+        sys.modules, "dbruntime.databricks_repl_context", _ns(get_context=_boom)
+    )
+    assert databricks.process_shape() == databricks.PROCESS_CHILD
+    assert databricks.notebook_evidence()["REPL context"] == "unavailable"
+
+
+def test_detection_imports_nothing(monkeypatch, _isolated):
+    """The probes are sys.modules lookups, and that is load-bearing.
+
+    Importing ``dbruntime`` or ``databricks.sdk.runtime`` is what attaches
+    Py4J to the driver's JVM and, in a child, what raises `parent_header`. A
+    detector that imported them would cause the very side effect it exists to
+    warn about.
+    """
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "15.4")
+    for name in ("dbruntime", "dbruntime.databricks_repl_context", "IPython"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+
+    # The delta, not the absolute set: another test in the session may
+    # legitimately have imported pyspark, and that is not this call's doing.
+    before = set(sys.modules)
+    databricks.process_shape()
+    databricks.notebook_evidence()
+    imported = set(sys.modules) - before
+
+    assert imported == set(), f"detection imported {sorted(imported)}"
+
+
+def test_notebook_evidence_whitelists_the_repl_context(monkeypatch, _isolated):
+    """apiToken is on that object; a report must not be one field away from it."""
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "15.4")
+    _in_repl(monkeypatch)
+    monkeypatch.setitem(
+        sys.modules,
+        "dbruntime.databricks_repl_context",
+        _ns(get_context=lambda: _ns(notebookId="7", clusterId="c1", apiToken="dapi-S")),
+    )
+    evidence = databricks.notebook_evidence()
+    assert evidence["notebook REPL"].startswith("yes")
+    assert "notebookId=7" in evidence["REPL context"]
+    assert "dapi-S" not in "".join(evidence.values())
+
+
+def test_notebook_evidence_sees_the_sdk_dbutils_shim(monkeypatch, _isolated):
+    monkeypatch.setitem(
+        sys.modules, "databricks.sdk.runtime", _ns(dbutils=object())
+    )
+    assert databricks.notebook_evidence()["dbutils"].startswith("loaded")
+
+
 def test_no_principal_anywhere_raises(_isolated):
     with pytest.raises(
         databricks.DatabricksError, match="no Azure service principal configured"

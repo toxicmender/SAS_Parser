@@ -166,7 +166,7 @@ def decode_claims(token: str) -> dict[str, Any]:
     return claims if isinstance(claims, dict) else {}
 
 
-def _claim_summary(claims: dict[str, Any]) -> dict[str, Any]:
+def claim_summary(claims: dict[str, Any]) -> dict[str, Any]:
     """The handful of claims worth printing, from a decoded token."""
     roles = claims.get("roles")
     return {
@@ -453,7 +453,7 @@ def check_token(client: Any) -> CheckResult:
             {"token length": len(token)},
         )
 
-    detail = _claim_summary(claims)
+    detail = claim_summary(claims)
     roles = claims.get("roles")
     granted = set(roles) if isinstance(roles, list) else set()
     if granted & _SUFFICIENT_ROLES:

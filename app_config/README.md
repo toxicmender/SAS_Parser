@@ -32,6 +32,8 @@ section. Credentials never belong in `config.json`.
 | `vault.py` | HashiCorp Vault authentication and secret retrieval. |
 | `spark.py` | Local or configured Spark-session creation. |
 | `sharepoint_check.py` | Read-only preflight for the SharePoint deployment. |
+| `databricks_check.py` | Read-only preflight for running *on* a Databricks cluster. |
+| `auth_check.py` | Dry run of the whole credential chain, offline by default. |
 | `logging_setup.py` | Console/file logging for the command-line entry points. |
 
 SharePoint is transport-only: conversion request semantics live in
@@ -47,6 +49,50 @@ Logger names follow `app_config.*`.
 python -m app_config.sharepoint_check            # the full preflight
 python -m app_config.sharepoint_check --offline  # configuration only, no network
 ```
+
+## Diagnosing a credential
+
+`auth_check` is the one to reach for when the failure is an *identity* rather
+than a path. The chain crosses three modules and branches, so no single
+module's preflight covers it:
+
+```
+process --> workspace --> bootstrap --+-> principal (sp-hsv-*) --> vault --> gateway
+                                      +-> sharepoint (saact-hsv-*) --> graph
+```
+
+```bash
+python -m app_config.auth_check          # the dry run: contacts nothing
+python -m app_config.auth_check --live   # read the scope, mint the tokens
+sas-parser --check-auth                  # the offline form, via the CLI
+```
+
+Offline by default, which is the inversion of `sharepoint_check --offline` and
+deliberate: this exists to be run where the credentials are in doubt, so the
+safe default is to touch nothing. Its most valuable output — which of three
+sources won for each setting, and which hop would break — costs no network.
+
+It reuses the sibling stages rather than restating them, and reads the gateway
+credential through `vault` rather than building an `LLMClientConfig`: this
+package is a dependency leaf, and `from_ai_gateway()` is the single owner of
+that construction. So it verifies the *credential*, not the client.
+
+## Which process am I in?
+
+`databricks.process_shape()` separates the notebook's own Python from a child
+of it (`%sh`, `!python …`, `subprocess`). No environment variable can:
+`DATABRICKS_RUNTIME_VERSION` is inherited by every child and the workspace
+credential is not, so a child detects Databricks, takes the notebook auth path,
+and fails the secret read from inside the SDK saying something about the Azure
+CLI or `'NoneType' object has no attribute 'parent_header'`.
+
+It discriminates on `in_notebook_repl()` — a missing `IPython.get_ipython()`,
+which is the *same fact* the SDK's `runtime` strategy dies on rather than a
+proxy for it. Not on an active SparkSession: a child acquires one as a side
+effect of that very failure, when the SDK imports `dbruntime` on its way to
+raising, so the session is a lagging indicator of the thing it was being asked
+about. Every probe is a `sys.modules` lookup and never an import, because
+importing those modules is what causes the side effect.
 
 Stages run in dependency order — `config`, `imports`, `identity`, `secrets`,
 `token`, `site`, `base`, then one per configured list — and a stage that cannot

@@ -37,6 +37,11 @@ Authentication
     Running on a Databricks cluster (``DATABRICKS_RUNTIME_VERSION`` is set) —
     the runtime authenticates itself and :meth:`~DatabricksConfig.get_token`
     returns ``None``. Nothing to configure; this is the production path.
+
+    With one trap, which is why :func:`process_shape` exists: that environment
+    variable is inherited by every *child* of a cluster process and the
+    credential is not, so a ``!python main.py …`` cell looks identical here and
+    has nothing to authenticate with. See "Which shape of process" below.
 ``pat``
     A personal access token in ``DATABRICKS_TOKEN``.
 ``azure-sp``
@@ -88,6 +93,16 @@ exists in the scope cannot also be what authenticates the read. In practice
 that bootstrap is the Databricks runtime's own credentials (on a cluster) or a
 PAT; without either, the read raises :class:`DatabricksError`.
 
+Which shape of process
+----------------------
+:func:`process_shape` distinguishes the notebook's own Python from a child of
+it — ``%sh``, ``!python …``, :mod:`subprocess` — which no environment variable
+can, because the runtime marker is inherited and the credential is not. It
+discriminates on :func:`in_notebook_repl`, whose ``False`` is the *same fact*
+the SDK's ``runtime`` auth strategy fails on rather than a proxy for it, and
+every probe it uses is a :data:`sys.modules` lookup so that detecting the
+problem cannot cause it. :func:`notebook_evidence` reports what each probe saw.
+
 Dependencies
 ------------
 Both clients are *optional* dependencies (extra ``databricks``):
@@ -113,8 +128,10 @@ Logger name: ``app_config.databricks``.
 
 from __future__ import annotations
 
+import builtins
 import logging
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -159,6 +176,16 @@ SECRET_KEY_TENANT_ID = "sp-hsv-tenantid"
 # Set by the Databricks runtime on every cluster and job, and by nothing else.
 _RUNTIME_ENV_VAR = "DATABRICKS_RUNTIME_VERSION"
 
+# The three shapes a process can have, as `process_shape` reports them.
+PROCESS_OFF_CLUSTER = "off-cluster"
+PROCESS_NOTEBOOK = "notebook"
+PROCESS_CHILD = "child"
+
+# Fields of Databricks' REPL context that are safe to put in a report.
+# `apiToken` is on that object too, which is exactly why this is a whitelist
+# and not a "everything except" list.
+_CONTEXT_FIELDS = ("notebookId", "clusterId", "jobId", "isInJob")
+
 
 class DatabricksError(RuntimeError):
     """Databricks is misconfigured, unreachable, or has no usable credentials.
@@ -171,6 +198,144 @@ class DatabricksError(RuntimeError):
 def in_databricks_runtime() -> bool:
     """True when this process is running on a Databricks cluster or job."""
     return bool(os.environ.get(_RUNTIME_ENV_VAR))
+
+
+# ---------------------------------------------------------------------------
+# Which *shape* of Databricks process this is
+# ---------------------------------------------------------------------------
+#
+# :func:`in_databricks_runtime` answers "am I on a cluster". These answer the
+# harder question the credential chain actually turns on: "am I the notebook".
+# Nothing in the environment separates the two — ``DATABRICKS_RUNTIME_VERSION``
+# is inherited by every child process and the workspace credential is not — so
+# a ``!python main.py …`` cell detects Databricks, takes the notebook auth
+# path, and fails the secret read with a message about something else entirely.
+#
+# **Every probe below is a ``sys.modules`` lookup, never an import.** That is a
+# correctness requirement, not an optimisation. Importing ``dbruntime`` or
+# ``databricks.sdk.runtime`` is what attaches Py4J to the driver's JVM, and in
+# a child process it is also what raises — so a detector that imported them
+# would cause the side effect it exists to warn about and would take the
+# ``'NoneType' object has no attribute 'parent_header'`` failure itself, at the
+# exact moment it was trying to predict it.
+
+
+def _ipython_shell() -> Any | None:
+    """The active IPython shell, or ``None`` — the one decisive probe.
+
+    ``None`` here is not an *inference* that the notebook credential is
+    missing; it is the same fact, read earlier. The databricks-sdk's
+    ``runtime`` auth strategy resolves its credential through ``dbruntime``'s
+    REPL context, which reads ``IPython.get_ipython()`` — so the strategy fails
+    in precisely the processes where this returns ``None``, and the
+    ``AttributeError`` it reports (``'NoneType' object has no attribute
+    'parent_header'``) *is* this probe, taken by the SDK a few seconds later
+    and without the guard.
+
+    Answered without importing IPython: a shell cannot exist in a process that
+    never imported the module, so an absent ``sys.modules`` entry settles it.
+    """
+    module = sys.modules.get("IPython")
+    if module is not None:
+        getter = getattr(module, "get_ipython", None)
+        if getter is not None:
+            try:
+                shell = getter()
+            except Exception:  # pragma: no cover - defensive, get_ipython is total
+                shell = None
+            if shell is not None:
+                return shell
+    # An interactive shell also injects `get_ipython` into builtins, which is
+    # free to check and does not depend on the module still being bound under
+    # its own name in sys.modules.
+    getter = getattr(builtins, "get_ipython", None)
+    if getter is None:
+        return None
+    try:
+        return getter()
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def _repl_context() -> Any | None:
+    """Databricks' own REPL context, or ``None``. Corroboration, never the test.
+
+    ``sys.modules`` only: see the note above on why this must not import
+    ``dbruntime``. It is also a *lagging* signal — a child process acquires one
+    the moment the SDK's runtime strategy loads that module on its way to
+    failing — which is the other reason it never decides anything.
+    """
+    module = sys.modules.get("dbruntime.databricks_repl_context")
+    if module is None:
+        return None
+    getter = getattr(module, "get_context", None)
+    if getter is None:
+        return None
+    try:
+        return getter()
+    except Exception:
+        return None
+
+
+def _sdk_runtime_dbutils() -> bool:
+    """True when the SDK's ``dbutils`` shim is already loaded in this process."""
+    return getattr(sys.modules.get("databricks.sdk.runtime"), "dbutils", None) is not None
+
+
+def in_notebook_repl() -> bool:
+    """True only in a notebook's own Python — the REPL process itself.
+
+    ``%run``-ed code and imported modules are the same process as the notebook
+    and so are included; ``%sh``, ``!python …`` and :mod:`subprocess` children
+    are not, which is the whole point. Never raises: this informs advice, and
+    advice must not be able to break the command it is advising about.
+    """
+    return _ipython_shell() is not None
+
+
+def process_shape() -> str:
+    """:data:`PROCESS_OFF_CLUSTER`, :data:`PROCESS_NOTEBOOK` or :data:`PROCESS_CHILD`.
+
+    The three shapes differ in exactly one thing that matters — whether a
+    workspace credential is reachable — and only the last two are hard to tell
+    apart from the environment alone.
+    """
+    if not in_databricks_runtime():
+        return PROCESS_OFF_CLUSTER
+    return PROCESS_NOTEBOOK if in_notebook_repl() else PROCESS_CHILD
+
+
+def notebook_evidence() -> dict[str, str]:
+    """What each probe saw, as report-safe strings for a preflight's detail.
+
+    The REPL context is reported through :data:`_CONTEXT_FIELDS` rather than
+    wholesale: it carries ``apiToken`` as well, and a preflight that prints its
+    findings must not be one keystroke away from printing a credential.
+    """
+    shell = _ipython_shell()
+    evidence = {
+        "notebook REPL": (
+            "yes (IPython shell)"
+            if shell is not None
+            else "no (no IPython shell in this process)"
+        ),
+        "dbutils": (
+            "loaded (databricks.sdk.runtime)"
+            if _sdk_runtime_dbutils()
+            else "not loaded"
+        ),
+    }
+    context = _repl_context()
+    if context is None:
+        evidence["REPL context"] = "unavailable"
+    else:
+        seen = [
+            f"{name}={value}"
+            for name in _CONTEXT_FIELDS
+            if (value := getattr(context, name, None)) not in (None, "")
+        ]
+        evidence["REPL context"] = ", ".join(seen) if seen else "present"
+    return evidence
 
 
 @dataclass
@@ -393,6 +558,13 @@ class DatabricksConfig:
         the read of it — the Databricks runtime on a cluster, or a PAT. Keeps
         :meth:`entra_token` from insisting on a scope it could never reach,
         so a shared :mod:`app_config.azure` identity still gets its turn.
+
+        Deliberately *not* narrowed to :func:`in_notebook_repl` the way
+        :func:`_subprocess_hint` is. This one gates a capability — which
+        identity :meth:`entra_token` mints from — not a diagnosis, and a
+        Databricks **job** task has no REPL and a perfectly good workspace
+        credential. Narrowing it would change credential selection for every
+        scheduled run to fix a message.
         """
         return bool(self.secret_scope) and bool(
             in_databricks_runtime() or self.token
@@ -739,13 +911,27 @@ def _subprocess_hint() -> str:
     ``!python …`` shell cell — but the notebook's *credential* lives in the
     REPL process, not in the environment, so the child inherits the detection
     without the authentication. The SDK then walks its whole auth chain and
-    ends up shelling out to ``az account show``, which reports something about
-    the Azure CLI and nothing about the real cause.
+    ends up either shelling out to ``az account show`` or dying inside its
+    ``runtime`` strategy on ``'NoneType' object has no attribute
+    'parent_header'`` — reporting, in both cases, something that names nothing
+    about the real cause.
 
-    Empty off-cluster and when a PAT is set, where neither applies.
+    Empty off-cluster and when a PAT is set, where neither applies. Keyed on
+    :func:`in_notebook_repl` rather than on :func:`in_databricks_runtime`
+    alone, so a scope read that fails *inside* the notebook — where the
+    credential is present and the problem is a grant or a key name — gets the
+    diagnosis that fits it instead of being told to stop using a subprocess it
+    is not using.
     """
     if not in_databricks_runtime() or os.environ.get("DATABRICKS_TOKEN"):
         return ""
+    if in_notebook_repl():
+        return (
+            ". This process is the notebook's own Python, so the workspace "
+            "credential is present and the child-process diagnosis does not "
+            "apply: check that the cluster's principal has READ on the scope, "
+            "and that the keys are the ones this deployment files them under"
+        )
     return (
         ". This process looks like a Databricks cluster but has no workspace "
         "credential. If it is a '!python ...' or subprocess cell, that is the "
