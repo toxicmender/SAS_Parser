@@ -291,6 +291,13 @@ class SharePointConfig:
         :func:`_normalise_base_path`). ``SHAREPOINT_FILE_SERVER_BASE_PATH`` /
         ``sharepoint.file_server_base_path``. ``""`` (default) is the library
         root. Join onto it with :meth:`drive_path`, never by hand.
+    kit_base_path : str
+        The *kit* root, one level above the applications root, for output filed
+        by analysis area rather than under an application — complexity's
+        reports land at ``{kit}/ComplexityAnalysis/Application/{app}/…``, beside
+        the applications tree rather than inside it. Same normalisation.
+        ``SHAREPOINT_KIT_BASE_PATH`` / ``sharepoint.kit_base_path``, ``""``
+        (default) the library root. Join onto it with :meth:`kit_path`.
     secret_scope : str | None
         Databricks secret scope holding SharePoint's *own* service principal.
         ``SHAREPOINT_SECRET_SCOPE`` / ``sharepoint.secret_scope``, defaulting
@@ -318,6 +325,7 @@ class SharePointConfig:
     scopes: tuple[str, ...] = (GRAPH_DEFAULT_SCOPE,)
     timeout: float = DEFAULT_TIMEOUT
     file_server_base_path: str = ""
+    kit_base_path: str = ""
     secret_scope: str | None = None
     tenant_id_key: str = DEFAULT_TENANT_ID_KEY
     client_id_key: str = DEFAULT_CLIENT_ID_KEY
@@ -358,6 +366,10 @@ class SharePointConfig:
             file_server_base_path=_normalise_base_path(
                 os.environ.get("SHAREPOINT_FILE_SERVER_BASE_PATH")
                 or get_value("sharepoint", "file_server_base_path")
+            ),
+            kit_base_path=_normalise_base_path(
+                os.environ.get("SHAREPOINT_KIT_BASE_PATH")
+                or get_value("sharepoint", "kit_base_path")
             ),
             secret_scope=(
                 os.environ.get("SHAREPOINT_SECRET_SCOPE")
@@ -417,21 +429,46 @@ class SharePointConfig:
             client_secret_key=self.client_secret_key,
         )
 
+    @staticmethod
+    def _joined(base: str, parts: tuple[str, ...]) -> str:
+        """*base* and *parts* as one drive-relative path.
+
+        The single place path segments are concatenated. There are two bases
+        (see :meth:`drive_path` and :meth:`kit_path`) and only ever one set of
+        joining rules, so they share this rather than each carrying a copy that
+        could drift on a trailing slash.
+        """
+        cleaned = [segment.strip().strip("/") for segment in (base, *parts) if segment]
+        return "/".join(part for part in cleaned if part)
+
     def drive_path(self, *parts: str) -> str:
         """
         :attr:`file_server_base_path` joined with *parts*, as one
         drive-relative path.
 
-        The single place path segments are concatenated, so no caller has to
-        remember whether the base carries a trailing slash or the document
-        library prefix. Empty and ``None``-ish parts are skipped, and each
-        part's own leading/trailing slashes are absorbed, so
-        ``drive_path("MyApp", "/scripts_original/")`` and
-        ``drive_path("MyApp/scripts_original")`` agree.
+        The applications root: conversion's scripts, its validation folder, and
+        xref all hang off this one. No caller has to remember whether the base
+        carries a trailing slash or the document library prefix. Empty and
+        ``None``-ish parts are skipped, and each part's own leading/trailing
+        slashes are absorbed, so ``drive_path("MyApp", "/scripts_original/")``
+        and ``drive_path("MyApp/scripts_original")`` agree.
         """
-        segments = [self.file_server_base_path, *parts]
-        cleaned = [segment.strip().strip("/") for segment in segments if segment]
-        return "/".join(part for part in cleaned if part)
+        return self._joined(self.file_server_base_path, parts)
+
+    def kit_path(self, *parts: str) -> str:
+        """
+        :attr:`kit_base_path` joined with *parts*, as one drive-relative path.
+
+        The *kit* root, one level above the applications root, for output that
+        is not filed per application under it — complexity analysis lands at
+        ``{kit}/ComplexityAnalysis/Application/{app}/…``, a sibling of the
+        applications tree rather than a folder inside it.
+
+        A second base rather than a second spelling of the first: joining rules
+        are shared (:meth:`_joined`), and the two roots move independently, so
+        re-pointing one does not silently move conversion's scripts as well.
+        """
+        return self._joined(self.kit_base_path, parts)
 
     def list_id(self, kind: str) -> str:
         """

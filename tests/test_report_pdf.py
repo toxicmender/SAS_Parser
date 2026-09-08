@@ -307,3 +307,71 @@ def test_complexity_and_validation_render_through_one_implementation():
     # Not two copies that happen to agree today.
     assert complexity_pdf.render_pdf is reporting_pdf.render_pdf
     assert complexity_pdf.STYLESHEET is reporting_pdf.STYLESHEET
+
+
+# ---------------------------------------------------------------------------
+# --app: filing the report where the conversion run already puts its verdicts
+# ---------------------------------------------------------------------------
+
+
+def _args(dest, app):
+    import argparse
+
+    return argparse.Namespace(pdf_sharepoint=dest, app=app)
+
+
+def test_app_files_the_report_beside_the_converted_scripts(monkeypatch):
+    """The destination comes from conversion, which owns that layout.
+
+    A conversion run writes its per-item verdicts and aggregate summary into
+    `scripts_converted/validation`; the standalone report belongs in the same
+    folder rather than at the library root, so a reviewer finds the whole
+    picture in one place.
+    """
+    from validation.__main__ import _report_destination
+
+    monkeypatch.setenv("SHAREPOINT_FILE_SERVER_BASE_PATH", "Kit/Applications")
+    app_config.clear_cache()
+    try:
+        assert _report_destination(_args("", "MyApp")) == (
+            "Kit/Applications/MyApp/scripts_converted/validation"
+        )
+    finally:
+        app_config.clear_cache()
+
+
+def test_an_explicit_destination_still_wins_over_app():
+    from validation.__main__ import _report_destination
+
+    assert _report_destination(_args("Scratch/here", "MyApp")) == "Scratch/here"
+
+
+def test_without_app_the_configured_precedence_is_untouched():
+    """A standalone run over validation/cases has no application to name."""
+    from validation.__main__ import _report_destination
+
+    # None means "let publish_report_pdf resolve its own default", which is the
+    # config key then the library root -- exactly as before this flag existed.
+    assert _report_destination(_args("", None)) is None
+    assert _report_destination(_args(None, None)) is None
+
+
+def test_the_destination_is_not_rebuilt_by_validation(monkeypatch):
+    """It asks conversion.paths rather than assembling the folder itself.
+
+    conversion/paths.py is deliberately the single owner of that layout ("a
+    deployment that renames a folder changes it here and nowhere else"), so a
+    rename there must move this too.
+    """
+    from conversion import paths
+    from validation.__main__ import _report_destination
+
+    monkeypatch.setattr(paths, "VALIDATION_FOLDER", "renamed-by-the-deployment")
+    monkeypatch.setenv("SHAREPOINT_FILE_SERVER_BASE_PATH", "Kit/Applications")
+    app_config.clear_cache()
+    try:
+        assert _report_destination(_args("", "MyApp")).endswith(
+            "renamed-by-the-deployment"
+        )
+    finally:
+        app_config.clear_cache()

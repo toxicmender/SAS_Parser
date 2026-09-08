@@ -9,6 +9,12 @@ Four conventions, all relative to
     {base}/{application}/scripts_converted/{model}/{timestamp}   <- upload
     {base}/{application}/scripts_converted/{model}/{timestamp}/prompts
 
+Complexity's reports are NOT here: they hang off ``kit_base_path`` instead, at
+``{kit}/ComplexityAnalysis/Application/{application}/…`` (see
+:func:`complexity.sharepoint.report_folder`), which is a sibling of this tree
+rather than a folder inside it. Validation's report does belong here, in
+:func:`validation` beside the converted scripts.
+
 They are functions rather than f-strings at the call sites so the layout is
 stated once: a deployment that renames a folder changes it here and nowhere
 else. Every one goes through

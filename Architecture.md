@@ -502,9 +502,15 @@ complexity/
                         signals, and writing a verdict's rationale.
   sharepoint.py         The complexity request list (Application /
                         Output_Language / Preferred_LLM) and where a run's
-                        reports go. READ-ONLY: no status write-back, no
-                        pending concept, timestamped folders for idempotence,
-                        and a run-summary.md standing in for a Status column.
+                        reports go:
+                        {kit}/ComplexityAnalysis/Application/{application}/
+                        {label}/{timestamp}, joined against kit_base_path --
+                        a SIBLING of the applications tree, not a folder
+                        inside it, so the application is the third segment
+                        rather than the first. READ-ONLY: no status
+                        write-back, no pending concept, timestamped folders
+                        for idempotence, and a run-summary.md standing in for
+                        a Status column.
   crossfile.py          CrossFileIndex: resolves each chunk's macro, dataset,
                         macro-variable, and libref references against the rest
                         of the corpus into internal / import / export /

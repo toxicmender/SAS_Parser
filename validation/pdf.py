@@ -19,10 +19,14 @@ optional ``sharepoint`` extra — only a caller that actually publishes pays for
 it.
 
 The SharePoint destination follows the repo-wide precedence rule (see
-:mod:`app_config`): explicit argument > config.json
-``validation.report_sharepoint_path`` > the library root. A destination ending
-in ``.pdf`` is the exact file path; anything else names a folder, under which a
-timestamped filename is created.
+``app_config``): the explicit argument, then config.json
+``validation.report_sharepoint_path``, then the library root. A destination
+ending in ``.pdf`` is an exact file path; anything else is a folder. The
+``python -m validation`` entry point supplies that explicit argument from
+``--app``, filing the report beside the application's converted scripts where
+a conversion run already writes its verdicts -- see
+``validation.__main__._report_destination`` for why the ``conversion`` import
+lives there and not here.
 
 Logger name: ``validation.pdf``.
 """

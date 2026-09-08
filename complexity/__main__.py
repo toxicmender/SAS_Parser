@@ -261,7 +261,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--sharepoint-out",
         default=None,
         help="With --sharepoint: upload into this folder instead of "
-        "{application}/complexity/{label}/{timestamp}.",
+        "ComplexityAnalysis/Application/{application}/{label}/{timestamp}. "
+        "Drive-relative, and it replaces the whole convention rather than "
+        "extending it.",
     )
     parser.add_argument(
         "--no-upload",
@@ -806,9 +808,12 @@ def _upload(
         # as the base with no application/label/timestamp beneath it.
         from dataclasses import replace
 
+        # kit_base_path, not file_server_base_path: report_folder joins
+        # against the kit root, so overriding the applications root would
+        # leave the destination untouched.
         override = replace(
             SharePointConfig.from_env(),
-            file_server_base_path=args.sharepoint_out.strip().strip("/"),
+            kit_base_path=args.sharepoint_out.strip().strip("/"),
         )
         return sp.upload_reports(
             "", "", "", paths, staging_root=staging, client=client, config=override
