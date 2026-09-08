@@ -23,6 +23,11 @@ from complexity import __main__ as cli
 from complexity import sharepoint as sp
 
 BASE = "Kit/Applications"
+# The kit root, one level up. Deliberately not a prefix-of-convenience: every
+# path assertion below distinguishes it from BASE, which is what proves
+# report_folder reads kit_base_path and not the applications root.
+KIT = "Kit"
+CX = f"{KIT}/ComplexityAnalysis/Application"
 
 _SAS = """\
 data work.staging;
@@ -54,6 +59,7 @@ def _config(**overrides) -> SharePointConfig:
         "site_id": "SITE",
         "drive_id": "DRV",
         "file_server_base_path": BASE,
+        "kit_base_path": KIT,
         "list_id_sas_complexity": "L-cx",
     }
     values.update(overrides)
@@ -174,7 +180,7 @@ def test_request_by_item_id():
 
 def test_report_folder_convention():
     assert sp.report_folder("MyApp", "sparksql", "20260804T101500Z", config=_config()) == (
-        f"{BASE}/MyApp/complexity/sparksql/20260804T101500Z"
+        f"{CX}/MyApp/sparksql/20260804T101500Z"
     )
 
 
@@ -208,7 +214,7 @@ def test_upload_reports_preserves_the_staged_tree(tmp_path):
         client=transport,
         config=_config(),
     )
-    root = f"{BASE}/MyApp/complexity/sparksql/TS"
+    root = f"{CX}/MyApp/sparksql/TS"
 
     assert uploaded == [
         f"{root}/complexity-report.md",
@@ -309,7 +315,7 @@ def test_end_to_end_uploads_the_whole_tree(_wired):
     assert cli.main(["--sharepoint", "--app", "MyApp"]) == 0
 
     names = [f"{folder}/{name}" for folder, name, _ in transport.uploaded]
-    root = f"{BASE}/MyApp/complexity/sparksql"
+    root = f"{CX}/MyApp/sparksql"
     assert any(n.endswith("/complexity-report.md") for n in names)
     assert any("/files/" in n for n in names)
     assert any(n.endswith("/run-summary.md") for n in names)
@@ -369,7 +375,7 @@ def test_label_is_the_rules_profile_without_llm_eval(_wired):
     # the folder when no model produced the estimate.
     assert transport.uploaded  # not vacuous: the run has to have delivered
     assert all(
-        folder.startswith(f"{BASE}/MyApp/complexity/pyspark/")
+        folder.startswith(f"{CX}/MyApp/pyspark/")
         for folder, _, _ in transport.uploaded
     )
 
@@ -386,7 +392,7 @@ def test_label_is_the_model_when_llm_eval_ran(_wired, monkeypatch):
 
     assert transport.uploaded
     assert all(
-        folder.startswith(f"{BASE}/MyApp/complexity/claude-sonnet-4-5/")
+        folder.startswith(f"{CX}/MyApp/claude-sonnet-4-5/")
         for folder, _, _ in transport.uploaded
     )
 
@@ -423,7 +429,7 @@ def test_explicit_target_beats_the_row(_wired):
 
     assert transport.uploaded
     assert all(
-        folder.startswith(f"{BASE}/MyApp/complexity/sparksql/")
+        folder.startswith(f"{CX}/MyApp/sparksql/")
         for folder, _, _ in transport.uploaded
     )
 
@@ -445,8 +451,11 @@ def test_each_row_gets_its_own_corpus_and_folder(_wired):
     _wired(transport)
     assert cli.main(["--sharepoint"]) == 0
 
-    folders = {folder.split("/complexity/")[0] for folder, _, _ in transport.uploaded}
-    assert folders == {f"{BASE}/AppA", f"{BASE}/AppB"}
+    # Two applications, two folders under the one analysis area. Sources are
+    # still read from the applications tree (BASE) while reports go to the kit
+    # tree (CX) -- the split this change introduces, asserted in one place.
+    folders = {"/".join(folder.split("/")[:4]) for folder, _, _ in transport.uploaded}
+    assert folders == {f"{CX}/AppA", f"{CX}/AppB"}
 
 
 def test_one_failing_row_does_not_stop_the_others(_wired):
@@ -467,6 +476,12 @@ def test_one_failing_row_does_not_stop_the_others(_wired):
 
 
 def test_sharepoint_out_overrides_the_convention(_wired):
+    """The override replaces the whole convention, kit root included.
+
+    It used to replace `file_server_base_path`; `report_folder` now joins
+    against `kit_base_path`, so an override of the old base would leave the
+    destination exactly where it was and say nothing about it.
+    """
     transport = _wired(_corpus_transport())
     cli.main(["--sharepoint", "--app", "MyApp", "--sharepoint-out", "Scratch/runs"])
 
@@ -474,6 +489,45 @@ def test_sharepoint_out_overrides_the_convention(_wired):
     assert all(
         folder.startswith("Scratch/runs") for folder, _, _ in transport.uploaded
     )
+    # Nothing of either configured root survives the override.
+    assert not any(
+        folder.startswith((BASE, f"{KIT}/Complexity")) for folder, _, _ in transport.uploaded
+    )
+
+
+def test_report_folder_reads_the_kit_root_not_the_applications_root():
+    """The crux: complexity is a sibling of the applications tree, not inside it.
+
+    The two bases are set to different values here on purpose. With the old
+    join this returns a path under `Kit/Applications`, which is precisely the
+    layout this change moves away from.
+    """
+    config = _config(
+        file_server_base_path="Somewhere/Else", kit_base_path="TheKit"
+    )
+
+    folder = sp.report_folder("MyApp", "sparksql", "TS", config=config)
+
+    assert folder == "TheKit/ComplexityAnalysis/Application/MyApp/sparksql/TS"
+    assert "Somewhere/Else" not in folder
+
+
+def test_report_folder_falls_back_to_the_library_root_when_unset():
+    """An unconfigured kit root is the drive root, matching drive_path."""
+    folder = sp.report_folder(
+        "MyApp", "sparksql", "TS", config=_config(kit_base_path="")
+    )
+
+    assert folder == "ComplexityAnalysis/Application/MyApp/sparksql/TS"
+
+
+def test_the_application_is_inside_the_area_not_the_other_way_round():
+    """The segment order is the change, not just the prefix."""
+    folder = sp.report_folder("MyApp", "sparksql", "TS", config=_config())
+
+    segments = folder.split("/")
+    assert segments.index("ComplexityAnalysis") < segments.index("MyApp")
+    assert "complexity" not in segments  # the old per-application subfolder
 
 
 def test_no_rows_is_a_failed_run(_wired):

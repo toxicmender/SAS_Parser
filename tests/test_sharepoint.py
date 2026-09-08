@@ -1055,6 +1055,54 @@ def test_drive_path_with_no_base_is_library_relative():
     assert cfg.drive_path() == ""
 
 
+def test_kit_path_joins_onto_the_kit_root():
+    """The second base: complexity's tree is a sibling of the applications one."""
+    cfg = sharepoint.SharePointConfig(
+        file_server_base_path="Kit/Applications", kit_base_path="Kit"
+    )
+    assert cfg.kit_path("ComplexityAnalysis", "Application", "MyApp") == (
+        "Kit/ComplexityAnalysis/Application/MyApp"
+    )
+    # It reads its own base, not the applications root.
+    assert "Applications" not in cfg.kit_path("ComplexityAnalysis")
+
+
+def test_kit_path_and_drive_path_join_identically():
+    """One joiner, two bases -- so they cannot drift on a stray slash.
+
+    Asserted rather than assumed: the two used to be one method, and the
+    cheapest way to reintroduce a layout bug is a second copy of the cleaning
+    rules that absorbs slashes slightly differently.
+    """
+    cfg = sharepoint.SharePointConfig(
+        file_server_base_path="Root", kit_base_path="Root"
+    )
+    for parts in (
+        ("MyApp", "sub"),
+        ("/MyApp/", "/sub/"),
+        ("MyApp/sub",),
+        ("", "MyApp"),
+        (),
+    ):
+        assert cfg.drive_path(*parts) == cfg.kit_path(*parts)
+
+
+def test_kit_path_with_no_base_is_library_relative():
+    cfg = sharepoint.SharePointConfig()
+    assert cfg.kit_path("ComplexityAnalysis") == "ComplexityAnalysis"
+    assert cfg.kit_path() == ""
+
+
+def test_the_kit_root_strips_the_document_library_prefix(monkeypatch):
+    """Pasted from a SharePoint URL, the same way the applications root is."""
+    monkeypatch.setenv(
+        "SHAREPOINT_KIT_BASE_PATH", "Shared Documents/Script Migration and Conversion Kit"
+    )
+    assert sharepoint.SharePointConfig.from_env().kit_base_path == (
+        "Script Migration and Conversion Kit"
+    )
+
+
 # ---------------------------------------------------------------------------
 # List ids
 # ---------------------------------------------------------------------------

@@ -14,8 +14,9 @@ Read-only, and why that simplifies things
   a run is explicitly triggered, so "which rows are outstanding" was never a
   question this flow had to answer.
 * **Idempotence is structural.** Every run lands in a fresh
-  ``{label}/{timestamp}`` folder, so re-running is non-destructive by
-  construction and needs no marker to make it so.
+  ``{label}/{timestamp}`` folder under
+  ``{kit}/ComplexityAnalysis/Application/{application}``, so re-running is
+  non-destructive by construction and needs no marker to make it so.
 * **Reporting replaces the column.** A ``run-summary.md`` is uploaded beside
   the reports, so an operator reading SharePoint sees the outcome — including
   a failure — where the artefacts are, rather than only in the logs.
@@ -60,7 +61,11 @@ COMPLEXITY_FIELDS: dict[str, str] = {
     "preferred_llm": "Preferred_LLM",
 }
 
-COMPLEXITY_FOLDER = "complexity"
+# The kit-relative branch complexity output lives under. It is a SIBLING of
+# the applications tree, not a folder inside it, which is why report_folder
+# joins against kit_base_path rather than file_server_base_path.
+COMPLEXITY_AREA = "ComplexityAnalysis"
+APPLICATION_FOLDER = "Application"
 RUN_SUMMARY_NAME = "run-summary.md"
 
 
@@ -171,16 +176,22 @@ def report_folder(
     config: SharePointConfig | None = None,
 ) -> str:
     """
-    Where one run's reports go: ``{base}/{application}/complexity/{label}/
-    {timestamp}``.
+    Where one run's reports go: ``{kit}/ComplexityAnalysis/Application/
+    {application}/{label}/{timestamp}``.
+
+    Joined against ``kit_base_path``, not the applications root: complexity
+    output is filed by *analysis area* first and application second, so it sits
+    beside the applications tree rather than inside each application's folder.
+    The application therefore appears as the third segment, not the first.
 
     *label* records **what produced the estimate** — the model id when
     ``--llm-eval`` ran, else the resolved rules profile. That mirrors
     conversion's ``{model}/{timestamp}`` while still meaning something for an
-    entirely offline run, where there is no model to name.
+    entirely offline run, where there is no model to name. Both segments stay:
+    they are what makes a re-run land somewhere new instead of overwriting.
     """
-    return resolve_config(config).drive_path(
-        application, COMPLEXITY_FOLDER, label, timestamp
+    return resolve_config(config).kit_path(
+        COMPLEXITY_AREA, APPLICATION_FOLDER, application, label, timestamp
     )
 
 

@@ -348,7 +348,11 @@ publish_report_pdf(report, "Reports/Validation")
 
 The SharePoint destination resolves with the repo-wide precedence rule:
 the explicit argument, else config.json `validation.report_sharepoint_path`,
-else the library root. Rendering needs only PyMuPDF (a core dependency) and
+else the library root. `python -m validation --app APPLICATION` supplies that
+explicit argument from `conversion.paths.validation()`, filing the report in
+the same `scripts_converted/validation` folder a conversion run writes its
+per-item verdicts and aggregate summary to — so a reviewer finds the whole
+picture in one place instead of the PDF somewhere else. Rendering needs only PyMuPDF (a core dependency) and
 markdown-it-py — no SharePoint extra; uploading imports `app_config.sharepoint`
 lazily, so `import validation` stays cheap.
 
