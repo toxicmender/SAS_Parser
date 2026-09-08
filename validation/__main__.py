@@ -191,8 +191,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="DEST",
         help="Render the report to PDF and upload it to a SharePoint document "
         "library. DEST is a folder (a timestamped filename is appended) or an "
-        "exact '*.pdf' path; omit DEST to use config.json "
-        "validation.report_sharepoint_path (then the library root).",
+        "exact '*.pdf' path; omit DEST to use --app's converted-scripts "
+        "validation folder, then config.json validation.report_sharepoint_path, "
+        "then the library root.",
+    )
+    parser.add_argument(
+        "--app",
+        default=None,
+        metavar="APPLICATION",
+        help="With --pdf-sharepoint and no explicit DEST: file the report "
+        "beside this application's converted scripts, in the same "
+        "'scripts_converted/validation' folder a conversion run writes its "
+        "per-item verdicts to. Without it the report has no application to be "
+        "filed under and the configured path is used instead.",
     )
     parser.add_argument(
         "--debug",
@@ -234,6 +245,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "run is gone; post-hoc validation reads a persistent store)"
         )
     return args
+
+
+def _report_destination(args: argparse.Namespace) -> str | None:
+    """Where ``--pdf-sharepoint`` should put the report, or ``None`` to let
+    :func:`validation.pdf.publish_report_pdf` resolve its configured default.
+
+    An explicit ``DEST`` always wins. Otherwise ``--app`` files the report
+    beside that application's converted scripts, which is where a conversion
+    run already writes its per-item verdicts and aggregate summary
+    (:func:`conversion.run._upload_validation`) -- so a reviewer finds the
+    whole picture in one folder rather than the PDF somewhere else.
+
+    ``conversion`` is imported *here*, in the entry point, and not in
+    :mod:`validation.pdf`. :mod:`conversion.run` already imports this package
+    for ``report_to_pdf`` and ``report_from_verdicts``, so an edge the other
+    way inside the library would close a cycle; keeping it at the CLI leaves
+    ``validation`` the leaf that ``conversion`` can go on importing. It also
+    means ``conversion.paths`` stays the single owner of that layout -- this
+    asks it where the folder is rather than rebuilding the answer.
+    """
+    if args.pdf_sharepoint:
+        return args.pdf_sharepoint
+    if not args.app:
+        return None
+    from conversion.paths import validation as validation_folder
+
+    return validation_folder(args.app)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -296,10 +334,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.pdf_sharepoint is not None:
         from app_config.sharepoint import SharePointError
+
         from .pdf import publish_report_pdf
 
         try:
-            item = publish_report_pdf(report, args.pdf_sharepoint or None)
+            item = publish_report_pdf(report, _report_destination(args))
             print(
                 "uploaded PDF report to SharePoint: "
                 f"{item.get('web_url') or item.get('name')}"
