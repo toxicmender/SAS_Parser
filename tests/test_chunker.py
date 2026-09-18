@@ -106,8 +106,9 @@ class TestSasSemanticChunker(unittest.TestCase):
         self.assertIn("sashelp.class", chunk.metadata.input_datasets)
 
     def test_hash_dataset_argument_macro_ref_not_guessed(self):
-        # A dataset: value holding a macro reference is unresolvable at the
-        # DATA-step level — it must not be reported as a literal input.
+        # A dataset: value holding a macro reference no %LET in the corpus
+        # assigns is reported exactly as written — never resolved to a guessed
+        # name, and never dropped, since the step does read *something*.
         source = (
             "data work.a;\n"
             "  declare hash h(dataset:\"&lookup_ds\");\n"
@@ -116,7 +117,24 @@ class TestSasSemanticChunker(unittest.TestCase):
         )
         result = SasSemanticChunker().chunk_text(source)
         chunk = result.chunks[0]
-        self.assertEqual(chunk.metadata.input_datasets, [])
+        self.assertEqual(chunk.metadata.input_datasets, ["&lookup_ds"])
+        self.assertEqual(
+            chunk.metadata.unresolved_dataset_refs, ["&lookup_ds"]
+        )
+
+    def test_hash_dataset_argument_macro_ref_resolved_from_let(self):
+        # The same argument, once a preceding %LET gives the reference a value.
+        source = (
+            "%let lookup_ds = sashelp.class;\n"
+            "data work.a;\n"
+            "  declare hash h(dataset:\"&lookup_ds\");\n"
+            "  h.definedone();\n"
+            "run;\n"
+        )
+        result = SasSemanticChunker().chunk_text(source)
+        step = result.chunks[-1]
+        self.assertEqual(step.metadata.input_datasets, ["sashelp.class"])
+        self.assertEqual(step.metadata.unresolved_dataset_refs, [])
 
     def test_macro_body_hash_dataset_literal_and_param(self):
         # Inside a %MACRO body the same argument classifies like any other

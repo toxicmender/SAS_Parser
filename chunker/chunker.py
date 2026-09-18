@@ -16,7 +16,7 @@ from typing import TextIO
 
 import app_config
 
-from .metadata import _merge_meta, _metadata_for, _title
+from .metadata import _merge_meta, _metadata_for, _title, resolve_macro_var_refs
 from .models import (
     SasBatchResult,
     SasChunk,
@@ -63,7 +63,10 @@ def _record_user_library(
     library instead of the temporary WORK library.  That invalidates the
     ``work.``-canonicalisation :func:`_canon_ds` applies, so the condition
     is surfaced as a diagnostic rather than silently mis-resolved.
-    Idempotent across regions, mirroring :func:`_record_parser_timeout`.
+    Idempotent, mirroring :func:`_record_parser_timeout`.
+
+    Called on the whole chunk list once :func:`resolve_macro_var_refs` has run,
+    so ``%let u = user; libname &u '/u/perm';`` raises it as well.
     """
     if any(d.code == "USER_LIBRARY_ASSIGNED" for d in diagnostics):
         return
@@ -206,6 +209,19 @@ class SasSemanticChunker:
                         diagnostics,
                     )
                 )
+
+            # A %LET assigns a name the chunks *after* it use, so dataset and
+            # libref references spelled through macro variables can only be
+            # resolved once the whole file has been built. Runs inside the
+            # watchdog because it is still parse work; a partial result from a
+            # deadline exit is resolved as far as it got.
+            watchdog.set_phase("macro-variable resolution")
+            resolve_macro_var_refs(chunks)
+            # After resolution, so `%let u = user; libname &u '/u/perm';`
+            # raises the diagnostic too — the whole point of it is that
+            # one-level names stop resolving to WORK, and that is just as true
+            # when the libref arrives through a macro variable.
+            _record_user_library(chunks, diagnostics)
 
         elapsed = time.perf_counter() - t0
         logger.info(
@@ -648,9 +664,7 @@ class SasSemanticChunker:
                 logger.debug(
                     f"_chunks_for_region: single  kind={region.kind.value}  words={wc}  lines={sl}-{el}"
                 )
-            single = [self._make_chunk(source_id, region, line_starts, next_index)]
-            _record_user_library(single, diagnostics)
-            return single
+            return [self._make_chunk(source_id, region, line_starts, next_index)]
 
         # Oversized — split at statement boundaries with overlap
         logger.info(
@@ -769,7 +783,6 @@ class SasSemanticChunker:
         logger.info(
             f"_chunks_for_region: {region.kind.value} → {len(chunks)} chunks (1 parent + {len(chunks) - 1} children)"
         )
-        _record_user_library(chunks, diagnostics)
         return chunks
 
     def _make_chunk(

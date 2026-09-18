@@ -54,6 +54,7 @@ import logging
 import re
 from dataclasses import dataclass
 
+from .macro_vars import DS_REF_TOKEN
 from .models import PathLocation, SasEngineRef, SasPathRef
 
 logger = logging.getLogger(__name__)
@@ -180,11 +181,19 @@ PATH_STATEMENTS: tuple[PathSpec, ...] = (
     # because an engine changes what the directory is (see SasPathRef.engine):
     # `libname x spde '/p'` is a partitioned SPD Engine library, not the plain
     # directory `libname x '/p'` names.
+    #
+    # The libref is matched with DS_REF_TOKEN, not a bare identifier, because
+    # `libname &lib_out '/data/x';` is an ordinary way to write one — and while
+    # this required an identifier, that statement matched nothing at all and its
+    # directory went unrecorded. `binds` then holds the reference as written
+    # until chunker.metadata.resolve_macro_var_refs gives it a value; the
+    # `head`/`q`/`path` shape xref.pre substitutes on is unchanged, since a
+    # wider libref only widens `head`.
     PathSpec(
         statement="libname",
         keyword="libname",
         pattern=re.compile(
-            r"(?P<head>\blibname\s+(?P<binds>[A-Za-z_]\w*)\s+"
+            rf"(?P<head>\blibname\s+(?P<binds>{DS_REF_TOKEN})\s+"
             r"(?:(?P<engine>[A-Za-z_]\w*)\s+)?)" + _VALUE,
             re.IGNORECASE,
         ),
@@ -194,7 +203,7 @@ PATH_STATEMENTS: tuple[PathSpec, ...] = (
         statement="filename",
         keyword="filename",
         pattern=re.compile(
-            r"(?P<head>\bfilename\s+(?P<binds>[A-Za-z_]\w*)\s+"
+            rf"(?P<head>\bfilename\s+(?P<binds>{DS_REF_TOKEN})\s+"
             r"(?:(?P<device>[A-Za-z_]\w*)\s+)?)" + _VALUE,
             re.IGNORECASE,
         ),
@@ -320,7 +329,8 @@ ENGINE_LIBNAMES: frozenset[str] = frozenset(
 # statement with a dozen options is routinely wrapped across lines, and the
 # terminator is the semicolon, not the line end.
 _ENGINE_LIBNAME_RE = re.compile(
-    r"\blibname\s+(?P<binds>[A-Za-z_]\w*)\s+(?P<engine>[A-Za-z_]\w*)\b(?P<opts>[^;]*);",
+    rf"\blibname\s+(?P<binds>{DS_REF_TOKEN})\s+(?P<engine>[A-Za-z_]\w*)\b"
+    r"(?P<opts>[^;]*);",
     re.IGNORECASE,
 )
 
