@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any
+from typing import Any, TypeVar
 
 from .keywords import (
     _MACRO_CALL_RE,
@@ -28,7 +28,16 @@ from .keywords import (
     _SAS_SUM_STATEMENT_RE,
     SAS_GLOBAL_STATEMENT_TOKENS,
 )
+from .macro_vars import (
+    DS_REF_TOKEN,
+    DS_REF_TOKEN_POSSESSIVE,
+    has_macro_ref,
+    is_dataset_shaped,
+    let_values,
+    resolve_refs,
+)
 from .models import (
+    SasChunk,
     SasChunkKind,
     SasChunkMetadata,
     SasEngineRef,
@@ -46,18 +55,25 @@ logger = logging.getLogger(__name__)
 # Regex catalogue (mirrors the Reference Sheet grammar)
 # ---------------------------------------------------------------------------
 
+#: Every dataset and libref position below is scanned with
+#: :data:`~chunker.macro_vars.DS_REF_TOKEN` rather than a bare identifier, so a
+#: name spelled through a macro variable (``data &table1;``,
+#: ``set &lname..&table1;``) is seen instead of being read as the identifier
+#: after the ``&`` — which is how ``&table1`` used to be reported as the
+#: dataset ``work.table1``. :func:`resolve_macro_var_refs` gives the names their
+#: values once the whole file (or corpus) has been walked.
 _DATASET_RE = re.compile(
-    r"\b(?:data|set|merge|update|modify)\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    rf"\b(?:data|set|merge|update|modify)\s+({DS_REF_TOKEN})",
     re.IGNORECASE,
 )
 _DATA_OPT_RE = re.compile(
-    r"\bdata\s*=\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    rf"\bdata\s*=\s*({DS_REF_TOKEN})",
     re.IGNORECASE,
 )
 # The libref a LIBNAME statement assigns (``libname <ref> ...``). Extraction is
 # positional, not temporal, so ``libname x clear;`` still reports x. ``_all_``
 # targets every assigned libref rather than naming one; the caller drops it.
-_LIBNAME_REF_RE = re.compile(r"\blibname\s+([A-Za-z_]\w*)", re.IGNORECASE)
+_LIBNAME_REF_RE = re.compile(rf"\blibname\s+({DS_REF_TOKEN})", re.IGNORECASE)
 _MACRO_DEF_RE = re.compile(r"%\s*macro\s+([A-Za-z_]\w*)", re.IGNORECASE)
 
 
@@ -87,7 +103,7 @@ _OPTIONS_RE = re.compile(r"\boptions\s+([^;]+)", re.IGNORECASE)
 _LABEL_RE = re.compile(r"\blabel\s+([A-Za-z_]\w*)\s*=", re.IGNORECASE)
 _PROC_RE = re.compile(r"\bproc\s+([A-Za-z_]\w*)", re.IGNORECASE)
 _DATA_RE = re.compile(
-    r"\bdata\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    rf"\bdata\s+({DS_REF_TOKEN})",
     re.IGNORECASE,
 )
 
@@ -135,8 +151,7 @@ _CONTROL_FLOW_OP_RE = re.compile(
 
 # Shared precompiled token/paren helpers reused across the extractors below.
 _PAREN_RE = re.compile(r"\([^)]*\)")  # a balanced-free "(...)" span to blank out
-_DS_TOKEN_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?")  # libref.member token
-_AMP_TOKEN_RE = re.compile(r"[A-Za-z_&][\w.&]*")  # dataset token that may hold &refs
+_AMP_TOKEN_RE = re.compile(DS_REF_TOKEN)  # dataset token that may hold &refs
 _IDENT_RE = re.compile(r"[A-Za-z_]\w*")  # bare SAS identifier
 _SPLIT_WS_COMMA_RE = re.compile(r"[,\s]+")  # %global/%local list separator
 _DATA_HDR_STRIP_RE = re.compile(r"^\s*data\s+", re.IGNORECASE)  # drop DATA keyword
@@ -565,6 +580,11 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
                 declared.append(name.lower())
     declared_macro_vars = sorted(set(declared))
 
+    # ── macro-variable values, for the %LET-driven name resolution pass ─────
+    # Scanned on `cf` so a quoted value survives to be unquoted; the pass that
+    # consumes this is resolve_macro_var_refs, below.
+    macro_var_values = let_values(cf) if "let" in lowcf else {}
+
     # ── recognised SAS functions and CALL routines ──────────────────────────
     # Scanned on `mt` (string literals blanked), with %MACRO headers and
     # grouped-list INPUT/PUT blanked on top so non-call ``name(`` don't register.
@@ -637,6 +657,7 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
         global_statement_keyword=global_stmt_kw,
         declared_macro_vars=declared_macro_vars,
         referenced_macro_vars=referenced_macro_vars,
+        macro_var_values=macro_var_values,
         recognized_functions=recognized_functions,
         recognized_call_routines=recognized_call_routines,
         component_objects=component_objects,
@@ -685,6 +706,9 @@ def _merge_meta(parent: SasChunkMetadata, child: SasChunkMetadata) -> SasChunkMe
       set deduplicates them; the sort is what keeps output reproducible);
     - ``list[SasEngineRef]`` → the same rule under
       :func:`~chunker.models._engine_ref_sort_key`;
+    - ``dict[str, str]`` → both sides merged, the child's entry winning on a
+      shared key (a %LET the child slice can see is the assignment in force
+      there; the parent's whole-region view may already hold a later one);
     - ``bool``        → OR (a flag raised anywhere in the region stays raised);
     - ``str | None``  → child's value, falling back to the parent's (the
       child is the more specific view of its own slice);
@@ -708,6 +732,8 @@ def _merge_meta(parent: SasChunkMetadata, child: SasChunkMetadata) -> SasChunkMe
             merged[name] = sorted({*p, *c}, key=_path_ref_sort_key)
         elif field.annotation == list[SasEngineRef]:
             merged[name] = sorted({*p, *c}, key=_engine_ref_sort_key)
+        elif field.annotation == dict[str, str]:
+            merged[name] = {**p, **c}
         elif field.annotation is bool:
             merged[name] = p or c
         elif field.annotation == (str | None):
@@ -734,23 +760,203 @@ def _title(kind: SasChunkKind, meta: SasChunkMetadata) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Macro-variable name resolution — a pass over already-built chunks
+# ---------------------------------------------------------------------------
+
+# Dataset lists in the *canonical* namespace: a resolved name is canonicalised
+# again (``batch_med`` → ``work.batch_med``) so it lands where the batcher's
+# producer/consumer matching looks for it. ``referenced_datasets`` is raw-source
+# provenance and is deliberately not in this tuple — it keeps the spelling the
+# statement used, exactly as it does for a name written without a macro.
+_CANONICAL_DS_FIELDS = (
+    "input_datasets",
+    "output_datasets",
+    "body_literal_inputs",
+    "body_literal_outputs",
+)
+
+# The two record types that carry a ``binds`` libref/fileref, which _resolve_binds
+# rewrites in place of a macro reference without otherwise touching the record.
+_BindsRefT = TypeVar("_BindsRefT", SasPathRef, SasEngineRef)
+
+
+def _resolve_names(
+    names: list[str], table: dict[str, str], *, canonical: bool
+) -> list[str]:
+    """*names* with their ``&`` references expanded, order-preserving.
+
+    Resolution can collapse two spellings onto one name, so the result is
+    deduplicated — by insertion order, never sorted, because
+    ``output_datasets`` order is load-bearing (invariant 3).
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        resolved = resolve_refs(name, table) if has_macro_ref(name) else name
+        if canonical:
+            resolved = _canon_ds(resolved)
+        if resolved not in seen:
+            seen.add(resolved)
+            out.append(resolved)
+    return out
+
+
+def _resolve_binds(refs: list[_BindsRefT], table: dict[str, str]) -> list[_BindsRefT]:
+    """*refs* with the libref/fileref each one assigns resolved against *table*.
+
+    ``binds`` is a name, already lowercased rather than kept verbatim, so it
+    resolves like any other name — and it has to, or ``libname &l '/data/x';``
+    would leave ``defines_librefs`` calling the library ``mylib`` while the
+    :class:`~chunker.models.SasPathRef` for the same statement calls it ``&l``.
+    ``path`` and ``raw`` are deliberately untouched: ``raw`` is documented as
+    the value exactly as written, and a path's own macro references are already
+    reported by ``has_macro_ref``.
+    """
+    return [
+        r.model_copy(update={"binds": resolve_refs(r.binds, table)})
+        if r.binds and has_macro_ref(r.binds)
+        else r
+        for r in refs
+    ]
+
+
+def _resolved_meta(
+    meta: SasChunkMetadata, table: dict[str, str], own_values: dict[str, str]
+) -> SasChunkMetadata | None:
+    """*meta* with every dataset/libref name resolved against *table*, or
+    ``None`` when nothing in it changed.
+
+    *own_values* are this chunk's own ``%LET`` assignments, already expanded by
+    the caller against the table in force where each one stands.
+    """
+    updates: dict[str, Any] = {
+        field: _resolve_names(getattr(meta, field), table, canonical=True)
+        for field in _CANONICAL_DS_FIELDS
+    }
+    updates["defines_librefs"] = sorted(
+        set(_resolve_names(meta.defines_librefs, table, canonical=False))
+    )
+    updates["external_refs"] = _resolve_binds(meta.external_refs, table)
+    updates["engine_refs"] = _resolve_binds(meta.engine_refs, table)
+
+    # A %LET whose value is written like a dataset reference names a library on
+    # sight — ``%let table_demogr = datacia.member_demographic;`` is how a great
+    # deal of production SAS names its tables — so the value joins the chunk's
+    # referenced datasets. It is provenance only, never I/O: a %LET reads and
+    # writes nothing, the step that uses &table_demogr does.
+    let_refs = [v for v in own_values.values() if is_dataset_shaped(v)]
+    updates["referenced_datasets"] = sorted(
+        {
+            *_resolve_names(meta.referenced_datasets, table, canonical=False),
+            *updates["input_datasets"],
+            *updates["output_datasets"],
+            *let_refs,
+        }
+    )
+    # Recomputed from the resolved names by the same recipe _metadata_for uses:
+    # the libref half of every two-level name, plus the ones assigned here. An
+    # unresolved libref (``&lib_out_spd``) is reported as written — the batch
+    # does depend on a library, and saying so beats reporting none.
+    updates["referenced_librefs"] = sorted(
+        {
+            d.split(".", 1)[0]
+            for d in updates["referenced_datasets"]
+            if "." in d and not d.startswith("'")
+        }
+        | set(updates["defines_librefs"])
+    )
+    if meta.step_name and has_macro_ref(meta.step_name):
+        updates["step_name"] = resolve_refs(meta.step_name, table)
+
+    changed = {k: v for k, v in updates.items() if v != getattr(meta, k)}
+    if not changed:
+        return None
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"resolve_macro_var_refs: {changed}")
+    return meta.model_copy(update=changed)
+
+
+def resolve_macro_var_refs(chunks: list[SasChunk]) -> None:
+    """Give ``&name`` dataset and libref references their values, in place.
+
+    Walks *chunks* once in source order, accumulating the ``%LET`` values each
+    one assigns and expanding the references of the ones that follow — so
+    ``data &table1; set &lname..&table1;`` reports ``work.batch_med`` and
+    ``xwrk.batch_med`` instead of the invented ``work.table1`` and no input at
+    all. Chunk ``title`` is refreshed when the DATA step's name resolves.
+
+    Run per file by :meth:`~chunker.chunker.SasSemanticChunker.chunk_text` and
+    again over the flattened corpus by
+    :class:`~chunker.batcher.MultiFileBatcher`, which is what lets a ``%LET`` in
+    one file resolve a name used in another. The second run is cheap and
+    idempotent: an already-resolved name holds no ``&`` and is skipped.
+
+    Two deliberate limits, both on the side of not guessing:
+
+    - **Source order, not execution order.** A ``%LET`` is in force for the
+      chunks after it, the same nearest-preceding-producer approximation
+      :mod:`chunker.batcher` already makes for datasets. A value assigned
+      inside a ``%MACRO`` body stays local to that chunk, since whether it ever
+      executes depends on a call site.
+    - **A macro's own parameters shadow the table.** Inside a
+      ``%MACRO m(ds);`` body, ``&ds`` is supplied by the call site, so a
+      corpus-level ``%let ds = ...;`` must not be read as its value. Those
+      references stay in ``body_param_inputs`` / ``body_param_outputs``, where
+      the batcher resolves them per call.
+    """
+    table: dict[str, str] = {}
+    for idx, chunk in enumerate(chunks):
+        meta = chunk.metadata
+        shadowed = set(meta.macro_param_names)
+        scope = (
+            {k: v for k, v in table.items() if k not in shadowed}
+            if shadowed
+            else dict(table)
+        )
+        # %LET resolves its value where it stands, so each assignment is
+        # expanded against the table as it was *before* it, then stored
+        # resolved: after ``%let x = work.a; %let x = &x.b;`` the variable holds
+        # work.ab, and a later ``data &x;`` writes work.ab — not a reference to
+        # itself. Source order inside the chunk is dict insertion order, so
+        # ``%let a = prod; %let b = &a..orders;`` resolves in one walk.
+        own: dict[str, str] = {}
+        for name, value in meta.macro_var_values.items():
+            own[name] = resolve_refs(value, scope) if has_macro_ref(value) else value
+            if name not in shadowed:
+                scope[name] = own[name]
+
+        if scope or own:
+            resolved = _resolved_meta(meta, scope, own)
+            if resolved is not None:
+                updates: dict[str, Any] = {"metadata": resolved}
+                if resolved.step_name != meta.step_name:
+                    updates["title"] = _title(chunk.kind, resolved)
+                chunks[idx] = chunk.model_copy(update=updates)
+
+        # A %MACRO body's assignments are conditional on the macro being
+        # called, so they never join the running table (see the docstring).
+        if own and chunk.kind is not SasChunkKind.MACRO_DEFINITION:
+            table.update({k: v for k, v in own.items() if k not in shadowed})
+
+
+# ---------------------------------------------------------------------------
 # Directed I/O extraction  — called from _metadata_for
 # ---------------------------------------------------------------------------
 
 _SQL_CREATE_RE = re.compile(
-    r"\bcreate\s+(?:table|view)\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    rf"\bcreate\s+(?:table|view)\s+({DS_REF_TOKEN})",
     re.IGNORECASE,
 )
 _SQL_FROM_RE = re.compile(
-    r"\bfrom\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    rf"\bfrom\s+({DS_REF_TOKEN})",
     re.IGNORECASE,
 )
 _SQL_JOIN_RE = re.compile(
-    r"\bjoin\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    rf"\bjoin\s+({DS_REF_TOKEN})",
     re.IGNORECASE,
 )
 _SQL_INTO_RE = re.compile(
-    r"\binsert\s+into\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    rf"\binsert\s+into\s+({DS_REF_TOKEN})",
     re.IGNORECASE,
 )
 # The inner token/whitespace quantifiers are *possessive* (``*+``) so a
@@ -758,30 +964,30 @@ _SQL_INTO_RE = re.compile(
 # backtracking exponentially (which the parse deadline cannot interrupt). Only
 # the outer ``+?`` stays lazy, to stop at the first terminator.
 _SET_RE = re.compile(
-    r"\bset\s++((?:[A-Za-z_]\w*+(?:\.[A-Za-z_]\w*+)?(?:\s*+\([^)]*\))?\s*+)+?)"
+    rf"\bset\s++((?:{DS_REF_TOKEN_POSSESSIVE}(?:\s*+\([^)]*\))?\s*+)+?)"
     r"(?=;|\bwhere\b|\bby\b|\bobs\b|\bnobs\b)",
     re.IGNORECASE | re.DOTALL,
 )
 _MERGE_RE = re.compile(
-    r"\bmerge\s++((?:[A-Za-z_]\w*+(?:\.[A-Za-z_]\w*+)?(?:\s*+\([^)]*\))?\s*+)+?)"
+    rf"\bmerge\s++((?:{DS_REF_TOKEN_POSSESSIVE}(?:\s*+\([^)]*\))?\s*+)+?)"
     r"(?=;|\bby\b)",
     re.IGNORECASE | re.DOTALL,
 )
 _UPDATE_RE = re.compile(
-    r"\bupdate\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    rf"\bupdate\s+({DS_REF_TOKEN})",
     re.IGNORECASE,
 )
 _MODIFY_RE = re.compile(
-    r"\bmodify\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    rf"\bmodify\s+({DS_REF_TOKEN})",
     re.IGNORECASE,
 )
 _OUTPUT_DS_RE = re.compile(
-    r"\boutput\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    rf"\boutput\s+({DS_REF_TOKEN})",
     re.IGNORECASE,
 )
 _PROC_OUT_RE = re.compile(
-    r"\bout\s*=\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)"
-    r"|\boutdata\s*=\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)",
+    rf"\bout\s*=\s*({DS_REF_TOKEN})"
+    rf"|\boutdata\s*=\s*({DS_REF_TOKEN})",
     re.IGNORECASE,
 )
 # Quoted physical-path dataset references (e.g. ``data 'c:/tmp/perm';``). String
@@ -834,34 +1040,35 @@ def _hash_dataset_refs(cf: str) -> list[str]:
 # possessive (``*+``) for the same reason as _SET_RE above; the outer ``+?``
 # stays lazy.
 _BODY_DATA_HDR_RE = re.compile(
-    r"(?<![\w=])data\s++((?:[A-Za-z_&][\w.&]*+(?:\s*+\([^)]*+\))?\s*+)+?)(?=;)",
+    rf"(?<![\w=])data\s++((?:{DS_REF_TOKEN_POSSESSIVE}(?:\s*+\([^)]*+\))?\s*+)+?)(?=;)",
     re.IGNORECASE,
 )
 _BODY_SET_RE = re.compile(
-    r"\bset\s++((?:[A-Za-z_&][\w.&]*+(?:\s*+\([^)]*\))?\s*+)+?)(?=;|\bwhere\b|\bby\b|\bobs\b)",
+    rf"\bset\s++((?:{DS_REF_TOKEN_POSSESSIVE}(?:\s*+\([^)]*\))?\s*+)+?)"
+    r"(?=;|\bwhere\b|\bby\b|\bobs\b)",
     re.IGNORECASE | re.DOTALL,
 )
 _BODY_MERGE_RE = re.compile(
-    r"\bmerge\s++((?:[A-Za-z_&][\w.&]*+(?:\s*+\([^)]*\))?\s*+)+?)(?=;|\bby\b)",
+    rf"\bmerge\s++((?:{DS_REF_TOKEN_POSSESSIVE}(?:\s*+\([^)]*\))?\s*+)+?)(?=;|\bby\b)",
     re.IGNORECASE | re.DOTALL,
 )
-_BODY_UPDATE_RE = re.compile(r"\bupdate\s+([A-Za-z_&][\w.&]*)", re.IGNORECASE)
-_BODY_MODIFY_RE = re.compile(r"\bmodify\s+([A-Za-z_&][\w.&]*)", re.IGNORECASE)
-_BODY_OUTPUT_RE = re.compile(r"\boutput\s+([A-Za-z_&][\w.&]*)", re.IGNORECASE)
-_BODY_PROC_IN_RE = re.compile(r"\bdata\s*=\s*([A-Za-z_&][\w.&]*)", re.IGNORECASE)
+_BODY_UPDATE_RE = re.compile(rf"\bupdate\s+({DS_REF_TOKEN})", re.IGNORECASE)
+_BODY_MODIFY_RE = re.compile(rf"\bmodify\s+({DS_REF_TOKEN})", re.IGNORECASE)
+_BODY_OUTPUT_RE = re.compile(rf"\boutput\s+({DS_REF_TOKEN})", re.IGNORECASE)
+_BODY_PROC_IN_RE = re.compile(rf"\bdata\s*=\s*({DS_REF_TOKEN})", re.IGNORECASE)
 _BODY_PROC_OUT_RE = re.compile(
-    r"\bout\s*=\s*([A-Za-z_&][\w.&]*)"
-    r"|\boutdata\s*=\s*([A-Za-z_&][\w.&]*)",
+    rf"\bout\s*=\s*({DS_REF_TOKEN})"
+    rf"|\boutdata\s*=\s*({DS_REF_TOKEN})",
     re.IGNORECASE,
 )
 _BODY_SQL_CREATE_RE = re.compile(
-    r"\bcreate\s+(?:table|view)\s+([A-Za-z_&][\w.&]*)",
+    rf"\bcreate\s+(?:table|view)\s+({DS_REF_TOKEN})",
     re.IGNORECASE,
 )
-_BODY_SQL_FROM_RE = re.compile(r"\bfrom\s+([A-Za-z_&][\w.&]*)", re.IGNORECASE)
-_BODY_SQL_JOIN_RE = re.compile(r"\bjoin\s+([A-Za-z_&][\w.&]*)", re.IGNORECASE)
+_BODY_SQL_FROM_RE = re.compile(rf"\bfrom\s+({DS_REF_TOKEN})", re.IGNORECASE)
+_BODY_SQL_JOIN_RE = re.compile(rf"\bjoin\s+({DS_REF_TOKEN})", re.IGNORECASE)
 _BODY_SQL_INTO_RE = re.compile(
-    r"\binsert\s+into\s+([A-Za-z_&][\w.&]*)",
+    rf"\binsert\s+into\s+({DS_REF_TOKEN})",
     re.IGNORECASE,
 )
 
@@ -872,25 +1079,43 @@ _ARG_SPLIT_RE = re.compile(r",(?![^(]*\))")
 _MACRO_SIG_RE = re.compile(r"%\s*macro\s+\w+\s*\(([^)]*)\)", re.IGNORECASE)
 
 
+# What a macro body's dataset reference turns out to be — the vocabulary
+# _classify_ref answers in and _classify_list dispatches on.
+_REF_LITERAL = "literal"  # no macro reference; the name is written out
+_REF_PARAM = "param"  # exactly this macro's parameter, resolved per call site
+_REF_CALL_SITE = "call_site"  # built from parameters, so only a call site knows it
+_REF_MACRO_VAR = "macro_var"  # macro variables, none of them this macro's own
+
+
 def _classify_ref(
     raw: str,
     param_pos: dict[str, int],
-) -> tuple[str, bool]:
+) -> tuple[str, str]:
     """
     Classify a raw dataset reference extracted from a macro body.
 
-    Returns (resolved_key, is_parameterised).
-    ``resolved_key`` is the literal lowercased dataset name if there is no
-    ``&`` reference, or the lowercased macro parameter name (without ``&``)
-    if the reference is a single, recognised macro variable.
+    Returns ``(key, kind)``, where *kind* is one of :data:`_REF_LITERAL`,
+    :data:`_REF_PARAM`, :data:`_REF_CALL_SITE` or :data:`_REF_MACRO_VAR` and
+    *key* is the lowercased parameter name for :data:`_REF_PARAM`, or the
+    lowercased reference exactly as written for everything else.
+
+    The distinction that matters is between a name the *call site* supplies
+    and one it does not.  ``&lib..&prefix._&suffix.`` is assembled from three
+    parameters, so no name exists until a call is made and this module never
+    fabricates one from the pieces (:data:`_REF_CALL_SITE`).  ``&reporting_lib``
+    inside the same body names a macro variable the corpus assigns, fixed for
+    every call, and :func:`resolve_macro_var_refs` can give it a value
+    (:data:`_REF_MACRO_VAR`).
     """
     raw = raw.strip()
     if "&" not in raw:
-        return raw.lower(), False
-    refs = _VAR_REF_RE.findall(raw)
-    if len(refs) == 1 and refs[0].lower() in param_pos:
-        return refs[0].lower(), True
-    return raw.lower(), True
+        return raw.lower(), _REF_LITERAL
+    refs = [r.lower() for r in _VAR_REF_RE.findall(raw)]
+    if len(refs) == 1 and refs[0] in param_pos:
+        return refs[0], _REF_PARAM
+    if any(r in param_pos for r in refs):
+        return raw.lower(), _REF_CALL_SITE
+    return raw.lower(), _REF_MACRO_VAR
 
 
 def _parse_macro_params(sig_text: str) -> list[tuple[str, str | None]]:
@@ -1035,29 +1260,34 @@ def _macro_body_io(
             raw = raw.strip()
             if not raw or raw.lower() in _SAS_RESERVED:
                 continue
-            key, is_param = _classify_ref(raw, param_pos)
-            if is_param:
-                pname = key
-                if pname in param_pos and pname not in seen_par:
-                    seen_par.add(pname)
-                    params_out.append({"param": pname, "pos": param_pos[pname]})
+            key, kind = _classify_ref(raw, param_pos)
+            if kind == _REF_PARAM:
+                if key not in seen_par:
+                    seen_par.add(key)
+                    params_out.append({"param": key, "pos": param_pos[key]})
                     if logger.isEnabledFor(logging.DEBUG):
                         logger.debug(
-                            f"_macro_body_io: {role} PARAM  raw={raw!r}  param={pname}  pos={param_pos[pname]}"
+                            f"_macro_body_io: {role} PARAM  raw={raw!r}  param={key}  pos={param_pos[key]}"
                         )
-                elif pname not in param_pos:
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(
-                            f"_macro_body_io: {role} UNRESOLVABLE param ref {raw!r}"
-                        )
+            elif kind == _REF_CALL_SITE:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"_macro_body_io: {role} CALL-SITE ref {raw!r} — no name "
+                        f"until the call's arguments are known"
+                    )
             else:
+                # _REF_LITERAL, and _REF_MACRO_VAR alongside it: a macro
+                # variable the call site does not supply has one value for
+                # every call, so it belongs with the literals — written as it
+                # stands until resolve_macro_var_refs finds the %LET that gives
+                # it a value, rather than dropped as it used to be.
                 key = _canon_ds(key)
                 if key not in seen_lit:
                     seen_lit.add(key)
                     literals.append(key)
                     if logger.isEnabledFor(logging.DEBUG):
                         logger.debug(
-                            f"_macro_body_io: {role} LITERAL  raw={raw!r}  name={key}"
+                            f"_macro_body_io: {role} {kind.upper()}  raw={raw!r}  name={key}"
                         )
 
         return literals, params_out
@@ -1090,6 +1320,11 @@ def _canon_ds(name: str) -> str:
     passes through unchanged:
 
     - two-level ``libref.member`` names;
+    - names still holding a macro reference (``&table1``), whose libref is
+      not knowable yet: ``&table1`` may well resolve to a two-level name, so
+      calling it ``work.&table1`` would assert a library the source never
+      named. :func:`resolve_macro_var_refs` canonicalises again once the
+      reference has a value, and what never resolves keeps the ``&``;
     - special ``_name_`` tokens (``_data_`` / ``_last_``), which are not
       Work members but placeholders the batcher's implicit-dataset pass
       resolves in corpus order;
@@ -1104,6 +1339,7 @@ def _canon_ds(name: str) -> str:
     """
     if (
         "." in name
+        or has_macro_ref(name)
         or name.startswith("'")
         or (name.startswith("_") and name.endswith("_"))
     ):
@@ -1125,7 +1361,7 @@ def _quoted_path(raw: str) -> str:
 
 def _multi_ds(match_group: str) -> list[str]:
     cleaned = _PAREN_RE.sub(" ", match_group)
-    tokens = _DS_TOKEN_RE.findall(cleaned)
+    tokens = _AMP_TOKEN_RE.findall(cleaned)
     return [_canon_ds(n) for t in tokens if (n := _ds_name(t))]
 
 
@@ -1212,12 +1448,12 @@ def _io_for(
                 inputs.append(_quoted_path(m.group(1)))
         # Hash object constructors load their DATASET: argument at
         # instantiation — an input like SET/MERGE. A value holding a macro
-        # reference is left unresolved rather than guessed.
+        # reference is recorded as written, like every other dataset position:
+        # resolve_macro_var_refs gives it a value if the corpus assigns one,
+        # and never guesses one if it does not.
         if "dataset" in lowcf:
             for raw in _hash_dataset_refs(cf):
-                if "&" in raw:
-                    continue
-                if (n := _ds_name(raw)) and _DS_TOKEN_RE.fullmatch(n):
+                if (n := _ds_name(raw)) and _AMP_TOKEN_RE.fullmatch(n):
                     inputs.append(_canon_ds(n))
 
     elif kind == SasChunkKind.PROC_STEP:

@@ -69,10 +69,15 @@ result.batches[0].output_datasets  # ['dev.staging.clean', ...]
 ```
 
 Names created via DATA headers, SET/MERGE renames, and PROC `OUT=`/`OUTPUT
-OUT=` all reach the mapper through the extracted metadata; a dataset name
-stored in a macro variable (`%let ds = mylib.orders;`, including the
-`%global`/`%local` + `%let` pattern) is additionally rewritten in the chunk
-*text*, since a `%let` value never appears in the metadata dataset lists.
+OUT=` all reach the mapper through the extracted metadata — including the ones
+written as `&refs`, which are resolved to real names before batching (see
+[Names spelled through macro variables](#names-spelled-through-macro-variables)).
+A dataset name *stored* in a macro variable (`%let ds = mylib.orders;`,
+including the `%global`/`%local` + `%let` pattern) is additionally rewritten in
+the chunk *text*, since the rewritten metadata fields hold the names steps
+read and write, not the `%let` values they were assembled from. A name that
+never resolved keeps its `&` and is never mapped: the mapping vocabulary
+cannot address it.
 
 The mapping can also come from a two-column CSV (`sas_name,databricks_name` —
 librefs or exact `libref.member` names) via `parse_databricks_mapping_csv`.
@@ -94,7 +99,8 @@ For running the work items end-to-end through an LLM, see the
 | `paths.py` | Where a physical path appears in SAS syntax — `PATH_STATEMENTS`, `classify_location`, `extract_paths`. The **single owner** of that grammar: `xref.pre` imports it to rewrite the same statements. |
 | `keywords.py` | SAS keyword catalogues transcribed from the SAS docs (reserved macro words, autocall macros, function / CALL-routine dictionaries, and `SAS_FUNCTION_CATEGORIES`) + the patterns compiled from them. Pure data; no package imports, no logging. |
 | `scanner.py` | Lexical layer: `_Unit` / `_Region` parse primitives, the statement classifier (`_classify`), text normalisation / sanitisation, line-offset helpers, and the `_Deadline` / `_ParseWatchdog` stuck-parser machinery. |
-| `metadata.py` | Per-chunk semantic extraction: `_metadata_for`, `_io_for` (directed dataset I/O), `_macro_body_io` (literal vs parameterised body refs), symput / SQL-INTO / CALL EXECUTE extractors, `_merge_meta`, and the extraction regex catalogue. |
+| `macro_vars.py` | Macro-variable values and reference expansion: `let_values` (the `%LET` symbol table), `resolve_refs` (`&name` / `&name.` / `&&name&i`), and `DS_REF_TOKEN` — the single definition of a dataset token that may embed `&refs`. Pure; no package imports. |
+| `metadata.py` | Per-chunk semantic extraction: `_metadata_for`, `_io_for` (directed dataset I/O), `_macro_body_io` (literal vs parameterised body refs), symput / SQL-INTO / CALL EXECUTE extractors, `_merge_meta`, the extraction regex catalogue, and `resolve_macro_var_refs` (the whole-list macro-name resolution pass). |
 | `chunker.py` | `SasSemanticChunker` orchestration (scan → group → build chunks, oversized-split with overlap). |
 | `batcher.py` | `_EdgeDiscovery` + Union-Find grouping, weak-edge resolution, context absorption, batch construction. `SasChunkBatcher` is a one-file convenience over `MultiFileBatcher`. |
 | `_repl.py` | `print_iterable` REPL helper (imported by nothing). |
@@ -106,9 +112,10 @@ For running the work items end-to-end through an LLM, see the
 > a prompt; `chunker.batcher` then packs these units by token cost
 > (`pipeline.max_merged_tokens`) on top. Two different questions, two units.
 
-**Import direction is strictly downward:** `keywords` and `models` import
-nothing from the package; `scanner` and `metadata` import from them; `chunker.py`
-imports from all four; `batcher` imports from `keywords`, `metadata`, `models`.
+**Import direction is strictly downward:** `keywords`, `macro_vars` and `models`
+import nothing from the package; `scanner`, `paths` and `metadata` import from
+them; `chunker.py` imports from all of them; `batcher` imports from `keywords`,
+`metadata`, `models`.
 The package imports nothing from `memory`, `llm_client`, `prompt_builder`, or
 `pipeline` — it is a leaf the `pipeline` package builds on.
 
@@ -150,6 +157,8 @@ fields** derived at access time, not stored:
   dependency).
 - `physical_paths` / `remote_paths` / `email_refs` — the `external_refs` entries
   whose `location` is `FILESYSTEM` / `REMOTE` / `EMAIL`.
+- `unresolved_dataset_refs` — the dataset names across `referenced_datasets`,
+  the I/O lists and `body_literal_*` that still hold a `&` (see below).
 
 Both appear in `model_dump()` but are silently ignored as constructor kwargs,
 and they do not appear in `__str__`. `defines_macros` / `invokes_macros` are the
@@ -176,6 +185,62 @@ keep honest, and the per-kind views above for consumers. `includes` is the
 `%INCLUDE` slice of the same scan, not a second definition of where an include
 path lives.
 
+### Names spelled through macro variables
+
+Production SAS names libraries and tables with macro variables far more often
+than it writes them out:
+
+```sas
+%let lname  = xwrk;
+%let suf    = batch_med;
+%let table1 = &suf;
+
+data &table1;
+  set &lname..&table1;
+run;
+```
+
+Every dataset position is scanned with `macro_vars.DS_REF_TOKEN`, which admits
+`&refs`, so those names are seen at all; `metadata.resolve_macro_var_refs` then
+walks the built chunks in source order, accumulating each `%LET` value and
+expanding the references of the chunks that follow. The step above reports
+`work.batch_med` out, `xwrk.batch_med` in, and `xwrk` as a referenced libref.
+The delimiter dot is SAS's: in `&lname..&table1` one dot ends the reference and
+the other separates libref from member. Chains (`&table1` → `&suf` →
+`batch_med`) resolve in full, a `%LET` value is expanded where it stands (so
+`%let x = &x.b;` appends rather than recursing), and the indirect `&&ds&i`
+idiom is rescanned when — and only when — the rescan resolves it completely.
+
+**What does not resolve is reported exactly as written**, never dropped and
+never guessed at:
+
+```sas
+%let table_reg_excl_spd = &lib_out_spd..cia_hso_excl;   /* &lib_out_spd unknown */
+```
+
+`referenced_datasets` gains `&lib_out_spd..cia_hso_excl` and
+`referenced_librefs` gains `&lib_out_spd`; `SasChunkMetadata.unresolved_dataset_refs`
+and `SasBatch.unresolved_dataset_refs` are the views that separate those from
+the resolved names. A reference whose value only exists at run time is still a
+dependency, and saying "this batch reads a library called `&lib_out_spd`" is
+strictly better than reporting no library at all. For the same reason a name
+holding a `&` is never `work.`-canonicalised — `&suf` may well resolve to a
+two-level name — and the Databricks mapping skips it.
+
+A `%LET` whose value is *shaped* like a dataset reference
+(`%let table_demogr = datacia.member_demographic;`) contributes to
+`referenced_datasets` / `referenced_librefs` on sight. It is provenance only,
+never I/O: a `%LET` reads and writes nothing; the step that uses
+`&table_demogr` does.
+
+Two scope rules keep this from over-reaching. A macro's own parameters shadow
+the table, so `&ds` inside `%macro m(ds);` stays a `body_param_*` entry the
+batcher resolves per call site rather than picking up a corpus-level
+`%let ds = ...;`. And a `%LET` inside a `%MACRO` body stays local to that chunk,
+since whether it ever executes depends on a call. Resolution runs once per file
+in `chunk_text` and again over the flattened corpus in `MultiFileBatcher`,
+which is what lets a `%LET` in one file name a dataset another file reads.
+
 ## Batching model
 
 `_EdgeDiscovery` builds producer indices, then walks the flattened corpus once,
@@ -200,7 +265,8 @@ chunk's component, same-file only.
 
 Dataset names are canonicalised (`_canon_ds`): one-level names become
 `work.<name>` (a `USER_LIBRARY_ASSIGNED` diagnostic flags the case where that
-rewrite is inexact). Consumers link to the **nearest preceding producer** in
+rewrite is inexact); a name still holding a `&` is left alone, since its libref
+is not knowable yet. Consumers link to the **nearest preceding producer** in
 corpus order — the state a sequential SAS session would actually read — so
 unrelated jobs reusing `work.tmp` stay separate.
 
@@ -225,7 +291,8 @@ these silently changes behavior.
    (The list-merge in `_merge_meta` is the deliberate exception.)
 4. **Every `SasChunkMetadata` field must have a merge rule.** `_merge_meta`
    dispatches on field annotation (`list[str]` → sorted union,
-   `list[SasPathRef]` → union ordered by `_path_ref_sort_key`, `bool` → OR,
+   `list[SasPathRef]` → union ordered by `_path_ref_sort_key`,
+   `dict[str, str]` → merged with the child's entry winning, `bool` → OR,
    `str | None` → child-or-parent, `_MERGE_PARENT_WINS` → parent's value) and
    raises `TypeError` for anything else. The default-instance test in
    `tests/test_chunker.py` trips the guard for every stored field, so a new field
@@ -270,6 +337,17 @@ these silently changes behavior.
    exist in `_SAS_FUNCTIONS` or `_SAS_CALL_ROUTINES`;
    `tests/test_bundled_instructions.py` enforces both ends, so a typo cannot
    silently create a category nothing can ever match.
+10. **An unresolved macro reference stays verbatim, and stays reported.**
+   `resolve_macro_var_refs` never invents a name for a reference the corpus
+   does not assign, never drops it, and never rewrites the spelling of the part
+   it could not resolve — which is why expansion substitutes over the whole
+   string instead of re-rendering it from tokens (re-rendering `&lname` before
+   a `.` would have to re-escape SAS's delimiter dot, and `&lname.batch_med`
+   means something else than `&lname..batch_med`). The two directions this can
+   fail are both silent: guessing produces a dataset name nothing in the corpus
+   has, and dropping produces a step that appears to read nothing.
+   `_canon_ds` therefore leaves `&`-bearing names alone, and `_map_ds` refuses
+   to map them.
 
 ## Logging
 

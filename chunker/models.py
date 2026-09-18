@@ -253,6 +253,13 @@ class SasChunkMetadata(BaseModel):
     declared_macro_vars: list[str] = Field(default_factory=list)
     referenced_macro_vars: list[str] = Field(default_factory=list)
 
+    # The *values* the chunk's ``%LET`` statements assign, name → value, both
+    # lowercased. Only values that could name a dataset, a library or part of
+    # one are kept (``chunker.macro_vars.let_values``) — this is the symbol
+    # table ``chunker.metadata.resolve_macro_var_refs`` expands ``&name``
+    # references against, not a record of every string the job holds.
+    macro_var_values: dict[str, str] = Field(default_factory=dict)
+
     @computed_field  # type: ignore[prop-decorator]
     @property
     def referenced_automatic_vars(self) -> list[str]:
@@ -313,6 +320,33 @@ class SasChunkMetadata(BaseModel):
     # this file", these answer "what system is this, and how did the job log in
     # to it", and the two have no field in common beyond the libref.
     engine_refs: list[SasEngineRef] = Field(default_factory=list)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def unresolved_dataset_refs(self) -> list[str]:
+        """Dataset names the chunk still spells through a macro variable.
+
+        A name reaches this list when no ``%LET`` in the corpus gave its
+        reference a value — ``&lib_out_spd..cia_hso_excl`` — so its real
+        library and member are only knowable by running SAS. They stay in
+        ``referenced_datasets`` and the I/O lists exactly as written, because
+        a dependency that cannot be resolved is still a dependency; this view
+        is how a consumer tells those apart from the resolved names without
+        re-scanning for ``&``.
+        """
+        return sorted(
+            {
+                d
+                for d in (
+                    *self.referenced_datasets,
+                    *self.input_datasets,
+                    *self.output_datasets,
+                    *self.body_literal_inputs,
+                    *self.body_literal_outputs,
+                )
+                if "&" in d
+            }
+        )
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -618,6 +652,20 @@ class SasBatch(BaseModel):
     def remote_paths(self) -> list[SasPathRef]:
         """:attr:`external_refs` narrowed to remote services."""
         return [r for r in self.external_refs if r.location is PathLocation.REMOTE]
+
+    @property
+    def unresolved_dataset_refs(self) -> list[str]:
+        """Dataset names the batch spells through an unresolved macro variable.
+
+        The batch-level view of
+        :attr:`SasChunkMetadata.unresolved_dataset_refs`: every name whose
+        library or member no ``%LET`` in the corpus supplied. Non-empty means
+        part of this batch's data flow could not be traced statically, which a
+        consumer translating it needs to say out loud rather than discover.
+        """
+        return sorted(
+            {r for c in self.chunks for r in c.metadata.unresolved_dataset_refs}
+        )
 
     @property
     def has_symput_scope_hazard(self) -> bool:

@@ -98,11 +98,21 @@ chunker/
                         statement classifier (_classify), text normalisation
                         and sanitisation, line-offset helpers, and the
                         _Deadline/_ParseWatchdog stuck-parser machinery.
+  macro_vars.py         Macro-variable values and the reference expansion that
+                        resolves names: let_values (the %LET symbol table),
+                        resolve_refs (&name / &name. / &&name&i, delimiter-dot
+                        semantics included), and DS_REF_TOKEN — the one
+                        definition of a dataset token that may embed &refs,
+                        which every dataset position in metadata.py and the
+                        LIBNAME/FILENAME librefs in paths.py are scanned with.
+                        Pure data + functions; no package imports, no models.
   metadata.py           Per-chunk semantic extraction: _metadata_for, _io_for
                         (directed dataset I/O), _macro_body_io (literal vs
                         parameterised body refs), symput / SQL-INTO / CALL
-                        EXECUTE extractors, _merge_meta, and the extraction
-                        regex catalogue.
+                        EXECUTE extractors, _merge_meta, the extraction regex
+                        catalogue, and resolve_macro_var_refs — the whole-list
+                        pass that gives &name dataset/libref references their
+                        values once a file (or the corpus) has been walked.
   chunker.py            SasSemanticChunker orchestration (scan → group →
                         build chunks, oversized-split with overlap).
   batcher.py            _EdgeDiscovery + Union-Find grouping, weak-edge
@@ -978,6 +988,16 @@ any of these silently changes behavior.
      partitioned SPD Engine storage while `libname x '/p'` is an ordinary
      directory — indistinguishable for as long as that group stayed
      non-capturing, which it was until hydration needed to tell them apart.
+   - **One macro-reference grammar.** `chunker/macro_vars.py` owns what a name
+     spelled through a macro variable looks like (`DS_REF_TOKEN`) and how it
+     expands (`let_values` / `resolve_refs`). Every dataset position in
+     `chunker/metadata.py` and the LIBNAME/FILENAME librefs in
+     `chunker/paths.py` are scanned with that one token, because a scan that
+     required a bare identifier could not see `data &table1;` at all — it read
+     the identifier after the `&` and reported the dataset `work.table1`, which
+     does not exist. A second, narrower notion of "a name" living in either of
+     those modules brings that failure straight back, and it is silent: the
+     chunk reports *a* dataset, just not the one the source names.
    - **One path resolver.** `xref/mapping.py` decides which `by_path` key wins
      (exact match, then longest directory prefix) and what it rewrites to. Both
      halves of the substitution import it: `xref/pre.py` on the way in,
