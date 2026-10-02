@@ -42,5 +42,5 @@ tiktoken==0.13.0
 tqdm==4.67.1
 typing-extensions==4.15.0
 typing-inspection==0.4.2
-urllib3==2.5.0
+urllib3==2.8.0
 zstandard==0.25.0
