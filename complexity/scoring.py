@@ -21,7 +21,14 @@ import re
 from typing import Iterable
 
 import app_config
-from chunker.models import SasChunk, SasChunkMetadata, SasPathRef, _path_ref_sort_key
+from chunker.models import (
+    SasChunk,
+    SasChunkMetadata,
+    SasDbTableRef,
+    SasPathRef,
+    _db_table_sort_key,
+    _path_ref_sort_key,
+)
 from chunker.scanner import _sanitise
 
 from .models import ChunkComplexity, ComplexitySignal, ComplexityTier, TranslationParity
@@ -112,6 +119,18 @@ def _file_paths(scored: list[ChunkComplexity]) -> list[SasPathRef]:
     """
     return sorted(
         {ref for c in scored for ref in c.external_refs}, key=_path_ref_sort_key
+    )
+
+
+def _file_db_tables(scored: list[ChunkComplexity]) -> list[SasDbTableRef]:
+    """One file's database tables, rolled up from its chunks.
+
+    Deduplicated and ordered by :func:`~chunker.models._db_table_sort_key` —
+    the order :attr:`~chunker.models.SasBatch.db_tables` uses — on the same
+    grounds as :func:`_file_paths`.
+    """
+    return sorted(
+        {ref for c in scored for ref in c.db_tables}, key=_db_table_sort_key
     )
 
 

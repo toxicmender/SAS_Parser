@@ -77,7 +77,12 @@ from typing import Any
 
 import app_config
 from app_config.logging_setup import configure_logging
-from chunker import MultiFileBatcher, SasCorpus, SasSemanticChunker
+from chunker import (
+    MultiFileBatcher,
+    SasCorpus,
+    SasSemanticChunker,
+    resolve_corpus_references,
+)
 
 from .analyzer import ComplexityAnalyzer
 from .models import CorpusComplexityReport
@@ -481,15 +486,22 @@ def _hydration_plan(args: argparse.Namespace, sources: _Sources):  # type: ignor
     from data_hydration.naming import TableNameError
     from data_hydration.planner import build_corpus_plan
 
+    # Resolved as one corpus, so a database LIBNAME in a setup file reaches the
+    # reads in the files after it, as it does in the batched analysis.
+    corpus = resolve_corpus_references(SasCorpus(file_results=sources.file_results))
     by_source = {
-        result.source_id: (
+        result.source_id or "": (
             [r for c in result.chunks for r in c.metadata.engine_refs],
             [r for c in result.chunks for r in c.metadata.external_refs],
         )
-        for result in sources.file_results
+        for result in corpus.file_results
+    }
+    db_tables = {
+        result.source_id or "": [t for c in result.chunks for t in c.metadata.db_tables]
+        for result in corpus.file_results
     }
     try:
-        return build_corpus_plan(by_source, probe=None)
+        return build_corpus_plan(by_source, db_tables=db_tables, probe=None)
     except TableNameError as exc:
         logger.error(
             f"--hydration: {exc}; the complexity report is written without it"

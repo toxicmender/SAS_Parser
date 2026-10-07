@@ -3020,6 +3020,70 @@ class TestPathsSection(unittest.TestCase):
         )
 
 
+class TestDatabaseTablesSection(unittest.TestCase):
+    """Database tables beside the Paths section, in the database's own terms.
+
+    Not more Inputs: ``edw_export.current_nonip`` is an Oracle owner and table,
+    which used to land under Inputs as if it were a SAS dataset — and, with the
+    pass-through grammar, would otherwise vanish from the report altogether.
+    """
+
+    SOURCE = (
+        "libname edw oracle path=EDWPRO schema=fr_dm;\n"
+        "proc sql;\n"
+        "connect to oracle (user=&ora_user password=&ora_pass path=&ora_path);\n"
+        "create table nonip as select * from connection to oracle\n"
+        "(select cov_month from edw_export.current_nonip where table_cd='MED');\n"
+        "execute (truncate table stage.tmp) by oracle;\n"
+        "disconnect from oracle;\n"
+        "quit;\n"
+        "data work.accts; set edw.accounts; run;\n"
+    )
+
+    def setUp(self):
+        self.file = _file(_analyze(self.SOURCE), "t.sas")
+        self.text = render_file_report(self.file, texts={})
+
+    def test_reads_and_writes_are_grouped_with_their_sas_copy(self):
+        self.assertIn("## Database tables", self.text)
+        self.assertIn(
+            "`edw_export.current_nonip` on `oracle` → `work.nonip` "
+            "(connection_to `oracle`)",
+            self.text,
+        )
+        self.assertIn(
+            "`fr_dm.accounts` on `oracle` → `work.accts` (libname `edw`)", self.text
+        )
+        read, written = self.text.index("- Read:"), self.text.index("- Written:")
+        self.assertLess(read, written)
+        self.assertGreater(self.text.index("`stage.tmp` on `oracle`"), written)
+
+    def test_the_oracle_owner_is_no_longer_a_dataset_input(self):
+        self.assertNotIn("edw_export.current_nonip", self.file.input_datasets)
+        self.assertNotIn("work.connection", self.file.input_datasets)
+
+    def test_the_rollup_reconciles_against_its_chunks(self):
+        from_chunks = {t for c in self.file.chunks for t in c.db_tables}
+        self.assertEqual(set(self.file.db_tables), from_chunks)
+        self.assertIn("- Database:", self.text)
+
+    def test_a_file_touching_no_database_gets_no_section(self):
+        plain = _file(_analyze("data work.a;\n  set work.b;\nrun;\n"), "t.sas")
+        self.assertNotIn("## Database tables", render_file_report(plain, texts={}))
+
+    def test_a_dblink_and_an_unresolved_name_are_flagged(self):
+        scored = _file(
+            _analyze(
+                "proc sql;\ncreate table a as select * from connection to oracle\n"
+                "(select * from s.t@prodlink, &sch..u);\nquit;\n"
+            ),
+            "t.sas",
+        )
+        text = render_file_report(scored, texts={})
+        self.assertIn("through database link `prodlink`", text)
+        self.assertIn("**(unresolved macro reference)**", text)
+
+
 class TestChooseTarget(unittest.TestCase):
     """Which target an item is translated into, from the shipped profiles.
 

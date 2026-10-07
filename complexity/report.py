@@ -49,6 +49,7 @@ from .models import (
     CorpusComplexityReport,
     FileComplexity,
     PathLocation,
+    SasDbTableRef,
     SasPathRef,
 )
 from .naming import resolve_name
@@ -268,6 +269,44 @@ def _fmt_path_ref(ref: SasPathRef) -> str:
     return " ".join(parts)
 
 
+def _db_table_lines(file: FileComplexity) -> list[str]:
+    """The database tables this file reads and writes, in the database's terms.
+
+    Its own section rather than more Inputs/Outputs, because these are not SAS
+    datasets: ``edw_export.current_nonip`` is an Oracle owner and table, and a
+    migration answers it by hydrating or federating the table, not by finding a
+    LIBNAME. Reads first — they are what has to exist before the file runs —
+    each with the SAS copy it lands in. No tables, no heading, the rule
+    :func:`_path_lines` follows.
+    """
+    if not file.db_tables:
+        return []
+    lines = ["", "## Database tables", ""]
+    for access, heading in (("read", "Read"), ("write", "Written")):
+        refs = [r for r in file.db_tables if str(r.access) == access]
+        if not refs:
+            continue
+        lines.append(f"- {heading}:")
+        lines += [f"  - {_fmt_db_table(r)}" for r in refs]
+    return lines
+
+
+def _fmt_db_table(ref: SasDbTableRef) -> str:
+    """One database table as a report line: where it lives, then what became of it."""
+    parts = [f"`{ref.qualified}`"]
+    parts.append(f"on `{ref.engine}`" if ref.engine else "on an unknown engine")
+    if ref.dblink:
+        # The table lives in the *linked* database, not the one connected to —
+        # the line a reader provisioning access must not miss.
+        parts.append(f"through database link `{ref.dblink}`")
+    if ref.sas_targets:
+        parts.append("→ " + ", ".join(f"`{t}`" for t in ref.sas_targets))
+    parts.append(f"({ref.via} `{ref.connection}`)")
+    if ref.has_macro_ref:
+        parts.append("**(unresolved macro reference)**")
+    return " ".join(parts)
+
+
 def _hydration_lines(file: FileComplexity, plan: Any | None) -> list[str]:
     """What hydrating this file's sources would do, or nothing without a plan.
 
@@ -450,6 +489,7 @@ def render_file_report(
     # writes.
     lines += _dataset_lines(file)
     lines += _path_lines(file)
+    lines += _db_table_lines(file)
     # After the paths, because a hydration item is an answer to one of them: the
     # reader has just seen what the file reaches, and this says what becomes of it.
     lines += _hydration_lines(file, hydration)
@@ -504,6 +544,9 @@ def _chunk_section(
     if chunk.external_refs:
         # The same audit trail for the Paths section above.
         lines.append(f"- Paths: {_fmt_list(r.raw for r in chunk.external_refs)}")
+    if chunk.db_tables:
+        # ...and for the Database tables section.
+        lines.append(f"- Database: {_fmt_list(str(r) for r in chunk.db_tables)}")
     if chunk.signals:
         # Labelled and set apart, so the verdict bullets above and the
         # evidence bullets below do not read as one undifferentiated list.

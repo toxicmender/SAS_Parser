@@ -91,6 +91,7 @@ from .scoring import (
     _chunk_outputs,
     _contained_steps,
     _file_datasets,
+    _file_db_tables,
     _file_paths,
     _line_span,
     _merge_signals,
@@ -291,6 +292,7 @@ class ComplexityAnalyzer:
             input_datasets=_chunk_inputs(chunk.metadata),
             output_datasets=_chunk_outputs(chunk.metadata),
             external_refs=chunk.metadata.external_refs,
+            db_tables=chunk.metadata.db_tables,
             tier=tier,
             score=score,
             translation_difficulty=difficulty,
@@ -560,6 +562,7 @@ class ComplexityAnalyzer:
             )
             reads, writes, intermediates = _file_datasets(scored)
             external_refs = _file_paths(scored)
+            db_tables = _file_db_tables(scored)
 
             files.append(
                 FileComplexity(
@@ -592,6 +595,7 @@ class ComplexityAnalyzer:
                     output_datasets=writes,
                     intermediate_datasets=intermediates,
                     external_refs=external_refs,
+                    db_tables=db_tables,
                     chunks=scored,
                     cross_file=index.profile_for(source_id) if index else None,
                     suggested_split=(
