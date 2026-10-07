@@ -397,6 +397,9 @@ class DatasetRole(StrEnum):
     UPDATE = "update"
     # Deleted (PROC DATASETS DELETE, SQL DROP TABLE): neither read nor written.
     DROP = "drop"
+    # Named, not used: a %LET value written like a dataset reference
+    # (``%let t = edw.accounts;``). The step that uses &t reads or writes it.
+    MENTION = "mention"
 
     @property
     def reads(self) -> bool:
@@ -412,8 +415,9 @@ class SasDatasetRef:
     """One SAS dataset a chunk names, and what the chunk does with it.
 
     The stored source of a chunk's dataset metadata: ``input_datasets``,
-    ``output_datasets``, ``dropped_datasets`` and the ``body_*`` lists are
-    views of :attr:`SasChunkMetadata.dataset_refs`. Every rewrite — macro
+    ``output_datasets``, ``dropped_datasets``, ``referenced_datasets``,
+    ``referenced_librefs`` and the ``body_*`` lists are views of
+    :attr:`SasChunkMetadata.dataset_refs`. Every rewrite — macro
     variables resolved, ``_LAST_`` and ``_DATA_`` made concrete, the Databricks
     mapping — goes through :meth:`SasChunkMetadata.map_dataset_names`, so the
     views cannot disagree.
@@ -436,7 +440,7 @@ class SasDatasetRef:
         The name as the statement spelled it; empty when nothing recorded it.
     via
         The statement or option that named it (``set``, ``data``, ``out=``,
-        ``from``, …), or where the reference came from (``macro_call``: a
+        ``from``, ``%let``, …), or where the reference came from (``macro_call``: a
         call's argument, resolved through the macro's body; ``_last_``: the
         dataset SAS's ``_LAST_`` held); empty when nothing recorded it.
     in_macro_body
@@ -482,6 +486,8 @@ _DATASET_VIEWS = frozenset(
         "input_datasets",
         "output_datasets",
         "dropped_datasets",
+        "referenced_datasets",
+        "referenced_librefs",
         "body_literal_inputs",
         "body_literal_outputs",
         "body_param_inputs",
@@ -493,6 +499,11 @@ _DATASET_VIEWS = frozenset(
 _NO_VIEWS: dict[str, tuple[Any, ...]] = dict.fromkeys(_DATASET_VIEWS, ())
 
 
+def _libref_of(name: str) -> str | None:
+    """The libref of a two-level SAS name, or ``None`` (one-level, quoted path)."""
+    return name.split(".", 1)[0] if "." in name and not name.startswith("'") else None
+
+
 def _dataset_views(refs: tuple[SasDatasetRef, ...]) -> dict[str, tuple[Any, ...]]:
     """Every view of *refs* in one pass: names (or a parameter's ``(param,
     pos)``) in first-seen order, each once.
@@ -500,6 +511,9 @@ def _dataset_views(refs: tuple[SasDatasetRef, ...]) -> dict[str, tuple[Any, ...]
     A chunk's own references fill ``input_datasets``, ``output_datasets`` and
     ``dropped_datasets``; a macro body's fill the ``body_literal_*`` lists, or
     ``body_param_*`` when spelled through a parameter. UPDATE reads and writes.
+    ``referenced_datasets`` is every name, sorted, whatever its role, and
+    ``referenced_librefs`` the librefs those names hold (without the
+    chunk's ``defines_librefs``, which the property adds).
     """
     if not refs:
         return _NO_VIEWS  # most chunks name no dataset; never mutated
@@ -524,6 +538,11 @@ def _dataset_views(refs: tuple[SasDatasetRef, ...]) -> dict[str, tuple[Any, ...]
     views = dict(_NO_VIEWS)
     for view, keys in found.items():
         views[view] = tuple(keys)
+    names = sorted({ref.name for ref in refs})
+    views["referenced_datasets"] = tuple(names)
+    views["referenced_librefs"] = tuple(
+        sorted({lib for name in names if (lib := _libref_of(name)) is not None})
+    )
     return views
 
 
@@ -535,10 +554,12 @@ def _refs_from_lists(
     body_outputs: Iterable[str] = (),
     param_inputs: Iterable[Mapping[str, Any]] = (),
     param_outputs: Iterable[Mapping[str, Any]] = (),
+    referenced: Iterable[str] = (),
 ) -> tuple[SasDatasetRef, ...]:
     """The dataset references behind dataset lists, in the order the views
     read them back: the chunk's inputs, outputs and drops, then the macro
-    body's. Parameter entries are ``{"param": name, "pos": n}``."""
+    body's. Parameter entries are ``{"param": name, "pos": n}``. A
+    *referenced* name no other list holds is a MENTION."""
     read, write = DatasetRole.READ, DatasetRole.WRITE
     refs = [SasDatasetRef(name, read) for name in inputs]
     refs += [SasDatasetRef(name, write) for name in outputs]
@@ -557,6 +578,12 @@ def _refs_from_lists(
                     param_pos=int(entry["pos"]),
                 )
             )
+    named = {ref.name for ref in refs}
+    refs += [
+        SasDatasetRef(name, DatasetRole.MENTION)
+        for name in dict.fromkeys(referenced)
+        if name not in named
+    ]
     return tuple(refs)
 
 
@@ -593,8 +620,6 @@ class SasChunkMetadata(BaseModel):
     proc_name: str | None = None
     macro_name: str | None = None
     labels: list[str] = Field(default_factory=list)
-    referenced_librefs: list[str] = Field(default_factory=list)
-    referenced_datasets: list[str] = Field(default_factory=list)
     defines_librefs: list[str] = Field(default_factory=list)
     includes: list[str] = Field(default_factory=list)
     options: list[str] = Field(default_factory=list)
@@ -676,6 +701,25 @@ class SasChunkMetadata(BaseModel):
 
     @computed_field  # type: ignore[prop-decorator]
     @property
+    def referenced_datasets(self) -> list[str]:
+        """Every dataset the chunk names, sorted: what it reads, writes or
+        deletes, what its macro body does (a parameter as ``&param``), and
+        each ``%LET`` value written like a dataset (a MENTION)."""
+        return list(self._views()["referenced_datasets"])
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def referenced_librefs(self) -> list[str]:
+        """The librefs of :attr:`referenced_datasets`' two-level names, and
+        the ones the chunk assigns (``defines_librefs``), sorted. A libref
+        still spelled through a macro variable is reported as written."""
+        named = self._views()["referenced_librefs"]
+        if not self.defines_librefs:
+            return list(named)
+        return sorted({*named, *self.defines_librefs})
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
     def body_literal_inputs(self) -> list[str]:
         """Datasets a ``%MACRO`` body reads under a name of its own."""
         return list(self._views()["body_literal_inputs"])
@@ -710,6 +754,8 @@ class SasChunkMetadata(BaseModel):
             return data
         lists = {k: data[k] or () for k in _DATASET_VIEWS if k in data}
         data = {k: v for k, v in data.items() if k not in _DATASET_VIEWS}
+        # referenced_librefs is not read: every libref it held comes back from
+        # the names and defines_librefs.
         data.setdefault(
             "dataset_refs",
             _refs_from_lists(
@@ -720,6 +766,7 @@ class SasChunkMetadata(BaseModel):
                 body_outputs=lists.get("body_literal_outputs", ()),
                 param_inputs=lists.get("body_param_inputs", ()),
                 param_outputs=lists.get("body_param_outputs", ()),
+                referenced=lists.get("referenced_datasets", ()),
             ),
         )
         return data
@@ -816,21 +863,10 @@ class SasChunkMetadata(BaseModel):
         ``referenced_datasets`` and the I/O lists exactly as written, because
         a dependency that cannot be resolved is still a dependency; this view
         is how a consumer tells those apart from the resolved names without
-        re-scanning for ``&``.
+        re-scanning for ``&``. A macro body's parameter (``&ds``) is one too:
+        only a call names its dataset.
         """
-        return sorted(
-            {
-                d
-                for d in (
-                    *self.referenced_datasets,
-                    *self.input_datasets,
-                    *self.output_datasets,
-                    *self.body_literal_inputs,
-                    *self.body_literal_outputs,
-                )
-                if "&" in d
-            }
-        )
+        return [d for d in self._views()["referenced_datasets"] if "&" in d]
 
     @computed_field  # type: ignore[prop-decorator]
     @property

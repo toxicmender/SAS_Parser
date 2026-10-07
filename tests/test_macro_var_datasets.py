@@ -587,8 +587,8 @@ class TestMetadataPlumbing(unittest.TestCase):
         from chunker.models import DatasetRole, SasChunkMetadata, SasDatasetRef
 
         meta = SasChunkMetadata(
-            referenced_datasets=["&a", "work.plain"],
             dataset_refs=(
+                SasDatasetRef(name="&a", role=DatasetRole.MENTION, via="%let"),
                 SasDatasetRef(name="&b", role=DatasetRole.READ),
                 SasDatasetRef(name="work.plain", role=DatasetRole.WRITE),
                 SasDatasetRef(name="&c", role=DatasetRole.READ, in_macro_body=True),

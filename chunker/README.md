@@ -101,7 +101,8 @@ For running the work items end-to-end through an LLM, see the
 | `scanner.py` | Lexical layer: `_Unit` / `_Region` parse primitives and their `UnitRole` (code, comment, in-stream data, SUBMIT code), the statement classifier (`_classify`), where a macro call ends its statement (`_split_after_calls`), macro quoting (`_macro_quote_end`), in-stream blocks (`_in_stream_units`), text normalisation / sanitisation, line-offset helpers, and the `_Deadline` / `_ParseWatchdog` stuck-parser machinery. |
 | `macro_vars.py` | Macro-variable values and reference expansion: `let_values` (the `%LET` symbol table), `resolve_refs` (`&name` / `&name.` / `&&name&i`), `call_spans` (where back-to-back macro calls begin and end), and `DS_REF_TOKEN` — the single definition of a dataset token that may embed `&refs`. Pure; no package imports. |
 | `passthrough.py` | SQL pass-through — `CONNECT TO` / `CONNECTION TO` / `EXECUTE … BY` / `DISCONNECT` and the native-SQL table scan: `scan_pass_through` (tables + the spans to mask), `mask`, `db_table_ref` (the one `SasDbTableRef` builder). The **single owner** of that grammar. |
-| `metadata.py` | Per-chunk semantic extraction: `_metadata_for`, `_io_for` (directed dataset I/O), `_macro_body_io` (literal vs parameterised body refs), symput / SQL-INTO / CALL EXECUTE extractors, `_merge_meta`, the extraction regex catalogue, and the whole-list resolution passes — `resolve_macro_var_refs`, `resolve_db_librefs`, composed in order by `resolve_references` (and across files by `resolve_corpus_references`). |
+| `statements.py` | What each statement does to the datasets it names: `statements_of` (a region's statements, each with where it stands — open code, a DATA step, a PROC, a `%MACRO` body), the operand lists they read, and `dataset_refs` (the region's `SasDatasetRef`s, a macro body's classified as parameter, literal or macro variable). The **single owner** of dataset positions, for steps and macro bodies alike; `_canon_ds` lives here. |
+| `metadata.py` | Per-chunk semantic extraction: `_metadata_for` (datasets from `statements.dataset_refs`, plus the macro, path, function and symput / SQL-INTO / CALL EXECUTE scans), `_merge_meta`, the extraction regex catalogue, and the whole-list resolution passes — `resolve_macro_var_refs`, `resolve_db_librefs`, composed in order by `resolve_references` (and across files by `resolve_corpus_references`). |
 | `chunker.py` | `SasSemanticChunker` orchestration (scan → group → build chunks, oversized-split with overlap). |
 | `batcher.py` | `_EdgeDiscovery` + Union-Find grouping, weak-edge resolution, context absorption, batch construction. `SasChunkBatcher` is a one-file convenience over `MultiFileBatcher`. |
 | `_repl.py` | `print_iterable` REPL helper (imported by nothing). |
@@ -115,7 +116,7 @@ For running the work items end-to-end through an LLM, see the
 
 **Import direction is strictly downward:** `keywords`, `macro_vars` and `models`
 import nothing from the package; `scanner` and `paths` import from them;
-`passthrough` imports from those; `metadata` imports from all of them;
+`passthrough` and `statements` import from those; `metadata` imports from all of them;
 `chunker.py` imports from all of them; `batcher` imports from `keywords`,
 `metadata`, `models`.
 The package imports nothing from `memory`, `llm_client`, `prompt_builder`, or
@@ -176,7 +177,7 @@ this is a considered decision, not an accident.
 
 ### Metadata: stored vs computed
 
-`SasChunkMetadata` stores one field per concept. Five views are **computed
+`SasChunkMetadata` stores one field per concept. These views are **computed
 fields** derived at access time, not stored:
 
 - `referenced_automatic_vars` — the `&sys*` subset of `referenced_macro_vars`
@@ -187,8 +188,9 @@ fields** derived at access time, not stored:
   dependency).
 - `physical_paths` / `remote_paths` / `email_refs` — the `external_refs` entries
   whose `location` is `FILESYSTEM` / `REMOTE` / `EMAIL`.
-- `unresolved_dataset_refs` — the dataset names across `referenced_datasets`,
-  the I/O lists and `body_literal_*` that still hold a `&` (see below).
+- the dataset lists, views of `dataset_refs` (below), and
+  `unresolved_dataset_refs` — the dataset names that still hold a `&` (see
+  below).
 
 They appear in `model_dump()` but are silently ignored as constructor kwargs,
 and they do not appear in `__str__`. `defines_macros` / `invokes_macros` are the
@@ -197,9 +199,11 @@ EXECUTE-invoked macros).
 
 **Dataset references.** `dataset_refs` is the stored source of a chunk's
 dataset metadata: one `SasDatasetRef` per dataset named, with a `DatasetRole`
-(READ, WRITE, UPDATE — read and rewritten in place — or DROP), whether it sits
-in a `%MACRO` body, and the parameter it is spelled through. The dataset lists
-are computed views of it, serialised under their usual keys:
+(READ, WRITE, UPDATE — read and rewritten in place — DROP, or MENTION — named
+but not used), the statement or option that named it (`via`) and its spelling
+there (`raw`), whether it sits in a `%MACRO` body, and the parameter it is
+spelled through. The dataset lists are computed views of it, serialised under
+their usual keys:
 
 | View | References |
 |---|---|
@@ -208,6 +212,8 @@ are computed views of it, serialised under their usual keys:
 | `dropped_datasets` | DROP |
 | `body_literal_inputs` / `body_literal_outputs` | a macro body's, under names of their own |
 | `body_param_inputs` / `body_param_outputs` | a macro body's, through a parameter: `{"param", "pos"}` |
+| `referenced_datasets` | every name, whatever its role, sorted (a parameter as `&param`) |
+| `referenced_librefs` | the librefs of those names, plus `defines_librefs` |
 
 A rewrite changes the references, never a list:
 `SasChunkMetadata.map_dataset_names` renames or drops them (macro variables
@@ -215,9 +221,41 @@ resolved, `_LAST_`/`_DATA_` made concrete, the Databricks mapping), and
 `add_dataset_refs` appends (a call's resolved datasets). `model_copy` refuses an
 `update` that names a view. The lists are still accepted as input, so JSON
 written before `dataset_refs` loads, and `SasChunkMetadata(input_datasets=[…])`
-builds the references behind it. `referenced_datasets` and `referenced_librefs`
-are still stored for now: they hold raw spellings found by a separate scan that
-no reference records yet.
+builds the references behind it; a `referenced_datasets` name no other list
+holds becomes a MENTION.
+
+**Where datasets are read** (`statements.py`). A region is read one statement
+at a time, never as one stretch of text, and each statement knows where it
+stands: open code, a DATA step, a PROC (by name), inside a `%MACRO` or not —
+by the same header and terminator rules as block collection. A statement's
+core follows any `%IF … %THEN`, `%ELSE`, label, and in a DATA step `IF …
+THEN`, `ELSE`, `WHEN (…)` or `OTHERWISE`; a subsetting `IF` has none. Then:
+
+- **DATA step:** the DATA statement writes its datasets (not its `/ view=`
+  options; `_NULL_` is none); `SET`, `MERGE` and `UPDATE` read theirs; `MODIFY`
+  rewrites its master (UPDATE) and reads the rest; `OUTPUT` writes; a hash
+  object's quoted `dataset:` reads, or writes in `.output(…)`. An operand list
+  ends at an option (`end=`, `key=`, `nobs=`, `point=`, …), a `/` or the
+  statement's end, and skips each dataset's `(…)` options and macro calls.
+  `ds1-ds3` (and `m01-m10`) expands, up to 1,000 names; `lib.pre:` is one
+  pattern reference (`pattern=True`); a quoted path or `'name'n` is kept as
+  written, lowercased.
+- **PROC:** `data=` reads and `out=` / `outdata=` write, on any statement but
+  one shaped like an assignment (`out = x + 1;` in PHREG, NLMIXED, FCMP, IML);
+  PROC SORT without `out=` rewrites its `data=`. PROC SQL reads its
+  `FROM`/`JOIN` table and writes its `CREATE TABLE|VIEW`/`INSERT INTO` one.
+- **Open code** names no dataset: a `%PUT`, a `%LET`, a macro call's arguments.
+- **A `%MACRO` body** is read the same way, and its references are classified
+  by spelling: exactly one of its parameters (`&ds`, resolved per call site),
+  built from several (dropped: no call names one dataset), or written out or
+  through some other macro variable (a literal). A body statement outside any
+  step it opens may complete its caller's step (`%macro sets; set a b;
+  %mend;`), so it is read as what its keyword makes it — a DATA step
+  statement, a PROC SQL clause, or a statement with PROC options — and a
+  call of another macro is read for its `data=` / `out=` arguments, since the
+  batcher binds only the parameters of the macro a job calls.
+- Only DATA_STEP, PROC_STEP and MACRO_DEFINITION regions are read: nothing
+  else holds a statement that reads or writes.
 
 Names are lowercased at extraction; quoted physical paths keep a leading `'` so
 they can never collide with identifiers.
@@ -254,7 +292,7 @@ data &table1;
 run;
 ```
 
-Every dataset position is scanned with `macro_vars.DS_REF_TOKEN`, which admits
+Every dataset operand is read with `macro_vars.DS_REF_TOKEN`, which admits
 `&refs`, so those names are seen at all; `metadata.resolve_macro_var_refs` then
 walks the built chunks in source order, accumulating each `%LET` value and
 expanding the references of the chunks that follow. The step above reports
@@ -283,9 +321,10 @@ two-level name — and the Databricks mapping skips it.
 
 A `%LET` whose value is *shaped* like a dataset reference
 (`%let table_demogr = datacia.member_demographic;`) contributes to
-`referenced_datasets` / `referenced_librefs` on sight. It is provenance only,
-never I/O: a `%LET` reads and writes nothing; the step that uses
-`&table_demogr` does.
+`referenced_datasets` / `referenced_librefs` on sight, as a MENTION reference
+(`via="%let"`). It is provenance only, never I/O: a `%LET` reads and writes
+nothing; the step that uses `&table_demogr` does. Each resolution run derives
+those again from the values in force, replacing the last run's.
 
 Values come from more than `%LET` in open code, and `_MacroScope` (in
 `metadata.py`) is the one place that decides them, for every pass:
@@ -509,13 +548,19 @@ these silently changes behavior.
    has, and dropping produces a step that appears to read nothing.
    `_canon_ds` therefore leaves `&`-bearing names alone, and `_map_ds` refuses
    to map them.
-11. **Native SQL is never scanned as SAS.** Every dataset scan in
-   `_metadata_for` (`_DATASET_RE`, `_SQL_*`, `_io_for`, `_macro_body_io`, …)
-   reads the text with `scan_pass_through`'s spans masked. A new SAS-side
-   dataset scan must read the masked `mt_ds`/`cf_ds` too, or the
+11. **Native SQL is never scanned as SAS.** `_metadata_for` hands
+   `statements.dataset_refs` the text with `scan_pass_through`'s spans masked.
+   A new SAS-side dataset scan must read the masked `mt_ds`/`cf_ds` too, or the
    `work.connection` / Oracle-schema-as-libref misreadings come straight back —
    silently, since the chunk still reports *a* dataset. Scans for macro names,
    macro variables and functions keep the unmasked text on purpose.
+12. **A dataset is read from a statement, never from a stretch of text.**
+   `statements.py` is the one place that says which statement, in which
+   context, names which dataset, for steps and `%MACRO` bodies alike — there is
+   no second, whole-text pattern to keep in step with it. A name that appears
+   only in a comment, in-stream data, SUBMIT code, a string, a `%PUT` or an
+   assignment is no dataset, and `referenced_datasets` is a view of the
+   references, so it cannot report one either.
 
 ## Logging
 

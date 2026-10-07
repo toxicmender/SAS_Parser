@@ -103,7 +103,7 @@ def classify_location(device: str | None) -> PathLocation:
 def normalise_path(raw: str) -> str:
     """*raw* as a comparison key: stripped, lowercased, backslashes forward.
 
-    The same normalisation :func:`chunker.metadata._quoted_path` applies to
+    The same normalisation :func:`chunker.statements._quoted_path` applies to
     quoted dataset references, minus its quote wrapper — that exists only to keep
     a path key out of the dataset *identifier* namespace, and nothing here shares
     a namespace with identifiers. Per-OS case sensitivity is ignored, consistent

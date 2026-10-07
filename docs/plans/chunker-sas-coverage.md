@@ -1,9 +1,9 @@
 # Plan: close the chunker's SAS coverage gaps (breaking changes allowed)
 
-Status: Phases 0–2 implemented. `tests/test_sas_coverage.py` holds 183 probes:
+Status: Phases 0–3 implemented. `tests/test_sas_coverage.py` holds 183 probes:
 the 168 from the coverage review plus 15 precision probes (`X01`–`X15`). Today
-133 pass and 50 are expected failures, each naming the phase below that fixes
-it. Phases 3–9 are not started.
+153 pass and 30 are expected failures, each naming the phase below that fixes
+it. Phases 4–9 are not started.
 
 ## Context
 
@@ -232,7 +232,57 @@ Files: `chunker/models.py`, `chunker/metadata.py`, `chunker/batcher.py`.
   `_io_for`/`_macro_body_io` output. The suite stays green apart from
   constructor sites, which proves the plumbing before extraction changes.
 
-## Phase 3: per-statement extraction (L), new `chunker/statements.py`
+## Phase 3: per-statement extraction (L), new `chunker/statements.py` — done
+
+Done as planned, with these differences:
+
+- **No separate tokenizer.** `_operands` reads an operand list straight off the
+  sanitised statement: names, quoted paths and name literals, `(…)` option
+  groups skipped whole, macro calls skipped, numbered ranges (zero padding
+  kept) and prefix lists. It stops at a `name=` option or a `/`. `Statement`
+  carries `mt`, `cf`, `keyword`, `context`, `proc` and `in_macro`. The
+  statement core strips `%IF … %THEN`, `%ELSE`, labels, and in a DATA step
+  `IF … THEN`, `ELSE`, `WHEN (…)` and `OTHERWISE`.
+- **`_metadata_for(region)`** takes the region and reads its units. Only
+  DATA_STEP, PROC_STEP and MACRO_DEFINITION regions are read for datasets, as
+  before; the other kinds hold no statement that reads or writes.
+- **Hash `.output(dataset:)` writes.** PROC SQL keeps its four regexes, now
+  per statement, until Phase 5. A statement shaped like an assignment is
+  never read for PROC options, which also flipped X12, planned for Phase 4.
+- **`referenced_datasets` holds canonical names only,** one per reference of
+  any role, a parameter as `&param`. The raw spellings live in
+  `SasDatasetRef.raw`. `referenced_librefs` is their librefs plus
+  `defines_librefs`. `unresolved_dataset_refs` is every name with a `&`.
+- **`DatasetRole.MENTION`** is the role for a `%LET` value written like a
+  dataset, with `via="%let"`. `_resolved_meta` derives these again on every
+  run, so the corpus-level run replaces the file-level answer. Legacy JSON's
+  `referenced_datasets` loads as MENTION references.
+- **Macro bodies hold step fragments.** A body statement outside any step it
+  opens may complete its caller's step (`%macro sets; set a b; %mend;`), so
+  it is read by its keyword: a DATA step statement, a PROC SQL clause, or PROC
+  options. The old whole-text scan caught these, and losing them would have
+  cost batching edges. For the same reason, a call of another macro inside a
+  body is read for its `data=` / `out=` arguments: the batcher binds only the
+  parameters of the macro a job calls.
+- **Behaviour,** against Phase 2 on the 187-file corpus, the 4,800-chunk job
+  and the two reference examples:
+  - Recovered: SET/MERGE operands after options, UPDATE's transaction, MODIFY's
+    transaction, numbered ranges, prefix lists, and `h.output` (WRITE, not
+    READ).
+  - Removed:
+    - `work.view` (`/ view=`), `work.data` (`data;`) and `work.n` (`'x'n`);
+    - formats read as librefs (`yymmddn8.`);
+    - `%PUT` and `%LET` text, and assignment targets;
+    - a bogus libref `&d` from `&d._2`.
+  - Batches: D05, D06, D07 and D29 now join the files that write their
+    recovered inputs; 131 singletons become 127.
+  - Both reference examples are unchanged.
+  - **Gone until a later phase:** names that only the old raw scan saw.
+    These are SQL `UPDATE` (Phase 5), FedSQL (Phase 5), DS2 and IML
+    (Phase 6), and DATASETS `MODIFY` (Phase 4). They are no longer in
+    `referenced_datasets`.
+- **Performance.** With the extraction limited to step and macro regions,
+  `scripts/bench_chunker.py` measures within 0–4% of Phase 0 in one session.
 
 - **`Statement`** fields: `text`, `mt`, `cf` (slices of the region's single
   sanitised text), `keyword`, `context`, `offset`.
@@ -276,7 +326,7 @@ Files: `chunker/models.py`, `chunker/metadata.py`, `chunker/batcher.py`.
   `_multi_ds`.
 
 Probes flipped: D02–D07, D09, D10, D13, D17, D21, D29, D30, and the
-precision probes X06–X11.
+precision probes X06–X12.
 
 ## Phase 4: PROC option roles and PROC statements (M)
 

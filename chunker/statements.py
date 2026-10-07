@@ -1,0 +1,582 @@
+"""What each SAS statement does to the datasets it names. See chunker/README.md.
+
+A region is read one statement at a time, never as one stretch of text, so a
+dataset is recorded only where SAS reads or writes it: a DATA statement, SET,
+MERGE, UPDATE, MODIFY, OUTPUT, a hash object's ``dataset:``, a PROC's ``data=``
+/ ``out=``, a PROC SQL clause. Comments, data lines and SUBMIT code are no
+statements at all, and an assignment, a ``%PUT`` or a ``%LET`` names nothing.
+
+Steps and ``%MACRO`` bodies share the walk. A body may also hold part of a
+step for its caller's step to complete (``%macro sets; set a b; %mend;``), so a
+body statement outside any step it opens is read as what its keyword makes it.
+A body's references are classified afterwards by how their names are spelled:
+written out, one of the macro's own parameters (each call site supplies it),
+or built from several (no call site names one dataset). Pure functions; no
+logging.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
+from itertools import chain
+
+from .keywords import _MACRO_LANGUAGE_WORDS, _SAS_RESERVED, RUN_GROUP_PROCS
+from .macro_vars import DS_REF_TOKEN, has_macro_ref
+from .models import DatasetRole, SasChunkKind, SasDatasetRef
+from .scanner import (
+    _PROC_NAME_RE,
+    _STEP_END_RE,
+    UnitRole,
+    _classify_normed,
+    _norm,
+    _Unit,
+    _ws_end,
+)
+
+# ---------------------------------------------------------------------------
+# Dataset names
+# ---------------------------------------------------------------------------
+
+
+def _canon_ds(name: str) -> str:
+    """Canonicalise a dataset name for producer/consumer matching.
+
+    A one-level name resolves to the temporary Work library — per the SAS
+    Programmer's Guide: Essentials (Ch. 11), ``data mytable;`` "behaves the
+    same if you specify work.mytable" — so it is rewritten to
+    ``work.<name>``, unifying both spellings in the batcher's exact-string
+    dataset namespace.  Everything that is not a plain one-level identifier
+    passes through unchanged:
+
+    - two-level ``libref.member`` names;
+    - names still holding a macro reference (``&table1``), whose libref is
+      not knowable yet: ``&table1`` may well resolve to a two-level name, so
+      calling it ``work.&table1`` would assert a library the source never
+      named. :func:`~chunker.metadata.resolve_macro_var_refs` canonicalises
+      again once the reference has a value, and what never resolves keeps the
+      ``&``;
+    - special ``_name_`` tokens (``_data_`` / ``_last_``), which are not
+      Work members but placeholders the batcher's implicit-dataset pass
+      resolves in corpus order;
+    - quoted physical-path references (normalised by :func:`_quoted_path`
+      to a leading ``'``), which address a file directly, not a library
+      member.
+
+    The rewrite is inexact when a USER library is assigned (one-level names
+    then resolve to USER, not WORK — guide pp. 236, 252-253); the chunker
+    emits a ``USER_LIBRARY_ASSIGNED`` diagnostic in that case rather than
+    guessing.
+    """
+    if (
+        "." in name
+        or has_macro_ref(name)
+        or name.startswith("'")
+        or (name.startswith("_") and name.endswith("_"))
+    ):
+        return name
+    return f"work.{name}"
+
+
+def _quoted_path(raw: str) -> str:
+    """Normalise a quoted physical-path dataset reference to an exact-match
+    key: lowercased, backslashes → forward slashes, wrapped in single
+    quotes.  The quote wrapper is kept so a path key can never collide with
+    an identifier name (``data 'perm';`` addresses a file in the current
+    working directory, *not* work.perm) and so :func:`_canon_ds` passes it
+    through.  Per-OS path case-sensitivity is deliberately ignored,
+    consistent with the module's lowercase-everything policy."""
+    inner = raw.strip()[1:-1].strip().lower().replace("\\", "/")
+    return f"'{inner}'"
+
+
+def _ds_name(raw: str) -> str | None:
+    """*raw* lowercased, its dataset options dropped; ``None`` for a name SAS
+    reserves (``_null_``, ``_all_``, a library's name alone)."""
+    name = raw.strip().lower().split("(")[0].strip()
+    if not name or name in _SAS_RESERVED:
+        return None
+    return name
+
+
+# ---------------------------------------------------------------------------
+# Statements
+# ---------------------------------------------------------------------------
+
+# Where a statement stands: open code, a DATA step, or a PROC.
+OPEN, DATA, PROC = "open", "data", "proc"
+
+
+@dataclass(frozen=True, slots=True)
+class Statement:
+    """One SAS statement, from its core to its end.
+
+    The core is what follows a ``%IF … %THEN`` or ``%ELSE``, a label, and in a
+    DATA step an ``IF … THEN``, ``ELSE``, ``WHEN (…)`` or ``OTHERWISE``:
+    ``if x then output hi;`` is an OUTPUT statement.
+
+    Attributes
+    ----------
+    mt, cf
+        The statement as sanitised for scanning (:func:`chunker.scanner._sanitise`):
+        string contents blanked, and kept.
+    keyword
+        The core's first word, lowercased: ``set``, ``proc``, ``%let``, ``x``.
+    context
+        :data:`OPEN`, :data:`DATA` or :data:`PROC`, the statement included: a
+        DATA statement stands in its own step.
+    proc
+        The PROC's name in a PROC, else ``""``.
+    in_macro
+        Inside a ``%MACRO`` body.
+    """
+
+    mt: str
+    cf: str
+    keyword: str
+    context: str
+    proc: str
+    in_macro: bool
+
+
+_WORD_RE = re.compile(r"(%\s*)?([A-Za-z_]\w*)")
+_MACRO_IF_RE = re.compile(r"%\s*if\b", re.IGNORECASE)
+_MACRO_THEN_RE = re.compile(r"%\s*then\b", re.IGNORECASE)
+_MACRO_ELSE_RE = re.compile(r"%\s*else\b", re.IGNORECASE)
+_MACRO_LABEL_RE = re.compile(r"%[A-Za-z_]\w*\s*:")
+_IF_RE = re.compile(r"if\b", re.IGNORECASE)
+_THEN_RE = re.compile(r"\bthen\b", re.IGNORECASE)
+_ELSE_RE = re.compile(r"else\b", re.IGNORECASE)
+_WHEN_RE = re.compile(r"when\s*\(", re.IGNORECASE)
+_OTHERWISE_RE = re.compile(r"otherwise\b", re.IGNORECASE)
+_LABEL_RE = re.compile(r"[A-Za-z_]\w*\s*:(?![:=])")
+_PARENS_RE = re.compile(r"[()]")
+
+
+def _group_end(mt: str, open_at: int) -> int:
+    """Index just past the parenthesis closing the one at *open_at*; the end
+    of *mt* when none does. Strings are blanked in *mt*, so every parenthesis
+    left is code."""
+    depth = 0
+    for m in _PARENS_RE.finditer(mt, open_at):
+        depth += 1 if m.group() == "(" else -1
+        if depth == 0:
+            return m.end()
+    return len(mt)
+
+
+def _core_start(mt: str, context: str) -> int:
+    """Where the statement in *mt* proper begins (see :class:`Statement`);
+    -1 when it has none: a subsetting IF, a ``%IF`` without ``%THEN``."""
+    pos = _ws_end(mt, 0)
+    while True:
+        if mt.startswith("%", pos):
+            if m := _MACRO_IF_RE.match(mt, pos):
+                then = _MACRO_THEN_RE.search(mt, m.end())
+                if then is None:
+                    return -1
+                pos = _ws_end(mt, then.end())
+            elif m := _MACRO_ELSE_RE.match(mt, pos) or _MACRO_LABEL_RE.match(mt, pos):
+                pos = _ws_end(mt, m.end())
+            else:
+                return pos
+        elif context != DATA:
+            return pos
+        elif m := _IF_RE.match(mt, pos):
+            then = _THEN_RE.search(mt, m.end())
+            if then is None:
+                return -1
+            pos = _ws_end(mt, then.end())
+        elif m := _WHEN_RE.match(mt, pos):
+            pos = _ws_end(mt, _group_end(mt, m.end() - 1))
+        elif m := (
+            _ELSE_RE.match(mt, pos) or _OTHERWISE_RE.match(mt, pos) or _LABEL_RE.match(mt, pos)
+        ):
+            pos = _ws_end(mt, m.end())
+        else:
+            return pos
+
+
+def statements_of(
+    units: Sequence[_Unit], mt: str, cf: str, *, macro_body: bool = False
+) -> Iterator[Statement]:
+    """The statements of the CODE *units*, with where each stands.
+
+    *mt* and *cf* are the sanitised texts of the region the units tile, so a
+    unit's statement is the slice at its offset. Steps open and close by the
+    scanner's rules (:meth:`~chunker.chunker.SasSemanticChunker._collect_block`):
+    a DATA or PROC header opens one, RUN, RUN CANCEL or QUIT ends it, a PROC
+    that runs in groups ends only at QUIT, and PROC DS2's own DATA programs
+    stay inside it. *macro_body*: every statement is in a ``%MACRO`` body,
+    as in a split slice of one that lost its header.
+    """
+    context, proc, run_groups, depth = OPEN, "", False, 0
+    base = units[0].start if units else 0
+    for unit in units:
+        if unit.role is not UnitRole.CODE:
+            continue
+        a = unit.start - base
+        b = a + len(unit.text)
+        in_macro = macro_body or depth > 0
+        # A macro body's statement outside any step it opens may run inside
+        # its caller's DATA step (see _fragment_refs), so it loses its IF …
+        # THEN the same way.
+        core = _core_start(mt[a:b], DATA if in_macro and context == OPEN else context)
+        if core < 0:
+            continue
+        s_mt, s_cf = mt[a + core : b], cf[a + core : b]
+        word_m = _WORD_RE.match(s_mt)
+        if word_m is None:
+            keyword = ""
+        else:
+            keyword = ("%" if word_m.group(1) else "") + word_m.group(2).lower()
+        step_end = False
+        if keyword == "run" or keyword == "quit":
+            if context != OPEN and (ended := _STEP_END_RE.fullmatch(_norm(s_mt))):
+                step_end = not (run_groups and ended.group(1))
+        elif keyword == "%mend":
+            depth = max(0, depth - 1)
+            context = OPEN
+        elif keyword == "data" or keyword == "proc" or keyword == "%macro":
+            normed = _norm(s_mt)
+            kind = _classify_normed(normed)
+            if kind is SasChunkKind.MACRO_DEFINITION:
+                depth += 1
+                context = OPEN
+            elif kind is SasChunkKind.DATA_STEP and not (context == PROC and proc == "ds2"):
+                context, proc = DATA, ""
+            elif kind is SasChunkKind.PROC_STEP:
+                name = _PROC_NAME_RE.match(normed)
+                context, proc = PROC, name.group(1) if name else ""
+                run_groups = proc in RUN_GROUP_PROCS
+        yield Statement(s_mt, s_cf, keyword, context, proc, macro_body or depth > 0)
+        if step_end:
+            context, proc = OPEN, ""
+
+
+# ---------------------------------------------------------------------------
+# Operands
+# ---------------------------------------------------------------------------
+
+_TOKEN_RE = re.compile(DS_REF_TOKEN)
+_MACRO_CALL_HEAD_RE = re.compile(r"%\s*[A-Za-z_]\w*")
+_NUMBERED_RE = re.compile(r"^(.*?)(\d+)$")
+# A numbered range list never expands past this many datasets: a range is a
+# convenience for a handful, and a typo must not mint a million names.
+_MAX_RANGE = 1000
+
+
+@dataclass(frozen=True, slots=True)
+class _Operand:
+    raw: str  # as written
+    name: str  # canonical
+    pattern: bool = False
+
+
+def _token_operand(raw: str, *, pattern: bool = False) -> _Operand | None:
+    name = _ds_name(raw)
+    if name is None:
+        return None
+    if pattern:
+        return _Operand(raw + ":", _canon_ds(name) + ":", pattern=True)
+    return _Operand(raw, _canon_ds(name))
+
+
+def _numbered_range(first: str, last: str) -> list[str] | None:
+    """The names ``first``-``last`` spans (``ds1``-``ds3``: ds1, ds2, ds3),
+    when both bounds share a library and a stem and end in numbers. Bounds
+    written to one width keep it: ``m01``-``m10`` is m01 … m10."""
+    a, b = _NUMBERED_RE.match(first), _NUMBERED_RE.match(last)
+    if a is None or b is None or a.group(1).lower() != b.group(1).lower():
+        return None
+    lo, hi = int(a.group(2)), int(b.group(2))
+    if hi < lo or hi - lo >= _MAX_RANGE:
+        return None
+    width = len(a.group(2)) if len(a.group(2)) == len(b.group(2)) else 0
+    return [f"{a.group(1)}{i:0{width}d}" for i in range(lo, hi + 1)]
+
+
+def _operands(mt: str, cf: str, pos: int, *, limit: int = 0) -> list[_Operand]:
+    """The datasets a statement lists from *pos*: names with their options,
+    quoted paths, numbered ranges (``ds1-ds3``) and prefix lists (``pre:``).
+
+    The list ends at an option (``end=``, ``key=``, ``nobs=``, …), a ``/``,
+    or the statement's end; a macro call in it (``set %list(lib);``) names
+    nothing it can see. *limit*: at most that many (an option's value).
+    """
+    found: list[_Operand] = []
+    n = len(mt)
+    while not limit or len(found) < limit:
+        pos = _ws_end(mt, pos)
+        if pos >= n:
+            break
+        c = mt[pos]
+        if c == "(":  # the options of the dataset before
+            pos = _group_end(mt, pos)
+            continue
+        if c in "'\"":
+            close = mt.find(c, pos + 1)
+            if close == -1:
+                break
+            found.append(_Operand(cf[pos : close + 1], _quoted_path(cf[pos : close + 1])))
+            pos = close + 1
+            if pos < n and mt[pos] in "nN":  # a name literal: 'my data'n
+                pos += 1
+            continue
+        if c == "%" and (call := _MACRO_CALL_HEAD_RE.match(mt, pos)):
+            pos = _ws_end(mt, call.end())
+            if pos < n and mt[pos] == "(":
+                pos = _group_end(mt, pos)
+            continue
+        if c == "-" and found:  # a numbered range: ds1-ds3
+            last = _TOKEN_RE.match(mt, _ws_end(mt, pos + 1))
+            if last is None:
+                break
+            pos = last.end()
+            spanned = _numbered_range(found[-1].raw, cf[last.start() : last.end()])
+            for raw in spanned[1:] if spanned else [cf[last.start() : last.end()]]:
+                if op := _token_operand(raw):
+                    found.append(op)
+            continue
+        token = _TOKEN_RE.match(mt, pos)
+        if token is None:
+            break
+        after = _ws_end(mt, token.end())
+        if after < n and mt[after] == "=":  # an option: the datasets are done
+            break
+        pos = token.end()
+        prefix = pos < n and mt[pos] == ":"
+        if prefix:
+            pos += 1
+        if op := _token_operand(cf[token.start() : token.end()], pattern=prefix):
+            found.append(op)
+    return found
+
+
+# ---------------------------------------------------------------------------
+# What each statement names
+# ---------------------------------------------------------------------------
+
+READ, WRITE, UPDATE = DatasetRole.READ, DatasetRole.WRITE, DatasetRole.UPDATE
+
+# A hash object's DATASET: argument — the dataset a DECLARE (or _NEW_) loads at
+# instantiation, or the one an OUTPUT method writes. The name sits inside a
+# quoted literal, so it is read from cf, never mt; an unquoted argument (a
+# variable, an expression) is not a name and is skipped.
+_HASH_DATASET_ARG_RE = re.compile(
+    r"\bdataset\s*:\s*(['\"])\s*([^'\"]+?)\s*\1",
+    re.IGNORECASE,
+)
+_HASH_OUTPUT_RE = re.compile(r"\.\s*output\s*\(", re.IGNORECASE)
+_DS_TOKEN_FULL_RE = re.compile(rf"{DS_REF_TOKEN}\Z")
+
+# A PROC statement's dataset options, as the chunker has always read them:
+# DATA= reads, OUT= and OUTDATA= write.
+_PROC_OPTION_RE = re.compile(r"\b(data|out|outdata)\s*=", re.IGNORECASE)
+# A statement that assigns — `out = x + 1;` in PROC PHREG, NLMIXED, FCMP or
+# IML — names no dataset, whatever its variable is called.
+_ASSIGNMENT_RE = re.compile(r"[A-Za-z_]\w*\s*(?:\[[^\]]*\]|\{[^}]*\}|\([^)]*\))?\s*=(?!=)")
+
+# PROC SQL's dataset clauses (one SQL grammar arrives with sql.py).
+_SQL_WRITE_RE = re.compile(
+    rf"\b(create\s+(?:table|view)|insert\s+into)\s+({DS_REF_TOKEN})", re.IGNORECASE
+)
+_SQL_READ_RE = re.compile(rf"\b(from|join)\s+({DS_REF_TOKEN})", re.IGNORECASE)
+
+
+def _hash_refs(st: Statement) -> Iterator[tuple[_Operand, DatasetRole, str]]:
+    if "dataset" not in st.cf.lower():
+        return
+    role = WRITE if _HASH_OUTPUT_RE.search(st.mt) else READ
+    for m in _HASH_DATASET_ARG_RE.finditer(st.cf):
+        raw = m.group(2).split("(", 1)[0].strip()
+        if _DS_TOKEN_FULL_RE.match(raw) and (op := _token_operand(raw)):
+            yield op, role, "hash"
+
+
+def _data_step_refs(st: Statement) -> Iterator[tuple[_Operand, DatasetRole, str]]:
+    after = len(st.keyword)
+    if st.keyword in ("data", "set", "merge", "update", "output"):
+        role = WRITE if st.keyword in ("data", "output") else READ
+        for op in _operands(st.mt, st.cf, after):
+            yield op, role, st.keyword
+    elif st.keyword == "modify":
+        # MODIFY rewrites its master in place; the transaction is read.
+        for i, op in enumerate(_operands(st.mt, st.cf, after)):
+            yield op, UPDATE if i == 0 else READ, "modify"
+    yield from _hash_refs(st)
+
+
+def _sql_refs(st: Statement) -> Iterator[tuple[_Operand, DatasetRole, str]]:
+    for m in _SQL_WRITE_RE.finditer(st.mt):
+        if op := _token_operand(st.cf[m.start(2) : m.end(2)]):
+            yield op, WRITE, m.group(1).split(None, 1)[0].lower()
+    for m in _SQL_READ_RE.finditer(st.mt):
+        if op := _token_operand(st.cf[m.start(2) : m.end(2)]):
+            yield op, READ, m.group(1).lower()
+
+
+def _proc_option_refs(st: Statement) -> Iterator[tuple[_Operand, DatasetRole, str]]:
+    if "=" not in st.mt or _ASSIGNMENT_RE.match(st.mt):
+        return
+    reads: list[_Operand] = []
+    writes = False
+    for m in _PROC_OPTION_RE.finditer(st.mt):
+        option = m.group(1).lower()
+        for op in _operands(st.mt, st.cf, m.end(), limit=1):
+            if option == "data":
+                reads.append(op)
+                yield op, READ, "data="
+            else:
+                writes = True
+                yield op, WRITE, f"{option}="
+    # PROC SORT without OUT= sorts DATA= in place.
+    if st.keyword == "proc" and st.proc == "sort" and not writes:
+        for op in reads:
+            yield op, WRITE, "data="
+
+
+def _proc_refs(st: Statement) -> Iterator[tuple[_Operand, DatasetRole, str]]:
+    return _sql_refs(st) if st.proc == "sql" else _proc_option_refs(st)
+
+
+# A %MACRO body may hold part of a step, for a call inside one to complete:
+# `%macro sets; set a b; %mend;` (a DATA step's), `%macro src; select * from
+# &t; %mend;` (PROC SQL's). Its statements outside any step it opens are read
+# as what their keyword makes them.
+_SQL_KEYWORDS = frozenset({"select", "create", "insert", "delete"})
+_DATA_KEYWORDS = frozenset({"set", "merge", "update", "modify", "output"})
+# UPDATE as PROC SQL writes it, not the DATA step's: `update t <as a> set c = …`.
+_SQL_UPDATE_RE = re.compile(
+    rf"update\s+{DS_REF_TOKEN}(?:\s+(?:as\s+)?[A-Za-z_]\w*)?\s+set\b", re.IGNORECASE
+)
+
+
+def _fragment_refs(st: Statement) -> Iterator[tuple[_Operand, DatasetRole, str]]:
+    if st.keyword in _SQL_KEYWORDS or (
+        st.keyword == "update" and _SQL_UPDATE_RE.match(st.mt)
+    ):
+        return _sql_refs(st)
+    # OUTPUT with options is a PROC's (`output out=stats mean=m`).
+    if st.keyword in _DATA_KEYWORDS and not (st.keyword == "output" and "=" in st.mt):
+        return _data_step_refs(st)
+    return chain(_proc_option_refs(st), _hash_refs(st))
+
+
+def _statement_refs(st: Statement) -> Iterator[tuple[_Operand, DatasetRole, str]]:
+    if st.context == DATA:
+        return _data_step_refs(st)
+    if st.context == PROC:
+        return _proc_refs(st)
+    if not st.in_macro:
+        return iter(())
+    if not st.keyword.startswith("%"):
+        return _fragment_refs(st)
+    if st.keyword[1:] not in _MACRO_LANGUAGE_WORDS:
+        # A call of another macro: its DATA= and OUT= arguments are read as a
+        # PROC's options are. The batcher binds the parameters of the macro a
+        # job calls, never of the ones it calls in turn, so this is how a
+        # wrapper (`%step1(data=a, out=b);`) is seen to read and write.
+        return _proc_option_refs(st)
+    return iter(())
+
+
+# ---------------------------------------------------------------------------
+# Macro bodies
+# ---------------------------------------------------------------------------
+
+# What a macro body's dataset reference turns out to be.
+_REF_LITERAL = "literal"  # no macro reference; the name is written out
+_REF_PARAM = "param"  # exactly this macro's parameter, resolved per call site
+_REF_CALL_SITE = "call_site"  # built from parameters, so only a call site knows it
+_REF_MACRO_VAR = "macro_var"  # macro variables, none of them this macro's own
+
+_VAR_REF_RE = re.compile(r"&(\w+)\.?")
+
+
+def _classify_ref(raw: str, param_pos: Mapping[str, int]) -> tuple[str, str]:
+    """
+    Classify a raw dataset reference extracted from a macro body.
+
+    Returns ``(key, kind)``, where *kind* is one of :data:`_REF_LITERAL`,
+    :data:`_REF_PARAM`, :data:`_REF_CALL_SITE` or :data:`_REF_MACRO_VAR` and
+    *key* is the lowercased parameter name for :data:`_REF_PARAM`, or the
+    lowercased reference exactly as written for everything else.
+
+    The distinction that matters is between a name the *call site* supplies
+    and one it does not.  ``&lib..&prefix._&suffix.`` is assembled from three
+    parameters, so no name exists until a call is made and this module never
+    fabricates one from the pieces (:data:`_REF_CALL_SITE`).  ``&reporting_lib``
+    inside the same body names a macro variable the corpus assigns, fixed for
+    every call, and :func:`~chunker.metadata.resolve_macro_var_refs` can give
+    it a value (:data:`_REF_MACRO_VAR`).
+    """
+    raw = raw.strip()
+    if "&" not in raw:
+        return raw.lower(), _REF_LITERAL
+    refs = [r.lower() for r in _VAR_REF_RE.findall(raw)]
+    # A quoted path is never the parameter itself: "&dir/x" is built from it.
+    if len(refs) == 1 and refs[0] in param_pos and raw[0] not in "'\"":
+        return refs[0], _REF_PARAM
+    if any(r in param_pos for r in refs):
+        return raw.lower(), _REF_CALL_SITE
+    return raw.lower(), _REF_MACRO_VAR
+
+
+def _body_ref(
+    op: _Operand, role: DatasetRole, via: str, param_pos: Mapping[str, int]
+) -> SasDatasetRef | None:
+    """The macro-body reference *op* makes, by how its name is spelled; None
+    for one built from the macro's parameters, which no call names whole."""
+    key, kind = _classify_ref(op.raw, param_pos)
+    if kind == _REF_CALL_SITE:
+        return None
+    if kind == _REF_PARAM:
+        return SasDatasetRef(
+            f"&{key}",
+            role,
+            raw=op.raw,
+            via=via,
+            in_macro_body=True,
+            param=key,
+            param_pos=param_pos[key],
+        )
+    return SasDatasetRef(
+        op.name, role, raw=op.raw, via=via, in_macro_body=True, pattern=op.pattern
+    )
+
+
+# ---------------------------------------------------------------------------
+# A region's references
+# ---------------------------------------------------------------------------
+
+
+def dataset_refs(
+    units: Sequence[_Unit],
+    mt: str,
+    cf: str,
+    *,
+    macro_body: bool = False,
+    param_pos: Mapping[str, int] | None = None,
+) -> list[SasDatasetRef]:
+    """Every dataset reference the region's statements make, in source order.
+
+    *mt* and *cf* are the region's sanitised texts (with SQL pass-through
+    blanked: native SQL names no SAS dataset). In a ``%MACRO`` body — every
+    statement when *macro_body* — references are classified by spelling
+    against the macro's parameters, *param_pos* (name → position, -1 for a
+    keyword parameter).
+    """
+    params = param_pos or {}
+    refs: list[SasDatasetRef] = []
+    for st in statements_of(units, mt, cf, macro_body=macro_body):
+        for op, role, via in _statement_refs(st):
+            if st.in_macro:
+                if (ref := _body_ref(op, role, via, params)) is not None:
+                    refs.append(ref)
+            else:
+                refs.append(
+                    SasDatasetRef(op.name, role, raw=op.raw, via=via, pattern=op.pattern)
+                )
+    return refs

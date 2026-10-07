@@ -26,18 +26,13 @@ from chunker import SasChunkKind as K
 
 # ── why a probe fails today, and the plan phase that fixes it ──────────────────
 
-OPERANDS = "phase 3: SET/MERGE/UPDATE/MODIFY operands"
-HEADER = "phase 3: DATA statement options and hash methods"
-NOT_CODE = "phase 3: %PUT and %LET text and variable names read as datasets"
 PROC_OPTIONS = "phase 4: PROC option roles"
 ODS = "phase 4: ODS OUTPUT"
 SQL = "phase 5: SQL FROM lists and DML"
 EMBEDDED = "phase 6: DS2 and IML reads and writes"
 INCLUDES = "phase 7: %INCLUDE, filerefs and macro signatures"
 
-GAPS = frozenset(
-    {OPERANDS, HEADER, NOT_CODE, PROC_OPTIONS, ODS, SQL, EMBEDDED, INCLUDES}
-)
+GAPS = frozenset({PROC_OPTIONS, ODS, SQL, EMBEDDED, INCLUDES})
 
 # A probe's free-form check: (result, top-level chunks) -> a problem, or None.
 Check = Callable[[SasChunkResult, list[SasChunk]], "str | None"]
@@ -205,29 +200,28 @@ DATA_STEP_PROBES = [
           inputs={"work.a", "lib.b"}, outputs={"work.c"}),
     Probe("D02", "SET with dataset options",
           "data c; set lib.a(keep=x y where=(x > 1) rename=(y=z)); run;\n",
-          inputs={"lib.a"}, outputs={"work.c"}, gap=OPERANDS),
+          inputs={"lib.a"}, outputs={"work.c"}),
     Probe("D03", "SET numbered range list ds1-ds3", "data all; set ds1-ds3; run;\n",
-          inputs={"work.ds1", "work.ds2", "work.ds3"}, outputs={"work.all"}, gap=OPERANDS),
+          inputs={"work.ds1", "work.ds2", "work.ds3"}, outputs={"work.all"}),
     Probe("D04", "SET prefix list lib.sales_:", "data all; set lib.sales_:; run;\n",
           check=lambda r, top: None
           if any(i.startswith("lib.sales") for c in top for i in c.metadata.input_datasets)
-          else "prefix list not recorded as an input",
-          gap=OPERANDS),
+          else "prefix list not recorded as an input"),
     Probe("D05", "SET ... END= option", "data b; set a end=eof; if eof then put 'done'; run;\n",
-          inputs={"work.a"}, outputs={"work.b"}, never={"work.eof"}, gap=OPERANDS),
+          inputs={"work.a"}, outputs={"work.b"}, never={"work.eof"}),
     Probe("D06", "SET ... POINT= NOBS=",
           "data b;\n  do p = 1 to n by 2;\n    set a point=p nobs=n;\n    output;\n  end;\n  stop;\nrun;\n",
-          inputs={"work.a"}, outputs={"work.b"}, never={"work.p", "work.n"}, gap=OPERANDS),
+          inputs={"work.a"}, outputs={"work.b"}, never={"work.p", "work.n"}),
     Probe("D07", "SET ... INDSNAME=", "data c; set a b indsname=src; from = src; run;\n",
-          inputs={"work.a", "work.b"}, outputs={"work.c"}, never={"work.src"}, gap=OPERANDS),
+          inputs={"work.a", "work.b"}, outputs={"work.c"}, never={"work.src"}),
     Probe("D08", "MERGE with IN= and BY",
           "data c; merge a(in=ina) lib.b(in=inb); by id; if ina and inb; run;\n",
           inputs={"work.a", "lib.b"}, outputs={"work.c"}),
     Probe("D09", "UPDATE master transaction", "data master; update master trans; by id; run;\n",
-          inputs={"work.master", "work.trans"}, outputs={"work.master"}, gap=OPERANDS),
+          inputs={"work.master", "work.trans"}, outputs={"work.master"}),
     Probe("D10", "MODIFY master transaction",
           "data lib.master; modify lib.master trans; by id; run;\n",
-          inputs={"lib.master", "work.trans"}, outputs={"lib.master"}, gap=OPERANDS),
+          inputs={"lib.master", "work.trans"}, outputs={"lib.master"}),
     Probe("D11", "several outputs with OUTPUT",
           "data hi lo; set src; if x > 0 then output hi; else output lo; run;\n",
           inputs={"work.src"}, outputs={"work.hi", "work.lo"}),
@@ -235,7 +229,7 @@ DATA_STEP_PROBES = [
           "data _null_; set ctl; call symputx('n', count); run;\n",
           inputs={"work.ctl"}, outputs=set(), produces={"n"}),
     Probe("D13", "DATA step view", "data v / view=v; set a; run;\n",
-          inputs={"work.a"}, outputs={"work.v"}, gap=HEADER),
+          inputs={"work.a"}, outputs={"work.v"}),
     Probe("D14", "INFILE + INPUT (external file)",
           "data a; infile '/data/raw.csv' dlm=',' firstobs=2; input x y; run;\n",
           outputs={"work.a"}, inputs=set(), paths={"/data/raw.csv"}),
@@ -251,7 +245,7 @@ DATA_STEP_PROBES = [
           "data _null_;\n  declare hash h(dataset: 'a', ordered: 'y');\n"
           "  h.definekey('k'); h.definedata('k', 'v'); h.definedone();\n"
           "  h.output(dataset: 'lib.sorted');\nrun;\n",
-          inputs={"work.a"}, outputs={"lib.sorted"}, gap=HEADER),
+          inputs={"work.a"}, outputs={"lib.sorted"}),
     Probe("D18", "IF 0 THEN SET (attributes only)", "data b; if 0 then set lib.tmpl; x = 1; run;\n",
           inputs={"lib.tmpl"}, outputs={"work.b"}),
     Probe("D19", "SASHELP input", "data c; set sashelp.class; run;\n",
@@ -261,8 +255,7 @@ DATA_STEP_PROBES = [
           if top and top[0].metadata.input_datasets and top[0].metadata.output_datasets
           else "physical paths not recorded as I/O"),
     Probe("D21", "SET with KEY= / UNIQUE", "data c; set a; set lib.idx key=id / unique; run;\n",
-          inputs={"work.a", "lib.idx"}, outputs={"work.c"}, never={"work.id", "work.unique"},
-          gap=OPERANDS),
+          inputs={"work.a", "lib.idx"}, outputs={"work.c"}, never={"work.id", "work.unique"}),
     Probe("D22", "SET with OBS=/FIRSTOBS= options", "data c; set b(firstobs=2 obs=10); run;\n",
           inputs={"work.b"}, outputs={"work.c"}),
     Probe("D23", "DATA statement with dataset options",
@@ -284,10 +277,10 @@ DATA_STEP_PROBES = [
     Probe("D28", "DATAn: bare DATA statement", "data; set a; run;\n", inputs={"work.a"}),
     Probe("D29", "MERGE with RENAME= options",
           "data c; merge a(in=a1 rename=(x=y)) b; by id; run;\n",
-          inputs={"work.a", "work.b"}, outputs={"work.c"}, gap=OPERANDS),
+          inputs={"work.a", "work.b"}, outputs={"work.c"}),
     Probe("D30", "WHERE= with a macro date literal",
           "data out; set lib.in(where=(dt >= \"&start\"d)); run;\n",
-          inputs={"lib.in"}, outputs={"work.out"}, gap=OPERANDS),
+          inputs={"lib.in"}, outputs={"work.out"}),
 ]
 
 PROC_PROBES = [
@@ -660,20 +653,20 @@ PRECISION_PROBES = [
           "  create table new as select * from lib.cur;\nquit;\n",
           inputs={"lib.cur"}, outputs={"work.new"}, never_ref={"lib.legacy"}),
     Probe("X06", "%PUT text in open code", "%put Loading data from staging;\n",
-          never_ref={"from", "staging", "work.staging"}, gap=NOT_CODE),
+          never_ref={"from", "staging", "work.staging"}),
     Probe("X07", "%PUT text in a macro body", "%macro m;\n  %put Reading from stage;\n%mend;\n",
-          body_in=set(), never_ref={"work.stage"}, gap=NOT_CODE),
+          body_in=set(), never_ref={"work.stage"}),
     Probe("X08", "%LET value containing 'from'", "%let msg = copy from src;\n",
-          never_ref={"src", "work.src"}, gap=NOT_CODE),
+          never_ref={"src", "work.src"}),
     Probe("X09", "DATA step variable named out", "data b; set a; out = x * 2; run;\n",
-          inputs={"work.a"}, outputs={"work.b"}, never_ref={"x", "work.x"}, gap=NOT_CODE),
+          inputs={"work.a"}, outputs={"work.b"}, never_ref={"x", "work.x"}),
     Probe("X10", "DATA step variable named data", "data b; set a; if data = y then z = 1; run;\n",
-          inputs={"work.a"}, outputs={"work.b"}, never_ref={"y", "work.y"}, gap=NOT_CODE),
+          inputs={"work.a"}, outputs={"work.b"}, never_ref={"y", "work.y"}),
     Probe("X11", "PROC variable named from", "proc print data=a; var from to; run;\n",
-          inputs={"work.a"}, never_ref={"to", "work.to"}, gap=NOT_CODE),
+          inputs={"work.a"}, never_ref={"to", "work.to"}),
     Probe("X12", "PROC programming statement assigning out",
           "proc phreg data=a;\n  model t*c(0) = x;\n  out = x + 1;\nrun;\n",
-          inputs={"work.a"}, outputs=set(), gap=PROC_OPTIONS),
+          inputs={"work.a"}, outputs=set()),
     Probe("X13", "datalines holding SAS-like text",
           "data x;\n  input line $40.;\ndatalines;\nset lib.z\ndata lib.y\n;\nrun;\n",
           inputs=set(), outputs={"work.x"}, never_ref={"lib.z", "lib.y"}),

@@ -107,7 +107,7 @@ chunker/
                         resolve_refs (&name / &name. / &&name&i, delimiter-dot
                         semantics included), and DS_REF_TOKEN — the one
                         definition of a dataset token that may embed &refs,
-                        which every dataset position in metadata.py and the
+                        which every dataset operand in statements.py and the
                         LIBNAME/FILENAME librefs in paths.py are scanned with.
                         Pure data + functions; no package imports, no models.
   passthrough.py        SQL pass-through: CONNECT TO / CONNECTION TO / EXECUTE
@@ -116,10 +116,18 @@ chunker/
                         names (SasDbTableRef) and the spans every SAS-side
                         dataset scan must mask; db_table_ref is the one builder
                         of those records.
-  metadata.py           Per-chunk semantic extraction: _metadata_for, _io_for
-                        (directed dataset I/O), _macro_body_io (literal vs
-                        parameterised body refs), symput / SQL-INTO / CALL
-                        EXECUTE extractors, _merge_meta, the extraction regex
+  statements.py         What each statement does to the datasets it names:
+                        statements_of walks a region's statements, each with
+                        where it stands (open code, DATA step, PROC by name,
+                        %MACRO body); dataset_refs reads their operands into
+                        SasDatasetRef records (READ, WRITE, UPDATE) and
+                        classifies a macro body's as parameter, literal or
+                        macro variable. The one owner of dataset positions,
+                        for steps and macro bodies alike.
+  metadata.py           Per-chunk semantic extraction: _metadata_for (datasets
+                        from statements.dataset_refs, plus the macro, path,
+                        function and symput / SQL-INTO / CALL EXECUTE scans),
+                        _merge_meta, the extraction regex
                         catalogue, and the whole-list passes that run once a
                         file (or the corpus) has been walked:
                         resolve_macro_var_refs (&name references get their
@@ -693,6 +701,17 @@ constructor kwargs, and they do not appear in `__str__` (which walks
 `__dict__`). `defines_macros` / `invokes_macros` are the single
 authoritative macro fields (`invokes_macros` includes CALL EXECUTE-invoked
 macros).
+
+Every dataset list — `input_datasets`, `output_datasets`, `dropped_datasets`,
+`referenced_datasets`, `referenced_librefs`, the `body_*` lists and
+`unresolved_dataset_refs` — is a view of one stored tuple, `dataset_refs`, of
+`SasDatasetRef` records (name, `DatasetRole` READ / WRITE / UPDATE / DROP /
+MENTION, the statement that named it, macro body, parameter). They come from
+`chunker/statements.py`, which reads a region statement by statement, each
+knowing whether it stands in open code, a DATA step, a PROC or a %MACRO body:
+a name in a comment, in-stream data, a `%PUT`, a string or an assignment is no
+dataset. A `%LET` value written like a dataset is a MENTION (named, not
+used). See `chunker/README.md` for the per-statement rules.
 
 ## Batching model
 

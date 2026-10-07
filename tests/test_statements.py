@@ -1,0 +1,357 @@
+"""chunker.statements: what each SAS statement does to the datasets it names.
+
+A region is read one statement at a time, each knowing whether it stands in
+open code, a DATA step or a PROC, and inside a ``%MACRO`` or not. These tests
+pin that walk, the operand lists it reads, the role each statement gives a
+dataset, and how a macro body's references are told apart. The coverage
+probes (tests/test_sas_coverage.py) hold the language-level cases.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from chunker import DatasetRole, SasChunkKind, SasChunkMetadata, SasSemanticChunker
+from chunker.metadata import resolve_references
+from chunker.scanner import _Deadline, _line_starts, _Region, _sanitise
+from chunker.statements import DATA, OPEN, PROC, statements_of
+
+R, W, U, M = DatasetRole.READ, DatasetRole.WRITE, DatasetRole.UPDATE, DatasetRole.MENTION
+_CHUNKER = SasSemanticChunker(min_words=1, max_words=100_000)
+
+
+def _statements(src: str, *, macro_body: bool = False) -> list[tuple[str, str, str, bool]]:
+    """``(keyword, context, proc, in_macro)`` for each statement of *src*,
+    read as one region."""
+    units = _CHUNKER._scan_units(src, _line_starts(src), [], _Deadline(None))
+    region = _Region(SasChunkKind.UNKNOWN_STATEMENT_GROUP, units[0].start, units[-1].end, units)
+    text = region.code_text
+    return [
+        (st.keyword, st.context, st.proc, st.in_macro)
+        for st in statements_of(
+            units, _sanitise(text), _sanitise(text, blank_strings=False), macro_body=macro_body
+        )
+    ]
+
+
+def _refs(src: str) -> list[tuple[str, DatasetRole, str]]:
+    """``(name, role, via)`` of every reference the top-level chunks of *src* make."""
+    return [
+        (ref.name, ref.role, ref.via)
+        for chunk in _CHUNKER.chunk_text(src).chunks
+        if chunk.parent_id is None
+        for ref in chunk.metadata.dataset_refs
+    ]
+
+
+def _body(src: str) -> SasChunkMetadata:
+    """The metadata of the one %MACRO in *src*."""
+    (chunk,) = [
+        c
+        for c in _CHUNKER.chunk_text(src).chunks
+        if c.kind is SasChunkKind.MACRO_DEFINITION and c.parent_id is None
+    ]
+    return chunk.metadata
+
+
+# ── the walk ─────────────────────────────────────────────────────────────────
+
+
+def test_a_step_opens_at_its_header_and_ends_at_run():
+    assert _statements("x = 1; data a; set b; run; y = 2;") == [
+        ("x", OPEN, "", False),
+        ("data", DATA, "", False),
+        ("set", DATA, "", False),
+        ("run", DATA, "", False),
+        ("y", OPEN, "", False),
+    ]
+
+
+def test_a_run_group_proc_ends_only_at_quit():
+    contexts = [
+        (kw, ctx, proc)
+        for kw, ctx, proc, _ in _statements(
+            "proc datasets lib=work; modify a; run; delete b; run; quit; z = 1;"
+        )
+    ]
+    assert contexts == [
+        ("proc", PROC, "datasets"),
+        ("modify", PROC, "datasets"),
+        ("run", PROC, "datasets"),
+        ("delete", PROC, "datasets"),
+        ("run", PROC, "datasets"),
+        ("quit", PROC, "datasets"),
+        ("z", OPEN, ""),
+    ]
+
+
+def test_proc_ds2_keeps_its_own_data_programs():
+    src = "proc ds2; data out; method run(); set in; end; enddata; run; quit;"
+    assert {(ctx, proc) for _, ctx, proc, _ in _statements(src)} == {(PROC, "ds2")}
+
+
+def test_a_data_variable_named_data_opens_nothing():
+    assert [ctx for _, ctx, _, _ in _statements("data = 1; proc = 2;")] == [OPEN, OPEN]
+
+
+def test_the_core_follows_if_then_else_when_otherwise_and_labels():
+    src = (
+        "data a; if x then output hi; else output lo; select (k); when (1) output one;"
+        " otherwise output two; end; next: set b; run;"
+    )
+    assert [kw for kw, *_ in _statements(src)] == [
+        "data", "output", "output", "select", "output", "output", "end", "set", "run",
+    ]
+
+
+def test_a_subsetting_if_has_no_core():
+    assert [kw for kw, *_ in _statements("data a; set b; if x > 1; run;")] == [
+        "data", "set", "run",
+    ]
+
+
+def test_the_core_follows_macro_if_then_and_else():
+    src = "%if &x %then %do; data a; run; %end; %else data b;"
+    assert [kw for kw, *_ in _statements(src)] == ["%do", "data", "run", "%end", "data"]
+
+
+def test_comments_and_in_stream_data_are_no_statements():
+    src = "data a;\n  * set lib.old;\n  input x;\ndatalines;\nset lib.z\n;\nrun;\n"
+    # The line ending the data is a statement of its own: a null one.
+    assert [kw for kw, *_ in _statements(src)] == ["data", "input", "datalines", "", "run"]
+
+
+def test_a_macro_body_is_tracked_through_nesting():
+    src = "%macro m; %macro n; %mend; data a; run; %mend; data b; run;"
+    assert [(kw, inside) for kw, _, _, inside in _statements(src)] == [
+        ("%macro", True),
+        ("%macro", True),
+        ("%mend", True),
+        ("data", True),
+        ("run", True),
+        ("%mend", False),
+        ("data", False),
+        ("run", False),
+    ]
+
+
+def test_a_slice_of_a_macro_body_is_in_it_throughout():
+    assert {inside for *_, inside in _statements("set a; %mend;", macro_body=True)} == {True}
+
+
+# ── DATA step statements ─────────────────────────────────────────────────────
+
+
+def test_data_statement_names_its_outputs_not_its_options():
+    assert _refs("data a(keep=x) lib.b / view=a; set c; run;") == [
+        ("work.a", W, "data"),
+        ("lib.b", W, "data"),
+        ("work.c", R, "set"),
+    ]
+
+
+def test_data_null_names_nothing():
+    assert _refs("data _null_; set a; run;") == [("work.a", R, "set")]
+
+
+def test_set_reads_every_dataset_up_to_its_options():
+    src = "data x; set a(where=(y in ('a;b' 'c'))) lib.c end=eof nobs=n; set d key=k / unique; run;"
+    assert [n for n, role, _ in _refs(src) if role is R] == ["work.a", "lib.c", "work.d"]
+
+
+@pytest.mark.parametrize(
+    ("operands", "names"),
+    [
+        ("ds1-ds3", ["work.ds1", "work.ds2", "work.ds3"]),
+        ("ds1 - ds3 x", ["work.ds1", "work.ds2", "work.ds3", "work.x"]),
+        ("m01-m03", ["work.m01", "work.m02", "work.m03"]),
+        ("lib.p8-lib.p10", ["lib.p8", "lib.p9", "lib.p10"]),
+        # Too wide to be a range anyone meant: the bounds, not 5,000 names.
+        ("d1-d5000", ["work.d1", "work.d5000"]),
+    ],
+)
+def test_a_numbered_range_names_every_dataset_it_spans(operands, names):
+    assert [n for n, role, _ in _refs(f"data x; set {operands}; run;") if role is R] == names
+
+
+def test_a_prefix_list_is_a_pattern():
+    (chunk,) = _CHUNKER.chunk_text("data x; set lib.sales_: q:; run;").chunks
+    patterns = [(r.name, r.raw) for r in chunk.metadata.dataset_refs if r.pattern]
+    assert patterns == [("lib.sales_:", "lib.sales_:"), ("work.q:", "q:")]
+
+
+def test_quoted_paths_and_name_literals():
+    src = "data 'C:\\Tmp\\Out'; set \"/data/in.sas7bdat\" 'my data'n; run;"
+    assert _refs(src) == [
+        ("'c:/tmp/out'", W, "data"),
+        ("'/data/in.sas7bdat'", R, "set"),
+        ("'my data'", R, "set"),
+    ]
+
+
+def test_a_macro_call_among_the_operands_names_nothing_it_can_see():
+    assert [n for n, *_ in _refs("data x; set %list(lib) work.y; run;")] == ["work.x", "work.y"]
+
+
+def test_update_reads_both_and_modify_rewrites_its_master():
+    src = "data m; update m t; run; data lib.m; modify lib.m t2; run;"
+    assert _refs(src) == [
+        ("work.m", W, "data"),
+        ("work.m", R, "update"),
+        ("work.t", R, "update"),
+        ("lib.m", W, "data"),
+        ("lib.m", U, "modify"),
+        ("work.t2", R, "modify"),
+    ]
+
+
+def test_output_writes_every_dataset_it_names():
+    assert _refs("data a b; set s; if x then output a; else output b; run;")[-2:] == [
+        ("work.a", W, "output"),
+        ("work.b", W, "output"),
+    ]
+
+
+def test_a_hash_object_reads_its_dataset_and_its_output_method_writes_one():
+    src = (
+        "data _null_;\n  declare hash h(dataset: 'lib.lk(where=(x>1))');\n"
+        "  h.definekey('k'); h.definedone();\n  rc = h.output(dataset: \"work.out\");\n"
+        "  declare hash g(dataset: dsname);\nrun;\n"
+    )
+    assert _refs(src) == [("lib.lk", R, "hash"), ("work.out", W, "hash")]
+
+
+def test_statements_that_only_look_like_dataset_positions():
+    src = "data b; set a; out = data * 2; if data = y then z = 1; put 'set lib.q;'; run;"
+    assert _refs(src) == [("work.b", W, "data"), ("work.a", R, "set")]
+
+
+# ── PROC statements ──────────────────────────────────────────────────────────
+
+
+def test_proc_data_reads_and_out_writes_on_any_statement():
+    src = "proc means data=a noprint; var x; output out=s mean=m; run;"
+    assert _refs(src) == [("work.a", R, "data="), ("work.s", W, "out=")]
+
+
+def test_proc_sort_without_out_rewrites_its_data():
+    assert _refs("proc sort data=lib.a; by x; run;") == [
+        ("lib.a", R, "data="),
+        ("lib.a", W, "data="),
+    ]
+    assert _refs("proc sort data=a out=b; by x; run;") == [
+        ("work.a", R, "data="),
+        ("work.b", W, "out="),
+    ]
+
+
+def test_an_assignment_in_a_proc_names_nothing():
+    src = "proc phreg data=a;\n  model t*c(0) = x;\n  out = x + 1;\n  data[1] = 2;\nrun;\n"
+    assert _refs(src) == [("work.a", R, "data=")]
+
+
+def test_proc_sql_clauses():
+    src = (
+        "proc sql;\n  create table c as select * from a join lib.b on 1;\n"
+        "  insert into d select * from e;\nquit;\n"
+    )
+    assert _refs(src) == [
+        ("work.c", W, "create"),
+        ("work.a", R, "from"),
+        ("lib.b", R, "join"),
+        ("work.d", W, "insert"),
+        ("work.e", R, "from"),
+    ]
+
+
+def test_open_code_names_no_dataset():
+    src = "%put Loading data from staging;\n%let msg = copy from src;\noptions obs=10;\n"
+    assert _refs(src) == []
+
+
+# ── macro bodies ─────────────────────────────────────────────────────────────
+
+
+def test_a_body_reference_is_a_parameter_a_literal_or_a_macro_variable():
+    meta = _body(
+        "%macro m(ds, out=);\n  data &out; set &ds lib.x &other &ds._&out; run;\n%mend;\n"
+    )
+    assert meta.body_param_outputs == [{"param": "out", "pos": -1}]
+    assert meta.body_param_inputs == [{"param": "ds", "pos": 0}]
+    # A macro variable the call does not supply is fixed for every call; one
+    # built from several parameters names no dataset until a call does.
+    assert meta.body_literal_inputs == ["lib.x", "&other"]
+    assert (meta.input_datasets, meta.output_datasets) == ([], [])
+
+
+def test_a_quoted_path_built_from_a_parameter_names_no_dataset():
+    meta = _body('%macro m(dir);\n  data x; set "&dir/in.sas7bdat" "/fixed/b"; run;\n%mend;\n')
+    assert (meta.body_param_inputs, meta.body_literal_inputs) == ([], ["'/fixed/b'"])
+
+
+@pytest.mark.parametrize(
+    ("body", "reads", "writes"),
+    [
+        # Part of a DATA step, for the caller's to complete.
+        ("set &t lib.b;", ["t"], []),
+        ("if first.id then output &t;", [], ["t"]),
+        # Part of a PROC SQL query.
+        ("select * from &t where x = 1;", ["t"], []),
+        ("create table &t as select * from lib.src;", [], ["t"]),
+        # Part of a PROC: OUTPUT with options is a PROC's.
+        ("output out=&t mean=m;", [], ["t"]),
+        # A call of another macro: its DATA= and OUT= arguments.
+        ("%inner(data=&t, out=lib.res);", ["t"], []),
+        # Text, not a dataset position.
+        ("%put Reading from &t;", [], []),
+        ("x = data;", [], []),
+    ],
+)
+def test_a_body_statement_outside_any_step_is_read_by_its_keyword(body, reads, writes):
+    meta = _body(f"%macro m(t);\n  {body}\n%mend;\n")
+    assert [e["param"] for e in meta.body_param_inputs] == reads
+    assert [e["param"] for e in meta.body_param_outputs] == writes
+
+
+def test_a_wrapper_macro_names_what_its_calls_read_and_write():
+    meta = _body("%macro run_all;\n  %step1(data=lib.a, out=b);\n%mend;\n")
+    assert (meta.body_literal_inputs, meta.body_literal_outputs) == (["lib.a"], ["work.b"])
+
+
+# ── %LET values and the reference views ──────────────────────────────────────
+
+
+def test_a_let_value_written_like_a_dataset_is_a_mention():
+    (chunk,) = _CHUNKER.chunk_text("%let t = edw.accounts;\n").chunks
+    meta = chunk.metadata
+    assert [(r.name, r.role, r.via) for r in meta.dataset_refs] == [("edw.accounts", M, "%let")]
+    assert (meta.input_datasets, meta.output_datasets) == ([], [])
+    assert meta.referenced_datasets == ["edw.accounts"]
+    assert meta.referenced_librefs == ["edw"]
+
+
+def test_let_mentions_are_rederived_not_accumulated():
+    chunks = _CHUNKER.chunk_text("%let s = prod;\n%let t = &s..orders;\n").chunks
+    before = [c.metadata.dataset_refs for c in chunks]
+    resolve_references(chunks)  # a second run, as the batcher's corpus pass makes
+    assert [c.metadata.dataset_refs for c in chunks] == before
+    assert chunks[1].metadata.referenced_datasets == ["prod.orders"]
+
+
+def test_referenced_views_cover_every_name_and_assigned_libref():
+    src = "libname out '/x';\ndata a; set lib.b; run;\n%macro m(ds); set &ds src.c; %mend;\n"
+    refs, librefs = set(), set()
+    for chunk in _CHUNKER.chunk_text(src).chunks:
+        refs.update(chunk.metadata.referenced_datasets)
+        librefs.update(chunk.metadata.referenced_librefs)
+    assert refs == {"work.a", "lib.b", "&ds", "src.c"}
+    assert librefs == {"out", "work", "lib", "src"}
+
+
+def test_old_metadata_with_referenced_datasets_keeps_them_as_mentions():
+    meta = SasChunkMetadata.model_validate(
+        {"input_datasets": ["work.a"], "referenced_datasets": ["a", "work.a", "lib.x"]}
+    )
+    assert meta.input_datasets == ["work.a"]
+    assert meta.referenced_datasets == ["a", "lib.x", "work.a"]
+    assert {r.name for r in meta.dataset_refs if r.role is M} == {"a", "lib.x"}

@@ -743,7 +743,7 @@ class SasSemanticChunker:
         logger.info(
             f"_chunks_for_region: oversized {region.kind.value}  words={wc} > max={self.max_words}  lines={sl}-{el}  splitting"
         )
-        parent_meta = _metadata_for(region.code_text, region.kind)
+        parent_meta = _metadata_for(region)
         parent_meta.has_unclosed_block = region.unclosed
         parent_chunk = self._make_chunk(
             source_id,
@@ -789,7 +789,7 @@ class SasSemanticChunker:
                 )
                 child_meta = _merge_meta(
                     parent_meta,
-                    _metadata_for(cr.code_text, region.kind),
+                    _metadata_for(cr),
                 )
                 child_meta.has_unclosed_block = region.unclosed
                 child = self._make_chunk(
@@ -822,7 +822,7 @@ class SasSemanticChunker:
             )
             child_meta = _merge_meta(
                 parent_meta,
-                _metadata_for(cr.code_text, region.kind),
+                _metadata_for(cr),
             )
             child_meta.has_unclosed_block = region.unclosed
             child = self._make_chunk(
@@ -868,7 +868,7 @@ class SasSemanticChunker:
         parent_id: str | None = None,
         metadata: SasChunkMetadata | None = None,
     ) -> SasChunk:
-        meta = metadata or _metadata_for(region.code_text, region.kind)
+        meta = metadata or _metadata_for(region)
         meta.has_unclosed_block = region.unclosed
         return SasChunk(
             chunk_id=f"chunk-{index + 1:04d}",
