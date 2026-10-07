@@ -548,3 +548,149 @@ class TestRunner:
         assert report.written == 1
         assert report.outcomes[0].status is ItemStatus.WRITTEN
         assert report.outcomes[0].rows == 42
+
+
+# ---------------------------------------------------------------------------
+# Database tables: SQL pass-through and named members of a database LIBNAME
+# ---------------------------------------------------------------------------
+
+PASS_THROUGH = """proc sql
+connect to oracle (user=&ora_user password=&ora_pass path=&ora_path);
+create table nonip as select * from connection to oracle
+(select cov_month, count as count from edw_export.current_nonip where table_cd='MED');
+disconnect from oracle;
+quit;
+"""
+
+
+def _db(source: str, source_id: str = "t.sas"):
+    """``(engine_refs, path_refs, db_tables)`` for *source*, via the real chunker."""
+    from chunker import SasSemanticChunker
+
+    result = SasSemanticChunker().chunk_text(source, source_id=source_id)
+    meta = [c.metadata for c in result.chunks]
+    return (
+        [r for m in meta for r in m.engine_refs],
+        [r for m in meta for r in m.external_refs],
+        [t for m in meta for t in m.db_tables],
+    )
+
+
+class TestDatabaseTables:
+    def test_a_pass_through_read_is_its_own_item(self):
+        engine_refs, path_refs, tables = _db(PASS_THROUGH)
+        plan = build_plan(
+            engine_refs, path_refs, db_tables=tables, config=_config(schema=None)
+        )
+        (item,) = plan.items
+        assert item.source.kind is SourceKind.ORACLE
+        assert item.source.object_name == "edw_export.current_nonip"
+        assert (item.source.connection, item.source.libref) == ("oracle", None)
+        assert item.source.locator == "&ora_path"
+        # No libref to name the schema after, so the Oracle owner does.
+        assert item.target_table == "main.edw_export.current_nonip"
+        assert "password, path, user" in item.blockers[0]
+
+    def test_writes_are_never_sources(self):
+        _, _, tables = _db(
+            "proc sql;\nconnect to oracle (path=P);\n"
+            "execute (truncate table stage.tmp) by oracle;\nquit;\n"
+        )
+        assert tables and build_plan(db_tables=tables, config=_config()).items == []
+
+    def test_a_libname_whose_tables_are_named_is_planned_per_table(self):
+        source = (
+            "libname edw oracle path=EDWPRO schema=fr_dm;\n"
+            "libname quiet oracle path=EDWPRO schema=other;\n"
+            "data work.a; set edw.accounts; run;\n"
+            "data work.b; set edw.orders; run;\n"
+        )
+        engine_refs, path_refs, tables = _db(source)
+        plan = build_plan(
+            engine_refs, path_refs, db_tables=tables, config=_config(schema=None)
+        )
+        objects = sorted(i.source.object_name for i in plan.items)
+        # edw's schema-level stand-in gives way to its two named tables; the
+        # LIBNAME nothing reads from keeps the stand-in it had.
+        assert objects == ["fr_dm.accounts", "fr_dm.orders", "other"]
+        targets = sorted(i.target_table for i in plan.items)
+        assert targets == ["main.edw.accounts", "main.edw.orders", "main.quiet.other"]
+
+    def test_one_table_read_by_two_files_is_one_item(self):
+        # Appending one copy per reader would load the rows twice.
+        _, _, first = _db(PASS_THROUGH, "a.sas")
+        _, _, second = _db(PASS_THROUGH, "b.sas")
+        plan = build_corpus_plan(
+            {}, db_tables={"a.sas": first, "b.sas": second}, config=_config()
+        )
+        (item,) = plan.items
+        assert item.write_mode is WriteMode.OVERWRITE
+        assert item.source.source_id == "a.sas"
+
+    def test_an_unknown_engine_and_a_dblink_block_the_item(self):
+        _, _, tables = _db(
+            "proc sql;\ncreate table a as select * from connection to mydb\n"
+            "(select * from s.t@prodlink);\nquit;\n"
+        )
+        (item,) = build_plan(db_tables=tables, config=_config()).items
+        joined = " ".join(item.blockers)
+        assert "connection 'mydb' is unknown" in joined
+        assert "database link 'prodlink'" in joined
+
+    def test_the_reader_selects_owner_and_table(self):
+        from data_hydration.sources.oracle import OracleReader
+
+        _, _, qualified = _db(PASS_THROUGH)
+        _, _, bare = _db(
+            "proc sql;\ncreate table a as select * from connection to oracle\n"
+            "(select * from current_nonip);\nquit;\n"
+        )
+        config = _config()
+        reads = {
+            OracleReader(item, config)._sql()
+            for tables in (qualified, bare)
+            for item in build_plan(db_tables=tables, config=config).items
+        }
+        assert reads == {
+            'SELECT * FROM "EDW_EXPORT"."CURRENT_NONIP"',
+            'SELECT * FROM "CURRENT_NONIP"',
+        }
+
+    def test_the_credential_is_keyed_on_the_connection(self, monkeypatch):
+        import types
+
+        import data_hydration.sources.oracle as oracle
+
+        seen: list[str] = []
+        monkeypatch.setattr(
+            oracle, "resolve_secret", lambda name, **_: seen.append(name) or "pw"
+        )
+        monkeypatch.setitem(
+            sys.modules, "oracledb", types.SimpleNamespace(connect=lambda **_: object())
+        )
+        _, _, tables = _db(
+            "proc sql;\nconnect to oracle as edw (path=EDWPRO user=svc);\n"
+            "create table a as select * from connection to edw (select * from s.t);\n"
+            "quit;\n"
+        )
+        (item,) = build_plan(db_tables=tables, config=_config()).items
+        oracle.connect(item, _config())
+        assert seen == ["oracle_password_edw"]
+
+    def test_the_cli_resolves_a_libname_in_another_file(self, tmp_path):
+        import argparse
+
+        from data_hydration.__main__ import _build_plan
+
+        (tmp_path / "a_setup.sas").write_text(
+            "libname edw oracle path=EDWPRO schema=fr_dm;\n"
+        )
+        (tmp_path / "b_job.sas").write_text(
+            "data work.a; set edw.accounts; run;\n" + PASS_THROUGH
+        )
+        args = argparse.Namespace(source_dir=tmp_path, pattern="*.sas", only=None)
+        plan = _build_plan(args, _config(schema=None))
+        assert sorted(i.source.object_name for i in plan.items) == [
+            "edw_export.current_nonip",
+            "fr_dm.accounts",
+        ]

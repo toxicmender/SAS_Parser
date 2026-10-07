@@ -85,6 +85,11 @@ class HydrationSource(BaseModel, frozen=True):
     libref
         The SAS libref or fileref this was bound to, when it was bound to one.
         Carried so a report can say which ``LIBNAME`` a row came from.
+    connection
+        For a table read through SQL pass-through, the name the SAS gave the
+        connection (``CONNECT TO oracle AS edw`` → ``edw``). It stands in for
+        :attr:`libref` where there is none: the credential is keyed on it, so a
+        corpus reaching two databases through two aliases can use two accounts.
     locator
         What addresses the *system*: an Oracle DSN or service name, an sFTP
         host, a storage account, or the directory holding a file.
@@ -108,6 +113,7 @@ class HydrationSource(BaseModel, frozen=True):
     locator: str = ""
     object_name: str = ""
     libref: str | None = None
+    connection: str | None = None
     options: tuple[tuple[str, str], ...] = ()
     has_macro_ref: bool = False
     source_id: str | None = None
@@ -118,7 +124,8 @@ class HydrationSource(BaseModel, frozen=True):
         return dict(self.options)
 
     def __str__(self) -> str:
-        bound = f" ({self.libref})" if self.libref else ""
+        name = self.libref or self.connection
+        bound = f" ({name})" if name else ""
         # Only the join is cleaned up; a leading slash is part of the path and
         # stripping it turns an absolute path into a misleading relative one.
         where = "/".join(p for p in (self.locator, self.object_name) if p)

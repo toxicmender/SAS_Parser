@@ -121,24 +121,40 @@ def _build_plan(args: argparse.Namespace, config: HydrationConfig) -> HydrationP
     itself must not depend on it (see the README's decoupling contract), and
     this entry point is a caller like any other.
     """
-    from chunker import SasSemanticChunker
+    from chunker import SasCorpus, SasSemanticChunker, resolve_corpus_references
 
     from .planner import build_corpus_plan
 
     chunker = SasSemanticChunker()
+    results = [
+        chunker.chunk_file(str(path))
+        for path in sorted(args.source_dir.rglob(args.pattern))
+    ]
+    # Resolved as one corpus, so a database LIBNAME (or a %LET) in a setup file
+    # reaches the reads in the files after it — chunk_file sees one file alone.
+    corpus = resolve_corpus_references(SasCorpus(file_results=results))
     by_source: dict[str, tuple[list, list]] = {}
-    for path in sorted(args.source_dir.rglob(args.pattern)):
-        result = chunker.chunk_file(str(path))
+    db_by_source: dict[str, list] = {}
+    for result in corpus.file_results:
+        source_id = result.source_id or ""
         engine_refs = [r for c in result.chunks for r in c.metadata.engine_refs]
         path_refs = [r for c in result.chunks for r in c.metadata.external_refs]
+        db_tables = [t for c in result.chunks for t in c.metadata.db_tables]
         if args.only:
             wanted = {libref.lower() for libref in args.only}
             engine_refs = [r for r in engine_refs if r.binds in wanted]
             path_refs = [r for r in path_refs if (r.binds or "") in wanted]
+            db_tables = [t for t in db_tables if t.connection in wanted]
         if engine_refs or path_refs:
-            by_source[str(path)] = (engine_refs, path_refs)
-    logger.info(f"_build_plan: {len(by_source)} file(s) name external data")
-    return build_corpus_plan(by_source, config=config, probe=None)
+            by_source[source_id] = (engine_refs, path_refs)
+        if db_tables:
+            db_by_source[source_id] = db_tables
+    logger.info(
+        f"_build_plan: {len(by_source.keys() | db_by_source.keys())} file(s) name external data"
+    )
+    return build_corpus_plan(
+        by_source, db_tables=db_by_source, config=config, probe=None
+    )
 
 
 def _print_plan(plan: HydrationPlan) -> None:
