@@ -787,6 +787,33 @@ to provision, which is a different question from how hard the code is. A file
 that reaches nothing outside gets no section, and every chunk that names a
 location prints its own `Paths:` line for the same audit trail as `Reads:`.
 
+## Database tables
+
+After the paths, the tables a file reads and writes **inside a database** —
+through SQL pass-through (`CONNECTION TO` / `EXECUTE … BY`) or as members of a
+database-engine LIBNAME — in the database's own terms, each read with the SAS
+copy it lands in:
+
+```
+## Database tables
+
+- Read:
+  - `edw_export.current_nonip` on `oracle` → `work.nonip` (connection_to `oracle`)
+  - `fr_dm.accounts` on `oracle` → `work.accts` (libname `edw`)
+- Written:
+  - `stage.tmp` on `oracle` (execute `oracle`)
+```
+
+Its own section rather than more Inputs, because these are not SAS datasets:
+`edw_export` is an Oracle owner, and a migration answers it by hydrating or
+federating the table, not by finding a LIBNAME. (Before the chunker had a
+pass-through grammar such a table *was* listed under Inputs — misfiled, beside
+the invented `work.connection`.) A table read through a `@dblink`, or whose name
+holds an unresolved `&macro` reference, is flagged. Reported, never scored; no
+tables, no section; every chunk prints a `Database:` line for the audit trail.
+With `--hydration`, each table read also gets its own item in the Hydration
+section.
+
 ## The dependency graph
 
 `crossfile.py` answers "what does *this* file depend on?" one file at a time.

@@ -106,13 +106,24 @@ chunker/
                         which every dataset position in metadata.py and the
                         LIBNAME/FILENAME librefs in paths.py are scanned with.
                         Pure data + functions; no package imports, no models.
+  passthrough.py        SQL pass-through: CONNECT TO / CONNECTION TO / EXECUTE
+                        ... BY / DISCONNECT and the native-SQL table scan.
+                        scan_pass_through returns the database tables a chunk
+                        names (SasDbTableRef) and the spans every SAS-side
+                        dataset scan must mask; db_table_ref is the one builder
+                        of those records.
   metadata.py           Per-chunk semantic extraction: _metadata_for, _io_for
                         (directed dataset I/O), _macro_body_io (literal vs
                         parameterised body refs), symput / SQL-INTO / CALL
                         EXECUTE extractors, _merge_meta, the extraction regex
-                        catalogue, and resolve_macro_var_refs — the whole-list
-                        pass that gives &name dataset/libref references their
-                        values once a file (or the corpus) has been walked.
+                        catalogue, and the whole-list passes that run once a
+                        file (or the corpus) has been walked:
+                        resolve_macro_var_refs (&name references get their
+                        values) then resolve_db_librefs (SAS names under a
+                        database-engine LIBNAME become database tables),
+                        composed in that order by resolve_references and,
+                        across files for callers that do not batch, by
+                        resolve_corpus_references.
   chunker.py            SasSemanticChunker orchestration (scan → group →
                         build chunks, oversized-split with overlap).
   batcher.py            _EdgeDiscovery + Union-Find grouping, weak-edge
@@ -998,6 +1009,15 @@ any of these silently changes behavior.
      does not exist. A second, narrower notion of "a name" living in either of
      those modules brings that failure straight back, and it is silent: the
      chunk reports *a* dataset, just not the one the source names.
+   - **One pass-through grammar.** `chunker/passthrough.py` owns SQL
+     pass-through — the statements, the native-SQL table scan, and the spans
+     that are *not SAS* — and reuses `chunker/paths.py`'s engine list and option
+     grammar rather than growing its own. Its tables are
+     `SasChunkMetadata.db_tables`, which `data_hydration` plans per table and
+     `complexity` reports, both from records rather than re-reading SQL. The
+     masking is the load-bearing half: while native SQL was scanned as SAS,
+     `from connection to oracle` was the dataset `work.connection` and the
+     Oracle owner `edw_export` a SAS libref every batch reported needing.
    - **One path resolver.** `xref/mapping.py` decides which `by_path` key wins
      (exact match, then longest directory prefix) and what it rewrites to. Both
      halves of the substitution import it: `xref/pre.py` on the way in,

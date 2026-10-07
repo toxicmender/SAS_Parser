@@ -95,12 +95,13 @@ For running the work items end-to-end through an LLM, see the
 
 | File | Role |
 |------|------|
-| `models.py` | Pydantic models: `SasChunk` (+`Kind`), `SasChunkMetadata`, `SasChunkResult`, `SasCorpus`, `SasBatch`, `SasBatchResult`, `SasDiagnostic` (+`Severity`), `SasPathRef` (+`PathLocation`). |
+| `models.py` | Pydantic models: `SasChunk` (+`Kind`), `SasChunkMetadata`, `SasChunkResult`, `SasCorpus`, `SasBatch`, `SasBatchResult`, `SasDiagnostic` (+`Severity`), `SasPathRef` (+`PathLocation`), `SasEngineRef`, `SasDbTableRef` (+`DbTableAccess`, `DbTableVia`). |
 | `paths.py` | Where a physical path appears in SAS syntax — `PATH_STATEMENTS`, `classify_location`, `extract_paths`. The **single owner** of that grammar: `xref.pre` imports it to rewrite the same statements. |
 | `keywords.py` | SAS keyword catalogues transcribed from the SAS docs (reserved macro words, autocall macros, function / CALL-routine dictionaries, and `SAS_FUNCTION_CATEGORIES`) + the patterns compiled from them. Pure data; no package imports, no logging. |
 | `scanner.py` | Lexical layer: `_Unit` / `_Region` parse primitives, the statement classifier (`_classify`), text normalisation / sanitisation, line-offset helpers, and the `_Deadline` / `_ParseWatchdog` stuck-parser machinery. |
 | `macro_vars.py` | Macro-variable values and reference expansion: `let_values` (the `%LET` symbol table), `resolve_refs` (`&name` / `&name.` / `&&name&i`), and `DS_REF_TOKEN` — the single definition of a dataset token that may embed `&refs`. Pure; no package imports. |
-| `metadata.py` | Per-chunk semantic extraction: `_metadata_for`, `_io_for` (directed dataset I/O), `_macro_body_io` (literal vs parameterised body refs), symput / SQL-INTO / CALL EXECUTE extractors, `_merge_meta`, the extraction regex catalogue, and `resolve_macro_var_refs` (the whole-list macro-name resolution pass). |
+| `passthrough.py` | SQL pass-through — `CONNECT TO` / `CONNECTION TO` / `EXECUTE … BY` / `DISCONNECT` and the native-SQL table scan: `scan_pass_through` (tables + the spans to mask), `mask`, `db_table_ref` (the one `SasDbTableRef` builder). The **single owner** of that grammar. |
+| `metadata.py` | Per-chunk semantic extraction: `_metadata_for`, `_io_for` (directed dataset I/O), `_macro_body_io` (literal vs parameterised body refs), symput / SQL-INTO / CALL EXECUTE extractors, `_merge_meta`, the extraction regex catalogue, and the whole-list resolution passes — `resolve_macro_var_refs`, `resolve_db_librefs`, composed in order by `resolve_references` (and across files by `resolve_corpus_references`). |
 | `chunker.py` | `SasSemanticChunker` orchestration (scan → group → build chunks, oversized-split with overlap). |
 | `batcher.py` | `_EdgeDiscovery` + Union-Find grouping, weak-edge resolution, context absorption, batch construction. `SasChunkBatcher` is a one-file convenience over `MultiFileBatcher`. |
 | `_repl.py` | `print_iterable` REPL helper (imported by nothing). |
@@ -113,8 +114,9 @@ For running the work items end-to-end through an LLM, see the
 > (`pipeline.max_merged_tokens`) on top. Two different questions, two units.
 
 **Import direction is strictly downward:** `keywords`, `macro_vars` and `models`
-import nothing from the package; `scanner`, `paths` and `metadata` import from
-them; `chunker.py` imports from all of them; `batcher` imports from `keywords`,
+import nothing from the package; `scanner` and `paths` import from them;
+`passthrough` imports from those; `metadata` imports from all of them;
+`chunker.py` imports from all of them; `batcher` imports from `keywords`,
 `metadata`, `models`.
 The package imports nothing from `memory`, `llm_client`, `prompt_builder`, or
 `pipeline` — it is a leaf the `pipeline` package builds on.
@@ -241,6 +243,58 @@ since whether it ever executes depends on a call. Resolution runs once per file
 in `chunk_text` and again over the flattened corpus in `MultiFileBatcher`,
 which is what lets a `%LET` in one file name a dataset another file reads.
 
+### Database tables (SQL pass-through and database LIBNAMEs)
+
+SAS reaches a database's own tables two ways, and both produce
+`SasDbTableRef` records on `SasChunkMetadata.db_tables` (rolled up as
+`SasBatch.db_tables`) — the table in the database's terms, linked to the SAS
+dataset the read lands in:
+
+```sas
+proc sql;
+connect to oracle (user=&ora_user password=&ora_pass path=&ora_path);
+create table nonip as select * from connection to oracle
+(select cov_month from edw_export.current_nonip where table_cd='MED');
+quit;
+/* → oracle:edw_export.current_nonip → work.nonip (read via connection_to oracle) */
+
+libname edw oracle path=EDWPRO schema=fr_dm;
+data work.accts; set edw.accounts; run;
+/* → oracle:fr_dm.accounts → work.accts (read via libname edw) */
+```
+
+**Explicit pass-through** is `passthrough.py`'s grammar: `CONNECT TO` (alias →
+engine and options, in statement order), `CONNECT USING`, `(FROM|JOIN)
+CONNECTION TO` (reads), `EXECUTE … BY` (writes and reads), `DISCONNECT`. The
+native SQL gets its own token walk — comma FROM lists, joins, subqueries, table
+functions, CTE names and `DUAL` excluded, `EXTRACT(… FROM …)`, Oracle `'…'`
+literals and `--` comments, `"QUOTED"` identifiers, `@dblink`, and every
+DDL/DML write form. Every *dataset* scan in `_metadata_for` runs on text where
+the pass-through spans are **masked**, so `from connection to oracle` stops
+being the dataset `work.connection`, `disconnect from oracle` stops being
+`work.oracle`, and the Oracle owner stops being a SAS libref a batch then
+"requires". Macro invocations are still read from the unmasked text: SAS
+resolves them before the native SQL is sent.
+
+**Database LIBNAMEs** are `metadata.resolve_db_librefs`: a source-order walk
+keeping the engine LIBNAMEs in force (`schema=` resolved against `%LET` where
+the LIBNAME stands; `libname x clear;` or a path rebind ends one; one inside a
+`%MACRO` body *does* bind, since connection macros are how production SAS hides
+credentials). A SAS name under such a libref keeps its place in the I/O lists —
+SAS code does name `edw.accounts` — and also gains a `via=libname` record.
+`CONNECT USING` records get their engine and options here.
+
+`resolve_references` runs the macro pass, then this one — the one order —
+from `chunk_text` (per file) and `MultiFileBatcher` (corpus-wide).
+`resolve_corpus_references(corpus)` does the same for callers that do not
+batch, which is how `data_hydration` and `complexity --hydration` see a LIBNAME
+in `setup.sas` reach the reads in `job.sas`.
+
+Options ride on each record, so a consumer never joins by alias. The one-line
+`str()` form — what reaches the LLM prompt — leaves them out, because that is
+where credentials live. No batching edges are added: two reads of one Oracle
+table are not a dependency between them.
+
 ## Batching model
 
 `_EdgeDiscovery` builds producer indices, then walks the flattened corpus once,
@@ -293,7 +347,9 @@ these silently changes behavior.
    dispatches on field annotation (`list[str]` → sorted union,
    `list[SasPathRef]` → union ordered by `_path_ref_sort_key`,
    `dict[str, str]` → merged with the child's entry winning, `bool` → OR,
-   `str | None` → child-or-parent, `_MERGE_PARENT_WINS` → parent's value) and
+   `str | None` → child-or-parent, `_MERGE_PARENT_WINS` → parent's value —
+   which includes `db_tables`, since a `CONNECT` and the `CONNECTION TO` using
+   its alias can land in different split slices) and
    raises `TypeError` for anything else. The default-instance test in
    `tests/test_chunker.py` trips the guard for every stored field, so a new field
    shape cannot ship without a conscious decision.
@@ -348,6 +404,13 @@ these silently changes behavior.
    has, and dropping produces a step that appears to read nothing.
    `_canon_ds` therefore leaves `&`-bearing names alone, and `_map_ds` refuses
    to map them.
+11. **Native SQL is never scanned as SAS.** Every dataset scan in
+   `_metadata_for` (`_DATASET_RE`, `_SQL_*`, `_io_for`, `_macro_body_io`, …)
+   reads the text with `scan_pass_through`'s spans masked. A new SAS-side
+   dataset scan must read the masked `mt_ds`/`cf_ds` too, or the
+   `work.connection` / Oracle-schema-as-libref misreadings come straight back —
+   silently, since the chunk still reports *a* dataset. Scans for macro names,
+   macro variables and functions keep the unmasked text on purpose.
 
 ## Logging
 

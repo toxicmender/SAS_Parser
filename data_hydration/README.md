@@ -43,6 +43,34 @@ That purity is not decoration. It is what lets `complexity` build a plan purely
 to print it: a report renderer must not be able to open a database connection,
 so `complexity` always passes `probe=None`.
 
+### Database tables
+
+`build_corpus_plan(..., db_tables=...)` takes the chunker's
+`SasChunkMetadata.db_tables` — the tables a corpus reaches inside a database,
+through SQL pass-through or as members of a database LIBNAME — and plans each
+table **read** as its own item: `object_name` is `owner.table`, the connection
+options are the ones that table was read through, and the target schema
+defaults to the libref, else the owner (`edw_export.current_nonip` →
+`<catalog>.edw_export.current_nonip`). Writes are what the converted job
+produces, never sources.
+
+- **One item per table.** A table read by five files is planned once, under the
+  first file that reads it; appending one copy per reader would load its rows
+  five times.
+- **A LIBNAME whose tables are named is planned per table.** Its schema-level
+  item — the stand-in when no table is known — is dropped; a LIBNAME nothing
+  names keeps it.
+- **Blocked, not guessed:** a connection whose engine is unknown (its `CONNECT`
+  made by a macro call), a `@dblink` (the table lives in the *linked* database),
+  and an unresolved `&macro` in the table name, alongside the usual option
+  check.
+- **Credentials** are keyed on the libref, or for pass-through on the
+  connection alias (`oracle_password_<alias>`).
+
+Pass metadata resolved across the corpus — `chunker.resolve_corpus_references`
+— or a LIBNAME in a setup file cannot reach the reads in the files after it.
+The CLI and `complexity --hydration` both do.
+
 ## Package layout
 
 | File | Role |
