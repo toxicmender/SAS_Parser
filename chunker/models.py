@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, replace
 from enum import StrEnum
+from typing import Any, Self
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -384,6 +387,179 @@ def _db_table_sort_key(
     )
 
 
+class DatasetRole(StrEnum):
+    """What a statement does to a SAS dataset it names."""
+
+    READ = "read"
+    WRITE = "write"
+    # Read and rewritten in place (MODIFY, APPEND BASE=, SQL INSERT/UPDATE/
+    # DELETE): an input and an output at once.
+    UPDATE = "update"
+    # Deleted (PROC DATASETS DELETE, SQL DROP TABLE): neither read nor written.
+    DROP = "drop"
+
+    @property
+    def reads(self) -> bool:
+        return self in (DatasetRole.READ, DatasetRole.UPDATE)
+
+    @property
+    def writes(self) -> bool:
+        return self in (DatasetRole.WRITE, DatasetRole.UPDATE)
+
+
+@dataclass(frozen=True, slots=True)
+class SasDatasetRef:
+    """One SAS dataset a chunk names, and what the chunk does with it.
+
+    The stored source of a chunk's dataset metadata: ``input_datasets``,
+    ``output_datasets``, ``dropped_datasets`` and the ``body_*`` lists are
+    views of :attr:`SasChunkMetadata.dataset_refs`. Every rewrite — macro
+    variables resolved, ``_LAST_`` and ``_DATA_`` made concrete, the Databricks
+    mapping — goes through :meth:`SasChunkMetadata.map_dataset_names`, so the
+    views cannot disagree.
+
+    Frozen so it is hashable, like its siblings, but a slotted dataclass
+    rather than a model: a corpus holds several per chunk, and the lighter
+    record keeps chunking and batching fast. Pydantic still validates and
+    serialises it as a field of :class:`SasChunkMetadata`.
+
+    Attributes
+    ----------
+    name
+        Canonical, as the batcher matches producers to consumers: ``work.x``
+        for a one-level name, ``lib.x``, ``'/path'`` for a physical path, and
+        the reference as written while it holds an unresolved ``&``. For a
+        parameter reference (:attr:`param`), the parameter: ``&ds``.
+    role
+        See :class:`DatasetRole`.
+    raw
+        The name as the statement spelled it; empty when nothing recorded it.
+    via
+        The statement or option that named it (``set``, ``data``, ``out=``,
+        ``from``, …), or where the reference came from (``macro_call``: a
+        call's argument, resolved through the macro's body; ``_last_``: the
+        dataset SAS's ``_LAST_`` held); empty when nothing recorded it.
+    in_macro_body
+        Named inside a ``%MACRO`` body, so read or written when the macro is
+        called, not where it is defined: the ``body_*`` views.
+    param, param_pos
+        A body reference spelled through one of the macro's own parameters,
+        and that parameter's position (-1 for a keyword parameter): each call
+        site supplies the dataset (``body_param_*``).
+    pattern
+        A name list rather than one dataset: ``lib.sales_:`` is every member of
+        ``lib`` whose name starts ``sales_``.
+    """
+
+    name: str
+    role: DatasetRole
+    raw: str = ""
+    via: str = ""
+    in_macro_body: bool = False
+    param: str | None = None
+    param_pos: int | None = None
+    pattern: bool = False
+
+    def __post_init__(self) -> None:
+        # Built directly, a dataclass is not validated: take "read" as READ, so
+        # the views' identity tests hold for every caller.
+        if type(self.role) is not DatasetRole:
+            object.__setattr__(self, "role", DatasetRole(self.role))
+
+    def __str__(self) -> str:
+        notes = [n for n in (self.via, "body" if self.in_macro_body else "") if n]
+        if self.param is not None:
+            notes.append(f"param {self.param}#{self.param_pos}")
+        return f"{self.role} {self.name}" + (f" ({', '.join(notes)})" if notes else "")
+
+
+# The dataset lists SasChunkMetadata computes from its dataset_refs. Also what
+# the metadata accepts in their place as input: JSON written before
+# dataset_refs, and callers that build metadata from lists (see
+# SasChunkMetadata._dataset_lists_as_refs).
+_DATASET_VIEWS = frozenset(
+    {
+        "input_datasets",
+        "output_datasets",
+        "dropped_datasets",
+        "body_literal_inputs",
+        "body_literal_outputs",
+        "body_param_inputs",
+        "body_param_outputs",
+    }
+)
+
+
+_NO_VIEWS: dict[str, tuple[Any, ...]] = dict.fromkeys(_DATASET_VIEWS, ())
+
+
+def _dataset_views(refs: tuple[SasDatasetRef, ...]) -> dict[str, tuple[Any, ...]]:
+    """Every view of *refs* in one pass: names (or a parameter's ``(param,
+    pos)``) in first-seen order, each once.
+
+    A chunk's own references fill ``input_datasets``, ``output_datasets`` and
+    ``dropped_datasets``; a macro body's fill the ``body_literal_*`` lists, or
+    ``body_param_*`` when spelled through a parameter. UPDATE reads and writes.
+    """
+    if not refs:
+        return _NO_VIEWS  # most chunks name no dataset; never mutated
+    found: dict[str, dict[Any, None]] = {}
+    for ref in refs:
+        role = ref.role
+        if ref.param is not None:
+            key: Any = (ref.param, ref.param_pos)
+            into = ("body_param_inputs", "body_param_outputs", None)
+        elif ref.in_macro_body:
+            key = ref.name
+            into = ("body_literal_inputs", "body_literal_outputs", None)
+        else:
+            key = ref.name
+            into = ("input_datasets", "output_datasets", "dropped_datasets")
+        if role is DatasetRole.READ or role is DatasetRole.UPDATE:
+            found.setdefault(into[0], {})[key] = None
+        if role is DatasetRole.WRITE or role is DatasetRole.UPDATE:
+            found.setdefault(into[1], {})[key] = None
+        if role is DatasetRole.DROP and into[2] is not None:
+            found.setdefault(into[2], {})[key] = None
+    views = dict(_NO_VIEWS)
+    for view, keys in found.items():
+        views[view] = tuple(keys)
+    return views
+
+
+def _refs_from_lists(
+    inputs: Iterable[str] = (),
+    outputs: Iterable[str] = (),
+    dropped: Iterable[str] = (),
+    body_inputs: Iterable[str] = (),
+    body_outputs: Iterable[str] = (),
+    param_inputs: Iterable[Mapping[str, Any]] = (),
+    param_outputs: Iterable[Mapping[str, Any]] = (),
+) -> tuple[SasDatasetRef, ...]:
+    """The dataset references behind dataset lists, in the order the views
+    read them back: the chunk's inputs, outputs and drops, then the macro
+    body's. Parameter entries are ``{"param": name, "pos": n}``."""
+    read, write = DatasetRole.READ, DatasetRole.WRITE
+    refs = [SasDatasetRef(name, read) for name in inputs]
+    refs += [SasDatasetRef(name, write) for name in outputs]
+    refs += [SasDatasetRef(name, DatasetRole.DROP) for name in dropped]
+    refs += [SasDatasetRef(name, read, in_macro_body=True) for name in body_inputs]
+    refs += [SasDatasetRef(name, write, in_macro_body=True) for name in body_outputs]
+    for entries, role in ((param_inputs, read), (param_outputs, write)):
+        for entry in entries:
+            param = str(entry["param"])
+            refs.append(
+                SasDatasetRef(
+                    f"&{param}",
+                    role,
+                    in_macro_body=True,
+                    param=param,
+                    param_pos=int(entry["pos"]),
+                )
+            )
+    return tuple(refs)
+
+
 class SasDiagnostic(BaseModel):
     """A recoverable parsing or classification issue."""
 
@@ -457,17 +633,138 @@ class SasChunkMetadata(BaseModel):
     # scoped to the steps that actually raise it instead of to every DATA step.
     data_step_statements: list[str] = Field(default_factory=list)
 
-    input_datasets: list[str] = Field(default_factory=list)
-    output_datasets: list[str] = Field(default_factory=list)
+    # Every SAS dataset the chunk names and what it does with each — see
+    # :class:`SasDatasetRef`. The dataset lists below are views of it. A tuple,
+    # so it changes only by being replaced, which keeps the views' cache sound.
+    dataset_refs: tuple[SasDatasetRef, ...] = ()
     defines_macros: list[str] = Field(default_factory=list)
     invokes_macros: list[str] = Field(default_factory=list)
-
-    body_literal_inputs: list[str] = Field(default_factory=list)
-    body_literal_outputs: list[str] = Field(default_factory=list)
-    # Each entry: {"param": "<name>", "pos": <int>} — pos >= 0 positional, -1 keyword.
-    body_param_inputs: list[dict[str, object]] = Field(default_factory=list)
-    body_param_outputs: list[dict[str, object]] = Field(default_factory=list)
     macro_param_names: list[str] = Field(default_factory=list)
+
+    def _views(self) -> dict[str, tuple[Any, ...]]:
+        """:func:`_dataset_views` of :attr:`dataset_refs`, computed once per
+        tuple: the batcher reads the views of every chunk many times over.
+        Kept outside the fields, so equality and dumps never see it."""
+        if not self.dataset_refs:
+            return _NO_VIEWS
+        cached = self.__dict__.get("_dataset_views_cache")
+        if cached is not None and cached[0] is self.dataset_refs:
+            return cached[1]
+        views = _dataset_views(self.dataset_refs)
+        self.__dict__["_dataset_views_cache"] = (self.dataset_refs, views)
+        return views
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def input_datasets(self) -> list[str]:
+        """Datasets the chunk reads (READ and UPDATE), first-seen order."""
+        return list(self._views()["input_datasets"])
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def output_datasets(self) -> list[str]:
+        """Datasets the chunk writes (WRITE and UPDATE), in the order the
+        source names them — load-bearing: the last is what ``_LAST_`` holds
+        after the chunk runs."""
+        return list(self._views()["output_datasets"])
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def dropped_datasets(self) -> list[str]:
+        """Datasets the chunk deletes."""
+        return list(self._views()["dropped_datasets"])
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def body_literal_inputs(self) -> list[str]:
+        """Datasets a ``%MACRO`` body reads under a name of its own."""
+        return list(self._views()["body_literal_inputs"])
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def body_literal_outputs(self) -> list[str]:
+        """Datasets a ``%MACRO`` body writes under a name of its own."""
+        return list(self._views()["body_literal_outputs"])
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def body_param_inputs(self) -> list[dict[str, object]]:
+        """``{"param": name, "pos": n}`` for each parameter a ``%MACRO`` body
+        reads a dataset through; ``pos`` >= 0 positional, -1 keyword."""
+        return [{"param": p, "pos": n} for p, n in self._views()["body_param_inputs"]]
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def body_param_outputs(self) -> list[dict[str, object]]:
+        """As :attr:`body_param_inputs`, for the datasets the body writes."""
+        return [{"param": p, "pos": n} for p, n in self._views()["body_param_outputs"]]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _dataset_lists_as_refs(cls, data: Any) -> Any:
+        """Accept the dataset lists in place of ``dataset_refs``: JSON written
+        before they existed loads, and ``SasChunkMetadata(input_datasets=[…])``
+        builds the references behind it. Alongside ``dataset_refs`` the lists
+        are its views, serialised with it, and give way to it."""
+        if type(data) is not dict or data.keys().isdisjoint(_DATASET_VIEWS):
+            return data
+        lists = {k: data[k] or () for k in _DATASET_VIEWS if k in data}
+        data = {k: v for k, v in data.items() if k not in _DATASET_VIEWS}
+        data.setdefault(
+            "dataset_refs",
+            _refs_from_lists(
+                inputs=lists.get("input_datasets", ()),
+                outputs=lists.get("output_datasets", ()),
+                dropped=lists.get("dropped_datasets", ()),
+                body_inputs=lists.get("body_literal_inputs", ()),
+                body_outputs=lists.get("body_literal_outputs", ()),
+                param_inputs=lists.get("body_param_inputs", ()),
+                param_outputs=lists.get("body_param_outputs", ()),
+            ),
+        )
+        return data
+
+    def model_copy(
+        self, *, update: Mapping[str, Any] | None = None, deep: bool = False
+    ) -> Self:
+        # A view named in `update` would be dropped without a word: its value
+        # comes from dataset_refs. Say so instead.
+        if update and (views := _DATASET_VIEWS & update.keys()):
+            raise ValueError(
+                f"{sorted(views)} are views of dataset_refs; rewrite the "
+                f"references (map_dataset_names, add_dataset_refs) instead"
+            )
+        return super().model_copy(update=update, deep=deep)
+
+    def map_dataset_names(
+        self, rename: Callable[[SasDatasetRef], str | None]
+    ) -> SasChunkMetadata:
+        """This metadata with each dataset reference renamed to what *rename*
+        returns for it, or dropped where that is ``None``: the one way to
+        rewrite dataset names, so every view moves together.
+
+        A parameter reference passes through untouched — each call site
+        supplies its dataset. Returns ``self`` when nothing changes.
+        """
+        refs = self.dataset_refs
+        names = [ref.name if ref.param is not None else rename(ref) for ref in refs]
+        if all(new == ref.name for new, ref in zip(names, refs)):
+            return self  # the common case, decided before any reference is hashed
+        renamed = tuple(
+            dict.fromkeys(
+                ref if new == ref.name else replace(ref, name=new)
+                for new, ref in zip(names, refs)
+                if new is not None
+            )
+        )
+        return self.model_copy(update={"dataset_refs": renamed})
+
+    def add_dataset_refs(self, refs: Iterable[SasDatasetRef]) -> SasChunkMetadata:
+        """This metadata with *refs* after its own; ``self`` when it has them all."""
+        merged = tuple(dict.fromkeys([*self.dataset_refs, *refs]))
+        if merged == self.dataset_refs:
+            return self
+        return self.model_copy(update={"dataset_refs": merged})
 
     produces_macrovars: list[str] = Field(default_factory=list)
 
@@ -558,7 +855,9 @@ class SasChunkMetadata(BaseModel):
     def __str__(self) -> str:
         # Show only populated fields, so empty defaults don't drown out the rest.
         populated = ", ".join(
-            f"{name}={value!r}" for name, value in self.__dict__.items() if value
+            f"{name}={value!r}"
+            for name in type(self).model_fields
+            if (value := getattr(self, name))
         )
         return f"SasChunkMetadata({populated or '<empty>'})"
 

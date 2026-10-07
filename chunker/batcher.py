@@ -23,6 +23,7 @@ from .keywords import _STANDARD_AUTOCALL_MACROS
 from .macro_vars import _parse_call_args
 from .metadata import _canon_ds, resolve_references
 from .models import (
+    DatasetRole,
     SasBatch,
     SasBatchResult,
     SasChunk,
@@ -30,6 +31,7 @@ from .models import (
     SasChunkMetadata,
     SasChunkResult,
     SasCorpus,
+    SasDatasetRef,
     _db_table_sort_key,
 )
 
@@ -186,42 +188,34 @@ def _resolve_implicit_datasets(flat_chunks: list[SasChunk]) -> None:
 
     for idx, chunk in enumerate(flat_chunks):
         meta = chunk.metadata
-        new_in = list(meta.input_datasets)
-        new_out = list(meta.output_datasets)
-        changed = False
 
-        if "_data_" in new_out:
-            resolved_out: list[str] = []
-            for ds in new_out:
-                if ds == "_data_":
-                    datan += 1
-                    ds = f"work.data{datan}"
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(
-                            f"implicit[_data_]: chunk {chunk.chunk_id} output resolved to '{ds}'"
-                        )
-                resolved_out.append(ds)
-            new_out = resolved_out
-            changed = True
-
-        if "_last_" in new_in:
-            if last_created is not None:
+        def concrete(ref: SasDatasetRef) -> str | None:
+            # The step's own placeholders; a macro body's run only when called.
+            nonlocal datan
+            if ref.in_macro_body:
+                return ref.name
+            if ref.name == "_data_" and ref.role.writes:
+                datan += 1
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"implicit[_data_]: chunk {chunk.chunk_id} output resolved to 'work.data{datan}'"
+                    )
+                return f"work.data{datan}"
+            if ref.name == "_last_" and ref.role.reads:
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
                         f"implicit[_last_]: chunk {chunk.chunk_id} input resolved to '{last_created}'"
-                    )
-                new_in = [last_created if ds == "_last_" else ds for ds in new_in]
-            else:
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        f"implicit[_last_]: chunk {chunk.chunk_id} references _LAST_ "
+                        if last_created is not None
+                        else f"implicit[_last_]: chunk {chunk.chunk_id} references _LAST_ "
                         f"before any dataset was created — dropped"
                     )
-                new_in = [ds for ds in new_in if ds != "_last_"]
-            changed = True
+                return last_created
+            return ref.name
+
+        updated = meta.map_dataset_names(concrete)
 
         if (
-            not new_in
+            not updated.input_datasets
             and last_created is not None
             and (
                 (
@@ -239,34 +233,22 @@ def _resolve_implicit_datasets(flat_chunks: list[SasChunk]) -> None:
                     f"implicit[no-data=]: chunk {chunk.chunk_id} ({chunk.kind.value}) "
                     f"gains implicit input '{last_created}'"
                 )
-            new_in = [last_created]
-            changed = True
-
-        if changed:
-            updated_meta = meta.model_copy(
-                update={"input_datasets": new_in, "output_datasets": new_out}
+            updated = updated.add_dataset_refs(
+                [SasDatasetRef(name=last_created, role=DatasetRole.READ, via="_last_")]
             )
-            flat_chunks[idx] = chunk.model_copy(update={"metadata": updated_meta})
 
-        if new_out:
+        if updated is not meta:
+            flat_chunks[idx] = chunk.model_copy(update={"metadata": updated})
+
+        if outputs := updated.output_datasets:
             # SAS sets _LAST_ to the most recently created data set; for a
             # multi-dataset DATA statement that is the last one named.
-            last_created = new_out[-1]
+            last_created = outputs[-1]
 
 
 # ---------------------------------------------------------------------------
 # Databricks name mapping (opt-in post-pass)
 # ---------------------------------------------------------------------------
-
-# Chunk-metadata list fields that hold dataset names and are rewritten by
-# replace_dataset_names. referenced_datasets is raw-source provenance and
-# body_param_* hold parameter references, so neither is touched.
-_DS_METADATA_FIELDS = (
-    "input_datasets",
-    "output_datasets",
-    "body_literal_inputs",
-    "body_literal_outputs",
-)
 
 # A ``%let name = value`` assignment (any chunk kind — GLOBAL_STATEMENT
 # chunks, but also %LET statements inside macro bodies and steps).  Group 1
@@ -464,12 +446,12 @@ def replace_dataset_names(
         return list(dict.fromkeys(_map_ds(ds, exact, by_libref) for ds in names))
 
     def _map_chunk(chunk: SasChunk) -> SasChunk:
-        meta_updates: dict[str, object] = {
-            field: mapped
-            for field in _DS_METADATA_FIELDS
-            if (mapped := _map_list(getattr(chunk.metadata, field)))
-            != getattr(chunk.metadata, field)
-        }
+        # Every dataset reference but a macro parameter's (the call site
+        # supplies that one); referenced_datasets is raw-source provenance and
+        # keeps the SAS spelling.
+        meta = chunk.metadata.map_dataset_names(
+            lambda ref: _map_ds(ref.name, exact, by_libref)
+        )
         # A database table's SAS copies are SAS dataset names too: renamed with
         # the rest, so the batch context never lists `work.nonip` next to the
         # Databricks name its "Datasets (out)" line now uses.
@@ -478,15 +460,15 @@ def replace_dataset_names(
                 t.model_copy(update={"sas_targets": targets})
                 if (targets := tuple(_map_list(list(t.sas_targets)))) != t.sas_targets
                 else t
-                for t in chunk.metadata.db_tables
+                for t in meta.db_tables
             ),
             key=_db_table_sort_key,
         )
-        if db_tables != chunk.metadata.db_tables:
-            meta_updates["db_tables"] = db_tables
+        if db_tables != meta.db_tables:
+            meta = meta.model_copy(update={"db_tables": db_tables})
         updates: dict[str, object] = {}
-        if meta_updates:
-            updates["metadata"] = chunk.metadata.model_copy(update=meta_updates)
+        if meta is not chunk.metadata:
+            updates["metadata"] = meta
         new_text = _map_let_values(chunk.text, exact, by_libref)
         if new_text != chunk.text:
             updates["text"] = new_text
@@ -494,7 +476,9 @@ def replace_dataset_names(
             return chunk
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                f"databricks-mapping: chunk {chunk.chunk_id} remapped  metadata={meta_updates}  let_text_rewritten={'text' in updates}"
+                f"databricks-mapping: chunk {chunk.chunk_id} remapped  "
+                f"inputs={meta.input_datasets}  outputs={meta.output_datasets}  "
+                f"let_text_rewritten={'text' in updates}"
             )
         return chunk.model_copy(update=updates)
 
@@ -969,28 +953,27 @@ class _EdgeDiscovery:
 
             # Persist resolved outputs/inputs back onto the chunk's metadata so
             # _make_batch and other consumers see them through the normal fields.
-            if resolved_outputs or resolved_inputs:
-                # Insertion-order dedupe, NOT sorted(): _resolve_implicit_datasets
-                # treats output_datasets[-1] as "the last dataset named".
-                new_out = list(
-                    dict.fromkeys(
-                        [*chunk.metadata.output_datasets, *resolved_outputs]
-                    )
-                )
-                new_in = list(
-                    dict.fromkeys(
-                        [*chunk.metadata.input_datasets, *resolved_inputs]
-                    )
-                )
-                updated_meta = chunk.metadata.model_copy(
-                    update={"output_datasets": new_out, "input_datasets": new_in},
-                )
+            # Appended after the chunk's own: _resolve_implicit_datasets treats
+            # the last output as "the last dataset named".
+            updated_meta = chunk.metadata.add_dataset_refs(
+                [
+                    *(
+                        SasDatasetRef(name=ds, role=DatasetRole.WRITE, via="macro_call")
+                        for ds in resolved_outputs
+                    ),
+                    *(
+                        SasDatasetRef(name=ds, role=DatasetRole.READ, via="macro_call")
+                        for ds in resolved_inputs
+                    ),
+                ]
+            )
+            if updated_meta is not chunk.metadata:
                 chunk = chunk.model_copy(update={"metadata": updated_meta})
                 self.flat_chunks[cidx] = chunk
                 meta = updated_meta
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
-                        f"macro_body_dataset: chunk {chunk.chunk_id} metadata updated  output_datasets={new_out}  input_datasets={new_in}"
+                        f"macro_body_dataset: chunk {chunk.chunk_id} metadata updated  output_datasets={meta.output_datasets}  input_datasets={meta.input_datasets}"
                     )
 
             # Link this call site to the nearest preceding producer of each

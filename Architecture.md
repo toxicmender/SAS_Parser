@@ -87,7 +87,8 @@ main.py                 The entry point (console script: `sas-parser`).
                         Neither falls back to the other silently.
 
 chunker/
-  models.py             Pydantic models: SasChunk(+Kind), SasChunkMetadata,
+  models.py             Pydantic models: SasChunk(+Kind), SasChunkMetadata
+                        and its SasDatasetRef records (+DatasetRole),
                         SasChunkResult, SasCorpus, SasBatch, SasBatchResult,
                         SasDiagnostic(+Severity)
   keywords.py           SAS keyword catalogues transcribed from the SAS docs
@@ -882,19 +883,21 @@ any of these silently changes behavior.
 3. **`output_datasets` is insertion-ordered, never sorted.**
    `_resolve_implicit_datasets` treats `output_datasets[-1]` as "the last
    dataset named" when resolving `_LAST_`/`_DATA_`/missing-`data=`
-   references. Sorting it breaks that convention (list-merge in
-   `_merge_meta` is the deliberate exception: split children lose ordering,
-   and implicit resolution operates on unsplit metadata).
+   references. Sorting it breaks that convention. It is a view of
+   `dataset_refs`, which `_merge_meta` unions in source order, the parent's
+   first, so split children keep the order.
 
 4. **Every `SasChunkMetadata` field must have a merge rule.** `_merge_meta`
    dispatches on field annotation (`list[str]` → sorted union,
+   `tuple[SasDatasetRef, ...]` → union in source order, parent first,
    `list[SasPathRef]` → union ordered by `_path_ref_sort_key`, `bool` → OR,
    `str | None` → child-or-parent, `_MERGE_PARENT_WINS` → parent's value)
    and raises `TypeError` for anything else. The default-instance test in
    `tests/test_chunker.py` trips the guard for every stored field, so a new
-   field shape cannot ship without a conscious decision. Signature-derived
-   fields (`macro_param_names`, `body_param_*`) are parent-wins because only
-   the split slice containing the `%MACRO` header can parse them.
+   field shape cannot ship without a conscious decision. `macro_param_names`
+   is parent-wins because only the split slice containing the `%MACRO` header
+   can parse it; a slice without the header has no parameters, so it adds no
+   parameter references to the parent's.
 
 5. **The LangGraph graph is compiled *without* a checkpointer, on
    purpose.** Durable per-thread persistence lives in the KV `msg::` row

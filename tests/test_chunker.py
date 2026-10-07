@@ -897,20 +897,29 @@ class TestMergeMeta(unittest.TestCase):
 
     def test_merge_rules_by_type(self):
         from chunker.metadata import _merge_meta
-        from chunker.models import SasChunkMetadata
+        from chunker.models import DatasetRole, SasChunkMetadata, SasDatasetRef
 
+        def writes(*names: str) -> tuple[SasDatasetRef, ...]:
+            return tuple(SasDatasetRef(name=n, role=DatasetRole.WRITE) for n in names)
+
+        out_param = SasDatasetRef(
+            name="&out",
+            role=DatasetRole.WRITE,
+            in_macro_body=True,
+            param="out",
+            param_pos=1,
+        )
         parent = SasChunkMetadata(
             step_name="parent_step",
             macro_name="outer",
-            output_datasets=["work.a", "work.b"],
+            dataset_refs=(*writes("work.b", "work.a"), out_param),
             contains_abort=True,
             macro_param_names=["ds", "out"],
-            body_param_outputs=[{"param": "out", "pos": 1}],
             referenced_macro_vars=["cutoff", "ds", "out"],
         )
         child = SasChunkMetadata(
             step_name="child_step",
-            output_datasets=["work.b", "work.c"],
+            dataset_refs=writes("work.a", "work.c"),
             referenced_macro_vars=["region"],
         )
         merged = _merge_meta(parent, child)
@@ -918,8 +927,9 @@ class TestMergeMeta(unittest.TestCase):
         # str | None → child wins, parent is the fallback
         self.assertEqual(merged.step_name, "child_step")
         self.assertEqual(merged.macro_name, "outer")
+        # list[SasDatasetRef] → union in source order, the parent's first
+        self.assertEqual(merged.output_datasets, ["work.b", "work.a", "work.c"])
         # list[str] → sorted union
-        self.assertEqual(merged.output_datasets, ["work.a", "work.b", "work.c"])
         self.assertEqual(
             merged.referenced_macro_vars, ["cutoff", "ds", "out", "region"]
         )

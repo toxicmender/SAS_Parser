@@ -584,13 +584,15 @@ class TestMetadataPlumbing(unittest.TestCase):
         )
 
     def test_unresolved_refs_view_spans_every_dataset_field(self):
-        from chunker.models import SasChunkMetadata
+        from chunker.models import DatasetRole, SasChunkMetadata, SasDatasetRef
 
         meta = SasChunkMetadata(
             referenced_datasets=["&a", "work.plain"],
-            input_datasets=["&b"],
-            output_datasets=["work.plain"],
-            body_literal_inputs=["&c"],
+            dataset_refs=(
+                SasDatasetRef(name="&b", role=DatasetRole.READ),
+                SasDatasetRef(name="work.plain", role=DatasetRole.WRITE),
+                SasDatasetRef(name="&c", role=DatasetRole.READ, in_macro_body=True),
+            ),
         )
         self.assertEqual(meta.unresolved_dataset_refs, ["&a", "&b", "&c"])
 

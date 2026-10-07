@@ -45,18 +45,21 @@ from .macro_vars import (
     resolve_refs,
 )
 from .models import (
+    DatasetRole,
     DbTableAccess,
     DbTableVia,
     SasChunk,
     SasChunkKind,
     SasChunkMetadata,
     SasCorpus,
+    SasDatasetRef,
     SasDbTableRef,
     SasEngineRef,
     SasPathRef,
     _db_table_sort_key,
     _engine_ref_sort_key,
     _path_ref_sort_key,
+    _refs_from_lists,
 )
 from .passthrough import db_table_ref, mask, scan_pass_through
 from .paths import ENGINE_LIBNAMES, extract_engine_refs, extract_paths
@@ -719,14 +722,16 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
         control_flow_op=control_flow_op,
         contains_abort=has_abort,
         contains_computed_goto=has_computed_goto,
-        input_datasets=inp,
-        output_datasets=out,
+        dataset_refs=_refs_from_lists(
+            inputs=inp,
+            outputs=out,
+            body_inputs=body_lit_in,
+            body_outputs=body_lit_out,
+            param_inputs=body_par_in,
+            param_outputs=body_par_out,
+        ),
         defines_macros=sorted(set(defs)),
         invokes_macros=sorted(set(invk)),
-        body_literal_inputs=body_lit_in,
-        body_literal_outputs=body_lit_out,
-        body_param_inputs=body_par_in,
-        body_param_outputs=body_par_out,
         macro_param_names=param_names,
         produces_macrovars=sorted(set(produces_macrovars)),
         symput_scope_hazard=hazard,
@@ -738,14 +743,14 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
 
 
 # Fields where the parent's whole-region value wins over the child's (a fallback)
-# rather than being unioned. Each needs context only the whole region holds: the
-# first three derive from the %MACRO signature header, which only the split
-# slice containing it can parse; ``db_tables`` from a CONNECT statement that may
-# sit in a different slice from the CONNECTION TO using its alias.
+# rather than being unioned. Each needs context only the whole region holds:
+# ``macro_param_names`` derives from the %MACRO signature header, which only the
+# split slice containing it can parse; ``db_tables`` from a CONNECT statement
+# that may sit in a different slice from the CONNECTION TO using its alias.
+# (Parameter dataset references need no entry: a slice without the header has
+# no parameters, so it adds none to the parent's.)
 _MERGE_PARENT_WINS = frozenset(
     {
-        "body_param_inputs",
-        "body_param_outputs",
         "macro_param_names",
         "db_tables",
     }
@@ -759,6 +764,9 @@ def _merge_meta(parent: SasChunkMetadata, child: SasChunkMetadata) -> SasChunkMe
     merged by its type automatically instead of being silently dropped:
 
     - ``list[str]``   → sorted union of both sides;
+    - ``tuple[SasDatasetRef, ...]`` → union in source order, the parent's
+      first: the child is a slice of the parent's region, so this keeps the
+      region's own order, which ``output_datasets`` relies on (``_LAST_``);
     - ``list[SasPathRef]`` → union of both sides, ordered by
       :func:`~chunker.models._path_ref_sort_key` (the records are frozen, so a
       set deduplicates them; the sort is what keeps output reproducible);
@@ -786,6 +794,8 @@ def _merge_meta(parent: SasChunkMetadata, child: SasChunkMetadata) -> SasChunkMe
             merged[name] = p or c
         elif field.annotation == list[str]:
             merged[name] = sorted({*p, *c})
+        elif field.annotation == tuple[SasDatasetRef, ...]:
+            merged[name] = tuple(dict.fromkeys([*p, *c]))
         elif field.annotation == list[SasPathRef]:
             merged[name] = sorted({*p, *c}, key=_path_ref_sort_key)
         elif field.annotation == list[SasEngineRef]:
@@ -821,18 +831,6 @@ def _title(kind: SasChunkKind, meta: SasChunkMetadata) -> str | None:
 # Macro-variable name resolution — a pass over already-built chunks
 # ---------------------------------------------------------------------------
 
-# Dataset lists in the *canonical* namespace: a resolved name is canonicalised
-# again (``batch_med`` → ``work.batch_med``) so it lands where the batcher's
-# producer/consumer matching looks for it. ``referenced_datasets`` is raw-source
-# provenance and is deliberately not in this tuple — it keeps the spelling the
-# statement used, exactly as it does for a name written without a macro.
-_CANONICAL_DS_FIELDS = (
-    "input_datasets",
-    "output_datasets",
-    "body_literal_inputs",
-    "body_literal_outputs",
-)
-
 # The two record types that carry a ``binds`` libref/fileref, which _resolve_binds
 # rewrites in place of a macro reference without otherwise touching the record.
 _BindsRefT = TypeVar("_BindsRefT", SasPathRef, SasEngineRef)
@@ -844,8 +842,8 @@ def _resolve_names(
     """*names* with their ``&`` references expanded, order-preserving.
 
     Resolution can collapse two spellings onto one name, so the result is
-    deduplicated — by insertion order, never sorted, because
-    ``output_datasets`` order is load-bearing (invariant 3).
+    deduplicated — by insertion order, never sorted, so a list kept in source
+    order (a pass-through read's ``sas_targets``) stays in it.
     """
     out: list[str] = []
     seen: set[str] = set()
@@ -946,11 +944,20 @@ def _resolved_meta(
 
     *own_values* are this chunk's own ``%LET`` assignments, already expanded by
     the caller against the table in force where each one stands.
+
+    A dataset reference's resolved name is canonicalised again (``batch_med``
+    → ``work.batch_med``) so it lands where the batcher's producer/consumer
+    matching looks for it. ``referenced_datasets`` is raw-source provenance: it
+    keeps the spelling the statement used, references expanded, exactly as it
+    does for a name written without a macro.
     """
-    updates: dict[str, Any] = {
-        field: _resolve_names(getattr(meta, field), table, canonical=True)
-        for field in _CANONICAL_DS_FIELDS
-    }
+
+    def resolved_name(ref: SasDatasetRef) -> str:
+        name = resolve_refs(ref.name, table) if has_macro_ref(ref.name) else ref.name
+        return _canon_ds(name)
+
+    resolved = meta.map_dataset_names(resolved_name)
+    updates: dict[str, Any] = {"dataset_refs": resolved.dataset_refs}
     updates["defines_librefs"] = sorted(
         set(_resolve_names(meta.defines_librefs, table, canonical=False))
     )
@@ -967,8 +974,12 @@ def _resolved_meta(
     updates["referenced_datasets"] = sorted(
         {
             *_resolve_names(meta.referenced_datasets, table, canonical=False),
-            *updates["input_datasets"],
-            *updates["output_datasets"],
+            # The chunk's own reads and writes: its input and output datasets.
+            *(
+                r.name
+                for r in resolved.dataset_refs
+                if not r.in_macro_body and r.role is not DatasetRole.DROP
+            ),
             *let_refs,
         }
     )
@@ -1340,6 +1351,8 @@ def _libname_tables(
     a DATA step, exactly what it makes from the read; for a multi-statement
     ``PROC SQL``, possibly more than one statement's worth.
     """
+    if not engines:
+        return []  # no database LIBNAME in force: no name can reach a table
     reads = dict.fromkeys([*meta.input_datasets, *meta.body_literal_inputs])
     writes = dict.fromkeys([*meta.output_datasets, *meta.body_literal_outputs])
     copies = tuple(

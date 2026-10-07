@@ -197,11 +197,13 @@ def test_unknown_mode_degrades_to_the_default(_isolated, caplog):
 
 def _batch_result(dataset: str):
     from chunker.models import (
+        DatasetRole,
         SasBatch,
         SasBatchResult,
         SasChunk,
         SasChunkKind,
         SasChunkMetadata,
+        SasDatasetRef,
     )
 
     chunk = SasChunk(
@@ -214,7 +216,9 @@ def _batch_result(dataset: str):
         end_line=1,
         start_char=0,
         end_char=10,
-        metadata=SasChunkMetadata(input_datasets=[dataset]),
+        metadata=SasChunkMetadata(
+            dataset_refs=(SasDatasetRef(name=dataset, role=DatasetRole.READ),)
+        ),
     )
     batch = SasBatch(batch_id="b-001", chunks=[chunk], source_files=["etl.sas"])
     return SasBatchResult(batches=[batch], singletons=[])

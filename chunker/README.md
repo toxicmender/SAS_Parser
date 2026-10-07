@@ -95,7 +95,7 @@ For running the work items end-to-end through an LLM, see the
 
 | File | Role |
 |------|------|
-| `models.py` | Pydantic models: `SasChunk` (+`Kind`), `SasChunkMetadata`, `SasChunkResult`, `SasCorpus`, `SasBatch`, `SasBatchResult`, `SasDiagnostic` (+`Severity`), `SasPathRef` (+`PathLocation`), `SasEngineRef`, `SasDbTableRef` (+`DbTableAccess`, `DbTableVia`). |
+| `models.py` | Pydantic models: `SasChunk` (+`Kind`), `SasChunkMetadata` and its `SasDatasetRef` records (+`DatasetRole`), `SasChunkResult`, `SasCorpus`, `SasBatch`, `SasBatchResult`, `SasDiagnostic` (+`Severity`), `SasPathRef` (+`PathLocation`), `SasEngineRef`, `SasDbTableRef` (+`DbTableAccess`, `DbTableVia`). |
 | `paths.py` | Where a physical path appears in SAS syntax — `PATH_STATEMENTS`, `classify_location`, `extract_paths`. The **single owner** of that grammar: `xref.pre` imports it to rewrite the same statements. |
 | `keywords.py` | SAS keyword catalogues transcribed from the SAS docs (reserved macro words, autocall macros, function / CALL-routine dictionaries, and `SAS_FUNCTION_CATEGORIES`) + the patterns compiled from them. Pure data; no package imports, no logging. |
 | `scanner.py` | Lexical layer: `_Unit` / `_Region` parse primitives and their `UnitRole` (code, comment, in-stream data, SUBMIT code), the statement classifier (`_classify`), where a macro call ends its statement (`_split_after_calls`), macro quoting (`_macro_quote_end`), in-stream blocks (`_in_stream_units`), text normalisation / sanitisation, line-offset helpers, and the `_Deadline` / `_ParseWatchdog` stuck-parser machinery. |
@@ -190,10 +190,34 @@ fields** derived at access time, not stored:
 - `unresolved_dataset_refs` — the dataset names across `referenced_datasets`,
   the I/O lists and `body_literal_*` that still hold a `&` (see below).
 
-Both appear in `model_dump()` but are silently ignored as constructor kwargs,
+They appear in `model_dump()` but are silently ignored as constructor kwargs,
 and they do not appear in `__str__`. `defines_macros` / `invokes_macros` are the
 single authoritative macro fields (`invokes_macros` includes CALL
 EXECUTE-invoked macros).
+
+**Dataset references.** `dataset_refs` is the stored source of a chunk's
+dataset metadata: one `SasDatasetRef` per dataset named, with a `DatasetRole`
+(READ, WRITE, UPDATE — read and rewritten in place — or DROP), whether it sits
+in a `%MACRO` body, and the parameter it is spelled through. The dataset lists
+are computed views of it, serialised under their usual keys:
+
+| View | References |
+|---|---|
+| `input_datasets` | READ and UPDATE, outside a macro body |
+| `output_datasets` | WRITE and UPDATE, outside a macro body, in source order (the last is `_LAST_`) |
+| `dropped_datasets` | DROP |
+| `body_literal_inputs` / `body_literal_outputs` | a macro body's, under names of their own |
+| `body_param_inputs` / `body_param_outputs` | a macro body's, through a parameter: `{"param", "pos"}` |
+
+A rewrite changes the references, never a list:
+`SasChunkMetadata.map_dataset_names` renames or drops them (macro variables
+resolved, `_LAST_`/`_DATA_` made concrete, the Databricks mapping), and
+`add_dataset_refs` appends (a call's resolved datasets). `model_copy` refuses an
+`update` that names a view. The lists are still accepted as input, so JSON
+written before `dataset_refs` loads, and `SasChunkMetadata(input_datasets=[…])`
+builds the references behind it. `referenced_datasets` and `referenced_librefs`
+are still stored for now: they hold raw spellings found by a separate scan that
+no reference records yet.
 
 Names are lowercased at extraction; quoted physical paths keep a leading `'` so
 they can never collide with identifiers.
@@ -413,9 +437,11 @@ these silently changes behavior.
 3. **`output_datasets` is insertion-ordered, never sorted.**
    `_resolve_implicit_datasets` treats `output_datasets[-1]` as "the last
    dataset named" when resolving `_LAST_` / `_DATA_` / missing-`data=` references.
-   (The list-merge in `_merge_meta` is the deliberate exception.)
+   Split children keep the order too: `_merge_meta` unions dataset references
+   in source order, the parent's first.
 4. **Every `SasChunkMetadata` field must have a merge rule.** `_merge_meta`
    dispatches on field annotation (`list[str]` → sorted union,
+   `tuple[SasDatasetRef, ...]` → union in source order, parent first,
    `list[SasPathRef]` → union ordered by `_path_ref_sort_key`,
    `dict[str, str]` → merged with the child's entry winning, `bool` → OR,
    `str | None` → child-or-parent, `_MERGE_PARENT_WINS` → parent's value —

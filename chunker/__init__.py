@@ -9,6 +9,7 @@ from .batcher import (
 from .chunker import SasSemanticChunker
 from .metadata import resolve_corpus_references
 from .models import (
+    DatasetRole,
     DbTableAccess,
     DbTableVia,
     PathLocation,
@@ -19,6 +20,7 @@ from .models import (
     SasChunkMetadata,
     SasChunkResult,
     SasCorpus,
+    SasDatasetRef,
     SasDbTableRef,
     SasDiagnostic,
     SasDiagnosticSeverity,
@@ -47,6 +49,8 @@ __all__ = [
     "SasChunk",
     "SasChunkKind",
     "SasChunkMetadata",
+    "SasDatasetRef",
+    "DatasetRole",
     "SasChunkResult",
     "SasDiagnostic",
     "SasDiagnosticSeverity",

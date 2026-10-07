@@ -1,9 +1,9 @@
 # Plan: close the chunker's SAS coverage gaps (breaking changes allowed)
 
-Status: Phases 0 and 1 implemented. `tests/test_sas_coverage.py` holds 183
-probes: the 168 from the coverage review plus 15 precision probes
-(`X01`–`X15`). Today 133 pass and 50 are expected failures, each naming the
-phase below that fixes it. Phases 2–9 are not started.
+Status: Phases 0–2 implemented. `tests/test_sas_coverage.py` holds 183 probes:
+the 168 from the coverage review plus 15 precision probes (`X01`–`X15`). Today
+133 pass and 50 are expected failures, each naming the phase below that fixes
+it. Phases 3–9 are not started.
 
 ## Context
 
@@ -56,7 +56,7 @@ These trace to four structural causes:
 
 | Change | Affected | Migration |
 |---|---|---|
-| `SasChunkMetadata.dataset_refs: list[SasDatasetRef]` becomes the stored source; `input_datasets`, `output_datasets`, `referenced_datasets`, `referenced_librefs`, `body_literal_*`, `body_param_*` become read-only computed views | ~10 test constructors; every `model_copy(update={"input_datasets": …})` site | JSON keys unchanged (computed fields serialise). A `model_validator(mode="before")` turns legacy lists into refs, so old JSON still loads. A guard test fails on any `update=` that names a view |
+| `SasChunkMetadata.dataset_refs: tuple[SasDatasetRef, ...]` becomes the stored source; `input_datasets`, `output_datasets`, `referenced_datasets`, `referenced_librefs`, `body_literal_*`, `body_param_*` become read-only computed views | ~10 test constructors; every `model_copy(update={"input_datasets": …})` site | JSON keys unchanged (computed fields serialise). A `model_validator(mode="before")` turns legacy lists into refs, so old JSON still loads. A guard test fails on any `update=` that names a view |
 | Update-in-place (SQL INSERT/UPDATE/DELETE/ALTER, `APPEND base=`, `MODIFY`) is role `UPDATE`, so the table appears in both input and output lists | Batching: the modifying step now depends on the table's earlier producer | Intended; batch diffs are reviewed in verification |
 | `referenced_datasets`/`referenced_librefs` come only from real dataset positions | Fewer, correct entries | — |
 | Chunk boundaries | Run-group PROCs (DATASETS, REG, …) keep statements after `run;` until `quit;`. DS2 programs stay inside PROC DS2. Datalines/SUBMIT text never opens a step. `%*` becomes COMMENT_BLOCK. `%symdel`, `%syslput`, … change MACRO_CALL → GLOBAL_STATEMENT. New global statements are recognised | Snapshot-style tests updated |
@@ -162,7 +162,39 @@ Probes flipped: L03, L08, L11, L15, L16, M16, G11, G12, G15, G16, G17, A06,
 E04, X01–X05, X13 and X14, plus the structural half of E01 (its I/O is
 Phase 6).
 
-## Phase 2: dataset reference model, behaviour-preserving (M)
+## Phase 2: dataset reference model, behaviour-preserving (M) — done
+
+Done as planned, with these differences:
+
+- **The record.** `SasDatasetRef` is a frozen, slotted dataclass, not a
+  pydantic model, and `dataset_refs` is a tuple. Pydantic still validates and
+  serialises it as a field. A model cost three tracked objects per record and
+  showed up as collector time. The tuple can only be replaced, never edited,
+  so the views are computed once per tuple and cached outside the fields.
+- **`referenced_datasets` and `referenced_librefs` stay stored until Phase
+  3.** They hold the spellings a separate raw scan finds (and `%LET` values
+  that look like datasets), which no reference records yet. Phase 3, which
+  removes that scan, makes them views; a `%LET` value then needs a
+  reference that neither reads nor writes.
+- **Rewrites are methods.** `SasChunkMetadata.map_dataset_names(rename)`
+  renames or drops references, and `add_dataset_refs` appends them.
+  `model_copy` raises on an `update` that names a view, rather than silently
+  dropping it. No sort key is needed: merging is a source-order union.
+- **Constructors.** A `before` validator turns the legacy lists into
+  references, so old JSON and every test constructor work unchanged. The five
+  sites pyright checks were moved to `dataset_refs` anyway.
+- **Behaviour.**
+  - Chunks, metadata and batches are identical to Phase 1 on the 187-file
+    corpus and a 4,800-chunk job, also with forced splits.
+  - The one change is planned: a split child keeps its region's dataset
+    order instead of an alphabetical one, so its last output is again
+    `_LAST_`.
+- **Performance.**
+  - Neutral, after two fixes: `_libname_tables` returns at once when no
+    database LIBNAME is in force, and `_resolved_meta` reads names from the
+    references instead of the views.
+  - Chunking the 900 KB files takes what it did at Phase 0, about 3% faster
+    than Phase 1. Batching is level with Phase 1.
 
 Files: `chunker/models.py`, `chunker/metadata.py`, `chunker/batcher.py`.
 
@@ -235,6 +267,10 @@ Files: `chunker/models.py`, `chunker/metadata.py`, `chunker/batcher.py`.
   options, symput) run on that masked text, so comments, datalines and
   foreign code count nowhere. (The masking itself, `_Region.code_text`,
   landed in Phase 1.)
+- **`referenced_datasets` and `referenced_librefs` become views** (carried over
+  from Phase 2): the raw and canonical names of every reference, and their
+  librefs plus `defines_librefs`. A `%LET` value that looks like a dataset
+  becomes a reference with a role that neither reads nor writes.
 - **Deleted:** `_DATASET_RE`, `_SET_RE`/`_MERGE_RE`/`_UPDATE_RE`/`_MODIFY_RE`/
   `_OUTPUT_DS_RE`, all 12 `_BODY_*` patterns, `_io_for`, `_macro_body_io`,
   `_multi_ds`.
