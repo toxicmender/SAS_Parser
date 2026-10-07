@@ -98,7 +98,7 @@ For running the work items end-to-end through an LLM, see the
 | `models.py` | Pydantic models: `SasChunk` (+`Kind`), `SasChunkMetadata`, `SasChunkResult`, `SasCorpus`, `SasBatch`, `SasBatchResult`, `SasDiagnostic` (+`Severity`), `SasPathRef` (+`PathLocation`), `SasEngineRef`, `SasDbTableRef` (+`DbTableAccess`, `DbTableVia`). |
 | `paths.py` | Where a physical path appears in SAS syntax — `PATH_STATEMENTS`, `classify_location`, `extract_paths`. The **single owner** of that grammar: `xref.pre` imports it to rewrite the same statements. |
 | `keywords.py` | SAS keyword catalogues transcribed from the SAS docs (reserved macro words, autocall macros, function / CALL-routine dictionaries, and `SAS_FUNCTION_CATEGORIES`) + the patterns compiled from them. Pure data; no package imports, no logging. |
-| `scanner.py` | Lexical layer: `_Unit` / `_Region` parse primitives, the statement classifier (`_classify`), where a macro call ends its statement (`_split_after_calls`), text normalisation / sanitisation, line-offset helpers, and the `_Deadline` / `_ParseWatchdog` stuck-parser machinery. |
+| `scanner.py` | Lexical layer: `_Unit` / `_Region` parse primitives and their `UnitRole` (code, comment, in-stream data, SUBMIT code), the statement classifier (`_classify`), where a macro call ends its statement (`_split_after_calls`), macro quoting (`_macro_quote_end`), in-stream blocks (`_in_stream_units`), text normalisation / sanitisation, line-offset helpers, and the `_Deadline` / `_ParseWatchdog` stuck-parser machinery. |
 | `macro_vars.py` | Macro-variable values and reference expansion: `let_values` (the `%LET` symbol table), `resolve_refs` (`&name` / `&name.` / `&&name&i`), `call_spans` (where back-to-back macro calls begin and end), and `DS_REF_TOKEN` — the single definition of a dataset token that may embed `&refs`. Pure; no package imports. |
 | `passthrough.py` | SQL pass-through — `CONNECT TO` / `CONNECTION TO` / `EXECUTE … BY` / `DISCONNECT` and the native-SQL table scan: `scan_pass_through` (tables + the spans to mask), `mask`, `db_table_ref` (the one `SasDbTableRef` builder). The **single owner** of that grammar. |
 | `metadata.py` | Per-chunk semantic extraction: `_metadata_for`, `_io_for` (directed dataset I/O), `_macro_body_io` (literal vs parameterised body refs), symput / SQL-INTO / CALL EXECUTE extractors, `_merge_meta`, the extraction regex catalogue, and the whole-list resolution passes — `resolve_macro_var_refs`, `resolve_db_librefs`, composed in order by `resolve_references` (and across files by `resolve_corpus_references`). |
@@ -139,12 +139,30 @@ this is a considered decision, not an accident.
   just before `%MEND;` or `RUN;` no longer hides the terminator and leaves its
   block open. `%vname(x) = 1;` — the call writes part of the statement — stays
   whole, as do macro statements (`%mend m;`, `%symdel x;`), which run to their
-  semicolon. A call that ends the file is complete, not unterminated.
+  semicolon. A call that ends the file is complete, not unterminated. Inside a
+  macro quoting function (`%STR`, `%NRSTR`, `%QUOTE`, `%NRQUOTE`, `%BQUOTE`,
+  `%NRBQUOTE`) a semicolon is text, so `%let sep = %str(;);` is one statement;
+  `%'`, `%"`, `%(` and `%)` are escapes there. An argument that never closes
+  quotes nothing.
+- **Statement roles (`UnitRole`):** every unit is CODE, COMMENT (a `/* */`
+  block, a `* …;` statement or a `%* …;` macro comment), DATALINES (the
+  in-stream data after `DATALINES`/`CARDS`/`LINES`/`PARMCARDS`, ended by the
+  first line holding a semicolon, or by a `;;;;` line for the `…4` forms) or
+  FOREIGN (another language's code from `SUBMIT` to the `ENDSUBMIT` line, in
+  PROC PYTHON, LUA, IML, …). Only CODE is SAS: the others never open or close
+  a block, a quote in them opens no string, and metadata reads the region with
+  them blanked (`_Region.code_text`), so commented-out code, data lines and
+  Python name no dataset, macro or path.
 - **Block collection rule:** only a new DATA / PROC / `%MACRO` header or an
-  explicit `RUN;` / `QUIT;` / `%MEND` closes the current block. FORMAT, OPTIONS,
-  LIBNAME, ODS, etc. inside a block body are collected, never treated as
-  boundaries. A `%MACRO` block closes only on its own (nesting-balanced)
-  `%MEND`.
+  explicit `RUN;` / `RUN CANCEL;` / `QUIT;` / `%MEND` closes the current block.
+  FORMAT, OPTIONS, LIBNAME, ODS, etc. inside a block body are collected, never
+  treated as boundaries, and a DATA or PROC keyword used as a variable
+  (`data = 1;`) is no header. A `%MACRO` block closes only on its own
+  (nesting-balanced) `%MEND`. A PROC in `keywords.RUN_GROUP_PROCS` (DATASETS,
+  REG, GLM, SQL, IML, …) runs in groups: `RUN;` does not end it, `QUIT;` does;
+  met by the next step or the end of the file after a `RUN;`, it ended at its
+  last `RUN;`, and what followed is open code again (no `UNCLOSED_*`). PROC DS2
+  holds DATA programs of its own, so their headers do not end it.
 - **Oversized splits:** a region exceeding `max_words` yields a *parent* chunk
   (full text) plus overlapping *child* chunks (`parent_id` set). The
   parent/child text redundancy is intentional context for the LLM. Child
@@ -436,6 +454,14 @@ these silently changes behavior.
    it. ⚠️ `X` is recognised only with its quoted
    argument or as the whole bare statement, because `x` is also one of the
    commonest SAS variable names; `x = 1;` and `x + 1;` must stay DATA step body.
+   The other global statements the classifier knows — `ENDSAS`, `DM`,
+   `SASFILE`, `LOCK`, `MISSING`, `PAGE`, `SKIP`, SAS/GRAPH's `GOPTIONS` and
+   `AXIS`/`SYMBOL`/`LEGEND`/`PATTERN`, SAS/CONNECT's `SIGNON`/`RSUBMIT`/…, and
+   the macro statements `%SYMDEL`, `%SYSLPUT`, `%SYSCALL`, … — carry their own
+   keyword, a numbered statement without its number (`title2` is `title`); the
+   same word followed by `=`, `+`, `:` or a subscript is a variable, not the
+   statement. A word the macro language owns (`%SYSFUNC`, `%STR`, a stray
+   `%MEND`) is never a MACRO_CALL.
 9. **`SAS_FUNCTION_CATEGORIES` is advisory and deliberately partial.** It maps
    a function or routine name to its family in *SAS Functions and CALL Routines
    by Category*, and its only consumer is `prompt_builder`'s `[category: ...]`

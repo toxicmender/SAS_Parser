@@ -1,9 +1,9 @@
 # Plan: close the chunker's SAS coverage gaps (breaking changes allowed)
 
-Status: Phase 0 implemented. `tests/test_sas_coverage.py` holds 183 probes: the
-168 from the coverage review plus 15 precision probes (`X01`–`X15`). Today 113
-pass and 70 are expected failures, each naming the phase below that fixes it.
-Phases 1–9 are not started.
+Status: Phases 0 and 1 implemented. `tests/test_sas_coverage.py` holds 183
+probes: the 168 from the coverage review plus 15 precision probes
+(`X01`–`X15`). Today 133 pass and 50 are expected failures, each naming the
+phase below that fixes it. Phases 2–9 are not started.
 
 ## Context
 
@@ -86,7 +86,40 @@ These trace to four structural causes:
   - Machine drift between sessions is about 15%, so the gate compares the two
     commits in the same session.
 
-## Phase 1: scanner, statement roles and block structure (M)
+## Phase 1: scanner, statement roles and block structure (M) — done
+
+Done as planned, with these differences:
+
+- **Masking came forward from Phase 3.** Metadata reads `_Region.code_text`,
+  the region with every non-CODE unit blanked, so comments count nowhere
+  either. That flipped X01–X05 as well as X13 and X14. Phase 3 still moves
+  `_metadata_for` onto units. One consequence: SAS runs a macro call written
+  inside a `*` comment, but the chunker no longer records it.
+- **Unclosed macro quoting stays linear.** `_macro_quote_end` records the
+  match of every parenthesis it walks past, so a `%str(` that never closes is
+  walked once. 20,000 such lines take 2.3 s, against 67 s for a walk per
+  function and 2.0 s at Phase 0.
+- **Small additions:**
+  - the classifier knows `cas`, `caslib`, `resetline`, `sysecho` and `%inc`;
+  - `RUN_GROUP_PROCS` adds catmod, document, gslide, gradar and gbarline;
+  - a DATA or PROC keyword used as a variable (`data = 1;`) opens no step;
+  - `global_statement_keyword` handles numbered statements, so `title2` is
+    `title` (it was `None`).
+- **Performance.** Full `chunk_text` on the 900 KB files is about 3% slower
+  (A/B against Phase 0, same session). The event regex is now an alternation
+  of literals, which the engine scans 2.5× faster than the old character
+  class.
+- **Batch diff.** On a 187-file corpus (every probe, both reference examples,
+  two multi-step jobs), batches went from 25 to 23 and singletons from 142 to
+  131. Every change follows from a chunk fix:
+  - global statements (`%let`, `signon`, `rsubmit`) join the step they
+    precede;
+  - run-group PROCs and DS2/Python blocks are whole chunks instead of
+    fragments;
+  - a DATA step that the false reads in its datalines held in a batch now
+    stands alone.
+- **Reference examples.** Both give the same complexity reports and hydration
+  plans as at Phase 0.
 
 Files: `chunker/scanner.py`, `chunker/chunker.py` (`_scan_units`,
 `_group_regions`, `_collect_block`), `chunker/keywords.py`.
@@ -126,8 +159,8 @@ Files: `chunker/scanner.py`, `chunker/chunker.py` (`_scan_units`,
    - The new words are added to `SAS_GLOBAL_STATEMENT_TOKENS`.
 
 Probes flipped: L03, L08, L11, L15, L16, M16, G11, G12, G15, G16, G17, A06,
-plus the structural half of E01 and E04, and the datalines/SUBMIT precision
-probes.
+E04, X01–X05, X13 and X14, plus the structural half of E01 (its I/O is
+Phase 6).
 
 ## Phase 2: dataset reference model, behaviour-preserving (M)
 
@@ -200,13 +233,14 @@ Files: `chunker/models.py`, `chunker/metadata.py`, `chunker/batcher.py`.
   `mt`/`cf` are built once with non-CODE units blanked. The remaining
   whole-text scans (functions, CALL routines, macro variables, labels,
   options, symput) run on that masked text, so comments, datalines and
-  foreign code count nowhere.
+  foreign code count nowhere. (The masking itself, `_Region.code_text`,
+  landed in Phase 1.)
 - **Deleted:** `_DATASET_RE`, `_SET_RE`/`_MERGE_RE`/`_UPDATE_RE`/`_MODIFY_RE`/
   `_OUTPUT_DS_RE`, all 12 `_BODY_*` patterns, `_io_for`, `_macro_body_io`,
   `_multi_ds`.
 
-Probes flipped: D02–D07, D09, D10, D13, D17, D21, D29, D30, and most
-precision probes.
+Probes flipped: D02–D07, D09, D10, D13, D17, D21, D29, D30, and the
+precision probes X06–X11.
 
 ## Phase 4: PROC option roles and PROC statements (M)
 

@@ -94,11 +94,13 @@ chunker/
                         (reserved macro words, autocall macros, function /
                         CALL-routine dictionaries) + patterns compiled from
                         them. Pure data; no package imports, no logging.
-  scanner.py            Lexical layer: _Unit/_Region parse primitives, the
-                        statement classifier (_classify), where a macro call
-                        ends its statement (_split_after_calls), text
-                        normalisation and sanitisation, line-offset helpers,
-                        and the _Deadline/_ParseWatchdog stuck-parser machinery.
+  scanner.py            Lexical layer: _Unit/_Region parse primitives and
+                        their UnitRole (code, comment, in-stream data, SUBMIT
+                        code), the statement classifier (_classify), where a
+                        macro call ends its statement (_split_after_calls),
+                        macro quoting, text normalisation and sanitisation,
+                        line-offset helpers, and the _Deadline/_ParseWatchdog
+                        stuck-parser machinery.
   macro_vars.py         Macro-variable values and the reference expansion that
                         resolves names: let_values (the %LET symbol table),
                         resolve_refs (&name / &name. / &&name&i, delimiter-dot
@@ -650,12 +652,20 @@ simplification — this is a considered decision, not an accident.
   macro call, which ends at the parenthesis closing its arguments (or at its
   name): the scanner cuts there when what follows opens a statement of its
   own, so back-to-back semicolon-less calls are separate units and a call
-  just before %MEND;/RUN; cannot hide the terminator.
+  just before %MEND;/RUN; cannot hide the terminator. A semicolon inside
+  %STR(…) and the other macro quoting functions ends nothing.
+- **Statement roles:** a unit is CODE, COMMENT (`/* */`, `*;`, `%*;`),
+  DATALINES (in-stream data) or FOREIGN (SUBMIT…ENDSUBMIT code). Only CODE
+  opens or closes blocks, and metadata reads the region with the rest
+  blanked, so commented-out code, data lines and Python name nothing.
 - **Block collection rule:** only a new DATA/PROC/%MACRO header or an
-  explicit RUN;/QUIT;/%MEND closes the current block. FORMAT, OPTIONS,
-  LIBNAME, ODS, etc. inside a block body are collected, never treated as
-  boundaries. A %MACRO block closes only on its own (nesting-balanced)
-  %MEND.
+  explicit RUN;/RUN CANCEL;/QUIT;/%MEND closes the current block. FORMAT,
+  OPTIONS, LIBNAME, ODS, etc. inside a block body are collected, never treated
+  as boundaries. A %MACRO block closes only on its own (nesting-balanced)
+  %MEND. A run-group PROC (DATASETS, REG, SQL, … in
+  `keywords.RUN_GROUP_PROCS`) ends at QUIT, or at its last RUN when the next
+  step or the end of the file comes first; PROC DS2's own DATA programs stay
+  inside it.
 - **Oversized splits:** a region exceeding `max_words` yields a *parent*
   chunk (full text) plus overlapping *child* chunks (`parent_id` set). The
   parent/child text redundancy is intentional context for the LLM. Child

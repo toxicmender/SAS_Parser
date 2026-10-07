@@ -26,13 +26,9 @@ from chunker import SasChunkKind as K
 
 # ── why a probe fails today, and the plan phase that fixes it ──────────────────
 
-LEXICAL = "phase 1: macro quoting, %* comments, datalines"
-RUN_GROUPS = "phase 1: run-group PROCs and RUN CANCEL"
-GLOBALS = "phase 1: global statements the classifier does not know"
-SUBMIT = "phase 1: SUBMIT blocks"
 OPERANDS = "phase 3: SET/MERGE/UPDATE/MODIFY operands"
 HEADER = "phase 3: DATA statement options and hash methods"
-NOT_CODE = "phase 3: comments, datalines and %PUT text scanned as code"
+NOT_CODE = "phase 3: %PUT and %LET text and variable names read as datasets"
 PROC_OPTIONS = "phase 4: PROC option roles"
 ODS = "phase 4: ODS OUTPUT"
 SQL = "phase 5: SQL FROM lists and DML"
@@ -40,8 +36,7 @@ EMBEDDED = "phase 6: DS2 and IML reads and writes"
 INCLUDES = "phase 7: %INCLUDE, filerefs and macro signatures"
 
 GAPS = frozenset(
-    {LEXICAL, RUN_GROUPS, GLOBALS, SUBMIT, OPERANDS, HEADER, NOT_CODE,
-     PROC_OPTIONS, ODS, SQL, EMBEDDED, INCLUDES}
+    {OPERANDS, HEADER, NOT_CODE, PROC_OPTIONS, ODS, SQL, EMBEDDED, INCLUDES}
 )
 
 # A probe's free-form check: (result, top-level chunks) -> a problem, or None.
@@ -156,7 +151,7 @@ LEXICAL_PROBES = [
     Probe("L02", "* comment statement", "* load the data;\ndata a; set b; run;\n",
           kinds=[K.COMMENT_BLOCK, K.DATA_STEP]),
     Probe("L03", "%* macro comment statement", "%* macro-level note;\ndata a; set b; run;\n",
-          kinds=[K.COMMENT_BLOCK, K.DATA_STEP], gap=LEXICAL),
+          kinds=[K.COMMENT_BLOCK, K.DATA_STEP]),
     Probe("L04", "semicolon inside a quoted string", "data a; x = 'a;b'; y = \"c;d\"; run;\n",
           kinds=[K.DATA_STEP], outputs={"work.a"}),
     Probe("L05", "doubled quote escape", "data a; x = 'it''s; fine'; run;\n",
@@ -171,14 +166,14 @@ LEXICAL_PROBES = [
           else "name-literal datasets not recorded"),
     Probe("L08", "datalines with keyword-like data",
           "data x;\n  input word $;\ndatalines;\nproc\ndata\nrun\n;\nrun;\n",
-          kinds=[K.DATA_STEP], outputs={"work.x"}, gap=LEXICAL),
+          kinds=[K.DATA_STEP], outputs={"work.x"}),
     Probe("L09", "datalines4 with semicolons in the data",
           "data x;\n  input line $40.;\ndatalines4;\na;b;c\nd;e\n;;;;\nrun;\n",
           kinds=[K.DATA_STEP], outputs={"work.x"}),
     Probe("L10", "cards statement", "data x;\n  input a b;\ncards;\n1 2\n3 4\n;\nrun;\n",
           kinds=[K.DATA_STEP], outputs={"work.x"}),
     Probe("L11", "%str(;) inside %let", "%let sep = %str(;);\ndata a; set b; run;\n",
-          kinds=[K.GLOBAL_STATEMENT, K.DATA_STEP], inputs={"work.b"}, gap=LEXICAL),
+          kinds=[K.GLOBAL_STATEMENT, K.DATA_STEP], inputs={"work.b"}),
     Probe("L12", "upper case, CRLF line ends", "DATA Work.Out;\r\n  SET Lib.In;\r\nRUN;\r\n",
           kinds=[K.DATA_STEP], inputs={"lib.in"}, outputs={"work.out"}),
     Probe("L13", "inline comments inside statements",
@@ -189,10 +184,10 @@ LEXICAL_PROBES = [
           kinds=[K.DATA_STEP, K.DATA_STEP], inputs={"work.b", "work.a"},
           outputs={"work.a", "work.c"}, closed=False),
     Probe("L15", "RUN CANCEL closes the step", "data a; set b; run cancel;\ndata c; set d; run;\n",
-          kinds=[K.DATA_STEP, K.DATA_STEP], gap=RUN_GROUPS),
+          kinds=[K.DATA_STEP, K.DATA_STEP]),
     Probe("L16", "interactive PROC: run groups until QUIT",
           "proc datasets lib=work nolist;\n  delete a;\nrun;\n  delete b;\nrun;\nquit;\n",
-          kinds=[K.PROC_STEP], gap=RUN_GROUPS),
+          kinds=[K.PROC_STEP]),
     Probe("L17", "unterminated string is reported, not fatal",
           "data a; x = 'oops; run;\ndata b; set c; run;\n",
           no_unknown=False, closed=False,
@@ -492,20 +487,20 @@ GLOBAL_PROBES = [
     Probe("G09", "X command", "x 'mkdir -p /tmp/work';\n", kinds=[K.GLOBAL_STATEMENT]),
     Probe("G10", "SYSTASK", "systask command \"ls\" wait;\n", kinds=[K.GLOBAL_STATEMENT]),
     Probe("G11", "ENDSAS", "data a; set b; run;\nendsas;\n",
-          kinds=[K.DATA_STEP, K.GLOBAL_STATEMENT], gap=GLOBALS),
+          kinds=[K.DATA_STEP, K.GLOBAL_STATEMENT]),
     Probe("G12", "DM command", "dm 'log; clear; output; clear;';\n",
-          kinds=[K.GLOBAL_STATEMENT], gap=GLOBALS),
+          kinds=[K.GLOBAL_STATEMENT]),
     Probe("G13", "%INCLUDE a path", "%include '/code/setup.sas';\n",
           kinds=[K.INCLUDE], includes={"/code/setup.sas"}),
     Probe("G14", "%INCLUDE fileref(member)", "filename m '/code';\n%include m(setup);\n",
           kinds=[K.GLOBAL_STATEMENT, K.INCLUDE]),
     Probe("G15", "SASFILE / LOCK", "sasfile lib.big load;\nlock lib.big;\n",
-          kinds=[K.GLOBAL_STATEMENT, K.GLOBAL_STATEMENT], gap=GLOBALS),
+          kinds=[K.GLOBAL_STATEMENT, K.GLOBAL_STATEMENT]),
     Probe("G16", "SAS/GRAPH GOPTIONS / AXIS / SYMBOL",
           "goptions reset=all;\naxis1 label=('x');\nsymbol1 v=dot;\n",
-          kinds=[K.GLOBAL_STATEMENT] * 3, gap=GLOBALS),
+          kinds=[K.GLOBAL_STATEMENT] * 3),
     Probe("G17", "MISSING / PAGE statements", "missing a b;\npage;\n",
-          kinds=[K.GLOBAL_STATEMENT, K.GLOBAL_STATEMENT], gap=GLOBALS),
+          kinds=[K.GLOBAL_STATEMENT, K.GLOBAL_STATEMENT]),
     Probe("G18", "standalone RUN / QUIT", "run;\nquit;\n",
           kinds=[K.STEP_BOUNDARY, K.STEP_BOUNDARY]),
     Probe("G19", "ODS GRAPHICS / ODS NORESULTS", "ods graphics on;\nods noresults;\n",
@@ -566,7 +561,7 @@ MACRO_PROBES = [
           kinds=[K.GLOBAL_STATEMENT, K.GLOBAL_STATEMENT]),
     Probe("M16", "%STR(;) in macro call arguments",
           "%macro m(sep); %put &sep; %mend;\n%m(sep=%str(;));\ndata a; set b; run;\n",
-          kinds=[K.MACRO_DEFINITION, K.MACRO_CALL, K.DATA_STEP], gap=LEXICAL),
+          kinds=[K.MACRO_DEFINITION, K.MACRO_CALL, K.DATA_STEP]),
     Probe("M17", "%NRSTR(%MEND) inside a macro body",
           "%macro m;\n  %put %nrstr(%mend);\n%mend;\ndata a; set b; run;\n",
           kinds=[K.MACRO_DEFINITION, K.DATA_STEP]),
@@ -620,7 +615,7 @@ ACCESS_PROBES = [
           else "engine not traced"),
     Probe("A06", "RSUBMIT / ENDRSUBMIT block",
           "signon dev;\nrsubmit;\n  data a; set b; run;\nendrsubmit;\nsignoff;\n",
-          has_in={"work.b"}, has_out={"work.a"}, gap=GLOBALS),
+          has_in={"work.b"}, has_out={"work.a"}),
 ]
 
 EMBEDDED_PROBES = [
@@ -636,7 +631,7 @@ EMBEDDED_PROBES = [
           kinds=[K.PROC_STEP], inputs={"lib.a"}, outputs={"work.out"}, gap=EMBEDDED),
     Probe("E04", "PROC PYTHON submit block",
           "proc python;\nsubmit;\ndata = load()\nrun = True\nendsubmit;\nrun;\n",
-          kinds=[K.PROC_STEP], gap=SUBMIT),
+          kinds=[K.PROC_STEP]),
     Probe("E05", "PROC FCMP function",
           "proc fcmp outlib=work.funcs.pkg;\n  function dbl(x);\n    return(x * 2);\n  endsub;\nrun;\n",
           kinds=[K.PROC_STEP]),
@@ -650,20 +645,20 @@ EMBEDDED_PROBES = [
 PRECISION_PROBES = [
     Probe("X01", "commented-out SET in a DATA step",
           "data a;\n  * was: set lib.old;\n  set lib.new;\nrun;\n",
-          inputs={"lib.new"}, outputs={"work.a"}, never_ref={"lib.old"}, gap=NOT_CODE),
+          inputs={"lib.new"}, outputs={"work.a"}, never_ref={"lib.old"}),
     Probe("X02", "commented-out OUT= in a PROC",
           "proc sort data=a out=b;\n  * out=c was the old target;\n  by id;\nrun;\n",
-          outputs={"work.b"}, never_ref={"work.c"}, gap=NOT_CODE),
+          outputs={"work.b"}, never_ref={"work.c"}),
     Probe("X03", "%* comment in a macro body",
           "%macro m;\n  %* old: data lib.tmp set lib.x;\n  data b; set c; run;\n%mend;\n",
-          body_in={"work.c"}, body_out={"work.b"}, gap=NOT_CODE),
+          body_in={"work.c"}, body_out={"work.b"}),
     Probe("X04", "statement comment in a macro body",
           "%macro m;\n  * data lib.old;\n  data b; set c; run;\n%mend;\n",
-          body_in={"work.c"}, body_out={"work.b"}, gap=NOT_CODE),
+          body_in={"work.c"}, body_out={"work.b"}),
     Probe("X05", "commented-out SQL in PROC SQL",
           "proc sql;\n  * create table old as select * from lib.legacy;\n"
           "  create table new as select * from lib.cur;\nquit;\n",
-          inputs={"lib.cur"}, outputs={"work.new"}, never_ref={"lib.legacy"}, gap=NOT_CODE),
+          inputs={"lib.cur"}, outputs={"work.new"}, never_ref={"lib.legacy"}),
     Probe("X06", "%PUT text in open code", "%put Loading data from staging;\n",
           never_ref={"from", "staging", "work.staging"}, gap=NOT_CODE),
     Probe("X07", "%PUT text in a macro body", "%macro m;\n  %put Reading from stage;\n%mend;\n",
@@ -681,10 +676,10 @@ PRECISION_PROBES = [
           inputs={"work.a"}, outputs=set(), gap=PROC_OPTIONS),
     Probe("X13", "datalines holding SAS-like text",
           "data x;\n  input line $40.;\ndatalines;\nset lib.z\ndata lib.y\n;\nrun;\n",
-          inputs=set(), outputs={"work.x"}, never_ref={"lib.z", "lib.y"}, gap=NOT_CODE),
+          inputs=set(), outputs={"work.x"}, never_ref={"lib.z", "lib.y"}),
     Probe("X14", "Python SUBMIT code that looks like SAS options",
           "proc python;\nsubmit;\nout = df.merge(x)\nendsubmit;\nrun;\n",
-          outputs=set(), never_ref={"df.merge"}, gap=NOT_CODE),
+          outputs=set(), never_ref={"df.merge"}),
     Probe("X15", "SQL inside a string literal", "data _null_;\n  put 'select * from lib.secret;';\nrun;\n",
           never_ref={"lib.secret"}),
 ]

@@ -18,6 +18,7 @@ from typing import Any, TypeVar
 from .keywords import (
     _MACRO_CALL_RE,
     _MACRO_INVOKE_RE,
+    _NUMBERED_GLOBAL_STATEMENTS,
     _SAS_CALL_ROUTINE_RE,
     _SAS_CALL_ROUTINES,
     _SAS_COMPONENT_OBJECT_RE,
@@ -132,15 +133,23 @@ def _nid(value: str) -> str:
 # against the start of its sanitised text.
 _MACRO_VAR_OP_RE = re.compile(r"%\s*(let|global|local|put)\b", re.IGNORECASE)
 
-# Leading statement keyword of a GLOBAL_STATEMENT chunk. ``title``/``footnote``
-# capture without their optional occurrence digit (title2 -> title). Built from
-# the published vocabulary so the tokens an instruction may scope on and the
-# tokens this can emit cannot drift apart. Longest-first so no token masks
-# another it prefixes.
+# Leading statement keyword of a GLOBAL_STATEMENT chunk. A numbered statement
+# captures without its occurrence number (title2 -> title, group 1); the rest
+# whole (group 2). Built from the published vocabulary so the tokens an
+# instruction may scope on and the tokens this can emit cannot drift apart.
+# Longest-first so no token masks another it prefixes.
 _GLOBAL_STMT_KW_RE = re.compile(
-    r"%?\s*("
-    + "|".join(sorted(SAS_GLOBAL_STATEMENT_TOKENS, key=len, reverse=True))
-    + r")\b",
+    r"%?\s*(?:("
+    + "|".join(sorted(_NUMBERED_GLOBAL_STATEMENTS, key=len, reverse=True))
+    + r")\d*|("
+    + "|".join(
+        sorted(
+            SAS_GLOBAL_STATEMENT_TOKENS - _NUMBERED_GLOBAL_STATEMENTS,
+            key=len,
+            reverse=True,
+        )
+    )
+    + r"))\b",
     re.IGNORECASE,
 )
 
@@ -538,7 +547,7 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
             var_op = op_m.group(1).lower()
         kw_m = _GLOBAL_STMT_KW_RE.match(mt.lstrip())
         if kw_m:
-            global_stmt_kw = kw_m.group(1).lower()
+            global_stmt_kw = (kw_m.group(1) or kw_m.group(2)).lower()
 
     # ── control-flow operation (only set for MACRO_CONTROL_FLOW chunks) ─────
     control_flow_op: str | None = None

@@ -660,6 +660,224 @@ class TestMacroCallsWithoutSemicolons(unittest.TestCase):
                 self.assertEqual(self._chunks(source).chunks[0].text, first)
 
 
+DATA, PROC, GLOBAL = (
+    SasChunkKind.DATA_STEP,
+    SasChunkKind.PROC_STEP,
+    SasChunkKind.GLOBAL_STATEMENT,
+)
+
+
+class TestStatementStructure(unittest.TestCase):
+    """What each statement is: comments, in-stream data and SUBMIT code are not
+    SAS; macro quoting hides semicolons; a run-group PROC ends at QUIT."""
+
+    def _chunks(self, source: str):
+        result = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(source)
+        self.assertEqual("".join(c.text for c in result.chunks), source)
+        return result
+
+    @staticmethod
+    def _kinds(result) -> list[SasChunkKind]:
+        return [c.kind for c in result.chunks]
+
+    # ── macro quoting ────────────────────────────────────────────────────────
+
+    def test_quoting_functions_hide_semicolons(self):
+        for statement in (
+            "%let sep = %str(;);\n",
+            "%let q = %str(%');\n",  # an escaped unmatched quote
+            "%let p = %nrstr(%();\n",  # an escaped unmatched parenthesis
+            "%let c = %quote(a;b) %nrquote(c;d) %bquote(e;f) %nrbquote(g;h);\n",
+            "%let n = %str(%nrstr(a;b) (c;d));\n",
+            "%let s = %str('a;b' /* c;d */);\n",
+        ):
+            with self.subTest(statement=statement):
+                result = self._chunks(statement + "data a; set b; run;\n")
+                self.assertEqual(self._kinds(result), [GLOBAL, DATA])
+                self.assertEqual(result.chunks[1].metadata.input_datasets, ["work.b"])
+                self.assertEqual(result.diagnostics, [])
+
+    def test_a_quoting_function_that_never_closes_quotes_nothing(self):
+        result = self._chunks("%put %str(a;\ndata x; set y; run;\n")
+        self.assertEqual(self._kinds(result), [GLOBAL, DATA])
+
+    def test_sanitise_blanks_quoted_semicolons_only_with_strings(self):
+        from chunker.scanner import _sanitise
+
+        text = "%let s = %str(a;b%') %nrstr(c;d);\nx = 'e;f';\n"
+        mt = _sanitise(text)
+        self.assertEqual(len(mt), len(text))
+        self.assertEqual(mt.count(";"), 2)  # the two statement terminators
+        self.assertIn("%str(a b% )", mt)
+        self.assertEqual(_sanitise(text, blank_strings=False), text)
+
+    def test_an_argument_that_never_closes_is_walked_once(self):
+        # The first walk pairs every parenthesis it passes (none close), so
+        # the quoting functions inside it are answered without another walk:
+        # the scan stays linear on source full of them.
+        from chunker.scanner import _macro_quote_end
+
+        text = "%put %str(;\n" * 50
+        known: dict[int, int] = {}
+        self.assertEqual(_macro_quote_end(text, text.index("(") + 1, known), -1)
+        self.assertEqual(sorted(known), [i for i, c in enumerate(text) if c == "("])
+        self.assertEqual(set(known.values()), {-1})
+
+    # ── comments ─────────────────────────────────────────────────────────────
+
+    def test_comments_are_not_read_as_code(self):
+        result = self._chunks(
+            "%* a macro comment: data lib.tmp;\n"
+            "data a;\n  * set lib.old;\n  %* set lib.older;\n  /* set lib.oldest; */\n"
+            "  set lib.new;\nrun;\n"
+        )
+        self.assertEqual(self._kinds(result), [SasChunkKind.COMMENT_BLOCK, DATA])
+        meta = result.chunks[1].metadata
+        self.assertEqual(meta.input_datasets, ["lib.new"])
+        named = {d for c in result.chunks for d in c.metadata.referenced_datasets}
+        self.assertFalse(named & {"lib.old", "lib.older", "lib.oldest", "lib.tmp"})
+
+    # ── in-stream data and SUBMIT code ───────────────────────────────────────
+
+    def test_datalines_are_data(self):
+        # A quote in the data opens no string, a keyword no step, and none of
+        # it names a dataset.
+        result = self._chunks(
+            "data names;\n  input name $;\ndatalines;\nO'Brien\nset lib.z\nproc\n;\nrun;\n"
+            "data copy; set names; run;\n"
+        )
+        self.assertEqual(self._kinds(result), [DATA, DATA])
+        self.assertEqual(result.chunks[0].metadata.input_datasets, [])
+        self.assertEqual(result.chunks[1].metadata.input_datasets, ["work.names"])
+        self.assertEqual(result.diagnostics, [])
+
+    def test_where_in_stream_data_ends(self):
+        for opener, data, rest in (
+            ("cards;", "1 2\n", ";\nrun;\n"),
+            # The first line holding a semicolon ends the data, and is SAS.
+            ("datalines;", "1 2\n", "run;\n"),
+            ("datalines4;", "a;b\nc;d;\n", ";;;;\nrun;\n"),
+            ("lines;", "x\n", ";\nrun;\n"),
+            ("parmcards4;", "x;\n", "  ;;;;\nrun;\n"),
+        ):
+            source = f"data x; input a $; {opener}\n{data}{rest}data y; set x; run;\n"
+            with self.subTest(opener=opener):
+                result = self._chunks(source)
+                self.assertEqual(self._kinds(result), [DATA, DATA])
+                self.assertTrue(result.chunks[0].text.endswith(f"{data}{rest}"))
+                self.assertEqual(result.diagnostics, [])
+
+    def test_a_call_before_datalines_is_cut_off(self):
+        result = self._chunks(
+            "data x; input a $;\n%header\ndatalines;\nO'Brien\n;\nrun;\ndata y; set x; run;\n"
+        )
+        self.assertEqual(self._kinds(result), [DATA, DATA])
+        self.assertEqual(result.chunks[0].metadata.invokes_macros, ["header"])
+
+    def test_submit_code_is_not_sas(self):
+        result = self._chunks(
+            "proc python;\nsubmit;\nout = df.merge(x)\nprint('it''s; fine')\n"
+            "data = load()\nendsubmit;\nrun;\ndata y; set z; run;\n"
+        )
+        self.assertEqual(self._kinds(result), [PROC, DATA])
+        meta = result.chunks[0].metadata
+        self.assertEqual((meta.input_datasets, meta.output_datasets), ([], []))
+        self.assertEqual(meta.referenced_datasets, [])
+        self.assertEqual(result.diagnostics, [])
+
+    def test_a_variable_named_like_a_statement_is_not_one(self):
+        result = self._chunks(
+            "data b; set a; data = 1; proc = 2; submit = 3; page + 1; run;\n"
+        )
+        self.assertEqual(self._kinds(result), [DATA])
+        self.assertEqual(result.diagnostics, [])
+
+    # ── step ends ────────────────────────────────────────────────────────────
+
+    def test_run_cancel_ends_a_step(self):
+        result = self._chunks("data a; set b; run cancel;\ndata c; set d; run;\n")
+        self.assertEqual(self._kinds(result), [DATA, DATA])
+        self.assertEqual(result.diagnostics, [])
+
+    def test_a_run_group_proc_ends_at_quit(self):
+        result = self._chunks(
+            "proc datasets lib=work nolist;\n  delete a;\nrun;\n  title 'x';\n"
+            "  delete b;\nrun;\nquit;\n"
+        )
+        self.assertEqual(self._kinds(result), [PROC])
+        self.assertEqual(result.diagnostics, [])
+
+    def test_a_run_group_proc_met_by_a_step_ended_at_its_last_run(self):
+        # No QUIT: the PROC ended at its last RUN, and what followed it is open
+        # code again — not part of the PROC, and not an unclosed step.
+        result = self._chunks(
+            "proc reg data=a;\n  model y = x;\nrun;\n  model y2 = x;\nrun;\n"
+            "%let n = 1;\ntitle 'next';\nproc print data=a; run;\n"
+        )
+        self.assertEqual(self._kinds(result), [PROC, GLOBAL, GLOBAL, PROC])
+        self.assertTrue(result.chunks[0].text.endswith("model y2 = x;\nrun;\n"))
+        self.assertEqual(result.diagnostics, [])
+        # The same at the end of the file.
+        result = self._chunks("proc glm data=a; model y = x; run;\n%let n = 1;\n")
+        self.assertEqual(self._kinds(result), [PROC, GLOBAL])
+        self.assertEqual(result.diagnostics, [])
+
+    def test_a_run_group_proc_without_run_is_unclosed(self):
+        result = self._chunks("proc sql;\n  create table b as select * from a;\ndata c; set b; run;\n")
+        self.assertEqual(self._kinds(result), [PROC, DATA])
+        self.assertEqual(
+            [d.code for d in result.diagnostics], ["UNCLOSED_DATA_OR_PROC_STEP"]
+        )
+
+    def test_proc_ds2_holds_its_own_data_programs(self):
+        result = self._chunks(
+            "proc ds2;\n  data out / overwrite=yes;\n    method run();\n      set in;\n"
+            "    end;\n  enddata;\nrun;\n  data more; method run(); set out; end; enddata;\n"
+            "run;\nquit;\ndata after; set out; run;\n"
+        )
+        self.assertEqual(self._kinds(result), [PROC, DATA])
+        self.assertEqual(result.chunks[0].metadata.proc_name, "ds2")
+
+    # ── statements the classifier knows ──────────────────────────────────────
+
+    def test_global_statements_and_their_keywords(self):
+        source = (
+            "endsas;\ndm 'log; clear;';\nsasfile lib.big load;\nlock lib.big;\n"
+            "missing a b;\npage;\nskip 2;\ncatname cat.all (a.x b.y);\nresetline;\n"
+            "cas mysess;\ncaslib _all_ assign;\ngoptions reset=all;\naxis1 label=('x');\n"
+            "symbol2 v=dot;\nlegend label=none;\npattern1 v=s;\ntitle2 'Report';\n"
+            "footnote3 'f';\nsignon dev;\nrsubmit;\nendrsubmit;\nrget;\nsignoff;\n"
+            "%symdel x;\n%syslput y = 1;\n%sysrput z = 2;\n%syscall set(dsid);\n"
+        )
+        result = self._chunks(source)
+        self.assertEqual(set(self._kinds(result)), {GLOBAL})
+        self.assertEqual(
+            [c.metadata.global_statement_keyword for c in result.chunks],
+            [
+                "endsas", "dm", "sasfile", "lock", "missing", "page", "skip",
+                "catname", "resetline", "cas", "caslib", "goptions", "axis",
+                "symbol", "legend", "pattern", "title", "footnote", "signon",
+                "rsubmit", "endrsubmit", "rget", "signoff", "symdel", "syslput",
+                "sysrput", "syscall",
+            ],
+        )
+        # Macro statements invoke no macro of their own name.
+        self.assertEqual([c for c in result.chunks if c.metadata.invokes_macros], [])
+        from chunker.keywords import SAS_GLOBAL_STATEMENT_TOKENS
+
+        emitted = {c.metadata.global_statement_keyword for c in result.chunks}
+        self.assertTrue(emitted <= SAS_GLOBAL_STATEMENT_TOKENS)
+
+    def test_inc_is_include(self):
+        result = self._chunks("%inc '/code/setup.sas';\n")
+        self.assertEqual(self._kinds(result), [SasChunkKind.INCLUDE])
+
+    def test_a_macro_language_word_is_not_a_call(self):
+        result = self._chunks("%sysfunc(dosubl(%nrstr(data a; run;)));\n%mend;\n")
+        self.assertNotIn(SasChunkKind.MACRO_CALL, self._kinds(result))
+        self.assertEqual([c.metadata.invokes_macros for c in result.chunks], [[]])
+
+
 class TestMergeMeta(unittest.TestCase):
     """Pin the introspective _merge_meta's per-type rules.
 
