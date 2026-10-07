@@ -675,8 +675,9 @@ class TestMacroCalls(unittest.TestCase):
         self.assertEqual(called, ["edw_export.a", "edw_export.b"])
 
     def test_calls_without_semicolons_are_each_a_call(self):
-        # The scanner splits statements at semicolons: these reach it as one chunk.
-        rows = _read(PULL + "%pull(tbl=a, out=x)\n%pull(tbl=b, schema=edw_hist, out=y)\n")
+        src = PULL + "%pull(tbl=a, out=x)\n%pull(tbl=b, schema=edw_hist, out=y)\n"
+        self.assertEqual(len(_of_kind(_chunk(src), SasChunkKind.MACRO_CALL)), 2)
+        rows = _read(src)
         called = sorted(str(t) for t, k in rows if k == SasChunkKind.MACRO_CALL)
         self.assertEqual(
             called,

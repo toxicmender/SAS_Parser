@@ -98,8 +98,8 @@ For running the work items end-to-end through an LLM, see the
 | `models.py` | Pydantic models: `SasChunk` (+`Kind`), `SasChunkMetadata`, `SasChunkResult`, `SasCorpus`, `SasBatch`, `SasBatchResult`, `SasDiagnostic` (+`Severity`), `SasPathRef` (+`PathLocation`), `SasEngineRef`, `SasDbTableRef` (+`DbTableAccess`, `DbTableVia`). |
 | `paths.py` | Where a physical path appears in SAS syntax — `PATH_STATEMENTS`, `classify_location`, `extract_paths`. The **single owner** of that grammar: `xref.pre` imports it to rewrite the same statements. |
 | `keywords.py` | SAS keyword catalogues transcribed from the SAS docs (reserved macro words, autocall macros, function / CALL-routine dictionaries, and `SAS_FUNCTION_CATEGORIES`) + the patterns compiled from them. Pure data; no package imports, no logging. |
-| `scanner.py` | Lexical layer: `_Unit` / `_Region` parse primitives, the statement classifier (`_classify`), text normalisation / sanitisation, line-offset helpers, and the `_Deadline` / `_ParseWatchdog` stuck-parser machinery. |
-| `macro_vars.py` | Macro-variable values and reference expansion: `let_values` (the `%LET` symbol table), `resolve_refs` (`&name` / `&name.` / `&&name&i`), and `DS_REF_TOKEN` — the single definition of a dataset token that may embed `&refs`. Pure; no package imports. |
+| `scanner.py` | Lexical layer: `_Unit` / `_Region` parse primitives, the statement classifier (`_classify`), where a macro call ends its statement (`_split_after_calls`), text normalisation / sanitisation, line-offset helpers, and the `_Deadline` / `_ParseWatchdog` stuck-parser machinery. |
+| `macro_vars.py` | Macro-variable values and reference expansion: `let_values` (the `%LET` symbol table), `resolve_refs` (`&name` / `&name.` / `&&name&i`), `call_spans` (where back-to-back macro calls begin and end), and `DS_REF_TOKEN` — the single definition of a dataset token that may embed `&refs`. Pure; no package imports. |
 | `passthrough.py` | SQL pass-through — `CONNECT TO` / `CONNECTION TO` / `EXECUTE … BY` / `DISCONNECT` and the native-SQL table scan: `scan_pass_through` (tables + the spans to mask), `mask`, `db_table_ref` (the one `SasDbTableRef` builder). The **single owner** of that grammar. |
 | `metadata.py` | Per-chunk semantic extraction: `_metadata_for`, `_io_for` (directed dataset I/O), `_macro_body_io` (literal vs parameterised body refs), symput / SQL-INTO / CALL EXECUTE extractors, `_merge_meta`, the extraction regex catalogue, and the whole-list resolution passes — `resolve_macro_var_refs`, `resolve_db_librefs`, composed in order by `resolve_references` (and across files by `resolve_corpus_references`). |
 | `chunker.py` | `SasSemanticChunker` orchestration (scan → group → build chunks, oversized-split with overlap). |
@@ -130,6 +130,16 @@ grammar-driven parser. It degrades gracefully on malformed source (emitting
 Replacing it with a full SAS grammar would be a rewrite, not a simplification —
 this is a considered decision, not an accident.
 
+- **Statement boundaries:** a statement ends at its semicolon — except a
+  macro call, which needs none: it ends at the parenthesis closing its
+  arguments, or at its name when it has none. The scanner cuts a unit there
+  when what follows opens a statement of its own (another call, any statement
+  `_classify` knows, a comment), so `%pull(tbl=a)` and `%pull(tbl=b)` on
+  consecutive lines are two calls, the `data x;` after them a step, and a call
+  just before `%MEND;` or `RUN;` no longer hides the terminator and leaves its
+  block open. `%vname(x) = 1;` — the call writes part of the statement — stays
+  whole, as do macro statements (`%mend m;`, `%symdel x;`), which run to their
+  semicolon. A call that ends the file is complete, not unterminated.
 - **Block collection rule:** only a new DATA / PROC / `%MACRO` header or an
   explicit `RUN;` / `QUIT;` / `%MEND` closes the current block. FORMAT, OPTIONS,
   LIBNAME, ODS, etc. inside a block body are collected, never treated as
@@ -323,9 +333,9 @@ defaults and the globals in force, and marked with the macro's name:
 ```
 
 Calls written back to back without semicolons (`%pull(tbl=a, out=x)` on one
-line, `%pull(tbl=b, out=y)` on the next) reach the resolver as one chunk, since
-the statement scanner splits at semicolons; each is still its own call, bound in
-order against the globals the one before it left.
+line, `%pull(tbl=b, out=y)` on the next) are calls of their own (see
+*Statement boundaries*), each bound in order against the globals the one before
+it left.
 
 `resolve_references` runs the macro pass, then this one — the one order —
 from `chunk_text` (per file) and `MultiFileBatcher` (corpus-wide).

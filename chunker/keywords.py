@@ -123,12 +123,16 @@ _ADDITIONAL_MACRO_FUNCTION_WORDS = frozenset(
     }
 )
 
+# Every word the macro language owns: the full exclusion set for macro-call
+# detection, as a set (the scanner) and as a regex alternation (below).
+_MACRO_LANGUAGE_WORDS = _RESERVED_WORDS | _ADDITIONAL_MACRO_FUNCTION_WORDS
+
 # Longest words first so the alternation doesn't short-circuit on a shorter
 # word that is a prefix of a longer one.
 _RESERVED_WORDS_PATTERN = "|".join(
     re.escape(w)
     for w in sorted(
-        _RESERVED_WORDS | _ADDITIONAL_MACRO_FUNCTION_WORDS,
+        _MACRO_LANGUAGE_WORDS,
         key=len,
         reverse=True,
     )

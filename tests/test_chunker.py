@@ -570,6 +570,96 @@ class TestSasSemanticChunker(unittest.TestCase):
         self.assertEqual(result.chunks[0].kind, SasChunkKind.DATA_STEP)
 
 
+class TestMacroCallsWithoutSemicolons(unittest.TestCase):
+    """A macro call needs no semicolon: it ends at the parenthesis closing its
+    arguments, or at its name, and what follows is a statement of its own."""
+
+    def _chunks(self, source: str):
+        result = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(source)
+        # The cuts move no text: the chunks still tile the source.
+        self.assertEqual("".join(c.text for c in result.chunks), source)
+        return result
+
+    @staticmethod
+    def _kinds(result) -> list[SasChunkKind]:
+        return [c.kind for c in result.chunks]
+
+    def test_back_to_back_calls_then_a_step(self):
+        result = self._chunks("%pull(tbl=a)\n%pull(tbl=b)\ndata x; set y; run;\n")
+        self.assertEqual(
+            self._kinds(result),
+            [SasChunkKind.MACRO_CALL, SasChunkKind.MACRO_CALL, SasChunkKind.DATA_STEP],
+        )
+        self.assertEqual(
+            [c.text for c in result.chunks[:2]], ["%pull(tbl=a)\n", "%pull(tbl=b)\n"]
+        )
+        step = result.chunks[2].metadata
+        self.assertEqual((step.output_datasets, step.input_datasets), (["work.x"], ["work.y"]))
+        self.assertEqual(result.diagnostics, [])
+
+    def test_a_call_without_arguments(self):
+        result = self._chunks("%setup\ndata x; set y; run;\n")
+        self.assertEqual(self._kinds(result), [SasChunkKind.MACRO_CALL, SasChunkKind.DATA_STEP])
+
+    def test_a_call_before_mend_closes_the_macro(self):
+        # The %mend hid behind the call: the macro swallowed the rest of the file.
+        result = self._chunks(
+            "%macro m;\n  data a; set b; run;\n  %inner(a)\n%mend;\ndata x; set y; run;\n"
+        )
+        self.assertEqual(
+            self._kinds(result), [SasChunkKind.MACRO_DEFINITION, SasChunkKind.DATA_STEP]
+        )
+        self.assertFalse(result.chunks[0].metadata.has_unclosed_block)
+        self.assertEqual(result.diagnostics, [])
+
+    def test_a_call_before_run_closes_the_step(self):
+        result = self._chunks("proc print data=x;\n%foot\nrun;\ndata z; set w; run;\n")
+        self.assertEqual(self._kinds(result), [SasChunkKind.PROC_STEP, SasChunkKind.DATA_STEP])
+        self.assertFalse(result.chunks[0].metadata.has_unclosed_block)
+        self.assertEqual(result.diagnostics, [])
+
+    def test_a_call_before_a_nested_macro(self):
+        # Behind the call the nested %macro went uncounted, so its %mend closed
+        # the outer macro early.
+        result = self._chunks(
+            "%macro outer;\n  %inner(a)\n  %macro nested; %put n; %mend;\n"
+            "%mend outer;\ndata after; set x; run;\n"
+        )
+        self.assertEqual(
+            self._kinds(result), [SasChunkKind.MACRO_DEFINITION, SasChunkKind.DATA_STEP]
+        )
+        self.assertTrue(result.chunks[0].text.endswith("%mend outer;\n"))
+
+    def test_calls_ending_the_file_are_complete(self):
+        with self.assertNoLogs("chunker.chunker", level="WARNING"):
+            result = self._chunks("%pull(tbl=a)\n%pull(tbl=b)")
+        self.assertEqual(self._kinds(result), [SasChunkKind.MACRO_CALL] * 2)
+        self.assertFalse(any(c.metadata.has_unclosed_block for c in result.chunks))
+
+    def test_comments_after_a_call_are_comments(self):
+        result = self._chunks("%load(x)\n\n/* step 2 */\n* note;\nproc means data=x; run;\n")
+        self.assertEqual(
+            self._kinds(result),
+            [
+                SasChunkKind.MACRO_CALL,
+                SasChunkKind.COMMENT_BLOCK,
+                SasChunkKind.COMMENT_BLOCK,
+                SasChunkKind.PROC_STEP,
+            ],
+        )
+
+    def test_what_stays_whole(self):
+        # A call writing part of its statement; a macro statement, which runs
+        # to its semicolon; an argument list that never closes.
+        for source, first in (
+            ("data a;\n  %vname(x) = 1;\nrun;\n", "data a;\n  %vname(x) = 1;\nrun;\n"),
+            ("%symdel x;\n", "%symdel x;\n"),
+            ("%pull(tbl=a\ndata x; set y; run;\n", "%pull(tbl=a\ndata x; "),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self._chunks(source).chunks[0].text, first)
+
+
 class TestMergeMeta(unittest.TestCase):
     """Pin the introspective _merge_meta's per-type rules.
 

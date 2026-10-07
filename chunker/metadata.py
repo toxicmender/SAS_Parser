@@ -1185,16 +1185,17 @@ class _MacroScope:
         """The calls a MACRO_CALL chunk makes of macros defined earlier, in
         source order, each with its positional and keyword arguments.
 
-        Usually one. Calls written without semicolons reach here as one chunk —
-        the statement scanner splits at semicolons — and each is a call of its
-        own; see :func:`~chunker.macro_vars.call_spans`.
+        One, as a rule: the scanner ends a statement after a call that needs
+        no semicolon (see :func:`~chunker.scanner._split_after_calls`). Every
+        call the text opens with is still read, so binding never depends on
+        where a chunk happens to end.
         """
         if chunk.kind is not SasChunkKind.MACRO_CALL:
             return []
         return [
-            (macro, *_parse_call_args(chunk.text[start:end]))
-            for name, start, end in call_spans(_sanitise(chunk.text))
-            if (macro := self._macros.get(name)) is not None
+            (macro, *_parse_call_args(chunk.text[span.start : span.end]))
+            for span in call_spans(_sanitise(chunk.text))
+            if (macro := self._macros.get(span.name)) is not None
         ]
 
     def leave(self, chunk: SasChunk, own: dict[str, str]) -> list[SasDbTableRef]:

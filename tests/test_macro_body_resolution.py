@@ -354,6 +354,26 @@ class TestParameterisedMacroBodyBatching(unittest.TestCase):
             self.assertEqual(len(b.chunks), 2)
             self.assertIn("load", b.required_macros)
 
+    def test_call_sites_without_semicolons_resolve_independently(self):
+        """The same calls written without semicolons, as SAS allows: each is
+        still its own call site, binding its own argument, and the PROCs after
+        them are steps of their own rather than text inside the first call."""
+        src = (
+            "%macro load(out); data &out.; x=1; run; %mend;\n"
+            "%load(work.first)\n"
+            "%load(work.second)\n"
+            "proc print data=work.first; run;\n"
+            "proc means data=work.second; run;\n"
+        )
+        br = SasChunkBatcher().batch(_C.chunk_text(src))
+        self.assertEqual(len(br.batches), 3)
+        pipeline_outputs = [set(b.output_datasets) for b in br.batches[1:]]
+        self.assertIn({"work.first"}, pipeline_outputs)
+        self.assertIn({"work.second"}, pipeline_outputs)
+        for b in br.batches[1:]:
+            self.assertEqual(len(b.chunks), 2)
+            self.assertIn("load", b.required_macros)
+
 
 # ---------------------------------------------------------------------------
 # 4b. Nested macro invocation — one macro's DEFINITION body invokes another

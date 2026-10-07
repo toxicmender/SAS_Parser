@@ -198,7 +198,7 @@ class TestCallSpans(unittest.TestCase):
     """Macro calls back to back, as one semicolon-split chunk holds them."""
 
     def _calls(self, text: str) -> list[str]:
-        return [text[start:end] for _, start, end in call_spans(_sanitise(text))]
+        return [text[span.start : span.end] for span in call_spans(_sanitise(text))]
 
     def test_calls_without_semicolons(self):
         self.assertEqual(
@@ -206,7 +206,7 @@ class TestCallSpans(unittest.TestCase):
             ["%pull(tbl=a)", "%Pull (tbl=b)", "%setup"],
         )
         self.assertEqual(
-            [name for name, _, _ in call_spans("%pull(tbl=a)\n%Pull (tbl=b)")],
+            [span.name for span in call_spans("%pull(tbl=a)\n%Pull (tbl=b)")],
             ["pull", "pull"],
         )
 
@@ -221,6 +221,8 @@ class TestCallSpans(unittest.TestCase):
 
     def test_an_unclosed_list_runs_to_the_end(self):
         self.assertEqual(self._calls("%a(x=1\n%b(2)"), ["%a(x=1\n%b(2)"])
+        self.assertEqual([span.closed for span in call_spans("%a(x=1\n%b(2)")], [False])
+        self.assertEqual([span.closed for span in call_spans("%a(1) %b")], [True, True])
 
     def test_text_that_opens_with_no_call(self):
         self.assertEqual(self._calls("data x; %a(1)"), [])

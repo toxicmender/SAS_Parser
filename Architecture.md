@@ -95,9 +95,10 @@ chunker/
                         CALL-routine dictionaries) + patterns compiled from
                         them. Pure data; no package imports, no logging.
   scanner.py            Lexical layer: _Unit/_Region parse primitives, the
-                        statement classifier (_classify), text normalisation
-                        and sanitisation, line-offset helpers, and the
-                        _Deadline/_ParseWatchdog stuck-parser machinery.
+                        statement classifier (_classify), where a macro call
+                        ends its statement (_split_after_calls), text
+                        normalisation and sanitisation, line-offset helpers,
+                        and the _Deadline/_ParseWatchdog stuck-parser machinery.
   macro_vars.py         Macro-variable values and the reference expansion that
                         resolves names: let_values (the %LET symbol table),
                         resolve_refs (&name / &name. / &&name&i, delimiter-dot
@@ -645,6 +646,11 @@ grammar-driven parser. It degrades gracefully on malformed source (emitting
 Replacing it with a full SAS grammar would be a rewrite, not a
 simplification — this is a considered decision, not an accident.
 
+- **Statement boundaries:** a statement ends at its semicolon, except a
+  macro call, which ends at the parenthesis closing its arguments (or at its
+  name): the scanner cuts there when what follows opens a statement of its
+  own, so back-to-back semicolon-less calls are separate units and a call
+  just before %MEND;/RUN; cannot hide the terminator.
 - **Block collection rule:** only a new DATA/PROC/%MACRO header or an
   explicit RUN;/QUIT;/%MEND closes the current block. FORMAT, OPTIONS,
   LIBNAME, ODS, etc. inside a block body are collected, never treated as

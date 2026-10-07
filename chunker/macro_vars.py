@@ -47,6 +47,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Mapping
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -280,38 +281,45 @@ _KW_ARG_RE = re.compile(r"([A-Za-z_]\w*)\s*=(.*)$", re.DOTALL)
 # One call in a run of them: %name, then its argument list when a "(" follows.
 # Semicolons between calls are empty statements.
 _CALL_RUN_RE = re.compile(r"[\s;]*(%\s*([A-Za-z_]\w*))\s*(\()?")
+_PAREN_RE = re.compile(r"[()]")
 
 
-def call_spans(mt: str) -> list[tuple[str, int, int]]:
-    """``(name, start, end)`` of each macro call *mt* opens with, back to back.
+class CallSpan(NamedTuple):
+    """One macro call found by :func:`call_spans`."""
 
-    A call needs no semicolon, so ``%pull(tbl=a)`` and ``%pull(tbl=b)`` on
-    consecutive lines are two calls even where a statement scanner, splitting
-    at semicolons, sees one statement. A call ends at the parenthesis closing
-    its argument list — or at its name, when no list follows — and the next
-    starts only where another ``%name`` follows; anything else ends the run.
+    name: str  # lowercased
+    start: int  # the "%"
+    end: int  # past its closing ")", or its name when no list follows
+    closed: bool  # False: the argument list runs to the end of the text
+
+
+def call_spans(mt: str) -> list[CallSpan]:
+    """Each macro call *mt* opens with, back to back.
+
+    A call needs no semicolon: it ends at the parenthesis closing its argument
+    list — or at its name, when no list follows — so ``%pull(tbl=a)`` and
+    ``%pull(tbl=b)`` on consecutive lines are two calls, and the next starts
+    only where another ``%name`` follows; anything else ends the run.
 
     *mt* must be sanitised text (comments and string interiors blanked), so a
-    parenthesis inside a quoted argument cannot end a call; a list left open
-    runs to the end. Names are lowercased; offsets index *mt*, which is
-    char-aligned with the text it was made from.
+    parenthesis inside a quoted argument cannot end a call. A list left open
+    runs to the end of the text and is not ``closed``. Offsets index *mt*,
+    which is char-aligned with the text it was made from. The parentheses are
+    found by regex, not character by character: the scanner runs this on every
+    statement that opens with a call.
     """
-    spans: list[tuple[str, int, int]] = []
+    spans: list[CallSpan] = []
     pos = 0
     while m := _CALL_RUN_RE.match(mt, pos):
-        end = m.end(1)
+        end, closed = m.end(1), True
         if m.group(3) is not None:
-            depth = 0
-            end = len(mt)
-            for i in range(m.start(3), len(mt)):
-                if mt[i] == "(":
-                    depth += 1
-                elif mt[i] == ")":
-                    depth -= 1
-                    if depth == 0:
-                        end = i + 1
-                        break
-        spans.append((m.group(2).lower(), m.start(1), end))
+            depth, end, closed = 0, len(mt), False
+            for paren in _PAREN_RE.finditer(mt, m.start(3)):
+                depth += 1 if paren.group() == "(" else -1
+                if depth == 0:
+                    end, closed = paren.end(), True
+                    break
+        spans.append(CallSpan(m.group(2).lower(), m.start(1), end, closed))
         pos = end
     return spans
 

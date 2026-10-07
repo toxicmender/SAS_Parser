@@ -1,5 +1,6 @@
 """Lexical layer of the SAS chunker: parse primitives, statement classifier,
-sanitiser, and the deadline/watchdog machinery. See chunker/README.md.
+sanitiser, where a macro call ends its statement, and the deadline/watchdog
+machinery. See chunker/README.md.
 
 Logger name: ``chunker.scanner``.
 """
@@ -14,6 +15,8 @@ from bisect import bisect_right
 from dataclasses import dataclass
 from functools import cached_property
 
+from .keywords import _MACRO_LANGUAGE_WORDS
+from .macro_vars import call_spans
 from .models import SasChunkKind, SasDiagnostic, SasDiagnosticSeverity
 
 logger = logging.getLogger(__name__)
@@ -377,3 +380,108 @@ def _sanitise(text: str, *, blank_strings: bool = True) -> str:
     if blank_strings:
         return _COMMENT_OR_STRING_RE.sub(_sanitise_repl, text)
     return _COMMENT_ONLY_RE.sub(lambda m: _blank_span(m.group(0)), text)
+
+
+# ---------------------------------------------------------------------------
+# Statement ends that are not semicolons
+# ---------------------------------------------------------------------------
+
+# A unit that opens with %name: the only kind a macro call can end early.
+_LEADING_MACRO_RE = re.compile(r"\s*%\s*([A-Za-z_]\w*)")
+
+
+def _opens_statement(mt: str) -> bool:
+    """Whether sanitised *mt* — what follows a macro call — begins a statement
+    of its own: one :func:`_classify` recognises, or a ``*`` comment."""
+    return _is_stmt_comment(mt) or _classify(mt) is not None
+
+
+def _call_and_comments(unit: _Unit, start: int, after: int, nxt: int) -> list[_Unit]:
+    """The call ``unit.text[start:after]``, then each block comment between it
+    and the next statement at *nxt* as a comment unit of its own — as the
+    scanner makes one when a comment follows a semicolon."""
+    text = unit.text
+    comments: list[_Unit] = []
+    at = after
+    while at < nxt and text.startswith("/*", at):
+        close = text.find("*/", at + 2)
+        if close == -1 or close + 2 > nxt:
+            break
+        end = _ws_end(text, close + 2)
+        comments.append(
+            _Unit(
+                start=unit.start + at,
+                end=unit.start + end,
+                text=text[at:end],
+                is_comment=True,
+            )
+        )
+        at = end
+    if at != nxt:
+        # Not only comments in between after all: the gap stays with the call.
+        after, comments = nxt, []
+    call = _Unit(start=unit.start + start, end=unit.start + after, text=text[start:after])
+    return [call, *comments]
+
+
+def _split_after_calls(unit: _Unit) -> list[_Unit]:
+    """*unit*, cut after each macro call that ends before its statement does.
+
+    A macro call needs no semicolon — it ends at the parenthesis closing its
+    arguments, or at its name when it has none — but statements are found by
+    their semicolons, so in::
+
+        %pull(tbl=a)
+        %pull(tbl=b)
+        data x; set y; run;
+
+    one unit held both calls and the DATA header, and ``set y;`` was left
+    unrecognised. Worse, a call just before ``%MEND;`` or ``RUN;`` hid the
+    terminator, leaving its block open to the end of the file.
+
+    A cut follows a call only when what comes next opens a statement of its
+    own: another call, a statement :func:`_classify` knows, or a ``*`` comment.
+    ``%vname(x) = 1;``, where the call writes part of the statement, stays
+    whole, as does a unit that opens with a macro-language word (``%mend m;``,
+    ``%symdel x;``, ``%let``): those statements run to their semicolon. So does
+    an argument list that never closes. Block comments between a call and the
+    next statement become comment units. A call that ends the unit is
+    complete, so a file ending in one is not unterminated.
+
+    The pieces are contiguous slices of *unit*: a block collects the same text
+    either way, and only where top-level regions begin and end changes.
+    """
+    m = _LEADING_MACRO_RE.match(unit.text)
+    if m is None or m.group(1).lower() in _MACRO_LANGUAGE_WORDS:
+        return [unit]
+    text = unit.text
+    mt = _sanitise(text)
+    spans = call_spans(mt)
+    pieces: list[_Unit] = []
+    cut = 0
+    complete = False
+    for i, span in enumerate(spans):
+        if span.name in _MACRO_LANGUAGE_WORDS or not span.closed:
+            break
+        nxt = _ws_end(mt, span.end)
+        if nxt == len(mt):
+            complete = True
+            break
+        another_call = i + 1 < len(spans) and spans[i + 1].start == nxt
+        if not another_call and not _opens_statement(mt[nxt:]):
+            break
+        pieces += _call_and_comments(unit, cut, _ws_end(text, span.end), nxt)
+        cut = nxt
+    if not pieces and not complete:
+        return [unit]
+    rest = text[cut:]
+    pieces.append(
+        _Unit(
+            start=unit.start + cut,
+            end=unit.end,
+            text=rest,
+            is_comment=_is_stmt_comment(rest),
+            terminated=unit.terminated or complete,
+        )
+    )
+    return pieces

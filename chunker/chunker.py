@@ -40,6 +40,7 @@ from .scanner import (
     _line_starts,
     _norm,
     _record_parser_timeout,
+    _split_after_calls,
     _ws_end,
 )
 
@@ -342,10 +343,12 @@ class SasSemanticChunker:
                 continue
 
             # ── statement terminator (the only remaining event kind: ";") ───
+            # A macro call needs no semicolon, so one unit may hold a call and
+            # the statements after it: _split_after_calls cuts them apart.
             end = _ws_end(source, index + 1)
             text = source[stmt_start:end]
             is_comment = _is_stmt_comment(text)
-            units.append(
+            pieces = _split_after_calls(
                 _Unit(
                     start=stmt_start,
                     end=end,
@@ -353,22 +356,23 @@ class SasSemanticChunker:
                     is_comment=is_comment,
                 )
             )
+            units.extend(pieces)
             if logger.isEnabledFor(logging.DEBUG):
                 text_preview = text[:60].replace("\n", "↵")
+                cut = f"  pieces={len(pieces)}" if len(pieces) > 1 else ""
                 logger.debug(
                     f"_scan_units: stmt  line={_line_for(stmt_start, line_starts)}  "
-                    f"comment={is_comment}  text={text_preview!r}"
+                    f"comment={is_comment}  text={text_preview!r}{cut}"
                 )
             stmt_start = None
             index = end
 
-        # trailing unterminated fragment
+        # trailing unterminated fragment — complete after all when it ends in
+        # a macro call, which needs no semicolon
         if stmt_start is not None and stmt_start < len(source):
             text = source[stmt_start:]
             if text.strip():
-                line = _line_for(stmt_start, line_starts)
-                logger.warning(f"_scan_units: unterminated statement at line {line}")
-                units.append(
+                pieces = _split_after_calls(
                     _Unit(
                         start=stmt_start,
                         end=len(source),
@@ -377,6 +381,10 @@ class SasSemanticChunker:
                         terminated=False,
                     )
                 )
+                if not pieces[-1].terminated:
+                    line = _line_for(pieces[-1].start, line_starts)
+                    logger.warning(f"_scan_units: unterminated statement at line {line}")
+                units.extend(pieces)
 
         non_empty = [u for u in units if u.text]
         logger.debug(
