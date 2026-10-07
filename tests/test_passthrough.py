@@ -611,6 +611,20 @@ class TestPlumbing(unittest.TestCase):
                 [("oracle", "s.t")],
             )
 
+    def test_the_databricks_mapping_renames_the_sas_copy(self):
+        # The SAS copy is a SAS dataset name like any other: renamed with the
+        # rest, or the prompt would list work.nonip beside dev.staging.nonip.
+        mapped = SasChunkBatcher(databricks_mapping={"work": "dev.staging"}).batch(
+            _chunk(EXAMPLE)
+        )
+        tables = [
+            t
+            for item in mapped.all_ordered_items
+            for c in getattr(item, "chunks", [item])
+            for t in c.metadata.db_tables
+        ]
+        self.assertEqual([t.sas_targets for t in tables], [("dev.staging.nonip",)])
+
     def test_batch_result_serialises(self):
         result = _chunk(LIBNAME + EXAMPLE + "data work.a; set edw.accounts; run;\n")
         dumped = json.loads(json.dumps(SasChunkBatcher().batch(result).model_dump()))

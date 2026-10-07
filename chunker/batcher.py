@@ -29,6 +29,7 @@ from .models import (
     SasChunkMetadata,
     SasChunkResult,
     SasCorpus,
+    _db_table_sort_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -565,12 +566,26 @@ def replace_dataset_names(
         return list(dict.fromkeys(_map_ds(ds, exact, by_libref) for ds in names))
 
     def _map_chunk(chunk: SasChunk) -> SasChunk:
-        meta_updates = {
+        meta_updates: dict[str, object] = {
             field: mapped
             for field in _DS_METADATA_FIELDS
             if (mapped := _map_list(getattr(chunk.metadata, field)))
             != getattr(chunk.metadata, field)
         }
+        # A database table's SAS copies are SAS dataset names too: renamed with
+        # the rest, so the batch context never lists `work.nonip` next to the
+        # Databricks name its "Datasets (out)" line now uses.
+        db_tables = sorted(
+            (
+                t.model_copy(update={"sas_targets": targets})
+                if (targets := tuple(_map_list(list(t.sas_targets)))) != t.sas_targets
+                else t
+                for t in chunk.metadata.db_tables
+            ),
+            key=_db_table_sort_key,
+        )
+        if db_tables != chunk.metadata.db_tables:
+            meta_updates["db_tables"] = db_tables
         updates: dict[str, object] = {}
         if meta_updates:
             updates["metadata"] = chunk.metadata.model_copy(update=meta_updates)

@@ -251,8 +251,7 @@ class _NativeTables:
             if word != "with":
                 continue
             j = i + 1
-            while j < self.n and self.words[j] is not None:
-                name = self.words[j]
+            while j < self.n and (name := self.words[j]) is not None:
                 j += 1
                 if j < self.n and self.toks[j] == "(":  # column list
                     j = self._after(j)

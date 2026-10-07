@@ -455,6 +455,10 @@ def _format_batch_message(
         required_macros=_fmt_list(batch.required_macros),
         defined_macros=_fmt_list(batch.defined_macros),
         required_librefs=_fmt_list(batch.required_librefs),
+        # Oracle (or other database) tables the batch reads or writes, in the
+        # database's own terms and linked to the SAS copy — the one place the
+        # model learns that `work.nonip` *is* `edw_export.current_nonip`.
+        db_tables=_fmt_list([str(t) for t in batch.db_tables]),
         standard_autocall_macros=_fmt_list(batch.standard_autocall_macros),
         required_macrovars=_fmt_list(batch.required_macrovars),
         produced_macrovars=_fmt_list(batch.produced_macrovars),
