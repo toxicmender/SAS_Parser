@@ -37,14 +37,20 @@ from .macro_vars import (
     resolve_refs,
 )
 from .models import (
+    DbTableAccess,
+    DbTableVia,
     SasChunk,
     SasChunkKind,
     SasChunkMetadata,
+    SasCorpus,
+    SasDbTableRef,
     SasEngineRef,
     SasPathRef,
+    _db_table_sort_key,
     _engine_ref_sort_key,
     _path_ref_sort_key,
 )
+from .passthrough import db_table_ref, mask, scan_pass_through
 from .paths import extract_engine_refs, extract_paths
 from .scanner import _blank_span, _sanitise
 
@@ -433,27 +439,48 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
     # with \b or a lookbehind (which the engine cannot literal-prefix skip).
     low = mt.lower()
     lowcf = cf.lower()
+    # ── SQL pass-through: database tables, and the native SQL to mask ───────
+    # Native SQL is the database's, not SAS's: every *dataset* scan below runs
+    # on mt_ds/cf_ds, where it is blanked, so `from connection to oracle` and
+    # `disconnect from oracle` stop reading as datasets and an Oracle owner
+    # stops reading as a SAS libref. Everything else keeps the full text —
+    # `&ora_user` in the CONNECT options is still a referenced macro variable.
+    # "connect" also gates CONNECTION TO; "execute" catches EXECUTE ... BY.
+    db_tables: list[SasDbTableRef] = []
+    mt_ds, cf_ds = mt, cf
+    if "connect" in lowcf or "execute" in lowcf:
+        scan = scan_pass_through(cf, mt)
+        if scan.spans:
+            mt_ds, cf_ds = mask(mt, scan.spans), mask(cf, scan.spans)
+        db_tables = [
+            t.model_copy(
+                update={"sas_targets": tuple(_canon_ds(s) for s in t.sas_targets)}
+            )
+            if t.sas_targets
+            else t
+            for t in scan.tables
+        ]
     # Dataset names collected from dataset positions only (DATA/SET/MERGE/UPDATE/
     # MODIFY keywords, DATA=/OUT=/OUTDATA= options, PROC SQL clauses) so table
     # aliases and BY-group temporaries aren't mistaken for datasets/librefs.
-    datasets = [_nid(m.group(1)) for m in _DATASET_RE.finditer(mt)]
-    datasets += [_nid(m.group(1)) for m in _DATA_OPT_RE.finditer(mt)]
+    datasets = [_nid(m.group(1)) for m in _DATASET_RE.finditer(mt_ds)]
+    datasets += [_nid(m.group(1)) for m in _DATA_OPT_RE.finditer(mt_ds)]
     if "create" in low:
-        datasets += [_nid(m.group(1)) for m in _SQL_CREATE_RE.finditer(mt)]
+        datasets += [_nid(m.group(1)) for m in _SQL_CREATE_RE.finditer(mt_ds)]
     if "from" in low:
-        datasets += [_nid(m.group(1)) for m in _SQL_FROM_RE.finditer(mt)]
+        datasets += [_nid(m.group(1)) for m in _SQL_FROM_RE.finditer(mt_ds)]
     if "join" in low:
-        datasets += [_nid(m.group(1)) for m in _SQL_JOIN_RE.finditer(mt)]
+        datasets += [_nid(m.group(1)) for m in _SQL_JOIN_RE.finditer(mt_ds)]
     if "insert" in low:
-        datasets += [_nid(m.group(1)) for m in _SQL_INTO_RE.finditer(mt)]
+        datasets += [_nid(m.group(1)) for m in _SQL_INTO_RE.finditer(mt_ds)]
     if "out" in low:
         datasets += [
-            _nid(m.group(1) or m.group(2)) for m in _PROC_OUT_RE.finditer(mt)
+            _nid(m.group(1) or m.group(2)) for m in _PROC_OUT_RE.finditer(mt_ds)
         ]
     # Directed I/O parses the full dataset lists (_DATASET_RE above captures only
     # the first of a multi-dataset statement), so its canonical names complete
     # referenced_datasets in their work.-qualified spelling.
-    inp, out, defs, invk = _io_for(text, kind, mt, cf)
+    inp, out, defs, invk = _io_for(text, kind, mt_ds, cf_ds, macro_mt=mt)
     dataset_set = set(datasets) | set(inp) | set(out)
     # Librefs this chunk assigns; ``_all_`` targets every assigned libref.
     defines_librefs = sorted(
@@ -528,7 +555,7 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
     param_names: list[str] = []
     if kind == SasChunkKind.MACRO_DEFINITION:
         body_lit_in, body_lit_out, body_par_in, body_par_out, param_names = (
-            _macro_body_io(text, mt, cf)
+            _macro_body_io(text, mt_ds, cf_ds)
         )
 
     # ── high-severity control-flow visibility (MACRO_DEFINITION bodies) ─────
@@ -679,17 +706,21 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
         symput_hazard_vars=sorted(set(hazard_vars)),
         external_refs=external_refs,
         engine_refs=engine_refs,
+        db_tables=db_tables,
     )
 
 
 # Fields where the parent's whole-region value wins over the child's (a fallback)
-# rather than being unioned. All derive from the %MACRO signature header, which
-# only the split slice containing it can parse.
+# rather than being unioned. Each needs context only the whole region holds: the
+# first three derive from the %MACRO signature header, which only the split
+# slice containing it can parse; ``db_tables`` from a CONNECT statement that may
+# sit in a different slice from the CONNECTION TO using its alias.
 _MERGE_PARENT_WINS = frozenset(
     {
         "body_param_inputs",
         "body_param_outputs",
         "macro_param_names",
+        "db_tables",
     }
 )
 
@@ -820,6 +851,44 @@ def _resolve_binds(refs: list[_BindsRefT], table: dict[str, str]) -> list[_Binds
     ]
 
 
+def _resolve_db_tables(
+    refs: list[SasDbTableRef], table: dict[str, str]
+) -> list[SasDbTableRef]:
+    """*refs* with macro references in their names and SAS copies resolved.
+
+    A pass-through name is re-parsed from ``raw`` — the text as written, which
+    never changes — so a corpus-level run with a larger table resolves what a
+    file-level run could not, and repeating a run changes nothing. LIBNAME
+    records are left alone: their ``raw`` is the SAS spelling (``edw.accounts``),
+    whose first part is a libref, not a schema, and :func:`resolve_db_librefs`
+    rebuilds them from already-resolved names anyway.
+    """
+    out: list[SasDbTableRef] = []
+    for ref in refs:
+        if ref.via is DbTableVia.LIBNAME or not (
+            has_macro_ref(ref.raw)
+            or has_macro_ref(ref.connection)
+            or any(map(has_macro_ref, ref.sas_targets))
+        ):
+            out.append(ref)
+            continue
+        out.append(
+            db_table_ref(
+                ref.raw,
+                name=resolve_refs(ref.raw, table),
+                access=ref.access,
+                via=ref.via,
+                connection=resolve_refs(ref.connection, table),
+                engine=ref.engine,
+                sas_targets=tuple(
+                    _resolve_names(list(ref.sas_targets), table, canonical=True)
+                ),
+                options=ref.options,
+            )
+        )
+    return sorted(dict.fromkeys(out), key=_db_table_sort_key)
+
+
 def _resolved_meta(
     meta: SasChunkMetadata, table: dict[str, str], own_values: dict[str, str]
 ) -> SasChunkMetadata | None:
@@ -838,6 +907,7 @@ def _resolved_meta(
     )
     updates["external_refs"] = _resolve_binds(meta.external_refs, table)
     updates["engine_refs"] = _resolve_binds(meta.engine_refs, table)
+    updates["db_tables"] = _resolve_db_tables(meta.db_tables, table)
 
     # A %LET whose value is written like a dataset reference names a library on
     # sight — ``%let table_demogr = datacia.member_demographic;`` is how a great
@@ -876,6 +946,54 @@ def _resolved_meta(
     return meta.model_copy(update=changed)
 
 
+class _MacroScope:
+    """The ``%LET`` table a source-order walk carries from chunk to chunk.
+
+    The one definition of the scoping rules every resolution pass applies, so
+    :func:`resolve_macro_var_refs` and :func:`resolve_db_librefs` cannot
+    disagree about what ``&name`` holds at a given chunk.
+    """
+
+    def __init__(self) -> None:
+        self._table: dict[str, str] = {}
+
+    def enter(self, chunk: SasChunk) -> tuple[dict[str, str], dict[str, str]]:
+        """``(scope, own)`` for *chunk*: the table its names resolve against,
+        and its own ``%LET`` values resolved where they stand.
+
+        A macro's own parameters are dropped from the scope — the call site
+        supplies them. ``%LET`` resolves its value where it stands, so each
+        assignment is expanded against the table as it was *before* it, then
+        stored resolved: after ``%let x = work.a; %let x = &x.b;`` the variable
+        holds work.ab, and a later ``data &x;`` writes work.ab — not a
+        reference to itself. Source order inside the chunk is dict insertion
+        order, so ``%let a = prod; %let b = &a..orders;`` resolves in one walk.
+        """
+        meta = chunk.metadata
+        shadowed = set(meta.macro_param_names)
+        scope = (
+            {k: v for k, v in self._table.items() if k not in shadowed}
+            if shadowed
+            else dict(self._table)
+        )
+        own: dict[str, str] = {}
+        for name, value in meta.macro_var_values.items():
+            own[name] = resolve_refs(value, scope) if has_macro_ref(value) else value
+            if name not in shadowed:
+                scope[name] = own[name]
+        return scope, own
+
+    def leave(self, chunk: SasChunk, own: dict[str, str]) -> None:
+        """Carry *chunk*'s assignments forward to the chunks after it.
+
+        A ``%MACRO`` body's assignments are conditional on the macro being
+        called, so they never join the running table.
+        """
+        if own and chunk.kind is not SasChunkKind.MACRO_DEFINITION:
+            shadowed = set(chunk.metadata.macro_param_names)
+            self._table.update({k: v for k, v in own.items() if k not in shadowed})
+
+
 def resolve_macro_var_refs(chunks: list[SasChunk]) -> None:
     """Give ``&name`` dataset and libref references their values, in place.
 
@@ -904,39 +1022,168 @@ def resolve_macro_var_refs(chunks: list[SasChunk]) -> None:
       references stay in ``body_param_inputs`` / ``body_param_outputs``, where
       the batcher resolves them per call.
     """
-    table: dict[str, str] = {}
+    macros = _MacroScope()
     for idx, chunk in enumerate(chunks):
-        meta = chunk.metadata
-        shadowed = set(meta.macro_param_names)
-        scope = (
-            {k: v for k, v in table.items() if k not in shadowed}
-            if shadowed
-            else dict(table)
-        )
-        # %LET resolves its value where it stands, so each assignment is
-        # expanded against the table as it was *before* it, then stored
-        # resolved: after ``%let x = work.a; %let x = &x.b;`` the variable holds
-        # work.ab, and a later ``data &x;`` writes work.ab — not a reference to
-        # itself. Source order inside the chunk is dict insertion order, so
-        # ``%let a = prod; %let b = &a..orders;`` resolves in one walk.
-        own: dict[str, str] = {}
-        for name, value in meta.macro_var_values.items():
-            own[name] = resolve_refs(value, scope) if has_macro_ref(value) else value
-            if name not in shadowed:
-                scope[name] = own[name]
-
+        scope, own = macros.enter(chunk)
         if scope or own:
-            resolved = _resolved_meta(meta, scope, own)
+            resolved = _resolved_meta(chunk.metadata, scope, own)
             if resolved is not None:
                 updates: dict[str, Any] = {"metadata": resolved}
-                if resolved.step_name != meta.step_name:
+                if resolved.step_name != chunk.metadata.step_name:
                     updates["title"] = _title(chunk.kind, resolved)
                 chunks[idx] = chunk.model_copy(update=updates)
+        macros.leave(chunk, own)
 
-        # A %MACRO body's assignments are conditional on the macro being
-        # called, so they never join the running table (see the docstring).
-        if own and chunk.kind is not SasChunkKind.MACRO_DEFINITION:
-            table.update({k: v for k, v in own.items() if k not in shadowed})
+
+def _libref_of(name: str) -> str | None:
+    """The libref of a two-level SAS name, or ``None`` (one-level, quoted path)."""
+    return name.split(".", 1)[0] if "." in name and not name.startswith("'") else None
+
+
+def _libname_tables(
+    meta: SasChunkMetadata, engines: dict[str, tuple[SasEngineRef, str | None]]
+) -> list[SasDbTableRef]:
+    """The database tables *meta*'s SAS names reach through engine librefs.
+
+    ``set edw.accounts;`` after ``libname edw oracle schema=fr_dm`` reads the
+    Oracle table ``fr_dm.accounts``; ``data edw.x;`` writes one. A read's SAS
+    copies are the chunk's outputs that are not themselves database tables — for
+    a DATA step, exactly what it makes from the read; for a multi-statement
+    ``PROC SQL``, possibly more than one statement's worth.
+    """
+    reads = dict.fromkeys([*meta.input_datasets, *meta.body_literal_inputs])
+    writes = dict.fromkeys([*meta.output_datasets, *meta.body_literal_outputs])
+    copies = tuple(
+        w
+        for w in writes
+        if _libref_of(w) not in engines and not (w.startswith("_") and w.endswith("_"))
+    )
+    found: list[SasDbTableRef] = []
+    for names, access in ((reads, DbTableAccess.READ), (writes, DbTableAccess.WRITE)):
+        for name in names:
+            libref = _libref_of(name)
+            if libref is None or libref not in engines:
+                continue
+            ref, db_schema = engines[libref]
+            found.append(
+                db_table_ref(
+                    name,
+                    name=name.split(".", 1)[1],
+                    default_schema=db_schema,
+                    access=access,
+                    via=DbTableVia.LIBNAME,
+                    connection=libref,
+                    engine=ref.engine,
+                    sas_targets=copies if access is DbTableAccess.READ else (),
+                    options=ref.options,
+                )
+            )
+    return found
+
+
+def _with_libref_engine(
+    ref: SasDbTableRef, engines: dict[str, tuple[SasEngineRef, str | None]]
+) -> SasDbTableRef:
+    """*ref* with the engine and options of the LIBNAME its connection names.
+
+    For ``CONNECT USING edw`` — which borrows the LIBNAME's connection, so the
+    pass-through scan could record neither. Only a record whose engine is still
+    unknown is filled; one a ``CONNECT TO`` named is never overridden.
+    """
+    if ref.engine is not None or ref.connection not in engines:
+        return ref
+    libname, _ = engines[ref.connection]
+    return ref.model_copy(update={"engine": libname.engine, "options": libname.options})
+
+
+def resolve_db_librefs(chunks: list[SasChunk]) -> None:
+    """Register the database tables SAS names reach through engine LIBNAMEs, in place.
+
+    Walks *chunks* in source order keeping the engine LIBNAMEs in force —
+    ``libname edw oracle path=EDWPRO schema=fr_dm`` binds ``edw`` to Oracle
+    schema ``fr_dm`` — and gives every later SAS name under such a libref a
+    :class:`~chunker.models.SasDbTableRef` (``via=LIBNAME``). The SAS name
+    itself stays where it is: SAS code does name ``edw.accounts``.
+
+    - Any other binding of the libref ends it: ``libname edw clear;``, or a path
+      LIBNAME reusing the name.
+    - An engine LIBNAME inside a ``%MACRO`` body *does* bind, unlike a ``%LET``:
+      connection macros are how production SAS hides its credentials, and a
+      libref names a connection, so binding it cannot give an unrelated name a
+      wrong value the way a stray ``%LET`` could.
+    - ``schema=`` is resolved against the ``%LET`` table where the LIBNAME
+      stands; the options themselves stay as written.
+    - ``CONNECT USING`` records get their engine and options here.
+
+    Replaces each chunk's ``via=LIBNAME`` records rather than adding to them, so
+    the per-file run in ``chunk_text`` and the corpus-level run in the batcher
+    compose: the second only adds what a LIBNAME in another file makes visible.
+    Runs after :func:`resolve_macro_var_refs` — see :func:`resolve_references`.
+    """
+    macros = _MacroScope()
+    engines: dict[str, tuple[SasEngineRef, str | None]] = {}
+    for idx, chunk in enumerate(chunks):
+        meta = chunk.metadata
+        scope, own = macros.enter(chunk)
+        for libref in meta.defines_librefs:
+            engines.pop(libref, None)
+        for engine_ref in meta.engine_refs:
+            db_schema = engine_ref.option_map.get("schema")
+            engines[engine_ref.binds] = (
+                engine_ref,
+                resolve_refs(db_schema, scope).lower() if db_schema else None,
+            )
+        tables = [
+            _with_libref_engine(t, engines)
+            for t in meta.db_tables
+            if t.via is not DbTableVia.LIBNAME
+        ]
+        tables = sorted(
+            dict.fromkeys([*tables, *_libname_tables(meta, engines)]),
+            key=_db_table_sort_key,
+        )
+        if tables != meta.db_tables:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"resolve_db_librefs: {chunk.chunk_id} db_tables={[str(t) for t in tables]}"
+                )
+            chunks[idx] = chunk.model_copy(
+                update={"metadata": meta.model_copy(update={"db_tables": tables})}
+            )
+        macros.leave(chunk, own)
+
+
+def resolve_references(chunks: list[SasChunk]) -> None:
+    """Every cross-chunk name resolution, in the one order that works, in place.
+
+    Macro variables first — a libref, a dataset and a pass-through table can all
+    be spelled through one — then database librefs, which read the resolved
+    names. :meth:`~chunker.chunker.SasSemanticChunker.chunk_text`,
+    :class:`~chunker.batcher.MultiFileBatcher` and
+    :func:`resolve_corpus_references` all call this, so the order lives here.
+    """
+    resolve_macro_var_refs(chunks)
+    resolve_db_librefs(chunks)
+
+
+def resolve_corpus_references(corpus: SasCorpus) -> SasCorpus:
+    """*corpus* with names resolved across its files, for callers that do not batch.
+
+    ``chunk_file`` resolves each file alone, so a ``%LET`` or a database
+    LIBNAME in ``setup.sas`` cannot reach a name in ``job.sas`` until something
+    walks the corpus. :class:`~chunker.batcher.MultiFileBatcher` does; a caller
+    that only wants metadata — the hydration planner, say — calls this. Chunk
+    ids are unchanged, and the input is not mutated.
+    """
+    flat = [c for r in corpus.file_results for c in r.chunks]
+    resolve_references(flat)
+    results = []
+    start = 0
+    for result in corpus.file_results:
+        end = start + len(result.chunks)
+        results.append(result.model_copy(update={"chunks": flat[start:end]}))
+        start = end
+    return SasCorpus(file_results=results)
 
 
 # ---------------------------------------------------------------------------
@@ -1370,6 +1617,7 @@ def _io_for(
     kind: SasChunkKind,
     mt: str | None = None,
     cf: str | None = None,
+    macro_mt: str | None = None,
 ) -> tuple[list[str], list[str], list[str], list[str]]:
     """
     Extract directed data-flow edges from a single chunk's source text.
@@ -1379,6 +1627,12 @@ def _io_for(
     for quoted physical-path dataset references, which live *inside* string
     delimiters); callers that already have them pass them in to avoid
     redundant sanitise passes.  When omitted they are computed here.
+
+    ``macro_mt`` is the text the macro-name scans read, when it differs from
+    ``mt``: :func:`_metadata_for` passes a *masked* ``mt`` (SQL pass-through
+    blanked) for the dataset scans, but a ``%macro`` call inside native SQL
+    still runs — SAS resolves it before sending the text — so the invocation
+    scan reads the unmasked form.  Defaults to ``mt``.
 
     All extracted names are canonicalised via :func:`_canon_ds`, so a
     one-level name and its ``work.``-qualified spelling land in the same
@@ -1392,15 +1646,19 @@ def _io_for(
         mt = _sanitise(text)
     if cf is None:
         cf = _sanitise(text, blank_strings=False)
+    if macro_mt is None:
+        macro_mt = mt
 
     inputs: list[str] = []
     outputs: list[str] = []
     defines: list[str] = []
     # Every chunk kind may invoke a macro inline, so this scan is unconditional.
-    invokes: list[str] = [m.group(1).lower() for m in _MACRO_INVOKE_RE.finditer(mt)]
+    invokes: list[str] = [
+        m.group(1).lower() for m in _MACRO_INVOKE_RE.finditer(macro_mt)
+    ]
 
     if kind == SasChunkKind.MACRO_DEFINITION:
-        for m in _MACRO_DEF_RE.finditer(mt):
+        for m in _MACRO_DEF_RE.finditer(macro_mt):
             defines.append(m.group(1).lower())
 
     elif kind == SasChunkKind.MACRO_CALL:

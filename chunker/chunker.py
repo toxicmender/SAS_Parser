@@ -16,7 +16,7 @@ from typing import TextIO
 
 import app_config
 
-from .metadata import _merge_meta, _metadata_for, _title, resolve_macro_var_refs
+from .metadata import _merge_meta, _metadata_for, _title, resolve_references
 from .models import (
     SasBatchResult,
     SasChunk,
@@ -210,13 +210,14 @@ class SasSemanticChunker:
                     )
                 )
 
-            # A %LET assigns a name the chunks *after* it use, so dataset and
-            # libref references spelled through macro variables can only be
-            # resolved once the whole file has been built. Runs inside the
-            # watchdog because it is still parse work; a partial result from a
-            # deadline exit is resolved as far as it got.
-            watchdog.set_phase("macro-variable resolution")
-            resolve_macro_var_refs(chunks)
+            # A %LET or a database LIBNAME gives meaning to names in the
+            # chunks *after* it, so references spelled through macro variables
+            # and SAS names under a database libref can only be resolved once
+            # the whole file has been built. Runs inside the watchdog because
+            # it is still parse work; a partial result from a deadline exit is
+            # resolved as far as it got.
+            watchdog.set_phase("reference resolution")
+            resolve_references(chunks)
             # After resolution, so `%let u = user; libname &u '/u/perm';`
             # raises the diagnostic too — the whole point of it is that
             # one-level names stop resolving to WORK, and that is just as true

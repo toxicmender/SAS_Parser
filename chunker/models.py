@@ -207,6 +207,146 @@ def _engine_ref_sort_key(ref: SasEngineRef) -> tuple[str, str]:
     return (ref.engine, ref.binds)
 
 
+class DbTableAccess(StrEnum):
+    """Which way a :class:`SasDbTableRef`'s rows move, seen from the database."""
+
+    READ = "read"
+    WRITE = "write"
+
+
+class DbTableVia(StrEnum):
+    """How the SAS reached a :class:`SasDbTableRef`.
+
+    ``CONNECTION_TO`` and ``EXECUTE`` are explicit SQL pass-through — native SQL
+    SAS hands to the database untouched, recognised by
+    :mod:`chunker.passthrough`. ``LIBNAME`` is a SAS two-level name whose libref
+    a database-engine LIBNAME bound (``set edw.accounts;`` after
+    ``libname edw oracle ...``), recognised by
+    :func:`chunker.metadata.resolve_db_librefs`.
+    """
+
+    CONNECTION_TO = "connection_to"
+    EXECUTE = "execute"
+    LIBNAME = "libname"
+
+
+class SasDbTableRef(BaseModel, frozen=True):
+    """A table inside a database that a chunk reads or writes, in the database's terms.
+
+    The third sibling of :class:`SasPathRef` and :class:`SasEngineRef`.
+    :class:`SasEngineRef` records that a job *connects* to Oracle; this records
+    *which tables* it touches there — ``edw_export.current_nonip`` — which is
+    what a migration has to hydrate, and which no SAS dataset name says::
+
+        create table nonip as select * from connection to oracle
+        (select cov_month from edw_export.current_nonip);
+
+    The SAS copy that read lands in (``work.nonip``) stays registered as an
+    ordinary SAS dataset in ``output_datasets``; :attr:`sas_targets` is the link
+    between the two. Frozen so it is hashable, for the same reason the siblings
+    are.
+
+    Attributes
+    ----------
+    engine
+        The SAS/ACCESS engine, lowercased: ``oracle``, ``teradata``, ... ``None``
+        when the connection cannot be traced — a ``CONNECTION TO edw`` whose
+        ``CONNECT`` was made by a macro call, under an alias that names no engine.
+    connection
+        The name the SAS used for the connection: the pass-through alias
+        (``CONNECT TO oracle AS edw`` → ``edw``; the engine itself when there was
+        no ``AS``), or the libref for :attr:`DbTableVia.LIBNAME` and
+        ``CONNECT USING``.
+    db_schema
+        The schema (Oracle owner) the table lives in, lowercased. ``None`` when
+        the reference is unqualified: the database then resolves it against the
+        connecting account's default schema, which static analysis cannot know.
+        Named ``db_schema`` because ``schema`` shadows a pydantic attribute.
+    table
+        The table name, lowercased, quotes stripped.
+    access
+        Read or write, from the database's side. A pass-through ``SELECT`` reads;
+        ``EXECUTE (create table ...)`` writes; ``data edw.x;`` writes.
+    via
+        See :class:`DbTableVia`.
+    sas_targets
+        The SAS datasets a read is copied into — ``create table nonip as select
+        * from connection to oracle (...)`` → ``("work.nonip",)``. Canonical SAS
+        names, as in ``output_datasets``. Empty for writes, and for a read whose
+        rows only print or feed ``INTO :macro_var``.
+    dblink
+        An Oracle ``@link`` suffix, lowercased: the table lives in the *linked*
+        database, not the one the connection reaches.
+    options
+        The connection's ``key=value`` options exactly as written — the
+        ``CONNECT TO`` arguments, or the LIBNAME's — so a consumer has the whole
+        connection on the one record rather than joining by alias (two
+        ``PROC SQL`` blocks may reuse one alias with different ``path=``).
+        Macro references stay unresolved, as on :class:`SasEngineRef`.
+    has_macro_ref
+        The table's *name* still holds an unresolved ``&`` reference, so
+        :attr:`db_schema` / :attr:`table` are not the names SAS would send.
+    raw
+        The reference exactly as written: ``"EDW"."T"``, ``&schema..current_nonip``,
+        or the SAS name ``edw.accounts`` for :attr:`DbTableVia.LIBNAME`.
+    """
+
+    engine: str | None = None
+    connection: str
+    db_schema: str | None = None
+    table: str
+    access: DbTableAccess
+    via: DbTableVia
+    sas_targets: tuple[str, ...] = ()
+    dblink: str | None = None
+    options: tuple[tuple[str, str], ...] = ()
+    has_macro_ref: bool = False
+    raw: str = ""
+
+    @property
+    def qualified(self) -> str:
+        """``db_schema.table``, or just ``table`` when unqualified."""
+        return f"{self.db_schema}.{self.table}" if self.db_schema else self.table
+
+    @property
+    def option_map(self) -> dict[str, str]:
+        """:attr:`options` as a mapping. Later duplicates win, as SAS does."""
+        return dict(self.options)
+
+    def __str__(self) -> str:
+        # Options are deliberately left out: this string reaches the LLM prompt,
+        # and connection options are where credentials live.
+        link = f"@{self.dblink}" if self.dblink else ""
+        copies = f" → {', '.join(self.sas_targets)}" if self.sas_targets else ""
+        return (
+            f"{self.engine or self.connection}:{self.qualified}{link}{copies} "
+            f"({self.access} via {self.via} {self.connection})"
+        )
+
+
+def _db_table_sort_key(
+    ref: SasDbTableRef,
+) -> tuple[str, str, str, str, str, str, str, tuple[str, ...], tuple[tuple[str, str], ...], str]:
+    """Total order over :class:`SasDbTableRef`, defined once.
+
+    Same reason as :func:`_path_ref_sort_key`: these records are deduplicated
+    through sets, and batch output is pinned by tests (invariant 9). Every field
+    that can tell two records apart takes part, so the order is total.
+    """
+    return (
+        ref.engine or "",
+        ref.db_schema or "",
+        ref.table,
+        ref.dblink or "",
+        str(ref.access),
+        str(ref.via),
+        ref.connection,
+        ref.sas_targets,
+        ref.options,
+        ref.raw,
+    )
+
+
 class SasDiagnostic(BaseModel):
     """A recoverable parsing or classification issue."""
 
@@ -320,6 +460,14 @@ class SasChunkMetadata(BaseModel):
     # this file", these answer "what system is this, and how did the job log in
     # to it", and the two have no field in common beyond the libref.
     engine_refs: list[SasEngineRef] = Field(default_factory=list)
+
+    # Tables inside a database the chunk reads or writes — see
+    # :class:`SasDbTableRef`. Separate from the SAS dataset lists above because
+    # it is a different namespace: ``edw_export.current_nonip`` is an Oracle
+    # owner and table, not a SAS libref and member, and filing it with them is
+    # how an Oracle schema used to be reported as a missing LIBNAME. Sorted by
+    # ``_db_table_sort_key``.
+    db_tables: list[SasDbTableRef] = Field(default_factory=list)
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -641,6 +789,17 @@ class SasBatch(BaseModel):
         return sorted(
             {r for c in self.chunks for r in c.metadata.engine_refs},
             key=_engine_ref_sort_key,
+        )
+
+    @property
+    def db_tables(self) -> list[SasDbTableRef]:
+        """Every database table the batch's chunks read or write.
+
+        Deduplicated and ordered on the same grounds as :attr:`external_refs`.
+        """
+        return sorted(
+            {r for c in self.chunks for r in c.metadata.db_tables},
+            key=_db_table_sort_key,
         )
 
     @property

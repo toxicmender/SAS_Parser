@@ -20,7 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .keywords import _STANDARD_AUTOCALL_MACROS
-from .metadata import _canon_ds, resolve_macro_var_refs
+from .metadata import _canon_ds, resolve_references
 from .models import (
     SasBatch,
     SasBatchResult,
@@ -2033,11 +2033,11 @@ class MultiFileBatcher:
             f"MultiFileBatcher.batch: flat index  total={n}  file_offsets={file_offsets}"
         )
 
-        # ── macro-variable name resolution (corpus-wide %LET table) ─────────
-        # Each file already resolved its own %LETs when it was chunked; this
-        # run is what lets a %LET in one file give a name to a dataset another
-        # file reads, and it is a no-op for names already resolved.
-        resolve_macro_var_refs(flat_chunks)
+        # ── reference resolution (corpus-wide %LET and LIBNAME tables) ──────
+        # Each file already resolved its own when it was chunked; this run is
+        # what lets a %LET or a database LIBNAME in one file give meaning to a
+        # name another file uses, and it is a no-op for names already resolved.
+        resolve_references(flat_chunks)
 
         # ── implicit dataset resolution (_LAST_ / _DATA_ / no DATA=) ────────
         _resolve_implicit_datasets(flat_chunks)
