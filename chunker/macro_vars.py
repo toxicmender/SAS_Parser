@@ -277,6 +277,45 @@ _CALL_OPEN_RE = re.compile(r"%\s*[A-Za-z_]\w*\s*\(")
 # positional value like f(x=1) is not mistaken for keyword 'f(x'.
 _KW_ARG_RE = re.compile(r"([A-Za-z_]\w*)\s*=(.*)$", re.DOTALL)
 
+# One call in a run of them: %name, then its argument list when a "(" follows.
+# Semicolons between calls are empty statements.
+_CALL_RUN_RE = re.compile(r"[\s;]*(%\s*([A-Za-z_]\w*))\s*(\()?")
+
+
+def call_spans(mt: str) -> list[tuple[str, int, int]]:
+    """``(name, start, end)`` of each macro call *mt* opens with, back to back.
+
+    A call needs no semicolon, so ``%pull(tbl=a)`` and ``%pull(tbl=b)`` on
+    consecutive lines are two calls even where a statement scanner, splitting
+    at semicolons, sees one statement. A call ends at the parenthesis closing
+    its argument list — or at its name, when no list follows — and the next
+    starts only where another ``%name`` follows; anything else ends the run.
+
+    *mt* must be sanitised text (comments and string interiors blanked), so a
+    parenthesis inside a quoted argument cannot end a call; a list left open
+    runs to the end. Names are lowercased; offsets index *mt*, which is
+    char-aligned with the text it was made from.
+    """
+    spans: list[tuple[str, int, int]] = []
+    pos = 0
+    while m := _CALL_RUN_RE.match(mt, pos):
+        end = m.end(1)
+        if m.group(3) is not None:
+            depth = 0
+            end = len(mt)
+            for i in range(m.start(3), len(mt)):
+                if mt[i] == "(":
+                    depth += 1
+                elif mt[i] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+        spans.append((m.group(2).lower(), m.start(1), end))
+        pos = end
+    return spans
+
+
 def _extract_call_arg_text(call_text: str) -> str | None:
     """Return the text between the call's balanced outer parens, or None.
 

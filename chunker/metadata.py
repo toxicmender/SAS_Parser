@@ -35,6 +35,7 @@ from .macro_vars import (
     DS_REF_TOKEN,
     DS_REF_TOKEN_POSSESSIVE,
     _parse_call_args,
+    call_spans,
     has_macro_ref,
     is_dataset_shaped,
     let_assignments,
@@ -989,8 +990,6 @@ def _resolved_meta(
 _MACRO_CONTROL_RE = re.compile(r"%\s*(?:if|do|goto)\b", re.IGNORECASE)
 # %GLOBAL / %LOCAL declaration lists, told apart (unlike _GLOBAL_LOCAL_DECL_RE).
 _SCOPE_DECL_RE = re.compile(r"%\s*(global|local)\s+([^;]+?)\s*;", re.IGNORECASE)
-# The macro a MACRO_CALL chunk calls: the name its text opens with.
-_CALLED_MACRO_RE = re.compile(r"\s*%\s*([A-Za-z_]\w*)")
 
 
 def _assign(table: dict[str, str], name: str, value: str) -> None:
@@ -1126,7 +1125,7 @@ class _MacroScope:
     in open code; ``CALL SYMPUT``/``SYMPUTX`` with static values (and the
     run-time producers that make a variable unknown); and the globals a called
     ``%MACRO`` sets. The macros defined so far are kept too, for
-    :meth:`call` to bind a call's arguments.
+    :meth:`_calls` to bind a call's arguments.
     """
 
     def __init__(self) -> None:
@@ -1180,27 +1179,37 @@ class _MacroScope:
                 bound[name] = value
         return ChainMap(bound, dict.fromkeys(macro.params, ""), self._table)
 
-    def call(self, chunk: SasChunk) -> tuple[_MacroDef, ChainMap[str, str]] | None:
-        """For a MACRO_CALL of a macro defined earlier: the definition, and the
-        table its body resolves against at this call. ``None`` otherwise."""
-        if chunk.kind is not SasChunkKind.MACRO_CALL:
-            return None
-        m = _CALLED_MACRO_RE.match(_sanitise(chunk.text))
-        macro = self._macros.get(m.group(1).lower()) if m else None
-        if macro is None:
-            return None
-        positional, keyword = _parse_call_args(chunk.text)
-        return macro, self._binding(macro, positional, keyword)
+    def _calls(
+        self, chunk: SasChunk
+    ) -> list[tuple[_MacroDef, list[str], dict[str, str]]]:
+        """The calls a MACRO_CALL chunk makes of macros defined earlier, in
+        source order, each with its positional and keyword arguments.
 
-    def leave(self, chunk: SasChunk, own: dict[str, str]) -> None:
-        """Carry what *chunk* leaves behind to the chunks after it.
+        Usually one. Calls written without semicolons reach here as one chunk —
+        the statement scanner splits at semicolons — and each is a call of its
+        own; see :func:`~chunker.macro_vars.call_spans`.
+        """
+        if chunk.kind is not SasChunkKind.MACRO_CALL:
+            return []
+        return [
+            (macro, *_parse_call_args(chunk.text[start:end]))
+            for name, start, end in call_spans(_sanitise(chunk.text))
+            if (macro := self._macros.get(name)) is not None
+        ]
+
+    def leave(self, chunk: SasChunk, own: dict[str, str]) -> list[SasDbTableRef]:
+        """Carry what *chunk* leaves behind to the chunks after it, and return
+        the database tables its macro calls read.
 
         Defining a ``%MACRO`` runs nothing: its assignments wait for a call, and
-        the definition is kept for :meth:`call`. Anything else applies, in
-        order, its own ``%LET`` values, what its run-time producers leave (see
-        :func:`_run_time_values`), and the global effects of the macros it
-        calls — with the call's arguments for a MACRO_CALL, the defaults alone
-        for a call inlined in another statement.
+        the definition is kept for :meth:`_calls`. A MACRO_CALL runs its calls
+        first, in order: each binds its own arguments against the globals the
+        calls before it left, reads its body's tables (see
+        :func:`_call_site_tables`) and leaves its global effects. Then, as for
+        any other chunk: its own ``%LET`` values, what its run-time producers
+        leave (see :func:`_run_time_values`), and — for a chunk that called
+        nothing — the global effects of the macros it invokes inline, with
+        their defaults alone.
         """
         meta = chunk.metadata
         if chunk.kind is SasChunkKind.MACRO_DEFINITION:
@@ -1208,24 +1217,25 @@ class _MacroScope:
             # would register a body cut in half under the same name.
             if chunk.parent_id is None and meta.macro_name:
                 self._macros[meta.macro_name] = _MacroDef.of(chunk)
-            return
+            return []
+        tables: list[SasDbTableRef] = []
+        calls = self._calls(chunk)
+        for macro, positional, keyword in calls:
+            binding = self._binding(macro, positional, keyword)
+            tables += _call_site_tables(macro, binding)
+            for name, value in macro.global_effects(self._table, binding).items():
+                _assign(self._table, name, value)
         for name, value in own.items():
             _assign(self._table, name, value)
         for name, value in _run_time_values(chunk).items():
             _assign(self._table, name, value)
-        call = self.call(chunk)
-        invoked = (
-            [call]
-            if call
-            else [
-                (macro, self._binding(macro, [], {}))
-                for name in meta.invokes_macros
-                if (macro := self._macros.get(name)) is not None
-            ]
-        )
-        for macro, binding in invoked:
-            for name, value in macro.global_effects(self._table, binding).items():
-                _assign(self._table, name, value)
+        if not calls:
+            for name in meta.invokes_macros:
+                if (macro := self._macros.get(name)) is not None:
+                    binding = self._binding(macro, [], {})
+                    for var, value in macro.global_effects(self._table, binding).items():
+                        _assign(self._table, var, value)
+        return tables
 
 
 def _call_site_tables(
@@ -1287,23 +1297,21 @@ def resolve_macro_var_refs(chunks: list[SasChunk]) -> None:
             updates["metadata"] = resolved
             if resolved.step_name != meta.step_name:
                 updates["title"] = _title(chunk.kind, resolved)
-        # A call of a macro defined earlier reads the tables its body names,
-        # resolved with this call's arguments. Recomputed on every run (not
+        if updates:
+            chunks[idx] = chunk = chunk.model_copy(update=updates)
+        # Each call of a macro defined earlier reads the tables its body names,
+        # resolved with that call's arguments. Recomputed on every run (not
         # added to), so the corpus-level run replaces the file-level answer.
-        current = resolved or meta
-        call = macros.call(chunk)
+        called = macros.leave(chunk, own)
+        current = chunk.metadata
         tables = sorted(
-            {
-                *(t for t in current.db_tables if t.macro is None),
-                *(_call_site_tables(*call) if call else ()),
-            },
+            {*(t for t in current.db_tables if t.macro is None), *called},
             key=_db_table_sort_key,
         )
         if tables != current.db_tables:
-            updates["metadata"] = current.model_copy(update={"db_tables": tables})
-        if updates:
-            chunks[idx] = chunk = chunk.model_copy(update=updates)
-        macros.leave(chunk, own)
+            chunks[idx] = chunk.model_copy(
+                update={"metadata": current.model_copy(update={"db_tables": tables})}
+            )
 
 
 def _libref_of(name: str) -> str | None:

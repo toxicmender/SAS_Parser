@@ -165,6 +165,9 @@ _CREATE_MODIFIERS = frozenset(
 # reference *with* its delimiter dot, a "quoted" identifier, a run of other
 # name characters, or a separator dot.
 _NAME_PIECE_RE = re.compile(r'&+[A-Za-z_]\w*\.?|"[^"\n]*"|[^."&]+|\.|&')
+# A part ending in a macro reference with no delimiter after it: "&sch" once
+# its quotes are stripped, or a LIBNAME's schema=&sch.
+_ENDS_IN_REF_RE = re.compile(r"&+[A-Za-z_]\w*\Z")
 
 
 def _name_parts(body: str) -> list[str]:
@@ -174,18 +177,31 @@ def _name_parts(body: str) -> list[str]:
     — so it separates nothing: ``t_&sfx._v`` is one table, ``t_<sfx>_v``; in
     ``&sch..t`` the first dot ends ``&sch`` and only the second separates.
     Splitting on every dot made an unresolved ``edw_export.t_&sfx._v`` read as
-    schema ``edw_export.t_&sfx``, table ``_v``. A delimiter ending a part is
-    dropped (``&sch.`` and ``&sch`` name one variable); one inside a part is
-    kept, since removing it would change which variable is meant.
+    schema ``edw_export.t_&sfx``, table ``_v``. A delimiter stays with its part,
+    and so does each further dot after it — an indirect ``&&sch_&env...t`` needs
+    one per rescan — so the parts join back with single dots into the name as
+    written. A dot run anywhere else (SQL Server's ``db..t``) is one separator.
     """
     parts = [""]
     for m in _NAME_PIECE_RE.finditer(body):
         piece = m.group(0)
-        if piece == ".":
-            parts.append("")
-        else:
+        if piece != ".":
             parts[-1] += piece
-    return [p[:-1] if p.endswith(".") else p for p in parts if p]
+        elif not parts[-1] and len(parts) > 1 and parts[-2].endswith("."):
+            parts[-2] += "."
+        else:
+            parts.append("")
+    return [p for p in parts if p]
+
+
+def _delimited(part: str) -> str:
+    """*part*, ready for a separator dot to follow it.
+
+    One ending in a bare macro reference gets the delimiter SAS consumes first,
+    or the joined name would say something else: ``&sch.t`` is *one* name, the
+    value of ``sch`` followed by ``t``; ``&sch..t`` is schema and table.
+    """
+    return f"{part}." if _ENDS_IN_REF_RE.search(part) else part
 
 
 def split_table_name(name: str) -> tuple[str | None, str, str | None]:
@@ -194,13 +210,18 @@ def split_table_name(name: str) -> tuple[str | None, str, str | None]:
     Lowercased, quotes stripped. Everything before the last part is the schema,
     so SQL Server's ``db.dbo.t`` keeps its database as ``db.dbo`` rather than
     losing it. Macro references split as SAS would read them — see
-    :func:`_name_parts`.
+    :func:`_name_parts`. A schema that ends in an unresolved reference keeps its
+    delimiter (``&sch..t`` → ``&sch.``), so schema and table join back into what
+    SAS would read, ``&sch..t``; the table's own trailing delimiter is dropped,
+    since ``&tbl.`` and ``&tbl`` name one variable.
     """
     body, _, link = name.partition("@")
     parts = [p.strip('"').lower() for p in _name_parts(body)]
     if not parts:
         return None, body.strip().lower(), (link.lower() or None)
-    return ".".join(parts[:-1]) or None, parts[-1], (link.lower() or None)
+    *schema, table = parts
+    db_schema = ".".join(_delimited(p) for p in schema) or None
+    return db_schema, table.rstrip(".") or table, (link.lower() or None)
 
 
 def db_table_ref(
@@ -226,7 +247,8 @@ def db_table_ref(
     construction here is what keeps :attr:`~SasDbTableRef.has_macro_ref` honest.
     """
     db_schema, table, dblink = split_table_name(raw if name is None else name)
-    db_schema = db_schema or default_schema
+    if db_schema is None and default_schema:
+        db_schema = _delimited(default_schema)
     return SasDbTableRef(
         engine=engine,
         connection=connection,

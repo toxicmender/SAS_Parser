@@ -333,8 +333,14 @@ class TestNativeSql(unittest.TestCase):
     def test_split_table_name(self):
         self.assertEqual(split_table_name('"EDW"."Current_NonIP"'), ("edw", "current_nonip", None))
         self.assertEqual(split_table_name("s.t@ProdLink"), ("s", "t", "prodlink"))
-        self.assertEqual(split_table_name("&sch..t"), ("&sch", "t", None))
+        self.assertEqual(split_table_name("&sch..t"), ("&sch.", "t", None))
         self.assertEqual(split_table_name("db.dbo.t"), ("db.dbo", "t", None))
+        # Unresolved: a schema keeps the delimiters SAS needs to read it back.
+        self.assertEqual(split_table_name('"&sch"."&tbl"'), ("&sch.", "&tbl", None))
+        self.assertEqual(split_table_name("&&sch_&env...t"), ("&&sch_&env..", "t", None))
+        self.assertEqual(split_table_name("db.&sch..t"), ("db.&sch.", "t", None))
+        self.assertEqual(split_table_name("edw.&tbl."), ("edw", "&tbl", None))
+        self.assertEqual(split_table_name("db..t"), ("db", "t", None))
         self.assertEqual(split_table_name("t"), (None, "t", None))
 
     def test_quoted_identifiers_keep_their_spelling_in_raw(self):
@@ -464,7 +470,7 @@ class TestMacroResolution(unittest.TestCase):
 
     def test_an_unresolved_schema_is_kept_as_written(self):
         (table,) = _chunk(self._query()).chunks[0].metadata.db_tables
-        self.assertEqual(table.db_schema, "&sch")
+        self.assertEqual((table.db_schema, table.qualified), ("&sch.", "&sch..accounts"))
         self.assertTrue(table.has_macro_ref)
 
     def test_a_sas_copy_named_by_a_macro_variable(self):
@@ -551,7 +557,7 @@ class TestNameShapes(unittest.TestCase):
         self.assertEqual((table.db_schema, table.table), ("edw_export", "t_&sfx._v"))
         self.assertTrue(table.has_macro_ref)
         table = self._one(_query("select * from &sch..current_nonip"))
-        self.assertEqual((table.db_schema, table.table), ("&sch", "current_nonip"))
+        self.assertEqual((table.db_schema, table.table), ("&sch.", "current_nonip"))
 
     def test_an_indirect_reference_needs_its_extra_dot(self):
         prefix = "%let env = prod;\n%let sch_prod = edw_prod;\n"
@@ -564,6 +570,23 @@ class TestNameShapes(unittest.TestCase):
     def test_one_dot_after_a_reference_concatenates(self):
         table = self._one(_query("select * from &sch.current_nonip", "%let sch = edw_;\n"))
         self.assertEqual(table.qualified, "edw_current_nonip")
+
+    def test_an_unresolved_name_reads_back_as_sas_would(self):
+        # &sch.current_nonip would be one name to SAS: the schema keeps its delimiter.
+        for sql, qualified in (
+            ("&sch..current_nonip", "&sch..current_nonip"),
+            ('"&sch"."&tbl"', "&sch..&tbl"),
+            ("&&sch_&env...current_nonip", "&&sch_&env...current_nonip"),
+            ("edw_export.&tbl", "edw_export.&tbl"),
+        ):
+            with self.subTest(sql=sql):
+                table = self._one(_query(f"select * from {sql}"))
+                self.assertEqual(table.qualified, qualified)
+                self.assertTrue(table.has_macro_ref)
+        table = self._one(_query("select * from &sch..current_nonip"))
+        self.assertEqual(
+            str(table), "oracle:&sch..current_nonip → work.out (read via connection_to oracle)"
+        )
 
 
 class TestValueSources(unittest.TestCase):
@@ -580,22 +603,22 @@ class TestValueSources(unittest.TestCase):
 
     def test_a_value_from_a_data_column_is_unknown(self):
         prefix = "%let sch = old;\ndata _null_; set cfg; call symputx('sch', s); run;\n"
-        self.assertEqual(self._qualified(_query("select * from &sch..t", prefix)), ["&sch.t"])
+        self.assertEqual(self._qualified(_query("select * from &sch..t", prefix)), ["&sch..t"])
 
     def test_two_conflicting_literal_calls_are_unknown(self):
         prefix = (
             "data _null_; if x then call symputx('sch','A'); "
             "else call symputx('sch','B'); run;\n"
         )
-        self.assertEqual(self._qualified(_query("select * from &sch..t", prefix)), ["&sch.t"])
+        self.assertEqual(self._qualified(_query("select * from &sch..t", prefix)), ["&sch..t"])
 
     def test_sql_into_replaces_an_earlier_let(self):
         prefix = "%let sch = old;\nproc sql; select s into :sch from cfg; quit;\n"
-        self.assertEqual(self._qualified(_query("select * from &sch..t", prefix))[-1], "&sch.t")
+        self.assertEqual(self._qualified(_query("select * from &sch..t", prefix))[-1], "&sch..t")
 
     def test_a_let_to_a_non_name_replaces_an_earlier_one(self):
         prefix = "%let sch = old;\n%let sch = %scan(&list, 2);\n"
-        self.assertEqual(self._qualified(_query("select * from &sch..t", prefix)), ["&sch.t"])
+        self.assertEqual(self._qualified(_query("select * from &sch..t", prefix)), ["&sch..t"])
 
     def test_a_libname_schema_option_in_quotes(self):
         src = (
@@ -606,6 +629,12 @@ class TestValueSources(unittest.TestCase):
             [t.qualified for t, _ in _read(src) if t.via is DbTableVia.LIBNAME],
             ["fr_dm.accounts"],
         )
+
+    def test_an_unresolved_libname_schema(self):
+        src = "libname edw oracle path=P schema=&sch;\ndata work.a; set edw.accounts; run;\n"
+        (table,) = [t for t, _ in _read(src) if t.via is DbTableVia.LIBNAME]
+        self.assertEqual(table.qualified, "&sch..accounts")
+        self.assertTrue(table.has_macro_ref)
 
 
 class TestMacroCalls(unittest.TestCase):
@@ -645,6 +674,28 @@ class TestMacroCalls(unittest.TestCase):
         called = sorted(t.qualified for t, k in rows if k == SasChunkKind.MACRO_CALL)
         self.assertEqual(called, ["edw_export.a", "edw_export.b"])
 
+    def test_calls_without_semicolons_are_each_a_call(self):
+        # The scanner splits statements at semicolons: these reach it as one chunk.
+        rows = _read(PULL + "%pull(tbl=a, out=x)\n%pull(tbl=b, schema=edw_hist, out=y)\n")
+        called = sorted(str(t) for t, k in rows if k == SasChunkKind.MACRO_CALL)
+        self.assertEqual(
+            called,
+            [
+                "oracle:edw_export.a → work.x (read via connection_to oracle in %pull)",
+                "oracle:edw_hist.b → work.y (read via connection_to oracle in %pull)",
+            ],
+        )
+
+    def test_a_call_binds_against_the_globals_the_call_before_it_left(self):
+        src = (
+            "%macro init(e);\n%global sch;\n%let sch = edw_&e;\n%mend;\n"
+            "%macro pullg(tbl=);\nproc sql;\ncreate table x as select * from "
+            "connection to oracle (select * from &sch..&tbl);\nquit;\n%mend;\n"
+            "%init(prod)\n%pullg(tbl=t)\n"
+        )
+        called = [t.qualified for t, k in _read(src) if k == SasChunkKind.MACRO_CALL]
+        self.assertEqual(called, ["edw_prod.t"])
+
     def test_a_call_before_the_definition_reads_nothing_yet(self):
         rows = _read("%pull(tbl=a, out=x);\n" + PULL)
         self.assertEqual([t for t, k in rows if k == SasChunkKind.MACRO_CALL], [])
@@ -683,7 +734,7 @@ class TestMacroCalls(unittest.TestCase):
         )
         self.assertEqual(
             [t.qualified for t, _ in _read(src + _query("select * from &sch..t"))],
-            ["&sch.t"],
+            ["&sch..t"],
         )
 
     def test_local_and_undeclared_assignments_stay_in_the_macro(self):
@@ -695,7 +746,7 @@ class TestMacroCalls(unittest.TestCase):
         fresh = "%macro newv;\n%let fresh = inner;\n%mend;\n%newv;\n"
         self.assertEqual(
             [t.qualified for t, _ in _read(fresh + _query("select * from &fresh..t"))],
-            ["&fresh.t"],
+            ["&fresh..t"],
         )
 
     def test_resolution_with_calls_is_idempotent(self):

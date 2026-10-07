@@ -261,6 +261,8 @@ class SasDbTableRef(BaseModel, frozen=True):
         The schema (Oracle owner) the table lives in, lowercased. ``None`` when
         the reference is unqualified: the database then resolves it against the
         connecting account's default schema, which static analysis cannot know.
+        One ending in an unresolved reference keeps its delimiter dot
+        (``&sch.``), so :attr:`qualified` reads ``&sch..t`` as SAS would.
         Named ``db_schema`` because ``schema`` shadows a pydantic attribute.
     table
         The table name, lowercased, quotes stripped.
@@ -319,7 +321,12 @@ class SasDbTableRef(BaseModel, frozen=True):
 
     @property
     def qualified(self) -> str:
-        """``db_schema.table``, or just ``table`` when unqualified."""
+        """``db_schema.table``, or just ``table`` when unqualified.
+
+        Unresolved names read as SAS code would write them: ``&sch..t``, since a
+        schema ending in a reference carries its delimiter — ``&sch.t`` would be
+        one name, the value of ``sch`` followed by ``t``.
+        """
         return f"{self.db_schema}.{self.table}" if self.db_schema else self.table
 
     @property

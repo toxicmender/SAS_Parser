@@ -304,7 +304,9 @@ schema, the table or both (`&sch..&tbl`, `edw_export.t_&sfx._v`,
 `"&SCH"."&TBL"`, `&full_name`, indirect `&&sch_&env...t`), and in the
 connection name (`connection to &db`, `connect to &eng`). An unresolved name is
 split as SAS reads it — the dot after a reference is its delimiter, not a
-separator — and kept verbatim in `raw`, with `has_macro_ref` set. Inside a
+separator — and kept verbatim in `raw`, with `has_macro_ref` set. Its
+qualified form reads back as SAS would: a schema ending in a reference keeps
+that delimiter, so it is `&sch..t`, never `&sch.t` (one name to SAS). Inside a
 utility macro, a table named by the macro's **own parameters** is a template
 (`parameterised=True`, reported but never hydrated); each **call** of the macro
 gets the concrete table on its own chunk, resolved with that call's arguments,
@@ -319,6 +321,11 @@ defaults and the globals in force, and marked with the macro's name:
 %pull(tbl=current_nonip, out=nonip);
 /* the call → oracle:edw_export.current_nonip → work.nonip (read via connection_to oracle in %pull) */
 ```
+
+Calls written back to back without semicolons (`%pull(tbl=a, out=x)` on one
+line, `%pull(tbl=b, out=y)` on the next) reach the resolver as one chunk, since
+the statement scanner splits at semicolons; each is still its own call, bound in
+order against the globals the one before it left.
 
 `resolve_references` runs the macro pass, then this one — the one order —
 from `chunk_text` (per file) and `MultiFileBatcher` (corpus-wide).

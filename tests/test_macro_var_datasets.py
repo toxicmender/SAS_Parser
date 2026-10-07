@@ -36,6 +36,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from chunker import SasChunkBatcher, SasCorpus, SasSemanticChunker
 from chunker.batcher import MultiFileBatcher
 from chunker.macro_vars import (
+    call_spans,
     is_dataset_shaped,
     let_values,
     resolve_refs,
@@ -43,6 +44,7 @@ from chunker.macro_vars import (
 )
 from chunker.metadata import _canon_ds
 from chunker.models import SasChunkKind
+from chunker.scanner import _sanitise
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -190,6 +192,38 @@ class TestResolveRefs(unittest.TestCase):
     def test_empty_table_and_plain_text_short_circuit(self):
         self.assertEqual(resolve_refs("&ds", {}), "&ds")
         self.assertEqual(resolve_refs("work.orders", {"ds": "x"}), "work.orders")
+
+
+class TestCallSpans(unittest.TestCase):
+    """Macro calls back to back, as one semicolon-split chunk holds them."""
+
+    def _calls(self, text: str) -> list[str]:
+        return [text[start:end] for _, start, end in call_spans(_sanitise(text))]
+
+    def test_calls_without_semicolons(self):
+        self.assertEqual(
+            self._calls("%pull(tbl=a)\n%Pull (tbl=b) %setup\ndata x; set y; run;"),
+            ["%pull(tbl=a)", "%Pull (tbl=b)", "%setup"],
+        )
+        self.assertEqual(
+            [name for name, _, _ in call_spans("%pull(tbl=a)\n%Pull (tbl=b)")],
+            ["pull", "pull"],
+        )
+
+    def test_semicolons_between_calls(self):
+        self.assertEqual(self._calls("%a(1);\n%b;\n"), ["%a(1)", "%b"])
+
+    def test_a_quoted_paren_or_a_nested_call_does_not_end_one(self):
+        self.assertEqual(
+            self._calls("%a(x=')', y=%lowcase(B))\n%b(1)"),
+            ["%a(x=')', y=%lowcase(B))", "%b(1)"],
+        )
+
+    def test_an_unclosed_list_runs_to_the_end(self):
+        self.assertEqual(self._calls("%a(x=1\n%b(2)"), ["%a(x=1\n%b(2)"])
+
+    def test_text_that_opens_with_no_call(self):
+        self.assertEqual(self._calls("data x; %a(1)"), [])
 
 
 class TestIsDatasetShaped(unittest.TestCase):
