@@ -3083,6 +3083,24 @@ class TestDatabaseTablesSection(unittest.TestCase):
         self.assertIn("through database link `prodlink`", text)
         self.assertIn("**(unresolved macro reference)**", text)
 
+    def test_a_macro_template_and_its_call_are_told_apart(self):
+        scored = _file(
+            _analyze(
+                "%macro pull(schema=edw_export, tbl=, out=);\n"
+                "proc sql;\ncreate table &out as select * from connection to oracle\n"
+                "  (select * from &schema..&tbl);\nquit;\n%mend;\n"
+                "%pull(tbl=current_nonip, out=nonip);\n"
+            ),
+            "t.sas",
+        )
+        text = render_file_report(scored, texts={})
+        self.assertIn("*(named by the macro's parameters — resolved per call)*", text)
+        self.assertIn(
+            "`edw_export.current_nonip` on `oracle` → `work.nonip` "
+            "(connection_to `oracle` in `%pull`)",
+            text,
+        )
+
 
 class TestChooseTarget(unittest.TestCase):
     """Which target an item is translated into, from the shipped profiles.

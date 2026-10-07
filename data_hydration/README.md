@@ -66,6 +66,10 @@ produces, never sources.
   check.
 - **Credentials** are keyed on the libref, or for pass-through on the
   connection alias (`oracle_password_<alias>`).
+- **Names arrive resolved** when the corpus says what their macro variables
+  hold — `%LET`, `CALL SYMPUTX` literals, a utility macro's call arguments.
+  A table a `%MACRO` body names by its own parameters is a template and is
+  never planned: each call is planned instead, with the table it reads.
 
 Pass metadata resolved across the corpus — `chunker.resolve_corpus_references`
 — or a LIBNAME in a setup file cannot reach the reads in the files after it.

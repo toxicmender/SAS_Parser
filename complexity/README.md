@@ -809,7 +809,10 @@ Its own section rather than more Inputs, because these are not SAS datasets:
 federating the table, not by finding a LIBNAME. (Before the chunker had a
 pass-through grammar such a table *was* listed under Inputs — misfiled, beside
 the invented `work.connection`.) A table read through a `@dblink`, or whose name
-holds an unresolved `&macro` reference, is flagged. Reported, never scored; no
+holds an unresolved `&macro` reference, is flagged. A utility macro's table
+appears in two forms, each in the file where it occurs: in the `%MACRO` body as
+a template *(named by the macro's parameters — resolved per call)*, and at each
+call as the table that call reads, `in %pull`. Reported, never scored; no
 tables, no section; every chunk prints a `Database:` line for the audit trail.
 With `--hydration`, each table read also gets its own item in the Hydration
 section.

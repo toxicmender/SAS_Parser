@@ -64,33 +64,40 @@ logger = logging.getLogger(__name__)
 
 # CONNECT TO <engine> [AS <alias>]; the options parenthesis, when there is one,
 # is found from the end of the match.
+# A connection name — engine, alias or libref — in any of these statements. A
+# macro reference is allowed (``connection to &db``): parameterised connection
+# names are ordinary in utility macros, and while this required a bare
+# identifier such a statement matched nothing, so its native SQL went unmasked
+# and was read as SAS again. Resolved later, by the macro-variable pass.
+_CONN_NAME = r"[A-Za-z_&][\w&]*\.?"
+
 _CONNECT_TO_RE = re.compile(
-    r"\bconnect\s+to\s+(?P<engine>[A-Za-z_]\w*)"
-    r"(?:\s+as\s+(?P<alias>[A-Za-z_]\w*))?",
+    rf"\bconnect\s+to\s+(?P<engine>{_CONN_NAME})"
+    rf"(?:\s+as\s+(?P<alias>{_CONN_NAME}))?",
     re.IGNORECASE,
 )
 # CONNECT USING <libref> [AS <alias>] — reuses a LIBNAME's connection, so the
 # engine is the LIBNAME's: chunker.metadata.resolve_db_librefs fills it in.
 _CONNECT_USING_RE = re.compile(
-    r"\bconnect\s+using\s+(?P<libref>[A-Za-z_&][\w&]*\.?)"
-    r"(?:\s+as\s+(?P<alias>[A-Za-z_]\w*))?",
+    rf"\bconnect\s+using\s+(?P<libref>{_CONN_NAME})"
+    rf"(?:\s+as\s+(?P<alias>{_CONN_NAME}))?",
     re.IGNORECASE,
 )
 _DISCONNECT_RE = re.compile(
-    r"\bdisconnect\s+from\s+(?P<alias>[A-Za-z_]\w*)", re.IGNORECASE
+    rf"\bdisconnect\s+from\s+(?P<alias>{_CONN_NAME})", re.IGNORECASE
 )
 # FROM|JOIN CONNECTION TO <alias> ( — the match ends on the query's open paren.
 _CONNECTION_TO_RE = re.compile(
-    r"\b(?:from|join)\s+connection\s+to\s+(?P<alias>[A-Za-z_]\w*)\s*\(",
+    rf"\b(?:from|join)\s+connection\s+to\s+(?P<alias>{_CONN_NAME})\s*\(",
     re.IGNORECASE,
 )
 # EXECUTE ( <stmt> ) BY <alias>, or the newer EXECUTE BY <alias> ( <stmt> ). A
 # plain ``execute(`` with no BY after its parenthesis is not pass-through —
 # that is a DATA step's CALL EXECUTE — and is skipped.
 _EXECUTE_RE = re.compile(
-    r"\bexecute\s*(?:by\s+(?P<alias>[A-Za-z_]\w*)\s*)?\(", re.IGNORECASE
+    rf"\bexecute\s*(?:by\s+(?P<alias>{_CONN_NAME})\s*)?\(", re.IGNORECASE
 )
-_BY_ALIAS_RE = re.compile(r"\s*by\s+(?P<alias>[A-Za-z_]\w*)", re.IGNORECASE)
+_BY_ALIAS_RE = re.compile(rf"\s*by\s+(?P<alias>{_CONN_NAME})", re.IGNORECASE)
 
 # The SAS statement a CONNECTION TO feeds: the dataset it creates or inserts
 # into. Searched for, not anchored, so ``proc sql`` written without its own
@@ -110,10 +117,11 @@ _SAS_TARGET_RE = re.compile(
 _NATIVE_NOISE_RE = re.compile(r"'(?:[^']|'')*'|--[^\n]*")
 
 _IDENT = r'(?:"[^"\n]*"|[A-Za-z_&][\w$#&]*)'
-_IDENT_RE = re.compile(_IDENT)
-# A table reference: an identifier chain with an optional @dblink. ``..`` is a
-# macro reference's delimiter dot followed by the separator (``&schema..tbl``).
-_NATIVE_REF = rf"{_IDENT}(?:\.{{1,2}}{_IDENT})*(?:@[\w$#.&]+)?"
+# A table reference: an identifier chain with an optional @dblink. Dots come in
+# runs because macro references consume them: ``&schema..tbl`` is a delimiter
+# then the separator, and an indirect ``&&sch_&env...tbl`` needs one more per
+# rescan. _name_parts decides which dot does what.
+_NATIVE_REF = rf"{_IDENT}(?:\.+{_IDENT})*(?:@[\w$#.&]+)?"
 _NATIVE_TOKEN_RE = re.compile(rf"{_NATIVE_REF}|[(),;]")
 _WORD_RE = re.compile(r"[A-Za-z_]\w*")
 
@@ -153,15 +161,43 @@ _CREATE_MODIFIERS = frozenset(
 )
 
 
+# One piece of a table reference, for splitting it into parts: a macro
+# reference *with* its delimiter dot, a "quoted" identifier, a run of other
+# name characters, or a separator dot.
+_NAME_PIECE_RE = re.compile(r'&+[A-Za-z_]\w*\.?|"[^"\n]*"|[^."&]+|\.|&')
+
+
+def _name_parts(body: str) -> list[str]:
+    """*body*'s dot-separated parts, reading dots the way SAS's macro processor does.
+
+    The dot right after a macro reference is its *delimiter* — SAS consumes it
+    — so it separates nothing: ``t_&sfx._v`` is one table, ``t_<sfx>_v``; in
+    ``&sch..t`` the first dot ends ``&sch`` and only the second separates.
+    Splitting on every dot made an unresolved ``edw_export.t_&sfx._v`` read as
+    schema ``edw_export.t_&sfx``, table ``_v``. A delimiter ending a part is
+    dropped (``&sch.`` and ``&sch`` name one variable); one inside a part is
+    kept, since removing it would change which variable is meant.
+    """
+    parts = [""]
+    for m in _NAME_PIECE_RE.finditer(body):
+        piece = m.group(0)
+        if piece == ".":
+            parts.append("")
+        else:
+            parts[-1] += piece
+    return [p[:-1] if p.endswith(".") else p for p in parts if p]
+
+
 def split_table_name(name: str) -> tuple[str | None, str, str | None]:
     """``(db_schema, table, dblink)`` of a native table reference.
 
     Lowercased, quotes stripped. Everything before the last part is the schema,
     so SQL Server's ``db.dbo.t`` keeps its database as ``db.dbo`` rather than
-    losing it. ``&schema..t`` splits at the macro delimiter like any other dot.
+    losing it. Macro references split as SAS would read them — see
+    :func:`_name_parts`.
     """
     body, _, link = name.partition("@")
-    parts = [p.strip('"').lower() for p in _IDENT_RE.findall(body)]
+    parts = [p.strip('"').lower() for p in _name_parts(body)]
     if not parts:
         return None, body.strip().lower(), (link.lower() or None)
     return ".".join(parts[:-1]) or None, parts[-1], (link.lower() or None)
@@ -178,6 +214,8 @@ def db_table_ref(
     options: tuple[tuple[str, str], ...] = (),
     name: str | None = None,
     default_schema: str | None = None,
+    macro: str | None = None,
+    parameterised: bool = False,
 ) -> SasDbTableRef:
     """The single builder of a :class:`~chunker.models.SasDbTableRef`.
 
@@ -201,6 +239,8 @@ def db_table_ref(
         options=options,
         has_macro_ref="&" in f"{db_schema or ''}.{table}@{dblink or ''}",
         raw=raw,
+        macro=macro,
+        parameterised=parameterised,
     )
 
 
@@ -460,6 +500,11 @@ class _Structure:
         return stop, stop
 
 
+def _conn_name(token: str) -> str:
+    """A connection name as recorded: lowercased, a macro delimiter dot dropped."""
+    return token.lower().rstrip(".")
+
+
 def _options(text: str) -> tuple[tuple[str, str], ...]:
     """``key=value`` options, parsed by the engine-LIBNAME grammar in :mod:`chunker.paths`."""
     return tuple(
@@ -527,8 +572,8 @@ def scan_pass_through(cf: str, mt: str) -> PassThroughScan:
         if start < claimed:
             continue
         if kind == "connect":
-            engine = m.group("engine").lower()
-            alias = (m.group("alias") or engine).lower()
+            engine = _conn_name(m.group("engine"))
+            alias = _conn_name(m.group("alias") or engine)
             j = m.end()
             while j < len(mt) and mt[j].isspace():
                 j += 1
@@ -539,12 +584,12 @@ def scan_pass_through(cf: str, mt: str) -> PassThroughScan:
             aliases[alias] = _Connection(engine, alias, options)
             end = structure.statement_end(j)
         elif kind == "using":
-            libref = m.group("libref").lower().rstrip(".")
-            alias = (m.group("alias") or libref).lower()
+            libref = _conn_name(m.group("libref"))
+            alias = _conn_name(m.group("alias") or libref)
             aliases[alias] = _Connection(None, libref)
             end = structure.statement_end(m.end())
         elif kind == "disconnect":
-            aliases.pop(m.group("alias").lower(), None)
+            aliases.pop(_conn_name(m.group("alias")), None)
             end = structure.statement_end(m.end())
         elif kind == "query":
             open_idx = m.end() - 1
@@ -554,7 +599,7 @@ def scan_pass_through(cf: str, mt: str) -> PassThroughScan:
                 native.reads(),
                 DbTableAccess.READ,
                 DbTableVia.CONNECTION_TO,
-                connection_for(m.group("alias").lower()),
+                connection_for(_conn_name(m.group("alias"))),
                 _sas_targets(mt, structure, start),
             )
         else:  # execute
@@ -566,7 +611,7 @@ def scan_pass_through(cf: str, mt: str) -> PassThroughScan:
                 if by is None:
                     continue  # CALL EXECUTE(...) — not pass-through
                 alias, after = by.group("alias"), by.end()
-            conn = connection_for(alias.lower())
+            conn = connection_for(_conn_name(alias))
             native = _NativeTables(cf[open_idx + 1 : body_end])
             record(native.reads(), DbTableAccess.READ, DbTableVia.EXECUTE, conn)
             record(native.writes(), DbTableAccess.WRITE, DbTableVia.EXECUTE, conn)

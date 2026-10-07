@@ -235,11 +235,26 @@ A `%LET` whose value is *shaped* like a dataset reference
 never I/O: a `%LET` reads and writes nothing; the step that uses
 `&table_demogr` does.
 
+Values come from more than `%LET` in open code, and `_MacroScope` (in
+`metadata.py`) is the one place that decides them, for every pass:
+
+- **`CALL SYMPUT`/`SYMPUTX`** with a literal name and a literal value
+  (`call symputx('sch', 'EDW_EXPORT');`) gives its value to the chunks *after*
+  the step — never the step itself, whose `&refs` SAS resolves at compile time.
+- **A called `%MACRO`** sets a global by SAS's rule: a `%LET` to a name declared
+  `%GLOBAL` there, or already global and neither a parameter nor `%LOCAL`.
+  Anything else stays in the macro's local table. A body with `%IF`/`%DO`/`%GOTO`
+  may or may not run an assignment, so what it could set becomes *unknown*.
+- **Unknown is a value too.** A variable reassigned to something that is not a
+  name, filled at run time (`INTO :sch`, `call symputx('sch', column)`), or
+  given two different literal values by one step stops resolving: a stale
+  `%let sch = old;` must not keep answering for it.
+
 Two scope rules keep this from over-reaching. A macro's own parameters shadow
 the table, so `&ds` inside `%macro m(ds);` stays a `body_param_*` entry the
 batcher resolves per call site rather than picking up a corpus-level
-`%let ds = ...;`. And a `%LET` inside a `%MACRO` body stays local to that chunk,
-since whether it ever executes depends on a call. Resolution runs once per file
+`%let ds = ...;`. And a `%LET` inside a `%MACRO` body stays local to that chunk
+until a call runs it (above). Resolution runs once per file
 in `chunk_text` and again over the flattened corpus in `MultiFileBatcher`,
 which is what lets a `%LET` in one file name a dataset another file reads.
 
@@ -283,6 +298,27 @@ the LIBNAME stands; `libname x clear;` or a path rebind ends one; one inside a
 credentials). A SAS name under such a libref keeps its place in the I/O lists —
 SAS code does name `edw.accounts` — and also gains a `via=libname` record.
 `CONNECT USING` records get their engine and options here.
+
+**Names spelled through macro variables** resolve like any other: in the
+schema, the table or both (`&sch..&tbl`, `edw_export.t_&sfx._v`,
+`"&SCH"."&TBL"`, `&full_name`, indirect `&&sch_&env...t`), and in the
+connection name (`connection to &db`, `connect to &eng`). An unresolved name is
+split as SAS reads it — the dot after a reference is its delimiter, not a
+separator — and kept verbatim in `raw`, with `has_macro_ref` set. Inside a
+utility macro, a table named by the macro's **own parameters** is a template
+(`parameterised=True`, reported but never hydrated); each **call** of the macro
+gets the concrete table on its own chunk, resolved with that call's arguments,
+defaults and the globals in force, and marked with the macro's name:
+
+```sas
+%macro pull(schema=edw_export, tbl=, out=);
+  proc sql; connect to oracle (path=&ora_path);
+  create table &out as select * from connection to oracle (select * from &schema..&tbl);
+  quit;
+%mend;
+%pull(tbl=current_nonip, out=nonip);
+/* the call → oracle:edw_export.current_nonip → work.nonip (read via connection_to oracle in %pull) */
+```
 
 `resolve_references` runs the macro pass, then this one — the one order —
 from `chunk_text` (per file) and `MultiFileBatcher` (corpus-wide).

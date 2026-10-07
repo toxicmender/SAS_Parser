@@ -289,6 +289,18 @@ class SasDbTableRef(BaseModel, frozen=True):
     raw
         The reference exactly as written: ``"EDW"."T"``, ``&schema..current_nonip``,
         or the SAS name ``edw.accounts`` for :attr:`DbTableVia.LIBNAME`.
+    macro
+        Set on a record attributed to a **macro call**: the name of the macro
+        whose ``%MACRO`` body holds the SQL. The record sits on the call's
+        chunk, resolved with that call's arguments — ``%pull(tbl=current_nonip)``
+        reads ``edw_export.current_nonip`` even though the body only says
+        ``&schema..&tbl``. ``None`` for a table named where the record sits.
+    parameterised
+        Inside a ``%MACRO`` body, the name is built from that macro's *own
+        parameters* — ``&schema..&tbl`` in ``%macro pull(schema=, tbl=)`` — so
+        it is a template, not a table: each call's reading is recorded on the
+        call's chunk (see :attr:`macro`), and a macro the corpus never calls
+        reads nothing. Reported, never hydrated.
     """
 
     engine: str | None = None
@@ -302,6 +314,8 @@ class SasDbTableRef(BaseModel, frozen=True):
     options: tuple[tuple[str, str], ...] = ()
     has_macro_ref: bool = False
     raw: str = ""
+    macro: str | None = None
+    parameterised: bool = False
 
     @property
     def qualified(self) -> str:
@@ -318,15 +332,29 @@ class SasDbTableRef(BaseModel, frozen=True):
         # and connection options are where credentials live.
         link = f"@{self.dblink}" if self.dblink else ""
         copies = f" → {', '.join(self.sas_targets)}" if self.sas_targets else ""
+        called = f" in %{self.macro}" if self.macro else ""
         return (
             f"{self.engine or self.connection}:{self.qualified}{link}{copies} "
-            f"({self.access} via {self.via} {self.connection})"
+            f"({self.access} via {self.via} {self.connection}{called})"
         )
 
 
 def _db_table_sort_key(
     ref: SasDbTableRef,
-) -> tuple[str, str, str, str, str, str, str, tuple[str, ...], tuple[tuple[str, str], ...], str]:
+) -> tuple[
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    tuple[str, ...],
+    tuple[tuple[str, str], ...],
+    str,
+    str,
+]:
     """Total order over :class:`SasDbTableRef`, defined once.
 
     Same reason as :func:`_path_ref_sort_key`: these records are deduplicated
@@ -341,9 +369,11 @@ def _db_table_sort_key(
         str(ref.access),
         str(ref.via),
         ref.connection,
+        ref.macro or "",
         ref.sas_targets,
         ref.options,
         ref.raw,
+        str(ref.parameterised),
     )
 
 
@@ -395,9 +425,11 @@ class SasChunkMetadata(BaseModel):
 
     # The *values* the chunk's ``%LET`` statements assign, name → value, both
     # lowercased. Only values that could name a dataset, a library or part of
-    # one are kept (``chunker.macro_vars.let_values``) — this is the symbol
-    # table ``chunker.metadata.resolve_macro_var_refs`` expands ``&name``
-    # references against, not a record of every string the job holds.
+    # one are kept (``chunker.macro_vars.let_values``); any other value maps to
+    # ``""``, meaning *unknown from here on*, so an earlier value cannot keep
+    # answering for the variable. This is the symbol table
+    # ``chunker.metadata.resolve_macro_var_refs`` expands ``&name`` references
+    # against, not a record of every string the job holds.
     macro_var_values: dict[str, str] = Field(default_factory=dict)
 
     @computed_field  # type: ignore[prop-decorator]

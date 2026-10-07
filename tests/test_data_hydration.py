@@ -694,3 +694,37 @@ class TestDatabaseTables:
             "edw_export.current_nonip",
             "fr_dm.accounts",
         ]
+
+
+class TestMacroResolvedTables:
+    """Oracle names spelled through macro variables, as the plan sees them."""
+
+    PULL = (
+        "%macro pull(schema=edw_export, tbl=, out=);\n"
+        "proc sql;\nconnect to oracle (path=EDWPRO);\n"
+        "create table &out as select * from connection to oracle\n"
+        "  (select * from &schema..&tbl);\n"
+        "quit;\n%mend;\n"
+    )
+
+    def test_a_calls_table_is_planned_and_the_template_is_not(self):
+        _, _, tables = _db(self.PULL + "%pull(tbl=current_nonip, out=nonip);\n")
+        plan = build_plan(db_tables=tables, config=_config(schema=None))
+        (item,) = plan.items
+        assert item.source.object_name == "edw_export.current_nonip"
+        assert item.target_table == "main.edw_export.current_nonip"
+        assert item.blockers == ()
+
+    def test_a_macro_nobody_calls_hydrates_nothing(self):
+        _, _, tables = _db(self.PULL)
+        assert tables and build_plan(db_tables=tables, config=_config()).items == []
+
+    def test_a_let_resolved_schema_is_planned_resolved(self):
+        _, _, tables = _db(
+            "%let sch = EDW_EXPORT;\nproc sql;\nconnect to oracle (path=EDWPRO);\n"
+            "create table a as select * from connection to oracle "
+            "(select * from &sch..current_nonip);\nquit;\n"
+        )
+        (item,) = build_plan(db_tables=tables, config=_config(schema=None)).items
+        assert item.source.object_name == "edw_export.current_nonip"
+        assert item.blockers == ()

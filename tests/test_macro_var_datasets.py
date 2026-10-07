@@ -97,15 +97,17 @@ class TestLetValues(unittest.TestCase):
     def test_quoted_value_unquoted(self):
         self.assertEqual(let_values("%let ds = 'lib.member';"), {"ds": "lib.member"})
 
-    def test_non_name_values_dropped(self):
+    def test_non_name_values_are_recorded_as_unknown(self):
         # Any string at all can be a %LET value; only one that could be a name,
-        # or part of one, is kept.
+        # or part of one, is kept. The rest map to "" — unknown from here on —
+        # rather than vanishing, so an earlier name-shaped value of the same
+        # variable cannot keep answering for it.
         src = (
             "%let where = age > 30 and sex = 'M';\n"
             "%let path = /sasdata3/dataetl/in.csv;\n"
             "%let lib = prod;\n"
         )
-        self.assertEqual(let_values(src), {"lib": "prod"})
+        self.assertEqual(let_values(src), {"where": "", "path": "", "lib": "prod"})
 
     def test_numeric_value_kept_as_a_name_fragment(self):
         # Not a name on its own, but half of one: &&ds&i, &lib..sales&yr.

@@ -301,8 +301,12 @@ def _fmt_db_table(ref: SasDbTableRef) -> str:
         parts.append(f"through database link `{ref.dblink}`")
     if ref.sas_targets:
         parts.append("→ " + ", ".join(f"`{t}`" for t in ref.sas_targets))
-    parts.append(f"({ref.via} `{ref.connection}`)")
-    if ref.has_macro_ref:
+    called = f" in `%{ref.macro}`" if ref.macro else ""
+    parts.append(f"({ref.via} `{ref.connection}`{called})")
+    if ref.parameterised:
+        # Not a table yet: each call names one, and its own line says which.
+        parts.append("*(named by the macro's parameters — resolved per call)*")
+    elif ref.has_macro_ref:
         parts.append("**(unresolved macro reference)**")
     return " ".join(parts)
 

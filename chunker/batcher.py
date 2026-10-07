@@ -20,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .keywords import _STANDARD_AUTOCALL_MACROS
+from .macro_vars import _parse_call_args
 from .metadata import _canon_ds, resolve_references
 from .models import (
     SasBatch,
@@ -94,112 +95,9 @@ class _Edge:
         return f"_Edge {self.from_id} -> {self.to_id} [{self.kind} via {self.via}]{scope}"
 
 
-# Locates the opening of a macro call's argument list: %macroname( . The
-# balanced closing paren is found by _extract_call_arg_text below.
-_CALL_OPEN_RE = re.compile(r"%\s*[A-Za-z_]\w*\s*\(")
-
-# A keyword argument is name= at the start of the (stripped) argument, so a
-# positional value like f(x=1) is not mistaken for keyword 'f(x'.
-_KW_ARG_RE = re.compile(r"([A-Za-z_]\w*)\s*=(.*)$", re.DOTALL)
-
 # A libref.member (or bare member) dataset token, for scanning a MACRO_CALL's
 # argument text against the producer index.
 _ARG_DS_TOKEN_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?")
-
-
-def _extract_call_arg_text(call_text: str) -> str | None:
-    """Return the text between the call's balanced outer parens, or None.
-
-    Walks characters with a paren-depth counter, treating single- and
-    double-quoted spans as opaque, so nested constructs like
-    ``%clean(%str(a,b), out=f(x))`` yield the full argument text instead
-    of stopping at the first ``)``.  An unbalanced call (truncated chunk)
-    falls back to everything after the opening paren.
-    """
-    m = _CALL_OPEN_RE.search(call_text)
-    if not m:
-        return None
-    start = m.end()
-    depth = 1
-    quote: str | None = None
-    for i in range(start, len(call_text)):
-        ch = call_text[i]
-        if quote:
-            if ch == quote:
-                quote = None
-        elif ch in ("'", '"'):
-            quote = ch
-        elif ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth == 0:
-                return call_text[start:i]
-    return call_text[start:]
-
-
-def _split_call_args(raw_args: str) -> list[str]:
-    """Split an argument list on top-level commas (quote- and paren-aware)."""
-    parts: list[str] = []
-    buf: list[str] = []
-    depth = 0
-    quote: str | None = None
-    for ch in raw_args:
-        if quote:
-            if ch == quote:
-                quote = None
-        elif ch in ("'", '"'):
-            quote = ch
-        elif ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-        elif ch == "," and depth == 0:
-            parts.append("".join(buf))
-            buf = []
-            continue
-        buf.append(ch)
-    parts.append("".join(buf))
-    return [p.strip() for p in parts if p.strip()]
-
-
-def _parse_call_args(call_text: str) -> tuple[list[str], dict[str, str]]:
-    """
-    Parse a MACRO_CALL chunk's raw text into (positional_args, keyword_args).
-
-    Used by Fix B (parameterised macro output/input resolution): the
-    definition's ``body_param_outputs``/``body_param_inputs`` reference a
-    parameter by name and positional index, and this function recovers the
-    actual values supplied at the call site so those references can be
-    resolved to concrete dataset names.
-
-    Quoting and trailing dots are stripped from each value so that
-    ``work.orders``, ``'work.orders'``, and ``work.orders.`` all normalise
-    to the same lowercase dataset key.
-    """
-    raw_args = _extract_call_arg_text(call_text)
-    if raw_args is None:
-        return [], {}
-
-    positional: list[str] = []
-    keyword: dict[str, str] = {}
-
-    for part in _split_call_args(raw_args):
-        kw = _KW_ARG_RE.match(part)
-        if kw:
-            keyword[kw.group(1).lower()] = _clean_arg_value(kw.group(2))
-        else:
-            positional.append(_clean_arg_value(part))
-
-    return positional, keyword
-
-
-def _clean_arg_value(value: str) -> str:
-    """Strip quotes and a single trailing dot from a macro call argument."""
-    v = value.strip()
-    if v.startswith(("'", '"')) and v.endswith(("'", '"')):
-        v = v[1:-1]
-    return v.rstrip(".").lower()
 
 
 def _file_of_map(file_offsets: list[int], n: int) -> list[int]:

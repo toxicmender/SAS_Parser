@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import ChainMap
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, TypeVar
 
 from .keywords import (
@@ -31,9 +34,12 @@ from .keywords import (
 from .macro_vars import (
     DS_REF_TOKEN,
     DS_REF_TOKEN_POSSESSIVE,
+    _parse_call_args,
     has_macro_ref,
     is_dataset_shaped,
+    let_assignments,
     let_values,
+    name_value,
     resolve_refs,
 )
 from .models import (
@@ -51,7 +57,7 @@ from .models import (
     _path_ref_sort_key,
 )
 from .passthrough import db_table_ref, mask, scan_pass_through
-from .paths import extract_engine_refs, extract_paths
+from .paths import ENGINE_LIBNAMES, extract_engine_refs, extract_paths
 from .scanner import _blank_span, _sanitise
 
 logger = logging.getLogger(__name__)
@@ -669,6 +675,17 @@ def _metadata_for(text: str, kind: SasChunkKind) -> SasChunkMetadata:
         if _SAS_DATASET_OPTION_RE.search(mt):
             data_step_statements.add("dataset_option")
 
+    # A pass-through table named by this macro's own parameters is a template:
+    # each call's reading is recorded at the call (resolve_macro_var_refs).
+    if param_names and db_tables:
+        params = set(param_names)
+        db_tables = [
+            t.model_copy(update={"parameterised": True})
+            if params & {r.lower() for r in _VAR_REF_RE.findall(t.raw)}
+            else t
+            for t in db_tables
+        ]
+
     return SasChunkMetadata(
         step_name=_nid(dm.group(1)) if dm else None,
         proc_name=_nid(pm.group(1)) if pm else None,
@@ -812,7 +829,7 @@ _BindsRefT = TypeVar("_BindsRefT", SasPathRef, SasEngineRef)
 
 
 def _resolve_names(
-    names: list[str], table: dict[str, str], *, canonical: bool
+    names: list[str], table: Mapping[str, str], *, canonical: bool
 ) -> list[str]:
     """*names* with their ``&`` references expanded, order-preserving.
 
@@ -832,7 +849,7 @@ def _resolve_names(
     return out
 
 
-def _resolve_binds(refs: list[_BindsRefT], table: dict[str, str]) -> list[_BindsRefT]:
+def _resolve_binds(refs: list[_BindsRefT], table: Mapping[str, str]) -> list[_BindsRefT]:
     """*refs* with the libref/fileref each one assigns resolved against *table*.
 
     ``binds`` is a name, already lowercased rather than kept verbatim, so it
@@ -851,46 +868,68 @@ def _resolve_binds(refs: list[_BindsRefT], table: dict[str, str]) -> list[_Binds
     ]
 
 
-def _resolve_db_tables(
-    refs: list[SasDbTableRef], table: dict[str, str]
-) -> list[SasDbTableRef]:
-    """*refs* with macro references in their names and SAS copies resolved.
+def _resolve_name(name: str, table: Mapping[str, str]) -> str:
+    """A connection name or engine with its macro references expanded."""
+    return resolve_refs(name, table).lower() if has_macro_ref(name) else name
 
-    A pass-through name is re-parsed from ``raw`` — the text as written, which
-    never changes — so a corpus-level run with a larger table resolves what a
-    file-level run could not, and repeating a run changes nothing. LIBNAME
-    records are left alone: their ``raw`` is the SAS spelling (``edw.accounts``),
-    whose first part is a libref, not a schema, and :func:`resolve_db_librefs`
-    rebuilds them from already-resolved names anyway.
+
+def _resolve_db_table(ref: SasDbTableRef, table: Mapping[str, str]) -> SasDbTableRef:
+    """*ref* re-derived with every macro reference it holds expanded against *table*.
+
+    The name is re-parsed from ``raw`` — the text as written, which never
+    changes — so resolving again with a larger table (the corpus-level run, or
+    a macro call's arguments) completes what an earlier run could not, and
+    resolving twice changes nothing. A connection name resolves too, and when
+    the resolved alias is itself an engine (``connection to &db`` with
+    ``%let db = oracle;``) the engine is taken from it, as an unaliased
+    ``CONNECT TO`` would have said.
+    """
+    connection = _resolve_name(ref.connection, table)
+    engine = _resolve_name(ref.engine, table) if ref.engine else None
+    if (engine is None or has_macro_ref(engine)) and connection in ENGINE_LIBNAMES:
+        engine = connection
+    return db_table_ref(
+        ref.raw,
+        name=resolve_refs(ref.raw, table),
+        access=ref.access,
+        via=ref.via,
+        connection=connection,
+        engine=engine,
+        sas_targets=tuple(_resolve_names(list(ref.sas_targets), table, canonical=True)),
+        options=ref.options,
+        macro=ref.macro,
+        parameterised=ref.parameterised,
+    )
+
+
+def _resolve_db_tables(
+    refs: list[SasDbTableRef], table: Mapping[str, str]
+) -> list[SasDbTableRef]:
+    """*refs* with the macro references in their names resolved — see
+    :func:`_resolve_db_table`.
+
+    Two kinds are left alone. LIBNAME records: their ``raw`` is the SAS spelling
+    (``edw.accounts``), whose first part is a libref, not a schema, and
+    :func:`resolve_db_librefs` rebuilds them from already-resolved names. And
+    records attributed to a macro call: those were resolved with the call's
+    arguments, which this chunk's own table does not hold.
     """
     out: list[SasDbTableRef] = []
     for ref in refs:
-        if ref.via is DbTableVia.LIBNAME or not (
-            has_macro_ref(ref.raw)
-            or has_macro_ref(ref.connection)
-            or any(map(has_macro_ref, ref.sas_targets))
+        held = (ref.raw, ref.connection, ref.engine or "", *ref.sas_targets)
+        if (
+            ref.via is DbTableVia.LIBNAME
+            or ref.macro is not None
+            or not any(map(has_macro_ref, held))
         ):
             out.append(ref)
-            continue
-        out.append(
-            db_table_ref(
-                ref.raw,
-                name=resolve_refs(ref.raw, table),
-                access=ref.access,
-                via=ref.via,
-                connection=resolve_refs(ref.connection, table),
-                engine=ref.engine,
-                sas_targets=tuple(
-                    _resolve_names(list(ref.sas_targets), table, canonical=True)
-                ),
-                options=ref.options,
-            )
-        )
+        else:
+            out.append(_resolve_db_table(ref, table))
     return sorted(dict.fromkeys(out), key=_db_table_sort_key)
 
 
 def _resolved_meta(
-    meta: SasChunkMetadata, table: dict[str, str], own_values: dict[str, str]
+    meta: SasChunkMetadata, table: Mapping[str, str], own_values: dict[str, str]
 ) -> SasChunkMetadata | None:
     """*meta* with every dataset/libref name resolved against *table*, or
     ``None`` when nothing in it changed.
@@ -946,18 +985,155 @@ def _resolved_meta(
     return meta.model_copy(update=changed)
 
 
+# Macro control flow: an assignment under one of these may or may not run.
+_MACRO_CONTROL_RE = re.compile(r"%\s*(?:if|do|goto)\b", re.IGNORECASE)
+# %GLOBAL / %LOCAL declaration lists, told apart (unlike _GLOBAL_LOCAL_DECL_RE).
+_SCOPE_DECL_RE = re.compile(r"%\s*(global|local)\s+([^;]+?)\s*;", re.IGNORECASE)
+# The macro a MACRO_CALL chunk calls: the name its text opens with.
+_CALLED_MACRO_RE = re.compile(r"\s*%\s*([A-Za-z_]\w*)")
+
+
+def _assign(table: dict[str, str], name: str, value: str) -> None:
+    """Give *name* its *value* in *table* — or forget it when the value is
+    ``""``, which is how every source here says "unknown from now on"."""
+    if value:
+        table[name] = value
+    else:
+        table.pop(name, None)
+
+
+def _symput_values(cf: str) -> dict[str, str]:
+    """The static values a step's ``CALL SYMPUT``/``SYMPUTX`` calls assign.
+
+    ``call symputx('sch', 'EDW_EXPORT');`` — a literal name and a literal,
+    name-shaped value — is knowable without running SAS. A value from a data
+    column, or two calls giving one name different values (an ``IF``/``ELSE``
+    choosing between them), is not: those map to ``""``. A single call is taken
+    as executed, which is the residual approximation.
+    """
+    seen: dict[str, set[str]] = {}
+    for m in _CALL_SYMPUT_RE.finditer(cf):
+        args = _split_top_level(m.group(2))
+        name = _clean_literal(args[0]) if args else None
+        if name is None or len(args) < 2:
+            continue
+        literal = _clean_literal(args[1])
+        value = name_value(literal) if literal is not None else None
+        seen.setdefault(name.strip().lower(), set()).add(value or "")
+    return {name: values.pop() if len(values) == 1 else "" for name, values in seen.items()}
+
+
+def _run_time_values(chunk: SasChunk) -> dict[str, str]:
+    """What the macro variables *chunk* creates at run time hold once it has run.
+
+    Every variable it produces — ``CALL SYMPUT``/``SYMPUTX``, ``PROC SQL INTO`` —
+    gets its static value when :func:`_symput_values` knows one, and is
+    otherwise *unknown*, which matters as much: an earlier ``%let sch = old;``
+    must stop answering for ``&sch`` once ``select s into :sch`` has replaced it.
+    Applied after the chunk, never to it — SAS resolves a step's own ``&refs``
+    when the step is compiled, before any of its CALLs run.
+    """
+    names = chunk.metadata.produces_macrovars
+    if not names:
+        return {}
+    static = (
+        _symput_values(_sanitise(chunk.text, blank_strings=False))
+        if "symput" in chunk.text.lower()
+        else {}
+    )
+    return {name: static.get(name, "") for name in names}
+
+
+@dataclass(frozen=True)
+class _MacroDef:
+    """What a call needs from a ``%MACRO`` defined earlier in the walk."""
+
+    name: str
+    positional: tuple[str, ...]
+    defaults: tuple[tuple[str, str], ...]
+    params: frozenset[str]
+    global_names: frozenset[str]
+    local_names: frozenset[str]
+    assignments: tuple[tuple[str, str], ...]
+    produces: frozenset[str]
+    conditional: bool
+    db_tables: tuple[SasDbTableRef, ...]
+
+    @classmethod
+    def of(cls, chunk: SasChunk) -> "_MacroDef":
+        meta = chunk.metadata
+        cf = _sanitise(chunk.text, blank_strings=False)
+        mt = _sanitise(chunk.text)
+        sig = _MACRO_SIG_RE.search(cf)
+        params = _parse_macro_params(sig.group(1) if sig else "")
+        declared: dict[str, set[str]] = {"global": set(), "local": set()}
+        for m in _SCOPE_DECL_RE.finditer(mt):
+            for name in _SPLIT_WS_COMMA_RE.split(m.group(2).strip()):
+                name = name.lstrip("&").rstrip(".")
+                if _IDENT_RE.fullmatch(name):
+                    declared[m.group(1).lower()].add(name.lower())
+        return cls(
+            name=meta.macro_name or "",
+            positional=tuple(n for n, d in params if d is None),
+            defaults=tuple((n, d) for n, d in params if d is not None),
+            params=frozenset(n for n, _ in params),
+            global_names=frozenset(declared["global"]),
+            local_names=frozenset(declared["local"]),
+            assignments=tuple(let_assignments(cf)),
+            produces=frozenset(meta.produces_macrovars),
+            conditional=bool(_MACRO_CONTROL_RE.search(mt)),
+            db_tables=tuple(meta.db_tables),
+        )
+
+    def global_effects(
+        self, globals_now: dict[str, str], binding: ChainMap[str, str]
+    ) -> dict[str, str]:
+        """What one call leaves in the *global* table, by SAS's scoping rule.
+
+        A ``%LET`` in the body updates the global variable when the name is
+        declared ``%GLOBAL`` there, or already exists globally and is neither a
+        parameter nor ``%LOCAL``; anything else lands in the macro's own local
+        table and vanishes with the call. Values resolve in body order against
+        the call's *binding*. A body with ``%IF``/``%DO``/``%GOTO`` may or may
+        not run an assignment, so every global it could touch becomes unknown
+        rather than guessed — including one holding a value before the call.
+        So does a global the body may overwrite with ``CALL SYMPUT``/``INTO``.
+        """
+        assigned: dict[str, str] = {}
+        local = ChainMap(assigned, *binding.maps)
+        effects: dict[str, str] = {}
+        for name, raw in self.assignments:
+            resolved = resolve_refs(raw, local) if has_macro_ref(raw) else raw
+            value = name_value(resolved) or ""
+            assigned[name] = value  # "" hides an outer value: unknown
+            if name in self.params or name in self.local_names:
+                continue
+            if name in self.global_names or name in globals_now or name in effects:
+                unknown = self.conditional or has_macro_ref(value)
+                effects[name] = "" if unknown else value
+        for name in self.produces:
+            if name in globals_now and name not in self.params | self.local_names:
+                effects[name] = ""
+        return effects
+
+
 class _MacroScope:
-    """The ``%LET`` table a source-order walk carries from chunk to chunk.
+    """The macro-variable table a source-order walk carries from chunk to chunk.
 
     The one definition of the scoping rules every resolution pass applies, so
     :func:`resolve_macro_var_refs` and :func:`resolve_db_librefs` cannot
-    disagree about what ``&name`` holds at a given chunk.
+    disagree about what ``&name`` holds at a given chunk. Its sources: ``%LET``
+    in open code; ``CALL SYMPUT``/``SYMPUTX`` with static values (and the
+    run-time producers that make a variable unknown); and the globals a called
+    ``%MACRO`` sets. The macros defined so far are kept too, for
+    :meth:`call` to bind a call's arguments.
     """
 
     def __init__(self) -> None:
         self._table: dict[str, str] = {}
+        self._macros: dict[str, _MacroDef] = {}
 
-    def enter(self, chunk: SasChunk) -> tuple[dict[str, str], dict[str, str]]:
+    def enter(self, chunk: SasChunk) -> tuple[Mapping[str, str], dict[str, str]]:
         """``(scope, own)`` for *chunk*: the table its names resolve against,
         and its own ``%LET`` values resolved where they stand.
 
@@ -968,30 +1144,109 @@ class _MacroScope:
         holds work.ab, and a later ``data &x;`` writes work.ab — not a
         reference to itself. Source order inside the chunk is dict insertion
         order, so ``%let a = prod; %let b = &a..orders;`` resolves in one walk.
+        A value that is not a name (``""``) makes the variable unknown.
         """
         meta = chunk.metadata
-        shadowed = set(meta.macro_param_names)
-        scope = (
-            {k: v for k, v in self._table.items() if k not in shadowed}
-            if shadowed
-            else dict(self._table)
-        )
+        # Layered, never copied: copying the table for every chunk made a file
+        # of thousands of %LETs quadratic. Parameters are hidden by an empty
+        # value, which resolve_refs reads as unknown.
+        hidden = dict.fromkeys(meta.macro_param_names, "")
+        overlay: dict[str, str] = {}
+        scope: Mapping[str, str] = ChainMap(overlay, hidden, self._table)
         own: dict[str, str] = {}
         for name, value in meta.macro_var_values.items():
             own[name] = resolve_refs(value, scope) if has_macro_ref(value) else value
-            if name not in shadowed:
-                scope[name] = own[name]
+            if name not in hidden:
+                overlay[name] = own[name]
         return scope, own
 
-    def leave(self, chunk: SasChunk, own: dict[str, str]) -> None:
-        """Carry *chunk*'s assignments forward to the chunks after it.
+    def _binding(
+        self, macro: _MacroDef, positional: list[str], keyword: dict[str, str]
+    ) -> ChainMap[str, str]:
+        """The table *macro*'s body resolves against for one call.
 
-        A ``%MACRO`` body's assignments are conditional on the macro being
-        called, so they never join the running table.
+        Defaults, then positional arguments by position, then keyword arguments
+        by name; each value resolved against the caller's globals. Every
+        parameter shadows a global of the same name, bound or not: an
+        unbound ``&tbl`` stays ``&tbl`` rather than borrowing a stranger's value.
         """
-        if own and chunk.kind is not SasChunkKind.MACRO_DEFINITION:
-            shadowed = set(chunk.metadata.macro_param_names)
-            self._table.update({k: v for k, v in own.items() if k not in shadowed})
+        supplied = dict(macro.defaults)
+        supplied.update(zip(macro.positional, positional))
+        supplied.update((k, v) for k, v in keyword.items() if k in macro.params)
+        bound: dict[str, str] = {}
+        for name, raw in supplied.items():
+            resolved = resolve_refs(raw, self._table) if has_macro_ref(raw) else raw
+            if value := name_value(resolved):
+                bound[name] = value
+        return ChainMap(bound, dict.fromkeys(macro.params, ""), self._table)
+
+    def call(self, chunk: SasChunk) -> tuple[_MacroDef, ChainMap[str, str]] | None:
+        """For a MACRO_CALL of a macro defined earlier: the definition, and the
+        table its body resolves against at this call. ``None`` otherwise."""
+        if chunk.kind is not SasChunkKind.MACRO_CALL:
+            return None
+        m = _CALLED_MACRO_RE.match(_sanitise(chunk.text))
+        macro = self._macros.get(m.group(1).lower()) if m else None
+        if macro is None:
+            return None
+        positional, keyword = _parse_call_args(chunk.text)
+        return macro, self._binding(macro, positional, keyword)
+
+    def leave(self, chunk: SasChunk, own: dict[str, str]) -> None:
+        """Carry what *chunk* leaves behind to the chunks after it.
+
+        Defining a ``%MACRO`` runs nothing: its assignments wait for a call, and
+        the definition is kept for :meth:`call`. Anything else applies, in
+        order, its own ``%LET`` values, what its run-time producers leave (see
+        :func:`_run_time_values`), and the global effects of the macros it
+        calls — with the call's arguments for a MACRO_CALL, the defaults alone
+        for a call inlined in another statement.
+        """
+        meta = chunk.metadata
+        if chunk.kind is SasChunkKind.MACRO_DEFINITION:
+            # Only the region's whole text holds the signature: a split child
+            # would register a body cut in half under the same name.
+            if chunk.parent_id is None and meta.macro_name:
+                self._macros[meta.macro_name] = _MacroDef.of(chunk)
+            return
+        for name, value in own.items():
+            _assign(self._table, name, value)
+        for name, value in _run_time_values(chunk).items():
+            _assign(self._table, name, value)
+        call = self.call(chunk)
+        invoked = (
+            [call]
+            if call
+            else [
+                (macro, self._binding(macro, [], {}))
+                for name in meta.invokes_macros
+                if (macro := self._macros.get(name)) is not None
+            ]
+        )
+        for macro, binding in invoked:
+            for name, value in macro.global_effects(self._table, binding).items():
+                _assign(self._table, name, value)
+
+
+def _call_site_tables(
+    macro: _MacroDef, binding: Mapping[str, str]
+) -> list[SasDbTableRef]:
+    """*macro*'s pass-through tables as one call of it reads them.
+
+    ``%pull(tbl=current_nonip, out=nonip)`` runs a body that says
+    ``create table &out as select * from connection to oracle (select * from
+    &schema..&tbl)``; resolved with the call's binding that is
+    ``edw_export.current_nonip → work.nonip``, recorded on the call's chunk and
+    marked with the macro's name. LIBNAME records are SAS names, which the
+    batcher already resolves per call for datasets.
+    """
+    return [
+        _resolve_db_table(ref, binding).model_copy(
+            update={"macro": macro.name, "parameterised": False}
+        )
+        for ref in macro.db_tables
+        if ref.via is not DbTableVia.LIBNAME and ref.macro is None
+    ]
 
 
 def resolve_macro_var_refs(chunks: list[SasChunk]) -> None:
@@ -1025,13 +1280,29 @@ def resolve_macro_var_refs(chunks: list[SasChunk]) -> None:
     macros = _MacroScope()
     for idx, chunk in enumerate(chunks):
         scope, own = macros.enter(chunk)
-        if scope or own:
-            resolved = _resolved_meta(chunk.metadata, scope, own)
-            if resolved is not None:
-                updates: dict[str, Any] = {"metadata": resolved}
-                if resolved.step_name != chunk.metadata.step_name:
-                    updates["title"] = _title(chunk.kind, resolved)
-                chunks[idx] = chunk.model_copy(update=updates)
+        meta = chunk.metadata
+        updates: dict[str, Any] = {}
+        resolved = _resolved_meta(meta, scope, own) if scope or own else None
+        if resolved is not None:
+            updates["metadata"] = resolved
+            if resolved.step_name != meta.step_name:
+                updates["title"] = _title(chunk.kind, resolved)
+        # A call of a macro defined earlier reads the tables its body names,
+        # resolved with this call's arguments. Recomputed on every run (not
+        # added to), so the corpus-level run replaces the file-level answer.
+        current = resolved or meta
+        call = macros.call(chunk)
+        tables = sorted(
+            {
+                *(t for t in current.db_tables if t.macro is None),
+                *(_call_site_tables(*call) if call else ()),
+            },
+            key=_db_table_sort_key,
+        )
+        if tables != current.db_tables:
+            updates["metadata"] = current.model_copy(update={"db_tables": tables})
+        if updates:
+            chunks[idx] = chunk = chunk.model_copy(update=updates)
         macros.leave(chunk, own)
 
 

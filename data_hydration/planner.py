@@ -139,7 +139,8 @@ def _db_table_source(
     ref: "SasDbTableRef", source_id: str | None
 ) -> tuple[HydrationSource, tuple[str, ...]] | None:
     """A source for one database table the corpus *reads*, with the blockers
-    only this kind of source can have — or ``None`` for a write.
+    only this kind of source can have — or ``None`` for a write, or for a
+    macro-body template named by the macro's own parameters.
 
     A write is something the converted job produces, never a table to load.
     ``object_name`` is ``owner.table`` (``partition._owner_of`` and the Oracle
@@ -147,7 +148,9 @@ def _db_table_source(
     no join by alias is needed. Compared by the string value of the chunker's
     enums, which keeps this module free of a run-time chunker import.
     """
-    if str(ref.access) != "read":
+    if str(ref.access) != "read" or ref.parameterised:
+        # A write is the job's output; a parameterised name is a template in a
+        # macro body, whose every call is recorded — resolved — on its own.
         return None
     options = ref.option_map
     blockers: list[str] = []

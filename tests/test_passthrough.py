@@ -493,6 +493,243 @@ class TestMacroResolution(unittest.TestCase):
         )
 
 
+# ── 7b. Every source of a macro variable's value ───────────────────────────
+
+
+def _read(source: str, **kwargs):
+    """Every database table *source* names, as ``(record, chunk kind)`` pairs."""
+    return [
+        (t, c.kind)
+        for c in _chunk(source, **kwargs).chunks
+        for t in c.metadata.db_tables
+    ]
+
+
+def _query(sql: str, prefix: str = "", alias: str = "oracle") -> str:
+    return (
+        f"{prefix}proc sql;\nconnect to oracle (path=P);\n"
+        f"create table out as select * from connection to {alias}\n({sql});\nquit;\n"
+    )
+
+
+PULL = (
+    "%macro pull(schema=edw_export, tbl=, out=);\n"
+    "proc sql;\nconnect to oracle (path=P);\n"
+    "create table &out as select * from connection to oracle\n"
+    "  (select * from &schema..&tbl);\n"
+    "quit;\n%mend;\n"
+)
+
+
+class TestNameShapes(unittest.TestCase):
+    """Where a macro reference sits in an Oracle name, resolved or not."""
+
+    def _one(self, source: str):
+        (table,) = [t for t, _ in _read(source)]
+        return table
+
+    def test_schema_table_or_both(self):
+        for sql, prefix in (
+            ("&sch..current_nonip", "%let sch = EDW_EXPORT;\n"),
+            ("edw_export.&tbl", "%let tbl = CURRENT_NONIP;\n"),
+            ("&sch..&tbl", "%let sch = edw_export;\n%let tbl = current_nonip;\n"),
+            ("&full", "%let full = edw_export.current_nonip;\n"),
+            ('"&sch"."&tbl"', "%let sch = EDW_EXPORT;\n%let tbl = CURRENT_NONIP;\n"),
+        ):
+            with self.subTest(sql=sql):
+                table = self._one(_query(f"select * from {sql}", prefix))
+                self.assertEqual(table.qualified, "edw_export.current_nonip")
+                self.assertFalse(table.has_macro_ref)
+
+    def test_a_reference_inside_a_name(self):
+        table = self._one(_query("select * from edw_export.t_&sfx._v", "%let sfx = med;\n"))
+        self.assertEqual(table.qualified, "edw_export.t_med_v")
+
+    def test_an_unresolved_name_splits_where_sas_would(self):
+        # The dot after &sfx is its delimiter, not a separator: one table.
+        table = self._one(_query("select * from edw_export.t_&sfx._v"))
+        self.assertEqual((table.db_schema, table.table), ("edw_export", "t_&sfx._v"))
+        self.assertTrue(table.has_macro_ref)
+        table = self._one(_query("select * from &sch..current_nonip"))
+        self.assertEqual((table.db_schema, table.table), ("&sch", "current_nonip"))
+
+    def test_an_indirect_reference_needs_its_extra_dot(self):
+        prefix = "%let env = prod;\n%let sch_prod = edw_prod;\n"
+        table = self._one(_query("select * from &&sch_&env...current_nonip", prefix))
+        self.assertEqual(table.qualified, "edw_prod.current_nonip")
+        # With two dots each rescan eats one, and SAS itself sends one name.
+        table = self._one(_query("select * from &&sch_&env..current_nonip", prefix))
+        self.assertEqual(table.qualified, "edw_prodcurrent_nonip")
+
+    def test_one_dot_after_a_reference_concatenates(self):
+        table = self._one(_query("select * from &sch.current_nonip", "%let sch = edw_;\n"))
+        self.assertEqual(table.qualified, "edw_current_nonip")
+
+
+class TestValueSources(unittest.TestCase):
+    """Where the value comes from — and when it stops being known."""
+
+    def _qualified(self, source: str) -> list[str]:
+        return [t.qualified for t, kind in _read(source) if kind == SasChunkKind.PROC_STEP]
+
+    def test_call_symputx_with_literals(self):
+        prefix = "data _null_;\n  call symputx('sch', 'EDW_EXPORT');\nrun;\n"
+        self.assertEqual(
+            self._qualified(_query("select * from &sch..t", prefix)), ["edw_export.t"]
+        )
+
+    def test_a_value_from_a_data_column_is_unknown(self):
+        prefix = "%let sch = old;\ndata _null_; set cfg; call symputx('sch', s); run;\n"
+        self.assertEqual(self._qualified(_query("select * from &sch..t", prefix)), ["&sch.t"])
+
+    def test_two_conflicting_literal_calls_are_unknown(self):
+        prefix = (
+            "data _null_; if x then call symputx('sch','A'); "
+            "else call symputx('sch','B'); run;\n"
+        )
+        self.assertEqual(self._qualified(_query("select * from &sch..t", prefix)), ["&sch.t"])
+
+    def test_sql_into_replaces_an_earlier_let(self):
+        prefix = "%let sch = old;\nproc sql; select s into :sch from cfg; quit;\n"
+        self.assertEqual(self._qualified(_query("select * from &sch..t", prefix))[-1], "&sch.t")
+
+    def test_a_let_to_a_non_name_replaces_an_earlier_one(self):
+        prefix = "%let sch = old;\n%let sch = %scan(&list, 2);\n"
+        self.assertEqual(self._qualified(_query("select * from &sch..t", prefix)), ["&sch.t"])
+
+    def test_a_libname_schema_option_in_quotes(self):
+        src = (
+            '%let sch = FR_DM;\nlibname edw oracle path=P schema="&sch";\n'
+            "data work.a; set edw.accounts; run;\n"
+        )
+        self.assertEqual(
+            [t.qualified for t, _ in _read(src) if t.via is DbTableVia.LIBNAME],
+            ["fr_dm.accounts"],
+        )
+
+
+class TestMacroCalls(unittest.TestCase):
+    """Utility macros: tables named by parameters, globals set by a call."""
+
+    def test_a_call_resolves_its_parameters(self):
+        rows = _read(PULL + "%pull(tbl=current_nonip, out=nonip);\n")
+        template = [t for t, k in rows if k == SasChunkKind.MACRO_DEFINITION]
+        called = [t for t, k in rows if k == SasChunkKind.MACRO_CALL]
+        self.assertEqual(len(template), 1)
+        self.assertTrue(template[0].parameterised)
+        (table,) = called
+        self.assertEqual(
+            str(table),
+            "oracle:edw_export.current_nonip → work.nonip "
+            "(read via connection_to oracle in %pull)",
+        )
+        self.assertFalse(table.parameterised)
+
+    def test_positional_arguments_and_a_global_passed_in(self):
+        src = (
+            "%macro p2(s, t);\nproc sql;\ncreate table x as select * from "
+            "connection to oracle (select * from &s..&t);\nquit;\n%mend;\n"
+            "%let mytab = accounts;\n%p2(fr_dm, &mytab);\n"
+        )
+        called = [t.qualified for t, k in _read(src) if k == SasChunkKind.MACRO_CALL]
+        self.assertEqual(called, ["fr_dm.accounts"])
+
+    def test_a_parameter_shadows_a_global_of_the_same_name(self):
+        rows = _read("%let tbl = wrong;\n" + PULL + "%pull(out=nonip);\n")
+        (table,) = [t for t, k in rows if k == SasChunkKind.MACRO_CALL]
+        self.assertEqual(table.qualified, "edw_export.&tbl")
+        self.assertTrue(table.has_macro_ref)
+
+    def test_each_call_reads_its_own_table(self):
+        rows = _read(PULL + "%pull(tbl=a, out=x);\n%pull(tbl=b, out=y);\n")
+        called = sorted(t.qualified for t, k in rows if k == SasChunkKind.MACRO_CALL)
+        self.assertEqual(called, ["edw_export.a", "edw_export.b"])
+
+    def test_a_call_before_the_definition_reads_nothing_yet(self):
+        rows = _read("%pull(tbl=a, out=x);\n" + PULL)
+        self.assertEqual([t for t, k in rows if k == SasChunkKind.MACRO_CALL], [])
+
+    def test_a_macro_defined_in_another_file(self):
+        macros = _chunk(PULL, source_id="macros.sas")
+        job = _chunk("%pull(tbl=current_nonip, out=nonip);\n", source_id="job.sas")
+        resolved = resolve_corpus_references(SasCorpus(file_results=[macros, job]))
+        (table,) = resolved.file_results[1].chunks[0].metadata.db_tables
+        self.assertEqual((table.qualified, table.macro), ("edw_export.current_nonip", "pull"))
+        batched = MultiFileBatcher().batch(SasCorpus(file_results=[macros, job]))
+        self.assertIn(
+            "edw_export.current_nonip",
+            [t.qualified for b in batched.batches for t in b.db_tables]
+            + [t.qualified for c in batched.singletons for t in c.metadata.db_tables],
+        )
+
+    def test_global_set_by_a_called_macro(self):
+        src = "%macro init;\n%global sch;\n%let sch = edw_export;\n%mend;\n%init;\n"
+        self.assertEqual(
+            [t.qualified for t, _ in _read(src + _query("select * from &sch..t"))],
+            ["edw_export.t"],
+        )
+
+    def test_an_existing_global_updated_inside_a_macro(self):
+        src = "%let sch = dev;\n%macro setp;\n%let sch = prod_s;\n%mend;\n%setp;\n"
+        self.assertEqual(
+            [t.qualified for t, _ in _read(src + _query("select * from &sch..t"))],
+            ["prod_s.t"],
+        )
+
+    def test_a_conditional_assignment_makes_the_global_unknown(self):
+        src = (
+            "%let sch = dev;\n%macro sete(e);\n"
+            "%if &e = P %then %let sch = prod_s;\n%mend;\n%sete(P);\n"
+        )
+        self.assertEqual(
+            [t.qualified for t, _ in _read(src + _query("select * from &sch..t"))],
+            ["&sch.t"],
+        )
+
+    def test_local_and_undeclared_assignments_stay_in_the_macro(self):
+        local = "%let sch = dev;\n%macro loc;\n%local sch;\n%let sch = inner;\n%mend;\n%loc;\n"
+        self.assertEqual(
+            [t.qualified for t, _ in _read(local + _query("select * from &sch..t"))],
+            ["dev.t"],
+        )
+        fresh = "%macro newv;\n%let fresh = inner;\n%mend;\n%newv;\n"
+        self.assertEqual(
+            [t.qualified for t, _ in _read(fresh + _query("select * from &fresh..t"))],
+            ["&fresh.t"],
+        )
+
+    def test_resolution_with_calls_is_idempotent(self):
+        result = _chunk(PULL + "%pull(tbl=current_nonip, out=nonip);\n")
+        chunks = list(result.chunks)
+        resolve_references(chunks)
+        self.assertEqual([c.metadata for c in chunks], [c.metadata for c in result.chunks])
+
+
+class TestConnectionNames(unittest.TestCase):
+    def test_an_alias_spelled_through_a_macro_variable(self):
+        src = _query("select * from s.t", "%let db = oracle;\n", alias="&db")
+        (table,) = [t for t, _ in _read(src)]
+        self.assertEqual((table.engine, table.connection), ("oracle", "oracle"))
+
+    def test_an_unresolved_alias_is_still_pass_through(self):
+        # The statement must be recognised even when its alias is unknown, or
+        # its SQL is read as SAS and invents work.connection again.
+        result = _chunk(_query("select * from s.t", alias="&db"))
+        proc = _of_kind(result, SasChunkKind.PROC_STEP)[0]
+        self.assertEqual(proc.metadata.input_datasets, [])
+        (table,) = proc.metadata.db_tables
+        self.assertIsNone(table.engine)
+        self.assertEqual(table.connection, "&db")
+
+    def test_an_engine_spelled_through_a_macro_variable(self):
+        src = (
+            "%let eng = oracle;\nproc sql;\nconnect to &eng as x (path=P);\n"
+            "create table a as select * from connection to x (select * from s.t);\nquit;\n"
+        )
+        (table,) = [t for t, _ in _read(src)]
+        self.assertEqual((table.engine, table.connection), ("oracle", "x"))
+
+
 # ── 8. Database-engine LIBNAMEs ────────────────────────────────────────────
 
 
