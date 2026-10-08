@@ -513,6 +513,28 @@ is not knowable yet. Consumers link to the **nearest preceding producer** in
 corpus order — the state a sequential SAS session would actually read — so
 unrelated jobs reusing `work.tmp` stay separate.
 
+The roles decide what counts as a producer. A WRITE or UPDATE ref produces its
+name, so a step that appends to or modifies a table depends on the table's
+earlier producer and is itself the producer a later reader links to. A DROP
+ref produces nothing, and a MENTION ref is not dataset flow at all. Pattern
+refs take part on both sides:
+
+- A **pattern input** (`set lib.sales_:;`) links to the nearest preceding
+  producer of each name its prefix covers. The names come from a sorted index
+  of every produced name, searched by bisection. One edge goes to each source
+  chunk; its `via` is the alphabetically first name that chunk supplied.
+- A **whole-library input** (`lib.:`, from CONTENTS of `_ALL_` or a COPY of
+  every member) links nothing. Tying one housekeeping step to every producer in
+  the library would fuse unrelated jobs into one batch.
+- A **pattern output** (`tgt.:`, from a COPY with no SELECT) produces every
+  name it covers. A later `set tgt.cust;` links to the COPY when the COPY is
+  nearer than any step that wrote `tgt.cust` by name.
+- `_LAST_` skips a pattern output, since a COPY of a whole library creates no
+  one data set.
+
+The same nearest-producer lookup serves `dataset_flow`, `macro_arg_dataset` and
+the resolved inputs of `macro_body_dataset`.
+
 ## Load-bearing invariants
 
 Things that look like implementation details but are contracts. Breaking any of

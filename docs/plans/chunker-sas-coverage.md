@@ -1,8 +1,10 @@
 # Plan: close the chunker's SAS coverage gaps (breaking changes allowed)
 
-Status: Phases 0–7 implemented. `tests/test_sas_coverage.py` holds 184 probes:
+Status: Phases 0–8 implemented. `tests/test_sas_coverage.py` holds 184 probes:
 the 168 from the coverage review, 15 precision probes (`X01`–`X15`), and G22
-(INFILE through a fileref). All of them pass. Phases 8–9 are not started.
+(INFILE through a fileref). All of them pass. Phase 9 is not started. Phase 8
+raised an open question about tables updated in place by several files; see
+its section.
 
 ## Context
 
@@ -535,7 +537,51 @@ Done as planned, with these differences:
 
 Probes flipped: G20, G21, M23, plus a new probe for INFILE through a fileref.
 
-## Phase 8: batcher and consumers (S)
+## Phase 8: batcher and consumers (S) — done
+
+Done as planned, with these differences:
+
+- **One producer lookup.** `_EdgeDiscovery._nearest_producer(name, idx)`
+  returns the nearest producer before `idx`: by name, or a pattern output
+  covering the name, whichever is later. `dataset_flow`, `macro_arg_dataset`
+  and the resolved inputs of `macro_body_dataset` all use it.
+- **Indices.** `_build_indices` adds `ds_names`, every produced name sorted.
+  It also adds `pattern_outputs`, mapping each written prefix to its producers
+  and sharing the `produces_ds` lists. A macro call that resolves a new output
+  name adds it to `ds_names`.
+- **Pattern inputs.** `_pattern_flow` links each source chunk once. It covers
+  each name under the prefix and each written pattern that overlaps it. A
+  whole-library input (`lib.:`, from CONTENTS `_ALL_` or COPY) links nothing,
+  so a housekeeping step cannot fuse every job writing to that library.
+- **`_LAST_`** is the last output that is not a pattern.
+- **Complexity.** `ChunkComplexity` and `FileComplexity` gain
+  `updated_datasets` and `dropped_datasets`. The Paths section gains a last
+  group for FILEREF refs that no FILENAME assigns. Before, a file with only
+  such refs printed an empty Paths heading.
+- **Behaviour,** against Phase 7: chunk metadata and batches are identical on
+  the probe corpus (23 batches, 114 singletons) and the 1,500-chunk file. The
+  e2e reports and hydration plans are unchanged.
+- **Performance.** Batching is within noise of Phase 7. Chunking is unchanged
+  by this phase, at 10–11% over Phase 0 on the 900 KB files.
+
+**Open question (behaviour left unchanged).** An UPDATE ref puts its table in
+both lists. Two complexity consumers treat a table written in a file as
+satisfied by that file:
+
+- `complexity.crossfile` and the Datasets rollup. A file that only updates a
+  table lists it as an intermediate and imports it from no file. The file
+  that creates the table still lists the updater as depending on it.
+- Several files updating one table depend on each other through it: for
+  example, jobs that each append to a shared audit table. The dependency graph
+  reports them as a cycle, and the migration waves leave them unordered.
+
+In-place SORT and `data x; set x;` behaved this way before this plan. Phases 4
+and 5 made UPDATE refs common (APPEND `base=`, SQL INSERT/UPDATE/DELETE,
+MODIFY). In the batcher, an update links to the nearest preceding writer, as
+the breaking-changes table intends. So jobs appending to one table share a
+batch.
+
+The plan as written:
 
 - **Dataset flow (`_dataset_flow`, `_build_indices`).** Pattern refs match
   producers sharing their libref and prefix: a sorted name index with bisect,

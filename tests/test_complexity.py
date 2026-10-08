@@ -2412,6 +2412,49 @@ class TestDatasets(unittest.TestCase):
         text = render_file_report(_file(_analyze("%let x = 1;\n"), "t.sas"))
         self.assertNotIn("## Datasets", text)
 
+    # Appends to mart.hist, inserts into mart.log, and deletes three tables.
+    MAINTENANCE = (
+        "data work.stg; set edw.raw; run;\n"
+        "proc append base=mart.hist data=work.stg; run;\n"
+        "proc sql; insert into mart.log select * from work.stg;"
+        " drop table work.old; quit;\n"
+        "proc datasets lib=work nolist; delete tmp1 tmp2; quit;\n"
+    )
+
+    def test_updates_and_deletes_are_named_per_chunk(self):
+        chunks = sorted(
+            _file(_analyze(self.MAINTENANCE), "t.sas").chunks,
+            key=lambda c: c.start_line,
+        )
+        self.assertEqual(chunks[0].updated_datasets, [])
+        self.assertEqual(chunks[1].updated_datasets, ["mart.hist"])
+        self.assertEqual(chunks[2].updated_datasets, ["mart.log"])
+        self.assertEqual(chunks[2].dropped_datasets, ["work.old"])
+        self.assertEqual(chunks[3].dropped_datasets, ["work.tmp1", "work.tmp2"])
+        # An updated table is read and written; a deleted one is neither.
+        self.assertIn("mart.hist", chunks[1].input_datasets)
+        self.assertIn("mart.hist", chunks[1].output_datasets)
+        self.assertNotIn("work.old", chunks[2].output_datasets)
+
+    def test_the_report_calls_out_updates_and_deletes(self):
+        file = _file(_analyze(self.MAINTENANCE), "t.sas")
+        self.assertEqual(file.updated_datasets, ["mart.hist", "mart.log"])
+        self.assertEqual(file.dropped_datasets, ["work.old", "work.tmp1", "work.tmp2"])
+        text = render_file_report(file)
+        self.assertIn(
+            "- Updated in place (rows added or changed): mart.hist, mart.log", text
+        )
+        self.assertIn("- Deleted: work.old, work.tmp1, work.tmp2", text)
+
+    def test_a_file_that_only_deletes_still_gets_a_section(self):
+        file = _file(
+            _analyze("proc datasets lib=work nolist; delete tmp1; quit;\n"), "t.sas"
+        )
+        text = render_file_report(file)
+        self.assertIn("## Datasets", text)
+        self.assertIn("- Deleted: work.tmp1", text)
+        self.assertNotIn("Updated in place", text)
+
     def test_the_rollup_agrees_with_cross_file_coupling(self):
         """An imported dataset must not also be claimed as locally produced."""
         report = ComplexityAnalyzer().analyze_corpus(
@@ -3018,6 +3061,24 @@ class TestPathsSection(unittest.TestCase):
         self.assertIn(
             "**(unresolved macro reference)**", render_file_report(scored, texts={})
         )
+
+    def test_a_fileref_no_filename_assigns_gets_its_own_group(self):
+        scored = _file(_analyze("data work.r; infile rawin; input x; run;\n"), "t.sas")
+        text = render_file_report(scored, texts={})
+        self.assertIn("- Filerefs no FILENAME in the corpus assigns:", text)
+        self.assertIn("`rawin` — infile `rawin`", text)
+
+    def test_a_fileref_a_filename_assigns_is_reported_where_it_points(self):
+        scored = _file(
+            _analyze(
+                "filename rawin '/data/in/raw.txt';\n"
+                "data work.r; infile rawin; input x; run;\n"
+            ),
+            "t.sas",
+        )
+        text = render_file_report(scored, texts={})
+        self.assertNotIn("Filerefs no FILENAME", text)
+        self.assertIn("`rawin` — infile `rawin`", text)
 
 
 class TestDatabaseTablesSection(unittest.TestCase):

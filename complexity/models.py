@@ -133,6 +133,10 @@ class ChunkComplexity(_ComplexityBase):
     # are small, and a rollup needs them per chunk to be auditable.
     input_datasets: list[str] = Field(default_factory=list)
     output_datasets: list[str] = Field(default_factory=list)
+    # Of those, the ones rewritten in place (MODIFY, APPEND BASE=, SQL INSERT/
+    # UPDATE/DELETE), and the ones it deletes (PROC DATASETS DELETE, SQL DROP).
+    updated_datasets: list[str] = Field(default_factory=list)
+    dropped_datasets: list[str] = Field(default_factory=list)
     # The external locations this chunk names — the filesystem paths, remote
     # services and mailboxes behind its LIBNAME/FILENAME/INFILE/... statements.
     # Carried up for the same reason as the datasets above: a file's path list
@@ -278,6 +282,11 @@ class FileComplexity(_ComplexityBase):
     input_datasets: list[str] = Field(default_factory=list)
     output_datasets: list[str] = Field(default_factory=list)
     intermediate_datasets: list[str] = Field(default_factory=list)
+    # Datasets the file rewrites in place — each also an input and an output
+    # above, and the place a migration most easily turns an append into an
+    # overwrite — and the ones it deletes.
+    updated_datasets: list[str] = Field(default_factory=list)
+    dropped_datasets: list[str] = Field(default_factory=list)
     # Everywhere outside the SAS libraries this file reaches. Reported, never
     # scored: like the dataset interface above it says what a migration has to
     # provision, which is not the same question as how hard the code is.

@@ -762,6 +762,14 @@ creator (the last assignment before the reference is the one whose value
 SAS resolves), so a name reassigned across unrelated jobs cannot fuse
 them, and a reference before any assignment gets no edge.
 
+WRITE and UPDATE refs produce a name; DROP and MENTION refs do not. A
+pattern input (`set lib.sales_:;`) links to the nearest preceding producer
+of each produced name its prefix covers, found by bisection in a sorted name
+index. A whole-library input (`lib.:`) links nothing, so a housekeeping step
+cannot fuse every job that writes to the library. A pattern output (`tgt.:`
+from a whole-library COPY) produces every name it covers, and `_LAST_`
+skips it.
+
 ## Pipeline and memory
 
 `SasLLMPipeline` compiles a one-node LangGraph `StateGraph(MessagesState)`.

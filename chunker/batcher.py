@@ -240,10 +240,13 @@ def _resolve_implicit_datasets(flat_chunks: list[SasChunk]) -> None:
         if updated is not meta:
             flat_chunks[idx] = chunk.model_copy(update={"metadata": updated})
 
-        if outputs := updated.output_datasets:
-            # SAS sets _LAST_ to the most recently created data set; for a
-            # multi-dataset DATA statement that is the last one named.
-            last_created = outputs[-1]
+        # SAS sets _LAST_ to the most recently created data set; for a
+        # multi-dataset DATA statement that is the last one named. A pattern
+        # (a COPY's `tgt.:`) names no one data set.
+        for name in reversed(updated.output_datasets):
+            if not name.endswith(":"):
+                last_created = name
+                break
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +631,12 @@ class _EdgeDiscovery:
         # SYMPUT/SQL-INTO side effects or %LET/%GLOBAL/%LOCAL declarations
         # (both treated identically).
         self.produces_macrovar: dict[str, list[int]] = defaultdict(list)
+        # Every produced name, sorted, so a pattern input (`set lib.sales_:;`)
+        # finds the names its prefix covers by bisection; and each pattern
+        # written (`tgt.:` after a whole-library COPY) by its prefix, sharing
+        # produces_ds's lists.
+        self.ds_names: list[str] = []
+        self.pattern_outputs: dict[str, list[int]] = {}
 
     # ------------------------------------------------------------------
     # Shared edge constructor
@@ -723,6 +732,10 @@ class _EdgeDiscovery:
                             f"index[ds-literal-body]: chunk {chunk.chunk_id} (g{gidx}) macro body writes '{ds}'"
                         )
 
+        self.ds_names = sorted(self.produces_ds)
+        self.pattern_outputs = {
+            name[:-1]: plist for name, plist in self.produces_ds.items() if name.endswith(":")
+        }
         logger.debug(
             f"index built  unique_output_datasets={len(self.produces_ds)}  unique_macro_definitions={len(self.defines_macro)}"
         )
@@ -769,26 +782,73 @@ class _EdgeDiscovery:
         # order — the state a sequential SAS session would read — so independent
         # jobs reusing a scratch name like work.tmp stay in separate components.
         for ds in meta.input_datasets:
-            plist = self.produces_ds.get(ds)
-            if not plist:
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        f"edge-skip[ds]: '{ds}' read by {chunk.chunk_id} — no producer in corpus"
-                    )
+            if ds.endswith(":"):
+                self._pattern_flow(cidx, chunk, ds)
                 continue
-            pos = bisect_left(plist, cidx) - 1
-            if pos < 0:
+            src = self._nearest_producer(ds, cidx)
+            if src is None:
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
-                        f"edge-skip[ds]: '{ds}' read by {chunk.chunk_id} — no preceding producer"
+                        f"edge-skip[ds]: '{ds}' read by {chunk.chunk_id} — "
+                        + ("no preceding producer" if ds in self.produces_ds else "no producer in corpus")
                     )
                 continue
             self._add_edge(
                 kind="dataset_flow",
-                from_idx=plist[pos],
+                from_idx=src,
                 to_idx=cidx,
                 via=ds,
             )
+
+    def _nearest_producer(self, ds: str, cidx: int) -> int | None:
+        """The nearest chunk before *cidx* that writes *ds*: by name, or as a
+        member of a pattern it wrote (a whole-library COPY's ``tgt.:``)."""
+        plist = self.produces_ds.get(ds)
+        pos = bisect_left(plist, cidx) - 1 if plist else -1
+        src = plist[pos] if plist and pos >= 0 else None
+        for prefix, producers in self.pattern_outputs.items():
+            if ds.startswith(prefix):
+                at = bisect_left(producers, cidx) - 1
+                if at >= 0 and (src is None or producers[at] > src):
+                    src = producers[at]
+        return src
+
+    def _pattern_flow(
+        self, cidx: int, chunk: SasChunk, pattern: str, *, kind: str = "dataset_flow"
+    ) -> None:
+        """A pattern input reads every dataset its prefix names: ``set
+        lib.sales_:;`` links to the nearest preceding producer of each
+        ``lib.sales_*`` written before it, and of each pattern written that
+        overlaps it.
+
+        A whole library (``lib.:`` — CONTENTS of ``_ALL_``, a COPY of every
+        member) links nothing: tying one housekeeping step to every producer
+        in the library would fuse unrelated jobs into one batch, and says
+        nothing about what the step needs translated with it.
+        """
+        prefix = pattern[:-1]
+        if prefix.endswith("."):
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"edge-skip[ds]: '{pattern}' read by {chunk.chunk_id} — a whole library"
+                )
+            return
+        sources: dict[int, str] = {}
+        for name in self.ds_names[bisect_left(self.ds_names, prefix) :]:
+            if not name.startswith(prefix):
+                break
+            src = self._nearest_producer(name, cidx)
+            if src is not None:
+                sources.setdefault(src, name)
+        for written, producers in self.pattern_outputs.items():
+            # Two prefixes name a common dataset when one extends the other:
+            # `lib.:` written covers `lib.sales_:`, and so would `lib.sales_e:`.
+            if prefix.startswith(written) or written.startswith(prefix):
+                pos = bisect_left(producers, cidx) - 1
+                if pos >= 0:
+                    sources.setdefault(producers[pos], written + ":")
+        for src, via in sorted(sources.items()):
+            self._add_edge(kind=kind, from_idx=src, to_idx=cidx, via=via)
 
     def _macrovar_flow(
         self, cidx: int, chunk: SasChunk, meta: SasChunkMetadata
@@ -862,15 +922,12 @@ class _EdgeDiscovery:
                 if ds_norm in seen_arg_ds:
                     continue
                 seen_arg_ds.add(ds_norm)
-                plist = self.produces_ds.get(ds_norm)
-                if not plist:
-                    continue
-                pos = bisect_left(plist, cidx) - 1
-                if pos < 0:
+                src = self._nearest_producer(ds_norm, cidx)
+                if src is None:
                     continue
                 self._add_edge(
                     kind="macro_arg_dataset",
-                    from_idx=plist[pos],
+                    from_idx=src,
                     to_idx=cidx,
                     via=ds_norm,
                 )
@@ -944,6 +1001,8 @@ class _EdgeDiscovery:
             # (not append) keeps produces_ds sorted, the invariant the
             # nearest-preceding bisect lookups rely on.
             for ds in resolved_outputs:
+                if ds not in self.produces_ds:
+                    insort(self.ds_names, ds)
                 if cidx not in self.produces_ds[ds]:
                     insort(self.produces_ds[ds], cidx)
                     if logger.isEnabledFor(logging.DEBUG):
@@ -979,12 +1038,10 @@ class _EdgeDiscovery:
             # Link this call site to the nearest preceding producer of each
             # resolved input (whose actual name is only known at this site).
             for ds in resolved_inputs:
-                plist = self.produces_ds.get(ds)
-                preceding = None
-                if plist:
-                    pos = bisect_left(plist, cidx) - 1
-                    if pos >= 0:
-                        preceding = plist[pos]
+                if ds.endswith(":"):
+                    self._pattern_flow(cidx, chunk, ds, kind="macro_body_dataset")
+                    continue
+                preceding = self._nearest_producer(ds, cidx)
                 if preceding is None:
                     if logger.isEnabledFor(logging.DEBUG):
                         logger.debug(

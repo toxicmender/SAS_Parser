@@ -60,6 +60,7 @@ from typing import Iterable
 
 import app_config
 from chunker.models import (
+    DatasetRole,
     SasBatch,
     SasBatchResult,
     SasChunk,
@@ -88,8 +89,10 @@ from .models import (
 from .rules import RuleSet, SizeModel, load_ruleset
 from .scoring import (
     _chunk_inputs,
+    _chunk_names,
     _chunk_outputs,
     _contained_steps,
+    _dedupe,
     _file_datasets,
     _file_db_tables,
     _file_paths,
@@ -291,6 +294,8 @@ class ComplexityAnalyzer:
             end_line=chunk.end_line,
             input_datasets=_chunk_inputs(chunk.metadata),
             output_datasets=_chunk_outputs(chunk.metadata),
+            updated_datasets=_chunk_names(chunk.metadata, DatasetRole.UPDATE),
+            dropped_datasets=_chunk_names(chunk.metadata, DatasetRole.DROP),
             external_refs=chunk.metadata.external_refs,
             db_tables=chunk.metadata.db_tables,
             tier=tier,
@@ -594,6 +599,8 @@ class ComplexityAnalyzer:
                     input_datasets=reads,
                     output_datasets=writes,
                     intermediate_datasets=intermediates,
+                    updated_datasets=_dedupe(d for c in scored for d in c.updated_datasets),
+                    dropped_datasets=_dedupe(d for c in scored for d in c.dropped_datasets),
                     external_refs=external_refs,
                     db_tables=db_tables,
                     chunks=scored,

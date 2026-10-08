@@ -771,6 +771,129 @@ class TestOrderAwareDatasetFlow(unittest.TestCase):
         self.assertEqual(len(br.singletons), 2)
 
 
+class TestPatternDatasetFlow(unittest.TestCase):
+    """Dataset lists (``set lib.sales_:;``) and whole-library writes (a COPY
+    with no SELECT writes ``tgt.:``) under the nearest-producer rule."""
+
+    def test_prefix_input_links_each_matching_producer(self):
+        src = (
+            "data mylib.sales_east; set raw.e; run;\n"
+            "data mylib.sales_west; set raw.w; run;\n"
+            "data mylib.other; set raw.o; run;\n"
+            "data work.all_sales; set mylib.sales_:; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertEqual(
+            [c.chunk_id for c in br.batches[0].chunks],
+            ["chunk-0001", "chunk-0002", "chunk-0004"],
+        )
+        self.assertIn("dataset_flow(mylib.sales_east)", br.batches[0].reason)
+        self.assertIn("dataset_flow(mylib.sales_west)", br.batches[0].reason)
+        self.assertEqual(_singleton_ids(br), ["chunk-0003"])
+
+    def test_prefix_input_takes_only_preceding_producers(self):
+        src = (
+            "data work.all_sales; set mylib.sales_:; run;\n"
+            "data mylib.sales_east; set raw.e; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 0)
+
+    def test_whole_library_input_links_nothing(self):
+        """CONTENTS of _ALL_ reads every member; tying it to every producer in
+        the library would fuse unrelated jobs, so it stays alone."""
+        src = (
+            "data mylib.a; set raw.e; run;\n"
+            "proc contents data=mylib._all_; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 0)
+        self.assertEqual(len(br.singletons), 2)
+
+    def test_whole_library_copy_produces_its_members(self):
+        src = (
+            "proc copy in=src out=tgt; run;\n"
+            "data work.x; set tgt.cust; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertIn("dataset_flow(tgt.cust)", br.batches[0].reason)
+
+    def test_whole_library_copy_covers_a_prefix_input(self):
+        src = (
+            "proc copy in=src out=tgt; run;\n"
+            "data work.x; set tgt.cust_:; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertIn("dataset_flow(tgt.:)", br.batches[0].reason)
+
+    def test_prefix_input_after_a_copy_skips_the_overwritten_producer(self):
+        """The COPY replaced tgt.cust_a, so the list reads the COPY's copy."""
+        src = (
+            "data tgt.cust_a; set raw.c; run;\n"
+            "proc copy in=src out=tgt; run;\n"
+            "data work.x; set tgt.cust_:; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertEqual(
+            [c.chunk_id for c in br.batches[0].chunks], ["chunk-0002", "chunk-0003"]
+        )
+
+    def test_later_copy_replaces_an_earlier_exact_producer(self):
+        """The COPY overwrote tgt.cust after the DATA step wrote it, so the
+        reader depends on the COPY, the nearest producer."""
+        src = (
+            "data tgt.cust; set raw.c; run;\n"
+            "proc copy in=src out=tgt; run;\n"
+            "data work.x; set tgt.cust; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertEqual(
+            [c.chunk_id for c in br.batches[0].chunks], ["chunk-0002", "chunk-0003"]
+        )
+
+    def test_last_skips_a_pattern_output(self):
+        """_LAST_ is the last data set created; a whole-library COPY creates
+        no one data set, so PROC PRINT with no DATA= reads work.a."""
+        src = (
+            "data work.a; set raw.e; run;\n"
+            "proc copy in=src out=tgt; run;\n"
+            "proc print; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertEqual(
+            [c.chunk_id for c in br.batches[0].chunks], ["chunk-0001", "chunk-0003"]
+        )
+        self.assertIn("dataset_flow(work.a)", br.batches[0].reason)
+
+    def test_macro_argument_pattern_resolves_through_the_body(self):
+        src = (
+            "%macro rd(ds); data work.y; set &ds; run; %mend;\n"
+            "data mylib.sales_east; set raw.e; run;\n"
+            "%rd(mylib.sales_:);\n"
+        )
+        _, br = _chunk_and_batch(src)
+        reasons = " ".join(b.reason for b in br.batches)
+        self.assertIn("macro_body_dataset(mylib.sales_east)", reasons)
+
+    def test_drop_is_not_a_producer(self):
+        src = (
+            "data work.a; set raw.e; run;\n"
+            "proc datasets lib=work nolist; delete a; quit;\n"
+            "proc print data=work.a; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertEqual(
+            [c.chunk_id for c in br.batches[0].chunks], ["chunk-0001", "chunk-0003"]
+        )
+
+
 # ── 11. Global-context batch (tiered weak-edge resolution) ────────────────
 
 

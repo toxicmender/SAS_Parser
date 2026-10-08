@@ -193,7 +193,12 @@ def _dataset_lines(file: FileComplexity) -> list[str]:
     them. A file that touches no dataset at all gets no section — an empty one
     would say nothing the absence does not.
     """
-    if not (file.input_datasets or file.output_datasets or file.intermediate_datasets):
+    if not (
+        file.input_datasets
+        or file.output_datasets
+        or file.intermediate_datasets
+        or file.dropped_datasets
+    ):
         return []
     lines = [
         "",
@@ -207,6 +212,16 @@ def _dataset_lines(file: FileComplexity) -> list[str]:
             f"- Intermediates (written and read here): "
             f"{_fmt_list(file.intermediate_datasets)}"
         )
+    if file.updated_datasets:
+        # Each already listed above, since an update both reads and writes;
+        # called out because appending to a table is what a migration most
+        # easily turns into replacing it.
+        lines.append(
+            f"- Updated in place (rows added or changed): "
+            f"{_fmt_list(file.updated_datasets)}"
+        )
+    if file.dropped_datasets:
+        lines.append(f"- Deleted: {_fmt_list(file.dropped_datasets)}")
     return lines
 
 
@@ -220,6 +235,7 @@ _PATH_GROUPS: tuple[tuple[PathLocation, str], ...] = (
     (PathLocation.EMAIL, "Email destinations"),
     (PathLocation.PIPE, "Shell pipes (a command, not a location)"),
     (PathLocation.DEVICE, "Other devices"),
+    (PathLocation.FILEREF, "Filerefs no FILENAME in the corpus assigns"),
 )
 
 

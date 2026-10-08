@@ -22,6 +22,7 @@ from typing import Iterable
 
 import app_config
 from chunker.models import (
+    DatasetRole,
     SasChunk,
     SasChunkMetadata,
     SasDbTableRef,
@@ -85,6 +86,14 @@ def _chunk_inputs(meta: SasChunkMetadata) -> list[str]:
 def _chunk_outputs(meta: SasChunkMetadata) -> list[str]:
     """Datasets a chunk writes, its macro body's literal writes included."""
     return _dedupe([*meta.output_datasets, *meta.body_literal_outputs])
+
+
+def _chunk_names(meta: SasChunkMetadata, role: DatasetRole) -> list[str]:
+    """Datasets a chunk names in *role*, its macro body's literal ones
+    included — UPDATE (read and rewritten in place) or DROP (deleted)."""
+    return _dedupe(
+        r.name for r in meta.dataset_refs if r.role is role and r.param is None
+    )
 
 
 def _file_datasets(

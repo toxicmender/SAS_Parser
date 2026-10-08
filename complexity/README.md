@@ -754,6 +754,22 @@ reported as an input, which is the same rule `crossfile.py` applies when
 deciding whether a read is a cross-file import. The two sections cannot
 contradict each other by construction.
 
+Two more lines appear only when they have something to say:
+
+```markdown
+- Updated in place (rows added or changed): mart.hist
+- Deleted: work.tmp1
+```
+
+**Updated in place** names the tables the file rewrites rather than creates —
+`MODIFY`, `PROC APPEND BASE=`, SQL `INSERT`/`UPDATE`/`DELETE`, an in-place
+`PROC SORT`. Each is also counted in the three lines above, since an update both
+reads and writes; it is called out because an append is what a migration most
+easily turns into a replacement. **Deleted** names the tables the file removes
+(`PROC DATASETS DELETE`, SQL `DROP TABLE`), which are neither inputs nor
+outputs. Both come from the chunker's dataset reference roles (`UPDATE` and
+`DROP`; see `chunker/README.md`).
+
 Every chunk that touches a dataset prints its own `Reads:` / `Writes:` line, so
 a reader who doubts a rollup can find the chunk that put each name in it.
 
@@ -780,7 +796,10 @@ Grouped by kind because the kinds need different answers: a filesystem path
 wants a volume or external location, an FTP reference wants egress and a
 credential, and a shell pipe wants somebody to decide what replaces it. A value
 carrying an unresolved `&macro` reference is flagged as such — it is not what
-SAS resolves at run time, so it cannot be mapped as written.
+SAS resolves at run time, so it cannot be mapped as written. A fileref used by
+`INFILE`, `FILE` or `%INCLUDE` is reported where its `FILENAME` points; one that
+no `FILENAME` in the corpus assigns (an autoexec or the job's JCL does) gets
+its own last group, *Filerefs no FILENAME in the corpus assigns*.
 
 Reported, never scored. Like the dataset interface, it says what a migration has
 to provision, which is a different question from how hard the code is. A file
