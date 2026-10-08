@@ -1,9 +1,9 @@
 # Plan: close the chunker's SAS coverage gaps (breaking changes allowed)
 
-Status: Phases 0–4 implemented. `tests/test_sas_coverage.py` holds 183 probes:
+Status: Phases 0–5 implemented. `tests/test_sas_coverage.py` holds 183 probes:
 the 168 from the coverage review plus 15 precision probes (`X01`–`X15`). Today
-171 pass and 12 are expected failures, each naming the phase below that fixes
-it. Phases 5–9 are not started.
+178 pass and 5 are expected failures, each naming the phase below that fixes
+it. Phases 6–9 are not started.
 
 ## Context
 
@@ -411,7 +411,35 @@ Done as planned, with these differences:
 Probes flipped: P03, P08, P09, P10, P12, P15, P16, P18–P21, P27, P30, P32,
 P33, P35, P36, P38.
 
-## Phase 5: one SQL grammar (M), new `chunker/sql.py`
+## Phase 5: one SQL grammar (M), new `chunker/sql.py` — done
+
+Done as planned, with these differences:
+
+- **`sql.SqlStatement(text, dialect)`** owns the walker and
+  `split_table_name`; `passthrough` imports both. NATIVE is the old walker
+  unchanged, and `tests/test_passthrough.py` passes as it did.
+  - `reads()` and `writes()` give NATIVE's raw names.
+  - `refs()` gives SAS's `(name, role, clause)` in source order.
+- **SAS dialect.** It reads `cf`, where strings are intact. A quoted string is
+  a literal anywhere but a table's place, where it is a path or a name
+  literal. `%name(…)` there is a macro call, skipped. `DROP TABLE a, b` drops
+  a list (SAS only: NATIVE keeps its old reading).
+- **Callers.** PROC SQL, PROC FEDSQL and a macro body's SQL fragments.
+  `statements._SQL_WRITE_RE` and `_SQL_READ_RE` are deleted. DS2's `{…}`
+  waits for Phase 6, which reads DS2's SET.
+- **Probe expectations.** S06 and S07 now list the INSERT target among the
+  inputs. This is the UPDATE role the breaking-changes table set; the probes
+  predate it.
+- **Behaviour,** against Phase 4:
+  - In the 187-file corpus, comma joins recovered `lib.b`, `lib.c3` and
+    `work.lookup`. FedSQL reads and writes. DELETE, UPDATE, ALTER and INSERT
+    are UPDATE refs, LIKE reads, and DROP is a DROP ref.
+  - Batches: 118 → 112 singletons. A comma-joined lookup now joins the step
+    that builds it, the in-place rewrites of `lib.t` chain, and the FedSQL
+    step joins the files that write its input.
+  - The 4,800-chunk job and both reference examples are unchanged.
+- **Performance.** `scripts/bench_chunker.py` measures within 3–11% of
+  Phase 0 in one session. Batching is within noise of Phase 4.
 
 - **Move the walker.** `_NativeTables` moves from `passthrough.py` to
   `sql.SqlStatement(text, dialect)`.

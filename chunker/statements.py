@@ -43,6 +43,7 @@ from .scanner import (
     _Unit,
     _ws_end,
 )
+from .sql import Dialect, SqlStatement, _delimited
 
 # ---------------------------------------------------------------------------
 # Dataset names
@@ -89,15 +90,11 @@ def _canon_ds(name: str, library: str = "work") -> str:
     return _member(library, name)
 
 
-_ENDS_IN_REF_RE = re.compile(r"&\w+\Z")
-
-
 def _member(library: str, member: str) -> str:
     """``library.member``. A library spelled through a macro variable keeps
     its delimiter dot: ``&lib`` and ``x`` make ``&lib..x``, which SAS reads as
     the value of ``&lib``, a dot, and ``x``."""
-    dot = ".." if _ENDS_IN_REF_RE.search(library) else "."
-    return f"{library}{dot}{member}"
+    return f"{_delimited(library)}.{member}"
 
 
 def _quoted_path(raw: str) -> str:
@@ -403,12 +400,6 @@ _DS_TOKEN_FULL_RE = re.compile(rf"{DS_REF_TOKEN}\Z")
 # IML — names no dataset, whatever its variable is called.
 _ASSIGNMENT_RE = re.compile(r"[A-Za-z_]\w*\s*(?:\[[^\]]*\]|\{[^}]*\}|\([^)]*\))?\s*=(?!=)")
 
-# PROC SQL's dataset clauses (one SQL grammar arrives with sql.py).
-_SQL_WRITE_RE = re.compile(
-    rf"\b(create\s+(?:table|view)|insert\s+into)\s+({DS_REF_TOKEN})", re.IGNORECASE
-)
-_SQL_READ_RE = re.compile(rf"\b(from|join)\s+({DS_REF_TOKEN})", re.IGNORECASE)
-
 # What one statement names: a dataset, what the statement does to it, and the
 # statement or option that named it.
 _Ref = tuple[_Operand, DatasetRole, str]
@@ -438,12 +429,13 @@ def _data_step_refs(st: Statement) -> Iterator[_Ref]:
 
 
 def _sql_refs(st: Statement) -> Iterator[_Ref]:
-    for m in _SQL_WRITE_RE.finditer(st.mt):
-        if op := _token_operand(st.cf[m.start(2) : m.end(2)]):
-            yield op, WRITE, m.group(1).split(None, 1)[0].lower()
-    for m in _SQL_READ_RE.finditer(st.mt):
-        if op := _token_operand(st.cf[m.start(2) : m.end(2)]):
-            yield op, READ, m.group(1).lower()
+    """A PROC SQL or FEDSQL statement's tables, by the one SQL grammar."""
+    for raw, role, via in SqlStatement(st.cf, Dialect.SAS).refs():
+        if raw[0] in "'\"":  # a physical path, or a name literal: 'my data'n
+            quoted = raw[:-1] if raw[-1] in "nN" else raw
+            yield _Operand(raw, _quoted_path(quoted)), role, via
+        elif op := _token_operand(raw):
+            yield op, role, via
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +569,8 @@ _KILL_RE = re.compile(r"(?:^|[^=\s])\s+kill\b", re.IGNORECASE)
 _MOVE_RE = re.compile(r"(?:^|[^=\s])\s+move\b", re.IGNORECASE)
 # CHANGE and EXCHANGE: `old=new` pairs of member names.
 _PAIR_RE = re.compile(rf"({DS_REF_TOKEN})\s*=\s*({DS_REF_TOKEN})")
+# The PROCs whose statements are SQL.
+_SQL_PROCS = frozenset({"sql", "fedsql"})
 # PROC DATASETS statements that name members of its library.
 _DATASETS_STATEMENTS = frozenset(
     {"append", "change", "exchange", "copy", "delete", "modify", "age", "contents"}
@@ -634,7 +628,7 @@ class _ProcStep:
             yield from _ods_output_refs(st)
         elif kw == "proc":
             yield from self._proc_statement(st)
-        elif self.proc == "sql":
+        elif self.proc in _SQL_PROCS:
             yield from _sql_refs(st)
         elif self.copy is not None:
             if kw == "select":

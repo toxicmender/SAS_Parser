@@ -100,7 +100,8 @@ For running the work items end-to-end through an LLM, see the
 | `keywords.py` | SAS keyword catalogues transcribed from the SAS docs (reserved macro words, autocall macros, function / CALL-routine dictionaries, and `SAS_FUNCTION_CATEGORIES`) + the patterns compiled from them. Pure data; no package imports, no logging. |
 | `scanner.py` | Lexical layer: `_Unit` / `_Region` parse primitives and their `UnitRole` (code, comment, in-stream data, SUBMIT code), the statement classifier (`_classify`), where a macro call ends its statement (`_split_after_calls`), macro quoting (`_macro_quote_end`), in-stream blocks (`_in_stream_units`), text normalisation / sanitisation, line-offset helpers, and the `_Deadline` / `_ParseWatchdog` stuck-parser machinery. |
 | `macro_vars.py` | Macro-variable values and reference expansion: `let_values` (the `%LET` symbol table), `resolve_refs` (`&name` / `&name.` / `&&name&i`), `call_spans` (where back-to-back macro calls begin and end), and `DS_REF_TOKEN` — the single definition of a dataset token that may embed `&refs`. Pure; no package imports. |
-| `passthrough.py` | SQL pass-through — `CONNECT TO` / `CONNECTION TO` / `EXECUTE … BY` / `DISCONNECT` and the native-SQL table scan: `scan_pass_through` (tables + the spans to mask), `mask`, `db_table_ref` (the one `SasDbTableRef` builder). The **single owner** of that grammar. |
+| `sql.py` | The one SQL grammar: `SqlStatement(text, dialect)`, a token walk that reads a statement's tables by clause and verb, and `split_table_name`. `Dialect.NATIVE` reads a database's own SQL for pass-through; `Dialect.SAS` reads PROC SQL and PROC FEDSQL and gives each table its role (`SqlStatement.refs`). |
+| `passthrough.py` | SQL pass-through — `CONNECT TO` / `CONNECTION TO` / `EXECUTE … BY` / `DISCONNECT`, and the native SQL inside them read by `sql.SqlStatement`: `scan_pass_through` (tables + the spans to mask), `mask`, `db_table_ref` (the one `SasDbTableRef` builder). The **single owner** of the pass-through statements. |
 | `statements.py` | What each statement does to the datasets it names: `statements_of` (a region's statements, each with where it stands — open code, a DATA step, a PROC, a `%MACRO` body), the operand lists they read, and `dataset_refs` (the region's `SasDatasetRef`s, a macro body's classified as parameter, literal or macro variable). The **single owner** of dataset positions, for steps and macro bodies alike; `_canon_ds` lives here. |
 | `metadata.py` | Per-chunk semantic extraction: `_metadata_for` (datasets from `statements.dataset_refs`, plus the macro, path, function and symput / SQL-INTO / CALL EXECUTE scans), `_merge_meta`, the extraction regex catalogue, and the whole-list resolution passes — `resolve_macro_var_refs`, `resolve_ods_outputs`, `resolve_db_librefs`, composed in order by `resolve_references` (and across files by `resolve_corpus_references`). |
 | `chunker.py` | `SasSemanticChunker` orchestration (scan → group → build chunks, oversized-split with overlap). |
@@ -116,7 +117,7 @@ For running the work items end-to-end through an LLM, see the
 
 **Import direction is strictly downward:** `keywords`, `macro_vars` and `models`
 import nothing from the package; `scanner` and `paths` import from them;
-`passthrough` and `statements` import from those; `metadata` imports from all of them;
+`sql` imports from them, `passthrough` and `statements` from those; `metadata` imports from all of them;
 `chunker.py` imports from all of them; `batcher` imports from `keywords`,
 `metadata`, `models`.
 The package imports nothing from `memory`, `llm_client`, `prompt_builder`, or
@@ -267,8 +268,14 @@ THEN`, `ELSE`, `WHEN (…)` or `OTHERWISE`; a subsetting `IF` has none. Then:
     `metadata.resolve_ods_outputs` hands them to the next PROC_STEP of the
     file. `ods output close|clear` before one cancels them; they stay on the
     statement as MENTIONs.
-  - PROC SQL reads its `FROM`/`JOIN` table and writes its `CREATE TABLE|VIEW`/
-    `INSERT INTO` one.
+  - **PROC SQL and PROC FEDSQL** statements go through `sql.SqlStatement` in
+    its SAS dialect: FROM lists (comma joins too) and JOINs read, subqueries
+    and inline views included; `CREATE TABLE|VIEW` writes, and reads its
+    `LIKE` table; `INSERT`, `UPDATE`, `DELETE` and `ALTER TABLE` rewrite a
+    table in place (UPDATE); `DROP TABLE|VIEW` deletes a list (DROP);
+    `CREATE INDEX` and `DESCRIBE` name none. A table's `(…)` is its dataset
+    options, a quoted path or `'name'n` is a table, a macro call names nothing
+    visible, and `dictionary.*` is SAS's metadata, no dataset.
 - **Open code** names no dataset but through ODS OUTPUT: not a `%PUT`, a
   `%LET`, or a macro call's arguments.
 - **A `%MACRO` body** is read the same way, and its references are classified
@@ -589,6 +596,14 @@ these silently changes behavior.
    only in a comment, in-stream data, SUBMIT code, a string, a `%PUT` or an
    assignment is no dataset, and `referenced_datasets` is a view of the
    references, so it cannot report one either.
+13. **One SQL grammar, two dialects.** `sql.SqlStatement` reads every SQL
+   statement the chunker meets — PROC SQL, PROC FEDSQL and pass-through's
+   native SQL — so a fix to how a FROM list or a subquery is walked lands in
+   all of them. What differs is the dialect (a database's `"quoted"` names,
+   `@dblink` and table functions, against SAS's dataset options, paths and
+   name literals), never a second walker. The NATIVE dialect's reads and
+   writes are pinned by `tests/test_passthrough.py`; change it and they say
+   so.
 
 ## Logging
 

@@ -110,12 +110,18 @@ chunker/
                         which every dataset operand in statements.py and the
                         LIBNAME/FILENAME librefs in paths.py are scanned with.
                         Pure data + functions; no package imports, no models.
+  sql.py                The one SQL grammar: SqlStatement(text, dialect), a
+                        token walk reading a statement's tables by clause and
+                        verb. Dialect.NATIVE reads a database's own SQL for
+                        pass-through; Dialect.SAS reads PROC SQL and FEDSQL
+                        and gives each table its role (FROM/JOIN read, CREATE
+                        writes, INSERT/UPDATE/DELETE/ALTER update, DROP drops).
   passthrough.py        SQL pass-through: CONNECT TO / CONNECTION TO / EXECUTE
-                        ... BY / DISCONNECT and the native-SQL table scan.
-                        scan_pass_through returns the database tables a chunk
-                        names (SasDbTableRef) and the spans every SAS-side
-                        dataset scan must mask; db_table_ref is the one builder
-                        of those records.
+                        ... BY / DISCONNECT, their native SQL read by
+                        sql.SqlStatement. scan_pass_through returns the
+                        database tables a chunk names (SasDbTableRef) and the
+                        spans every SAS-side dataset scan must mask;
+                        db_table_ref is the one builder of those records.
   statements.py         What each statement does to the datasets it names:
                         statements_of walks a region's statements, each with
                         where it stands (open code, DATA step, PROC by name,

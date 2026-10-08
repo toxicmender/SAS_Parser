@@ -406,7 +406,7 @@ def test_proc_sql_clauses():
         ("work.c", W, "create"),
         ("work.a", R, "from"),
         ("lib.b", R, "join"),
-        ("work.d", W, "insert"),
+        ("work.d", U, "insert"),
         ("work.e", R, "from"),
     ]
 

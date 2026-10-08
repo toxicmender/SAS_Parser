@@ -38,7 +38,7 @@ from chunker import (
 from chunker.batcher import MultiFileBatcher
 from chunker.metadata import resolve_references
 from chunker.models import SasChunkKind
-from chunker.passthrough import _NativeTables, split_table_name
+from chunker.sql import SqlStatement, split_table_name
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -59,7 +59,7 @@ def _tables(result) -> list[str]:
 
 
 def _native(sql: str) -> tuple[list[str], list[str]]:
-    native = _NativeTables(sql)
+    native = SqlStatement(sql)
     return native.reads(), native.writes()
 
 

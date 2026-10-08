@@ -26,11 +26,10 @@ from chunker import SasChunkKind as K
 
 # ── why a probe fails today, and the plan phase that fixes it ──────────────────
 
-SQL = "phase 5: SQL FROM lists and DML"
 EMBEDDED = "phase 6: DS2 and IML reads and writes"
 INCLUDES = "phase 7: %INCLUDE, filerefs and macro signatures"
 
-GAPS = frozenset({SQL, EMBEDDED, INCLUDES})
+GAPS = frozenset({EMBEDDED, INCLUDES})
 
 # A probe's free-form check: (result, top-level chunks) -> a problem, or None.
 Check = Callable[[SasChunkResult, list[SasChunk]], "str | None"]
@@ -397,24 +396,26 @@ SQL_PROBES = [
           inputs={"work.a", "lib.b"}, outputs={"work.c"}),
     Probe("S02", "comma join: FROM a, b",
           _sql("create table c as select * from a as x, lib.b as y where x.id = y.id;"),
-          inputs={"work.a", "lib.b"}, outputs={"work.c"}, gap=SQL),
+          inputs={"work.a", "lib.b"}, outputs={"work.c"}),
     Probe("S03", "three-way comma join",
           _sql("create table c as select * from a, b, lib.c3 where a.k = b.k and b.k = c3.k;"),
-          inputs={"work.a", "work.b", "lib.c3"}, outputs={"work.c"}, gap=SQL),
+          inputs={"work.a", "work.b", "lib.c3"}, outputs={"work.c"}),
     Probe("S04", "subquery in WHERE",
           _sql("create table c as select * from a where id in (select id from lib.b);"),
           inputs={"work.a", "lib.b"}, outputs={"work.c"}),
     Probe("S05", "inline view in FROM",
           _sql("create table c as select * from (select id from lib.b) as s;"),
           inputs={"lib.b"}, outputs={"work.c"}),
+    # INSERT adds rows to what the table holds: read and rewritten in place
+    # (UPDATE), as APPEND's BASE= is.
     Probe("S06", "INSERT INTO ... SELECT", _sql("insert into lib.t select * from s;"),
-          inputs={"work.s"}, outputs={"lib.t"}),
+          inputs={"work.s", "lib.t"}, outputs={"lib.t"}),
     Probe("S07", "INSERT INTO ... VALUES", _sql("insert into lib.t values (1, 'a');"),
-          outputs={"lib.t"}, inputs=set()),
+          outputs={"lib.t"}, inputs={"lib.t"}),
     Probe("S08", "DELETE FROM modifies the table", _sql("delete from lib.t where x = 1;"),
-          has_out={"lib.t"}, gap=SQL),
+          has_out={"lib.t"}),
     Probe("S09", "UPDATE ... SET modifies the table", _sql("update lib.t set x = 1 where y = 2;"),
-          has_out={"lib.t"}, gap=SQL),
+          has_out={"lib.t"}),
     Probe("S10", "SELECT INTO :macro var",
           "proc sql noprint;\nselect count(*) into :n trimmed from lib.t;\nquit;\n",
           inputs={"lib.t"}, outputs=set(), produces={"n"}),
@@ -424,10 +425,10 @@ SQL_PROBES = [
           _sql("create table u as select * from a union select * from lib.b;"),
           inputs={"work.a", "lib.b"}, outputs={"work.u"}),
     Probe("S13", "CREATE TABLE ... LIKE", _sql("create table c like lib.t;"),
-          inputs={"lib.t"}, outputs={"work.c"}, gap=SQL),
+          inputs={"lib.t"}, outputs={"work.c"}),
     Probe("S14", "DROP TABLE is not a read", _sql("drop table lib.t;"), never={"lib.t"}),
     Probe("S15", "ALTER TABLE modifies the table", _sql("alter table lib.t add z num;"),
-          has_out={"lib.t"}, gap=SQL),
+          has_out={"lib.t"}),
     Probe("S16", "FROM with dataset options",
           _sql("create table c as select * from lib.a(where=(x > 1));"),
           inputs={"lib.a"}, outputs={"work.c"}),
@@ -616,7 +617,7 @@ EMBEDDED_PROBES = [
           "  enddata;\nrun;\nquit;\n",
           kinds=[K.PROC_STEP], inputs={"work.in_ds"}, outputs={"work.out_ds"}, gap=EMBEDDED),
     Probe("E02", "PROC FEDSQL", "proc fedsql;\n  create table c as select * from a;\nquit;\n",
-          inputs={"work.a"}, outputs={"work.c"}, gap=SQL),
+          inputs={"work.a"}, outputs={"work.c"}),
     Probe("E03", "PROC IML USE / CREATE",
           "proc iml;\n  use lib.a; read all var _num_ into m; close lib.a;\n"
           "  create out from m; append from m; close out;\nquit;\n",
