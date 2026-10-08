@@ -140,7 +140,9 @@ chunker/
                         catalogue, and the whole-list passes that run once a
                         file (or the corpus) has been walked:
                         resolve_macro_var_refs (&name references get their
-                        values), resolve_ods_outputs (an open-code ODS OUTPUT
+                        values), resolve_filerefs (a reference through a
+                        fileref takes its FILENAME's place),
+                        resolve_ods_outputs (an open-code ODS OUTPUT
                         request goes to the PROC that writes it), then
                         resolve_db_librefs (SAS names under a
                         database-engine LIBNAME become database tables),

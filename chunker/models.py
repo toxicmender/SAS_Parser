@@ -64,6 +64,11 @@ class PathLocation(StrEnum):
     ``DEVICE`` is the deliberate catch-all: a device keyword this module does
     not know must land somewhere visible instead of defaulting to
     :attr:`FILESYSTEM`.
+
+    ``FILEREF`` is a place named through a fileref (``infile in;``,
+    ``%include src(one);``) whose FILENAME the corpus does not show where it
+    stands. :func:`chunker.metadata.resolve_filerefs` gives every reference it
+    can the FILENAME's location and path; the rest stay FILEREF.
     """
 
     FILESYSTEM = "filesystem"
@@ -71,6 +76,7 @@ class PathLocation(StrEnum):
     EMAIL = "email"
     PIPE = "pipe"
     DEVICE = "device"
+    FILEREF = "fileref"
 
 
 class SasPathRef(BaseModel, frozen=True):
@@ -97,7 +103,9 @@ class SasPathRef(BaseModel, frozen=True):
         *rewrite* the source needs the original spelling; a consumer that has to
         *match* wants ``path``.
     binds
-        The libref or fileref the statement assigns, when it assigns one.
+        The libref or fileref the statement assigns, when it assigns one —
+        or, for a reference made through a fileref (``infile in;``), the
+        fileref it uses.
     device
         The device keyword as written, when there was one.
     engine

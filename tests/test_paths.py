@@ -66,16 +66,39 @@ class TestStatementForms:
         assert _one("infile '/data/in/cust.csv' dlm=',';").statement == "infile"
         assert _one("file '/data/out/rep.txt';").statement == "file"
 
-    def test_infile_naming_a_fileref_yields_nothing(self):
-        # An unquoted INFILE names a fileref a FILENAME already declared. The
-        # path lives on that FILENAME, and reporting the fileref as a path
-        # would put a name that is not a location into the inventory.
-        assert extract_paths("infile rawdata;") == []
+    def test_infile_naming_a_fileref_is_a_fileref_reference(self):
+        # An unquoted INFILE names a fileref a FILENAME declares. It is recorded
+        # as a FILEREF — no location, so nothing that maps paths to storage
+        # sees it — until chunker.metadata.resolve_filerefs gives it the path
+        # of the FILENAME in force.
+        ref = _one("infile rawdata dlm=',' firstobs=2;")
+        assert (ref.statement, ref.location, ref.binds, ref.path) == (
+            "infile",
+            PathLocation.FILEREF,
+            "rawdata",
+            "rawdata",
+        )
+        assert _one("file out(report.txt);").raw == "out(report.txt)"
+        # SAS's own filerefs belong to no FILENAME.
+        assert extract_paths("infile datalines; infile cards4; file print; file log;") == []
 
     def test_include(self):
         ref = _one("%include '/code/macros/common.sas';")
         assert ref.statement == "include"
         assert ref.path == "/code/macros/common.sas"
+
+    def test_include_of_several_files(self):
+        refs = extract_paths("%include '/a.sas' \"/b.sas\" / source2;")
+        assert [(r.statement, r.path) for r in refs] == [("include", "/a.sas"), ("include", "/b.sas")]
+
+    def test_include_through_a_fileref(self):
+        refs = extract_paths("%include src(one two.sas);\n%include setup lib2 / source2;\n")
+        assert [(r.raw, r.binds, r.location) for r in refs] == [
+            ("src(one)", "src", PathLocation.FILEREF),
+            ("src(two.sas)", "src", PathLocation.FILEREF),
+            ("setup", "setup", PathLocation.FILEREF),
+            ("lib2", "lib2", PathLocation.FILEREF),
+        ]
 
     def test_proc_import_datafile(self):
         ref = _one('proc import datafile="/in/a.xlsx" out=work.a; run;')
@@ -295,3 +318,44 @@ class TestScanScope:
 
     def test_empty_text(self):
         assert extract_paths("") == []
+
+
+class TestFilerefResolution:
+    """chunker.metadata.resolve_filerefs: a reference made through a fileref
+    takes the place of the FILENAME in force where it stands."""
+
+    @staticmethod
+    def _refs(source: str) -> list[list[tuple[str, str, str]]]:
+        from chunker import SasSemanticChunker
+
+        result = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(source)
+        return [
+            [(r.statement, str(r.location), r.path) for r in c.metadata.external_refs]
+            for c in result.chunks
+        ]
+
+    def test_a_member_of_a_directory_and_a_whole_file(self):
+        refs = self._refs(
+            "filename src '/code';\n%include src(setup util.sas);\n"
+            "filename in url 'https://h/x.csv';\ndata a; infile in; input x; run;\n"
+        )
+        assert refs[1] == [
+            ("include", "filesystem", "/code/setup.sas"),
+            ("include", "filesystem", "/code/util.sas"),
+        ]
+        assert refs[3] == [("infile", "remote", "https://h/x.csv")]
+
+    def test_the_latest_filename_wins_and_clear_ends_it(self):
+        refs = self._refs(
+            "filename in '/a.csv';\nfilename in '/b.csv';\ndata a; infile in; run;\n"
+            "filename in clear;\ndata b; infile in; run;\n"
+            "filename in temp;\ndata c; infile in; run;\n"
+        )
+        assert refs[2] == [("infile", "filesystem", "/b.csv")]
+        assert refs[4] == [("infile", "fileref", "in")]
+        assert refs[6] == [("infile", "fileref", "in")]
+
+    def test_a_fileref_spelled_through_a_macro_variable(self):
+        refs = self._refs("%let f = in;\nfilename &f '/data/x.csv';\ndata a; infile in; run;\n")
+        assert refs[2] == [("infile", "filesystem", "/data/x.csv")]
+

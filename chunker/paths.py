@@ -12,9 +12,10 @@ This table used to live in :mod:`xref.pre`, which rewrites those same paths from
 an XREF mapping. Two modules recognising "where a path belongs in SAS" would be
 two definitions drifting apart — the failure Architecture.md invariant 12 names —
 so the grammar lives here, with the chunker that owns SAS syntax, and
-:mod:`xref.pre` imports it. The match groups are named ``head`` / ``q`` / ``path``
-because that is the shape its substitution helper is built on: rewriting is
-``head + quote + new_path + quote``.
+:mod:`xref.pre` imports it. A spec says where each quoted value of a match stands
+(:meth:`PathSpec.value_spans`) — one, or several for a list such as ``%include
+'/a.sas' '/b.sas';`` — and the substitution rewrites exactly those, leaving the
+statement around them as written.
 
 Not every quoted argument is a directory
 ----------------------------------------
@@ -30,9 +31,14 @@ comment or a string that merely looks like a path is not a path. The scans run o
 the comments-blanked, strings-intact form of the text, because the value lives
 inside the string literal that the fully sanitised form has already blanked.
 
-Known limit: ``options sasautos=('/a' '/b')`` reports only the first entry. The
-concatenation form needs a scan the ``head``/``path`` substitution shape cannot
-express, and reporting the first is better than reporting none.
+Known limit: ``options sasautos=('/a' '/b')`` reports only the first entry;
+reporting the first is better than reporting none.
+
+A statement may also name a place through a fileref (``infile in;``,
+``%include src(one);``). Those specs record the fileref, as
+:attr:`~chunker.models.PathLocation.FILEREF`, and
+:func:`chunker.metadata.resolve_filerefs` gives each the place the FILENAME in
+force names.
 
 Not every LIBNAME names a place
 -------------------------------
@@ -127,37 +133,92 @@ class PathSpec:
     pattern
         Compiled, with ``head`` / ``q`` / ``path`` groups (see the module
         docstring) plus optional ``binds`` and ``device`` groups.
+    many
+        The statement names several values: each quoted value in its
+        ``paths`` group (``%include '/a.sas' '/b.sas';``), or, for a fileref
+        spec, each member in ``members`` or each fileref in ``frefs``.
+    fileref
+        The statement names a fileref, not a place (``infile in;``,
+        ``%include src(one two);``): its references are
+        :attr:`~chunker.models.PathLocation.FILEREF`, ``binds`` the fileref,
+        until :func:`chunker.metadata.resolve_filerefs` finds the FILENAME.
     """
 
     statement: str
     keyword: str
     pattern: re.Pattern[str]
+    many: bool = False
+    fileref: bool = False
 
     def location_for(self, match: re.Match[str]) -> PathLocation:
         """Where this match points, from its device group if it has one."""
+        if self.fileref:
+            return PathLocation.FILEREF
         return classify_location(_group(match, "device"))
 
-    def ref_for(self, match: re.Match[str]) -> SasPathRef | None:
-        """*match* as a :class:`~chunker.models.SasPathRef`, or ``None``.
+    def value_spans(self, match: re.Match[str]) -> list[tuple[int, int]]:
+        """Where each quoted value of *match* stands in ``match.string``,
+        quotes excluded: what :mod:`xref.pre` rewrites. A fileref has none."""
+        if self.fileref:
+            return []
+        if not self.many:
+            return [match.span("path")]
+        start, end = match.span("paths")
+        return [m.span("path") for m in _VALUE_RE.finditer(match.string, start, end)]
 
-        ``None`` when the quoted value is empty — ``infile '';`` names nothing,
-        and an empty entry in an inventory is worse than no entry.
+    def refs_for(self, match: re.Match[str]) -> list[SasPathRef]:
+        """Every :class:`~chunker.models.SasPathRef` *match* names.
+
+        A quoted value that is empty is left out — ``infile '';`` names
+        nothing, and an empty entry in an inventory is worse than no entry.
         """
-        raw = match.group("path").strip()
-        if not raw:
-            return None
+        if self.fileref:
+            return self._fileref_refs(match)
         device = _group(match, "device")
         engine = _group(match, "engine")
-        return SasPathRef(
-            statement=self.statement,
-            location=classify_location(device),
-            path=normalise_path(raw),
-            raw=raw,
-            binds=(b.lower() if (b := _group(match, "binds")) else None),
-            device=(device.lower() if device else None),
-            engine=(engine.lower() if engine else None),
-            has_macro_ref="&" in raw,
-        )
+        binds = _group(match, "binds")
+        refs: list[SasPathRef] = []
+        for start, end in self.value_spans(match):
+            raw = match.string[start:end].strip()
+            if raw:
+                refs.append(
+                    SasPathRef(
+                        statement=self.statement,
+                        location=classify_location(device),
+                        path=normalise_path(raw),
+                        raw=raw,
+                        binds=binds.lower() if binds else None,
+                        device=device.lower() if device else None,
+                        engine=engine.lower() if engine else None,
+                        has_macro_ref="&" in raw,
+                    )
+                )
+        return refs
+
+    def _fileref_refs(self, match: re.Match[str]) -> list[SasPathRef]:
+        """``src(one)`` and ``src(two)`` for ``%include src(one two);``;
+        ``in`` for ``infile in;``. Written as the statement spells them,
+        lowercased, until the FILENAME's path replaces them."""
+        members = _group(match, "members")
+        if members is not None:
+            fref = match.group("binds")
+            spelled = [f"{fref}({m})" for m in _MEMBER_RE.findall(members)]
+            binds = [fref] * len(spelled)
+        elif (frefs := _group(match, "frefs")) is not None:
+            spelled = binds = frefs.split()
+        else:
+            spelled = binds = [match.group("binds")]
+        return [
+            SasPathRef(
+                statement=self.statement,
+                location=PathLocation.FILEREF,
+                path=raw.lower(),
+                raw=raw,
+                binds=fref.lower(),
+                has_macro_ref="&" in raw,
+            )
+            for raw, fref in zip(spelled, binds)
+        ]
 
 
 def _group(match: re.Match[str], name: str) -> str | None:
@@ -173,6 +234,14 @@ def _group(match: re.Match[str], name: str) -> str | None:
 # The quoted-value tail every spec ends with: an opening quote, the value, and
 # the same quote again. A SAS statement's quoted literal does not span lines.
 _VALUE = r"(?P<q>['\"])(?P<path>[^'\"\n]*)(?P=q)"
+_VALUE_RE = re.compile(_VALUE)
+# One quoted value, ungrouped, to repeat in a list.
+_QUOTED = r"""(?:'[^'\n]*'|"[^"\n]*")"""
+# A fileref, and the members of a directory it names: `src(one two)`.
+_FREF = r"[A-Za-z_&][\w&]*"
+_MEMBER_RE = re.compile(r"""'[^'\n]*'|"[^"\n]*"|[\w&.$]+""")
+# Filerefs SAS reserves for its own destinations and in-stream data.
+_RESERVED_FREFS = r"(?!(?:cards4?|datalines4?|print|log|_webout)\b)"
 
 #: Every statement form recognised, in scan order. Iterated by
 #: :func:`extract_paths` and by :func:`xref.pre.rewrite_source_text`.
@@ -220,11 +289,57 @@ PATH_STATEMENTS: tuple[PathSpec, ...] = (
         keyword="file",
         pattern=re.compile(r"(?P<head>\bfile\s+)" + _VALUE, re.IGNORECASE),
     ),
-    # %include '<path>'
+    # %include '<path>' ['<path>' ...]: one reference per file.
     PathSpec(
         statement="include",
         keyword="include",
-        pattern=re.compile(r"(?P<head>%\s*include\s+)" + _VALUE, re.IGNORECASE),
+        pattern=re.compile(
+            rf"(?P<head>%\s*include\s+)(?P<paths>(?:{_QUOTED}\s*)+)", re.IGNORECASE
+        ),
+        many=True,
+    ),
+    # %include src(one two): members of the directory a fileref names, and
+    # %include src [other]: whole files filerefs name.
+    PathSpec(
+        statement="include",
+        keyword="include",
+        pattern=re.compile(
+            rf"%\s*include\s+(?P<binds>{_FREF})\s*\((?P<members>[^)]*)\)",
+            re.IGNORECASE,
+        ),
+        many=True,
+        fileref=True,
+    ),
+    PathSpec(
+        statement="include",
+        keyword="include",
+        pattern=re.compile(
+            rf"%\s*include\s+(?P<frefs>{_FREF}(?:\s+{_FREF})*)\s*(?=[;/]|\Z)",
+            re.IGNORECASE,
+        ),
+        many=True,
+        fileref=True,
+    ),
+    # infile in / file out [(member)]: the file a fileref names.
+    PathSpec(
+        statement="infile",
+        keyword="infile",
+        pattern=re.compile(
+            rf"\binfile\s+{_RESERVED_FREFS}(?P<binds>{_FREF})\b"
+            r"(?:\s*\((?P<members>[^)]*)\))?",
+            re.IGNORECASE,
+        ),
+        fileref=True,
+    ),
+    PathSpec(
+        statement="file",
+        keyword="file",
+        pattern=re.compile(
+            rf"\bfile\s+{_RESERVED_FREFS}(?P<binds>{_FREF})\b"
+            r"(?:\s*\((?P<members>[^)]*)\))?",
+            re.IGNORECASE,
+        ),
+        fileref=True,
     ),
     # PROC IMPORT datafile='<path>' / PROC EXPORT outfile='<path>'. Keyed on the
     # option rather than the PROC: the option is what carries the path, and it
@@ -300,10 +415,10 @@ def extract_paths(text: str) -> list[SasPathRef]:
         if spec.keyword not in lowered:
             continue
         for match in spec.pattern.finditer(text):
-            ref = spec.ref_for(match)
-            if ref is not None and ref not in seen:
-                seen.add(ref)
-                refs.append(ref)
+            for ref in spec.refs_for(match):
+                if ref not in seen:
+                    seen.add(ref)
+                    refs.append(ref)
     if refs and logger.isEnabledFor(logging.DEBUG):
         logger.debug(f"extract_paths: {len(refs)} external reference(s)")
     return refs

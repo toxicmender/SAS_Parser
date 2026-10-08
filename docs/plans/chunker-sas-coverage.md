@@ -1,9 +1,8 @@
 # Plan: close the chunker's SAS coverage gaps (breaking changes allowed)
 
-Status: Phases 0–6 implemented. `tests/test_sas_coverage.py` holds 183 probes:
-the 168 from the coverage review plus 15 precision probes (`X01`–`X15`). Today
-180 pass and 3 are expected failures, each naming the phase below that fixes
-it. Phases 7–9 are not started.
+Status: Phases 0–7 implemented. `tests/test_sas_coverage.py` holds 184 probes:
+the 168 from the coverage review, 15 precision probes (`X01`–`X15`), and G22
+(INFILE through a fileref). All of them pass. Phases 8–9 are not started.
 
 ## Context
 
@@ -485,7 +484,36 @@ of Phase 0.
 
 Probes flipped: E01 (I/O), E03.
 
-## Phase 7: %INCLUDE, filerefs, macro signatures (M)
+## Phase 7: %INCLUDE, filerefs, macro signatures (M) — done
+
+Done as planned, with these differences:
+
+- **Path specs.** `PathSpec` gains `many` and `fileref`, `refs_for` (several
+  refs per match) and `value_spans`.
+  - Two fileref specs serve `%include`: `src(one two)` and a bare list
+    `setup lib2`. One more serves `infile`/`file fref[(member)]`.
+  - The fileref specs skip SAS's own `print`, `log`, `datalines`, `cards`
+    and `_webout`.
+  - An unresolved FILEREF ref keeps its spelling (`src(one)`) as `path` and
+    `raw`, and `binds` holds the fileref it uses.
+- **`resolve_filerefs`** runs right after macro-variable resolution, so a
+  fileref spelled `&f` is bound by its value. A FILENAME with no quoted place
+  (`clear`, `temp`) ends its fileref, and `filename _all_ clear` ends all.
+  Resolved refs keep `raw` as written and take the FILENAME's location, path
+  and device. `includes` is derived again.
+- **Hydration.** `data_hydration.planner` skips an `infile` ref made
+  through a fileref: the FILENAME's own ref is that file's one source. A file
+  read through a fileref does not become a second item.
+- **`macro_signature`** shares `_balanced_text` with the call-argument parser.
+  `_MACRO_SIG_RE`, `_ARG_SPLIT_RE` and `_parse_macro_params` are deleted.
+- **Behaviour,** against Phase 6:
+  - G14's and G21's members resolve, G20's second file is recorded, and
+    M23's parameters are right (`list` and `n`; it used to read `b`).
+  - Batches: the false macro-variable edge between M23 (`&n` is its own
+    parameter) and D12 (`symputx('n', …)`) is gone, so 24 → 23 batches.
+  - The 4,800-chunk job and both reference examples are unchanged.
+- **Performance.** `scripts/bench_chunker.py` measures within 6–9% of
+  Phase 0 in one session. Batching is within noise of Phase 6.
 
 - **Multi-value path specs.** `PathSpec` gets a multi-value mode. The include
   spec matches the whole `%include` statement and yields one `SasPathRef` per

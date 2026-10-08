@@ -25,10 +25,10 @@ from chunker import SasChunk, SasChunkResult, SasSemanticChunker
 from chunker import SasChunkKind as K
 
 # ── why a probe fails today, and the plan phase that fixes it ──────────────────
+# Every gap the plan named is closed. A probe added for a construct the chunker
+# does not handle yet names its reason here and in its ``gap``.
 
-INCLUDES = "phase 7: %INCLUDE, filerefs and macro signatures"
-
-GAPS = frozenset({INCLUDES})
+GAPS: frozenset[str] = frozenset()
 
 # A probe's free-form check: (result, top-level chunks) -> a problem, or None.
 Check = Callable[[SasChunkResult, list[SasChunk]], "str | None"]
@@ -498,11 +498,15 @@ GLOBAL_PROBES = [
     Probe("G19", "ODS GRAPHICS / ODS NORESULTS", "ods graphics on;\nods noresults;\n",
           kinds=[K.GLOBAL_STATEMENT, K.GLOBAL_STATEMENT]),
     Probe("G20", "%INCLUDE several files", "%include '/a.sas' '/b.sas' / source2;\n",
-          includes={"/a.sas", "/b.sas"}, gap=INCLUDES),
+          includes={"/a.sas", "/b.sas"}),
     Probe("G21", "%INCLUDE fileref(members)", "filename src '/code';\n%include src(one two);\n",
-          check=lambda r, top: None if any(c.metadata.includes for c in top)
-          else "include members not recorded",
-          gap=INCLUDES),
+          includes={"/code/one.sas", "/code/two.sas"}),
+    Probe("G22", "INFILE through a fileref",
+          "filename raw '/data/in.csv';\ndata a; infile raw dsd; input x; run;\n",
+          outputs={"work.a"},
+          check=lambda r, top: None
+          if [p.path for p in top[1].metadata.physical_paths] == ["/data/in.csv"]
+          else f"infile refs={top[1].metadata.external_refs}"),
 ]
 
 MACRO_PROBES = [
@@ -574,8 +578,7 @@ MACRO_PROBES = [
     Probe("M23", "parameter default containing commas",
           "%macro m(list=%str(a,b), n=2);\n  %put &list &n;\n%mend;\n",
           check=lambda r, top: None if set(top[0].metadata.macro_param_names) == {"list", "n"}
-          else f"macro_param_names={top[0].metadata.macro_param_names}",
-          gap=INCLUDES),
+          else f"macro_param_names={top[0].metadata.macro_param_names}"),
 ]
 
 ACCESS_PROBES = [

@@ -39,6 +39,7 @@ from chunker.macro_vars import (
     call_spans,
     is_dataset_shaped,
     let_values,
+    macro_signature,
     resolve_refs,
     strip_quotes,
 )
@@ -226,6 +227,25 @@ class TestCallSpans(unittest.TestCase):
 
     def test_text_that_opens_with_no_call(self):
         self.assertEqual(self._calls("data x; %a(1)"), [])
+
+
+class TestMacroSignature(unittest.TestCase):
+    def test_positional_and_keyword_parameters(self):
+        self.assertEqual(
+            macro_signature("%macro load(src, out=work.x, n=);"),
+            [("src", None), ("out", "work.x"), ("n", "")],
+        )
+
+    def test_a_default_holding_commas_or_parentheses_is_one_parameter(self):
+        self.assertEqual(
+            macro_signature("%macro m(list=%str(a,b), fmt=put(x, 8.), q='a,b', n=2);"),
+            [("list", "%str(a,b)"), ("fmt", "put(x, 8.)"), ("q", "'a,b'"), ("n", "2")],
+        )
+
+    def test_no_parameter_list(self):
+        self.assertEqual(macro_signature("%macro m / parmbuff;"), [])
+        self.assertEqual(macro_signature("%macro m;"), [])
+        self.assertEqual(macro_signature("data a; run;"), [])
 
 
 class TestIsDatasetShaped(unittest.TestCase):

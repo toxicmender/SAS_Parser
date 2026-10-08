@@ -138,19 +138,26 @@ def rewrite_source_text(
     def _substitute(match: re.Match[str], *, spec: "PathSpec") -> str:
         # A device form's quoted argument is a command line or an address, not a
         # location a path mapping can address. See the module docstring;
-        # classifying it is chunker.paths' call, not ours.
+        # classifying it is chunker.paths' call, not ours. A fileref names no
+        # path at all.
         if spec.location_for(match) is not PathLocation.FILESYSTEM:
             return match.group(0)
-        raw = match.group("path")
-        if "&" in raw:
-            stats.unresolved.append(raw)
-            return match.group(0)
-        mapped = map_path(raw, by_path, keys)
-        if mapped is None:
-            return match.group(0)
-        stats.rewritten[raw] = mapped
-        quote = match.group("q")
-        return f"{match.group('head')}{quote}{mapped}{quote}"
+        # Each quoted value the statement names, rewritten where it stands:
+        # `%include '/a.sas' '/b.sas';` names two.
+        text, parts, last = match.string, [], match.start()
+        for start, end in spec.value_spans(match):
+            raw = text[start:end]
+            if "&" in raw:
+                stats.unresolved.append(raw)
+                continue
+            mapped = map_path(raw, by_path, keys)
+            if mapped is None:
+                continue
+            stats.rewritten[raw] = mapped
+            parts += [text[last:start], mapped]
+            last = end
+        parts.append(text[last : match.end()])
+        return "".join(parts)
 
     rewritten = text
     for spec in PATH_STATEMENTS:

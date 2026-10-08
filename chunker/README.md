@@ -99,11 +99,11 @@ For running the work items end-to-end through an LLM, see the
 | `paths.py` | Where a physical path appears in SAS syntax — `PATH_STATEMENTS`, `classify_location`, `extract_paths`. The **single owner** of that grammar: `xref.pre` imports it to rewrite the same statements. |
 | `keywords.py` | SAS keyword catalogues transcribed from the SAS docs (reserved macro words, autocall macros, function / CALL-routine dictionaries, and `SAS_FUNCTION_CATEGORIES`) + the patterns compiled from them. Pure data; no package imports, no logging. |
 | `scanner.py` | Lexical layer: `_Unit` / `_Region` parse primitives and their `UnitRole` (code, comment, in-stream data, SUBMIT code), the statement classifier (`_classify`), where a macro call ends its statement (`_split_after_calls`), macro quoting (`_macro_quote_end`), in-stream blocks (`_in_stream_units`), text normalisation / sanitisation, line-offset helpers, and the `_Deadline` / `_ParseWatchdog` stuck-parser machinery. |
-| `macro_vars.py` | Macro-variable values and reference expansion: `let_values` (the `%LET` symbol table), `resolve_refs` (`&name` / `&name.` / `&&name&i`), `call_spans` (where back-to-back macro calls begin and end), and `DS_REF_TOKEN` — the single definition of a dataset token that may embed `&refs`. Pure; no package imports. |
+| `macro_vars.py` | Macro-variable values and reference expansion: `let_values` (the `%LET` symbol table), `resolve_refs` (`&name` / `&name.` / `&&name&i`), `call_spans` (where back-to-back macro calls begin and end), `macro_signature` (a `%MACRO`'s parameters, read with balanced parentheses), and `DS_REF_TOKEN` — the single definition of a dataset token that may embed `&refs`. Pure; no package imports. |
 | `sql.py` | The one SQL grammar: `SqlStatement(text, dialect)`, a token walk that reads a statement's tables by clause and verb, and `split_table_name`. `Dialect.NATIVE` reads a database's own SQL for pass-through; `Dialect.SAS` reads PROC SQL and PROC FEDSQL and gives each table its role (`SqlStatement.refs`). |
 | `passthrough.py` | SQL pass-through — `CONNECT TO` / `CONNECTION TO` / `EXECUTE … BY` / `DISCONNECT`, and the native SQL inside them read by `sql.SqlStatement`: `scan_pass_through` (tables + the spans to mask), `mask`, `db_table_ref` (the one `SasDbTableRef` builder). The **single owner** of the pass-through statements. |
 | `statements.py` | What each statement does to the datasets it names: `statements_of` (a region's statements, each with where it stands — open code, a DATA step, a PROC, a `%MACRO` body), the operand lists they read, and `dataset_refs` (the region's `SasDatasetRef`s, a macro body's classified as parameter, literal or macro variable). The **single owner** of dataset positions, for steps and macro bodies alike; `_canon_ds` lives here. |
-| `metadata.py` | Per-chunk semantic extraction: `_metadata_for` (datasets from `statements.dataset_refs`, plus the macro, path, function and symput / SQL-INTO / CALL EXECUTE scans), `_merge_meta`, the extraction regex catalogue, and the whole-list resolution passes — `resolve_macro_var_refs`, `resolve_ods_outputs`, `resolve_db_librefs`, composed in order by `resolve_references` (and across files by `resolve_corpus_references`). |
+| `metadata.py` | Per-chunk semantic extraction: `_metadata_for` (datasets from `statements.dataset_refs`, plus the macro, path, function and symput / SQL-INTO / CALL EXECUTE scans), `_merge_meta`, the extraction regex catalogue, and the whole-list resolution passes — `resolve_macro_var_refs`, `resolve_filerefs`, `resolve_ods_outputs`, `resolve_db_librefs`, composed in order by `resolve_references` (and across files by `resolve_corpus_references`). |
 | `chunker.py` | `SasSemanticChunker` orchestration (scan → group → build chunks, oversized-split with overlap). |
 | `batcher.py` | `_EdgeDiscovery` + Union-Find grouping, weak-edge resolution, context absorption, batch construction. `SasChunkBatcher` is a one-file convenience over `MultiFileBatcher`. |
 | `_repl.py` | `print_iterable` REPL helper (imported by nothing). |
@@ -313,6 +313,19 @@ A `FILENAME` device keyword redirects the same syntax somewhere that is not the
 filesystem, so each record carries a `PathLocation` — `FILESYSTEM`, `REMOTE`
 (FTP, URL, …), `EMAIL`, `PIPE` (a shell command), or `DEVICE` for a keyword this
 module does not know. An unknown device is never silently treated as a path.
+
+A statement may name several places: `%include '/a.sas' '/b.sas';` is two
+records (a `PathSpec` with `many=True`; `xref.pre` rewrites each value through
+`spec.value_spans`). And a place may be named through a fileref — `%include
+src(one two);`, `%include setup;`, `infile in;`, `file out;` (SAS's own
+`print`, `log`, `datalines`, `cards` excepted). Those are recorded as
+`FILEREF`, the fileref in `binds`, and `metadata.resolve_filerefs` walks the
+corpus in source order with the FILENAMEs in force: the latest binding of a
+fileref wins, `clear` or a FILENAME with no quoted place ends it, and each
+later reference takes the FILENAME's location and path — a member of a
+directory as `<dir>/one.sas`, SAS adding `.sas` for `%INCLUDE`. A fileref
+nothing binds stays `FILEREF`. A file read through a fileref is the FILENAME's
+file, so the hydration planner plans it once, from the FILENAME.
 
 One list rather than one per kind: one scan to keep correct, one merge rule to
 keep honest, and the per-kind views above for consumers. `includes` is the

@@ -189,6 +189,11 @@ def _path_source(ref: "SasPathRef", source_id: str | None) -> HydrationSource | 
     """
     if ref.statement in {"include", "ods", "sasautos", "file", "proc_export"}:
         return None
+    # ``infile in;`` reads through a fileref, at the path its FILENAME names
+    # (chunker.metadata.resolve_filerefs): that FILENAME's own reference is
+    # the source, planned once.
+    if ref.statement == "infile" and ref.binds is not None:
+        return None
     # A .sas7bndx is an INDEX, not data. Left in, it would be planned as an
     # ordinary file and — because it shares its stem with the dataset it indexes
     # — render the same target table, appending index pages into it as rows.

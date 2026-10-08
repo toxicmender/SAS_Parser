@@ -324,23 +324,20 @@ def call_spans(mt: str) -> list[CallSpan]:
     return spans
 
 
-def _extract_call_arg_text(call_text: str) -> str | None:
-    """Return the text between the call's balanced outer parens, or None.
+def _balanced_text(text: str, start: int) -> str:
+    """The text from *start*, just past an opening paren, to its balanced
+    closing paren.
 
     Walks characters with a paren-depth counter, treating single- and
     double-quoted spans as opaque, so nested constructs like
     ``%clean(%str(a,b), out=f(x))`` yield the full argument text instead
-    of stopping at the first ``)``.  An unbalanced call (truncated chunk)
-    falls back to everything after the opening paren.
+    of stopping at the first ``)``.  Unbalanced (a truncated chunk), it is
+    everything after the opening paren.
     """
-    m = _CALL_OPEN_RE.search(call_text)
-    if not m:
-        return None
-    start = m.end()
     depth = 1
     quote: str | None = None
-    for i in range(start, len(call_text)):
-        ch = call_text[i]
+    for i in range(start, len(text)):
+        ch = text[i]
         if quote:
             if ch == quote:
                 quote = None
@@ -351,8 +348,39 @@ def _extract_call_arg_text(call_text: str) -> str | None:
         elif ch == ")":
             depth -= 1
             if depth == 0:
-                return call_text[start:i]
-    return call_text[start:]
+                return text[start:i]
+    return text[start:]
+
+
+def _extract_call_arg_text(call_text: str) -> str | None:
+    """Return the text between the call's balanced outer parens, or None."""
+    m = _CALL_OPEN_RE.search(call_text)
+    if not m:
+        return None
+    return _balanced_text(call_text, m.end())
+
+
+# A %MACRO statement's name, and the paren its parameter list opens with.
+_MACRO_HEAD_RE = re.compile(r"%\s*macro\s+([A-Za-z_]\w*)\s*(\()?", re.IGNORECASE)
+
+
+def macro_signature(text: str) -> list[tuple[str, str | None]]:
+    """The ``(name, default)`` parameters of the first ``%MACRO`` statement
+    in *text*, in signature order, names lowercased; ``default`` is ``None``
+    for a positional parameter.
+
+    The list is read with balanced parentheses and split on top-level commas,
+    so a default holding either — ``list=%str(a,b)``, ``fmt=put(x, 8.)`` — is
+    one parameter, as SAS reads it.
+    """
+    m = _MACRO_HEAD_RE.search(text)
+    if m is None or m.group(2) is None:
+        return []
+    params: list[tuple[str, str | None]] = []
+    for part in _split_call_args(_balanced_text(text, m.end())):
+        name, eq, default = part.partition("=")
+        params.append((name.strip().lower(), default.strip() if eq else None))
+    return params
 
 
 def _split_call_args(raw_args: str) -> list[str]:

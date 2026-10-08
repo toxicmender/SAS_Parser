@@ -39,6 +39,7 @@ from .macro_vars import (
     is_dataset_shaped,
     let_assignments,
     let_values,
+    macro_signature,
     name_value,
     resolve_refs,
 )
@@ -46,6 +47,7 @@ from .models import (
     DatasetRole,
     DbTableAccess,
     DbTableVia,
+    PathLocation,
     SasChunk,
     SasChunkKind,
     SasChunkMetadata,
@@ -60,7 +62,7 @@ from .models import (
     _path_ref_sort_key,
 )
 from .passthrough import db_table_ref, mask, scan_pass_through
-from .paths import ENGINE_LIBNAMES, extract_engine_refs, extract_paths
+from .paths import ENGINE_LIBNAMES, extract_engine_refs, extract_paths, normalise_path
 from .scanner import _blank_span, _Region, _sanitise
 from .statements import _canon_ds
 from .statements import dataset_refs as statement_dataset_refs
@@ -446,13 +448,6 @@ _ODS_OUTPUT_END_RE = re.compile(
 )
 
 
-def _macro_params(text: str) -> list[tuple[str, str | None]]:
-    """The ``(name, default)`` parameters of the ``%MACRO`` heading *text*,
-    in signature order; ``default`` is ``None`` for a positional one."""
-    sig_m = _MACRO_SIG_RE.search(text)
-    return _parse_macro_params(sig_m.group(1) if sig_m else "")
-
-
 def _metadata_for(region: _Region) -> SasChunkMetadata:
     """The metadata of *region*'s code: its comments, in-stream data and
     SUBMIT code are blanked first (:attr:`~chunker.scanner._Region.code_text`),
@@ -491,7 +486,7 @@ def _metadata_for(region: _Region) -> SasChunkMetadata:
             for t in scan.tables
         ]
     # ── a %MACRO's parameters: position, or -1 for a keyword parameter ──────
-    params = _macro_params(text) if kind == SasChunkKind.MACRO_DEFINITION else []
+    params = macro_signature(text) if kind == SasChunkKind.MACRO_DEFINITION else []
     param_names = [name for name, _ in params]
     param_pos: dict[str, int] = {}
     positional = 0
@@ -1066,8 +1061,7 @@ class _MacroDef:
         meta = chunk.metadata
         cf = _sanitise(chunk.text, blank_strings=False)
         mt = _sanitise(chunk.text)
-        sig = _MACRO_SIG_RE.search(cf)
-        params = _parse_macro_params(sig.group(1) if sig else "")
+        params = macro_signature(cf)
         declared: dict[str, set[str]] = {"global": set(), "local": set()}
         for m in _SCOPE_DECL_RE.finditer(mt):
             for name in _SPLIT_WS_COMMA_RE.split(m.group(2).strip()):
@@ -1514,17 +1508,103 @@ def resolve_ods_outputs(chunks: list[SasChunk]) -> None:
             claimed_by, pending = chunk.chunk_id, []
 
 
+# A FILENAME statement's fileref: `filename in '/x';` binds it, and one with no
+# quoted place (`filename in clear;`, `filename in temp;`) ends what it held.
+_FILENAME_STMT_RE = re.compile(rf"\bfilename\s+({DS_REF_TOKEN})", re.IGNORECASE)
+# `src(one)`: a member of the directory a fileref names.
+_FILEREF_MEMBER_RE = re.compile(r"(?P<fref>[^(]+)\((?P<member>.*)\)\Z", re.DOTALL)
+
+
+def _through_fileref(ref: SasPathRef, filename: SasPathRef) -> SasPathRef:
+    """*ref*, made through a fileref, at the place the FILENAME *filename*
+    gave it: the file itself, or a member of the directory — ``%include
+    src(one)`` reads ``<dir>/one.sas``, SAS adding the extension."""
+    path = filename.path
+    if (m := _FILEREF_MEMBER_RE.match(ref.raw)) is not None:
+        member = m.group("member").strip().strip("'\"")
+        if ref.statement == "include" and "." not in member:
+            member += ".sas"
+        path = f"{path.rstrip('/')}/{member}"
+    path = normalise_path(path)
+    return ref.model_copy(
+        update={
+            "location": filename.location,
+            "path": path,
+            "device": filename.device,
+            "has_macro_ref": "&" in path,
+        }
+    )
+
+
+def resolve_filerefs(chunks: list[SasChunk]) -> None:
+    """Give each reference made through a fileref the place its FILENAME names, in place.
+
+    ``filename src '/code';`` then ``%include src(setup);`` includes
+    ``/code/setup.sas``; ``filename in '/data/x.csv';`` then ``infile in;``
+    reads ``/data/x.csv``. Walks *chunks* in source order keeping the filerefs
+    in force — the last FILENAME of each wins, and one with no quoted place
+    (``clear``, ``temp``) ends it — and gives each later FILEREF reference
+    (:attr:`~chunker.models.PathLocation.FILEREF`) the FILENAME's location
+    and path. One no FILENAME before it binds stays FILEREF. ``includes`` is
+    derived again from the result.
+
+    A FILENAME inside a ``%MACRO`` body binds too, as a LIBNAME does there. A
+    resolved reference is FILEREF no longer, so running the pass again — the
+    corpus-level run after the per-file one — changes nothing it resolved.
+    """
+    bound: dict[str, SasPathRef] = {}
+    for idx, chunk in enumerate(chunks):
+        meta = chunk.metadata
+        refs = meta.external_refs
+        named = {r.binds: r for r in refs if r.statement == "filename" and r.binds}
+        if named or meta.global_statement_keyword == "filename":
+            bound.update(named)
+            for m in _FILENAME_STMT_RE.finditer(_sanitise(chunk.text)):
+                fref = m.group(1).lower()
+                if fref == "_all_":
+                    bound.clear()
+                elif fref not in named:
+                    bound.pop(fref, None)
+        if not bound or all(r.location is not PathLocation.FILEREF for r in refs):
+            continue
+        resolved = [
+            _through_fileref(r, bound[r.binds])
+            if r.location is PathLocation.FILEREF and r.binds in bound
+            else r
+            for r in refs
+        ]
+        if resolved == refs:
+            continue
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"resolve_filerefs: {chunk.chunk_id} "
+                f"{[(r.raw, r.path) for r in resolved if r not in refs]}"
+            )
+        chunks[idx] = chunk.model_copy(
+            update={
+                "metadata": meta.model_copy(
+                    update={
+                        "external_refs": resolved,
+                        "includes": [r.path for r in resolved if r.statement == "include"],
+                    }
+                )
+            }
+        )
+
+
 def resolve_references(chunks: list[SasChunk]) -> None:
     """Every cross-chunk name resolution, in the one order that works, in place.
 
-    Macro variables first — a libref, a dataset and a pass-through table can all
-    be spelled through one — then ODS OUTPUT requests, moved to their PROCs
-    with their names resolved, then database librefs, which read the resolved
-    names where they end up. :meth:`~chunker.chunker.SasSemanticChunker.chunk_text`,
+    Macro variables first — a libref, a dataset, a fileref and a pass-through
+    table can all be spelled through one — then filerefs, ODS OUTPUT
+    requests, moved to their PROCs with their names resolved, and database
+    librefs, which read the resolved names where they end up.
+    :meth:`~chunker.chunker.SasSemanticChunker.chunk_text`,
     :class:`~chunker.batcher.MultiFileBatcher` and
     :func:`resolve_corpus_references` all call this, so the order lives here.
     """
     resolve_macro_var_refs(chunks)
+    resolve_filerefs(chunks)
     resolve_ods_outputs(chunks)
     resolve_db_librefs(chunks)
 
@@ -1547,31 +1627,3 @@ def resolve_corpus_references(corpus: SasCorpus) -> SasCorpus:
         results.append(result.model_copy(update={"chunks": flat[start:end]}))
         start = end
     return SasCorpus(file_results=results)
-
-
-# ---------------------------------------------------------------------------
-# %MACRO signatures
-# ---------------------------------------------------------------------------
-
-# Splits a macro argument list on commas, respecting nested parens
-_ARG_SPLIT_RE = re.compile(r",(?![^(]*\))")
-
-# Extracts macro signature: %macro name(params)
-_MACRO_SIG_RE = re.compile(r"%\s*macro\s+\w+\s*\(([^)]*)\)", re.IGNORECASE)
-
-
-def _parse_macro_params(sig_text: str) -> list[tuple[str, str | None]]:
-    """Parse a comma-separated macro parameter list into (name, default)."""
-    params: list[tuple[str, str | None]] = []
-    if not sig_text.strip():
-        return params
-    for part in _ARG_SPLIT_RE.split(sig_text):
-        part = part.strip()
-        if not part:
-            continue
-        if "=" in part:
-            name, default = part.split("=", 1)
-            params.append((name.strip().lower(), default.strip()))
-        else:
-            params.append((part.lower(), None))
-    return params

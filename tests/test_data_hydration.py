@@ -146,6 +146,20 @@ class TestPathSources:
         assert item.target_table == UNRESOLVED_TARGET
         assert "library directory" in item.blockers[0]
 
+    def test_a_file_read_through_a_fileref_is_one_item(self):
+        # The chunker gives `infile in;` its FILENAME's path; the FILENAME is
+        # still the one source of that file, not one of two.
+        from chunker import SasSemanticChunker
+
+        src = "filename in '/data/cust.csv';\ndata a; infile in dlm=','; input x; run;\n"
+        chunks = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(src).chunks
+        refs = [r for c in chunks for r in c.metadata.external_refs]
+        assert [(r.statement, r.path) for r in refs] == [
+            ("filename", "/data/cust.csv"),
+            ("infile", "/data/cust.csv"),
+        ]
+        assert len(build_plan((), refs, config=_config()).items) == 1
+
     def test_an_ftp_filename_becomes_an_sftp_source(self):
         plan = _plan("filename raw ftp '/incoming/cust.csv' host='h';")
         assert plan.items[0].source.kind is SourceKind.SFTP
