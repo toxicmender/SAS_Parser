@@ -1,9 +1,9 @@
 # Plan: close the chunker's SAS coverage gaps (breaking changes allowed)
 
-Status: Phases 0–5 implemented. `tests/test_sas_coverage.py` holds 183 probes:
+Status: Phases 0–6 implemented. `tests/test_sas_coverage.py` holds 183 probes:
 the 168 from the coverage review plus 15 precision probes (`X01`–`X15`). Today
-178 pass and 5 are expected failures, each naming the phase below that fixes
-it. Phases 6–9 are not started.
+180 pass and 3 are expected failures, each naming the phase below that fixes
+it. Phases 7–9 are not started.
 
 ## Context
 
@@ -460,7 +460,19 @@ Done as planned, with these differences:
 
 Probes flipped: S02, S03, S08, S09, S13, S15, E02.
 
-## Phase 6: embedded languages (S)
+## Phase 6: embedded languages (S) — done
+
+Done as planned. Differences:
+
+- DS2's `set from th;` reads a THREAD program's rows, not a table, and
+  names nothing.
+- IML reads only the first operand of `use`, `edit` and `create` (`create
+  out var {x y}` names `out`, not `var`); an expression in parentheses
+  (`use (dsname);`) names nothing.
+
+Behaviour against Phase 5: only E01 and E03 change. Batches, the 4,800-chunk
+job and both reference examples are identical. Chunking stays within 0–11%
+of Phase 0.
 
 - **PROC DS2:**
   - DS2 `data out / overwrite=yes;` → WRITE `out`;

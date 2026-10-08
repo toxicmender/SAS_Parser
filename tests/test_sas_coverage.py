@@ -26,10 +26,9 @@ from chunker import SasChunkKind as K
 
 # ── why a probe fails today, and the plan phase that fixes it ──────────────────
 
-EMBEDDED = "phase 6: DS2 and IML reads and writes"
 INCLUDES = "phase 7: %INCLUDE, filerefs and macro signatures"
 
-GAPS = frozenset({EMBEDDED, INCLUDES})
+GAPS = frozenset({INCLUDES})
 
 # A probe's free-form check: (result, top-level chunks) -> a problem, or None.
 Check = Callable[[SasChunkResult, list[SasChunk]], "str | None"]
@@ -615,13 +614,13 @@ EMBEDDED_PROBES = [
     Probe("E01", "PROC DS2 data program",
           "proc ds2;\n  data out_ds / overwrite=yes;\n    method run();\n      set in_ds;\n    end;\n"
           "  enddata;\nrun;\nquit;\n",
-          kinds=[K.PROC_STEP], inputs={"work.in_ds"}, outputs={"work.out_ds"}, gap=EMBEDDED),
+          kinds=[K.PROC_STEP], inputs={"work.in_ds"}, outputs={"work.out_ds"}),
     Probe("E02", "PROC FEDSQL", "proc fedsql;\n  create table c as select * from a;\nquit;\n",
           inputs={"work.a"}, outputs={"work.c"}),
     Probe("E03", "PROC IML USE / CREATE",
           "proc iml;\n  use lib.a; read all var _num_ into m; close lib.a;\n"
           "  create out from m; append from m; close out;\nquit;\n",
-          kinds=[K.PROC_STEP], inputs={"lib.a"}, outputs={"work.out"}, gap=EMBEDDED),
+          kinds=[K.PROC_STEP], inputs={"lib.a"}, outputs={"work.out"}),
     Probe("E04", "PROC PYTHON submit block",
           "proc python;\nsubmit;\ndata = load()\nrun = True\nendsubmit;\nrun;\n",
           kinds=[K.PROC_STEP]),

@@ -268,6 +268,13 @@ THEN`, `ELSE`, `WHEN (…)` or `OTHERWISE`; a subsetting `IF` has none. Then:
     `metadata.resolve_ods_outputs` hands them to the next PROC_STEP of the
     file. `ods output close|clear` before one cancels them; they stay on the
     statement as MENTIONs.
+  - **PROC DS2:** a DATA program writes its tables (`/ overwrite=` aside);
+    SET and MERGE read theirs, a `set {select …}` query's through the SQL
+    grammar; `set from th;` reads a THREAD program's rows, no table.
+  - **PROC IML:** `use` reads the dataset it names first, `edit` updates it,
+    `create` writes it; `append`, `read` and `close` work on one already
+    open. Code between SUBMIT and ENDSUBMIT — R, Python, Lua, Groovy — stays
+    opaque: whatever datasets it touches are not seen.
   - **PROC SQL and PROC FEDSQL** statements go through `sql.SqlStatement` in
     its SAS dialect: FROM lists (comma joins too) and JOINs read, subqueries
     and inline views included; `CREATE TABLE|VIEW` writes, and reads its

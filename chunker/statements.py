@@ -428,14 +428,49 @@ def _data_step_refs(st: Statement) -> Iterator[_Ref]:
     yield from _hash_refs(st)
 
 
-def _sql_refs(st: Statement) -> Iterator[_Ref]:
-    """A PROC SQL or FEDSQL statement's tables, by the one SQL grammar."""
-    for raw, role, via in SqlStatement(st.cf, Dialect.SAS).refs():
+def _sql_refs(st: Statement, start: int = 0, end: int | None = None) -> Iterator[_Ref]:
+    """The tables a SAS SQL statement names — PROC SQL, PROC FEDSQL, or the
+    query in ``st.cf[start:end]`` — by the one SQL grammar."""
+    for raw, role, via in SqlStatement(st.cf[start:end], Dialect.SAS).refs():
         if raw[0] in "'\"":  # a physical path, or a name literal: 'my data'n
             quoted = raw[:-1] if raw[-1] in "nN" else raw
             yield _Operand(raw, _quoted_path(quoted)), role, via
         elif op := _token_operand(raw):
             yield op, role, via
+
+
+# PROC DS2. A DATA program writes its tables; SET and MERGE read theirs, a
+# `{select …}` query's included. `set from th;` reads a THREAD program's rows,
+# not a table.
+_SET_FROM_THREAD_RE = re.compile(r"from\b", re.IGNORECASE)
+
+
+def _ds2_refs(st: Statement) -> Iterator[_Ref]:
+    kw, after = st.keyword, len(st.keyword)
+    if kw == "data":
+        for op in _operands(st.mt, st.cf, after):
+            yield op, WRITE, "data"
+    elif kw in ("set", "merge"):
+        at = _ws_end(st.mt, after)
+        if st.mt.startswith("{", at):
+            close = st.mt.find("}", at)
+            yield from _sql_refs(st, at + 1, close if close >= 0 else None)
+        elif not _SET_FROM_THREAD_RE.match(st.mt, at):
+            for op in _operands(st.mt, st.cf, after):
+                yield op, READ, kw
+
+
+# PROC IML: USE opens a dataset to read, EDIT to read and change, CREATE a new
+# one; its name comes first (`create out from m;`, `use a var {x};`). APPEND,
+# READ and CLOSE work on one already open.
+_IML_ROLES = {"use": READ, "edit": UPDATE, "create": WRITE}
+
+
+def _iml_refs(st: Statement) -> Iterator[_Ref]:
+    role = _IML_ROLES.get(st.keyword)
+    if role is not None:
+        for op in _operands(st.mt, st.cf, len(st.keyword), limit=1):
+            yield op, role, st.keyword
 
 
 # ---------------------------------------------------------------------------
@@ -630,6 +665,10 @@ class _ProcStep:
             yield from self._proc_statement(st)
         elif self.proc in _SQL_PROCS:
             yield from _sql_refs(st)
+        elif self.proc == "ds2":
+            yield from _ds2_refs(st)
+        elif self.proc == "iml":
+            yield from _iml_refs(st)
         elif self.copy is not None:
             if kw == "select":
                 yield from self.copy.select(st)

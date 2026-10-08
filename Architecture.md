@@ -130,9 +130,9 @@ chunker/
                         classifies a macro body's as parameter, literal or
                         macro variable. A PROC's options name what
                         keywords.PROC_OPTION_ROLES says they name in it; PROC
-                        DATASETS, PROC COPY and ODS OUTPUT have readers of
-                        their own. The one owner of dataset positions, for
-                        steps and macro bodies alike.
+                        DATASETS, PROC COPY, ODS OUTPUT, DS2 and IML have
+                        readers of their own. The one owner of dataset
+                        positions, for steps and macro bodies alike.
   metadata.py           Per-chunk semantic extraction: _metadata_for (datasets
                         from statements.dataset_refs, plus the macro, path,
                         function and symput / SQL-INTO / CALL EXECUTE scans),

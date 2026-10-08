@@ -397,6 +397,34 @@ def test_ods_output_in_a_macro_body_is_the_bodys():
     assert meta.body_param_outputs == [{"param": "o", "pos": 0}]
 
 
+def test_proc_ds2_reads_and_writes_its_tables():
+    src = (
+        "proc ds2;\n"
+        "  thread t / overwrite=yes; method run(); set lib.raw; end; endthread;\n"
+        "  data out_ds lib.copy / overwrite=yes;\n"
+        "    dcl thread t th;\n"
+        "    method run(); set from th; set {select k, v from lib.lk where v > 1}; end;\n"
+        "  enddata;\n"
+        "run;\nquit;\n"
+    )
+    assert _refs(src) == [
+        ("lib.raw", R, "set"),
+        ("work.out_ds", W, "data"),
+        ("lib.copy", W, "data"),
+        ("lib.lk", R, "from"),
+    ]
+
+
+def test_proc_iml_opens_datasets_by_name():
+    src = (
+        "proc iml;\n  use lib.a var {x y} where(x > 0); read all var _num_ into m; close lib.a;\n"
+        "  edit lib.b; delete all where(x < 0); purge;\n"
+        "  create out var {x y}; append from m; close out;\n"
+        "  use (dsname);\nquit;\n"
+    )
+    assert _refs(src) == [("lib.a", R, "use"), ("lib.b", U, "edit"), ("work.out", W, "create")]
+
+
 def test_proc_sql_clauses():
     src = (
         "proc sql;\n  create table c as select * from a join lib.b on 1;\n"
