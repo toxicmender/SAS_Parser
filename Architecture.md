@@ -736,7 +736,7 @@ once, emitting typed edges:
 
 | Edge kind            | Tier   | Meaning |
 |----------------------|--------|---------|
-| `dataset_flow`       | strong | chunk reads a dataset a preceding chunk wrote |
+| `dataset_flow`       | strong | chunk reads or updates a dataset a preceding chunk created |
 | `macro_body_dataset` | strong | call-site-resolved parameterised macro-body I/O |
 | `macro_invocation`   | weak   | chunk invokes a macro defined elsewhere |
 | `macro_var_flow`     | weak   | chunk reads `&name`; links to the nearest preceding creator |
@@ -762,7 +762,10 @@ creator (the last assignment before the reference is the one whose value
 SAS resolves), so a name reassigned across unrelated jobs cannot fuse
 them, and a reference before any assignment gets no edge.
 
-WRITE and UPDATE refs produce a name; DROP and MENTION refs do not. A
+Only a WRITE ref produces a name. A step updating a table in place (APPEND
+`base=`, SQL INSERT, MODIFY) links to the table's nearest preceding creator
+like any reader and supplies it to nobody, so jobs appending to one shared
+table do not chain into one batch; DROP and MENTION refs produce nothing. A
 pattern input (`set lib.sales_:;`) links to the nearest preceding producer
 of each produced name its prefix covers, found by bisection in a sorted name
 index. A whole-library input (`lib.:`) links nothing, so a housekeeping step

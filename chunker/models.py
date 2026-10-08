@@ -399,9 +399,12 @@ class DatasetRole(StrEnum):
     """What a statement does to a SAS dataset it names."""
 
     READ = "read"
+    # Created or replaced: the one role that supplies a dataset to later steps.
     WRITE = "write"
     # Read and rewritten in place (MODIFY, APPEND BASE=, SQL INSERT/UPDATE/
-    # DELETE): an input and an output at once.
+    # DELETE, an in-place SORT): an input and an output at once. It needs the
+    # table to exist and supplies it to nobody: a later step that reads the
+    # table, or updates it too, depends on the step that created it.
     UPDATE = "update"
     # Deleted (PROC DATASETS DELETE, SQL DROP TABLE): neither read nor written.
     DROP = "drop"
@@ -504,7 +507,12 @@ _DATASET_VIEWS = frozenset(
 )
 
 
-_NO_VIEWS: dict[str, tuple[Any, ...]] = dict.fromkeys(_DATASET_VIEWS, ())
+# Views read by the consumers but never serialised or accepted as input: the
+# datasets a chunk (or its macro body) creates, which alone supply later steps.
+_CREATED_VIEWS = frozenset({"created_datasets", "body_literal_created"})
+
+
+_NO_VIEWS: dict[str, tuple[Any, ...]] = dict.fromkeys(_DATASET_VIEWS | _CREATED_VIEWS, ())
 
 
 def _libref_of(name: str) -> str | None:
@@ -519,7 +527,8 @@ def _dataset_views(refs: tuple[SasDatasetRef, ...]) -> dict[str, tuple[Any, ...]
     A chunk's own references fill ``input_datasets``, ``output_datasets`` and
     ``dropped_datasets``; a macro body's fill the ``body_literal_*`` lists, or
     ``body_param_*`` when spelled through a parameter. UPDATE reads and writes.
-    ``referenced_datasets`` is every name, sorted, whatever its role, and
+    WRITE alone also fills ``created_datasets`` (``body_literal_created`` in a
+    body). ``referenced_datasets`` is every name, sorted, whatever its role, and
     ``referenced_librefs`` the librefs those names hold (without the
     chunk's ``defines_librefs``, which the property adds).
     """
@@ -530,17 +539,19 @@ def _dataset_views(refs: tuple[SasDatasetRef, ...]) -> dict[str, tuple[Any, ...]
         role = ref.role
         if ref.param is not None:
             key: Any = (ref.param, ref.param_pos)
-            into = ("body_param_inputs", "body_param_outputs", None)
+            into = ("body_param_inputs", "body_param_outputs", None, None)
         elif ref.in_macro_body:
             key = ref.name
-            into = ("body_literal_inputs", "body_literal_outputs", None)
+            into = ("body_literal_inputs", "body_literal_outputs", None, "body_literal_created")
         else:
             key = ref.name
-            into = ("input_datasets", "output_datasets", "dropped_datasets")
+            into = ("input_datasets", "output_datasets", "dropped_datasets", "created_datasets")
         if role is DatasetRole.READ or role is DatasetRole.UPDATE:
             found.setdefault(into[0], {})[key] = None
         if role is DatasetRole.WRITE or role is DatasetRole.UPDATE:
             found.setdefault(into[1], {})[key] = None
+            if role is DatasetRole.WRITE and into[3] is not None:
+                found.setdefault(into[3], {})[key] = None
         if role is DatasetRole.DROP and into[2] is not None:
             found.setdefault(into[2], {})[key] = None
     views = dict(_NO_VIEWS)
@@ -706,6 +717,20 @@ class SasChunkMetadata(BaseModel):
     def dropped_datasets(self) -> list[str]:
         """Datasets the chunk deletes."""
         return list(self._views()["dropped_datasets"])
+
+    @property
+    def created_datasets(self) -> list[str]:
+        """Of :attr:`output_datasets`, the ones the chunk creates or replaces
+        (WRITE), first-seen order: what it supplies to the steps after it.
+        A table it only updates in place is not here — the update needs the
+        table, and its creator supplies it. Not serialised: a view the batcher
+        and :mod:`complexity.crossfile` read, never part of the record."""
+        return list(self._views()["created_datasets"])
+
+    @property
+    def body_literal_created(self) -> list[str]:
+        """As :attr:`created_datasets`, for a ``%MACRO`` body's own names."""
+        return list(self._views()["body_literal_created"])
 
     @computed_field  # type: ignore[prop-decorator]
     @property

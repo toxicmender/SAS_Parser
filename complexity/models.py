@@ -133,8 +133,9 @@ class ChunkComplexity(_ComplexityBase):
     # are small, and a rollup needs them per chunk to be auditable.
     input_datasets: list[str] = Field(default_factory=list)
     output_datasets: list[str] = Field(default_factory=list)
-    # Of those, the ones rewritten in place (MODIFY, APPEND BASE=, SQL INSERT/
-    # UPDATE/DELETE), and the ones it deletes (PROC DATASETS DELETE, SQL DROP).
+    # Of those, the ones it updates in place without creating them (MODIFY,
+    # APPEND BASE=, SQL INSERT/UPDATE/DELETE), and the ones it deletes (PROC
+    # DATASETS DELETE, SQL DROP).
     updated_datasets: list[str] = Field(default_factory=list)
     dropped_datasets: list[str] = Field(default_factory=list)
     # The external locations this chunk names — the filesystem paths, remote
@@ -274,17 +275,17 @@ class FileComplexity(_ComplexityBase):
     # with nothing explaining it reads as a bug in one of the two.
     comment_chunk_count: int = 0
     # The file's data interface, split three ways because the three mean
-    # different things to whoever migrates it: `input_datasets` are read but not
-    # written here, so they must exist before this file runs;
-    # `intermediate_datasets` are written and read within it, so they are
-    # internal and nobody outside needs to provide them; `output_datasets` is
-    # everything it writes, which is what downstream files may be waiting on.
+    # different things to whoever migrates it: `input_datasets` are read (or
+    # updated in place) but not created here, so they must exist before this
+    # file runs; `intermediate_datasets` are created and read within it, so they
+    # are internal and nobody outside needs to provide them; `output_datasets`
+    # is everything it writes, which is what downstream files may be waiting on.
     input_datasets: list[str] = Field(default_factory=list)
     output_datasets: list[str] = Field(default_factory=list)
     intermediate_datasets: list[str] = Field(default_factory=list)
-    # Datasets the file rewrites in place — each also an input and an output
-    # above, and the place a migration most easily turns an append into an
-    # overwrite — and the ones it deletes.
+    # Datasets the file updates in place — each also an output above, and an
+    # input unless the file creates it too; the place a migration most easily
+    # turns an append into an overwrite — and the ones it deletes.
     updated_datasets: list[str] = Field(default_factory=list)
     dropped_datasets: list[str] = Field(default_factory=list)
     # Everywhere outside the SAS libraries this file reaches. Reported, never

@@ -686,8 +686,11 @@ class _ProcStep:
     def _proc_statement(self, st: Statement) -> Iterator[_Ref]:
         refs = list(_statement_option_refs(st, self.roles))
         if self.proc == "sort" and all(via != "out=" for _, _, via in refs):
-            # Without OUT= the sort rewrites DATA= in place.
-            refs = [(op, UPDATE if via == "data=" else role, via) for op, role, via in refs]
+            # Without OUT= the sort replaces DATA= with a sorted copy: it reads
+            # the table and creates its new version, as `data x; set x;` does.
+            # Not an UPDATE, which supplies nothing: a later BY step reads the
+            # sorted table, so it depends on the sort.
+            refs += [(op, WRITE, via) for op, role, via in refs if via == "data="]
         yield from refs
         flags = _blank_groups(st.mt)
         if self.proc == "datasets":
@@ -895,12 +898,31 @@ def dataset_refs(
                     SasDatasetRef(op.name, role, raw=op.raw, via=via, pattern=op.pattern)
                 )
 
+    def close_data_step(start: int) -> None:
+        # MODIFY updates its master where it stands: the DATA statement names
+        # that table, and OUTPUT adds rows to it, so neither creates it.
+        masters = {
+            r.name for r in refs[start:] if r.role is UPDATE and r.via == "modify"
+        }
+        if masters:
+            refs[start:] = [
+                r
+                for r in refs[start:]
+                if not (r.role is WRITE and r.name in masters and r.via in ("data", "output"))
+            ]
+
     # A PROC step is read by one _ProcStep, from its PROC statement to the
     # statement that ends it: what one statement names can depend on another's
     # (PROC DATASETS's LIB=, PROC COPY's SELECT).
     step: _ProcStep | None = None
     step_in_macro = False
+    data_start: int | None = None  # where the open DATA step's refs begin
+    modifies = False  # and whether it has a MODIFY statement
     for st in statements_of(units, mt, cf, macro_body=macro_body):
+        if data_start is not None and (st.context != DATA or st.keyword == "data"):
+            if modifies:
+                close_data_step(data_start)
+            data_start, modifies = None, False
         if step is not None and (st.context != PROC or st.keyword == "proc"):
             add(step.close(), step_in_macro)
             step = None
@@ -909,7 +931,13 @@ def dataset_refs(
                 step, step_in_macro = _ProcStep(st.proc), st.in_macro
             add(step.read(st), st.in_macro)
         else:
+            if st.context == DATA:
+                if data_start is None:
+                    data_start = len(refs)
+                modifies = modifies or st.keyword == "modify"
             add(_statement_refs(st), st.in_macro)
+    if data_start is not None and modifies:
+        close_data_step(data_start)
     if step is not None:
         add(step.close(), step_in_macro)
     return refs

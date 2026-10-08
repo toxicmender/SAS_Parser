@@ -1261,6 +1261,54 @@ class TestCrossFile(unittest.TestCase):
         self.assertEqual(lib.depended_on_by, ["job.sas"])
 
 
+class TestUpdatesAcrossFiles(unittest.TestCase):
+    """Only a file that creates a table supplies it. A file that updates one
+    in place needs it from the creator and supplies it to nobody."""
+
+    # create.sas makes audit.log; two jobs append to it; a report reads it.
+    FILES = dict(
+        create="data audit.log; length job $8; stop; run;\n",
+        job1="data work.r1; set edw.a; run;\n"
+        "proc append base=audit.log data=work.r1; run;\n",
+        job2="proc sql; insert into audit.log select * from edw.b; quit;\n",
+        report="proc print data=audit.log; run;\n",
+    )
+
+    def setUp(self):
+        self.report = ComplexityAnalyzer().analyze_corpus(_corpus(**self.FILES))
+
+    def _profile(self, source_id: str):
+        profile = _file(self.report, source_id).cross_file
+        assert profile is not None
+        return profile
+
+    def test_an_appending_file_imports_the_table_from_its_creator(self):
+        job1 = self._profile("job1.sas")
+        self.assertEqual(job1.depends_on, ["create.sas"])
+        self.assertIn("audit.log written by create.sas", job1.imports)
+
+    def test_appending_files_do_not_depend_on_each_other(self):
+        self.assertEqual(self._profile("job1.sas").depended_on_by, [])
+        self.assertEqual(self._profile("job2.sas").depended_on_by, [])
+        graph = self.report.graph
+        assert graph is not None
+        self.assertEqual(graph.cycles, [])
+
+    def test_a_reader_depends_on_the_creator_alone(self):
+        self.assertEqual(self._profile("report.sas").depends_on, ["create.sas"])
+        self.assertEqual(
+            self._profile("create.sas").depended_on_by,
+            ["job1.sas", "job2.sas", "report.sas"],
+        )
+
+    def test_the_datasets_section_agrees(self):
+        job1 = _file(self.report, "job1.sas")
+        self.assertIn("audit.log", job1.input_datasets)
+        self.assertIn("audit.log", job1.output_datasets)
+        self.assertNotIn("audit.log", job1.intermediate_datasets)
+        self.assertEqual(job1.updated_datasets, ["audit.log"])
+
+
 class TestFileComplexity(unittest.TestCase):
     """The file rollup, and how it renders."""
 
@@ -2435,6 +2483,24 @@ class TestDatasets(unittest.TestCase):
         self.assertIn("mart.hist", chunks[1].input_datasets)
         self.assertIn("mart.hist", chunks[1].output_datasets)
         self.assertNotIn("work.old", chunks[2].output_datasets)
+
+    def test_a_table_only_updated_here_is_an_input(self):
+        """Something else creates mart.hist; appending to it needs it first."""
+        file = _file(_analyze(self.MAINTENANCE), "t.sas")
+        self.assertEqual(file.input_datasets, ["edw.raw", "mart.hist", "mart.log"])
+        self.assertNotIn("mart.hist", file.intermediate_datasets)
+        self.assertIn("mart.hist", file.output_datasets)
+
+    def test_a_table_created_then_inserted_into_is_not_an_update(self):
+        file = _file(
+            _analyze(
+                "proc sql; create table work.x as select * from edw.raw;"
+                " insert into work.x values (1); quit;\n"
+            ),
+            "t.sas",
+        )
+        self.assertEqual(file.updated_datasets, [])
+        self.assertEqual(file.output_datasets, ["work.x"])
 
     def test_the_report_calls_out_updates_and_deletes(self):
         file = _file(_analyze(self.MAINTENANCE), "t.sas")

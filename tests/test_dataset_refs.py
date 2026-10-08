@@ -46,6 +46,26 @@ def test_views_split_references_by_role():
     assert meta.dropped_datasets == ["work.tmp"]
 
 
+def test_only_a_write_creates():
+    # What a chunk supplies to later steps: an UPDATE needs the table first.
+    meta = _meta(
+        _ref("lib.master", U),
+        _ref("work.a", W),
+        _ref("lib.in", R),
+        _ref("lib.body", W, in_macro_body=True),
+        _ref("lib.log", U, in_macro_body=True),
+        _param("out", 0, W),
+    )
+    assert meta.output_datasets == ["lib.master", "work.a"]
+    assert meta.created_datasets == ["work.a"]
+    assert meta.body_literal_outputs == ["lib.body", "lib.log"]
+    assert meta.body_literal_created == ["lib.body"]
+    # Views for the consumers, not part of the record.
+    dumped = meta.model_dump()
+    assert "created_datasets" not in dumped
+    assert "body_literal_created" not in dumped
+
+
 def test_macro_body_references_stay_out_of_the_chunk_lists():
     meta = _meta(
         _ref("lib.in", R, in_macro_body=True),

@@ -657,13 +657,22 @@ source scanning:
 | Reference | Producer field | Consumer field |
 | --- | --- | --- |
 | macro | `defines_macros` | `invokes_macros` |
-| dataset | `output_datasets`, `body_literal_outputs` | `input_datasets` |
+| dataset | `created_datasets`, `body_literal_created` | `input_datasets` |
 | macro variable | `produces_macrovars`, `declared_macro_vars` | `consumes_macrovars` |
 | libref | `defines_librefs` | libref prefix of dataset I/O |
 
 Each reference lands in one of three states: **internal** (same file — no
 signal at all), **import/export** (satisfied by another file in the corpus), or
 **unresolved** (satisfied by nothing in scope).
+
+Only a file that creates a dataset supplies it. A file that updates a table in
+place — `PROC APPEND BASE=`, SQL `INSERT`/`UPDATE`/`DELETE`, `MODIFY` — needs
+the table, so its `input_datasets` hold it and it imports it from the files that
+create it; it exports it to nobody. Jobs that each append to one shared audit
+table therefore depend on the table's creator and not on each other, which
+keeps them out of a dependency cycle, and a later reader depends on the creator
+alone. An in-place `PROC SORT` is not an update: it replaces the table with a
+sorted copy, so it creates it, as `data x; set x;` does.
 
 `%INCLUDE` is deliberately **not** among them. The chunker already surfaces it
 as both a chunk kind and a metadata flag, and the catalogue rates both
@@ -748,11 +757,13 @@ its coupling — the second only means something once you know the first:
 
 The three-way split is the useful part. **Inputs** must already exist when this
 file runs; **outputs** are what downstream files are waiting on; and
-**intermediates** — written *and* read inside this file — are its own business,
-so nobody has to provide them. A dataset the file writes is therefore never
+**intermediates** — created *and* read inside this file — are its own business,
+so nobody has to provide them. A dataset the file creates is therefore never
 reported as an input, which is the same rule `crossfile.py` applies when
 deciding whether a read is a cross-file import. The two sections cannot
-contradict each other by construction.
+contradict each other by construction. A table the file only updates in place
+is an input — something else creates it — and an output, since the file
+writes to it.
 
 Two more lines appear only when they have something to say:
 
@@ -761,11 +772,12 @@ Two more lines appear only when they have something to say:
 - Deleted: work.tmp1
 ```
 
-**Updated in place** names the tables the file rewrites rather than creates —
-`MODIFY`, `PROC APPEND BASE=`, SQL `INSERT`/`UPDATE`/`DELETE`, an in-place
-`PROC SORT`. Each is also counted in the three lines above, since an update both
-reads and writes; it is called out because an append is what a migration most
-easily turns into a replacement. **Deleted** names the tables the file removes
+**Updated in place** names the tables the file changes where they stand rather
+than creates — `MODIFY`, `PROC APPEND BASE=`, SQL `INSERT`/`UPDATE`/`DELETE`.
+Each is also among the outputs, and among the inputs unless the file creates it
+too; it is called out because an append is what a migration most easily turns
+into a replacement. A table a step creates and then inserts into is not listed.
+**Deleted** names the tables the file removes
 (`PROC DATASETS DELETE`, SQL `DROP TABLE`), which are neither inputs nor
 outputs. Both come from the chunker's dataset reference roles (`UPDATE` and
 `DROP`; see `chunker/README.md`).

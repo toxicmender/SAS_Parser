@@ -25,9 +25,15 @@ looked at one file would be an unfounded assertion, and it is the difference
 between MEDIUM/PARTIAL and HIGH/MANUAL.
 
 Everything here is derived from metadata the chunker already extracts —
-``defines_macros`` / ``invokes_macros``, ``output_datasets`` /
+``defines_macros`` / ``invokes_macros``, ``created_datasets`` /
 ``input_datasets``, ``produces_macrovars`` / ``consumes_macrovars``,
 ``defines_librefs``, and ``includes``. No new source scanning.
+
+Only a file that creates a dataset supplies it. A file that updates a table in
+place (``PROC APPEND BASE=``, SQL ``INSERT``, ``MODIFY``) needs the table, so it
+imports it from the files that create it, and supplies it to nobody: two jobs
+appending to one audit table do not depend on each other, and a later reader
+depends on the creator alone.
 
 Two exclusion sets are reused from the chunker rather than re-listed, on the
 same reasoning as :func:`chunker.scanner._sanitise` in
@@ -198,12 +204,13 @@ class CrossFileIndex:
             meta = chunk.metadata
             for macro in meta.defines_macros:
                 _record(macros, macro, source)
-            for dataset in meta.output_datasets:
+            # Creations only: an update in place needs the table it changes.
+            for dataset in meta.created_datasets:
                 _record(datasets, dataset, source)
-            # A macro definition's literal body outputs are produced by this
+            # A macro definition's literal body creations are produced by this
             # file too, once the macro is called (the batcher takes the same
             # view when computing a batch's outputs).
-            for dataset in meta.body_literal_outputs:
+            for dataset in meta.body_literal_created:
                 _record(datasets, dataset, source)
             for var in (*meta.produces_macrovars, *meta.declared_macro_vars):
                 _record(macrovars, var, source)
@@ -324,7 +331,7 @@ class CrossFileIndex:
                     )
                 )
 
-        # ── datasets read here but written elsewhere ─────────────────────────
+        # ── datasets read or updated here but created elsewhere ──────────────
         for dataset in meta.input_datasets:
             key = dataset.lower()
             if source in datasets.get(key, set()):
@@ -349,8 +356,8 @@ class CrossFileIndex:
                     )
                 )
 
-        # ── datasets written here and read elsewhere ─────────────────────────
-        for dataset in meta.output_datasets:
+        # ── datasets created here and read (or updated) elsewhere ────────────
+        for dataset in meta.created_datasets:
             users = _owners(consumers.datasets, dataset, source)
             if users:
                 refs.append(

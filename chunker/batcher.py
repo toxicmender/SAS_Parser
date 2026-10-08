@@ -623,7 +623,10 @@ class _EdgeDiscovery:
         self.edges: list[_Edge] = []
 
         # ── producer indices (filled by _build_indices) ────────────────────
-        # dataset → global indices of chunks that write it
+        # dataset → global indices of chunks that create it (WRITE). A step
+        # that updates a table in place (APPEND BASE=, SQL INSERT, MODIFY, an
+        # in-place SORT) needs the table and supplies it to nobody, so jobs
+        # appending to one shared table do not chain into one batch.
         self.produces_ds: dict[str, list[int]] = defaultdict(list)
         # macro name → global index of defining chunk (last definition wins)
         self.defines_macro: dict[str, int] = {}
@@ -683,11 +686,11 @@ class _EdgeDiscovery:
     def _build_indices(self) -> None:
         for gidx, chunk in enumerate(self.flat_chunks):
             meta = chunk.metadata
-            for ds in meta.output_datasets:
+            for ds in meta.created_datasets:
                 self.produces_ds[ds].append(gidx)
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
-                        f"index[ds]:    chunk {chunk.chunk_id} (g{gidx}) writes '{ds}'"
+                        f"index[ds]:    chunk {chunk.chunk_id} (g{gidx}) creates '{ds}'"
                     )
             for mac in meta.defines_macros:
                 if mac in self.defines_macro:
@@ -721,16 +724,15 @@ class _EdgeDiscovery:
                             f"index[macrovar-decl]: chunk {chunk.chunk_id} (g{gidx}) declares &{mvar}"
                         )
 
-            # Literal macro-body outputs (hard-coded dataset names in a %MACRO
+            # Literal macro-body creations (hard-coded dataset names in a %MACRO
             # body) are registered as if the MACRO_DEFINITION chunk itself were
             # the producer; macro_invocation edges then link every call site in.
-            if meta.body_literal_outputs:
-                for ds in meta.body_literal_outputs:
-                    self.produces_ds[ds].append(gidx)
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(
-                            f"index[ds-literal-body]: chunk {chunk.chunk_id} (g{gidx}) macro body writes '{ds}'"
-                        )
+            for ds in meta.body_literal_created:
+                self.produces_ds[ds].append(gidx)
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"index[ds-literal-body]: chunk {chunk.chunk_id} (g{gidx}) macro body creates '{ds}'"
+                    )
 
         self.ds_names = sorted(self.produces_ds)
         self.pattern_outputs = {
@@ -781,6 +783,8 @@ class _EdgeDiscovery:
         # A consumer links only to the nearest preceding producer in corpus
         # order — the state a sequential SAS session would read — so independent
         # jobs reusing a scratch name like work.tmp stay in separate components.
+        # Producers are the steps that create a table; a step updating it in
+        # place reads it here like any consumer (its inputs include it).
         for ds in meta.input_datasets:
             if ds.endswith(":"):
                 self._pattern_flow(cidx, chunk, ds)
@@ -801,8 +805,9 @@ class _EdgeDiscovery:
             )
 
     def _nearest_producer(self, ds: str, cidx: int) -> int | None:
-        """The nearest chunk before *cidx* that writes *ds*: by name, or as a
-        member of a pattern it wrote (a whole-library COPY's ``tgt.:``)."""
+        """The nearest chunk before *cidx* that creates *ds*: by name, or as a
+        member of a pattern it wrote (a whole-library COPY's ``tgt.:``). A
+        step that only updates *ds* in place is never the answer."""
         plist = self.produces_ds.get(ds)
         pos = bisect_left(plist, cidx) - 1 if plist else -1
         src = plist[pos] if plist and pos >= 0 else None
@@ -959,10 +964,8 @@ class _EdgeDiscovery:
                     f"macro_body_dataset: call {chunk.chunk_id} invokes %{mac}  pos_args={pos_args}  kw_args={kw_args}"
                 )
 
-            def _resolve(entry: dict) -> str | None:
-                pname = entry["param"]
-                pos = entry["pos"]
-                if pos >= 0:
+            def _resolve(pname: str, pos: int | None) -> str | None:
+                if pos is not None and pos >= 0:
                     if pos < len(pos_args):
                         return pos_args[pos]
                     if pname in kw_args:
@@ -971,61 +974,49 @@ class _EdgeDiscovery:
                 # keyword-only parameter
                 return kw_args.get(pname)
 
-            # Resolved values are canonicalised (one-level → work.) to match the
-            # producer index; a value still containing ``&`` is unresolvable and
-            # kept verbatim, matching nothing rather than a guessed name.
-            resolved_outputs: list[str] = []
-            for entry in def_meta.body_param_outputs:
-                val = _resolve(entry)
-                if val:
-                    val = val if "&" in val else _canon_ds(val)
-                    resolved_outputs.append(val)
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(
-                            f"macro_body_dataset: resolved param '{entry['param']}' → output '{val}'  (call {chunk.chunk_id})"
-                        )
+            # Each body reference spelled through a parameter, resolved with the
+            # role the body gives it: `data &ds;` creates the argument, `set
+            # &ds;` reads it, `proc append base=&ds` updates it. Resolved values
+            # are canonicalised (one-level → work.) to match the producer index;
+            # a value still containing ``&`` is unresolvable and kept verbatim,
+            # matching nothing rather than a guessed name.
+            resolved: list[SasDatasetRef] = []
+            for ref in def_meta.dataset_refs:
+                if ref.param is None or not (ref.role.reads or ref.role.writes):
+                    continue
+                val = _resolve(ref.param, ref.param_pos)
+                if not val:
+                    continue
+                val = val if "&" in val else _canon_ds(val)
+                resolved.append(SasDatasetRef(name=val, role=ref.role, via="macro_call"))
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"macro_body_dataset: resolved param '{ref.param}' → {ref.role} '{val}'  (call {chunk.chunk_id})"
+                    )
+            resolved = list(dict.fromkeys(resolved))
+            resolved_inputs = [r.name for r in resolved if r.role.reads]
 
-            resolved_inputs: list[str] = []
-            for entry in def_meta.body_param_inputs:
-                val = _resolve(entry)
-                if val:
-                    val = val if "&" in val else _canon_ds(val)
-                    resolved_inputs.append(val)
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(
-                            f"macro_body_dataset: resolved param '{entry['param']}' → input '{val}'  (call {chunk.chunk_id})"
-                        )
-
-            # Register this call site as a producer of its resolved outputs so
+            # Register this call site as the producer of what it creates, so
             # later chunks get linked via the normal dataset_flow pass. insort
             # (not append) keeps produces_ds sorted, the invariant the
             # nearest-preceding bisect lookups rely on.
-            for ds in resolved_outputs:
+            for ref in resolved:
+                if ref.role is not DatasetRole.WRITE:
+                    continue
+                ds = ref.name
                 if ds not in self.produces_ds:
                     insort(self.ds_names, ds)
                 if cidx not in self.produces_ds[ds]:
                     insort(self.produces_ds[ds], cidx)
                     if logger.isEnabledFor(logging.DEBUG):
                         logger.debug(
-                            f"index[ds-call-resolved]: chunk {chunk.chunk_id} (g{cidx}) resolved-produces '{ds}' via %{mac}"
+                            f"index[ds-call-resolved]: chunk {chunk.chunk_id} (g{cidx}) resolved-creates '{ds}' via %{mac}"
                         )
 
-            # Persist resolved outputs/inputs back onto the chunk's metadata so
+            # Persist the resolved references back onto the chunk's metadata so
             # _make_batch and other consumers see them through the normal fields.
-            # Appended after the chunk's own: _resolve_implicit_datasets treats
-            # the last output as "the last dataset named".
-            updated_meta = chunk.metadata.add_dataset_refs(
-                [
-                    *(
-                        SasDatasetRef(name=ds, role=DatasetRole.WRITE, via="macro_call")
-                        for ds in resolved_outputs
-                    ),
-                    *(
-                        SasDatasetRef(name=ds, role=DatasetRole.READ, via="macro_call")
-                        for ds in resolved_inputs
-                    ),
-                ]
-            )
+            # Appended after the chunk's own, in the body's order.
+            updated_meta = chunk.metadata.add_dataset_refs(resolved)
             if updated_meta is not chunk.metadata:
                 chunk = chunk.model_copy(update={"metadata": updated_meta})
                 self.flat_chunks[cidx] = chunk
@@ -1035,8 +1026,9 @@ class _EdgeDiscovery:
                         f"macro_body_dataset: chunk {chunk.chunk_id} metadata updated  output_datasets={meta.output_datasets}  input_datasets={meta.input_datasets}"
                     )
 
-            # Link this call site to the nearest preceding producer of each
-            # resolved input (whose actual name is only known at this site).
+            # Link this call site to the nearest preceding creator of each
+            # table it resolves to read or update (whose actual name is only
+            # known at this site).
             for ds in resolved_inputs:
                 if ds.endswith(":"):
                     self._pattern_flow(cidx, chunk, ds, kind="macro_body_dataset")
@@ -1263,11 +1255,16 @@ def _make_batch(
             seen_set.add(fid)
 
     # ── intra-batch production sets ────────────────────────────────────────
+    # Everything the batch writes, and of that what it creates: only a
+    # creation satisfies a read, so a table the batch only appends to is
+    # still an input it needs from outside.
     intra_outputs: set[str] = set()
+    intra_created: set[str] = set()
     intra_macros: set[str] = set()
     intra_macrovars: set[str] = set()
     for c in member_chunks:
         intra_outputs.update(c.metadata.output_datasets)
+        intra_created.update(c.metadata.created_datasets)
         intra_macros.update(c.metadata.defines_macros)
         intra_macrovars.update(c.metadata.produces_macrovars)
         # %LET / %GLOBAL / %LOCAL declarations also satisfy a name intra-batch
@@ -1277,6 +1274,7 @@ def _make_batch(
         # a call site is also in this batch (usually the case).
         if c.kind == SasChunkKind.MACRO_DEFINITION:
             intra_outputs.update(c.metadata.body_literal_outputs)
+            intra_created.update(c.metadata.body_literal_created)
 
     logger.debug(
         f"_make_batch {bid}: intra_outputs={sorted(intra_outputs)}  intra_macros={sorted(intra_macros)}  source_files={seen_files}"
@@ -1287,7 +1285,7 @@ def _make_batch(
     seen_ei: set[str] = set()
     for c in member_chunks:
         for ds in c.metadata.input_datasets:
-            if ds not in intra_outputs and ds not in seen_ei:
+            if ds not in intra_created and ds not in seen_ei:
                 ext_inputs.append(ds)
                 seen_ei.add(ds)
                 if logger.isEnabledFor(logging.DEBUG):
@@ -1503,19 +1501,20 @@ def _merge_singletons_into_batch(
     token-budgeted packing (:func:`coalesce_into_batches` with
     ``max_tokens``), where the flattened members of adjacent items get the
     same aggregation under an explicit *reason*. Intra-batch subtraction is
-    exact there too: outputs of earlier members consumed by later members
-    become internal. Member order is preserved (callers pass corpus order).
+    exact there too: datasets earlier members create and later members read
+    or update become internal. Member order is preserved (callers pass corpus
+    order).
     """
-    intra_outputs: set[str] = set()
+    intra_created: set[str] = set()
     intra_macros: set[str] = set()
     intra_macrovars: set[str] = set()
     for c in chunks:
-        intra_outputs.update(c.metadata.output_datasets)
+        intra_created.update(c.metadata.created_datasets)
         intra_macros.update(c.metadata.defines_macros)
         intra_macrovars.update(c.metadata.produces_macrovars)
         intra_macrovars.update(c.metadata.declared_macro_vars)
         if c.kind == SasChunkKind.MACRO_DEFINITION:
-            intra_outputs.update(c.metadata.body_literal_outputs)
+            intra_created.update(c.metadata.body_literal_created)
 
     def _dedup(pairs: list[str]) -> list[str]:
         return list(dict.fromkeys(pairs))
@@ -1527,7 +1526,7 @@ def _merge_singletons_into_batch(
             ds
             for c in chunks
             for ds in c.metadata.input_datasets
-            if ds not in intra_outputs
+            if ds not in intra_created
         ]
     )
     defined_macros = _dedup(

@@ -195,14 +195,21 @@ def test_a_macro_call_among_the_operands_names_nothing_it_can_see():
 
 
 def test_update_reads_both_and_modify_rewrites_its_master():
+    # MODIFY changes its master where it stands: the DATA statement names the
+    # table being modified, and OUTPUT adds rows to it, so neither creates it.
     src = "data m; update m t; run; data lib.m; modify lib.m t2; run;"
     assert _refs(src) == [
         ("work.m", W, "data"),
         ("work.m", R, "update"),
         ("work.t", R, "update"),
-        ("lib.m", W, "data"),
         ("lib.m", U, "modify"),
         ("work.t2", R, "modify"),
+    ]
+    src = "data lib.m work.log; modify lib.m; output lib.m; output work.log; run;"
+    assert _refs(src) == [
+        ("work.log", W, "data"),
+        ("lib.m", U, "modify"),
+        ("work.log", W, "output"),
     ]
 
 
@@ -235,8 +242,13 @@ def test_proc_data_reads_and_out_writes_on_any_statement():
     assert _refs(src) == [("work.a", R, "data="), ("work.s", W, "out=")]
 
 
-def test_proc_sort_without_out_rewrites_its_data():
-    assert _refs("proc sort data=lib.a; by x; run;") == [("lib.a", U, "data=")]
+def test_proc_sort_without_out_replaces_its_data():
+    # A new sorted table replaces the old, as `data a; set a;` would: a read
+    # and a creation, so a later BY step depends on the sort.
+    assert _refs("proc sort data=lib.a; by x; run;") == [
+        ("lib.a", R, "data="),
+        ("lib.a", W, "data="),
+    ]
     assert _refs("proc sort data=a out=b; by x; run;") == [
         ("work.a", R, "data="),
         ("work.b", W, "out="),

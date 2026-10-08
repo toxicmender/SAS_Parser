@@ -200,11 +200,13 @@ EXECUTE-invoked macros).
 
 **Dataset references.** `dataset_refs` is the stored source of a chunk's
 dataset metadata: one `SasDatasetRef` per dataset named, with a `DatasetRole`
-(READ, WRITE, UPDATE — read and rewritten in place — DROP, or MENTION — named
-but not used), the statement or option that named it (`via`) and its spelling
-there (`raw`), whether it sits in a `%MACRO` body, and the parameter it is
-spelled through. The dataset lists are computed views of it, serialised under
-their usual keys:
+(READ; WRITE — created or replaced; UPDATE — changed where it stands; DROP; or
+MENTION — named but not used), the statement or option that named it (`via`)
+and its spelling there (`raw`), whether it sits in a `%MACRO` body, and the
+parameter it is spelled through. Only a WRITE supplies a dataset to later
+steps: an UPDATE needs the table to exist, so it links to the table's creator
+like any reader (see *Batching*). The dataset lists are computed views of it,
+serialised under their usual keys:
 
 | View | References |
 |---|---|
@@ -215,6 +217,10 @@ their usual keys:
 | `body_param_inputs` / `body_param_outputs` | a macro body's, through a parameter: `{"param", "pos"}` |
 | `referenced_datasets` | every name, whatever its role, sorted (a parameter as `&param`) |
 | `referenced_librefs` | the librefs of those names, plus `defines_librefs` |
+
+Two more views, `created_datasets` and `body_literal_created` (WRITE alone,
+outside and inside a macro body), are plain properties for the batcher and
+`complexity.crossfile`, never serialised.
 
 A rewrite changes the references, never a list:
 `SasChunkMetadata.map_dataset_names` renames or drops them (macro variables
@@ -234,7 +240,8 @@ THEN`, `ELSE`, `WHEN (…)` or `OTHERWISE`; a subsetting `IF` has none. Then:
 
 - **DATA step:** the DATA statement writes its datasets (not its `/ view=`
   options; `_NULL_` is none); `SET`, `MERGE` and `UPDATE` read theirs; `MODIFY`
-  rewrites its master (UPDATE) and reads the rest; `OUTPUT` writes; a hash
+  updates its master (UPDATE) and reads the rest, and then neither the DATA
+  statement nor an `OUTPUT` naming that master creates it; `OUTPUT` writes; a hash
   object's quoted `dataset:` reads, or writes in `.output(…)`. An operand list
   ends at an option (`end=`, `key=`, `nobs=`, `point=`, …), a `/` or the
   statement's end, and skips each dataset's `(…)` options and macro calls.
@@ -253,7 +260,9 @@ THEN`, `ELSE`, `WHEN (…)` or `OTHERWISE`; a subsetting `IF` has none. Then:
   `score`, `baseline` and `forecast`; in any other statement only after its
   `/`, and never in an assignment (`out = x + 1;` in PHREG, NLMIXED, FCMP,
   IML) — so `label out = 'x';` names nothing, nor does an option inside a
-  dataset's own `(…)`. PROC SORT without `out=` rewrites its `data=` (UPDATE).
+  dataset's own `(…)`. PROC SORT without `out=` replaces its `data=` with a
+  sorted copy: a READ and a WRITE, as `data x; set x;` is, so a later BY step
+  depends on the sort.
   - **PROC DATASETS** names members of its `lib=` library: `append` (base
     UPDATE, data READ), `delete` (DROP), `change old=new` (old READ and DROP,
     new WRITE), `exchange` and `modify` and `age` (UPDATE), `contents`, and
@@ -491,7 +500,7 @@ emitting typed edges:
 
 | Edge kind | Tier | Meaning |
 |-----------|------|---------|
-| `dataset_flow` | strong | chunk reads a dataset a preceding chunk wrote |
+| `dataset_flow` | strong | chunk reads or updates a dataset a preceding chunk created |
 | `macro_body_dataset` | strong | call-site-resolved parameterised macro-body I/O |
 | `macro_invocation` | weak | chunk invokes a macro defined elsewhere |
 | `macro_var_flow` | weak | chunk reads `&name` a preceding chunk created |
@@ -513,11 +522,15 @@ is not knowable yet. Consumers link to the **nearest preceding producer** in
 corpus order — the state a sequential SAS session would actually read — so
 unrelated jobs reusing `work.tmp` stay separate.
 
-The roles decide what counts as a producer. A WRITE or UPDATE ref produces its
-name, so a step that appends to or modifies a table depends on the table's
-earlier producer and is itself the producer a later reader links to. A DROP
-ref produces nothing, and a MENTION ref is not dataset flow at all. Pattern
-refs take part on both sides:
+The roles decide what counts as a producer. Only a WRITE ref produces its name.
+A step that updates a table in place (`PROC APPEND BASE=`, SQL `INSERT`,
+`MODIFY`) reads it like any consumer: it links to the table's nearest
+preceding creator and supplies it to nobody. Jobs that each append to one
+shared audit table therefore do not chain into one batch, and a later reader
+links to the creator, not to the last job that appended. A batch whose
+members only update a table lists it among the inputs it needs. A DROP ref
+produces nothing, and a MENTION ref is not dataset flow at all. Pattern refs
+take part on both sides:
 
 - A **pattern input** (`set lib.sales_:;`) links to the nearest preceding
   producer of each name its prefix covers. The names come from a sorted index

@@ -3,8 +3,8 @@
 Status: Phases 0–8 implemented. `tests/test_sas_coverage.py` holds 184 probes:
 the 168 from the coverage review, 15 precision probes (`X01`–`X15`), and G22
 (INFILE through a fileref). All of them pass. Phase 9 is not started. Phase 8
-raised an open question about tables updated in place by several files; see
-its section.
+raised a question about tables updated in place by several files, settled as
+"only a creation supplies a table"; see its section.
 
 ## Context
 
@@ -564,9 +564,9 @@ Done as planned, with these differences:
 - **Performance.** Batching is within noise of Phase 7. Chunking is unchanged
   by this phase, at 10–11% over Phase 0 on the 900 KB files.
 
-**Open question (behaviour left unchanged).** An UPDATE ref puts its table in
-both lists. Two complexity consumers treat a table written in a file as
-satisfied by that file:
+**Question found in this phase.** An UPDATE ref puts its table in both lists.
+Two complexity consumers treat a table written in a file as satisfied by that
+file:
 
 - `complexity.crossfile` and the Datasets rollup. A file that only updates a
   table lists it as an intermediate and imports it from no file. The file
@@ -580,6 +580,31 @@ and 5 made UPDATE refs common (APPEND `base=`, SQL INSERT/UPDATE/DELETE,
 MODIFY). In the batcher, an update links to the nearest preceding writer, as
 the breaking-changes table intends. So jobs appending to one table share a
 batch.
+
+**Decision: only a creation supplies a table** (complexity and batcher alike).
+
+- **The rule.** An UPDATE ref needs its table and supplies it to nobody. Only
+  a WRITE supplies a table, whether it creates or replaces it.
+  `SasChunkMetadata` gains two views, `created_datasets` and
+  `body_literal_created`. They are plain properties, never serialised.
+- **Batcher.** The producer index holds creations only. An update links to the
+  nearest preceding creator, as a read does. A macro call's resolved
+  parameter refs keep the body's role, so `base=&b` resolves to an UPDATE.
+  A batch lists a table its members only update among the inputs it needs.
+- **Complexity.** `crossfile` takes producers and exports from the creations.
+  A file that only updates a table imports it from the creating files and
+  exports it to nobody. In the Datasets rollup, such a table is an input and
+  an output, not an intermediate. `updated_datasets` leaves out a table the
+  same chunk creates, such as CREATE TABLE followed by INSERT.
+- **MODIFY.** The DATA statement naming the master, and an OUTPUT to it, no
+  longer add a WRITE, so a MODIFY step does not create its master.
+- **In-place SORT** (no `out=`) becomes READ plus WRITE: a replacement, as
+  `data x; set x;` is. This reverses Phase 4's UPDATE. SAS writes a sorted
+  copy over the table, and a later BY step depends on that sort. Five batcher
+  tests pin this, across files too.
+- **Not changed.** A replacement (`data x; set x;`, in-place SORT) still
+  counts as created by the file that replaces it. Its read is satisfied in
+  that file, as before this plan.
 
 The plan as written:
 

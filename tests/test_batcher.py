@@ -894,6 +894,96 @@ class TestPatternDatasetFlow(unittest.TestCase):
         )
 
 
+class TestUpdateInPlace(unittest.TestCase):
+    """A step that updates a table in place (APPEND BASE=, SQL INSERT,
+    MODIFY) needs the table and supplies it to nobody: readers and other
+    updaters link to the step that created it."""
+
+    def test_appenders_without_the_creator_stay_apart(self):
+        """Two jobs appending to one audit table are not one batch."""
+        src = (
+            "data work.r1; set edw.a; run;\n"
+            "proc append base=audit.log data=work.r1; run;\n"
+            "data work.r2; set edw.b; run;\n"
+            "proc append base=audit.log data=work.r2; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(
+            [[c.chunk_id for c in b.chunks] for b in br.batches],
+            [["chunk-0001", "chunk-0002"], ["chunk-0003", "chunk-0004"]],
+        )
+
+    def test_appenders_link_to_the_creator_not_to_each_other(self):
+        src = (
+            "data audit.log; length job $8; stop; run;\n"
+            "proc append base=audit.log data=edw.a; run;\n"
+            "proc sql; insert into audit.log select * from edw.b; quit;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        reason = br.batches[0].reason
+        self.assertIn("dataset_flow(audit.log): chunk-0001 → chunk-0002", reason)
+        self.assertIn("dataset_flow(audit.log): chunk-0001 → chunk-0003", reason)
+        self.assertNotIn("chunk-0002 → chunk-0003", reason)
+
+    def test_a_reader_after_an_append_links_to_the_creator(self):
+        src = (
+            "data mart.h; set raw.x; run;\n"
+            "data work.n; set raw.y; run;\n"
+            "proc append base=mart.h data=work.n; run;\n"
+            "proc print data=mart.h; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        reason = br.batches[0].reason
+        self.assertIn("dataset_flow(mart.h): chunk-0001 → chunk-0004", reason)
+        self.assertNotIn("chunk-0003 → chunk-0004", reason)
+
+    def test_an_updated_table_is_an_input_its_batch_needs(self):
+        src = (
+            "data work.n; set raw.y; run;\n"
+            "proc append base=mart.h data=work.n; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        batch = br.batches[0]
+        self.assertEqual(batch.input_datasets, ["raw.y", "mart.h"])
+        self.assertIn("mart.h", batch.output_datasets)
+
+    def test_a_modify_step_does_not_create_its_master(self):
+        src = (
+            "data lib.a; modify lib.a; x = 1; run;\n"
+            "proc print data=lib.a; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 0)
+        self.assertEqual(len(br.singletons), 2)
+
+    def test_an_in_place_sort_replaces_its_table(self):
+        """PROC SORT with no OUT= writes a sorted copy over the table: a
+        creation, so a later BY step depends on the sort."""
+        src = (
+            "data work.o; set raw.o; run;\n"
+            "proc sort data=work.o; by id; run;\n"
+            "data work.m; merge work.o work.c; by id; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        reason = br.batches[0].reason
+        self.assertIn("dataset_flow(work.o): chunk-0001 → chunk-0002", reason)
+        self.assertIn("dataset_flow(work.o): chunk-0002 → chunk-0003", reason)
+
+    def test_macro_calls_that_append_link_to_the_creator(self):
+        src = (
+            "%macro app(base); proc append base=&base data=edw.n; run; %mend;\n"
+            "data mart.h; set raw.x; run;\n"
+            "%app(mart.h);\n"
+            "%app(mart.h);\n"
+        )
+        _, br = _chunk_and_batch(src)
+        reason = " ".join(b.reason for b in br.batches)
+        self.assertIn("macro_body_dataset(mart.h): chunk-0002 → chunk-0003", reason)
+        self.assertIn("macro_body_dataset(mart.h): chunk-0002 → chunk-0004", reason)
+        self.assertNotIn("chunk-0003 → chunk-0004", reason)
+
+
 # ── 11. Global-context batch (tiered weak-edge resolution) ────────────────
 
 
