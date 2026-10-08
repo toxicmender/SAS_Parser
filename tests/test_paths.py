@@ -87,6 +87,15 @@ class TestStatementForms:
         assert ref.statement == "proc_export"
         assert ref.path == "/out/a.csv"
 
+    def test_proc_printto_log_and_print(self):
+        refs = extract_paths("proc printto log='/logs/job.log' print=\"/out/job.lst\" new; run;")
+        assert [(r.statement, r.path) for r in refs] == [
+            ("printto", "/logs/job.log"),
+            ("printto", "/out/job.lst"),
+        ]
+        # LOG= and PRINT= mean nothing outside PROC PRINTTO.
+        assert extract_paths("%put log='/not/a/path';") == []
+
     def test_ods_file_and_path(self):
         refs = extract_paths("ods html file='/rep/out.html' path='/rep';")
         assert {r.path for r in refs} == {"/rep/out.html", "/rep"}

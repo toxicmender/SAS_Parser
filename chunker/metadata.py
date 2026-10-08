@@ -12,7 +12,7 @@ import logging
 import re
 from collections import ChainMap
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, TypeVar
 
 from .keywords import (
@@ -439,6 +439,11 @@ def _extract_sql_into_vars(text: str) -> list[str]:
 _DATASET_KINDS = frozenset(
     {SasChunkKind.DATA_STEP, SasChunkKind.PROC_STEP, SasChunkKind.MACRO_DEFINITION}
 )
+# An ODS OUTPUT statement, and the ones that end its requests.
+_ODS_OUTPUT_RE = re.compile(r"ods\s+output\b", re.IGNORECASE)
+_ODS_OUTPUT_END_RE = re.compile(
+    r"ods\s+(?:output\s+(?:close|clear)|_all_\s+close)\b", re.IGNORECASE
+)
 
 
 def _macro_params(text: str) -> list[tuple[str, str | None]]:
@@ -498,9 +503,10 @@ def _metadata_for(region: _Region) -> SasChunkMetadata:
             param_pos[name] = -1
 
     # ── datasets, statement by statement ────────────────────────────────────
-    # Only a step or a %MACRO holds a statement that reads or writes one;
-    # every statement of a %MACRO region stands in its body, a split slice
-    # without the %MACRO statement included.
+    # Only a step or a %MACRO holds a statement that reads or writes one —
+    # and an ODS OUTPUT statement, whose datasets resolve_ods_outputs hands to
+    # the PROC that writes them. Every statement of a %MACRO region stands in
+    # its body, a split slice without the %MACRO statement included.
     refs = (
         statement_dataset_refs(
             region.units,
@@ -510,6 +516,7 @@ def _metadata_for(region: _Region) -> SasChunkMetadata:
             param_pos=param_pos,
         )
         if kind in _DATASET_KINDS
+        or (kind == SasChunkKind.GLOBAL_STATEMENT and _ODS_OUTPUT_RE.match(mt.lstrip()))
         else []
     )
 
@@ -1426,16 +1433,99 @@ def resolve_db_librefs(chunks: list[SasChunk]) -> None:
         macros.leave(chunk, own)
 
 
+def _with_dataset_refs(
+    chunk: SasChunk, refs: tuple[SasDatasetRef, ...]
+) -> SasChunk:
+    meta = chunk.metadata.add_dataset_refs(refs)
+    return chunk if meta is chunk.metadata else chunk.model_copy(update={"metadata": meta})
+
+
+def resolve_ods_outputs(chunks: list[SasChunk]) -> None:
+    """Give each ODS OUTPUT request in open code to the PROC that fulfils it, in place.
+
+    ``ods output Summary=sumstats;`` asks the next procedure for its Summary
+    table: the PROC MEANS after it writes work.sumstats, not the ODS statement.
+    The statement's requests — WRITE references with ``via="ods_output"`` —
+    move to the next PROC_STEP of the same file: its chunk and the chunks it
+    was split into. ``ods output close|clear`` or ``ods _all_ close`` before
+    any PROC cancels them; each stays on its statement as a MENTION, named but
+    never written. A request nothing takes or cancels stays as it is.
+
+    Moving is idempotent: a request once moved or cancelled is no longer a
+    WRITE on its statement, so the corpus-level run finds none to move. An ODS
+    OUTPUT inside a PROC, or in a ``%MACRO`` body, is that PROC's or that
+    body's from the start.
+    """
+
+    def requested(ref: SasDatasetRef) -> bool:
+        return ref.via == "ods_output" and ref.role is DatasetRole.WRITE
+
+    pending: list[int] = []  # ODS statements whose requests wait for a PROC
+    source: str | None = None
+    claimed_by: str | None = None
+    taken: tuple[SasDatasetRef, ...] = ()
+    for idx, chunk in enumerate(chunks):
+        if idx == 0 or chunk.source_id != source:
+            source, pending, claimed_by = chunk.source_id, [], None
+        if claimed_by is not None and chunk.parent_id == claimed_by:
+            chunks[idx] = _with_dataset_refs(chunk, taken)  # a split slice
+            continue
+        claimed_by = None
+        if (
+            chunk.kind is SasChunkKind.GLOBAL_STATEMENT
+            and chunk.metadata.global_statement_keyword == "ods"
+        ):
+            if _ODS_OUTPUT_END_RE.match(_sanitise(chunk.text).lstrip()):
+                for i in pending:
+                    meta = chunks[i].metadata
+                    refs = tuple(
+                        replace(ref, role=DatasetRole.MENTION) if requested(ref) else ref
+                        for ref in meta.dataset_refs
+                    )
+                    chunks[i] = chunks[i].model_copy(
+                        update={"metadata": meta.model_copy(update={"dataset_refs": refs})}
+                    )
+                pending = []
+            elif any(map(requested, chunk.metadata.dataset_refs)):
+                pending.append(idx)
+        elif (
+            chunk.kind is SasChunkKind.PROC_STEP
+            and chunk.parent_id is None
+            and pending
+        ):
+            taken = tuple(
+                ref
+                for i in pending
+                for ref in chunks[i].metadata.dataset_refs
+                if requested(ref)
+            )
+            for i in pending:
+                ods = chunks[i]
+                kept = ods.metadata.map_dataset_names(
+                    lambda ref: None if requested(ref) else ref.name
+                )
+                chunks[i] = ods.model_copy(update={"metadata": kept})
+            chunks[idx] = _with_dataset_refs(chunk, taken)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"resolve_ods_outputs: {chunk.chunk_id} writes "
+                    f"{[ref.name for ref in taken]}"
+                )
+            claimed_by, pending = chunk.chunk_id, []
+
+
 def resolve_references(chunks: list[SasChunk]) -> None:
     """Every cross-chunk name resolution, in the one order that works, in place.
 
     Macro variables first — a libref, a dataset and a pass-through table can all
-    be spelled through one — then database librefs, which read the resolved
-    names. :meth:`~chunker.chunker.SasSemanticChunker.chunk_text`,
+    be spelled through one — then ODS OUTPUT requests, moved to their PROCs
+    with their names resolved, then database librefs, which read the resolved
+    names where they end up. :meth:`~chunker.chunker.SasSemanticChunker.chunk_text`,
     :class:`~chunker.batcher.MultiFileBatcher` and
     :func:`resolve_corpus_references` all call this, so the order lives here.
     """
     resolve_macro_var_refs(chunks)
+    resolve_ods_outputs(chunks)
     resolve_db_librefs(chunks)
 
 

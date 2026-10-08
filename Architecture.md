@@ -120,10 +120,13 @@ chunker/
                         statements_of walks a region's statements, each with
                         where it stands (open code, DATA step, PROC by name,
                         %MACRO body); dataset_refs reads their operands into
-                        SasDatasetRef records (READ, WRITE, UPDATE) and
+                        SasDatasetRef records (READ, WRITE, UPDATE, DROP) and
                         classifies a macro body's as parameter, literal or
-                        macro variable. The one owner of dataset positions,
-                        for steps and macro bodies alike.
+                        macro variable. A PROC's options name what
+                        keywords.PROC_OPTION_ROLES says they name in it; PROC
+                        DATASETS, PROC COPY and ODS OUTPUT have readers of
+                        their own. The one owner of dataset positions, for
+                        steps and macro bodies alike.
   metadata.py           Per-chunk semantic extraction: _metadata_for (datasets
                         from statements.dataset_refs, plus the macro, path,
                         function and symput / SQL-INTO / CALL EXECUTE scans),
@@ -131,7 +134,9 @@ chunker/
                         catalogue, and the whole-list passes that run once a
                         file (or the corpus) has been walked:
                         resolve_macro_var_refs (&name references get their
-                        values) then resolve_db_librefs (SAS names under a
+                        values), resolve_ods_outputs (an open-code ODS OUTPUT
+                        request goes to the PROC that writes it), then
+                        resolve_db_librefs (SAS names under a
                         database-engine LIBNAME become database tables),
                         composed in that order by resolve_references and,
                         across files for callers that do not batch, by
@@ -710,8 +715,11 @@ MENTION, the statement that named it, macro body, parameter). They come from
 `chunker/statements.py`, which reads a region statement by statement, each
 knowing whether it stands in open code, a DATA step, a PROC or a %MACRO body:
 a name in a comment, in-stream data, a `%PUT`, a string or an assignment is no
-dataset. A `%LET` value written like a dataset is a MENTION (named, not
-used). See `chunker/README.md` for the per-statement rules.
+dataset. A PROC's options mean what `keywords.PROC_OPTION_ROLES` says they
+mean in that PROC (APPEND's `base=` is UPDATE; COPY's `out=` is a libref,
+not a dataset). A `%LET` value written like a dataset is a MENTION (named,
+not used), as is an ODS OUTPUT request closed before any PROC takes it. See
+`chunker/README.md` for the per-statement rules.
 
 ## Batching model
 

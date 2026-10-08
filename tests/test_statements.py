@@ -17,6 +17,7 @@ from chunker.scanner import _Deadline, _line_starts, _Region, _sanitise
 from chunker.statements import DATA, OPEN, PROC, statements_of
 
 R, W, U, M = DatasetRole.READ, DatasetRole.WRITE, DatasetRole.UPDATE, DatasetRole.MENTION
+D = DatasetRole.DROP
 _CHUNKER = SasSemanticChunker(min_words=1, max_words=100_000)
 
 
@@ -235,10 +236,7 @@ def test_proc_data_reads_and_out_writes_on_any_statement():
 
 
 def test_proc_sort_without_out_rewrites_its_data():
-    assert _refs("proc sort data=lib.a; by x; run;") == [
-        ("lib.a", R, "data="),
-        ("lib.a", W, "data="),
-    ]
+    assert _refs("proc sort data=lib.a; by x; run;") == [("lib.a", U, "data=")]
     assert _refs("proc sort data=a out=b; by x; run;") == [
         ("work.a", R, "data="),
         ("work.b", W, "out="),
@@ -248,6 +246,155 @@ def test_proc_sort_without_out_rewrites_its_data():
 def test_an_assignment_in_a_proc_names_nothing():
     src = "proc phreg data=a;\n  model t*c(0) = x;\n  out = x + 1;\n  data[1] = 2;\nrun;\n"
     assert _refs(src) == [("work.a", R, "data=")]
+
+
+@pytest.mark.parametrize(
+    ("src", "refs"),
+    [
+        # Each PROC's own options (keywords.PROC_OPTION_ROLES).
+        (
+            "proc append base=lib.m data=new force; run;",
+            [("lib.m", U, "base="), ("work.new", R, "data=")],
+        ),
+        (
+            "proc compare base=a compare=b out=d outstats=s; run;",
+            [("work.a", R, "base="), ("work.b", R, "compare="), ("work.d", W, "out="),
+             ("work.s", W, "outstats=")],
+        ),
+        (
+            "proc sort data=a out=b dupout=d; by k; run;",
+            [("work.a", R, "data="), ("work.b", W, "out="), ("work.d", W, "dupout=")],
+        ),
+        (
+            "proc format cntlin=f library=lib cntlout=g; run;",
+            [("work.f", R, "cntlin="), ("work.g", W, "cntlout=")],
+        ),
+        ("proc corr data=a outp=p noprint; run;", [("work.a", R, "data="), ("work.p", W, "outp=")]),
+        ("proc fastclus data=a seed=s mean=m; run;",
+         [("work.a", R, "data="), ("work.s", R, "seed="), ("work.m", W, "mean=")]),
+        # Everywhere else SEED= is a number, or a macro variable holding one.
+        ("proc surveyselect data=a out=b seed=&seed; run;",
+         [("work.a", R, "data="), ("work.b", W, "out=")]),
+        ("proc score data=a score=c out=s; run;",
+         [("work.a", R, "data="), ("work.c", R, "score="), ("work.s", W, "out=")]),
+        # The statistics and modelling defaults.
+        ("proc reg data=a outest=e; model y = x; output out=p p=yhat; run; quit;",
+         [("work.a", R, "data="), ("work.e", W, "outest="), ("work.p", W, "out=")]),
+        ("proc logistic inmodel=m; score data=n out=s; run;",
+         [("work.m", R, "inmodel="), ("work.n", R, "data="), ("work.s", W, "out=")]),
+        ("proc means data=a classdata=c; class g; run;",
+         [("work.a", R, "data="), ("work.c", R, "classdata=")]),
+        # Values that only look like datasets.
+        ("proc http url='https://x' out=resp headerout=h; run;", []),
+        ("proc fcmp outlib=work.funcs.pkg; function f(x); return(x); endsub; run;",
+         [("work.funcs", W, "outlib=")]),
+        ("proc contents data=lib._all_ out=meta; run;",
+         [("lib.:", R, "data="), ("work.meta", W, "out=")]),
+    ],
+)
+def test_a_proc_option_names_what_its_proc_says(src, refs):
+    assert _refs(src) == refs
+
+
+def test_proc_options_come_from_the_statements_that_carry_them():
+    src = (
+        "proc freq data=a;\n  tables g / out=f;\n  label out = 'Output';\n"
+        "  where data = x;\n  weight w / data=nope;\nrun;\n"
+    )
+    # Before a slash: variables and labels. After it, an option the PROC's
+    # roles know is read whatever the statement — roles are per PROC.
+    assert _refs(src) == [("work.a", R, "data="), ("work.f", W, "out="), ("work.nope", R, "data=")]
+    # A dataset's own options are not the statement's.
+    assert _refs("proc print data=a(rename=(data=d2 out=o2)); run;") == [("work.a", R, "data=")]
+
+
+def test_proc_datasets_names_members_of_its_library():
+    src = (
+        "proc datasets lib=lib nolist;\n  append base=all data=part;\n  delete t1 t2;\n"
+        "  change old=new;\n  exchange x=y;\n  modify m;\n    rename a=b;\n  age a1 a2;\n"
+        "  contents data=c out=meta;\nquit;\n"
+    )
+    assert _refs(src) == [
+        ("lib.all", U, "base="),
+        ("lib.part", R, "data="),
+        ("lib.t1", D, "delete"),
+        ("lib.t2", D, "delete"),
+        ("lib.old", R, "change"),
+        ("lib.old", D, "change"),
+        ("lib.new", W, "change"),
+        ("lib.x", U, "exchange"),
+        ("lib.y", U, "exchange"),
+        ("lib.m", U, "modify"),
+        ("lib.a1", U, "age"),
+        ("lib.a2", U, "age"),
+        ("lib.c", R, "data="),
+        ("work.meta", W, "out="),
+    ]
+
+
+def test_proc_datasets_kill_deletes_every_member():
+    assert _refs("proc datasets lib=scratch kill nolist; quit;") == [("scratch.:", D, "kill")]
+    assert _refs("proc datasets lib=kill nolist; delete a; quit;") == [("kill.a", D, "delete")]
+
+
+def test_a_macro_library_keeps_its_delimiter_dot():
+    assert _refs("proc datasets lib=&lib; delete a; quit;") == [("&lib..a", D, "delete")]
+
+
+@pytest.mark.parametrize(
+    ("src", "refs"),
+    [
+        (
+            "proc copy in=src out=tgt; select a b; run;",
+            [("src.a", R, "copy"), ("tgt.a", W, "copy"), ("src.b", R, "copy"), ("tgt.b", W, "copy")],
+        ),
+        # Without SELECT every member is copied; EXCLUDE names the ones left.
+        ("proc copy in=src out=tgt; run;", [("src.:", R, "copy"), ("tgt.:", W, "copy")]),
+        ("proc copy in=src out=tgt; exclude z; run;", [("src.:", R, "copy"), ("tgt.:", W, "copy")]),
+        (
+            "proc copy in=src out=tgt move; select a; run;",
+            [("src.a", R, "copy"), ("tgt.a", W, "copy"), ("src.a", D, "copy")],
+        ),
+        # PROC DATASETS's COPY copies from its own library by default.
+        (
+            "proc datasets lib=src; copy out=tgt; select a; run; delete z; quit;",
+            [("src.a", R, "copy"), ("tgt.a", W, "copy"), ("src.z", D, "delete")],
+        ),
+        ("proc upload inlib=work outlib=rwork; select a; run;",
+         [("work.a", R, "copy"), ("rwork.a", W, "copy")]),
+        ("proc upload data=a out=rwork.a; run;", [("work.a", R, "data="), ("rwork.a", W, "out=")]),
+    ],
+)
+def test_a_library_copy_names_its_members(src, refs):
+    assert _refs(src) == refs
+
+
+def test_ods_output_in_a_proc_is_written_by_it():
+    src = "proc ttest data=a; class g; var x; ods output TTests=tt Statistics(persist=proc)=st; run;"
+    assert _refs(src) == [
+        ("work.a", R, "data="),
+        ("work.tt", W, "ods_output"),
+        ("work.st", W, "ods_output"),
+    ]
+
+
+def test_ods_output_in_open_code_is_written_by_the_next_proc():
+    src = (
+        "ods output Summary=s1;\nproc means data=a; run;\n"
+        "ods output Summary=s2;\nods output close;\nproc means data=a; run;\n"
+    )
+    chunks = _CHUNKER.chunk_text(src).chunks
+    assert [c.metadata.output_datasets for c in chunks] == [[], ["work.s1"], [], [], []]
+    # A request closed before any PROC takes it is named, never written.
+    assert [(r.name, r.role) for r in chunks[2].metadata.dataset_refs] == [("work.s2", M)]
+    before = [c.metadata.dataset_refs for c in chunks]
+    resolve_references(chunks)  # the batcher's corpus-level run
+    assert [c.metadata.dataset_refs for c in chunks] == before
+
+
+def test_ods_output_in_a_macro_body_is_the_bodys():
+    meta = _body("%macro m(o);\n  ods output Summary=&o;\n  proc means data=a; run;\n%mend;\n")
+    assert meta.body_param_outputs == [{"param": "o", "pos": 0}]
 
 
 def test_proc_sql_clauses():

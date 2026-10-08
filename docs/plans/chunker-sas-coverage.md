@@ -1,9 +1,9 @@
 # Plan: close the chunker's SAS coverage gaps (breaking changes allowed)
 
-Status: Phases 0–3 implemented. `tests/test_sas_coverage.py` holds 183 probes:
+Status: Phases 0–4 implemented. `tests/test_sas_coverage.py` holds 183 probes:
 the 168 from the coverage review plus 15 precision probes (`X01`–`X15`). Today
-153 pass and 30 are expected failures, each naming the phase below that fixes
-it. Phases 4–9 are not started.
+171 pass and 12 are expected failures, each naming the phase below that fixes
+it. Phases 5–9 are not started.
 
 ## Context
 
@@ -328,7 +328,51 @@ Done as planned, with these differences:
 Probes flipped: D02–D07, D09, D10, D13, D17, D21, D29, D30, and the
 precision probes X06–X12.
 
-## Phase 4: PROC option roles and PROC statements (M)
+## Phase 4: PROC option roles and PROC statements (M) — done
+
+Done as planned, with these differences:
+
+- **Two tables, in `keywords.py`.**
+  - `PROC_OPTION_DEFAULTS` holds for every PROC: `data=` read, `out=` and
+    `outdata=` write, and the modelling options (`outest=`, `outstat=`,
+    `outmodel=`, `outtree=`, `outseed=`, `testout=` write; `inmodel=`,
+    `inest=`, `testdata=`, `classdata=` read).
+  - `PROC_OPTION_ROLES` adds a PROC's own options or overrides a default.
+    Roles: read, write, update, `libref`, `fileref`, and `package` (FCMP's
+    `lib.member.package`). An option neither table lists names nothing.
+  - `seed=` reads a dataset only in FASTCLUS; elsewhere it is a random seed
+    (`seed=&seed` in SURVEYSELECT). `score=` reads only in PROC SCORE.
+- **Where options are read.** Anywhere in the PROC statement and in `output`,
+  `score`, `baseline` and `forecast`. In any other statement, only after its
+  `/` (`tables g / out=f`, `model … / outroc=r`), so `label out = 'x';` and
+  `where data = x;` name nothing. Never in an assignment, nor inside a
+  dataset's own `(…)` options.
+- **One reader per PROC step** (`statements._ProcStep`), because what one
+  statement names can depend on another: DATASETS's `lib=`, COPY's `select`.
+  - DATASETS also handles `exchange` (UPDATE both). CHANGE reads, drops and
+    writes.
+  - UPLOAD and DOWNLOAD with `inlib=`/`outlib=` copy like PROC COPY.
+- **ODS OUTPUT.** `resolve_ods_outputs` runs between macro-variable
+  resolution and database librefs, so names resolve where the statement
+  stands and the PROC's database tables see them. It moves a request to the
+  next top-level PROC_STEP of the same file and to that region's split
+  slices. A request cancelled by `ods output close|clear` stays on its
+  statement as a MENTION; one never taken stays a WRITE there.
+- **Probe expectations.** P08 and P10 now list the APPEND base among the
+  inputs. This is the UPDATE role the breaking-changes table set; the probes
+  predate it.
+- **Behaviour,** against Phase 3:
+  - In the 187-file corpus, 22 chunks' references change, every one through
+    an option role, a DATASETS statement, a library copy, ODS OUTPUT or the
+    PRINTTO path. `work.tgt` (COPY) and `work.resp` (HTTP) are gone.
+  - Batches: 23 → 24, and 127 → 118 singletons. Each merge is a dataset the
+    roles now see: CHANGE writes what REG reads, APPEND reads its base,
+    COMPARE reads its inputs, LOGISTIC reads its `inmodel=`, and CHANGE
+    writes a member another file reads.
+  - The 4,800-chunk job and both reference examples are unchanged; only the
+    run date stamped in the reports differs.
+- **Performance.** `scripts/bench_chunker.py` measures within 0–9% of Phase 0
+  in one session; batching is level with Phase 3.
 
 - **`keywords.PROC_OPTION_ROLES`** (pure data). The default for every PROC is
   `data=` read, `out=`/`outdata=` write. Per-PROC entries:

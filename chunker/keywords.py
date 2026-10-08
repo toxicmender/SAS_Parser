@@ -504,6 +504,61 @@ RUN_GROUP_PROCS: frozenset[str] = frozenset(
     }
 )
 
+# What a PROC's options name, for chunker.statements. Either a dataset the step
+# reads, writes or updates in place ("read", "write", "update"), or a value
+# that only looks like one:
+#   - a "libref" (PROC COPY's IN= and OUT=);
+#   - a "fileref" (PROC HTTP's OUT=);
+#   - a "package" — the lib.member.package PROC FCMP's OUTLIB= names, which
+#     writes lib.member.
+# PROC_OPTION_DEFAULTS holds in every PROC. PROC_OPTION_ROLES adds a PROC's own
+# options, and overrides what a default option names there. An option neither
+# table lists names no dataset: FORMAT's LIBRARY= is a catalog, PRINTTO's LOG=
+# a file. Lowercase throughout.
+PROC_OPTION_DEFAULTS: dict[str, str] = {
+    "data": "read",
+    "out": "write",
+    "outdata": "write",
+    # Statistics and modelling: estimates, statistics, fitted models and trees
+    # out; a fitted model, estimates, test data or class levels in.
+    "outest": "write",
+    "outmodel": "write",
+    "outstat": "write",
+    "outtree": "write",
+    "outseed": "write",
+    "testout": "write",
+    "inmodel": "read",
+    "inest": "read",
+    "testdata": "read",
+    "classdata": "read",
+}
+
+PROC_OPTION_ROLES: dict[str, dict[str, str]] = {
+    # BASE= has DATA='s rows added to it: read and rewritten in place.
+    "append": {"base": "update", "new": "read"},
+    "compare": {"base": "read", "compare": "read", "outstats": "write"},
+    "sort": {"dupout": "write", "uniqueout": "write"},
+    "format": {"cntlin": "read", "cntlout": "write"},
+    "contents": {"out2": "write"},
+    "corr": {"outp": "write", "outs": "write", "outk": "write", "outh": "write"},
+    # FASTCLUS reads its initial seeds from SEED= and writes the cluster means
+    # to MEAN=. Everywhere else SEED= is a random-number seed.
+    "fastclus": {"seed": "read", "mean": "write", "instat": "read"},
+    "score": {"score": "read"},
+    "phreg": {"covariates": "read"},
+    "copy": {"in": "libref", "out": "libref"},
+    "upload": {"inlib": "libref", "outlib": "libref"},
+    "download": {"inlib": "libref", "outlib": "libref"},
+    "http": {
+        "in": "fileref",
+        "out": "fileref",
+        "headerin": "fileref",
+        "headerout": "fileref",
+    },
+    "json": {"out": "fileref"},
+    "fcmp": {"outlib": "package"},
+}
+
 # A function call is ``name(`` where the name is not glued to a preceding ``%``,
 # ``&``, or ``.``; a CALL routine is ``CALL name`` at a word boundary. Both
 # scans capture the *generic* identifier token and leave the "is it a known

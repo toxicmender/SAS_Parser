@@ -102,7 +102,7 @@ For running the work items end-to-end through an LLM, see the
 | `macro_vars.py` | Macro-variable values and reference expansion: `let_values` (the `%LET` symbol table), `resolve_refs` (`&name` / `&name.` / `&&name&i`), `call_spans` (where back-to-back macro calls begin and end), and `DS_REF_TOKEN` — the single definition of a dataset token that may embed `&refs`. Pure; no package imports. |
 | `passthrough.py` | SQL pass-through — `CONNECT TO` / `CONNECTION TO` / `EXECUTE … BY` / `DISCONNECT` and the native-SQL table scan: `scan_pass_through` (tables + the spans to mask), `mask`, `db_table_ref` (the one `SasDbTableRef` builder). The **single owner** of that grammar. |
 | `statements.py` | What each statement does to the datasets it names: `statements_of` (a region's statements, each with where it stands — open code, a DATA step, a PROC, a `%MACRO` body), the operand lists they read, and `dataset_refs` (the region's `SasDatasetRef`s, a macro body's classified as parameter, literal or macro variable). The **single owner** of dataset positions, for steps and macro bodies alike; `_canon_ds` lives here. |
-| `metadata.py` | Per-chunk semantic extraction: `_metadata_for` (datasets from `statements.dataset_refs`, plus the macro, path, function and symput / SQL-INTO / CALL EXECUTE scans), `_merge_meta`, the extraction regex catalogue, and the whole-list resolution passes — `resolve_macro_var_refs`, `resolve_db_librefs`, composed in order by `resolve_references` (and across files by `resolve_corpus_references`). |
+| `metadata.py` | Per-chunk semantic extraction: `_metadata_for` (datasets from `statements.dataset_refs`, plus the macro, path, function and symput / SQL-INTO / CALL EXECUTE scans), `_merge_meta`, the extraction regex catalogue, and the whole-list resolution passes — `resolve_macro_var_refs`, `resolve_ods_outputs`, `resolve_db_librefs`, composed in order by `resolve_references` (and across files by `resolve_corpus_references`). |
 | `chunker.py` | `SasSemanticChunker` orchestration (scan → group → build chunks, oversized-split with overlap). |
 | `batcher.py` | `_EdgeDiscovery` + Union-Find grouping, weak-edge resolution, context absorption, batch construction. `SasChunkBatcher` is a one-file convenience over `MultiFileBatcher`. |
 | `_repl.py` | `print_iterable` REPL helper (imported by nothing). |
@@ -240,11 +240,37 @@ THEN`, `ELSE`, `WHEN (…)` or `OTHERWISE`; a subsetting `IF` has none. Then:
   `ds1-ds3` (and `m01-m10`) expands, up to 1,000 names; `lib.pre:` is one
   pattern reference (`pattern=True`); a quoted path or `'name'n` is kept as
   written, lowercased.
-- **PROC:** `data=` reads and `out=` / `outdata=` write, on any statement but
-  one shaped like an assignment (`out = x + 1;` in PHREG, NLMIXED, FCMP, IML);
-  PROC SORT without `out=` rewrites its `data=`. PROC SQL reads its
-  `FROM`/`JOIN` table and writes its `CREATE TABLE|VIEW`/`INSERT INTO` one.
-- **Open code** names no dataset: a `%PUT`, a `%LET`, a macro call's arguments.
+- **PROC:** an option names what `keywords.PROC_OPTION_ROLES` says it names
+  in that PROC, over `PROC_OPTION_DEFAULTS` (`data=` reads; `out=`,
+  `outdata=`, `outest=`, `outstat=`, `outmodel=`, … write; `inmodel=`,
+  `testdata=`, `classdata=`, … read). A PROC's own entry adds options
+  (APPEND's `base=` is UPDATE, COMPARE's `compare=` and FORMAT's `cntlin=`
+  read, SORT's `dupout=` writes) or says an option is no dataset (COPY's
+  `in=`/`out=` are librefs, HTTP's `out=` a fileref; FCMP's
+  `outlib=lib.member.package` writes `lib.member`). `lib._all_` is the pattern
+  `lib.:`. Options are read anywhere in the PROC statement and in `output`,
+  `score`, `baseline` and `forecast`; in any other statement only after its
+  `/`, and never in an assignment (`out = x + 1;` in PHREG, NLMIXED, FCMP,
+  IML) — so `label out = 'x';` names nothing, nor does an option inside a
+  dataset's own `(…)`. PROC SORT without `out=` rewrites its `data=` (UPDATE).
+  - **PROC DATASETS** names members of its `lib=` library: `append` (base
+    UPDATE, data READ), `delete` (DROP), `change old=new` (old READ and DROP,
+    new WRITE), `exchange` and `modify` and `age` (UPDATE), `contents`, and
+    `kill` (DROP of the pattern `lib.:`).
+  - **A library copy** — PROC COPY, PROC DATASETS's `copy`, UPLOAD and
+    DOWNLOAD with `inlib=`/`outlib=` — reads each `select`ed member from the
+    source and writes it to the target. Without `select` (or with `exclude`)
+    it copies the patterns `source.:` → `target.:`; `move` deletes the
+    source's.
+  - **ODS OUTPUT** (`ods output Summary=s;`) writes its datasets: in a PROC,
+    that PROC does. In open code the statement records them, and
+    `metadata.resolve_ods_outputs` hands them to the next PROC_STEP of the
+    file. `ods output close|clear` before one cancels them; they stay on the
+    statement as MENTIONs.
+  - PROC SQL reads its `FROM`/`JOIN` table and writes its `CREATE TABLE|VIEW`/
+    `INSERT INTO` one.
+- **Open code** names no dataset but through ODS OUTPUT: not a `%PUT`, a
+  `%LET`, or a macro call's arguments.
 - **A `%MACRO` body** is read the same way, and its references are classified
   by spelling: exactly one of its parameters (`&ds`, resolved per call site),
   built from several (dropped: no call names one dataset), or written out or
@@ -254,8 +280,9 @@ THEN`, `ELSE`, `WHEN (…)` or `OTHERWISE`; a subsetting `IF` has none. Then:
   statement, a PROC SQL clause, or a statement with PROC options — and a
   call of another macro is read for its `data=` / `out=` arguments, since the
   batcher binds only the parameters of the macro a job calls.
-- Only DATA_STEP, PROC_STEP and MACRO_DEFINITION regions are read: nothing
-  else holds a statement that reads or writes.
+- Only DATA_STEP, PROC_STEP and MACRO_DEFINITION regions are read, and a
+  GLOBAL_STATEMENT that is an ODS OUTPUT: nothing else holds a statement
+  that reads or writes.
 
 Names are lowercased at extraction; quoted physical paths keep a leading `'` so
 they can never collide with identifiers.
@@ -265,7 +292,8 @@ they can never collide with identifiers.
 `external_refs` is one stored list of `SasPathRef` records — every location a
 chunk's statements name, whatever kind of place it is. `paths.py` recognises
 `LIBNAME`, `FILENAME`, `INFILE` / `FILE`, `%INCLUDE`, PROC IMPORT/EXPORT's
-`datafile=` / `outfile=`, ODS `file=` / `path=`, and `options sasautos=`.
+`datafile=` / `outfile=`, PROC PRINTTO's `log=` / `print=`, ODS `file=` /
+`path=`, and `options sasautos=`.
 
 A `FILENAME` device keyword redirects the same syntax somewhere that is not the
 filesystem, so each record carries a `PathLocation` — `FILESYSTEM`, `REMOTE`

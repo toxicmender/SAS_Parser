@@ -239,6 +239,24 @@ PATH_STATEMENTS: tuple[PathSpec, ...] = (
         keyword="outfile",
         pattern=re.compile(r"(?P<head>\boutfile\s*=\s*)" + _VALUE, re.IGNORECASE),
     ),
+    # PROC PRINTTO log='<path>' / print='<path>': where a job sends its log and
+    # its output. Anchored on the PROC, since LOG= and PRINT= alone are too
+    # common as words; one spec per option, so a statement naming both yields
+    # both.
+    PathSpec(
+        statement="printto",
+        keyword="printto",
+        pattern=re.compile(
+            r"(?P<head>\bprintto\b[^;]*?\blog\s*=\s*)" + _VALUE, re.IGNORECASE
+        ),
+    ),
+    PathSpec(
+        statement="printto",
+        keyword="printto",
+        pattern=re.compile(
+            r"(?P<head>\bprintto\b[^;]*?\bprint\s*=\s*)" + _VALUE, re.IGNORECASE
+        ),
+    ),
     # ODS destinations: file='<path>' / path='<path>'. The \b keeps this off
     # ``outfile=``, whose 'file' has no word boundary before it.
     PathSpec(

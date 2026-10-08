@@ -2,27 +2,36 @@
 
 A region is read one statement at a time, never as one stretch of text, so a
 dataset is recorded only where SAS reads or writes it: a DATA statement, SET,
-MERGE, UPDATE, MODIFY, OUTPUT, a hash object's ``dataset:``, a PROC's ``data=``
-/ ``out=``, a PROC SQL clause. Comments, data lines and SUBMIT code are no
-statements at all, and an assignment, a ``%PUT`` or a ``%LET`` names nothing.
+MERGE, UPDATE, MODIFY, OUTPUT, a hash object's ``dataset:``, a PROC SQL clause,
+a PROC's options — by what each names in that PROC (``keywords.PROC_OPTION_ROLES``)
+— PROC DATASETS's and PROC COPY's member statements, and ODS OUTPUT. Comments,
+data lines and SUBMIT code are no statements at all, and an assignment, a
+``%PUT`` or a ``%LET`` names nothing.
 
 Steps and ``%MACRO`` bodies share the walk. A body may also hold part of a
 step for its caller's step to complete (``%macro sets; set a b; %mend;``), so a
 body statement outside any step it opens is read as what its keyword makes it.
 A body's references are classified afterwards by how their names are spelled:
 written out, one of the macro's own parameters (each call site supplies it),
-or built from several (no call site names one dataset). Pure functions; no
-logging.
+or built from several (no call site names one dataset). Pure: the same
+statements always name the same references. No logging.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from functools import cache
 from itertools import chain
 
-from .keywords import _MACRO_LANGUAGE_WORDS, _SAS_RESERVED, RUN_GROUP_PROCS
+from .keywords import (
+    _MACRO_LANGUAGE_WORDS,
+    _SAS_RESERVED,
+    PROC_OPTION_DEFAULTS,
+    PROC_OPTION_ROLES,
+    RUN_GROUP_PROCS,
+)
 from .macro_vars import DS_REF_TOKEN, has_macro_ref
 from .models import DatasetRole, SasChunkKind, SasDatasetRef
 from .scanner import (
@@ -40,15 +49,16 @@ from .scanner import (
 # ---------------------------------------------------------------------------
 
 
-def _canon_ds(name: str) -> str:
+def _canon_ds(name: str, library: str = "work") -> str:
     """Canonicalise a dataset name for producer/consumer matching.
 
     A one-level name resolves to the temporary Work library — per the SAS
     Programmer's Guide: Essentials (Ch. 11), ``data mytable;`` "behaves the
     same if you specify work.mytable" — so it is rewritten to
     ``work.<name>``, unifying both spellings in the batcher's exact-string
-    dataset namespace.  Everything that is not a plain one-level identifier
-    passes through unchanged:
+    dataset namespace. (*library* names another default where SAS has one:
+    PROC DATASETS's ``LIB=``.) Everything that is not a plain one-level
+    identifier passes through unchanged:
 
     - two-level ``libref.member`` names;
     - names still holding a macro reference (``&table1``), whose libref is
@@ -76,7 +86,18 @@ def _canon_ds(name: str) -> str:
         or (name.startswith("_") and name.endswith("_"))
     ):
         return name
-    return f"work.{name}"
+    return _member(library, name)
+
+
+_ENDS_IN_REF_RE = re.compile(r"&\w+\Z")
+
+
+def _member(library: str, member: str) -> str:
+    """``library.member``. A library spelled through a macro variable keeps
+    its delimiter dot: ``&lib`` and ``x`` make ``&lib..x``, which SAS reads as
+    the value of ``&lib``, a dot, and ``x``."""
+    dot = ".." if _ENDS_IN_REF_RE.search(library) else "."
+    return f"{library}{dot}{member}"
 
 
 def _quoted_path(raw: str) -> str:
@@ -274,13 +295,15 @@ class _Operand:
     pattern: bool = False
 
 
-def _token_operand(raw: str, *, pattern: bool = False) -> _Operand | None:
+def _token_operand(
+    raw: str, *, pattern: bool = False, library: str = "work"
+) -> _Operand | None:
     name = _ds_name(raw)
     if name is None:
         return None
     if pattern:
-        return _Operand(raw + ":", _canon_ds(name) + ":", pattern=True)
-    return _Operand(raw, _canon_ds(name))
+        return _Operand(raw + ":", _canon_ds(name, library) + ":", pattern=True)
+    return _Operand(raw, _canon_ds(name, library))
 
 
 def _numbered_range(first: str, last: str) -> list[str] | None:
@@ -297,13 +320,16 @@ def _numbered_range(first: str, last: str) -> list[str] | None:
     return [f"{a.group(1)}{i:0{width}d}" for i in range(lo, hi + 1)]
 
 
-def _operands(mt: str, cf: str, pos: int, *, limit: int = 0) -> list[_Operand]:
+def _operands(
+    mt: str, cf: str, pos: int, *, limit: int = 0, library: str = "work"
+) -> list[_Operand]:
     """The datasets a statement lists from *pos*: names with their options,
     quoted paths, numbered ranges (``ds1-ds3``) and prefix lists (``pre:``).
 
     The list ends at an option (``end=``, ``key=``, ``nobs=``, …), a ``/``,
     or the statement's end; a macro call in it (``set %list(lib);``) names
     nothing it can see. *limit*: at most that many (an option's value).
+    *library*: where a one-level name lives.
     """
     found: list[_Operand] = []
     n = len(mt)
@@ -336,7 +362,7 @@ def _operands(mt: str, cf: str, pos: int, *, limit: int = 0) -> list[_Operand]:
             pos = last.end()
             spanned = _numbered_range(found[-1].raw, cf[last.start() : last.end()])
             for raw in spanned[1:] if spanned else [cf[last.start() : last.end()]]:
-                if op := _token_operand(raw):
+                if op := _token_operand(raw, library=library):
                     found.append(op)
             continue
         token = _TOKEN_RE.match(mt, pos)
@@ -349,7 +375,8 @@ def _operands(mt: str, cf: str, pos: int, *, limit: int = 0) -> list[_Operand]:
         prefix = pos < n and mt[pos] == ":"
         if prefix:
             pos += 1
-        if op := _token_operand(cf[token.start() : token.end()], pattern=prefix):
+        raw = cf[token.start() : token.end()]
+        if op := _token_operand(raw, pattern=prefix, library=library):
             found.append(op)
     return found
 
@@ -359,6 +386,7 @@ def _operands(mt: str, cf: str, pos: int, *, limit: int = 0) -> list[_Operand]:
 # ---------------------------------------------------------------------------
 
 READ, WRITE, UPDATE = DatasetRole.READ, DatasetRole.WRITE, DatasetRole.UPDATE
+DROP = DatasetRole.DROP
 
 # A hash object's DATASET: argument — the dataset a DECLARE (or _NEW_) loads at
 # instantiation, or the one an OUTPUT method writes. The name sits inside a
@@ -371,9 +399,6 @@ _HASH_DATASET_ARG_RE = re.compile(
 _HASH_OUTPUT_RE = re.compile(r"\.\s*output\s*\(", re.IGNORECASE)
 _DS_TOKEN_FULL_RE = re.compile(rf"{DS_REF_TOKEN}\Z")
 
-# A PROC statement's dataset options, as the chunker has always read them:
-# DATA= reads, OUT= and OUTDATA= write.
-_PROC_OPTION_RE = re.compile(r"\b(data|out|outdata)\s*=", re.IGNORECASE)
 # A statement that assigns — `out = x + 1;` in PROC PHREG, NLMIXED, FCMP or
 # IML — names no dataset, whatever its variable is called.
 _ASSIGNMENT_RE = re.compile(r"[A-Za-z_]\w*\s*(?:\[[^\]]*\]|\{[^}]*\}|\([^)]*\))?\s*=(?!=)")
@@ -384,8 +409,12 @@ _SQL_WRITE_RE = re.compile(
 )
 _SQL_READ_RE = re.compile(rf"\b(from|join)\s+({DS_REF_TOKEN})", re.IGNORECASE)
 
+# What one statement names: a dataset, what the statement does to it, and the
+# statement or option that named it.
+_Ref = tuple[_Operand, DatasetRole, str]
 
-def _hash_refs(st: Statement) -> Iterator[tuple[_Operand, DatasetRole, str]]:
+
+def _hash_refs(st: Statement) -> Iterator[_Ref]:
     if "dataset" not in st.cf.lower():
         return
     role = WRITE if _HASH_OUTPUT_RE.search(st.mt) else READ
@@ -395,7 +424,7 @@ def _hash_refs(st: Statement) -> Iterator[tuple[_Operand, DatasetRole, str]]:
             yield op, role, "hash"
 
 
-def _data_step_refs(st: Statement) -> Iterator[tuple[_Operand, DatasetRole, str]]:
+def _data_step_refs(st: Statement) -> Iterator[_Ref]:
     after = len(st.keyword)
     if st.keyword in ("data", "set", "merge", "update", "output"):
         role = WRITE if st.keyword in ("data", "output") else READ
@@ -408,7 +437,7 @@ def _data_step_refs(st: Statement) -> Iterator[tuple[_Operand, DatasetRole, str]
     yield from _hash_refs(st)
 
 
-def _sql_refs(st: Statement) -> Iterator[tuple[_Operand, DatasetRole, str]]:
+def _sql_refs(st: Statement) -> Iterator[_Ref]:
     for m in _SQL_WRITE_RE.finditer(st.mt):
         if op := _token_operand(st.cf[m.start(2) : m.end(2)]):
             yield op, WRITE, m.group(1).split(None, 1)[0].lower()
@@ -417,29 +446,267 @@ def _sql_refs(st: Statement) -> Iterator[tuple[_Operand, DatasetRole, str]]:
             yield op, READ, m.group(1).lower()
 
 
-def _proc_option_refs(st: Statement) -> Iterator[tuple[_Operand, DatasetRole, str]]:
-    if "=" not in st.mt or _ASSIGNMENT_RE.match(st.mt):
-        return
-    reads: list[_Operand] = []
-    writes = False
-    for m in _PROC_OPTION_RE.finditer(st.mt):
+# ---------------------------------------------------------------------------
+# PROC options
+# ---------------------------------------------------------------------------
+
+_ROLES = {"read": READ, "write": WRITE, "update": UPDATE}
+_NAMED_OPTION_RE = re.compile(r"\b([A-Za-z_]\w*)\s*=(?!=)")
+# Statements whose options may stand anywhere in them, as a PROC statement's
+# do: `output out=s mean=m;`, `score data=new out=scored;`. Any other
+# statement's options follow its `/` (`tables g / out=cnt;`, `model y = x /
+# outroc=r;`); before it come variables, labels and conditions, so `label out
+# = 'x';` and `where data = 1;` name nothing.
+_OPTION_STATEMENTS = frozenset({"proc", "output", "score", "baseline", "forecast"})
+
+
+@cache
+def _option_roles(proc: str) -> Mapping[str, str]:
+    """What *proc*'s options name: keywords.PROC_OPTION_DEFAULTS, with the
+    PROC's own keywords.PROC_OPTION_ROLES over them."""
+    return {**PROC_OPTION_DEFAULTS, **PROC_OPTION_ROLES.get(proc, {})}
+
+
+def _blank_groups(text: str) -> str:
+    """*text* with every parenthesised group blanked, parentheses included: a
+    dataset's own options (``data=a(where=(out=1))``) are not the statement's."""
+    if "(" not in text:
+        return text
+    parts: list[str] = []
+    depth = last = 0
+    for m in _PARENS_RE.finditer(text):
+        if m.group() == "(":
+            if depth == 0:
+                parts.append(text[last : m.start()])
+                last = m.start()
+            depth += 1
+        elif depth:
+            depth -= 1
+            if depth == 0:
+                parts.append(" " * (m.end() - last))
+                last = m.end()
+    parts.append(" " * (len(text) - last) if depth else text[last:])
+    return "".join(parts)
+
+
+def _option_value(st: Statement, names: Collection[str]) -> str | None:
+    """The token the first of the options *names* is set to, lowercased."""
+    for m in _NAMED_OPTION_RE.finditer(_blank_groups(st.mt)):
+        if m.group(1).lower() in names:
+            token = _TOKEN_RE.match(st.mt, _ws_end(st.mt, m.end()))
+            return st.cf[token.start() : token.end()].lower() if token else None
+    return None
+
+
+def _option_refs(
+    st: Statement,
+    roles: Mapping[str, str],
+    start: int,
+    end: int | None = None,
+    *,
+    library: str = "work",
+) -> Iterator[_Ref]:
+    """The datasets the ``name=`` options in ``st.mt[start:end]`` name, by
+    *roles* (see keywords.PROC_OPTION_DEFAULTS). ``lib._all_`` is every member
+    of lib: the pattern ``lib.:``."""
+    stop = len(st.mt) if end is None else end
+    for m in _NAMED_OPTION_RE.finditer(_blank_groups(st.mt[start:stop])):
         option = m.group(1).lower()
-        for op in _operands(st.mt, st.cf, m.end(), limit=1):
-            if option == "data":
-                reads.append(op)
-                yield op, READ, "data="
-            else:
-                writes = True
-                yield op, WRITE, f"{option}="
-    # PROC SORT without OUT= sorts DATA= in place.
-    if st.keyword == "proc" and st.proc == "sort" and not writes:
-        for op in reads:
-            yield op, WRITE, "data="
+        role = roles.get(option)
+        dataset_role = WRITE if role == "package" else _ROLES.get(role or "")
+        if dataset_role is None:
+            continue  # no option of this PROC's, or a libref or fileref
+        at = _ws_end(st.mt, start + m.end())
+        token = _TOKEN_RE.match(st.mt, at)
+        written = st.cf[token.start() : token.end()].lower() if token else ""
+        if written == "_all_" or written.endswith("._all_"):
+            lib = written[:-6] or library
+            yield _Operand(written, _member(lib, ":"), pattern=True), dataset_role, f"{option}="
+            continue
+        for op in _operands(st.mt, st.cf, at, limit=1, library=library):
+            if role == "package" and op.name.count(".") >= 2:
+                # FCMP's lib.member.package: the package lives in lib.member.
+                op = _Operand(op.raw, _canon_ds(op.name.rsplit(".", 1)[0]))
+            yield op, dataset_role, f"{option}="
 
 
-def _proc_refs(st: Statement) -> Iterator[tuple[_Operand, DatasetRole, str]]:
-    return _sql_refs(st) if st.proc == "sql" else _proc_option_refs(st)
+def _statement_option_refs(
+    st: Statement, roles: Mapping[str, str], *, library: str = "work"
+) -> Iterator[_Ref]:
+    """The datasets a PROC's statement names by its options: anywhere in one
+    of _OPTION_STATEMENTS, after the ``/`` in any other, never in an
+    assignment."""
+    if "=" not in st.mt or _ASSIGNMENT_RE.match(st.mt):
+        return iter(())
+    if st.keyword in _OPTION_STATEMENTS:
+        return _option_refs(st, roles, len(st.keyword), library=library)
+    slash = _blank_groups(st.mt).find("/")
+    if slash < 0:
+        return iter(())
+    return _option_refs(st, roles, slash + 1, library=library)
 
+
+# `ods output Summary=s TTests(persist=proc)=t;`: each output object's dataset,
+# which the PROC that produces the object writes.
+_ODS_OUTPUT_RE = re.compile(r"ods\s+output\b", re.IGNORECASE)
+
+
+def _ods_output_refs(st: Statement) -> Iterator[_Ref]:
+    head = _ODS_OUTPUT_RE.match(st.mt)
+    if head is None:
+        return
+    for m in _NAMED_OPTION_RE.finditer(_blank_groups(st.mt[head.end() :])):
+        for op in _operands(st.mt, st.cf, head.end() + m.end(), limit=1):
+            yield op, WRITE, "ods_output"
+
+
+# ---------------------------------------------------------------------------
+# PROC steps
+# ---------------------------------------------------------------------------
+
+# The libraries PROC COPY copies between, and UPLOAD and DOWNLOAD when they
+# copy a library rather than one dataset.
+_COPY_LIBRARIES = {
+    "copy": ("in", "out"),
+    "upload": ("inlib", "outlib"),
+    "download": ("inlib", "outlib"),
+}
+# A bare word option, never an option's value: `kill` in `proc datasets lib=x
+# kill;`, not in `lib=kill`.
+_KILL_RE = re.compile(r"(?:^|[^=\s])\s+kill\b", re.IGNORECASE)
+_MOVE_RE = re.compile(r"(?:^|[^=\s])\s+move\b", re.IGNORECASE)
+# CHANGE and EXCHANGE: `old=new` pairs of member names.
+_PAIR_RE = re.compile(rf"({DS_REF_TOKEN})\s*=\s*({DS_REF_TOKEN})")
+# PROC DATASETS statements that name members of its library.
+_DATASETS_STATEMENTS = frozenset(
+    {"append", "change", "exchange", "copy", "delete", "modify", "age", "contents"}
+)
+
+
+class _CopyGroup:
+    """Members copied from one library to another: PROC COPY (UPLOAD,
+    DOWNLOAD) or PROC DATASETS's COPY statement. SELECT names them; without it
+    (or with EXCLUDE, naming the ones left behind) every member goes: the
+    patterns ``source.:`` and ``target.:``. MOVE deletes them from the source.
+    """
+
+    __slots__ = ("source", "target", "move", "selected")
+
+    def __init__(self, source: str, target: str, move: bool) -> None:
+        self.source, self.target, self.move = source, target, move
+        self.selected = False
+
+    def _copied(self, member: str, pattern: bool) -> Iterator[_Ref]:
+        yield _Operand(member, _member(self.source, member), pattern), READ, "copy"
+        yield _Operand(member, _member(self.target, member), pattern), WRITE, "copy"
+        if self.move:
+            yield _Operand(member, _member(self.source, member), pattern), DROP, "copy"
+
+    def select(self, st: Statement) -> Iterator[_Ref]:
+        self.selected = True
+        for op in _operands(st.mt, st.cf, len(st.keyword)):
+            yield from self._copied(op.raw.lower(), op.pattern)
+
+    def close(self) -> Iterator[_Ref]:
+        if not self.selected:
+            yield from self._copied(":", True)
+
+
+class _ProcStep:
+    """One PROC step's statements, read in order: each statement's options by
+    what they name in this PROC, PROC SORT's in-place rewrite, PROC DATASETS's
+    member statements, a library copy's members, and ODS OUTPUT."""
+
+    __slots__ = ("proc", "roles", "library", "copy")
+
+    def __init__(self, proc: str) -> None:
+        self.proc = proc
+        self.roles = _option_roles(proc)
+        self.library = "work"  # where PROC DATASETS's member names live
+        self.copy: _CopyGroup | None = None
+
+    def read(self, st: Statement) -> Iterator[_Ref]:
+        kw = st.keyword
+        # SELECT and EXCLUDE belong to the copy just before them.
+        if self.copy is not None and kw not in ("select", "exclude"):
+            yield from self.close()
+        if kw == "ods":
+            yield from _ods_output_refs(st)
+        elif kw == "proc":
+            yield from self._proc_statement(st)
+        elif self.proc == "sql":
+            yield from _sql_refs(st)
+        elif self.copy is not None:
+            if kw == "select":
+                yield from self.copy.select(st)
+        elif self.proc == "datasets" and kw in _DATASETS_STATEMENTS:
+            yield from self._datasets_statement(st)
+        else:
+            yield from _statement_option_refs(st, self.roles)
+
+    def close(self) -> Iterator[_Ref]:
+        """What the step names once it ends: a copy without SELECT."""
+        if self.copy is not None:
+            copy, self.copy = self.copy, None
+            yield from copy.close()
+
+    def _proc_statement(self, st: Statement) -> Iterator[_Ref]:
+        refs = list(_statement_option_refs(st, self.roles))
+        if self.proc == "sort" and all(via != "out=" for _, _, via in refs):
+            # Without OUT= the sort rewrites DATA= in place.
+            refs = [(op, UPDATE if via == "data=" else role, via) for op, role, via in refs]
+        yield from refs
+        flags = _blank_groups(st.mt)
+        if self.proc == "datasets":
+            self.library = _option_value(st, ("library", "lib")) or "work"
+            if _KILL_RE.search(flags):
+                yield _Operand("kill", _member(self.library, ":"), True), DROP, "kill"
+        elif self.proc in _COPY_LIBRARIES:
+            source_option, target_option = _COPY_LIBRARIES[self.proc]
+            source = _option_value(st, (source_option,))
+            target = _option_value(st, (target_option,))
+            if source and target:
+                self.copy = _CopyGroup(source, target, bool(_MOVE_RE.search(flags)))
+
+    def _datasets_statement(self, st: Statement) -> Iterator[_Ref]:
+        kw, lib, after = st.keyword, self.library, len(st.keyword)
+        if kw == "append":
+            yield from _option_refs(st, _option_roles("append"), after, library=lib)
+        elif kw == "contents":
+            yield from _option_refs(st, {"data": "read"}, after, library=lib)
+            yield from _option_refs(st, {"out": "write", "out2": "write"}, after)
+        elif kw == "copy":
+            source = _option_value(st, ("in",)) or lib
+            target = _option_value(st, ("out",))
+            if target:
+                self.copy = _CopyGroup(source, target, bool(_MOVE_RE.search(st.mt)))
+        elif kw == "delete":
+            for op in _operands(st.mt, st.cf, after, library=lib):
+                yield op, DROP, "delete"
+        elif kw in ("modify", "age"):
+            limit = 1 if kw == "modify" else 0
+            for op in _operands(st.mt, st.cf, after, limit=limit, library=lib):
+                yield op, UPDATE, kw
+        else:  # change old=new; exchange a=b
+            scan = _blank_groups(st.mt)
+            slash = scan.find("/")
+            for m in _PAIR_RE.finditer(scan, after, slash if slash >= 0 else len(scan)):
+                old = _token_operand(st.cf[m.start(1) : m.end(1)], library=lib)
+                new = _token_operand(st.cf[m.start(2) : m.end(2)], library=lib)
+                if old is None or new is None:
+                    continue
+                if kw == "change":  # old's rows become new's, and old is gone
+                    yield old, READ, kw
+                    yield old, DROP, kw
+                    yield new, WRITE, kw
+                else:
+                    yield old, UPDATE, kw
+                    yield new, UPDATE, kw
+
+
+# ---------------------------------------------------------------------------
+# Outside a PROC
+# ---------------------------------------------------------------------------
 
 # A %MACRO body may hold part of a step, for a call inside one to complete:
 # `%macro sets; set a b; %mend;` (a DATA step's), `%macro src; select * from
@@ -453,7 +720,7 @@ _SQL_UPDATE_RE = re.compile(
 )
 
 
-def _fragment_refs(st: Statement) -> Iterator[tuple[_Operand, DatasetRole, str]]:
+def _fragment_refs(st: Statement) -> Iterator[_Ref]:
     if st.keyword in _SQL_KEYWORDS or (
         st.keyword == "update" and _SQL_UPDATE_RE.match(st.mt)
     ):
@@ -461,24 +728,38 @@ def _fragment_refs(st: Statement) -> Iterator[tuple[_Operand, DatasetRole, str]]
     # OUTPUT with options is a PROC's (`output out=stats mean=m`).
     if st.keyword in _DATA_KEYWORDS and not (st.keyword == "output" and "=" in st.mt):
         return _data_step_refs(st)
-    return chain(_proc_option_refs(st), _hash_refs(st))
+    return chain(_statement_option_refs(st, _option_roles("")), _hash_refs(st))
 
 
-def _statement_refs(st: Statement) -> Iterator[tuple[_Operand, DatasetRole, str]]:
+def _call_option_refs(st: Statement) -> Iterator[_Ref]:
+    """A macro call's arguments, read as a PROC's options are (by the default
+    roles): ``%step1(data=a, out=b)`` reads a and writes b."""
+    open_at = st.mt.find("(")
+    if open_at < 0:
+        return iter(())
+    return _option_refs(st, _option_roles(""), open_at + 1, _group_end(st.mt, open_at) - 1)
+
+
+def _statement_refs(st: Statement) -> Iterator[_Ref]:
+    """What a statement outside a PROC step names (a PROC's go through
+    :class:`_ProcStep`)."""
     if st.context == DATA:
         return _data_step_refs(st)
-    if st.context == PROC:
-        return _proc_refs(st)
+    if st.keyword == "ods":
+        # A request the next PROC fulfils: in open code it waits on the ODS
+        # statement for metadata.resolve_ods_outputs to move; in a macro body
+        # the body's PROC writes it.
+        return _ods_output_refs(st)
     if not st.in_macro:
         return iter(())
     if not st.keyword.startswith("%"):
         return _fragment_refs(st)
     if st.keyword[1:] not in _MACRO_LANGUAGE_WORDS:
-        # A call of another macro: its DATA= and OUT= arguments are read as a
-        # PROC's options are. The batcher binds the parameters of the macro a
-        # job calls, never of the ones it calls in turn, so this is how a
-        # wrapper (`%step1(data=a, out=b);`) is seen to read and write.
-        return _proc_option_refs(st)
+        # A call of another macro: its DATA= and OUT= arguments. The batcher
+        # binds the parameters of the macro a job calls, never of the ones it
+        # calls in turn, so this is how a wrapper (`%step1(data=a, out=b);`)
+        # is seen to read and write.
+        return _call_option_refs(st)
     return iter(())
 
 
@@ -570,13 +851,32 @@ def dataset_refs(
     """
     params = param_pos or {}
     refs: list[SasDatasetRef] = []
-    for st in statements_of(units, mt, cf, macro_body=macro_body):
-        for op, role, via in _statement_refs(st):
-            if st.in_macro:
+
+    def add(found: Iterable[_Ref], in_macro: bool) -> None:
+        for op, role, via in found:
+            if in_macro:
                 if (ref := _body_ref(op, role, via, params)) is not None:
                     refs.append(ref)
             else:
                 refs.append(
                     SasDatasetRef(op.name, role, raw=op.raw, via=via, pattern=op.pattern)
                 )
+
+    # A PROC step is read by one _ProcStep, from its PROC statement to the
+    # statement that ends it: what one statement names can depend on another's
+    # (PROC DATASETS's LIB=, PROC COPY's SELECT).
+    step: _ProcStep | None = None
+    step_in_macro = False
+    for st in statements_of(units, mt, cf, macro_body=macro_body):
+        if step is not None and (st.context != PROC or st.keyword == "proc"):
+            add(step.close(), step_in_macro)
+            step = None
+        if st.context == PROC:
+            if step is None:
+                step, step_in_macro = _ProcStep(st.proc), st.in_macro
+            add(step.read(st), st.in_macro)
+        else:
+            add(_statement_refs(st), st.in_macro)
+    if step is not None:
+        add(step.close(), step_in_macro)
     return refs

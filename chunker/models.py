@@ -84,8 +84,8 @@ class SasPathRef(BaseModel, frozen=True):
     ----------
     statement
         Which statement named it — ``libname``, ``filename``, ``infile``,
-        ``file``, ``include``, ``proc_import``, ``proc_export``, ``ods``,
-        ``sasautos``.
+        ``file``, ``include``, ``proc_import``, ``proc_export``, ``printto``,
+        ``ods``, ``sasautos``.
     location
         See :class:`PathLocation`.
     path
