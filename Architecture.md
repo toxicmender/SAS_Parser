@@ -726,8 +726,12 @@ a name in a comment, in-stream data, a `%PUT`, a string or an assignment is no
 dataset. A PROC's options mean what `keywords.PROC_OPTION_ROLES` says they
 mean in that PROC (APPEND's `base=` is UPDATE; COPY's `out=` is a libref,
 not a dataset). A `%LET` value written like a dataset is a MENTION (named,
-not used), as is an ODS OUTPUT request closed before any PROC takes it. See
-`chunker/README.md` for the per-statement rules.
+not used), as is an ODS OUTPUT request closed before any PROC takes it. Only a
+WRITE creates a dataset; `created_datasets` and `body_literal_created` (plain
+properties, not serialised) list those, for the consumers that ask what a
+chunk supplies (invariant 17). See `chunker/README.md` for the per-statement
+rules and for what the chunker does not see (SUBMIT code, remote WORK, CAS
+actions, code generated at run time).
 
 ## Batching model
 
@@ -772,6 +776,84 @@ index. A whole-library input (`lib.:`) links nothing, so a housekeeping step
 cannot fuse every job that writes to the library. A pattern output (`tgt.:`
 from a whole-library COPY) produces every name it covers, and `_LAST_`
 skips it.
+
+## Migration note: statement-level dataset references
+
+The chunker's dataset extraction was rebuilt to read one statement at a time
+(`docs/plans/chunker-sas-coverage.md`). Serialised chunk JSON keeps its keys,
+and old JSON still loads. These changes are visible to callers.
+
+**Model and API**
+
+- **The dataset lists are views.** `input_datasets`, `output_datasets`, the
+  `body_*` lists, `referenced_datasets` and `referenced_librefs` are computed
+  from `SasChunkMetadata.dataset_refs`. Build metadata with `dataset_refs=`, or
+  pass the lists to the constructor, which turns them into references. Rewrite
+  with `map_dataset_names` / `add_dataset_refs`: `model_copy(update=…)` naming
+  a view raises `ValueError`.
+- **Roles.** UPDATE (changed in place) puts a table in both `input_datasets`
+  and `output_datasets`. DROP (deleted) fills the new `dropped_datasets`.
+  MENTION (named, not used) covers a `%LET` value written like a dataset.
+  What a chunk creates is `created_datasets`, a property that is not
+  serialised.
+- **Internals moved.**
+  - `_io_for` and `_macro_body_io` become `statements.dataset_refs`.
+  - `_Unit.is_comment` becomes `_Unit.role` (`UnitRole`).
+  - The pass-through table walker becomes `sql.SqlStatement(text,
+    Dialect.NATIVE)`.
+  - `_MACRO_SIG_RE` and `_parse_macro_params` become
+    `macro_vars.macro_signature`.
+- **Paths.**
+  - A place named through a fileref (`%include src(a);`, `infile in;`) is a
+    `PathLocation.FILEREF` ref with the fileref in `binds`.
+  - `resolve_filerefs` gives it the FILENAME's place.
+  - A `%include` of several files records each one, through
+    `PathSpec.refs_for`; `xref.pre` rewrites each value through
+    `value_spans`.
+- **Resolution order.** `resolve_references` runs macro variables, then
+  filerefs, ODS OUTPUT and database librefs. Call it rather than the passes
+  one by one.
+
+**Behaviour**
+
+- **Chunk boundaries.**
+  - A run-group PROC (`keywords.RUN_GROUP_PROCS`) keeps its statements after
+    `RUN;` until `QUIT;`.
+  - PROC DS2 holds its own DATA programs.
+  - In-stream data and SUBMIT code never open a step.
+  - `%* …;` is a COMMENT_BLOCK.
+  - `%symdel`, `%syslput` and the new global statements (ENDSAS, GOPTIONS,
+    SIGNON, …) are GLOBAL_STATEMENT, not MACRO_CALL.
+  - A `;` inside `%str(…)` ends nothing.
+- **Fewer, correct dataset names.** Comments, in-stream data, SUBMIT code,
+  `%PUT` text, strings and assignment targets name no dataset.
+  `referenced_datasets` holds canonical names only.
+- **PROC options mean what they mean in that PROC.** APPEND's `base=` is
+  UPDATE, COPY's `out=` is a libref, `outest=` and friends write. An open-code
+  ODS OUTPUT moves to the next PROC.
+- **Updates.**
+  - An in-place update needs its table: it links to the table's creator and
+    supplies it to nobody (invariant 17). So jobs appending to one shared
+    table no longer share a batch through it.
+  - A batch that only updates a table lists it among its inputs.
+  - A MODIFY step does not create its master.
+  - An in-place PROC SORT replaces its table (READ and WRITE), so a later BY
+    step depends on it.
+- **Patterns.** `set lib.pre:;` links to the producers of every matching
+  name. A whole-library read (`lib.:`) links nothing. A whole-library COPY
+  produces the members of its target.
+
+**Consumers**
+
+- **Complexity.**
+  - `ChunkComplexity` and `FileComplexity` gain `updated_datasets` and
+    `dropped_datasets`.
+  - The Datasets section adds "Updated in place" and "Deleted" lines.
+  - A table a file only updates is an input, imported from the file that
+    creates it, not an intermediate.
+  - The Paths section lists filerefs no FILENAME assigns.
+- **Hydration.** A file read through a fileref is planned once, from its
+  FILENAME.
 
 ## Pipeline and memory
 
@@ -914,9 +996,9 @@ Things that look like implementation details but are contracts. Breaking
 any of these silently changes behavior.
 
 1. **Edge discovery is one walk, in corpus order.**
-   `_EdgeDiscovery._resolve_macro_body` mutates `produces_ds` mid-walk: a
-   macro call site's resolved outputs are registered as producers at the
-   moment the call is visited, which is what implements "a macro's output
+   `_EdgeDiscovery._resolve_macro_body` mutates `produces_ds` mid-walk: what
+   a macro call site's resolved arguments create is registered at the moment
+   the call is visited, which is what implements "a macro's output
    exists only once the call has executed" under nearest-preceding-producer
    bisection. Splitting the edge families into separate corpus walks would
    let a consumer link to a producer that does not exist yet at its
@@ -924,12 +1006,15 @@ any of these silently changes behavior.
 
 2. **Producer lists stay sorted by global index.** The nearest-preceding
    lookups are `bisect_left` over `produces_ds[name]`; mid-walk
-   registration therefore uses `insort`, never `append`.
+   registration therefore uses `insort`, never `append`. `ds_names`, the
+   sorted name index a pattern input (`set lib.sales_:;`) bisects, gets a new
+   name the same way.
 
 3. **`output_datasets` is insertion-ordered, never sorted.**
-   `_resolve_implicit_datasets` treats `output_datasets[-1]` as "the last
-   dataset named" when resolving `_LAST_`/`_DATA_`/missing-`data=`
-   references. Sorting it breaks that convention. It is a view of
+   `_resolve_implicit_datasets` treats the last of `output_datasets` that is
+   not a pattern as "the last dataset named" when resolving
+   `_LAST_`/`_DATA_`/missing-`data=` references. Sorting it breaks that
+   convention. It is a view of
    `dataset_refs`, which `_merge_meta` unions in source order, the parent's
    first, so split children keep the order.
 
@@ -1066,8 +1151,8 @@ any of these silently changes behavior.
      non-capturing, which it was until hydration needed to tell them apart.
    - **One macro-reference grammar.** `chunker/macro_vars.py` owns what a name
      spelled through a macro variable looks like (`DS_REF_TOKEN`) and how it
-     expands (`let_values` / `resolve_refs`). Every dataset position in
-     `chunker/metadata.py` and the LIBNAME/FILENAME librefs in
+     expands (`let_values` / `resolve_refs`). Every dataset operand in
+     `chunker/statements.py` and the LIBNAME/FILENAME librefs in
      `chunker/paths.py` are scanned with that one token, because a scan that
      required a bare identifier could not see `data &table1;` at all — it read
      the identifier after the `&` and reported the dataset `work.table1`, which
@@ -1083,6 +1168,24 @@ any of these silently changes behavior.
      masking is the load-bearing half: while native SQL was scanned as SAS,
      `from connection to oracle` was the dataset `work.connection` and the
      Oracle owner `edw_export` a SAS libref every batch reported needing.
+   - **One dataset-position owner.** `chunker/statements.py` says which
+     statement, in which context, names which dataset, for steps and
+     `%MACRO` bodies alike, reading only CODE units (`_Region.code_text`
+     blanks comments, in-stream data and SUBMIT code). There used to be two
+     sets of whole-text patterns, one for steps and one for macro bodies.
+     They drifted apart and read commented-out code, `%PUT` text and
+     assignment targets as datasets. A third scan growing anywhere else
+     brings those false reads and writes back, silently, since the chunk
+     still reports *a* dataset.
+   - **One SQL grammar.** `chunker/sql.py`'s `SqlStatement` walks PROC SQL,
+     PROC FEDSQL, DS2's `{…}` queries and pass-through's native SQL. Only
+     the dialect differs, so a fix to a FROM list or a subquery reaches all
+     of them.
+   - **One PROC option table.** What an option names in a PROC is data in
+     `keywords.PROC_OPTION_DEFAULTS` and `keywords.PROC_OPTION_ROLES`, not a
+     pattern. A PROC learns an option by an entry there; statements that need
+     more than a table (DATASETS, COPY, ODS OUTPUT, DS2, IML) have readers in
+     `statements._ProcStep`.
    - **One path resolver.** `xref/mapping.py` decides which `by_path` key wins
      (exact match, then longest directory prefix) and what it rewrites to. Both
      halves of the substitution import it: `xref/pre.py` on the way in,
@@ -1175,6 +1278,17 @@ any of these silently changes behavior.
       alongside `names` and `graph_image`, and `None` (the default) renders
       nothing at all — a run without `--hydration` produces byte-identical
       reports.
+
+17. **Only a WRITE supplies a dataset.** A step that updates a table in place
+    (an UPDATE reference: APPEND `base=`, SQL INSERT/UPDATE/DELETE/ALTER,
+    MODIFY) needs the table and supplies it to nobody. The batcher's producer
+    index, a batch's satisfied inputs and `complexity.crossfile`'s producers
+    and exports therefore read `created_datasets` / `body_literal_created`,
+    never `output_datasets`, which holds updates too. Reading the wider list
+    there chains every job that appends to a shared audit table into one
+    batch, and puts those jobs in a dependency cycle that leaves the migration
+    waves unordered. Both failures are silent. An in-place PROC SORT is a
+    replacement (READ and WRITE), not an update: a later BY step depends on it.
 
 ## Conventions
 

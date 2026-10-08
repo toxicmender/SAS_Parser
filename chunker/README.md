@@ -176,6 +176,25 @@ this is a considered decision, not an accident.
   un-interruptible C-level regex call (catastrophic backtracking on hostile
   source). Pass `timeout=None` to disable both and parse unbounded.
 
+### What the chunker does not see
+
+Known limits, each a decision rather than an oversight:
+
+- **Other languages' code.** Code between SUBMIT and ENDSUBMIT (Python, R,
+  Lua, Groovy) is FOREIGN: whatever datasets it touches are not recorded.
+- **Remote WORK.** Statements inside RSUBMIT are recognised, but `work.x` on
+  the remote session is not told apart from the local WORK library.
+- **CAS actions.** PROC CAS action calls (`table.loadTable`, `casOut=`) name
+  no dataset.
+- **Code generated at run time.** CALL EXECUTE text and DOSUBL are not read
+  for datasets; only the macros a CALL EXECUTE invokes are recorded.
+- **A macro call as a `%THEN` action, with no semicolon after it.** `%if &x
+  %then %load(a)` followed by another statement does not end at the call, so
+  that statement is read as part of the `%IF`. In open code a DATA step
+  there loses its header.
+- **A full SAS grammar.** The scanner and statement-level extraction above
+  stay the design; see the start of this section.
+
 ### Metadata: stored vs computed
 
 `SasChunkMetadata` stores one field per concept. These views are **computed
@@ -554,18 +573,20 @@ Things that look like implementation details but are contracts. Breaking any of
 these silently changes behavior.
 
 1. **Edge discovery is one walk, in corpus order.**
-   `_EdgeDiscovery._resolve_macro_body` mutates `produces_ds` mid-walk: a macro
-   call site's resolved outputs are registered as producers at the moment the
+   `_EdgeDiscovery._resolve_macro_body` mutates `produces_ds` mid-walk: what a
+   macro call site's resolved arguments create is registered at the moment the
    call is visited, which implements "a macro's output exists only once the call
    has executed" under nearest-preceding-producer bisection. Splitting the edge
    families into separate corpus walks would let a consumer link to a producer
    that does not exist yet at its position — or miss one that does.
 2. **Producer lists stay sorted by global index.** The nearest-preceding lookups
    are `bisect_left` over `produces_ds[name]`; mid-walk registration therefore
-   uses `insort`, never `append`.
+   uses `insort`, never `append`. `ds_names`, the sorted index pattern inputs
+   bisect, gets a new name the same way.
 3. **`output_datasets` is insertion-ordered, never sorted.**
-   `_resolve_implicit_datasets` treats `output_datasets[-1]` as "the last
-   dataset named" when resolving `_LAST_` / `_DATA_` / missing-`data=` references.
+   `_resolve_implicit_datasets` treats the last of `output_datasets` that is not
+   a pattern as "the last dataset named" when resolving `_LAST_` / `_DATA_` /
+   missing-`data=` references.
    Split children keep the order too: `_merge_meta` unions dataset references
    in source order, the parent's first.
 4. **Every `SasChunkMetadata` field must have a merge rule.** `_merge_meta`
@@ -659,6 +680,27 @@ these silently changes behavior.
    name literals), never a second walker. The NATIVE dialect's reads and
    writes are pinned by `tests/test_passthrough.py`; change it and they say
    so.
+14. **Only CODE text is scanned.** A comment, in-stream data or SUBMIT code is
+   a unit of its own role. `_metadata_for` reads every scan from
+   `_Region.code_text`, where those units are blanked: the dataset statements,
+   and the whole-text scans for functions, CALL routines, macro variables,
+   labels, options and SYMPUT. `statements_of` skips the units outright. A new
+   scan that reads the raw region text instead brings back the false reads and
+   writes of commented-out code.
+15. **What a PROC option names is data.** `keywords.PROC_OPTION_DEFAULTS`
+   says what an option names in any PROC, and `keywords.PROC_OPTION_ROLES`
+   what it names in one (`read`, `write`, `update`, `libref`, `fileref`, or
+   `package` for FCMP's `lib.member.package`). Teach the chunker a PROC's
+   options by adding an entry there,
+   not a pattern in `statements.py`; the statements that need more than an
+   option table (DATASETS, COPY, ODS OUTPUT, SQL, DS2, IML) have their own
+   readers in `_ProcStep`.
+16. **Only a WRITE supplies a dataset.** The batcher's producer index, a
+   batch's satisfied inputs and `complexity.crossfile`'s producers and exports read
+   `created_datasets` / `body_literal_created`, never `output_datasets`. An
+   UPDATE is a consumer of the table it changes. Reading `output_datasets`
+   there again would chain every job that appends to a shared table into one
+   batch, and put them in a dependency cycle.
 
 ## Logging
 

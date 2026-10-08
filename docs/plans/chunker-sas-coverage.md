@@ -1,10 +1,10 @@
 # Plan: close the chunker's SAS coverage gaps (breaking changes allowed)
 
-Status: Phases 0–8 implemented. `tests/test_sas_coverage.py` holds 184 probes:
+Status: Phases 0–9 implemented. `tests/test_sas_coverage.py` holds 184 probes:
 the 168 from the coverage review, 15 precision probes (`X01`–`X15`), and G22
-(INFILE through a fileref). All of them pass. Phase 9 is not started. Phase 8
-raised a question about tables updated in place by several files, settled as
-"only a creation supplies a table"; see its section.
+(INFILE through a fileref). All of them pass. Phase 8 raised a question about
+tables updated in place by several files, settled as "only a creation
+supplies a table"; see its section.
 
 ## Context
 
@@ -58,7 +58,7 @@ These trace to four structural causes:
 | Change | Affected | Migration |
 |---|---|---|
 | `SasChunkMetadata.dataset_refs: tuple[SasDatasetRef, ...]` becomes the stored source; `input_datasets`, `output_datasets`, `referenced_datasets`, `referenced_librefs`, `body_literal_*`, `body_param_*` become read-only computed views | ~10 test constructors; every `model_copy(update={"input_datasets": …})` site | JSON keys unchanged (computed fields serialise). A `model_validator(mode="before")` turns legacy lists into refs, so old JSON still loads. A guard test fails on any `update=` that names a view |
-| Update-in-place (SQL INSERT/UPDATE/DELETE/ALTER, `APPEND base=`, `MODIFY`) is role `UPDATE`, so the table appears in both input and output lists | Batching: the modifying step now depends on the table's earlier producer | Intended; batch diffs are reviewed in verification |
+| Update-in-place (SQL INSERT/UPDATE/DELETE/ALTER, `APPEND base=`, `MODIFY`) is role `UPDATE`, so the table appears in both input and output lists | Batching: the modifying step now depends on the table's earlier producer | Intended; batch diffs are reviewed in verification. Refined in Phase 8: the modifying step depends on the table's creator and supplies it to nobody |
 | `referenced_datasets`/`referenced_librefs` come only from real dataset positions | Fewer, correct entries | — |
 | Chunk boundaries | Run-group PROCs (DATASETS, REG, …) keep statements after `run;` until `quit;`. DS2 programs stay inside PROC DS2. Datalines/SUBMIT text never opens a step. `%*` becomes COMMENT_BLOCK. `%symdel`, `%syslput`, … change MACRO_CALL → GLOBAL_STATEMENT. New global statements are recognised | Snapshot-style tests updated |
 | `_Unit.is_comment` → `_Unit.role` (`UnitRole`) | `chunker/` internals only (12 uses) | — |
@@ -617,7 +617,26 @@ The plan as written:
   already appear in both lists.
 - **Validation metrics.** Unaffected; they read the lists.
 
-## Phase 9: documentation (S)
+## Phase 9: documentation (S) — done
+
+Done as planned. Most of it landed with the phases themselves (layout rows,
+chunking model, metadata section, the one-extractor and one-SQL-grammar
+invariants), so this phase added what was left:
+
+- **`chunker/README.md`:**
+  - invariants 14 (only CODE text is scanned), 15 (what a PROC option names
+    is data in `keywords.py`) and 16 (only a WRITE supplies a dataset);
+  - invariants 1–3 updated for creations, `ds_names` and patterns;
+  - a "What the chunker does not see" section with this plan's out-of-scope
+    list.
+- **`Architecture.md`:**
+  - the same invariants, as invariant 17 and three more single owners under
+    invariant 12 (dataset positions, the SQL grammar, the PROC option table);
+  - the metadata and batching sections brought up to date;
+  - a migration note listing the breaking changes, grouped as model and API,
+    behaviour, and consumers.
+
+The plan as written:
 
 - `chunker/README.md`:
   - layout rows for `statements.py` and `sql.py`;
