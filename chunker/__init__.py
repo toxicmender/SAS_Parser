@@ -25,6 +25,7 @@ from .models import (
     SasDiagnostic,
     SasDiagnosticSeverity,
     SasEngineRef,
+    SasIncludeFile,
     SasPathRef,
 )
 from .paths import (
@@ -61,6 +62,7 @@ __all__ = [
     "SasCorpus",
     # physical/remote path recognition — the grammar xref.pre also reads
     "SasPathRef",
+    "SasIncludeFile",
     "PathLocation",
     "PATH_STATEMENTS",
     "classify_location",

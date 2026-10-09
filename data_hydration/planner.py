@@ -221,7 +221,7 @@ def _path_source(ref: "SasPathRef", source_id: str | None) -> HydrationSource | 
     if kind is SourceKind.SPDE:
         return HydrationSource(
             kind=kind,
-            locator=ref.raw,
+            locator=ref.effective_path,
             object_name=ref.binds or _stem(ref.path),
             libref=ref.binds,
             has_macro_ref=ref.has_macro_ref,
@@ -233,14 +233,14 @@ def _path_source(ref: "SasPathRef", source_id: str | None) -> HydrationSource | 
     if kind is SourceKind.FILE and "." not in _basename(ref.path):
         return HydrationSource(
             kind=kind,
-            locator=ref.raw,
+            locator=ref.effective_path,
             libref=ref.binds,
             has_macro_ref=ref.has_macro_ref,
             source_id=source_id,
         )
     return HydrationSource(
         kind=kind,
-        locator=_directory(ref.raw),
+        locator=_directory(ref.effective_path),
         object_name=_stem(ref.path),
         libref=ref.binds,
         has_macro_ref=ref.has_macro_ref,

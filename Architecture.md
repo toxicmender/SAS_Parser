@@ -733,6 +733,14 @@ chunk supplies (invariant 17). See `chunker/README.md` for the per-statement
 rules and for what the chunker does not see (SUBMIT code, remote WORK, CAS
 actions, code generated at run time).
 
+A path spelled through macro variables resolves in the same walk, from a
+second table of the same variables' values kept as written (invariant 18):
+`%include "&root/setup.sas";` after `%let root = /SAS/Prod;` reads
+`/SAS/Prod/setup.sas`. A `SasPathRef` keeps `raw` as written and records the
+place in `resolved_path`. `include_files` lists each SAS file the chunk's
+`%INCLUDE` statements read as a `SasIncludeFile`: path (resolved, case kept),
+raw, fileref, location, and whether it resolved.
+
 ## Batching model
 
 `_EdgeDiscovery` builds producer indices, then walks the flattened corpus
@@ -810,6 +818,12 @@ and old JSON still loads. These changes are visible to callers.
   - A `%include` of several files records each one, through
     `PathSpec.refs_for`; `xref.pre` rewrites each value through
     `value_spans`.
+  - A path spelled through macro variables resolves when the corpus assigns
+    them. `resolved_path` holds the place, and `path` is now its normalised
+    form. `has_macro_ref` means a reference is *still* unresolved, so the
+    hydration planner's locator uses `effective_path`.
+  - New, additive: `include_files` on the metadata (`SasIncludeFile`
+    records).
 - **Resolution order.** `resolve_references` runs macro variables, then
   filerefs, ODS OUTPUT and database librefs. Call it rather than the passes
   one by one.
@@ -1289,6 +1303,14 @@ any of these silently changes behavior.
     batch, and puts those jobs in a dependency cycle that leaves the migration
     waves unordered. Both failures are silent. An in-place PROC SORT is a
     replacement (READ and WRITE), not an update: a later BY step depends on it.
+
+18. **Names and paths resolve from different tables.** `_MacroScope` keeps
+    the macro-variable values that can name a dataset, lowercased
+    (`name_value`), and for paths every value as written (`text_value`).
+    Dataset names, librefs and database tables read the first, and paths read
+    the second. A path resolved from the name table comes out lowercased, and
+    loses any value with a `/` in it. A name resolved from the texts table
+    would make a directory a dataset name.
 
 ## Conventions
 

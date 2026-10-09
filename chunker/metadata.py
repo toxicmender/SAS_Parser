@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import re
 from collections import ChainMap
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any, TypeVar
 
@@ -42,6 +42,8 @@ from .macro_vars import (
     macro_signature,
     name_value,
     resolve_refs,
+    strip_quotes,
+    text_value,
 )
 from .models import (
     DatasetRole,
@@ -539,7 +541,7 @@ def _metadata_for(region: _Region) -> SasChunkMetadata:
     # ``includes`` is the %INCLUDE slice of that same scan rather than a second
     # definition of where an include path lives. It keeps its list[str] shape
     # and its consumers (complexity.crossfile, the [meta: includes] flag).
-    includes = [r.path for r in external_refs if r.statement == "include"]
+    includes = _include_paths(external_refs)
     options = (
         [_nid(p) for m in _OPTIONS_RE.finditer(mt) for p in m.group(1).split()]
         if "options" in low
@@ -808,6 +810,12 @@ def _merge_meta(parent: SasChunkMetadata, child: SasChunkMetadata) -> SasChunkMe
     return SasChunkMetadata(**merged)
 
 
+def _include_paths(refs: list[SasPathRef]) -> list[str]:
+    """``includes``: the normalised paths of *refs*' ``%INCLUDE`` files, derived
+    again wherever a pass changes the references."""
+    return [r.path for r in refs if r.statement == "include"]
+
+
 def _title(kind: SasChunkKind, meta: SasChunkMetadata) -> str | None:
     if kind == SasChunkKind.DATA_STEP and meta.step_name:
         return f"DATA {meta.step_name}"
@@ -867,6 +875,87 @@ def _resolve_binds(refs: list[_BindsRefT], table: Mapping[str, str]) -> list[_Bi
         else r
         for r in refs
     ]
+
+
+# Statements that may name their place through a fileref (`infile in;`,
+# `%include src(one);`): the forms chunker.paths records as FILEREF.
+_FILEREF_STATEMENTS = frozenset({"include", "infile", "file"})
+# What a macro variable standing for a fileref may hold: the fileref, or one
+# member of the directory it names — `src`, `src(setup)`.
+_FILEREF_SPELLING_RE = re.compile(
+    r"(?P<fref>[A-Za-z_]\w*)(?:\s*\(\s*(?P<member>[^()\s]+)\s*\))?"
+)
+# One quoted literal and nothing else: `'/sas/x.sas'`.
+_ONE_LITERAL_RE = re.compile(r"""\s*(['"])(?P<value>[^'"\n]*)\1\s*""")
+
+
+def _named_through_fileref(ref: SasPathRef) -> bool:
+    """Whether *ref* names its place through a fileref, or a macro variable
+    standing for one, rather than a quoted value: ``infile in;``, ``%include
+    src(one);``, ``%include &f;`` — before or after :func:`resolve_filerefs`
+    followed it, which keeps the fileref in ``binds``."""
+    return ref.statement in _FILEREF_STATEMENTS and (
+        ref.location is PathLocation.FILEREF or ref.binds is not None
+    )
+
+
+def _resolve_path(ref: SasPathRef, texts: Mapping[str, str]) -> SasPathRef:
+    """*ref* at the place it spells through macro variables, as far as *texts*
+    — the values the variables hold where its statement stands, as written —
+    can tell.
+
+    Re-derived from ``raw`` every time, like a database table's name, so the
+    corpus-level run completes what a file-level run could not and running it
+    twice changes nothing.
+
+    A quoted value pastes each variable's text in as written:
+    ``"&root/setup.sas"`` with ``%let root = /SAS/Prod;`` reads
+    ``/SAS/Prod/setup.sas``. Named through a fileref, the statement reads what
+    the variable holds as its own words: ``%include &f;`` with ``%let f =
+    '/sas/x.sas';`` includes that file, and with ``%let f = src(setup);`` the
+    member of the directory the fileref ``src`` names, which
+    :func:`resolve_filerefs` then follows.
+    """
+    text = resolve_refs(ref.raw, texts)
+    if _named_through_fileref(ref):
+        if (literal := _ONE_LITERAL_RE.fullmatch(text)) is not None:
+            place = literal.group("value").strip()
+            update: dict[str, Any] = {
+                "location": PathLocation.FILESYSTEM,
+                "path": normalise_path(place),
+                "binds": None,
+                "resolved_path": place,
+                "has_macro_ref": "&" in place,
+            }
+        elif (spelled := _FILEREF_SPELLING_RE.fullmatch(text.strip())) is not None:
+            spelling = text.strip()
+            update = {
+                "location": PathLocation.FILEREF,
+                "path": spelling.lower(),
+                "binds": spelled.group("fref").lower(),
+                "resolved_path": spelling,
+                "has_macro_ref": False,
+            }
+        else:
+            return ref
+    else:
+        # A value carrying its own quotes into a quoted path is broken SAS;
+        # read through them rather than report a path no file has.
+        place = strip_quotes(text)
+        update = {
+            "path": normalise_path(place),
+            "resolved_path": place if place != ref.raw else None,
+            "has_macro_ref": "&" in place,
+        }
+    if all(getattr(ref, k) == v for k, v in update.items()):
+        return ref
+    return ref.model_copy(update=update)
+
+
+def _resolve_paths(refs: list[SasPathRef], texts: Mapping[str, str]) -> list[SasPathRef]:
+    """*refs* with every place spelled through a macro variable worked out —
+    see :func:`_resolve_path`. One written out in full is left as it is."""
+    return [_resolve_path(r, texts) if "&" in r.raw else r for r in refs]
 
 
 def _resolve_name(name: str, table: Mapping[str, str]) -> str:
@@ -930,13 +1019,18 @@ def _resolve_db_tables(
 
 
 def _resolved_meta(
-    meta: SasChunkMetadata, table: Mapping[str, str], own_values: dict[str, str]
+    meta: SasChunkMetadata,
+    table: Mapping[str, str],
+    own_values: dict[str, str],
+    texts: Mapping[str, str] | None = None,
 ) -> SasChunkMetadata | None:
-    """*meta* with every dataset/libref name resolved against *table*, or
-    ``None`` when nothing in it changed.
+    """*meta* with every dataset/libref name resolved against *table*, and
+    every path against *texts*, or ``None`` when nothing in it changed.
 
     *own_values* are this chunk's own ``%LET`` assignments, already expanded by
-    the caller against the table in force where each one stands.
+    the caller against the table in force where each one stands. *texts* holds
+    the same variables' values as written, for paths (see
+    :meth:`_MacroScope.enter_texts`); without it paths keep their references.
 
     A dataset reference's resolved name is canonicalised again (``batch_med``
     → ``work.batch_med``) so it lands where the batcher's producer/consumer
@@ -970,7 +1064,11 @@ def _resolved_meta(
     updates["defines_librefs"] = sorted(
         set(_resolve_names(meta.defines_librefs, table, canonical=False))
     )
-    updates["external_refs"] = _resolve_binds(meta.external_refs, table)
+    paths = _resolve_binds(meta.external_refs, table)
+    if texts is not None:
+        paths = _resolve_paths(paths, texts)
+    updates["external_refs"] = paths
+    updates["includes"] = _include_paths(paths)
     updates["engine_refs"] = _resolve_binds(meta.engine_refs, table)
     updates["db_tables"] = _resolve_db_tables(meta.db_tables, table)
     if meta.step_name and has_macro_ref(meta.step_name):
@@ -999,14 +1097,18 @@ def _assign(table: dict[str, str], name: str, value: str) -> None:
         table.pop(name, None)
 
 
-def _symput_values(cf: str) -> dict[str, str]:
+def _symput_values(
+    cf: str, convert: Callable[[str], str | None] = name_value
+) -> dict[str, str]:
     """The static values a step's ``CALL SYMPUT``/``SYMPUTX`` calls assign.
 
     ``call symputx('sch', 'EDW_EXPORT');`` — a literal name and a literal,
     name-shaped value — is knowable without running SAS. A value from a data
     column, or two calls giving one name different values (an ``IF``/``ELSE``
     choosing between them), is not: those map to ``""``. A single call is taken
-    as executed, which is the residual approximation.
+    as executed, which is the residual approximation. *convert* says what a
+    literal may be: a name (:func:`name_value`), or a path's text
+    (:func:`text_value`).
     """
     seen: dict[str, set[str]] = {}
     for m in _CALL_SYMPUT_RE.finditer(cf):
@@ -1015,12 +1117,14 @@ def _symput_values(cf: str) -> dict[str, str]:
         if name is None or len(args) < 2:
             continue
         literal = _clean_literal(args[1])
-        value = name_value(literal) if literal is not None else None
+        value = convert(literal) if literal is not None else None
         seen.setdefault(name.strip().lower(), set()).add(value or "")
     return {name: values.pop() if len(values) == 1 else "" for name, values in seen.items()}
 
 
-def _run_time_values(chunk: SasChunk) -> dict[str, str]:
+def _run_time_values(
+    chunk: SasChunk, convert: Callable[[str], str | None] = name_value
+) -> dict[str, str]:
     """What the macro variables *chunk* creates at run time hold once it has run.
 
     Every variable it produces — ``CALL SYMPUT``/``SYMPUTX``, ``PROC SQL INTO`` —
@@ -1034,7 +1138,7 @@ def _run_time_values(chunk: SasChunk) -> dict[str, str]:
     if not names:
         return {}
     static = (
-        _symput_values(_sanitise(chunk.text, blank_strings=False))
+        _symput_values(_sanitise(chunk.text, blank_strings=False), convert)
         if "symput" in chunk.text.lower()
         else {}
     )
@@ -1082,7 +1186,10 @@ class _MacroDef:
         )
 
     def global_effects(
-        self, globals_now: dict[str, str], binding: ChainMap[str, str]
+        self,
+        globals_now: dict[str, str],
+        binding: ChainMap[str, str],
+        convert: Callable[[str], str | None] = name_value,
     ) -> dict[str, str]:
         """What one call leaves in the *global* table, by SAS's scoping rule.
 
@@ -1094,13 +1201,14 @@ class _MacroDef:
         not run an assignment, so every global it could touch becomes unknown
         rather than guessed — including one holding a value before the call.
         So does a global the body may overwrite with ``CALL SYMPUT``/``INTO``.
+        *convert* says what a value may be, as for :func:`_symput_values`.
         """
         assigned: dict[str, str] = {}
         local = ChainMap(assigned, *binding.maps)
         effects: dict[str, str] = {}
         for name, raw in self.assignments:
             resolved = resolve_refs(raw, local) if has_macro_ref(raw) else raw
-            value = name_value(resolved) or ""
+            value = convert(resolved) or ""
             assigned[name] = value  # "" hides an outer value: unknown
             if name in self.params or name in self.local_names:
                 continue
@@ -1123,10 +1231,17 @@ class _MacroScope:
     run-time producers that make a variable unknown); and the globals a called
     ``%MACRO`` sets. The macros defined so far are kept too, for
     :meth:`_calls` to bind a call's arguments.
+
+    With *texts*, a second table follows the same rules for paths: each
+    variable's value as written — case, separators and quotes kept, a path
+    like ``/SAS/Prod`` as welcome as a name — which a quoted path pastes in
+    where the name table holds only what can name a dataset (see
+    :func:`~chunker.macro_vars.text_value`).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, texts: bool = False) -> None:
         self._table: dict[str, str] = {}
+        self._texts: dict[str, str] | None = {} if texts else None
         self._macros: dict[str, _MacroDef] = {}
 
     def enter(self, chunk: SasChunk) -> tuple[Mapping[str, str], dict[str, str]]:
@@ -1156,8 +1271,38 @@ class _MacroScope:
                 overlay[name] = own[name]
         return scope, own
 
+    def enter_texts(self, chunk: SasChunk) -> tuple[Mapping[str, str], dict[str, str]]:
+        """As :meth:`enter`, for the texts table: ``(texts, own)``, where
+        *chunk*'s paths resolve and what its own ``%LET`` statements leave.
+
+        Each value resolves where it stands, as a name does, so ``%let root =
+        /SAS/Prod; %let code = &root/code;`` leaves ``code`` holding
+        ``/SAS/Prod/code``. Read from the chunk's text, and only for a chunk
+        that has a ``%LET`` at all — ``macro_var_values`` lists every one.
+        Empty when the scope keeps no texts.
+        """
+        if self._texts is None:
+            return {}, {}
+        meta = chunk.metadata
+        hidden = dict.fromkeys(meta.macro_param_names, "")
+        overlay: dict[str, str] = {}
+        scope: Mapping[str, str] = ChainMap(overlay, hidden, self._texts)
+        own: dict[str, str] = {}
+        if meta.macro_var_values:
+            for name, raw in let_assignments(_sanitise(chunk.text, blank_strings=False)):
+                value = text_value(raw) or ""
+                own[name] = resolve_refs(value, scope) if has_macro_ref(value) else value
+                if name not in hidden:
+                    overlay[name] = own[name]
+        return scope, own
+
     def _binding(
-        self, macro: _MacroDef, positional: list[str], keyword: dict[str, str]
+        self,
+        macro: _MacroDef,
+        positional: list[str],
+        keyword: dict[str, str],
+        table: dict[str, str] | None = None,
+        convert: Callable[[str], str | None] = name_value,
     ) -> ChainMap[str, str]:
         """The table *macro*'s body resolves against for one call.
 
@@ -1165,22 +1310,25 @@ class _MacroScope:
         by name; each value resolved against the caller's globals. Every
         parameter shadows a global of the same name, bound or not: an
         unbound ``&tbl`` stays ``&tbl`` rather than borrowing a stranger's value.
+        *table* and *convert* choose the names (the default) or the texts.
         """
+        globals_ = self._table if table is None else table
         supplied = dict(macro.defaults)
         supplied.update(zip(macro.positional, positional))
         supplied.update((k, v) for k, v in keyword.items() if k in macro.params)
         bound: dict[str, str] = {}
         for name, raw in supplied.items():
-            resolved = resolve_refs(raw, self._table) if has_macro_ref(raw) else raw
-            if value := name_value(resolved):
+            resolved = resolve_refs(raw, globals_) if has_macro_ref(raw) else raw
+            if value := convert(resolved):
                 bound[name] = value
-        return ChainMap(bound, dict.fromkeys(macro.params, ""), self._table)
+        return ChainMap(bound, dict.fromkeys(macro.params, ""), globals_)
 
     def _calls(
         self, chunk: SasChunk
-    ) -> list[tuple[_MacroDef, list[str], dict[str, str]]]:
+    ) -> list[tuple[_MacroDef, list[str], dict[str, str], str]]:
         """The calls a MACRO_CALL chunk makes of macros defined earlier, in
-        source order, each with its positional and keyword arguments.
+        source order, each with its positional and keyword arguments and the
+        call's own text.
 
         One, as a rule: the scanner ends a statement after a call that needs
         no semicolon (see :func:`~chunker.scanner._split_after_calls`). Every
@@ -1189,13 +1337,19 @@ class _MacroScope:
         """
         if chunk.kind is not SasChunkKind.MACRO_CALL:
             return []
-        return [
-            (macro, *_parse_call_args(chunk.text[span.start : span.end]))
-            for span in call_spans(_sanitise(chunk.text))
-            if (macro := self._macros.get(span.name)) is not None
-        ]
+        found = []
+        for span in call_spans(_sanitise(chunk.text)):
+            if (macro := self._macros.get(span.name)) is not None:
+                text = chunk.text[span.start : span.end]
+                found.append((macro, *_parse_call_args(text), text))
+        return found
 
-    def leave(self, chunk: SasChunk, own: dict[str, str]) -> list[SasDbTableRef]:
+    def leave(
+        self,
+        chunk: SasChunk,
+        own: dict[str, str],
+        own_texts: dict[str, str] | None = None,
+    ) -> list[SasDbTableRef]:
         """Carry what *chunk* leaves behind to the chunks after it, and return
         the database tables its macro calls read.
 
@@ -1207,7 +1361,8 @@ class _MacroScope:
         any other chunk: its own ``%LET`` values, what its run-time producers
         leave (see :func:`_run_time_values`), and — for a chunk that called
         nothing — the global effects of the macros it invokes inline, with
-        their defaults alone.
+        their defaults alone. The texts table, when kept, takes the same
+        effects, *own_texts* from :meth:`enter_texts`.
         """
         meta = chunk.metadata
         if chunk.kind is SasChunkKind.MACRO_DEFINITION:
@@ -1216,24 +1371,48 @@ class _MacroScope:
             if chunk.parent_id is None and meta.macro_name:
                 self._macros[meta.macro_name] = _MacroDef.of(chunk)
             return []
+        texts = self._texts
         tables: list[SasDbTableRef] = []
         calls = self._calls(chunk)
-        for macro, positional, keyword in calls:
+        for macro, positional, keyword, text in calls:
             binding = self._binding(macro, positional, keyword)
             tables += _call_site_tables(macro, binding)
             for name, value in macro.global_effects(self._table, binding).items():
                 _assign(self._table, name, value)
+            if texts is not None:
+                self._leave_texts(macro, *_parse_call_args(text, as_written=True), texts)
         for name, value in own.items():
             _assign(self._table, name, value)
         for name, value in _run_time_values(chunk).items():
             _assign(self._table, name, value)
+        if texts is not None:
+            for name, value in (own_texts or {}).items():
+                _assign(texts, name, value)
+            for name, value in _run_time_values(chunk, text_value).items():
+                _assign(texts, name, value)
         if not calls:
             for name in meta.invokes_macros:
                 if (macro := self._macros.get(name)) is not None:
                     binding = self._binding(macro, [], {})
                     for var, value in macro.global_effects(self._table, binding).items():
                         _assign(self._table, var, value)
+                    if texts is not None:
+                        self._leave_texts(macro, [], {}, texts)
         return tables
+
+    def _leave_texts(
+        self,
+        macro: _MacroDef,
+        positional: list[str],
+        keyword: dict[str, str],
+        texts: dict[str, str],
+    ) -> None:
+        """What one call of *macro* leaves in the texts table: the globals it
+        sets, valued as written (a ``%setpaths;`` whose body says ``%global
+        root; %let root = /SAS/Prod;``)."""
+        binding = self._binding(macro, positional, keyword, texts, text_value)
+        for name, value in macro.global_effects(texts, binding, text_value).items():
+            _assign(texts, name, value)
 
 
 def _call_site_tables(
@@ -1258,13 +1437,18 @@ def _call_site_tables(
 
 
 def resolve_macro_var_refs(chunks: list[SasChunk]) -> None:
-    """Give ``&name`` dataset and libref references their values, in place.
+    """Give ``&name`` dataset and libref references, and paths, their values, in place.
 
     Walks *chunks* once in source order, accumulating the ``%LET`` values each
     one assigns and expanding the references of the ones that follow — so
     ``data &table1; set &lname..&table1;`` reports ``work.batch_med`` and
     ``xwrk.batch_med`` instead of the invented ``work.table1`` and no input at
     all. Chunk ``title`` is refreshed when the DATA step's name resolves.
+
+    Paths take the same values as written (see :meth:`_MacroScope.enter_texts`):
+    ``%include "&root/setup.sas";`` after ``%let root = /SAS/Prod;`` includes
+    ``/SAS/Prod/setup.sas``, which the reference's ``resolved_path`` and the
+    chunk's ``include_files`` report.
 
     Run per file by :meth:`~chunker.chunker.SasSemanticChunker.chunk_text` and
     again over the flattened corpus by
@@ -1285,12 +1469,19 @@ def resolve_macro_var_refs(chunks: list[SasChunk]) -> None:
       references stay in ``body_param_inputs`` / ``body_param_outputs``, where
       the batcher resolves them per call.
     """
-    macros = _MacroScope()
+    # The texts table serves paths spelled through macro variables alone, and
+    # reading every %LET as written costs a pass over its chunk's text: keep it
+    # only for a corpus that has such a path.
+    spelled = any("&" in r.raw for c in chunks for r in c.metadata.external_refs)
+    macros = _MacroScope(texts=spelled)
     for idx, chunk in enumerate(chunks):
         scope, own = macros.enter(chunk)
+        texts, own_texts = macros.enter_texts(chunk)
         meta = chunk.metadata
         updates: dict[str, Any] = {}
-        resolved = _resolved_meta(meta, scope, own) if scope or own else None
+        resolved = (
+            _resolved_meta(meta, scope, own, texts) if scope or own or texts else None
+        )
         if resolved is not None:
             updates["metadata"] = resolved
             if resolved.step_name != meta.step_name:
@@ -1300,7 +1491,7 @@ def resolve_macro_var_refs(chunks: list[SasChunk]) -> None:
         # Each call of a macro defined earlier reads the tables its body names,
         # resolved with that call's arguments. Recomputed on every run (not
         # added to), so the corpus-level run replaces the file-level answer.
-        called = macros.leave(chunk, own)
+        called = macros.leave(chunk, own, own_texts)
         current = chunk.metadata
         tables = sorted(
             {*(t for t in current.db_tables if t.macro is None), *called},
@@ -1518,20 +1709,32 @@ _FILEREF_MEMBER_RE = re.compile(r"(?P<fref>[^(]+)\((?P<member>.*)\)\Z", re.DOTAL
 def _through_fileref(ref: SasPathRef, filename: SasPathRef) -> SasPathRef:
     """*ref*, made through a fileref, at the place the FILENAME *filename*
     gave it: the file itself, or a member of the directory — ``%include
-    src(one)`` reads ``<dir>/one.sas``, SAS adding the extension."""
-    path = filename.path
-    if (m := _FILEREF_MEMBER_RE.match(ref.raw)) is not None:
+    src(one)`` reads ``<dir>/one.sas``, SAS adding the extension.
+
+    Built from the FILENAME's place as SAS reads it (its macro variables
+    expanded, case kept), joined with the separator that place uses, so
+    ``C:\\code`` gives ``C:\\code\\one.sas``. A reference spelled through a
+    macro variable (``%include &f;``) reads the spelling the variable gave.
+    """
+    spelling = (
+        ref.resolved_path
+        if ref.location is PathLocation.FILEREF and ref.resolved_path
+        else ref.raw
+    )
+    place = filename.effective_path
+    if (m := _FILEREF_MEMBER_RE.match(spelling)) is not None:
         member = m.group("member").strip().strip("'\"")
         if ref.statement == "include" and "." not in member:
             member += ".sas"
-        path = f"{path.rstrip('/')}/{member}"
-    path = normalise_path(path)
+        sep = "\\" if "\\" in place and "/" not in place else "/"
+        place = place.rstrip("/\\") + sep + member
     return ref.model_copy(
         update={
             "location": filename.location,
-            "path": path,
+            "path": normalise_path(place),
+            "resolved_path": place,
             "device": filename.device,
-            "has_macro_ref": "&" in path,
+            "has_macro_ref": "&" in place,
         }
     )
 
@@ -1549,8 +1752,10 @@ def resolve_filerefs(chunks: list[SasChunk]) -> None:
     derived again from the result.
 
     A FILENAME inside a ``%MACRO`` body binds too, as a LIBNAME does there. A
-    resolved reference is FILEREF no longer, so running the pass again — the
-    corpus-level run after the per-file one — changes nothing it resolved.
+    reference already followed keeps its fileref in ``binds`` and is followed
+    again, from the FILENAME in force: the same answer when nothing changed,
+    and the corpus-level run's answer when a ``%LET`` in another file has since
+    resolved the FILENAME's own path.
     """
     bound: dict[str, SasPathRef] = {}
     for idx, chunk in enumerate(chunks):
@@ -1565,11 +1770,11 @@ def resolve_filerefs(chunks: list[SasChunk]) -> None:
                     bound.clear()
                 elif fref not in named:
                     bound.pop(fref, None)
-        if not bound or all(r.location is not PathLocation.FILEREF for r in refs):
+        if not bound or not any(map(_named_through_fileref, refs)):
             continue
         resolved = [
             _through_fileref(r, bound[r.binds])
-            if r.location is PathLocation.FILEREF and r.binds in bound
+            if _named_through_fileref(r) and r.binds in bound
             else r
             for r in refs
         ]
@@ -1585,7 +1790,7 @@ def resolve_filerefs(chunks: list[SasChunk]) -> None:
                 "metadata": meta.model_copy(
                     update={
                         "external_refs": resolved,
-                        "includes": [r.path for r in resolved if r.statement == "include"],
+                        "includes": _include_paths(resolved),
                     }
                 )
             }

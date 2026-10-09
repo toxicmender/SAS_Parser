@@ -263,12 +263,18 @@ def _path_lines(file: FileComplexity) -> list[str]:
 
 
 def _fmt_path_ref(ref: SasPathRef) -> str:
-    """One reference as a report line: the value as written, then its provenance.
+    """One reference as a report line: the value as written, where it resolves
+    to, then its provenance.
 
     ``raw`` rather than ``path`` because this is for a human to recognise in
     their own source; the normalised form exists for matching, not for reading.
+    A value spelled through macro variables or a fileref is followed by the
+    place SAS reads, ``resolved_path``, case kept.
     """
-    parts = [f"`{ref.raw}`", f"— {ref.statement}"]
+    parts = [f"`{ref.raw}`"]
+    if ref.resolved_path:
+        parts.append(f"→ `{ref.resolved_path}`")
+    parts.append(f"— {ref.statement}")
     if ref.binds:
         parts.append(f"`{ref.binds}`")
     if ref.device:

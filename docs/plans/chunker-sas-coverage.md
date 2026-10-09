@@ -1,8 +1,9 @@
 # Plan: close the chunker's SAS coverage gaps (breaking changes allowed)
 
-Status: Phases 0–9 implemented. `tests/test_sas_coverage.py` holds 184 probes:
-the 168 from the coverage review, 15 precision probes (`X01`–`X15`), and G22
-(INFILE through a fileref). All of them pass. Phase 8 raised a question about
+Status: Phases 0–9 implemented. `tests/test_sas_coverage.py` holds 186 probes:
+the 168 from the coverage review, 15 precision probes (`X01`–`X15`), G22
+(INFILE through a fileref), and G23–G24 (`%INCLUDE` paths built from `%LET`
+values; see *After the plan*). All of them pass. Phase 8 raised a question about
 tables updated in place by several files, settled as "only a creation
 supplies a table"; see its section.
 
@@ -648,6 +649,24 @@ The plan as written:
     `keywords.py`.
 - `Architecture.md`: the same, plus a migration note listing the breaking
   changes.
+
+## After the plan: %INCLUDE files and paths through macro variables
+
+- **`SasChunkMetadata.include_files`** lists each SAS file a `%INCLUDE` reads,
+  as a `SasIncludeFile`: path (resolved, case kept), raw, fileref, location,
+  and whether it resolved. It is a view of `external_refs`.
+- **Paths resolve through macro variables.** `_MacroScope` keeps a second
+  table with each variable's value as written, filled from `%LET`, literal
+  `CALL SYMPUTX`, and the globals a called macro sets, its arguments as
+  written. Every `SasPathRef` with a `&` is re-derived from `raw` against it:
+  - `resolved_path` holds the place, and `path` is its normalised form;
+  - `has_macro_ref` means a reference is still unresolved;
+  - `%include &f;` reads what `&f` holds as the statement's own words.
+- **Filerefs.** A FILENAME's resolved path carries to the members read through
+  it, joined with the separator the path uses. `resolve_filerefs` follows a
+  reference it already followed again at the corpus level.
+- **Consumers.** The complexity report shows `raw → resolved_path`. The
+  hydration planner locates a source at its `effective_path`.
 
 ## Verification (every phase, then end to end)
 

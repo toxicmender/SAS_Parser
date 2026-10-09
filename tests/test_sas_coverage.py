@@ -507,6 +507,15 @@ GLOBAL_PROBES = [
           check=lambda r, top: None
           if [p.path for p in top[1].metadata.physical_paths] == ["/data/in.csv"]
           else f"infile refs={top[1].metadata.external_refs}"),
+    Probe("G23", "%INCLUDE a path built from %LET values",
+          "%let root = /Code;\n%let dir = &root/lib;\n%include \"&dir/setup.sas\";\n",
+          includes={"/code/lib/setup.sas"},
+          check=lambda r, top: None
+          if [f.path for f in top[-1].metadata.include_files] == ["/Code/lib/setup.sas"]
+          else f"include_files={top[-1].metadata.include_files}"),
+    Probe("G24", "%INCLUDE fileref whose FILENAME path is a %LET value",
+          "%let root = /Code;\nfilename src \"&root\";\n%include src(one);\n",
+          includes={"/code/one.sas"}),
 ]
 
 MACRO_PROBES = [

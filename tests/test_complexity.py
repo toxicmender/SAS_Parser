@@ -3144,7 +3144,15 @@ class TestPathsSection(unittest.TestCase):
         )
         text = render_file_report(scored, texts={})
         self.assertNotIn("Filerefs no FILENAME", text)
-        self.assertIn("`rawin` — infile `rawin`", text)
+        self.assertIn("`rawin` → `/data/in/raw.txt` — infile `rawin`", text)
+
+    def test_a_path_spelled_through_a_macro_variable_shows_where_it_resolves(self):
+        scored = _file(
+            _analyze('%let root = /SASData;\nlibname raw "&root/in";\n'), "t.sas"
+        )
+        text = render_file_report(scored, texts={})
+        self.assertIn("`&root/in` → `/SASData/in` — libname `raw`", text)
+        self.assertNotIn("unresolved macro reference", text)
 
 
 class TestDatabaseTablesSection(unittest.TestCase):

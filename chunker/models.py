@@ -95,13 +95,24 @@ class SasPathRef(BaseModel, frozen=True):
     location
         See :class:`PathLocation`.
     path
-        Normalised for comparison: lowercased, backslashes turned to forward
-        slashes. Unlike the dataset vocabulary's quoted-path keys it carries no
-        quote wrapper — nothing here shares a namespace with identifiers.
+        The place, normalised for comparison: :attr:`effective_path` lowercased,
+        backslashes turned to forward slashes. Unlike the dataset vocabulary's
+        quoted-path keys it carries no quote wrapper — nothing here shares a
+        namespace with identifiers.
     raw
         Exactly as written, before normalisation. A consumer that has to
         *rewrite* the source needs the original spelling; a consumer that has to
         *match* wants ``path``.
+    resolved_path
+        The place as SAS reads it when ``raw`` spells it indirectly, case and
+        separators kept: ``raw`` with its ``&`` references expanded against the
+        macro variables in force where the statement stands (``&root/setup.sas``
+        → ``/sas/prod/setup.sas``), or, for a reference made through a fileref,
+        the place its FILENAME names (``src(setup)`` → ``/sas/prod/setup.sas``).
+        While no FILENAME binds that fileref, the spelling a macro variable gave
+        it (``%include &f;`` with ``%let f = src(setup);`` → ``src(setup)``).
+        ``None`` when ``raw`` already is the place, or nothing could be worked
+        out.
     binds
         The libref or fileref the statement assigns, when it assigns one —
         or, for a reference made through a fileref (``infile in;``), the
@@ -116,9 +127,10 @@ class SasPathRef(BaseModel, frozen=True):
         nothing downstream could tell them apart while this went unrecorded.
         Engines that carry no path at all are :class:`SasEngineRef` instead.
     has_macro_ref
-        The value contains a ``&`` reference, so its real value is not knowable
-        without running SAS. Recorded rather than dropped: a path that cannot be
-        resolved is exactly what a migration needs told about.
+        The place still holds a ``&`` reference no macro variable in the corpus
+        gives a value, so its real value is not knowable without running SAS.
+        Recorded rather than dropped: a path that cannot be resolved is exactly
+        what a migration needs told about.
     """
 
     statement: str
@@ -129,11 +141,71 @@ class SasPathRef(BaseModel, frozen=True):
     device: str | None = None
     engine: str | None = None
     has_macro_ref: bool = False
+    resolved_path: str | None = None
+
+    @property
+    def effective_path(self) -> str:
+        """The place as SAS reads it, case and separators kept:
+        :attr:`resolved_path` when the statement spells it indirectly,
+        otherwise :attr:`raw`."""
+        return self.resolved_path or self.raw
 
     def __str__(self) -> str:
         bound = f" {self.binds}" if self.binds else ""
         via = f" via {self.engine}" if self.engine else ""
-        return f"{self.statement}{bound}{via} [{self.location}] {self.raw}"
+        resolved = f" → {self.resolved_path}" if self.resolved_path else ""
+        return f"{self.statement}{bound}{via} [{self.location}] {self.raw}{resolved}"
+
+
+class SasIncludeFile(BaseModel, frozen=True):
+    """One SAS file a ``%INCLUDE`` statement pulls in.
+
+    A view of the statement's :class:`SasPathRef`, shaped for whoever needs
+    the file itself — to fetch it, add it to the corpus, or tell the model what
+    code the job runs — rather than to match it against other paths.
+
+    Attributes
+    ----------
+    path
+        The file as SAS reads it, case and separators kept: macro variables
+        expanded (``"&root/setup.sas"`` → ``/sas/prod/setup.sas``) and a
+        fileref followed to its FILENAME (``src(setup)`` →
+        ``/sas/prod/code/setup.sas``). As written when neither applies, or when
+        it could not be worked out — see :attr:`resolved`.
+    raw
+        The file as the ``%INCLUDE`` statement spells it.
+    fileref
+        The fileref it is named through (``%include src(setup);``), if any.
+    location
+        Where :attr:`path` points: a filesystem path as a rule; ``REMOTE`` for
+        a FILENAME URL or FTP device; ``FILEREF`` while no FILENAME binds the
+        fileref.
+    resolved
+        :attr:`path` is the file SAS reads: no ``&`` reference is left
+        unassigned and no fileref unbound.
+    """
+
+    path: str
+    raw: str
+    fileref: str | None = None
+    location: PathLocation = PathLocation.FILESYSTEM
+    resolved: bool = True
+
+    @classmethod
+    def of(cls, ref: SasPathRef) -> "SasIncludeFile":
+        """The include file *ref* — a ``%INCLUDE`` statement's reference — names."""
+        return cls(
+            path=ref.effective_path,
+            raw=ref.raw,
+            fileref=ref.binds,
+            location=ref.location,
+            resolved=not ref.has_macro_ref and ref.location is not PathLocation.FILEREF,
+        )
+
+    def __str__(self) -> str:
+        via = f" (via {self.fileref})" if self.fileref else ""
+        unresolved = "" if self.resolved else " [unresolved]"
+        return f"{self.path}{via}{unresolved}"
 
 
 def _path_ref_sort_key(ref: SasPathRef) -> tuple[str, str, str, str]:
@@ -920,6 +992,18 @@ class SasChunkMetadata(BaseModel):
     def email_refs(self) -> list[SasPathRef]:
         """Refs addressing a mailbox."""
         return [r for r in self.external_refs if r.location is PathLocation.EMAIL]
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def include_files(self) -> list[SasIncludeFile]:
+        """The SAS files the chunk's ``%INCLUDE`` statements pull in, one per
+        file in source order, each at the path SAS reads — macro variables
+        expanded and filerefs followed where the corpus says how (see
+        :class:`SasIncludeFile`). ``includes`` holds the same files'
+        normalised paths."""
+        return [
+            SasIncludeFile.of(r) for r in self.external_refs if r.statement == "include"
+        ]
 
     def __str__(self) -> str:
         # Show only populated fields, so empty defaults don't drown out the rest.

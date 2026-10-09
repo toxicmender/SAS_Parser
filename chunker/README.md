@@ -95,7 +95,7 @@ For running the work items end-to-end through an LLM, see the
 
 | File | Role |
 |------|------|
-| `models.py` | Pydantic models: `SasChunk` (+`Kind`), `SasChunkMetadata` and its `SasDatasetRef` records (+`DatasetRole`), `SasChunkResult`, `SasCorpus`, `SasBatch`, `SasBatchResult`, `SasDiagnostic` (+`Severity`), `SasPathRef` (+`PathLocation`), `SasEngineRef`, `SasDbTableRef` (+`DbTableAccess`, `DbTableVia`). |
+| `models.py` | Pydantic models: `SasChunk` (+`Kind`), `SasChunkMetadata` and its `SasDatasetRef` records (+`DatasetRole`), `SasChunkResult`, `SasCorpus`, `SasBatch`, `SasBatchResult`, `SasDiagnostic` (+`Severity`), `SasPathRef` (+`PathLocation`), `SasIncludeFile`, `SasEngineRef`, `SasDbTableRef` (+`DbTableAccess`, `DbTableVia`). |
 | `paths.py` | Where a physical path appears in SAS syntax — `PATH_STATEMENTS`, `classify_location`, `extract_paths`. The **single owner** of that grammar: `xref.pre` imports it to rewrite the same statements. |
 | `keywords.py` | SAS keyword catalogues transcribed from the SAS docs (reserved macro words, autocall macros, function / CALL-routine dictionaries, and `SAS_FUNCTION_CATEGORIES`) + the patterns compiled from them. Pure data; no package imports, no logging. |
 | `scanner.py` | Lexical layer: `_Unit` / `_Region` parse primitives and their `UnitRole` (code, comment, in-stream data, SUBMIT code), the statement classifier (`_classify`), where a macro call ends its statement (`_split_after_calls`), macro quoting (`_macro_quote_end`), in-stream blocks (`_in_stream_units`), text normalisation / sanitisation, line-offset helpers, and the `_Deadline` / `_ParseWatchdog` stuck-parser machinery. |
@@ -208,6 +208,8 @@ fields** derived at access time, not stored:
   dependency).
 - `physical_paths` / `remote_paths` / `email_refs` — the `external_refs` entries
   whose `location` is `FILESYSTEM` / `REMOTE` / `EMAIL`.
+- `include_files` — the SAS files the chunk's `%INCLUDE` statements read, as
+  `SasIncludeFile` records (see *External references*).
 - the dataset lists, views of `dataset_refs` (below), and
   `unresolved_dataset_refs` — the dataset names that still hold a `&` (see
   below).
@@ -355,10 +357,49 @@ directory as `<dir>/one.sas`, SAS adding `.sas` for `%INCLUDE`. A fileref
 nothing binds stays `FILEREF`. A file read through a fileref is the FILENAME's
 file, so the hydration planner plans it once, from the FILENAME.
 
+**Paths spelled through macro variables** resolve from the values in force
+where the statement stands, in the same source-order walk that resolves dataset
+names (`resolve_macro_var_refs`, and again across the corpus). The values are
+the ones `%LET`, a literal `CALL SYMPUTX` and a called macro's globals assign,
+but kept as written: case, separators and quotes, since a path is not a name.
+`_MacroScope` keeps them in a second table beside the names', for a corpus
+where some path holds a `&` at all; reading every `%LET` again costs a pass
+over its chunk's text.
+`%include "&root/setup.sas";` after `%let root = /SAS/Prod;` reads
+`/SAS/Prod/setup.sas`:
+
+- `raw` stays as written, `resolved_path` holds the place SAS reads
+  (`effective_path` is whichever applies), `path` is its normalised form, and
+  `has_macro_ref` says a reference is still unresolved.
+- A statement that names a fileref through a variable reads what the variable
+  holds as its own words. `%include &f;` with `%let f = '/sas/x.sas';`
+  includes that file, and with `%let f = src(util);` a member of `src`'s
+  directory.
+- A FILENAME's path resolves the same way, so a member read through it does
+  too. A reference already followed through a fileref is followed again at
+  the corpus level, where a `%LET` in another file may have resolved the
+  FILENAME.
+- A value computed at run time (`%sysget`, `%sysfunc`, `CALL SYMPUTX` from a
+  column) leaves the reference as written. So does a parameter of the macro
+  whose body holds the statement: the call site supplies it.
+
+**`include_files`** lists each SAS file a chunk's `%INCLUDE` statements pull in,
+one `SasIncludeFile` per file in source order:
+
+| Field | Holds |
+|---|---|
+| `path` | the file as SAS reads it: macro variables expanded, a fileref followed, case kept |
+| `raw` | the file as the statement spells it (`&root/setup.sas`, `src(util)`) |
+| `fileref` | the fileref it is named through, if any |
+| `location` | `FILESYSTEM` as a rule, `REMOTE` for a URL or FTP FILENAME, `FILEREF` while no FILENAME binds it |
+| `resolved` | `path` is the real file: no `&` reference left and no unbound fileref |
+
+It is a view of `external_refs`, serialised with the metadata.
+
 One list rather than one per kind: one scan to keep correct, one merge rule to
 keep honest, and the per-kind views above for consumers. `includes` is the
-`%INCLUDE` slice of the same scan, not a second definition of where an include
-path lives.
+`%INCLUDE` slice of the same scan, as normalised paths, not a second definition
+of where an include path lives.
 
 ### Names spelled through macro variables
 
@@ -658,7 +699,8 @@ these silently changes behavior.
    fail are both silent: guessing produces a dataset name nothing in the corpus
    has, and dropping produces a step that appears to read nothing.
    `_canon_ds` therefore leaves `&`-bearing names alone, and `_map_ds` refuses
-   to map them.
+   to map them. Paths follow the same rule: `raw` never changes, and
+   `resolved_path` keeps the part it could not expand (`/SAS/&sub/x.sas`).
 11. **Native SQL is never scanned as SAS.** `_metadata_for` hands
    `statements.dataset_refs` the text with `scan_pass_through`'s spans masked.
    A new SAS-side dataset scan must read the masked `mt_ds`/`cf_ds` too, or the
@@ -701,6 +743,13 @@ these silently changes behavior.
    UPDATE is a consumer of the table it changes. Reading `output_datasets`
    there again would chain every job that appends to a shared table into one
    batch, and put them in a dependency cycle.
+17. **Names and paths resolve from different tables.** `_MacroScope` keeps
+   the values that can name a dataset, lowercased (`name_value`), and, for
+   paths, every value as written (`text_value`). Dataset names, librefs and
+   database tables read the first, and paths read the second. Resolving a
+   path from the name table would lowercase it and lose every value with a
+   `/` in it. Resolving a name from the texts table would make a directory a
+   dataset name.
 
 ## Logging
 

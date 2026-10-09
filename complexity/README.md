@@ -807,8 +807,10 @@ statements, recognised by `chunker/paths.py`:
 Grouped by kind because the kinds need different answers: a filesystem path
 wants a volume or external location, an FTP reference wants egress and a
 credential, and a shell pipe wants somebody to decide what replaces it. A value
-carrying an unresolved `&macro` reference is flagged as such — it is not what
-SAS resolves at run time, so it cannot be mapped as written. A fileref used by
+spelled through macro variables the corpus assigns is followed by the place SAS
+reads (`` `&root/in` → `/SASData/in` — libname `raw` ``); one carrying a `&macro`
+reference nothing assigns is flagged as unresolved — it is not what SAS
+resolves at run time, so it cannot be mapped as written. A fileref used by
 `INFILE`, `FILE` or `%INCLUDE` is reported where its `FILENAME` points; one that
 no `FILENAME` in the corpus assigns (an autoexec or the job's JCL does) gets
 its own last group, *Filerefs no FILENAME in the corpus assigns*.

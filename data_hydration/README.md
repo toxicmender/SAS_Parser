@@ -70,6 +70,10 @@ produces, never sources.
   hold — `%LET`, `CALL SYMPUTX` literals, a utility macro's call arguments.
   A table a `%MACRO` body names by its own parameters is a template and is
   never planned: each call is planned instead, with the table it reads.
+- **Paths arrive resolved the same way.** `libname raw "&root/in";` after
+  `%let root = /SASData;` is planned at `/SASData/in` (the reference's
+  `effective_path`, case kept). Only a reference still unresolved becomes a
+  blocker.
 
 Pass metadata resolved across the corpus — `chunker.resolve_corpus_references`
 — or a LIBNAME in a setup file cannot reach the reads in the files after it.

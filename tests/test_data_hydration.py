@@ -160,6 +160,19 @@ class TestPathSources:
         ]
         assert len(build_plan((), refs, config=_config()).items) == 1
 
+    def test_a_path_spelled_through_a_macro_variable_is_read_where_it_resolves(self):
+        # The chunker expands `&root` from the %LET in force, case kept; the
+        # plan reads that place instead of blocking on the reference.
+        from chunker import SasSemanticChunker
+
+        src = "%let root = /SASData;\ndata a; infile \"&root/in/cust.csv\"; input x; run;\n"
+        chunks = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(src).chunks
+        refs = [r for c in chunks for r in c.metadata.external_refs]
+        [item] = build_plan((), refs, config=_config()).items
+        assert (item.source.locator, item.source.object_name) == ("/SASData/in", "cust")
+        assert not item.source.has_macro_ref
+        assert item.blockers == ()
+
     def test_an_ftp_filename_becomes_an_sftp_source(self):
         plan = _plan("filename raw ftp '/incoming/cust.csv' host='h';")
         assert plan.items[0].source.kind is SourceKind.SFTP

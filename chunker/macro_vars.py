@@ -134,6 +134,27 @@ def name_value(raw: str) -> str | None:
     return value.lower()
 
 
+#: Longest %LET value kept as text for a path. A path is rarely longer.
+_MAX_TEXT_LEN = 1024
+
+
+def text_value(raw: str) -> str | None:
+    """*raw* as a value pasted into a path — case, separators and quotes kept —
+    or ``None`` when its value is not knowable here.
+
+    The counterpart of :func:`name_value` for a reference inside a quoted path
+    (``"&root/setup.sas"``), where SAS pastes the value as written:
+    ``/SAS/Prod``, ``C:\\Projects``, or a quoted ``'/sas/x.sas'`` that
+    ``%include &f;`` reads as its own quoted path. A value that calls a macro
+    function (``%sysget(HOME)``, ``%sysfunc(getoption(work))``) is computed at
+    run time, so it is unknown, as an empty one is.
+    """
+    value = raw.strip()
+    if not value or len(value) > _MAX_TEXT_LEN or "%" in value:
+        return None
+    return value
+
+
 def let_assignments(text: str) -> list[tuple[str, str]]:
     """Every ``%LET`` in *text*, in order: ``(name, value as written)``.
 
@@ -408,7 +429,9 @@ def _split_call_args(raw_args: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-def _parse_call_args(call_text: str) -> tuple[list[str], dict[str, str]]:
+def _parse_call_args(
+    call_text: str, *, as_written: bool = False
+) -> tuple[list[str], dict[str, str]]:
     """
     Parse a MACRO_CALL chunk's raw text into (positional_args, keyword_args).
 
@@ -420,21 +443,24 @@ def _parse_call_args(call_text: str) -> tuple[list[str], dict[str, str]]:
 
     Quoting and trailing dots are stripped from each value so that
     ``work.orders``, ``'work.orders'``, and ``work.orders.`` all normalise
-    to the same lowercase dataset key.
+    to the same lowercase dataset key. *as_written* keeps each value as the
+    call spells it, only trimmed — what a path the macro builds from it reads
+    (``%setpaths(/SAS/Prod)``).
     """
     raw_args = _extract_call_arg_text(call_text)
     if raw_args is None:
         return [], {}
 
+    clean = str.strip if as_written else _clean_arg_value
     positional: list[str] = []
     keyword: dict[str, str] = {}
 
     for part in _split_call_args(raw_args):
         kw = _KW_ARG_RE.match(part)
         if kw:
-            keyword[kw.group(1).lower()] = _clean_arg_value(kw.group(2))
+            keyword[kw.group(1).lower()] = clean(kw.group(2))
         else:
-            positional.append(_clean_arg_value(part))
+            positional.append(clean(part))
 
     return positional, keyword
 
