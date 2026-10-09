@@ -3393,5 +3393,59 @@ class TestChooseTarget(unittest.TestCase):
         self.assertEqual(choice.reasons[0].name, "MACRO_DEFINITION")
 
 
+class TestIncludeCheckCLI(unittest.TestCase):
+    """`--check-includes` — each %INCLUDEd script looked for by file name."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        (self.tmp / "macros").mkdir()
+        (self.tmp / "macros" / "util.sas").write_text("%macro util; %mend;\n")
+        (self.tmp / "job.sas").write_text(
+            "%include '/sas/prod/util.sas';\n%include '/sas/prod/gone.sas';\n"
+            "data work.a; set raw.a; run;\n",
+            encoding="utf-8",
+        )
+
+    def _report(self, *args) -> str:
+        from complexity.__main__ import main
+
+        out = self.tmp / "report.md"
+        self.assertEqual(main([str(self.tmp), "--out", str(out), *args]), 0)
+        return out.read_text(encoding="utf-8")
+
+    def test_the_overall_report_says_where_each_script_was_found(self):
+        report = self._report("--check-includes")
+        section = report[report.index("## Included scripts"):]
+        self.assertIn("- Scripts included: **2** — found 1, not found **1**", section)
+        self.assertIn("| `util.sas` | job.sas:1 | `macros/util.sas` | — |", section)
+        self.assertIn("| `gone.sas` | job.sas:2 | **not found** | — |", section)
+
+    def test_app_names_the_sharepoint_folder_to_look_in(self):
+        import data_hydration.includes as includes
+
+        looked: list[str] = []
+
+        def fake_index(folder, **_):
+            looked.append(folder)
+            return {"gone.sas": (f"{folder}/gone.sas",)}
+
+        original = includes.sharepoint_index
+        includes.sharepoint_index = fake_index
+        self.addCleanup(setattr, includes, "sharepoint_index", original)
+        report = self._report("--check-includes", "--app", "MyApp")
+        self.assertEqual(len(looked), 1)
+        self.assertTrue(looked[0].endswith("MyApp/scripts_original"))
+        self.assertIn(f"| `gone.sas` | job.sas:2 | **not found** | `{looked[0]}/gone.sas` |", report)
+
+    def test_without_the_flag_the_report_is_unchanged(self):
+        self.assertNotIn("Included scripts", self._report())
+
+    def test_app_alone_still_needs_sharepoint(self):
+        from complexity.__main__ import main
+
+        self.assertEqual(main([str(self.tmp), "--app", "MyApp"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

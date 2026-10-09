@@ -379,6 +379,7 @@ def _sources_for(
     *,
     db_tables: Sequence["SasDbTableRef"] = (),
     named: frozenset[tuple[str, tuple[tuple[str, str], ...]]] = frozenset(),
+    code_filerefs: frozenset[str] = frozenset(),
 ) -> list[tuple[HydrationSource, tuple[str, ...]]]:
     """Every hydratable source one file's refs name, in reading order, each with
     the blockers only its kind can have.
@@ -386,6 +387,8 @@ def _sources_for(
     *named* holds the database LIBNAMEs — ``(libref, options)`` — whose tables
     the corpus names: those are planned table by table, so the LIBNAME's own
     schema-level item, which stands in when no table is known, is left out.
+    *code_filerefs* are the filerefs only ``%INCLUDE`` reads
+    (:func:`_code_filerefs`): their FILENAMEs name SAS source, not data.
     """
     sources: list[tuple[HydrationSource, tuple[str, ...]]] = [
         (_oracle_source(ref, source_id), _engine_blocker(ref.engine))
@@ -393,6 +396,8 @@ def _sources_for(
         if (ref.binds, ref.options) not in named
     ]
     for path_ref in path_refs:
+        if path_ref.statement == "filename" and path_ref.binds in code_filerefs:
+            continue
         source = _path_source(path_ref, source_id)
         if source is not None:
             sources.append((source, ()))
@@ -460,6 +465,26 @@ def build_plan(
         config=config,
         probe=probe,
     )
+
+
+def _code_filerefs(
+    by_source: Mapping[str, tuple[Sequence["SasEngineRef"], Sequence["SasPathRef"]]],
+) -> frozenset[str]:
+    """The filerefs the corpus only ``%INCLUDE``s through.
+
+    ``filename src '/code/macros'; %include src(util);`` names a directory of
+    SAS source: more code to convert, not data to load, as an ``%INCLUDE`` of
+    a quoted path is not. A fileref an INFILE or FILE statement also uses
+    holds data, and stays.
+    """
+    included: set[str] = set()
+    other: set[str] = set()
+    for _, path_refs in by_source.values():
+        for ref in path_refs:
+            if not ref.binds or ref.statement == "filename":
+                continue
+            (included if ref.statement == "include" else other).add(ref.binds)
+    return frozenset(included - other)
 
 
 #: LIBNAME engines whose directory holds each dataset as ``<member>.sas7bdat``:
@@ -571,6 +596,7 @@ def build_corpus_plan(
     )
     members, listed = _library_members(by_source, datasets or {})
     expanded: set[_Library] = set()
+    code_filerefs = _code_filerefs(by_source)
 
     sources: list[tuple[HydrationSource, tuple[str, ...]]] = []
     planned_tables: set[HydrationSource] = set()
@@ -583,6 +609,7 @@ def build_corpus_plan(
             source_id or None,
             db_tables=db_tables.get(source_id, ()),
             named=named,
+            code_filerefs=code_filerefs,
         ):
             library = (source.libref, source.locator)
             if source.kind is SourceKind.FILE and not source.object_name and library in members:

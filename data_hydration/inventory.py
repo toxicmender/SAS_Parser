@@ -139,6 +139,11 @@ class InventoryRow(BaseModel, frozen=True):
     in_macro_body, macro_param, macro_param_pos
         A dataset named inside a ``%MACRO`` body, and the parameter that
         spells it when a call supplies it.
+    found_local, found_sharepoint
+        For a ``%INCLUDE``, the scripts of its file name found in the local
+        corpus and in the application's SharePoint scripts folder
+        (:func:`data_hydration.includes.match_includes`); ``None`` where
+        nobody looked.
     """
 
     run_id: str
@@ -172,6 +177,8 @@ class InventoryRow(BaseModel, frozen=True):
     macro_param_pos: int | None = None
     macro: str | None = None
     parameterised: bool = False
+    found_local: tuple[str, ...] | None = None
+    found_sharepoint: tuple[str, ...] | None = None
 
     @field_validator("options", mode="before")
     @classmethod
@@ -591,6 +598,8 @@ _COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("macro_param_pos", "INT", "position of that parameter; -1 for a keyword"),
     ("macro", "STRING", "the macro whose call reads the table"),
     ("parameterised", "BOOLEAN", "a template built from the parameters of its macro"),
+    ("found_local", "ARRAY<STRING>", "an included script found in the local corpus"),
+    ("found_sharepoint", "ARRAY<STRING>", "an included script found in SharePoint"),
 )
 
 # Unity Catalog identifiers: one to three parts of letters, digits and _.
@@ -644,6 +653,9 @@ def _values(row: InventoryRow) -> tuple[Any, ...]:
     fields["kind"] = str(row.kind)
     fields["options"] = [list(pair) for pair in row.options]
     fields["sas_targets"] = list(row.sas_targets)
+    for name in ("found_local", "found_sharepoint"):
+        found = getattr(row, name)
+        fields[name] = None if found is None else list(found)
     return tuple(fields[name] for name, _, _ in _COLUMNS)
 
 

@@ -31,7 +31,7 @@ import logging
 import re
 # collections.abc rather than typing: Iterable is used as an isinstance test
 # below, not only as an annotation.
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -626,6 +626,48 @@ def _hydration_summary(plan: Any | None) -> list[str]:
     return lines
 
 
+def _include_summary(checks: Sequence[Any] | None, names: Mapping[str, str]) -> list[str]:
+    """Where each ``%INCLUDE``d script was found, or nothing without a check.
+
+    *checks* are :class:`data_hydration.includes.IncludeCheck` records, one per
+    script. A place nobody looked is ``—``; one looked in without finding the
+    script says so, since that is the dependency the corpus is missing.
+    """
+    if not checks:
+        return []
+    missing = sum(1 for c in checks if c.status != "found")
+    lines = [
+        "",
+        "## Included scripts",
+        "",
+        "Each script a `%INCLUDE` pulls in, looked for by file name in the "
+        "scored directory and in the application's SharePoint scripts folder.",
+        "",
+        f"- Scripts included: **{len(checks)}** — found {len(checks) - missing}, "
+        f"not found **{missing}**",
+        "",
+        "| Script | Included by | Local | SharePoint |",
+        "| --- | --- | --- | --- |",
+    ]
+
+    def cell(found: tuple[str, ...] | None, named: bool) -> str:
+        if found is None or not named:
+            return "—"
+        return ", ".join(f"`{f}`" for f in found) if found else "**not found**"
+
+    for check in checks:
+        named = check.file_name is not None
+        script = f"`{check.file_name}`" if named else f"`{check.spelled}` (no file name)"
+        by = ", ".join(
+            f"{resolve_name(source_id, names)}:{line}" for source_id, line in check.included_by
+        )
+        lines.append(
+            f"| {script} | {by} | {cell(check.local, named)} "
+            f"| {cell(check.sharepoint, named)} |"
+        )
+    return lines
+
+
 def render_overall_report(
     report: CorpusComplexityReport,
     *,
@@ -633,6 +675,7 @@ def render_overall_report(
     file_links: Mapping[str, str] | None = None,
     graph_image: str | None = None,
     hydration: Any | None = None,
+    includes: Sequence[Any] | None = None,
 ) -> str:
     """The corpus report, with an index of the individual reports appended.
 
@@ -644,10 +687,11 @@ def render_overall_report(
     graph, relative to where this Markdown will be written.
 
     *hydration* is an optional ``data_hydration.HydrationPlan``, summarised
-    before the file index. ``None`` renders nothing at all.
+    before the file index. ``None`` renders nothing at all. So is *includes*,
+    the ``%INCLUDE`` check (``data_hydration.includes.include_checks``).
     """
     body = report.to_markdown(top=top, graph_image=graph_image)
-    summary = _hydration_summary(hydration)
+    summary = _hydration_summary(hydration) + _include_summary(includes, report.names)
     if summary:
         body = body.rstrip() + "\n" + "\n".join(summary) + "\n"
     if not file_links:
@@ -755,6 +799,7 @@ def write_reports(
     overall_name: str = OVERALL_REPORT_NAME,
     graph_image: bool = True,
     hydration: Any | None = None,
+    includes: Sequence[Any] | None = None,
 ) -> WrittenReports:
     """Write the overall report and one report per source file under *out_dir*.
 
@@ -768,7 +813,8 @@ def write_reports(
 
     *hydration* is an optional ``data_hydration.HydrationPlan``: summarised in
     the overall report and broken down per file. Omitting it (the default)
-    leaves every report exactly as it was before hydration existed.
+    leaves every report exactly as it was before hydration existed. *includes*,
+    the ``%INCLUDE`` check, is summarised in the overall report the same way.
     """
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=True)
@@ -824,6 +870,7 @@ def write_reports(
                 drawn.relative_to(directory).as_posix() if drawn else None
             ),
             hydration=hydration,
+            includes=includes,
         ),
         encoding="utf-8",
     )

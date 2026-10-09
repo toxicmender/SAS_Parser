@@ -410,6 +410,10 @@ data_hydration/
                         plan_from_inventory plans from the rows alone, so the
                         CLI, complexity --hydration and --from-inventory share
                         one input. Literal passwords are stored redacted.
+  includes.py           Where each %INCLUDEd script is, by file name: the
+                        local corpus, the application's SharePoint scripts
+                        folder, or missing. Fills the inventory's found_*
+                        columns; complexity --check-includes reports it.
   partition.py          Native (Oracle partitions / SPDE components) -> row
                         range -> column range -> whole, each with the reason
                         recorded. probe=None restricts it to what is knowable

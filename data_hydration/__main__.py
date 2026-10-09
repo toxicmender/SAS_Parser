@@ -108,6 +108,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--run-id",
         help="With --from-inventory: plan from this inventory run, not the latest.",
     )
+    parser.add_argument(
+        "--check-includes",
+        action="store_true",
+        help=(
+            "Look for every %%INCLUDEd script by file name in the source "
+            "directory, and report the ones found nowhere."
+        ),
+    )
+    parser.add_argument(
+        "--sharepoint-app",
+        metavar="APPLICATION",
+        help=(
+            "Also look for them in APPLICATION's SharePoint scripts folder "
+            "({base}/APPLICATION/scripts_original). Implies --check-includes."
+        ),
+    )
     parser.add_argument("--debug", action="store_true", help="Debug logging.")
     parser.add_argument("--log-file", type=Path, help="Also write logs here.")
     return parser.parse_args(argv)
@@ -257,10 +273,10 @@ def _inventory(
         if not rows:
             logger.error(f"no inventory run to plan from in {table}")
             return None, False
-        return rows, False
-    rows = _corpus_inventory(args)
+        return _match_includes(args, rows)
+    rows, failed = _match_includes(args, _corpus_inventory(args))
     if not table:
-        return rows, False
+        return rows, failed
     try:
         write_inventory(rows, table)
     except Exception as exc:
@@ -269,7 +285,61 @@ def _inventory(
             f"{type(exc).__name__}: {exc}"
         )
         return rows, True
-    return rows, False
+    return rows, failed
+
+
+def _match_includes(
+    args: argparse.Namespace, rows: list[InventoryRow]
+) -> tuple[list[InventoryRow], bool]:
+    """*rows* with every ``%INCLUDE`` looked for, when asked; and whether a
+    place could not be searched. The source directory is searched when there
+    is one, and ``--sharepoint-app``'s scripts folder when given. A folder
+    SharePoint cannot list is reported and left unsearched."""
+    if not (args.check_includes or args.sharepoint_app):
+        return rows, False
+    from .includes import local_index, match_includes, sharepoint_index
+
+    local = local_index(args.source_dir) if args.source_dir is not None else None
+    sharepoint = None
+    failed = False
+    if args.sharepoint_app:
+        # The folder convention is conversion's, stated once there; this entry
+        # point imports it the way it imports the chunker.
+        from conversion.paths import original_scripts
+
+        folder = original_scripts(args.sharepoint_app)
+        try:
+            sharepoint = sharepoint_index(folder)
+        except Exception as exc:
+            logger.error(
+                f"could not list SharePoint folder {folder!r} — "
+                f"{type(exc).__name__}: {exc}"
+            )
+            failed = True
+    return match_includes(rows, local=local, sharepoint=sharepoint), failed
+
+
+def _print_includes(rows: list[InventoryRow]) -> None:
+    """Where each %INCLUDEd script was found, when anyone looked."""
+    from .includes import include_checks
+
+    checks = [c for c in include_checks(rows) if c.status != "unchecked"]
+    if not checks:
+        return
+    missing = [c for c in checks if c.status != "found"]
+    print(f"Included scripts — {len(checks)}, {len(missing)} not found\n")
+    for check in checks:
+        where = [
+            f"{place}: {', '.join(found)}"
+            for place, found in (("local", check.local), ("SharePoint", check.sharepoint))
+            if found
+        ]
+        name = check.file_name or check.spelled
+        status = "; ".join(where) if where else f"** {check.status}"
+        print(f"  {name}  ->  {status}")
+        for source_id, line in check.included_by:
+            print(f"      included by {source_id}:{line}")
+    print()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -296,6 +366,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_ARGS
 
     _print_plan(plan)
+    _print_includes(rows)
     if args.dry_run:
         return EXIT_FAILED if inventory_failed else EXIT_OK
 

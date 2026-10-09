@@ -820,6 +820,35 @@ to provision, which is a different question from how hard the code is. A file
 that reaches nothing outside gets no section, and every chunk that names a
 location prints its own `Paths:` line for the same audit trail as `Reads:`.
 
+## Included scripts
+
+`%include "/sas/prod/macros/util.sas";` names a script by where it lived on the
+SAS server. With `--check-includes` each one is looked for by **file name**,
+ignoring case and at any depth: in the scored directory, and in the
+application's SharePoint scripts folder (`{base}/{application}/scripts_original`)
+— the request row's application with `--sharepoint`, or `--app` on a local run.
+The overall report gains one row per script:
+
+```markdown
+## Included scripts
+
+- Scripts included: **3** — found 2, not found **1**
+
+| Script | Included by | Local | SharePoint |
+| --- | --- | --- | --- |
+| `util.sas` | job.sas:1 | `macros/util.sas` | `Apps/MyApp/scripts_original/util.sas` |
+| `gone.sas` | job.sas:2 | **not found** | **not found** |
+| `&f` (no file name) | job.sas:3 | — | — |
+```
+
+The file name is the one SAS opens: macro variables the corpus assigns are
+expanded and filerefs followed, so `%include src(util);` looks for `util.sas`.
+`—` is a place nobody looked; **not found** is a dependency the corpus is
+missing. The matching lives in `data_hydration.includes`, so
+`python -m data_hydration --check-includes` answers the same way and keeps the
+answer in the reference inventory. Off by default, and a run without it writes
+exactly the report it did before.
+
 ## Database tables
 
 After the paths, the tables a file reads and writes **inside a database** —
