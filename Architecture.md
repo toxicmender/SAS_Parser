@@ -405,6 +405,11 @@ data_hydration/
                         fails during --dry-run, not after data has moved.
   planner.py            Refs -> plan. Pure. Chunker types are TYPE_CHECKING
                         only, so importing this never imports chunker.
+  inventory.py          Every path and dataset the corpus names, resolved or
+                        not, as rows of a Delta table, one run per write.
+                        plan_from_inventory plans from the rows alone, so the
+                        CLI, complexity --hydration and --from-inventory share
+                        one input. Literal passwords are stored redacted.
   partition.py          Native (Oracle partitions / SPDE components) -> row
                         range -> column range -> whole, each with the reason
                         recorded. probe=None restricts it to what is knowable

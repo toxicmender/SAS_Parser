@@ -73,6 +73,7 @@ class TestDecoupling:
         code = (
             "import sys; import data_hydration; "
             "from data_hydration import build_corpus_plan; "
+            "from data_hydration import inventory_rows, plan_from_inventory; "
             "print(','.join(m for m in "
             "('chunker','pipeline','complexity','pyspark','oracledb',"
             "'paramiko','pyreadstat','saspy','azure') if m in sys.modules))"

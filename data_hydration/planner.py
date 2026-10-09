@@ -42,7 +42,7 @@ from .naming import TableNameError, render, validate_template
 from .partition import SourceProbe, plan_partitions
 
 if TYPE_CHECKING:  # annotations only — never imported at run time
-    from chunker.models import SasDbTableRef, SasEngineRef, SasPathRef
+    from chunker.models import SasDatasetRef, SasDbTableRef, SasEngineRef, SasPathRef
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +87,9 @@ def _macro_blocker(source: HydrationSource) -> tuple[str, ...]:
         return ()
     unresolved = sorted(key for key, value in source.options if "&" in value)
     parts = [f"option(s) {', '.join(unresolved)}"] if unresolved else []
+    # A path's place; a database's is one of its options, named above.
+    if "&" in source.locator and not source.options:
+        parts.append(f"the location '{source.locator}'")
     if "&" in source.object_name:
         parts.append(f"the object name '{source.object_name}'")
     where = " and ".join(parts) or "the connection"
@@ -405,6 +408,7 @@ def build_plan(
     path_refs: Sequence["SasPathRef"] = (),
     *,
     db_tables: Sequence["SasDbTableRef"] = (),
+    datasets: Sequence["SasDatasetRef"] = (),
     config: HydrationConfig | None = None,
     probe: SourceProbe | None = None,
     source_id: str | None = None,
@@ -422,6 +426,10 @@ def build_plan(
         read is planned as its own item (writes are the job's output, not a
         source), and a database LIBNAME whose tables appear here is planned
         through them instead of as one schema-level item.
+    datasets
+        ``chunk.metadata.dataset_refs`` from the same chunks: a directory
+        LIBNAME whose datasets are read here is planned per dataset (see
+        :func:`build_corpus_plan`).
     config
         ``None`` builds one with :meth:`HydrationConfig.from_env`.
     probe
@@ -448,15 +456,82 @@ def build_plan(
     return build_corpus_plan(
         {source_id or "": (engine_refs, path_refs)},
         db_tables={source_id or "": db_tables},
+        datasets={source_id or "": datasets},
         config=config,
         probe=probe,
     )
+
+
+#: LIBNAME engines whose directory holds each dataset as ``<member>.sas7bdat``:
+#: the default, written or not.
+_BASE_ENGINES = frozenset({"", "base", "v9", "v8", "v7"})
+
+
+def _directory_library(ref: "SasPathRef") -> bool:
+    """Whether *ref* is a LIBNAME binding a directory of SAS datasets."""
+    return (
+        ref.statement == "libname"
+        and bool(ref.binds)
+        and not (ref.binds or "").startswith("&")
+        and str(ref.location) == "filesystem"
+        and (ref.engine or "") in _BASE_ENGINES
+        and "." not in _basename(ref.path)
+    )
+
+
+#: A directory library: its libref and directory, as a library item has them.
+_Library = tuple[str | None, str]
+
+
+def _library_members(
+    by_source: Mapping[str, tuple[Sequence["SasEngineRef"], Sequence["SasPathRef"]]],
+    datasets: Mapping[str, Sequence["SasDatasetRef"]],
+) -> tuple[dict[_Library, list[tuple[str, str | None]]], set[_Library]]:
+    """The datasets to load from each directory library, and the libraries a
+    list is read from.
+
+    A dataset the corpus reads, or updates, through a libref a directory
+    LIBNAME binds, and that no step creates, is a member of that directory to
+    load: ``set raw.customers;`` after ``libname raw '/data/raw';`` reads
+    ``/data/raw/customers.sas7bdat``. The LIBNAME in force is the latest one
+    before the read in corpus order, a file's LIBNAMEs taken before its reads,
+    as SAS would have run them. A dataset some step creates is the job's own,
+    not a source; a list (``raw.sales_:``) has members only a listing knows.
+
+    Returns each library's members as ``(member, reading file)`` in first-read
+    order, and the libraries a list is read from.
+    """
+    created = {
+        ref.name for refs in datasets.values() for ref in refs if str(ref.role) == "write"
+    }
+    bound: dict[str, str] = {}
+    members: dict[_Library, list[tuple[str, str | None]]] = {}
+    listed: set[_Library] = set()
+    seen: set[tuple[str, str]] = set()
+    for source_id in dict.fromkeys([*by_source, *datasets]):
+        for ref in by_source.get(source_id, ((), ()))[1]:
+            if _directory_library(ref) and ref.binds:
+                bound[ref.binds] = ref.effective_path
+        for ref in datasets.get(source_id, ()):
+            if str(ref.role) not in ("read", "update") or ref.param is not None:
+                continue
+            libref, _, member = ref.name.partition(".")
+            if libref not in bound or not member:
+                continue
+            library = (libref, bound[libref])
+            if ref.pattern:
+                listed.add(library)
+            elif ref.name not in created and (library[1], member) not in seen:
+                seen.add((library[1], member))
+                members.setdefault(library, []).append((member, source_id or None))
+    return members, listed
 
 
 def build_corpus_plan(
     by_source: Mapping[str, tuple[Sequence["SasEngineRef"], Sequence["SasPathRef"]]],
     *,
     db_tables: Mapping[str, Sequence["SasDbTableRef"]] | None = None,
+    datasets: Mapping[str, Sequence["SasDatasetRef"]] | None = None,
     config: HydrationConfig | None = None,
     probe: SourceProbe | None = None,
 ) -> HydrationPlan:
@@ -469,13 +544,19 @@ def build_corpus_plan(
     think they were first and the second would wipe the first's rows.
 
     Files are visited in the mapping's order, which the caller controls; a file
-    present only in *db_tables* follows them.
+    present only in *db_tables* or *datasets* follows them.
 
     *db_tables* maps the same file keys to ``chunk.metadata.db_tables``. Pass
     metadata resolved across the corpus (``chunker.resolve_corpus_references``)
     or a database LIBNAME in one file cannot reach the reads in another. A table
     read in several places is **one** item, owned by the first file that reads
     it: appending one copy per reader would load its rows several times over.
+
+    *datasets* maps them to ``chunk.metadata.dataset_refs``, and is how a
+    directory LIBNAME is planned per dataset rather than as one blocked
+    library item (see :func:`_library_members`): each member read is a
+    ``sas7bdat`` item, owned by the first file that reads it. The library item
+    stays only when a list is read from it.
     """
     config = config or HydrationConfig.from_env()
     validate_template(config.table_template)
@@ -488,6 +569,8 @@ def build_corpus_plan(
         for table in tables
         if str(table.via) == "libname"
     )
+    members, listed = _library_members(by_source, datasets or {})
+    expanded: set[_Library] = set()
 
     sources: list[tuple[HydrationSource, tuple[str, ...]]] = []
     planned_tables: set[HydrationSource] = set()
@@ -501,6 +584,28 @@ def build_corpus_plan(
             db_tables=db_tables.get(source_id, ()),
             named=named,
         ):
+            library = (source.libref, source.locator)
+            if source.kind is SourceKind.FILE and not source.object_name and library in members:
+                # A directory whose datasets are named: one item per dataset,
+                # where the library is first declared.
+                if library not in expanded:
+                    expanded.add(library)
+                    sources += [
+                        (
+                            HydrationSource(
+                                kind=SourceKind.SAS_DATASET,
+                                locator=source.locator,
+                                object_name=member,
+                                libref=source.libref,
+                                has_macro_ref=source.has_macro_ref or "&" in member,
+                                source_id=reader,
+                            ),
+                            (),
+                        )
+                        for member, reader in members[library]
+                    ]
+                if library not in listed:
+                    continue
             if source.connection is not None:
                 identity = source.model_copy(update={"source_id": None})
                 if identity in planned_tables:

@@ -491,12 +491,13 @@ ENGINE_LIBNAMES: frozenset[str] = frozenset(
 
 # libname <libref> <engine> <options...>;
 #
-# The option tail is ``[^;]*``, which spans newlines by design — a connection
-# statement with a dozen options is routinely wrapped across lines, and the
-# terminator is the semicolon, not the line end.
+# The option tail spans newlines by design — a connection statement with a
+# dozen options is routinely wrapped across lines, and the terminator is the
+# semicolon, not the line end. A quoted value is one unit, since a connection
+# string holds semicolons of its own: noprompt="DSN=dw;UID=u;".
 _ENGINE_LIBNAME_RE = re.compile(
     rf"\blibname\s+(?P<binds>{DS_REF_TOKEN})\s+(?P<engine>[A-Za-z_]\w*)\b"
-    r"(?P<opts>[^;]*);",
+    r"""(?P<opts>(?:"[^"\n]*"|'[^'\n]*'|[^;])*);""",
     re.IGNORECASE,
 )
 

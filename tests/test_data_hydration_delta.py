@@ -342,3 +342,57 @@ class TestThroughTheRunner:
         assert not report.ok
         assert report.outcomes[0].status is ItemStatus.FAILED
         assert "FileNotFoundError" in (report.outcomes[0].error or "")
+
+
+class TestTheReferenceInventory:
+    """The inventory table, written and read back through a real Delta session:
+    one run per write, the latest read by default, rows unchanged."""
+
+    @pytest.fixture
+    def inventory(self, delta_spark):
+        delta_spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMA}")
+        table = f"{CATALOG}.{SCHEMA}.sas_refs"
+        yield table
+        delta_spark.sql(f"DROP TABLE IF EXISTS {table}")
+
+    @staticmethod
+    def _rows(source: str, run_id: str):
+        from chunker import SasCorpus, SasSemanticChunker, resolve_corpus_references
+        from data_hydration.inventory import inventory_rows
+
+        result = SasSemanticChunker().chunk_text(source, source_id="job.sas")
+        corpus = resolve_corpus_references(SasCorpus(file_results=[result]))
+        return inventory_rows(corpus.file_results, run_id=run_id)
+
+    def test_rows_survive_the_round_trip(self, delta_spark, inventory):
+        from data_hydration.inventory import read_inventory, write_inventory
+
+        rows = self._rows(
+            "%let root = /SASData;\nlibname raw \"&root/raw\";\n"
+            "libname edw oracle path=EDWPRO schema=fr_dm pass=\"x\";\n"
+            "data a; set raw.customers edw.accounts &lib..x; run;\n",
+            run_id="20260101T000000Z-00000001",
+        )
+        assert write_inventory(rows, inventory, spark=delta_spark) == len(rows)
+        back = read_inventory(inventory, spark=delta_spark)
+        # Timestamps come back in the session's zone; everything else as written.
+        strip = [r.model_copy(update={"recorded_at": None}) for r in rows]
+        assert [r.model_copy(update={"recorded_at": None}) for r in back] == strip
+        detail = delta_spark.sql(f"DESCRIBE DETAIL {inventory}").first()
+        assert detail["format"] == "delta"
+
+    def test_each_write_is_a_run_and_the_latest_is_read(self, delta_spark, inventory):
+        from data_hydration.inventory import read_inventory, write_inventory
+
+        first = self._rows("data a; set lib.one; run;\n", run_id="20260101T000000Z-00000001")
+        second = self._rows("data a; set lib.two; run;\n", run_id="20260102T000000Z-00000002")
+        write_inventory(first, inventory, spark=delta_spark)
+        write_inventory(second, inventory, spark=delta_spark)
+
+        def names(rows):
+            return {r.name for r in rows}
+
+        assert names(read_inventory(inventory, spark=delta_spark)) == {"lib.two", "work.a"}
+        pinned = read_inventory(inventory, spark=delta_spark, run_id=first[0].run_id)
+        assert names(pinned) == {"lib.one", "work.a"}
+        assert delta_spark.table(inventory).count() == len(first) + len(second)

@@ -285,6 +285,15 @@ class TestEngineLibnames:
         assert ref.option_map["server"] == "tdprod"
         assert ref.option_map["mode"] == "teradata"
 
+    def test_a_quoted_value_may_hold_semicolons(self):
+        # An ODBC connection string is one value, its semicolons included.
+        ref = self._one_engine('libname dw odbc noprompt="DSN=dw;UID=u;" schema=s;')
+        assert ref.option_map == {"noprompt": "DSN=dw;UID=u;", "schema": "s"}
+        # An unmatched quote is a character, as before.
+        assert extract_engine_refs("libname o oracle path=O'Neil;")[0].option_map == {
+            "path": "O'Neil"
+        }
+
     def test_a_path_libname_is_not_an_engine_libname(self):
         # The two scans partition the LIBNAME space: one needs a quoted value,
         # the other needs a known engine. Neither statement may reach both.
