@@ -142,6 +142,12 @@ class PathSpec:
         ``%include src(one two);``): its references are
         :attr:`~chunker.models.PathLocation.FILEREF`, ``binds`` the fileref,
         until :func:`chunker.metadata.resolve_filerefs` finds the FILENAME.
+    at_statement
+        A match counts only where a statement starts (:func:`_at_statement`).
+        The fileref forms are bare words, so without it "file written" in a
+        PUT string, a TITLE or a ``%PUT`` message would read as a FILE
+        statement naming a fileref. Checked after the match rather than by a
+        lookbehind, which would cost the pattern its literal prefix.
     """
 
     statement: str
@@ -149,6 +155,7 @@ class PathSpec:
     pattern: re.Pattern[str]
     many: bool = False
     fileref: bool = False
+    at_statement: bool = False
 
     def location_for(self, match: re.Match[str]) -> PathLocation:
         """Where this match points, from its device group if it has one."""
@@ -181,6 +188,9 @@ class PathSpec:
         for start, end in self.value_spans(match):
             raw = match.string[start:end].strip()
             if raw:
+                # SAS resolves macro references in a double-quoted value only:
+                # in '/data/R&D/x.csv' the & is a character of the name.
+                quote = match.string[start - 1] if start else ""
                 refs.append(
                     SasPathRef(
                         statement=self.statement,
@@ -190,7 +200,7 @@ class PathSpec:
                         binds=binds.lower() if binds else None,
                         device=device.lower() if device else None,
                         engine=engine.lower() if engine else None,
-                        has_macro_ref="&" in raw,
+                        has_macro_ref="&" in raw and quote != "'",
                     )
                 )
         return refs
@@ -221,6 +231,20 @@ class PathSpec:
         ]
 
 
+def _at_statement(text: str, pos: int) -> bool:
+    """Whether a statement starts at *pos* of *text*: at its start, after a
+    ``;``, or after the THEN / ELSE (or ``%THEN`` / ``%ELSE``) that runs it,
+    whitespace between."""
+    i = pos
+    while i > 0 and text[i - 1].isspace():
+        i -= 1
+    if i == 0 or text[i - 1] == ";":
+        return True
+    if text[max(0, i - 4) : i].lower() not in ("then", "else"):
+        return False
+    return i == 4 or not (text[i - 5].isalnum() or text[i - 5] == "_")
+
+
 def _group(match: re.Match[str], name: str) -> str | None:
     """*match*'s *name* group, or ``None`` when the pattern has no such group.
 
@@ -242,6 +266,8 @@ _FREF = r"[A-Za-z_&][\w&]*"
 _MEMBER_RE = re.compile(r"""'[^'\n]*'|"[^"\n]*"|[\w&.$]+""")
 # Filerefs SAS reserves for its own destinations and in-stream data.
 _RESERVED_FREFS = r"(?!(?:cards4?|datalines4?|print|log|_webout)\b)"
+# %INCLUDE and its abbreviation %INC.
+_INCLUDE = r"%\s*inc(?:lude)?\b"
 
 #: Every statement form recognised, in scan order. Iterated by
 #: :func:`extract_paths` and by :func:`xref.pre.rewrite_source_text`.
@@ -289,12 +315,13 @@ PATH_STATEMENTS: tuple[PathSpec, ...] = (
         keyword="file",
         pattern=re.compile(r"(?P<head>\bfile\s+)" + _VALUE, re.IGNORECASE),
     ),
-    # %include '<path>' ['<path>' ...]: one reference per file.
+    # %include '<path>' ['<path>' ...]: one reference per file. %INC is
+    # SAS's own abbreviation, and the keyword gate is "inc" for both.
     PathSpec(
         statement="include",
-        keyword="include",
+        keyword="inc",
         pattern=re.compile(
-            rf"(?P<head>%\s*include\s+)(?P<paths>(?:{_QUOTED}\s*)+)", re.IGNORECASE
+            rf"(?P<head>{_INCLUDE}\s*)(?P<paths>(?:{_QUOTED}\s*)+)", re.IGNORECASE
         ),
         many=True,
     ),
@@ -302,23 +329,25 @@ PATH_STATEMENTS: tuple[PathSpec, ...] = (
     # %include src [other]: whole files filerefs name.
     PathSpec(
         statement="include",
-        keyword="include",
+        keyword="inc",
         pattern=re.compile(
-            rf"%\s*include\s+(?P<binds>{_FREF})\s*\((?P<members>[^)]*)\)",
+            rf"{_INCLUDE}\s+(?P<binds>{_FREF})\s*\((?P<members>[^)]*)\)",
             re.IGNORECASE,
         ),
         many=True,
         fileref=True,
+        at_statement=True,
     ),
     PathSpec(
         statement="include",
-        keyword="include",
+        keyword="inc",
         pattern=re.compile(
-            rf"%\s*include\s+(?P<frefs>{_FREF}(?:\s+{_FREF})*)\s*(?=[;/]|\Z)",
+            rf"{_INCLUDE}\s+(?P<frefs>{_FREF}(?:\s+{_FREF})*)\s*(?=[;/]|\Z)",
             re.IGNORECASE,
         ),
         many=True,
         fileref=True,
+        at_statement=True,
     ),
     # infile in / file out [(member)]: the file a fileref names.
     PathSpec(
@@ -330,6 +359,7 @@ PATH_STATEMENTS: tuple[PathSpec, ...] = (
             re.IGNORECASE,
         ),
         fileref=True,
+        at_statement=True,
     ),
     PathSpec(
         statement="file",
@@ -340,6 +370,7 @@ PATH_STATEMENTS: tuple[PathSpec, ...] = (
             re.IGNORECASE,
         ),
         fileref=True,
+        at_statement=True,
     ),
     # PROC IMPORT datafile='<path>' / PROC EXPORT outfile='<path>'. Keyed on the
     # option rather than the PROC: the option is what carries the path, and it
@@ -415,6 +446,8 @@ def extract_paths(text: str) -> list[SasPathRef]:
         if spec.keyword not in lowered:
             continue
         for match in spec.pattern.finditer(text):
+            if spec.at_statement and not _at_statement(text, match.start()):
+                continue
             for ref in spec.refs_for(match):
                 if ref not in seen:
                     seen.add(ref)

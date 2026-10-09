@@ -348,7 +348,10 @@ A statement may name several places: `%include '/a.sas' '/b.sas';` is two
 records (a `PathSpec` with `many=True`; `xref.pre` rewrites each value through
 `spec.value_spans`). And a place may be named through a fileref — `%include
 src(one two);`, `%include setup;`, `infile in;`, `file out;` (SAS's own
-`print`, `log`, `datalines`, `cards` excepted). Those are recorded as
+`print`, `log`, `datalines`, `cards` excepted; `%INC` is `%INCLUDE`). Being
+bare words, these forms count only where a statement starts — after a `;`, a
+THEN or an ELSE — so "the file written" in a PUT string, a TITLE or a `%PUT`
+names no fileref. Those are recorded as
 `FILEREF`, the fileref in `binds`, and `metadata.resolve_filerefs` walks the
 corpus in source order with the FILENAMEs in force: the latest binding of a
 fileref wins, `clear` or a FILENAME with no quoted place ends it, and each
@@ -371,6 +374,8 @@ over its chunk's text.
 - `raw` stays as written, `resolved_path` holds the place SAS reads
   (`effective_path` is whichever applies), `path` is its normalised form, and
   `has_macro_ref` says a reference is still unresolved.
+- A single-quoted value is the place as written: SAS resolves `&` between
+  double quotes only, so `'/data/R&D/in'` holds no reference.
 - A statement that names a fileref through a variable reads what the variable
   holds as its own words. `%include &f;` with `%let f = '/sas/x.sas';`
   includes that file, and with `%let f = src(util);` a member of `src`'s

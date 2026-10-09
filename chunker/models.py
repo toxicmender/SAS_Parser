@@ -631,8 +631,18 @@ def _dataset_views(refs: tuple[SasDatasetRef, ...]) -> dict[str, tuple[Any, ...]
         views[view] = tuple(keys)
     names = sorted({ref.name for ref in refs})
     views["referenced_datasets"] = tuple(names)
+    # A SAS name has at most two levels: a third makes it a Databricks target
+    # name (`main.edw.accounts`, after replace_dataset_names), whose first part
+    # is a catalog, no SAS libref.
     views["referenced_librefs"] = tuple(
-        sorted({lib for name in names if (lib := _libref_of(name)) is not None})
+        sorted(
+            {
+                lib
+                for name in names
+                if ("&" in name or name.count(".") < 2)
+                and (lib := _libref_of(name)) is not None
+            }
+        )
     )
     return views
 

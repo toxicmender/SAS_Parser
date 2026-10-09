@@ -100,6 +100,26 @@ class TestStatementForms:
             ("lib2", "lib2", PathLocation.FILEREF),
         ]
 
+    def test_inc_is_include(self):
+        refs = extract_paths("%inc '/code/a.sas';\n%inc src(b);\n%INC setup;\n")
+        assert [(r.statement, r.raw) for r in refs] == [
+            ("include", "/code/a.sas"),
+            ("include", "src(b)"),
+            ("include", "setup"),
+        ]
+
+    def test_a_fileref_is_named_only_where_a_statement_starts(self):
+        # The fileref forms are bare words, so text that only reads like one
+        # names nothing: a PUT string, a TITLE, a %PUT message.
+        src = (
+            "data _null_; put 'the file written to disk'; run;\n"
+            "title 'infile errors by day';\n%put file saved;\n"
+        )
+        assert extract_paths(src) == []
+        # THEN and ELSE (and %THEN, %ELSE) start the statement they run.
+        src = "if x then infile in1; else infile in2;\n%if &y %then %include src(one);\n"
+        assert {r.raw for r in extract_paths(src)} == {"in1", "in2", "src(one)"}
+
     def test_proc_import_datafile(self):
         ref = _one('proc import datafile="/in/a.xlsx" out=work.a; run;')
         assert ref.statement == "proc_import"
@@ -190,6 +210,12 @@ class TestValues:
         ref = _one('libname raw "&root/in";')
         assert ref.has_macro_ref is True
         assert ref.raw == "&root/in"
+
+    def test_a_single_quoted_value_holds_no_macro_reference(self):
+        # SAS resolves macro references between double quotes only: between
+        # single quotes & is a character of the name.
+        ref = _one("libname rd '/data/R&D/in';")
+        assert (ref.has_macro_ref, ref.raw) == (False, "/data/R&D/in")
 
     def test_raw_is_preserved_while_path_is_normalised(self):
         ref = _one(r"libname win 'D:\Data\ETL';")

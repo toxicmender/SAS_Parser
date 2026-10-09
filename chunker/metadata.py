@@ -66,7 +66,7 @@ from .models import (
 from .passthrough import db_table_ref, mask, scan_pass_through
 from .paths import ENGINE_LIBNAMES, extract_engine_refs, extract_paths, normalise_path
 from .scanner import _blank_span, _Region, _sanitise
-from .statements import _canon_ds
+from .statements import _ODS_OUTPUT_RE, _VAR_REF_RE, _canon_ds
 from .statements import dataset_refs as statement_dataset_refs
 
 logger = logging.getLogger(__name__)
@@ -175,11 +175,9 @@ _IDENT_RE = re.compile(r"[A-Za-z_]\w*")  # bare SAS identifier
 _SPLIT_WS_COMMA_RE = re.compile(r"[,\s]+")  # %global/%local list separator
 _NUM_SUFFIX_RE = re.compile(r"^([A-Za-z_]+?)(\d+)$")  # split trailing integer
 
-# Any "&name" or "&name." reference — the single stored scan feeding
-# SasChunkMetadata.referenced_macro_vars (the automatic-variable and consumer
-# views are computed from it).
-_VAR_REF_RE = re.compile(r"&(\w+)\.?")
-
+# _VAR_REF_RE (from chunker.statements): any "&name" or "&name." reference —
+# the single stored scan feeding SasChunkMetadata.referenced_macro_vars (the
+# automatic-variable and consumer views are computed from it).
 
 # Macro-variable producer/consumer extraction: CALL SYMPUT/SYMPUTX and PROC SQL
 # INTO create a macro variable as a side effect rather than via %LET.
@@ -443,8 +441,8 @@ def _extract_sql_into_vars(text: str) -> list[str]:
 _DATASET_KINDS = frozenset(
     {SasChunkKind.DATA_STEP, SasChunkKind.PROC_STEP, SasChunkKind.MACRO_DEFINITION}
 )
-# An ODS OUTPUT statement, and the ones that end its requests.
-_ODS_OUTPUT_RE = re.compile(r"ods\s+output\b", re.IGNORECASE)
+# An ODS OUTPUT statement is _ODS_OUTPUT_RE (from chunker.statements, which
+# reads it); these are the ones that end its requests.
 _ODS_OUTPUT_END_RE = re.compile(
     r"ods\s+(?:output\s+(?:close|clear)|_all_\s+close)\b", re.IGNORECASE
 )
@@ -488,7 +486,9 @@ def _metadata_for(region: _Region) -> SasChunkMetadata:
             for t in scan.tables
         ]
     # ── a %MACRO's parameters: position, or -1 for a keyword parameter ──────
-    params = macro_signature(text) if kind == SasChunkKind.MACRO_DEFINITION else []
+    # Read from cf: a /* */ comment inside the parameter list is part of its
+    # CODE unit, and only cf has it blanked.
+    params = macro_signature(cf) if kind == SasChunkKind.MACRO_DEFINITION else []
     param_names = [name for name, _ in params]
     param_pos: dict[str, int] = {}
     positional = 0
@@ -954,8 +954,15 @@ def _resolve_path(ref: SasPathRef, texts: Mapping[str, str]) -> SasPathRef:
 
 def _resolve_paths(refs: list[SasPathRef], texts: Mapping[str, str]) -> list[SasPathRef]:
     """*refs* with every place spelled through a macro variable worked out —
-    see :func:`_resolve_path`. One written out in full is left as it is."""
-    return [_resolve_path(r, texts) if "&" in r.raw else r for r in refs]
+    see :func:`_resolve_path`. One written out in full is left as it is, and
+    so is a single-quoted value, where SAS reads ``&`` as a character: such a
+    reference never had ``has_macro_ref`` set, nor a ``resolved_path``."""
+    return [
+        _resolve_path(r, texts)
+        if "&" in r.raw and (r.has_macro_ref or r.resolved_path is not None)
+        else r
+        for r in refs
+    ]
 
 
 def _resolve_name(name: str, table: Mapping[str, str]) -> str:
@@ -1527,6 +1534,8 @@ def _libname_tables(
     for names, access in ((reads, DbTableAccess.READ), (writes, DbTableAccess.WRITE)):
         for name in names:
             libref = _libref_of(name)
+            # A list (`edw.acct_:`, `edw.:`) is recorded as written: which
+            # tables it covers only the database knows.
             if libref is None or libref not in engines:
                 continue
             ref, db_schema = engines[libref]
@@ -1631,10 +1640,11 @@ def resolve_ods_outputs(chunks: list[SasChunk]) -> None:
     ``ods output Summary=sumstats;`` asks the next procedure for its Summary
     table: the PROC MEANS after it writes work.sumstats, not the ODS statement.
     The statement's requests — WRITE references with ``via="ods_output"`` —
-    move to the next PROC_STEP of the same file: its chunk and the chunks it
-    was split into. ``ods output close|clear`` or ``ods _all_ close`` before
-    any PROC cancels them; each stays on its statement as a MENTION, named but
-    never written. A request nothing takes or cancels stays as it is.
+    move to the next PROC_STEP of the same file, or the next call of a macro
+    whose body runs a PROC: its chunk and the chunks it was split into.
+    ``ods output close|clear`` or ``ods _all_ close`` before any PROC cancels
+    them; each stays on its statement as a MENTION, named but never written. A
+    request nothing takes or cancels stays as it is.
 
     Moving is idempotent: a request once moved or cancelled is no longer a
     WRITE on its statement, so the corpus-level run finds none to move. An ODS
@@ -1644,6 +1654,25 @@ def resolve_ods_outputs(chunks: list[SasChunk]) -> None:
 
     def requested(ref: SasDatasetRef) -> bool:
         return ref.via == "ods_output" and ref.role is DatasetRole.WRITE
+
+    # A call of a macro whose body runs a PROC takes the requests too: the
+    # PROC it runs is the next one. A macro the corpus does not define is
+    # passed over, as nothing says it runs one.
+    runs_proc = {
+        c.metadata.macro_name
+        for c in chunks
+        if c.kind is SasChunkKind.MACRO_DEFINITION
+        and c.parent_id is None
+        and c.metadata.macro_name
+        and _RUNS_PROC_RE.search(_sanitise(c.text))
+    }
+
+    def runs_a_proc(chunk: SasChunk) -> bool:
+        if chunk.kind is SasChunkKind.PROC_STEP:
+            return True
+        return chunk.kind is SasChunkKind.MACRO_CALL and any(
+            name in runs_proc for name in chunk.metadata.invokes_macros
+        )
 
     pending: list[int] = []  # ODS statements whose requests wait for a PROC
     source: str | None = None
@@ -1673,11 +1702,7 @@ def resolve_ods_outputs(chunks: list[SasChunk]) -> None:
                 pending = []
             elif any(map(requested, chunk.metadata.dataset_refs)):
                 pending.append(idx)
-        elif (
-            chunk.kind is SasChunkKind.PROC_STEP
-            and chunk.parent_id is None
-            and pending
-        ):
+        elif chunk.parent_id is None and pending and runs_a_proc(chunk):
             taken = tuple(
                 ref
                 for i in pending
@@ -1697,6 +1722,10 @@ def resolve_ods_outputs(chunks: list[SasChunk]) -> None:
                     f"{[ref.name for ref in taken]}"
                 )
             claimed_by, pending = chunk.chunk_id, []
+
+
+# A PROC step a %MACRO body runs: `proc` opening a statement.
+_RUNS_PROC_RE = re.compile(r"(?:\A|;)\s*proc\s+[A-Za-z_]", re.IGNORECASE)
 
 
 # A FILENAME statement's fileref: `filename in '/x';` binds it, and one with no

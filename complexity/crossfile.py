@@ -132,6 +132,63 @@ def _owners(index: dict[str, set[str]], name: str, exclude: str) -> list[str]:
     return sorted(index.get(name.lower(), set()) - {exclude})
 
 
+# Dataset lists, by the rules chunker.batcher follows: `lib.sales_:` reads every
+# dataset whose name starts `lib.sales_`, `tgt.:` written by a whole-library
+# COPY creates every member of tgt, and a whole library read (`src.:`, from a
+# COPY or CONTENTS _ALL_) names no dataset anyone depends on for it.
+
+
+def _whole_library(name: str) -> bool:
+    """Whether *name* is the list of a whole library: ``src.:``."""
+    return name.endswith(".:")
+
+
+def _lists(index: dict[str, set[str]]) -> tuple[str, ...]:
+    """The dataset lists among *index*'s names, found once per corpus so a
+    lookup by exact name checks only them."""
+    return tuple(name for name in index if name.endswith(":"))
+
+
+def _dataset_creators(
+    index: dict[str, set[str]], lists: tuple[str, ...], name: str
+) -> set[str]:
+    """The files that create dataset *name* (lowercased), lists included: by
+    name, or as a member of a list they write (*lists*); for a list read,
+    every dataset under it."""
+    found = set(index.get(name, ()))
+    if name.endswith(":"):
+        prefix = name[:-1]
+        for written, files in index.items():
+            if written.startswith(prefix):
+                found |= files
+    else:
+        prefix = name
+    for written in lists:
+        if prefix.startswith(written[:-1]):
+            found |= index[written]
+    return found
+
+
+def _dataset_readers(
+    index: dict[str, set[str]], lists: tuple[str, ...], name: str
+) -> set[str]:
+    """The files that read dataset *name*, lists included: by name, or through
+    a list covering it (*lists*); for a list created, every dataset read under
+    it. A whole library read is no one's reader."""
+    key = name.lower()
+    found = set(index.get(key, ()))
+    if key.endswith(":"):
+        prefix = key[:-1]
+        for read, files in index.items():
+            if read.startswith(prefix) and not _whole_library(read):
+                found |= files
+        return found
+    for read in lists:
+        if not _whole_library(read) and key.startswith(read[:-1]):
+            found |= index[read]
+    return found
+
+
 def _named(files: Iterable[str], names: Mapping[str, str]) -> str:
     """*files* as a comma-separated list of display names.
 
@@ -230,14 +287,18 @@ class CrossFileIndex:
         # Resolved once for the whole corpus, because that is the only scope in
         # which "is this name ambiguous?" has an answer.
         index.names = display_names(sources)
+        producers = _Producers(macros, datasets, macrovars, librefs, _lists(datasets))
+        consumers = _Consumers(
+            macro_users, dataset_users, macrovar_users, _lists(dataset_users)
+        )
 
         for chunk in chunk_list:
             source = chunk.source_id or _INLINE
             refs = index._resolve_chunk(
                 chunk,
                 source,
-                producers=_Producers(macros, datasets, macrovars, librefs),
-                consumers=_Consumers(macro_users, dataset_users, macrovar_users),
+                producers=producers,
+                consumers=consumers,
                 multi=multi,
                 names=index.names,
             )
@@ -334,9 +395,12 @@ class CrossFileIndex:
         # ── datasets read or updated here but created elsewhere ──────────────
         for dataset in meta.input_datasets:
             key = dataset.lower()
-            if source in datasets.get(key, set()):
+            if _whole_library(key):
+                continue  # a whole library names no dataset to depend on
+            creators = _dataset_creators(datasets, producers.dataset_lists, key)
+            if source in creators:
                 continue
-            peers = _owners(datasets, key, source)
+            peers = sorted(creators - {source})
             if peers:
                 refs.append(
                     CrossFileRef(
@@ -358,7 +422,10 @@ class CrossFileIndex:
 
         # ── datasets created here and read (or updated) elsewhere ────────────
         for dataset in meta.created_datasets:
-            users = _owners(consumers.datasets, dataset, source)
+            users = sorted(
+                _dataset_readers(consumers.datasets, consumers.dataset_lists, dataset)
+                - {source}
+            )
             if users:
                 refs.append(
                     CrossFileRef(
@@ -493,20 +560,24 @@ class CrossFileIndex:
 
 
 class _Producers(NamedTuple):
-    """Which files create each macro, dataset, macro variable, and libref."""
+    """Which files create each macro, dataset, macro variable, and libref;
+    and the dataset lists among the datasets (see :func:`_lists`)."""
 
     macros: dict[str, set[str]]
     datasets: dict[str, set[str]]
     macrovars: dict[str, set[str]]
     librefs: dict[str, set[str]]
+    dataset_lists: tuple[str, ...] = ()
 
 
 class _Consumers(NamedTuple):
-    """Which files read each macro, dataset, and macro variable."""
+    """Which files read each macro, dataset, and macro variable; and the
+    dataset lists among the datasets."""
 
     macros: dict[str, set[str]]
     datasets: dict[str, set[str]]
     macrovars: dict[str, set[str]]
+    dataset_lists: tuple[str, ...] = ()
 
 
 def _build_profile(

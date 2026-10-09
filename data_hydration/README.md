@@ -63,7 +63,13 @@ produces, never sources.
 - **Blocked, not guessed:** a connection whose engine is unknown (its `CONNECT`
   made by a macro call), a `@dblink` (the table lives in the *linked* database),
   and an unresolved `&macro` in the table name, alongside the usual option
-  check.
+  check. A database other than Oracle (Teradata, DB2, …) is planned through
+  the SQL path so the plan lists it, and blocked: the one SQL reader speaks
+  Oracle.
+- **A list of tables is one item, named by the operator.** `set edw.acct_:;`
+  reads every table whose name starts `acct_`, and `proc copy in=edw` every
+  table there is; which those are only the database knows. The list is planned
+  as it is written, with no target and a blocker saying what it covers.
 - **Credentials** are keyed on the libref, or for pass-through on the
   connection alias (`oracle_password_<alias>`).
 - **Names arrive resolved** when the corpus says what their macro variables

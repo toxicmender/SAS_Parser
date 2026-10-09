@@ -1309,6 +1309,46 @@ class TestUpdatesAcrossFiles(unittest.TestCase):
         self.assertEqual(job1.updated_datasets, ["audit.log"])
 
 
+class TestDatasetListsAcrossFiles(unittest.TestCase):
+    """A dataset list links files as chunker.batcher links chunks: `lib.pre:`
+    covers every dataset whose name starts so, and a whole-library COPY
+    creates every member of its output library."""
+
+    FILES = dict(
+        copy="proc copy in=src out=tgt; run;\n",
+        member="data work.x; set tgt.members; run;\n",
+        months="data stage.sales_jan; set raw.j; run;\n"
+        "data stage.sales_feb; set raw.f; run;\n",
+        year="data work.all; set stage.sales_:; run;\n",
+    )
+
+    def setUp(self):
+        self.report = ComplexityAnalyzer().analyze_corpus(_corpus(**self.FILES))
+
+    def _profile(self, source_id: str):
+        profile = _file(self.report, source_id).cross_file
+        assert profile is not None
+        return profile
+
+    def test_a_member_of_a_copied_library_comes_from_the_copy(self):
+        member = self._profile("member.sas")
+        self.assertEqual(member.depends_on, ["copy.sas"])
+        self.assertIn("tgt.members written by copy.sas", member.imports)
+        self.assertEqual(self._profile("copy.sas").depended_on_by, ["member.sas"])
+
+    def test_a_prefix_list_reads_every_dataset_it_covers(self):
+        self.assertEqual(self._profile("year.sas").depends_on, ["months.sas"])
+        self.assertEqual(
+            self._profile("months.sas").exports,
+            ["stage.sales_jan read by year.sas", "stage.sales_feb read by year.sas"],
+        )
+
+    def test_a_whole_library_read_names_no_dataset(self):
+        # COPY reads src.: — every member of src, none of them a dataset any
+        # file is expected to write.
+        self.assertNotIn("dataset_unresolved", _cross_names(_file(self.report, "copy.sas")))
+
+
 class TestFileComplexity(unittest.TestCase):
     """The file rollup, and how it renders."""
 

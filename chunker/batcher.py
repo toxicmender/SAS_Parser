@@ -20,7 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .keywords import _STANDARD_AUTOCALL_MACROS
-from .macro_vars import _parse_call_args
+from .macro_vars import _parse_call_args, resolve_refs
 from .metadata import _canon_ds, resolve_references
 from .models import (
     DatasetRole,
@@ -450,8 +450,9 @@ def replace_dataset_names(
 
     def _map_chunk(chunk: SasChunk) -> SasChunk:
         # Every dataset reference but a macro parameter's (the call site
-        # supplies that one); referenced_datasets is raw-source provenance and
-        # keeps the SAS spelling.
+        # supplies that one). The views follow — referenced_datasets lists the
+        # target names; referenced_librefs leaves them out, since a catalog is
+        # no libref — and each reference's `raw` keeps the SAS spelling.
         meta = chunk.metadata.map_dataset_names(
             lambda ref: _map_ds(ref.name, exact, by_libref)
         )
@@ -987,6 +988,10 @@ class _EdgeDiscovery:
                 val = _resolve(ref.param, ref.param_pos)
                 if not val:
                     continue
+                if ref.name != f"&{ref.param}":
+                    # A name built around the parameter: `&lib..customers`
+                    # with lib=prod is prod.customers.
+                    val = resolve_refs(ref.name, {ref.param: val})
                 val = val if "&" in val else _canon_ds(val)
                 resolved.append(SasDatasetRef(name=val, role=ref.role, via="macro_call"))
                 if logger.isEnabledFor(logging.DEBUG):

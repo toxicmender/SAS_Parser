@@ -255,22 +255,23 @@ def statements_of(
                 step_end = not (run_groups and ended.group(1))
         elif keyword == "%mend":
             depth = max(0, depth - 1)
-            context = OPEN
+            context, run_groups = OPEN, False
         elif keyword == "data" or keyword == "proc" or keyword == "%macro":
             normed = _norm(s_mt)
             kind = _classify_normed(normed)
             if kind is SasChunkKind.MACRO_DEFINITION:
                 depth += 1
-                context = OPEN
+                context, run_groups = OPEN, False
             elif kind is SasChunkKind.DATA_STEP and not (context == PROC and proc == "ds2"):
-                context, proc = DATA, ""
+                # A DATA step ends at its RUN, whatever PROC ran before it.
+                context, proc, run_groups = DATA, "", False
             elif kind is SasChunkKind.PROC_STEP:
                 name = _PROC_NAME_RE.match(normed)
                 context, proc = PROC, name.group(1) if name else ""
                 run_groups = proc in RUN_GROUP_PROCS
         yield Statement(s_mt, s_cf, keyword, context, proc, macro_body or depth > 0)
         if step_end:
-            context, proc = OPEN, ""
+            context, proc, run_groups = OPEN, "", False
 
 
 # ---------------------------------------------------------------------------
@@ -812,6 +813,10 @@ _REF_MACRO_VAR = "macro_var"  # macro variables, none of them this macro's own
 _VAR_REF_RE = re.compile(r"&(\w+)\.?")
 
 
+# A reference that is one macro variable and nothing else: `&ds`, `&ds.`.
+_WHOLE_PARAM_RE = re.compile(r"&[A-Za-z_]\w*\.?")
+
+
 def _classify_ref(raw: str, param_pos: Mapping[str, int]) -> tuple[str, str]:
     """
     Classify a raw dataset reference extracted from a macro body.
@@ -850,14 +855,19 @@ def _body_ref(
     if kind == _REF_CALL_SITE:
         return None
     if kind == _REF_PARAM:
+        # The parameter itself (`&ds`), or a name built around it
+        # (`&lib..customers`), which keeps its spelling for the call site to
+        # fill in: the parameter's argument alone would name another dataset.
+        whole = _WHOLE_PARAM_RE.fullmatch(op.raw.strip()) is not None
         return SasDatasetRef(
-            f"&{key}",
+            f"&{key}" if whole else op.name,
             role,
             raw=op.raw,
             via=via,
             in_macro_body=True,
             param=key,
             param_pos=param_pos[key],
+            pattern=op.pattern,
         )
     return SasDatasetRef(
         op.name, role, raw=op.raw, via=via, in_macro_body=True, pattern=op.pattern
@@ -916,6 +926,7 @@ def dataset_refs(
     # (PROC DATASETS's LIB=, PROC COPY's SELECT).
     step: _ProcStep | None = None
     step_in_macro = False
+    group_start = 0  # where the open PROC step's (or run group's) refs begin
     data_start: int | None = None  # where the open DATA step's refs begin
     modifies = False  # and whether it has a MODIFY statement
     for st in statements_of(units, mt, cf, macro_body=macro_body):
@@ -926,15 +937,28 @@ def dataset_refs(
         if step is not None and (st.context != PROC or st.keyword == "proc"):
             add(step.close(), step_in_macro)
             step = None
+        # RUN CANCEL: SAS compiles the step (or a run-group PROC's current
+        # group) and runs none of it, so it reads and writes nothing.
+        cancel = st.keyword == "run" and _norm(st.mt).startswith("run cancel")
         if st.context == PROC:
             if step is None:
                 step, step_in_macro = _ProcStep(st.proc), st.in_macro
-            add(step.read(st), st.in_macro)
+                group_start = len(refs)
+            if cancel:
+                del refs[group_start:]
+                step = _ProcStep(st.proc)  # and nothing pending at its close
+            else:
+                add(step.read(st), st.in_macro)
+                if st.keyword == "run":
+                    group_start = len(refs)
         else:
             if st.context == DATA:
                 if data_start is None:
                     data_start = len(refs)
                 modifies = modifies or st.keyword == "modify"
+                if cancel:
+                    del refs[data_start:]
+                    continue
             add(_statement_refs(st), st.in_macro)
     if data_start is not None and modifies:
         close_data_step(data_start)

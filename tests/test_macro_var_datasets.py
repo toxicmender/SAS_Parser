@@ -247,6 +247,13 @@ class TestMacroSignature(unittest.TestCase):
         self.assertEqual(macro_signature("%macro m;"), [])
         self.assertEqual(macro_signature("data a; run;"), [])
 
+    def test_comments_in_the_parameter_list_are_no_parameters(self):
+        (chunk,) = _chunk(
+            "%macro load(lib=, /* the library */ tbl= /* its table */);\n"
+            "  data &lib..&tbl; run;\n%mend;\n"
+        ).chunks
+        self.assertEqual(chunk.metadata.macro_param_names, ["lib", "tbl"])
+
 
 class TestIsDatasetShaped(unittest.TestCase):
     def test_two_level_names(self):

@@ -86,6 +86,17 @@ def test_a_run_group_proc_ends_only_at_quit():
     ]
 
 
+def test_a_data_step_after_a_run_group_proc_ends_at_its_own_run():
+    # Running in groups is the PROC's rule, and ends with it.
+    src = "proc sql; drop table a; quit; data b; set c; run; x = 1;"
+    assert [(kw, ctx) for kw, ctx, _, _ in _statements(src)][-4:] == [
+        ("data", DATA),
+        ("set", DATA),
+        ("run", DATA),
+        ("x", OPEN),
+    ]
+
+
 def test_proc_ds2_keeps_its_own_data_programs():
     src = "proc ds2; data out; method run(); set in; end; enddata; run; quit;"
     assert {(ctx, proc) for _, ctx, proc, _ in _statements(src)} == {(PROC, "ds2")}
@@ -349,6 +360,14 @@ def test_proc_datasets_kill_deletes_every_member():
     assert _refs("proc datasets lib=kill nolist; delete a; quit;") == [("kill.a", D, "delete")]
 
 
+def test_run_cancel_runs_nothing():
+    assert _refs("data a; set b; run cancel;") == []
+    assert _refs("proc print data=a; run cancel;") == []
+    # A PROC that runs in groups loses the cancelled group only.
+    src = "proc datasets lib=work nolist; delete t1; run; delete t2; run cancel; quit;"
+    assert _refs(src) == [("work.t1", D, "delete")]
+
+
 def test_a_macro_library_keeps_its_delimiter_dot():
     assert _refs("proc datasets lib=&lib; delete a; quit;") == [("&lib..a", D, "delete")]
 
@@ -402,6 +421,21 @@ def test_ods_output_in_open_code_is_written_by_the_next_proc():
     before = [c.metadata.dataset_refs for c in chunks]
     resolve_references(chunks)  # the batcher's corpus-level run
     assert [c.metadata.dataset_refs for c in chunks] == before
+
+
+def test_ods_output_before_a_macro_call_is_written_by_the_proc_it_runs():
+    src = (
+        "%macro fit(data=);\n  proc reg data=&data; model y = x; run; quit;\n%mend;\n"
+        "ods output ParameterEstimates=pe;\n%fit(data=work.train);\n"
+        "proc print data=work.other; run;\n"
+    )
+    *_, call, proc = _CHUNKER.chunk_text(src).chunks
+    assert (call.kind, call.metadata.output_datasets) == (SasChunkKind.MACRO_CALL, ["work.pe"])
+    assert proc.metadata.output_datasets == []
+    # A macro the corpus does not define runs nothing anyone can see.
+    src = "ods output Summary=s;\n%elsewhere(x);\nproc means data=a; run;\n"
+    *_, call, proc = _CHUNKER.chunk_text(src).chunks
+    assert (call.metadata.output_datasets, proc.metadata.output_datasets) == ([], ["work.s"])
 
 
 def test_ods_output_in_a_macro_body_is_the_bodys():
@@ -469,6 +503,24 @@ def test_a_body_reference_is_a_parameter_a_literal_or_a_macro_variable():
     # built from several parameters names no dataset until a call does.
     assert meta.body_literal_inputs == ["lib.x", "&other"]
     assert (meta.input_datasets, meta.output_datasets) == ([], [])
+
+
+def test_a_name_built_around_one_parameter_keeps_its_spelling():
+    # The call site fills it in: lib=prod reads prod.customers, not prod.
+    meta = _body("%macro m(lib);\n  data work.out; set &lib..customers; run;\n%mend;\n")
+    assert [(r.name, r.param, r.param_pos) for r in meta.dataset_refs if r.param] == [
+        ("&lib..customers", "lib", 0)
+    ]
+    assert meta.body_param_inputs == [{"param": "lib", "pos": 0}]
+
+
+def test_a_body_step_after_a_run_group_proc_ends_at_its_run():
+    # Else the DATA step would run on to %mend and swallow the call after it.
+    meta = _body(
+        "%macro m;\n  proc sql; create table ids as select id from lib.a; quit;\n"
+        "  data ids2; set ids; run;\n  %summarize(data=ids2, out=summary);\n%mend;\n"
+    )
+    assert meta.body_literal_outputs == ["work.ids", "work.ids2", "work.summary"]
 
 
 def test_a_quoted_path_built_from_a_parameter_names_no_dataset():

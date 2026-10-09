@@ -130,9 +130,44 @@ def _oracle_source(ref: "SasEngineRef", source_id: str | None) -> HydrationSourc
 
 
 #: Engines with a :class:`SourceKind` of their own. Everything else is planned
-#: as ``ORACLE`` — the SQL path — because the shape of the work is the same and
-#: the plan records the real engine in ``options``.
+#: as ``ORACLE`` — the SQL path, the shape of the work being the same — and
+#: blocked by :func:`_engine_blocker`, since only the Oracle reader exists.
 _ENGINE_KINDS = frozenset({"oracle"})
+
+
+def _engine_blocker(engine: str | None) -> tuple[str, ...]:
+    """A blocker for a database no reader here connects to.
+
+    Teradata, DB2, SQL Server and the rest are planned through the SQL path so
+    the plan lists them, but the one SQL reader speaks Oracle: run as planned,
+    it would query the configured Oracle connection for a table that lives
+    somewhere else.
+    """
+    if engine is None or engine in _ENGINE_KINDS:
+        return ()
+    return (
+        f"a {engine} database: the hydration readers connect to Oracle only — "
+        f"load this table with a {engine} reader, or point the source at an "
+        f"Oracle copy",
+    )
+
+
+def _list_blocker(ref: "SasDbTableRef") -> tuple[str, ...]:
+    """A blocker for a read of a list of tables.
+
+    ``set edw.acct_:;`` reads every table whose name starts ``acct_``, and
+    ``proc copy in=edw`` every table there is (``edw.:``). Which tables those
+    are only the database knows, so the list is one item, planned to no table.
+    """
+    if not ref.table.endswith(":"):
+        return ()
+    tables = f"every {ref.db_schema or 'default-schema'} table"
+    if prefix := ref.table[:-1]:
+        tables += f" whose name starts '{prefix}'"
+    return (
+        f"{ref.raw} reads a list of tables — {tables}: the plan cannot name them "
+        f"without asking the database; list the tables the job needs",
+    )
 
 
 def _db_table_source(
@@ -166,6 +201,9 @@ def _db_table_source(
             f"linked database, not the one this connection reaches — point the "
             f"source at that database"
         )
+    if ref.engine is not None:
+        blockers.extend(_engine_blocker(ref.engine))
+    blockers.extend(_list_blocker(ref))
     source = HydrationSource(
         kind=SourceKind(ref.engine) if ref.engine in _ENGINE_KINDS else SourceKind.ORACLE,
         locator=options.get("path", "") or options.get("server", ""),
@@ -187,7 +225,9 @@ def _path_source(ref: "SasPathRef", source_id: str | None) -> HydrationSource | 
     Being selective here is what keeps the plan an inventory of *data* rather
     than of every string in the corpus.
     """
-    if ref.statement in {"include", "ods", "sasautos", "file", "proc_export"}:
+    # Where a job writes (FILE, PROC EXPORT, ODS, PROC PRINTTO's log and
+    # listing) and the SAS it pulls in are no data to load.
+    if ref.statement in {"include", "ods", "sasautos", "file", "proc_export", "printto"}:
         return None
     # ``infile in;`` reads through a fileref, at the path its FILENAME names
     # (chunker.metadata.resolve_filerefs): that FILENAME's own reference is
@@ -300,6 +340,10 @@ def _target_for(
     """
     schema_name = config.schema or source.libref
     table_name = source.object_name
+    if source.connection is not None and table_name.endswith(":"):
+        # A list of tables has a target per table, so none of its own; its
+        # blocker (_list_blocker) says why.
+        return (UNRESOLVED_TARGET, ())
     if source.connection is not None and "." in table_name:
         # A database table is owner.table: the table part names the target, and
         # the owner stands in for the schema when there is no libref to keep —
@@ -341,7 +385,7 @@ def _sources_for(
     schema-level item, which stands in when no table is known, is left out.
     """
     sources: list[tuple[HydrationSource, tuple[str, ...]]] = [
-        (_oracle_source(ref, source_id), ())
+        (_oracle_source(ref, source_id), _engine_blocker(ref.engine))
         for ref in engine_refs
         if (ref.binds, ref.options) not in named
     ]

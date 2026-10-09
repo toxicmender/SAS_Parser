@@ -145,12 +145,15 @@ def _build_plan(args: argparse.Namespace, config: HydrationConfig) -> HydrationP
             engine_refs = [r for r in engine_refs if r.binds in wanted]
             path_refs = [r for r in path_refs if (r.binds or "") in wanted]
             db_tables = [t for t in db_tables if t.connection in wanted]
-        if engine_refs or path_refs:
+        # Every file that names external data takes its place in corpus order,
+        # a file that only reads database tables too: the first file to read
+        # a shared table owns its item.
+        if engine_refs or path_refs or db_tables:
             by_source[source_id] = (engine_refs, path_refs)
         if db_tables:
             db_by_source[source_id] = db_tables
     logger.info(
-        f"_build_plan: {len(by_source.keys() | db_by_source.keys())} file(s) name external data"
+        f"_build_plan: {len(by_source)} file(s) name external data"
     )
     return build_corpus_plan(
         by_source, db_tables=db_by_source, config=config, probe=None

@@ -269,6 +269,20 @@ class TestMacroInvocation(unittest.TestCase):
         self.assertIn("clean", batch.defined_macros)
         self.assertEqual(len(batch.chunks), 2)
 
+    def test_a_name_built_around_one_parameter_resolves_at_the_call(self):
+        """&lib..customers with lib=prod reads prod.customers, not prod."""
+        src = (
+            "data prod.customers; x = 1; run;\n"
+            "%macro m(lib);\n  data work.out; set &lib..customers; run;\n%mend;\n"
+            "%m(prod);\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual((len(br.batches), len(br.singletons)), (1, 0))
+        self.assertIn(
+            "macro_body_dataset(prod.customers): chunk-0001 → chunk-0003",
+            br.batches[0].reason,
+        )
+
     def test_macro_def_two_callsites_globals_batch(self):
         """One macro definition + two independent call sites: the definition
         is consumed by two separate components, so it is promoted to the
@@ -671,21 +685,16 @@ class TestComplexPrograms(unittest.TestCase):
         Two macro definitions + two call sites + a downstream PROC.
 
         Static analysis result (with parameterised macro-body resolution):
-          batch-1: %macro load + %load(work, '/a.csv')
-                   — &lib..raw is a *compound* reference (parameter 'lib'
-                     concatenated with literal suffix '.raw'); this is
-                     intentionally left unresolved rather than guessing,
-                     so %load does not link to anything downstream.
-          batch-2: %macro clean + %clean(work.raw) + proc print data=work.raw
-                   — &ds. inside %clean is a *single* parameter reference,
-                     fully resolved to 'work.raw' at the call site, which
-                     correctly links the call to the downstream PROC PRINT.
+          - &lib..raw in %load is a name built around one parameter: the call
+            %load(work, '/a.csv') fills it in, so the call writes work.raw.
+          - &ds. in %clean is the parameter itself, so %clean(work.raw) reads
+            and rewrites work.raw, after %load wrote it.
+          - proc print data=work.raw reads what %clean left.
 
-        This demonstrates the mixed literal/parameterised resolution
-        strategy: simple single-variable parameter references resolve
-        correctly across files/call-sites, while compound concatenated
-        references (var + literal suffix, e.g. &lib..raw) are left
-        unresolved rather than silently producing a wrong dataset name.
+        So the whole program is one batch: each call site links to the next
+        through work.raw, and each definition to its call. A name built from
+        several parameters (&lib..&tbl) is still left alone, since no single
+        argument names it.
         """
         src = (
             "%macro load(lib, file);\n"
@@ -700,18 +709,13 @@ class TestComplexPrograms(unittest.TestCase):
             "proc print data=work.raw; run;\n"
         )
         _, br = _chunk_and_batch(src)
-        self.assertEqual(len(br.batches), 2)
+        self.assertEqual(len(br.batches), 1)
         self.assertEqual(len(br.singletons), 0)
-        all_def_macros = {mac for b in br.batches for mac in b.defined_macros}
-        self.assertIn("load", all_def_macros)
-        self.assertIn("clean", all_def_macros)
-        total = sum(len(b.chunks) for b in br.batches) + len(br.singletons)
-        self.assertEqual(total, 5)
-        # The %clean batch must now include the downstream PROC PRINT,
-        # since &ds. resolves to 'work.raw' at the call site.
-        clean_batch = next(b for b in br.batches if "clean" in b.defined_macros)
-        self.assertEqual(len(clean_batch.chunks), 3)
-        self.assertIn("work.raw", clean_batch.reason)
+        [batch] = br.batches
+        self.assertEqual(set(batch.defined_macros), {"load", "clean"})
+        self.assertEqual(len(batch.chunks), 5)
+        # %load's call writes work.raw (lib=work), which %clean's call reads.
+        self.assertIn("macro_body_dataset(work.raw)", batch.reason)
 
     def test_proc_sql_subquery_chain(self):
         """PROC SQL that references a table built by a prior DATA step."""
@@ -1165,6 +1169,13 @@ class TestDatabricksMapping(unittest.TestCase):
         _, br = _chunk_and_batch(src, databricks_mapping=self.MAPPING)
         batch = br.batches[0]
         self.assertEqual(batch.output_datasets, ["dev.staging.clean"])
+
+    def test_a_mapped_name_brings_no_catalog_into_the_librefs(self):
+        """A three-level name is Databricks's: its catalog is no SAS libref."""
+        _, br = _chunk_and_batch(self.SRC, databricks_mapping=self.MAPPING)
+        meta = br.batches[0].chunks[0].metadata
+        self.assertEqual(meta.referenced_datasets, ["dev.staging.clean", "prod.sales.raw"])
+        self.assertEqual(meta.referenced_librefs, [])
 
     def test_input_chunk_result_not_mutated(self):
         cr, _ = _chunk_and_batch(self.SRC, databricks_mapping=self.MAPPING)

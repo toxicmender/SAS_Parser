@@ -184,6 +184,7 @@ class TestPathSources:
             "filename mail email 'ops@example.com';",  # a mailbox
             "filename cmd pipe 'ls -l';",  # a command line
             "ods html file='/reports/out.html';",  # a report destination
+            "proc printto log='/logs/job.log' print='/out/job.lst'; run;",  # the job's log
         ],
     )
     def test_references_that_move_no_data_are_not_items(self, source):
@@ -664,6 +665,44 @@ class TestDatabaseTables:
         assert "connection 'mydb' is unknown" in joined
         assert "database link 'prodlink'" in joined
 
+    def test_a_database_no_reader_connects_to_is_blocked(self):
+        # Planned through the SQL path so the plan lists it, but the one SQL
+        # reader speaks Oracle: run as planned, it would ask the wrong database.
+        _, _, tables = _db(
+            "proc sql;\nconnect to teradata (server=tdprod user=svc);\n"
+            "create table a as select * from connection to teradata\n"
+            "(select * from dw.accounts);\nquit;\n"
+        )
+        (item,) = build_plan(db_tables=tables, config=_config()).items
+        assert item.source.object_name == "dw.accounts"
+        assert "a teradata database" in item.blockers[0]
+        (item,) = _plan("libname td teradata server=tdprod schema=dw user=svc;").items
+        assert "a teradata database" in item.blockers[0]
+
+    def test_a_list_of_tables_is_one_item_for_the_operator_to_name(self):
+        source = (
+            "libname edw oracle path=EDWPRO schema=fr_dm;\n"
+            "data work.a; set edw.acct_: edw.orders; run;\n"
+            "proc copy in=edw out=work; run;\n"
+        )
+        engine_refs, path_refs, tables = _db(source)
+        plan = build_plan(
+            engine_refs, path_refs, db_tables=tables, config=_config(schema=None)
+        )
+        items = {i.source.object_name: i for i in plan.items}
+        assert sorted(items) == ["fr_dm.:", "fr_dm.acct_:", "fr_dm.orders"]
+        assert items["fr_dm.orders"].blockers == ()
+        # Which tables a list covers only the database knows: no target, and
+        # a blocker that says what the list is.
+        acct, every = items["fr_dm.acct_:"], items["fr_dm.:"]
+        assert (acct.target_table, every.target_table) == (UNRESOLVED_TARGET,) * 2
+        assert acct.blockers == (
+            "edw.acct_: reads a list of tables — every fr_dm table whose name starts "
+            "'acct_': the plan cannot name them without asking the database; list "
+            "the tables the job needs",
+        )
+        assert "every fr_dm table:" in every.blockers[0]
+
     def test_the_reader_selects_owner_and_table(self):
         from data_hydration.sources.oracle import OracleReader
 
@@ -721,6 +760,24 @@ class TestDatabaseTables:
             "edw_export.current_nonip",
             "fr_dm.accounts",
         ]
+
+    def test_the_cli_gives_a_shared_table_to_the_first_file_that_reads_it(self, tmp_path):
+        import argparse
+
+        from data_hydration.__main__ import _build_plan
+
+        # a_reads.sas reads only the table; b_both.sas reads a file as well.
+        (tmp_path / "a_reads.sas").write_text(PASS_THROUGH)
+        (tmp_path / "b_both.sas").write_text(
+            "data x; infile '/data/in.csv'; input a; run;\n" + PASS_THROUGH
+        )
+        args = argparse.Namespace(source_dir=tmp_path, pattern="*.sas", only=None)
+        plan = _build_plan(args, _config(schema=None))
+        owners = {
+            i.source.object_name: pathlib.Path(i.source.source_id or "").name
+            for i in plan.items
+        }
+        assert owners == {"edw_export.current_nonip": "a_reads.sas", "in": "b_both.sas"}
 
 
 class TestMacroResolvedTables:

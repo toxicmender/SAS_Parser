@@ -172,6 +172,15 @@ def test_a_value_known_only_at_run_time_stays_unresolved():
         assert (x.path, x.resolved) == ("&root/x.sas", False), src
 
 
+def test_a_single_quoted_path_is_the_file_named():
+    # Between single quotes SAS reads & as a character, so no %LET applies.
+    src = "%let root = /A;\n%include '&root/x.sas';\n%inc \"&root/y.sas\";\n"
+    assert [(f.path, f.resolved) for f in _files(src)] == [
+        ("&root/x.sas", True),
+        ("/A/y.sas", True),
+    ]
+
+
 def test_a_partly_resolved_path_shows_what_resolved():
     [x] = _files('%let root = /SAS;\n%include "&root/&sub/x.sas";\n')
     assert (x.path, x.resolved) == ("/SAS/&sub/x.sas", False)
