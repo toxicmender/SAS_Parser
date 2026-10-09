@@ -95,12 +95,15 @@ For running the work items end-to-end through an LLM, see the
 
 | File | Role |
 |------|------|
-| `models.py` | Pydantic models: `SasChunk` (+`Kind`), `SasChunkMetadata`, `SasChunkResult`, `SasCorpus`, `SasBatch`, `SasBatchResult`, `SasDiagnostic` (+`Severity`), `SasPathRef` (+`PathLocation`). |
+| `models.py` | Pydantic models: `SasChunk` (+`Kind`), `SasChunkMetadata` and its `SasDatasetRef` records (+`DatasetRole`), `SasChunkResult`, `SasCorpus`, `SasBatch`, `SasBatchResult`, `SasDiagnostic` (+`Severity`), `SasPathRef` (+`PathLocation`), `SasIncludeFile`, `SasEngineRef`, `SasDbTableRef` (+`DbTableAccess`, `DbTableVia`). |
 | `paths.py` | Where a physical path appears in SAS syntax — `PATH_STATEMENTS`, `classify_location`, `extract_paths`. The **single owner** of that grammar: `xref.pre` imports it to rewrite the same statements. |
 | `keywords.py` | SAS keyword catalogues transcribed from the SAS docs (reserved macro words, autocall macros, function / CALL-routine dictionaries, and `SAS_FUNCTION_CATEGORIES`) + the patterns compiled from them. Pure data; no package imports, no logging. |
-| `scanner.py` | Lexical layer: `_Unit` / `_Region` parse primitives, the statement classifier (`_classify`), text normalisation / sanitisation, line-offset helpers, and the `_Deadline` / `_ParseWatchdog` stuck-parser machinery. |
-| `macro_vars.py` | Macro-variable values and reference expansion: `let_values` (the `%LET` symbol table), `resolve_refs` (`&name` / `&name.` / `&&name&i`), and `DS_REF_TOKEN` — the single definition of a dataset token that may embed `&refs`. Pure; no package imports. |
-| `metadata.py` | Per-chunk semantic extraction: `_metadata_for`, `_io_for` (directed dataset I/O), `_macro_body_io` (literal vs parameterised body refs), symput / SQL-INTO / CALL EXECUTE extractors, `_merge_meta`, the extraction regex catalogue, and `resolve_macro_var_refs` (the whole-list macro-name resolution pass). |
+| `scanner.py` | Lexical layer: `_Unit` / `_Region` parse primitives and their `UnitRole` (code, comment, in-stream data, SUBMIT code), the statement classifier (`_classify`), where a macro call ends its statement (`_split_after_calls`), macro quoting (`_macro_quote_end`), in-stream blocks (`_in_stream_units`), text normalisation / sanitisation, line-offset helpers, and the `_Deadline` / `_ParseWatchdog` stuck-parser machinery. |
+| `macro_vars.py` | Macro-variable values and reference expansion: `let_values` (the `%LET` symbol table), `resolve_refs` (`&name` / `&name.` / `&&name&i`), `call_spans` (where back-to-back macro calls begin and end), `macro_signature` (a `%MACRO`'s parameters, read with balanced parentheses), and `DS_REF_TOKEN` — the single definition of a dataset token that may embed `&refs`. Pure; no package imports. |
+| `sql.py` | The one SQL grammar: `SqlStatement(text, dialect)`, a token walk that reads a statement's tables by clause and verb, and `split_table_name`. `Dialect.NATIVE` reads a database's own SQL for pass-through; `Dialect.SAS` reads PROC SQL and PROC FEDSQL and gives each table its role (`SqlStatement.refs`). |
+| `passthrough.py` | SQL pass-through — `CONNECT TO` / `CONNECTION TO` / `EXECUTE … BY` / `DISCONNECT`, and the native SQL inside them read by `sql.SqlStatement`: `scan_pass_through` (tables + the spans to mask), `mask`, `db_table_ref` (the one `SasDbTableRef` builder). The **single owner** of the pass-through statements. |
+| `statements.py` | What each statement does to the datasets it names: `statements_of` (a region's statements, each with where it stands — open code, a DATA step, a PROC, a `%MACRO` body), the operand lists they read, and `dataset_refs` (the region's `SasDatasetRef`s, a macro body's classified as parameter, literal or macro variable). The **single owner** of dataset positions, for steps and macro bodies alike; `_canon_ds` lives here. |
+| `metadata.py` | Per-chunk semantic extraction: `_metadata_for` (datasets from `statements.dataset_refs`, plus the macro, path, function and symput / SQL-INTO / CALL EXECUTE scans), `_merge_meta`, the extraction regex catalogue, and the whole-list resolution passes — `resolve_macro_var_refs`, `resolve_filerefs`, `resolve_ods_outputs`, `resolve_db_librefs`, composed in order by `resolve_references` (and across files by `resolve_corpus_references`). |
 | `chunker.py` | `SasSemanticChunker` orchestration (scan → group → build chunks, oversized-split with overlap). |
 | `batcher.py` | `_EdgeDiscovery` + Union-Find grouping, weak-edge resolution, context absorption, batch construction. `SasChunkBatcher` is a one-file convenience over `MultiFileBatcher`. |
 | `_repl.py` | `print_iterable` REPL helper (imported by nothing). |
@@ -113,8 +116,9 @@ For running the work items end-to-end through an LLM, see the
 > (`pipeline.max_merged_tokens`) on top. Two different questions, two units.
 
 **Import direction is strictly downward:** `keywords`, `macro_vars` and `models`
-import nothing from the package; `scanner`, `paths` and `metadata` import from
-them; `chunker.py` imports from all of them; `batcher` imports from `keywords`,
+import nothing from the package; `scanner` and `paths` import from them;
+`sql` imports from them, `passthrough` and `statements` from those; `metadata` imports from all of them;
+`chunker.py` imports from all of them; `batcher` imports from `keywords`,
 `metadata`, `models`.
 The package imports nothing from `memory`, `llm_client`, `prompt_builder`, or
 `pipeline` — it is a leaf the `pipeline` package builds on.
@@ -128,11 +132,39 @@ grammar-driven parser. It degrades gracefully on malformed source (emitting
 Replacing it with a full SAS grammar would be a rewrite, not a simplification —
 this is a considered decision, not an accident.
 
+- **Statement boundaries:** a statement ends at its semicolon — except a
+  macro call, which needs none: it ends at the parenthesis closing its
+  arguments, or at its name when it has none. The scanner cuts a unit there
+  when what follows opens a statement of its own (another call, any statement
+  `_classify` knows, a comment), so `%pull(tbl=a)` and `%pull(tbl=b)` on
+  consecutive lines are two calls, the `data x;` after them a step, and a call
+  just before `%MEND;` or `RUN;` no longer hides the terminator and leaves its
+  block open. `%vname(x) = 1;` — the call writes part of the statement — stays
+  whole, as do macro statements (`%mend m;`, `%symdel x;`), which run to their
+  semicolon. A call that ends the file is complete, not unterminated. Inside a
+  macro quoting function (`%STR`, `%NRSTR`, `%QUOTE`, `%NRQUOTE`, `%BQUOTE`,
+  `%NRBQUOTE`) a semicolon is text, so `%let sep = %str(;);` is one statement;
+  `%'`, `%"`, `%(` and `%)` are escapes there. An argument that never closes
+  quotes nothing.
+- **Statement roles (`UnitRole`):** every unit is CODE, COMMENT (a `/* */`
+  block, a `* …;` statement or a `%* …;` macro comment), DATALINES (the
+  in-stream data after `DATALINES`/`CARDS`/`LINES`/`PARMCARDS`, ended by the
+  first line holding a semicolon, or by a `;;;;` line for the `…4` forms) or
+  FOREIGN (another language's code from `SUBMIT` to the `ENDSUBMIT` line, in
+  PROC PYTHON, LUA, IML, …). Only CODE is SAS: the others never open or close
+  a block, a quote in them opens no string, and metadata reads the region with
+  them blanked (`_Region.code_text`), so commented-out code, data lines and
+  Python name no dataset, macro or path.
 - **Block collection rule:** only a new DATA / PROC / `%MACRO` header or an
-  explicit `RUN;` / `QUIT;` / `%MEND` closes the current block. FORMAT, OPTIONS,
-  LIBNAME, ODS, etc. inside a block body are collected, never treated as
-  boundaries. A `%MACRO` block closes only on its own (nesting-balanced)
-  `%MEND`.
+  explicit `RUN;` / `RUN CANCEL;` / `QUIT;` / `%MEND` closes the current block.
+  FORMAT, OPTIONS, LIBNAME, ODS, etc. inside a block body are collected, never
+  treated as boundaries, and a DATA or PROC keyword used as a variable
+  (`data = 1;`) is no header. A `%MACRO` block closes only on its own
+  (nesting-balanced) `%MEND`. A PROC in `keywords.RUN_GROUP_PROCS` (DATASETS,
+  REG, GLM, SQL, IML, …) runs in groups: `RUN;` does not end it, `QUIT;` does;
+  met by the next step or the end of the file after a `RUN;`, it ended at its
+  last `RUN;`, and what followed is open code again (no `UNCLOSED_*`). PROC DS2
+  holds DATA programs of its own, so their headers do not end it.
 - **Oversized splits:** a region exceeding `max_words` yields a *parent* chunk
   (full text) plus overlapping *child* chunks (`parent_id` set). The
   parent/child text redundancy is intentional context for the LLM. Child
@@ -144,9 +176,28 @@ this is a considered decision, not an accident.
   un-interruptible C-level regex call (catastrophic backtracking on hostile
   source). Pass `timeout=None` to disable both and parse unbounded.
 
+### What the chunker does not see
+
+Known limits, each a decision rather than an oversight:
+
+- **Other languages' code.** Code between SUBMIT and ENDSUBMIT (Python, R,
+  Lua, Groovy) is FOREIGN: whatever datasets it touches are not recorded.
+- **Remote WORK.** Statements inside RSUBMIT are recognised, but `work.x` on
+  the remote session is not told apart from the local WORK library.
+- **CAS actions.** PROC CAS action calls (`table.loadTable`, `casOut=`) name
+  no dataset.
+- **Code generated at run time.** CALL EXECUTE text and DOSUBL are not read
+  for datasets; only the macros a CALL EXECUTE invokes are recorded.
+- **A macro call as a `%THEN` action, with no semicolon after it.** `%if &x
+  %then %load(a)` followed by another statement does not end at the call, so
+  that statement is read as part of the `%IF`. In open code a DATA step
+  there loses its header.
+- **A full SAS grammar.** The scanner and statement-level extraction above
+  stay the design; see the start of this section.
+
 ### Metadata: stored vs computed
 
-`SasChunkMetadata` stores one field per concept. Five views are **computed
+`SasChunkMetadata` stores one field per concept. These views are **computed
 fields** derived at access time, not stored:
 
 - `referenced_automatic_vars` — the `&sys*` subset of `referenced_macro_vars`
@@ -157,13 +208,125 @@ fields** derived at access time, not stored:
   dependency).
 - `physical_paths` / `remote_paths` / `email_refs` — the `external_refs` entries
   whose `location` is `FILESYSTEM` / `REMOTE` / `EMAIL`.
-- `unresolved_dataset_refs` — the dataset names across `referenced_datasets`,
-  the I/O lists and `body_literal_*` that still hold a `&` (see below).
+- `include_files` — the SAS files the chunk's `%INCLUDE` statements read, as
+  `SasIncludeFile` records (see *External references*).
+- the dataset lists, views of `dataset_refs` (below), and
+  `unresolved_dataset_refs` — the dataset names that still hold a `&` (see
+  below).
 
-Both appear in `model_dump()` but are silently ignored as constructor kwargs,
+They appear in `model_dump()` but are silently ignored as constructor kwargs,
 and they do not appear in `__str__`. `defines_macros` / `invokes_macros` are the
 single authoritative macro fields (`invokes_macros` includes CALL
 EXECUTE-invoked macros).
+
+**Dataset references.** `dataset_refs` is the stored source of a chunk's
+dataset metadata: one `SasDatasetRef` per dataset named, with a `DatasetRole`
+(READ; WRITE — created or replaced; UPDATE — changed where it stands; DROP; or
+MENTION — named but not used), the statement or option that named it (`via`)
+and its spelling there (`raw`), whether it sits in a `%MACRO` body, and the
+parameter it is spelled through. Only a WRITE supplies a dataset to later
+steps: an UPDATE needs the table to exist, so it links to the table's creator
+like any reader (see *Batching*). The dataset lists are computed views of it,
+serialised under their usual keys:
+
+| View | References |
+|---|---|
+| `input_datasets` | READ and UPDATE, outside a macro body |
+| `output_datasets` | WRITE and UPDATE, outside a macro body, in source order (the last is `_LAST_`) |
+| `dropped_datasets` | DROP |
+| `body_literal_inputs` / `body_literal_outputs` | a macro body's, under names of their own |
+| `body_param_inputs` / `body_param_outputs` | a macro body's, through a parameter: `{"param", "pos"}` |
+| `referenced_datasets` | every name, whatever its role, sorted (a parameter as `&param`) |
+| `referenced_librefs` | the librefs of those names, plus `defines_librefs` |
+
+Two more views, `created_datasets` and `body_literal_created` (WRITE alone,
+outside and inside a macro body), are plain properties for the batcher and
+`complexity.crossfile`, never serialised.
+
+A rewrite changes the references, never a list:
+`SasChunkMetadata.map_dataset_names` renames or drops them (macro variables
+resolved, `_LAST_`/`_DATA_` made concrete, the Databricks mapping), and
+`add_dataset_refs` appends (a call's resolved datasets). `model_copy` refuses an
+`update` that names a view. The lists are still accepted as input, so JSON
+written before `dataset_refs` loads, and `SasChunkMetadata(input_datasets=[…])`
+builds the references behind it; a `referenced_datasets` name no other list
+holds becomes a MENTION.
+
+**Where datasets are read** (`statements.py`). A region is read one statement
+at a time, never as one stretch of text, and each statement knows where it
+stands: open code, a DATA step, a PROC (by name), inside a `%MACRO` or not —
+by the same header and terminator rules as block collection. A statement's
+core follows any `%IF … %THEN`, `%ELSE`, label, and in a DATA step `IF …
+THEN`, `ELSE`, `WHEN (…)` or `OTHERWISE`; a subsetting `IF` has none. Then:
+
+- **DATA step:** the DATA statement writes its datasets (not its `/ view=`
+  options; `_NULL_` is none); `SET`, `MERGE` and `UPDATE` read theirs; `MODIFY`
+  updates its master (UPDATE) and reads the rest, and then neither the DATA
+  statement nor an `OUTPUT` naming that master creates it; `OUTPUT` writes; a hash
+  object's quoted `dataset:` reads, or writes in `.output(…)`. An operand list
+  ends at an option (`end=`, `key=`, `nobs=`, `point=`, …), a `/` or the
+  statement's end, and skips each dataset's `(…)` options and macro calls.
+  `ds1-ds3` (and `m01-m10`) expands, up to 1,000 names; `lib.pre:` is one
+  pattern reference (`pattern=True`); a quoted path or `'name'n` is kept as
+  written, lowercased.
+- **PROC:** an option names what `keywords.PROC_OPTION_ROLES` says it names
+  in that PROC, over `PROC_OPTION_DEFAULTS` (`data=` reads; `out=`,
+  `outdata=`, `outest=`, `outstat=`, `outmodel=`, … write; `inmodel=`,
+  `testdata=`, `classdata=`, … read). A PROC's own entry adds options
+  (APPEND's `base=` is UPDATE, COMPARE's `compare=` and FORMAT's `cntlin=`
+  read, SORT's `dupout=` writes) or says an option is no dataset (COPY's
+  `in=`/`out=` are librefs, HTTP's `out=` a fileref; FCMP's
+  `outlib=lib.member.package` writes `lib.member`). `lib._all_` is the pattern
+  `lib.:`. Options are read anywhere in the PROC statement and in `output`,
+  `score`, `baseline` and `forecast`; in any other statement only after its
+  `/`, and never in an assignment (`out = x + 1;` in PHREG, NLMIXED, FCMP,
+  IML) — so `label out = 'x';` names nothing, nor does an option inside a
+  dataset's own `(…)`. PROC SORT without `out=` replaces its `data=` with a
+  sorted copy: a READ and a WRITE, as `data x; set x;` is, so a later BY step
+  depends on the sort.
+  - **PROC DATASETS** names members of its `lib=` library: `append` (base
+    UPDATE, data READ), `delete` (DROP), `change old=new` (old READ and DROP,
+    new WRITE), `exchange` and `modify` and `age` (UPDATE), `contents`, and
+    `kill` (DROP of the pattern `lib.:`).
+  - **A library copy** — PROC COPY, PROC DATASETS's `copy`, UPLOAD and
+    DOWNLOAD with `inlib=`/`outlib=` — reads each `select`ed member from the
+    source and writes it to the target. Without `select` (or with `exclude`)
+    it copies the patterns `source.:` → `target.:`; `move` deletes the
+    source's.
+  - **ODS OUTPUT** (`ods output Summary=s;`) writes its datasets: in a PROC,
+    that PROC does. In open code the statement records them, and
+    `metadata.resolve_ods_outputs` hands them to the next PROC_STEP of the
+    file. `ods output close|clear` before one cancels them; they stay on the
+    statement as MENTIONs.
+  - **PROC DS2:** a DATA program writes its tables (`/ overwrite=` aside);
+    SET and MERGE read theirs, a `set {select …}` query's through the SQL
+    grammar; `set from th;` reads a THREAD program's rows, no table.
+  - **PROC IML:** `use` reads the dataset it names first, `edit` updates it,
+    `create` writes it; `append`, `read` and `close` work on one already
+    open. Code between SUBMIT and ENDSUBMIT — R, Python, Lua, Groovy — stays
+    opaque: whatever datasets it touches are not seen.
+  - **PROC SQL and PROC FEDSQL** statements go through `sql.SqlStatement` in
+    its SAS dialect: FROM lists (comma joins too) and JOINs read, subqueries
+    and inline views included; `CREATE TABLE|VIEW` writes, and reads its
+    `LIKE` table; `INSERT`, `UPDATE`, `DELETE` and `ALTER TABLE` rewrite a
+    table in place (UPDATE); `DROP TABLE|VIEW` deletes a list (DROP);
+    `CREATE INDEX` and `DESCRIBE` name none. A table's `(…)` is its dataset
+    options, a quoted path or `'name'n` is a table, a macro call names nothing
+    visible, and `dictionary.*` is SAS's metadata, no dataset.
+- **Open code** names no dataset but through ODS OUTPUT: not a `%PUT`, a
+  `%LET`, or a macro call's arguments.
+- **A `%MACRO` body** is read the same way, and its references are classified
+  by spelling: exactly one of its parameters (`&ds`, resolved per call site),
+  built from several (dropped: no call names one dataset), or written out or
+  through some other macro variable (a literal). A body statement outside any
+  step it opens may complete its caller's step (`%macro sets; set a b;
+  %mend;`), so it is read as what its keyword makes it — a DATA step
+  statement, a PROC SQL clause, or a statement with PROC options — and a
+  call of another macro is read for its `data=` / `out=` arguments, since the
+  batcher binds only the parameters of the macro a job calls.
+- Only DATA_STEP, PROC_STEP and MACRO_DEFINITION regions are read, and a
+  GLOBAL_STATEMENT that is an ODS OUTPUT: nothing else holds a statement
+  that reads or writes.
 
 Names are lowercased at extraction; quoted physical paths keep a leading `'` so
 they can never collide with identifiers.
@@ -173,17 +336,75 @@ they can never collide with identifiers.
 `external_refs` is one stored list of `SasPathRef` records — every location a
 chunk's statements name, whatever kind of place it is. `paths.py` recognises
 `LIBNAME`, `FILENAME`, `INFILE` / `FILE`, `%INCLUDE`, PROC IMPORT/EXPORT's
-`datafile=` / `outfile=`, ODS `file=` / `path=`, and `options sasautos=`.
+`datafile=` / `outfile=`, PROC PRINTTO's `log=` / `print=`, ODS `file=` /
+`path=`, and `options sasautos=`.
 
 A `FILENAME` device keyword redirects the same syntax somewhere that is not the
 filesystem, so each record carries a `PathLocation` — `FILESYSTEM`, `REMOTE`
 (FTP, URL, …), `EMAIL`, `PIPE` (a shell command), or `DEVICE` for a keyword this
 module does not know. An unknown device is never silently treated as a path.
 
+A statement may name several places: `%include '/a.sas' '/b.sas';` is two
+records (a `PathSpec` with `many=True`; `xref.pre` rewrites each value through
+`spec.value_spans`). And a place may be named through a fileref — `%include
+src(one two);`, `%include setup;`, `infile in;`, `file out;` (SAS's own
+`print`, `log`, `datalines`, `cards` excepted; `%INC` is `%INCLUDE`). Being
+bare words, these forms count only where a statement starts — after a `;`, a
+THEN or an ELSE — so "the file written" in a PUT string, a TITLE or a `%PUT`
+names no fileref. Those are recorded as
+`FILEREF`, the fileref in `binds`, and `metadata.resolve_filerefs` walks the
+corpus in source order with the FILENAMEs in force: the latest binding of a
+fileref wins, `clear` or a FILENAME with no quoted place ends it, and each
+later reference takes the FILENAME's location and path — a member of a
+directory as `<dir>/one.sas`, SAS adding `.sas` for `%INCLUDE`. A fileref
+nothing binds stays `FILEREF`. A file read through a fileref is the FILENAME's
+file, so the hydration planner plans it once, from the FILENAME.
+
+**Paths spelled through macro variables** resolve from the values in force
+where the statement stands, in the same source-order walk that resolves dataset
+names (`resolve_macro_var_refs`, and again across the corpus). The values are
+the ones `%LET`, a literal `CALL SYMPUTX` and a called macro's globals assign,
+but kept as written: case, separators and quotes, since a path is not a name.
+`_MacroScope` keeps them in a second table beside the names', for a corpus
+where some path holds a `&` at all; reading every `%LET` again costs a pass
+over its chunk's text.
+`%include "&root/setup.sas";` after `%let root = /SAS/Prod;` reads
+`/SAS/Prod/setup.sas`:
+
+- `raw` stays as written, `resolved_path` holds the place SAS reads
+  (`effective_path` is whichever applies), `path` is its normalised form, and
+  `has_macro_ref` says a reference is still unresolved.
+- A single-quoted value is the place as written: SAS resolves `&` between
+  double quotes only, so `'/data/R&D/in'` holds no reference.
+- A statement that names a fileref through a variable reads what the variable
+  holds as its own words. `%include &f;` with `%let f = '/sas/x.sas';`
+  includes that file, and with `%let f = src(util);` a member of `src`'s
+  directory.
+- A FILENAME's path resolves the same way, so a member read through it does
+  too. A reference already followed through a fileref is followed again at
+  the corpus level, where a `%LET` in another file may have resolved the
+  FILENAME.
+- A value computed at run time (`%sysget`, `%sysfunc`, `CALL SYMPUTX` from a
+  column) leaves the reference as written. So does a parameter of the macro
+  whose body holds the statement: the call site supplies it.
+
+**`include_files`** lists each SAS file a chunk's `%INCLUDE` statements pull in,
+one `SasIncludeFile` per file in source order:
+
+| Field | Holds |
+|---|---|
+| `path` | the file as SAS reads it: macro variables expanded, a fileref followed, case kept |
+| `raw` | the file as the statement spells it (`&root/setup.sas`, `src(util)`) |
+| `fileref` | the fileref it is named through, if any |
+| `location` | `FILESYSTEM` as a rule, `REMOTE` for a URL or FTP FILENAME, `FILEREF` while no FILENAME binds it |
+| `resolved` | `path` is the real file: no `&` reference left and no unbound fileref |
+
+It is a view of `external_refs`, serialised with the metadata.
+
 One list rather than one per kind: one scan to keep correct, one merge rule to
 keep honest, and the per-kind views above for consumers. `includes` is the
-`%INCLUDE` slice of the same scan, not a second definition of where an include
-path lives.
+`%INCLUDE` slice of the same scan, as normalised paths, not a second definition
+of where an include path lives.
 
 ### Names spelled through macro variables
 
@@ -200,7 +421,7 @@ data &table1;
 run;
 ```
 
-Every dataset position is scanned with `macro_vars.DS_REF_TOKEN`, which admits
+Every dataset operand is read with `macro_vars.DS_REF_TOKEN`, which admits
 `&refs`, so those names are seen at all; `metadata.resolve_macro_var_refs` then
 walks the built chunks in source order, accumulating each `%LET` value and
 expanding the references of the chunks that follow. The step above reports
@@ -229,17 +450,113 @@ two-level name — and the Databricks mapping skips it.
 
 A `%LET` whose value is *shaped* like a dataset reference
 (`%let table_demogr = datacia.member_demographic;`) contributes to
-`referenced_datasets` / `referenced_librefs` on sight. It is provenance only,
-never I/O: a `%LET` reads and writes nothing; the step that uses
-`&table_demogr` does.
+`referenced_datasets` / `referenced_librefs` on sight, as a MENTION reference
+(`via="%let"`). It is provenance only, never I/O: a `%LET` reads and writes
+nothing; the step that uses `&table_demogr` does. Each resolution run derives
+those again from the values in force, replacing the last run's.
+
+Values come from more than `%LET` in open code, and `_MacroScope` (in
+`metadata.py`) is the one place that decides them, for every pass:
+
+- **`CALL SYMPUT`/`SYMPUTX`** with a literal name and a literal value
+  (`call symputx('sch', 'EDW_EXPORT');`) gives its value to the chunks *after*
+  the step — never the step itself, whose `&refs` SAS resolves at compile time.
+- **A called `%MACRO`** sets a global by SAS's rule: a `%LET` to a name declared
+  `%GLOBAL` there, or already global and neither a parameter nor `%LOCAL`.
+  Anything else stays in the macro's local table. A body with `%IF`/`%DO`/`%GOTO`
+  may or may not run an assignment, so what it could set becomes *unknown*.
+- **Unknown is a value too.** A variable reassigned to something that is not a
+  name, filled at run time (`INTO :sch`, `call symputx('sch', column)`), or
+  given two different literal values by one step stops resolving: a stale
+  `%let sch = old;` must not keep answering for it.
 
 Two scope rules keep this from over-reaching. A macro's own parameters shadow
 the table, so `&ds` inside `%macro m(ds);` stays a `body_param_*` entry the
 batcher resolves per call site rather than picking up a corpus-level
-`%let ds = ...;`. And a `%LET` inside a `%MACRO` body stays local to that chunk,
-since whether it ever executes depends on a call. Resolution runs once per file
+`%let ds = ...;`. And a `%LET` inside a `%MACRO` body stays local to that chunk
+until a call runs it (above). Resolution runs once per file
 in `chunk_text` and again over the flattened corpus in `MultiFileBatcher`,
 which is what lets a `%LET` in one file name a dataset another file reads.
+
+### Database tables (SQL pass-through and database LIBNAMEs)
+
+SAS reaches a database's own tables two ways, and both produce
+`SasDbTableRef` records on `SasChunkMetadata.db_tables` (rolled up as
+`SasBatch.db_tables`) — the table in the database's terms, linked to the SAS
+dataset the read lands in:
+
+```sas
+proc sql;
+connect to oracle (user=&ora_user password=&ora_pass path=&ora_path);
+create table nonip as select * from connection to oracle
+(select cov_month from edw_export.current_nonip where table_cd='MED');
+quit;
+/* → oracle:edw_export.current_nonip → work.nonip (read via connection_to oracle) */
+
+libname edw oracle path=EDWPRO schema=fr_dm;
+data work.accts; set edw.accounts; run;
+/* → oracle:fr_dm.accounts → work.accts (read via libname edw) */
+```
+
+**Explicit pass-through** is `passthrough.py`'s grammar: `CONNECT TO` (alias →
+engine and options, in statement order), `CONNECT USING`, `(FROM|JOIN)
+CONNECTION TO` (reads), `EXECUTE … BY` (writes and reads), `DISCONNECT`. The
+native SQL gets its own token walk — comma FROM lists, joins, subqueries, table
+functions, CTE names and `DUAL` excluded, `EXTRACT(… FROM …)`, Oracle `'…'`
+literals and `--` comments, `"QUOTED"` identifiers, `@dblink`, and every
+DDL/DML write form. Every *dataset* scan in `_metadata_for` runs on text where
+the pass-through spans are **masked**, so `from connection to oracle` stops
+being the dataset `work.connection`, `disconnect from oracle` stops being
+`work.oracle`, and the Oracle owner stops being a SAS libref a batch then
+"requires". Macro invocations are still read from the unmasked text: SAS
+resolves them before the native SQL is sent.
+
+**Database LIBNAMEs** are `metadata.resolve_db_librefs`: a source-order walk
+keeping the engine LIBNAMEs in force (`schema=` resolved against `%LET` where
+the LIBNAME stands; `libname x clear;` or a path rebind ends one; one inside a
+`%MACRO` body *does* bind, since connection macros are how production SAS hides
+credentials). A SAS name under such a libref keeps its place in the I/O lists —
+SAS code does name `edw.accounts` — and also gains a `via=libname` record.
+`CONNECT USING` records get their engine and options here.
+
+**Names spelled through macro variables** resolve like any other: in the
+schema, the table or both (`&sch..&tbl`, `edw_export.t_&sfx._v`,
+`"&SCH"."&TBL"`, `&full_name`, indirect `&&sch_&env...t`), and in the
+connection name (`connection to &db`, `connect to &eng`). An unresolved name is
+split as SAS reads it — the dot after a reference is its delimiter, not a
+separator — and kept verbatim in `raw`, with `has_macro_ref` set. Its
+qualified form reads back as SAS would: a schema ending in a reference keeps
+that delimiter, so it is `&sch..t`, never `&sch.t` (one name to SAS). Inside a
+utility macro, a table named by the macro's **own parameters** is a template
+(`parameterised=True`, reported but never hydrated); each **call** of the macro
+gets the concrete table on its own chunk, resolved with that call's arguments,
+defaults and the globals in force, and marked with the macro's name:
+
+```sas
+%macro pull(schema=edw_export, tbl=, out=);
+  proc sql; connect to oracle (path=&ora_path);
+  create table &out as select * from connection to oracle (select * from &schema..&tbl);
+  quit;
+%mend;
+%pull(tbl=current_nonip, out=nonip);
+/* the call → oracle:edw_export.current_nonip → work.nonip (read via connection_to oracle in %pull) */
+```
+
+Calls written back to back without semicolons (`%pull(tbl=a, out=x)` on one
+line, `%pull(tbl=b, out=y)` on the next) are calls of their own (see
+*Statement boundaries*), each bound in order against the globals the one before
+it left.
+
+`resolve_references` runs the macro pass, then this one — the one order —
+from `chunk_text` (per file) and `MultiFileBatcher` (corpus-wide).
+`resolve_corpus_references(corpus)` does the same for callers that do not
+batch, which is how `data_hydration` and `complexity --hydration` see a LIBNAME
+in `setup.sas` reach the reads in `job.sas`.
+
+Options ride on each record, so a consumer never joins by alias. The one-line
+`str()` form — what reaches the LLM prompt — leaves them out, because that is
+where credentials live. No batching edges are added: two reads of one Oracle
+table are not a dependency between them.
 
 ## Batching model
 
@@ -248,7 +565,7 @@ emitting typed edges:
 
 | Edge kind | Tier | Meaning |
 |-----------|------|---------|
-| `dataset_flow` | strong | chunk reads a dataset a preceding chunk wrote |
+| `dataset_flow` | strong | chunk reads or updates a dataset a preceding chunk created |
 | `macro_body_dataset` | strong | call-site-resolved parameterised macro-body I/O |
 | `macro_invocation` | weak | chunk invokes a macro defined elsewhere |
 | `macro_var_flow` | weak | chunk reads `&name` a preceding chunk created |
@@ -270,30 +587,62 @@ is not knowable yet. Consumers link to the **nearest preceding producer** in
 corpus order — the state a sequential SAS session would actually read — so
 unrelated jobs reusing `work.tmp` stay separate.
 
+The roles decide what counts as a producer. Only a WRITE ref produces its name.
+A step that updates a table in place (`PROC APPEND BASE=`, SQL `INSERT`,
+`MODIFY`) reads it like any consumer: it links to the table's nearest
+preceding creator and supplies it to nobody. Jobs that each append to one
+shared audit table therefore do not chain into one batch, and a later reader
+links to the creator, not to the last job that appended. A batch whose
+members only update a table lists it among the inputs it needs. A DROP ref
+produces nothing, and a MENTION ref is not dataset flow at all. Pattern refs
+take part on both sides:
+
+- A **pattern input** (`set lib.sales_:;`) links to the nearest preceding
+  producer of each name its prefix covers. The names come from a sorted index
+  of every produced name, searched by bisection. One edge goes to each source
+  chunk; its `via` is the alphabetically first name that chunk supplied.
+- A **whole-library input** (`lib.:`, from CONTENTS of `_ALL_` or a COPY of
+  every member) links nothing. Tying one housekeeping step to every producer in
+  the library would fuse unrelated jobs into one batch.
+- A **pattern output** (`tgt.:`, from a COPY with no SELECT) produces every
+  name it covers. A later `set tgt.cust;` links to the COPY when the COPY is
+  nearer than any step that wrote `tgt.cust` by name.
+- `_LAST_` skips a pattern output, since a COPY of a whole library creates no
+  one data set.
+
+The same nearest-producer lookup serves `dataset_flow`, `macro_arg_dataset` and
+the resolved inputs of `macro_body_dataset`.
+
 ## Load-bearing invariants
 
 Things that look like implementation details but are contracts. Breaking any of
 these silently changes behavior.
 
 1. **Edge discovery is one walk, in corpus order.**
-   `_EdgeDiscovery._resolve_macro_body` mutates `produces_ds` mid-walk: a macro
-   call site's resolved outputs are registered as producers at the moment the
+   `_EdgeDiscovery._resolve_macro_body` mutates `produces_ds` mid-walk: what a
+   macro call site's resolved arguments create is registered at the moment the
    call is visited, which implements "a macro's output exists only once the call
    has executed" under nearest-preceding-producer bisection. Splitting the edge
    families into separate corpus walks would let a consumer link to a producer
    that does not exist yet at its position — or miss one that does.
 2. **Producer lists stay sorted by global index.** The nearest-preceding lookups
    are `bisect_left` over `produces_ds[name]`; mid-walk registration therefore
-   uses `insort`, never `append`.
+   uses `insort`, never `append`. `ds_names`, the sorted index pattern inputs
+   bisect, gets a new name the same way.
 3. **`output_datasets` is insertion-ordered, never sorted.**
-   `_resolve_implicit_datasets` treats `output_datasets[-1]` as "the last
-   dataset named" when resolving `_LAST_` / `_DATA_` / missing-`data=` references.
-   (The list-merge in `_merge_meta` is the deliberate exception.)
+   `_resolve_implicit_datasets` treats the last of `output_datasets` that is not
+   a pattern as "the last dataset named" when resolving `_LAST_` / `_DATA_` /
+   missing-`data=` references.
+   Split children keep the order too: `_merge_meta` unions dataset references
+   in source order, the parent's first.
 4. **Every `SasChunkMetadata` field must have a merge rule.** `_merge_meta`
    dispatches on field annotation (`list[str]` → sorted union,
+   `tuple[SasDatasetRef, ...]` → union in source order, parent first,
    `list[SasPathRef]` → union ordered by `_path_ref_sort_key`,
    `dict[str, str]` → merged with the child's entry winning, `bool` → OR,
-   `str | None` → child-or-parent, `_MERGE_PARENT_WINS` → parent's value) and
+   `str | None` → child-or-parent, `_MERGE_PARENT_WINS` → parent's value —
+   which includes `db_tables`, since a `CONNECT` and the `CONNECTION TO` using
+   its alias can land in different split slices) and
    raises `TypeError` for anything else. The default-instance test in
    `tests/test_chunker.py` trips the guard for every stored field, so a new field
    shape cannot ship without a conscious decision.
@@ -327,6 +676,14 @@ these silently changes behavior.
    it. ⚠️ `X` is recognised only with its quoted
    argument or as the whole bare statement, because `x` is also one of the
    commonest SAS variable names; `x = 1;` and `x + 1;` must stay DATA step body.
+   The other global statements the classifier knows — `ENDSAS`, `DM`,
+   `SASFILE`, `LOCK`, `MISSING`, `PAGE`, `SKIP`, SAS/GRAPH's `GOPTIONS` and
+   `AXIS`/`SYMBOL`/`LEGEND`/`PATTERN`, SAS/CONNECT's `SIGNON`/`RSUBMIT`/…, and
+   the macro statements `%SYMDEL`, `%SYSLPUT`, `%SYSCALL`, … — carry their own
+   keyword, a numbered statement without its number (`title2` is `title`); the
+   same word followed by `=`, `+`, `:` or a subscript is a variable, not the
+   statement. A word the macro language owns (`%SYSFUNC`, `%STR`, a stray
+   `%MEND`) is never a MACRO_CALL.
 9. **`SAS_FUNCTION_CATEGORIES` is advisory and deliberately partial.** It maps
    a function or routine name to its family in *SAS Functions and CALL Routines
    by Category*, and its only consumer is `prompt_builder`'s `[category: ...]`
@@ -347,7 +704,57 @@ these silently changes behavior.
    fail are both silent: guessing produces a dataset name nothing in the corpus
    has, and dropping produces a step that appears to read nothing.
    `_canon_ds` therefore leaves `&`-bearing names alone, and `_map_ds` refuses
-   to map them.
+   to map them. Paths follow the same rule: `raw` never changes, and
+   `resolved_path` keeps the part it could not expand (`/SAS/&sub/x.sas`).
+11. **Native SQL is never scanned as SAS.** `_metadata_for` hands
+   `statements.dataset_refs` the text with `scan_pass_through`'s spans masked.
+   A new SAS-side dataset scan must read the masked `mt_ds`/`cf_ds` too, or the
+   `work.connection` / Oracle-schema-as-libref misreadings come straight back —
+   silently, since the chunk still reports *a* dataset. Scans for macro names,
+   macro variables and functions keep the unmasked text on purpose.
+12. **A dataset is read from a statement, never from a stretch of text.**
+   `statements.py` is the one place that says which statement, in which
+   context, names which dataset, for steps and `%MACRO` bodies alike — there is
+   no second, whole-text pattern to keep in step with it. A name that appears
+   only in a comment, in-stream data, SUBMIT code, a string, a `%PUT` or an
+   assignment is no dataset, and `referenced_datasets` is a view of the
+   references, so it cannot report one either.
+13. **One SQL grammar, two dialects.** `sql.SqlStatement` reads every SQL
+   statement the chunker meets — PROC SQL, PROC FEDSQL and pass-through's
+   native SQL — so a fix to how a FROM list or a subquery is walked lands in
+   all of them. What differs is the dialect (a database's `"quoted"` names,
+   `@dblink` and table functions, against SAS's dataset options, paths and
+   name literals), never a second walker. The NATIVE dialect's reads and
+   writes are pinned by `tests/test_passthrough.py`; change it and they say
+   so.
+14. **Only CODE text is scanned.** A comment, in-stream data or SUBMIT code is
+   a unit of its own role. `_metadata_for` reads every scan from
+   `_Region.code_text`, where those units are blanked: the dataset statements,
+   and the whole-text scans for functions, CALL routines, macro variables,
+   labels, options and SYMPUT. `statements_of` skips the units outright. A new
+   scan that reads the raw region text instead brings back the false reads and
+   writes of commented-out code.
+15. **What a PROC option names is data.** `keywords.PROC_OPTION_DEFAULTS`
+   says what an option names in any PROC, and `keywords.PROC_OPTION_ROLES`
+   what it names in one (`read`, `write`, `update`, `libref`, `fileref`, or
+   `package` for FCMP's `lib.member.package`). Teach the chunker a PROC's
+   options by adding an entry there,
+   not a pattern in `statements.py`; the statements that need more than an
+   option table (DATASETS, COPY, ODS OUTPUT, SQL, DS2, IML) have their own
+   readers in `_ProcStep`.
+16. **Only a WRITE supplies a dataset.** The batcher's producer index, a
+   batch's satisfied inputs and `complexity.crossfile`'s producers and exports read
+   `created_datasets` / `body_literal_created`, never `output_datasets`. An
+   UPDATE is a consumer of the table it changes. Reading `output_datasets`
+   there again would chain every job that appends to a shared table into one
+   batch, and put them in a dependency cycle.
+17. **Names and paths resolve from different tables.** `_MacroScope` keeps
+   the values that can name a dataset, lowercased (`name_value`), and, for
+   paths, every value as written (`text_value`). Dataset names, librefs and
+   database tables read the first, and paths read the second. Resolving a
+   path from the name table would lowercase it and lose every value with a
+   `/` in it. Resolving a name from the texts table would make a directory a
+   dataset name.
 
 ## Logging
 

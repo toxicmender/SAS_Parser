@@ -13,7 +13,7 @@ A %MACRO body may reference datasets two ways:
                   value is known (Fix B).
 
 This file verifies:
-  1. _macro_body_io extraction correctness (chunker-level)
+  1. the dataset references a %MACRO chunk records for its body (chunker-level)
   2. _parse_call_args parsing correctness (batcher-level)
   3. End-to-end batching behaviour for both literal and parameterised
      macro bodies, including the cross-file case that originally failed
@@ -31,15 +31,31 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from chunker import SasChunkBatcher, SasCorpus, SasSemanticChunker
+from chunker import SasChunkBatcher, SasChunkKind, SasCorpus, SasSemanticChunker
 from chunker.batcher import MultiFileBatcher, _parse_call_args
-from chunker.metadata import _macro_body_io
 
 _C = SasSemanticChunker(min_words=1, max_words=9_999)
 
 
+def _macro_body_io(
+    source: str,
+) -> tuple[list[str], list[str], list[dict], list[dict], list[str]]:
+    """The body dataset lists and parameters of the one %MACRO in *source*."""
+    (chunk,) = [
+        c for c in _C.chunk_text(source).chunks if c.kind is SasChunkKind.MACRO_DEFINITION
+    ]
+    meta = chunk.metadata
+    return (
+        meta.body_literal_inputs,
+        meta.body_literal_outputs,
+        meta.body_param_inputs,
+        meta.body_param_outputs,
+        meta.macro_param_names,
+    )
+
+
 # ---------------------------------------------------------------------------
-# 1. _macro_body_io extraction (chunker-level unit tests)
+# 1. A macro body's dataset references (chunker-level unit tests)
 # ---------------------------------------------------------------------------
 
 
@@ -354,6 +370,26 @@ class TestParameterisedMacroBodyBatching(unittest.TestCase):
             self.assertEqual(len(b.chunks), 2)
             self.assertIn("load", b.required_macros)
 
+    def test_call_sites_without_semicolons_resolve_independently(self):
+        """The same calls written without semicolons, as SAS allows: each is
+        still its own call site, binding its own argument, and the PROCs after
+        them are steps of their own rather than text inside the first call."""
+        src = (
+            "%macro load(out); data &out.; x=1; run; %mend;\n"
+            "%load(work.first)\n"
+            "%load(work.second)\n"
+            "proc print data=work.first; run;\n"
+            "proc means data=work.second; run;\n"
+        )
+        br = SasChunkBatcher().batch(_C.chunk_text(src))
+        self.assertEqual(len(br.batches), 3)
+        pipeline_outputs = [set(b.output_datasets) for b in br.batches[1:]]
+        self.assertIn({"work.first"}, pipeline_outputs)
+        self.assertIn({"work.second"}, pipeline_outputs)
+        for b in br.batches[1:]:
+            self.assertEqual(len(b.chunks), 2)
+            self.assertIn("load", b.required_macros)
+
 
 # ---------------------------------------------------------------------------
 # 4b. Nested macro invocation — one macro's DEFINITION body invokes another
@@ -373,9 +409,9 @@ class TestParameterisedMacroBodyBatching(unittest.TestCase):
 #
 # This differs from the call-site scenarios in section 4: there, a
 # MACRO_CALL chunk invokes a macro.  Here, a MACRO_DEFINITION chunk's body
-# invokes a *different* macro.  This is already handled by the existing
-# _io_for(MACRO_DEFINITION) branch, which scans the full body (not just the
-# header) for %macro_call patterns via _MACRO_INVOKE_RE — so %abc inside
+# invokes a *different* macro.  This is already handled by _metadata_for,
+# which scans the full body (not just the header) of a MACRO_DEFINITION for
+# %macro_call patterns via _MACRO_INVOKE_RE — so %abc inside
 # xyz's body is correctly captured in xyz's invokes_macros list.  These
 # tests pin that behaviour and extend it to the parameterised and
 # cross-file cases.

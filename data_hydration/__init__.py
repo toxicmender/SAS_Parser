@@ -22,6 +22,14 @@ from .models import (
 from .naming import TableNameError, render, validate_template
 
 if TYPE_CHECKING:  # real types for a checker, no import cost at run time
+    from .inventory import (
+        InventoryRow,
+        RefKind,
+        inventory_rows,
+        plan_from_inventory,
+        read_inventory,
+        write_inventory,
+    )
     from .planner import build_corpus_plan, build_plan
     from .runner import execute
     from .secrets import HydrationCredentialError, resolve_secret
@@ -32,6 +40,12 @@ if TYPE_CHECKING:  # real types for a checker, no import cost at run time
 _LAZY = {
     "build_plan": ".planner",
     "build_corpus_plan": ".planner",
+    "InventoryRow": ".inventory",
+    "RefKind": ".inventory",
+    "inventory_rows": ".inventory",
+    "plan_from_inventory": ".inventory",
+    "read_inventory": ".inventory",
+    "write_inventory": ".inventory",
     "execute": ".runner",
     "resolve_secret": ".secrets",
     "HydrationCredentialError": ".secrets",
@@ -52,6 +66,13 @@ __all__ = [
     "build_plan",
     "build_corpus_plan",
     "execute",
+    # the reference inventory
+    "InventoryRow",
+    "RefKind",
+    "inventory_rows",
+    "plan_from_inventory",
+    "read_inventory",
+    "write_inventory",
     # models
     "HydrationItem",
     "HydrationPlan",

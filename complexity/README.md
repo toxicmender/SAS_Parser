@@ -657,13 +657,22 @@ source scanning:
 | Reference | Producer field | Consumer field |
 | --- | --- | --- |
 | macro | `defines_macros` | `invokes_macros` |
-| dataset | `output_datasets`, `body_literal_outputs` | `input_datasets` |
+| dataset | `created_datasets`, `body_literal_created` | `input_datasets` |
 | macro variable | `produces_macrovars`, `declared_macro_vars` | `consumes_macrovars` |
 | libref | `defines_librefs` | libref prefix of dataset I/O |
 
 Each reference lands in one of three states: **internal** (same file — no
 signal at all), **import/export** (satisfied by another file in the corpus), or
 **unresolved** (satisfied by nothing in scope).
+
+Only a file that creates a dataset supplies it. A file that updates a table in
+place — `PROC APPEND BASE=`, SQL `INSERT`/`UPDATE`/`DELETE`, `MODIFY` — needs
+the table, so its `input_datasets` hold it and it imports it from the files that
+create it; it exports it to nobody. Jobs that each append to one shared audit
+table therefore depend on the table's creator and not on each other, which
+keeps them out of a dependency cycle, and a later reader depends on the creator
+alone. An in-place `PROC SORT` is not an update: it replaces the table with a
+sorted copy, so it creates it, as `data x; set x;` does.
 
 `%INCLUDE` is deliberately **not** among them. The chunker already surfaces it
 as both a chunk kind and a metadata flag, and the catalogue rates both
@@ -748,11 +757,30 @@ its coupling — the second only means something once you know the first:
 
 The three-way split is the useful part. **Inputs** must already exist when this
 file runs; **outputs** are what downstream files are waiting on; and
-**intermediates** — written *and* read inside this file — are its own business,
-so nobody has to provide them. A dataset the file writes is therefore never
+**intermediates** — created *and* read inside this file — are its own business,
+so nobody has to provide them. A dataset the file creates is therefore never
 reported as an input, which is the same rule `crossfile.py` applies when
 deciding whether a read is a cross-file import. The two sections cannot
-contradict each other by construction.
+contradict each other by construction. A table the file only updates in place
+is an input — something else creates it — and an output, since the file
+writes to it.
+
+Two more lines appear only when they have something to say:
+
+```markdown
+- Updated in place (rows added or changed): mart.hist
+- Deleted: work.tmp1
+```
+
+**Updated in place** names the tables the file changes where they stand rather
+than creates — `MODIFY`, `PROC APPEND BASE=`, SQL `INSERT`/`UPDATE`/`DELETE`.
+Each is also among the outputs, and among the inputs unless the file creates it
+too; it is called out because an append is what a migration most easily turns
+into a replacement. A table a step creates and then inserts into is not listed.
+**Deleted** names the tables the file removes
+(`PROC DATASETS DELETE`, SQL `DROP TABLE`), which are neither inputs nor
+outputs. Both come from the chunker's dataset reference roles (`UPDATE` and
+`DROP`; see `chunker/README.md`).
 
 Every chunk that touches a dataset prints its own `Reads:` / `Writes:` line, so
 a reader who doubts a rollup can find the chunk that put each name in it.
@@ -779,13 +807,77 @@ statements, recognised by `chunker/paths.py`:
 Grouped by kind because the kinds need different answers: a filesystem path
 wants a volume or external location, an FTP reference wants egress and a
 credential, and a shell pipe wants somebody to decide what replaces it. A value
-carrying an unresolved `&macro` reference is flagged as such — it is not what
-SAS resolves at run time, so it cannot be mapped as written.
+spelled through macro variables the corpus assigns is followed by the place SAS
+reads (`` `&root/in` → `/SASData/in` — libname `raw` ``); one carrying a `&macro`
+reference nothing assigns is flagged as unresolved — it is not what SAS
+resolves at run time, so it cannot be mapped as written. A fileref used by
+`INFILE`, `FILE` or `%INCLUDE` is reported where its `FILENAME` points; one that
+no `FILENAME` in the corpus assigns (an autoexec or the job's JCL does) gets
+its own last group, *Filerefs no FILENAME in the corpus assigns*.
 
 Reported, never scored. Like the dataset interface, it says what a migration has
 to provision, which is a different question from how hard the code is. A file
 that reaches nothing outside gets no section, and every chunk that names a
 location prints its own `Paths:` line for the same audit trail as `Reads:`.
+
+## Included scripts
+
+`%include "/sas/prod/macros/util.sas";` names a script by where it lived on the
+SAS server. With `--check-includes` each one is looked for by **file name**,
+ignoring case and at any depth: in the scored directory, and in the
+application's SharePoint scripts folder (`{base}/{application}/scripts_original`)
+— the request row's application with `--sharepoint`, or `--app` on a local run.
+The overall report gains one row per script:
+
+```markdown
+## Included scripts
+
+- Scripts included: **3** — found 2, not found **1**
+
+| Script | Included by | Local | SharePoint |
+| --- | --- | --- | --- |
+| `util.sas` | job.sas:1 | `macros/util.sas` | `Apps/MyApp/scripts_original/util.sas` |
+| `gone.sas` | job.sas:2 | **not found** | **not found** |
+| `&f` (no file name) | job.sas:3 | — | — |
+```
+
+The file name is the one SAS opens: macro variables the corpus assigns are
+expanded and filerefs followed, so `%include src(util);` looks for `util.sas`.
+`—` is a place nobody looked; **not found** is a dependency the corpus is
+missing. The matching lives in `data_hydration.includes`, so
+`python -m data_hydration --check-includes` answers the same way and keeps the
+answer in the reference inventory. Off by default, and a run without it writes
+exactly the report it did before.
+
+## Database tables
+
+After the paths, the tables a file reads and writes **inside a database** —
+through SQL pass-through (`CONNECTION TO` / `EXECUTE … BY`) or as members of a
+database-engine LIBNAME — in the database's own terms, each read with the SAS
+copy it lands in:
+
+```
+## Database tables
+
+- Read:
+  - `edw_export.current_nonip` on `oracle` → `work.nonip` (connection_to `oracle`)
+  - `fr_dm.accounts` on `oracle` → `work.accts` (libname `edw`)
+- Written:
+  - `stage.tmp` on `oracle` (execute `oracle`)
+```
+
+Its own section rather than more Inputs, because these are not SAS datasets:
+`edw_export` is an Oracle owner, and a migration answers it by hydrating or
+federating the table, not by finding a LIBNAME. (Before the chunker had a
+pass-through grammar such a table *was* listed under Inputs — misfiled, beside
+the invented `work.connection`.) A table read through a `@dblink`, or whose name
+holds an unresolved `&macro` reference, is flagged. A utility macro's table
+appears in two forms, each in the file where it occurs: in the `%MACRO` body as
+a template *(named by the macro's parameters — resolved per call)*, and at each
+call as the table that call reads, `in %pull`. Reported, never scored; no
+tables, no section; every chunk prints a `Database:` line for the audit trail.
+With `--hydration`, each table read also gets its own item in the Hydration
+section.
 
 ## The dependency graph
 

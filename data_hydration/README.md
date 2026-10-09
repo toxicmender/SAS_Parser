@@ -29,6 +29,14 @@ Then run it:
 python -m data_hydration path/to/sas --stage bronze
 ```
 
+Keep the corpus's reference inventory in a Delta table, and plan from it later
+without the SAS source:
+
+```bash
+python -m data_hydration path/to/sas --dry-run --inventory-table main.meta.sas_refs
+python -m data_hydration --from-inventory --inventory-table main.meta.sas_refs
+```
+
 ## Plan, then execute
 
 Two layers, and the split is the design:
@@ -43,6 +51,124 @@ That purity is not decoration. It is what lets `complexity` build a plan purely
 to print it: a report renderer must not be able to open a database connection,
 so `complexity` always passes `probe=None`.
 
+### Database tables
+
+`build_corpus_plan(..., db_tables=...)` takes the chunker's
+`SasChunkMetadata.db_tables` — the tables a corpus reaches inside a database,
+through SQL pass-through or as members of a database LIBNAME — and plans each
+table **read** as its own item: `object_name` is `owner.table`, the connection
+options are the ones that table was read through, and the target schema
+defaults to the libref, else the owner (`edw_export.current_nonip` →
+`<catalog>.edw_export.current_nonip`). Writes are what the converted job
+produces, never sources.
+
+- **One item per table.** A table read by five files is planned once, under the
+  first file that reads it; appending one copy per reader would load its rows
+  five times.
+- **A LIBNAME whose tables are named is planned per table.** Its schema-level
+  item — the stand-in when no table is known — is dropped; a LIBNAME nothing
+  names keeps it.
+- **Blocked, not guessed:** a connection whose engine is unknown (its `CONNECT`
+  made by a macro call), a `@dblink` (the table lives in the *linked* database),
+  and an unresolved `&macro` in the table name, alongside the usual option
+  check. A database other than Oracle (Teradata, DB2, …) is planned through
+  the SQL path so the plan lists it, and blocked: the one SQL reader speaks
+  Oracle.
+- **A list of tables is one item, named by the operator.** `set edw.acct_:;`
+  reads every table whose name starts `acct_`, and `proc copy in=edw` every
+  table there is; which those are only the database knows. The list is planned
+  as it is written, with no target and a blocker saying what it covers.
+- **Credentials** are keyed on the libref, or for pass-through on the
+  connection alias (`oracle_password_<alias>`).
+- **Names arrive resolved** when the corpus says what their macro variables
+  hold — `%LET`, `CALL SYMPUTX` literals, a utility macro's call arguments.
+  A table a `%MACRO` body names by its own parameters is a template and is
+  never planned: each call is planned instead, with the table it reads.
+- **Paths arrive resolved the same way.** `libname raw "&root/in";` after
+  `%let root = /SASData;` is planned at `/SASData/in` (the reference's
+  `effective_path`, case kept). Only a reference still unresolved becomes a
+  blocker.
+
+Pass metadata resolved across the corpus — `chunker.resolve_corpus_references`
+— or a LIBNAME in a setup file cannot reach the reads in the files after it.
+The CLI and `complexity --hydration` both do.
+
+### SAS data libraries
+
+`build_corpus_plan(..., datasets=...)` takes `chunk.metadata.dataset_refs`, and
+plans a **directory LIBNAME per dataset**, the way a database LIBNAME is planned
+per table. `set raw.customers;` after `libname raw '/data/raw';` is a
+`sas7bdat` item for `/data/raw/customers.sas7bdat`, target
+`<catalog>.raw.customers`, owned by the first file that reads it.
+
+- **Only what the job needs from outside.** A dataset some step creates is the
+  job's own and is never loaded; one only updated in place (`proc append
+  base=`) must already exist, so it is.
+- **The LIBNAME in force** is the latest one before the read, in corpus order
+  (a file's LIBNAMEs before its reads). A read before any LIBNAME binds its
+  libref is not planned.
+- **The library item stays** where no member is named, blocked as before, and
+  where a list (`raw.sales_:`) is read from it: which members that covers, only
+  a listing knows.
+- A member spelled through an unresolved macro variable (`raw.&tbl`) is an
+  item, blocked; an SPD Engine library is not split (see below).
+
+## The reference inventory
+
+`inventory.py` keeps **every reference the corpus makes**, resolved or not, as
+rows: each path (`LIBNAME`, `FILENAME`, `INFILE`, `%INCLUDE`, ...), each SAS
+dataset a step reads or writes, each database table and each database LIBNAME.
+`resolved` says which still hold an unresolved `&macro`; `raw` is the SAS
+spelling, `value` the place or name SAS reads, `name` the comparison key.
+
+- **`inventory_rows(file_results)`** builds the rows from the chunker's results
+  (top-level chunks only, so a chunk split for size is not read twice).
+- **`write_inventory(rows, table)`** appends them to a Delta table as one *run*:
+  `run_id` is `<UTC stamp>-<8 hex>`, so the latest run sorts last and the table
+  keeps the history. The table and its schema are created when missing, never
+  its catalog. **`read_inventory(table)`** reads the latest run back, or a
+  given `run_id`.
+- **`plan_from_inventory(rows)`** plans from the rows alone. The CLI and
+  `complexity --hydration` plan this way, so the inventory is the planner's
+  one input, and `--from-inventory` plans from the table with no SAS source
+  and no chunker.
+- **No secret is stored.** A connection option whose key names a password
+  (`pass=`, `password=`, `pwd=`, ...) is stored as `<redacted>`, in `options`
+  and in the statement's `raw`, and so is a `PWD=` inside a connection string.
+  A `&macro` reference is kept: it is no secret, and the plan's blocker names
+  it. No reader takes a password from these options anyway (invariant 6).
+
+The CLI writes the inventory when `--inventory-table` or
+`data_hydration.inventory_table` names a table, with `--dry-run` too: it is a
+record of the corpus, not a load. A table that cannot be written fails the run's
+exit status, never its plan.
+
+### Included scripts
+
+`includes.py` answers where the scripts a corpus `%INCLUDE`s are. The path an
+`%INCLUDE` names is the SAS server's, so each script is looked for by **file
+name** — the one SAS opens, macro variables expanded and filerefs followed
+(`src(util)` opens `util.sas`) — ignoring case and at any depth:
+
+```bash
+python -m data_hydration path/to/sas --dry-run --check-includes
+python -m data_hydration path/to/sas --dry-run --sharepoint-app MyApp
+```
+
+`--check-includes` looks in the source directory; `--sharepoint-app` also looks
+in the application's SharePoint scripts folder (`{base}/{app}/scripts_original`,
+`conversion.paths`) and implies it. Each `%INCLUDE` row of the inventory records
+the answer in `found_local` / `found_sharepoint` (`None` where nobody looked, an
+empty list where the script is missing), and the CLI prints one line per
+script. A folder SharePoint cannot list fails the run's exit status, never the
+rest of the check. `python -m complexity --check-includes` uses the same
+matching for its report.
+
+An `%INCLUDE` also says what a FILENAME is: `filename src '/code/macros';` read
+only through `%include src(util);` names SAS source, so the plan leaves it out,
+as it leaves out an `%INCLUDE` of a quoted path. A fileref INFILE or FILE reads
+too holds data, and stays.
+
 ## Package layout
 
 | File | Role |
@@ -52,6 +178,8 @@ so `complexity` always passes `probe=None`.
 | `secrets.py` | The one credential chain, and the Entra ID adapter |
 | `naming.py` | The target-name template |
 | `planner.py` | Refs → plan. Pure |
+| `inventory.py` | Refs → inventory rows → plan; the inventory's Delta table |
+| `includes.py` | Where each `%INCLUDE`d script is: local, SharePoint, or missing |
 | `partition.py` | Which partitioning strategy, and why |
 | `runner.py` | Executes a plan, one item at a time |
 | `rawio.py` | `RangedRawIO` — object storage as a file object |
@@ -130,6 +258,9 @@ logging through `app_config.logging_setup.configure_logging`, never
 installed: sources are hand-written fakes recording their calls, and
 `RangedRawIO` is exercised against an in-memory byte source.
 
-⚠️ **`sinks/delta.py` cannot be exercised in the local `.venv`**, where `pyspark`
-is shadowed by `databricks-connect`. Verify it in Docker (`docker/spark`), the
-same rule `memory.store`'s Delta backend follows.
+⚠️ **`sinks/delta.py` and the inventory's table cannot be exercised in the
+local `.venv`**, where `pyspark` is shadowed by `databricks-connect`. Verify them
+in Docker (`docker/spark`), the same rule `memory.store`'s Delta backend
+follows: `tests/test_data_hydration_delta.py` writes and reads both through a
+real Delta session there. `tests/test_data_hydration_inventory.py` covers the
+rest of the inventory with no Spark at all.

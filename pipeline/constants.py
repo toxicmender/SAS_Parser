@@ -164,6 +164,7 @@ _BATCH_CONTEXT_TEMPLATE = """\
 - Macros (required) : {required_macros}
 - Macros (defined)  : {defined_macros}
 - Librefs (required): {required_librefs}
+- Database tables   : {db_tables}
 - Autocall macros   : {standard_autocall_macros}
 - Macrovars (req)   : {required_macrovars}
 - Macrovars (prod)  : {produced_macrovars}

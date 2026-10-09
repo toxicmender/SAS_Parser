@@ -36,13 +36,16 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from chunker import SasChunkBatcher, SasCorpus, SasSemanticChunker
 from chunker.batcher import MultiFileBatcher
 from chunker.macro_vars import (
+    call_spans,
     is_dataset_shaped,
     let_values,
+    macro_signature,
     resolve_refs,
     strip_quotes,
 )
 from chunker.metadata import _canon_ds
 from chunker.models import SasChunkKind
+from chunker.scanner import _sanitise
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -97,15 +100,17 @@ class TestLetValues(unittest.TestCase):
     def test_quoted_value_unquoted(self):
         self.assertEqual(let_values("%let ds = 'lib.member';"), {"ds": "lib.member"})
 
-    def test_non_name_values_dropped(self):
+    def test_non_name_values_are_recorded_as_unknown(self):
         # Any string at all can be a %LET value; only one that could be a name,
-        # or part of one, is kept.
+        # or part of one, is kept. The rest map to "" — unknown from here on —
+        # rather than vanishing, so an earlier name-shaped value of the same
+        # variable cannot keep answering for it.
         src = (
             "%let where = age > 30 and sex = 'M';\n"
             "%let path = /sasdata3/dataetl/in.csv;\n"
             "%let lib = prod;\n"
         )
-        self.assertEqual(let_values(src), {"lib": "prod"})
+        self.assertEqual(let_values(src), {"where": "", "path": "", "lib": "prod"})
 
     def test_numeric_value_kept_as_a_name_fragment(self):
         # Not a name on its own, but half of one: &&ds&i, &lib..sales&yr.
@@ -188,6 +193,66 @@ class TestResolveRefs(unittest.TestCase):
     def test_empty_table_and_plain_text_short_circuit(self):
         self.assertEqual(resolve_refs("&ds", {}), "&ds")
         self.assertEqual(resolve_refs("work.orders", {"ds": "x"}), "work.orders")
+
+
+class TestCallSpans(unittest.TestCase):
+    """Macro calls back to back, as one semicolon-split chunk holds them."""
+
+    def _calls(self, text: str) -> list[str]:
+        return [text[span.start : span.end] for span in call_spans(_sanitise(text))]
+
+    def test_calls_without_semicolons(self):
+        self.assertEqual(
+            self._calls("%pull(tbl=a)\n%Pull (tbl=b) %setup\ndata x; set y; run;"),
+            ["%pull(tbl=a)", "%Pull (tbl=b)", "%setup"],
+        )
+        self.assertEqual(
+            [span.name for span in call_spans("%pull(tbl=a)\n%Pull (tbl=b)")],
+            ["pull", "pull"],
+        )
+
+    def test_semicolons_between_calls(self):
+        self.assertEqual(self._calls("%a(1);\n%b;\n"), ["%a(1)", "%b"])
+
+    def test_a_quoted_paren_or_a_nested_call_does_not_end_one(self):
+        self.assertEqual(
+            self._calls("%a(x=')', y=%lowcase(B))\n%b(1)"),
+            ["%a(x=')', y=%lowcase(B))", "%b(1)"],
+        )
+
+    def test_an_unclosed_list_runs_to_the_end(self):
+        self.assertEqual(self._calls("%a(x=1\n%b(2)"), ["%a(x=1\n%b(2)"])
+        self.assertEqual([span.closed for span in call_spans("%a(x=1\n%b(2)")], [False])
+        self.assertEqual([span.closed for span in call_spans("%a(1) %b")], [True, True])
+
+    def test_text_that_opens_with_no_call(self):
+        self.assertEqual(self._calls("data x; %a(1)"), [])
+
+
+class TestMacroSignature(unittest.TestCase):
+    def test_positional_and_keyword_parameters(self):
+        self.assertEqual(
+            macro_signature("%macro load(src, out=work.x, n=);"),
+            [("src", None), ("out", "work.x"), ("n", "")],
+        )
+
+    def test_a_default_holding_commas_or_parentheses_is_one_parameter(self):
+        self.assertEqual(
+            macro_signature("%macro m(list=%str(a,b), fmt=put(x, 8.), q='a,b', n=2);"),
+            [("list", "%str(a,b)"), ("fmt", "put(x, 8.)"), ("q", "'a,b'"), ("n", "2")],
+        )
+
+    def test_no_parameter_list(self):
+        self.assertEqual(macro_signature("%macro m / parmbuff;"), [])
+        self.assertEqual(macro_signature("%macro m;"), [])
+        self.assertEqual(macro_signature("data a; run;"), [])
+
+    def test_comments_in_the_parameter_list_are_no_parameters(self):
+        (chunk,) = _chunk(
+            "%macro load(lib=, /* the library */ tbl= /* its table */);\n"
+            "  data &lib..&tbl; run;\n%mend;\n"
+        ).chunks
+        self.assertEqual(chunk.metadata.macro_param_names, ["lib", "tbl"])
 
 
 class TestIsDatasetShaped(unittest.TestCase):
@@ -546,13 +611,15 @@ class TestMetadataPlumbing(unittest.TestCase):
         )
 
     def test_unresolved_refs_view_spans_every_dataset_field(self):
-        from chunker.models import SasChunkMetadata
+        from chunker.models import DatasetRole, SasChunkMetadata, SasDatasetRef
 
         meta = SasChunkMetadata(
-            referenced_datasets=["&a", "work.plain"],
-            input_datasets=["&b"],
-            output_datasets=["work.plain"],
-            body_literal_inputs=["&c"],
+            dataset_refs=(
+                SasDatasetRef(name="&a", role=DatasetRole.MENTION, via="%let"),
+                SasDatasetRef(name="&b", role=DatasetRole.READ),
+                SasDatasetRef(name="work.plain", role=DatasetRole.WRITE),
+                SasDatasetRef(name="&c", role=DatasetRole.READ, in_macro_body=True),
+            ),
         )
         self.assertEqual(meta.unresolved_dataset_refs, ["&a", "&b", "&c"])
 

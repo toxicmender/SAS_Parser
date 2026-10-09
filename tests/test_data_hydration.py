@@ -73,6 +73,7 @@ class TestDecoupling:
         code = (
             "import sys; import data_hydration; "
             "from data_hydration import build_corpus_plan; "
+            "from data_hydration import inventory_rows, plan_from_inventory; "
             "print(','.join(m for m in "
             "('chunker','pipeline','complexity','pyspark','oracledb',"
             "'paramiko','pyreadstat','saspy','azure') if m in sys.modules))"
@@ -146,6 +147,33 @@ class TestPathSources:
         assert item.target_table == UNRESOLVED_TARGET
         assert "library directory" in item.blockers[0]
 
+    def test_a_file_read_through_a_fileref_is_one_item(self):
+        # The chunker gives `infile in;` its FILENAME's path; the FILENAME is
+        # still the one source of that file, not one of two.
+        from chunker import SasSemanticChunker
+
+        src = "filename in '/data/cust.csv';\ndata a; infile in dlm=','; input x; run;\n"
+        chunks = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(src).chunks
+        refs = [r for c in chunks for r in c.metadata.external_refs]
+        assert [(r.statement, r.path) for r in refs] == [
+            ("filename", "/data/cust.csv"),
+            ("infile", "/data/cust.csv"),
+        ]
+        assert len(build_plan((), refs, config=_config()).items) == 1
+
+    def test_a_path_spelled_through_a_macro_variable_is_read_where_it_resolves(self):
+        # The chunker expands `&root` from the %LET in force, case kept; the
+        # plan reads that place instead of blocking on the reference.
+        from chunker import SasSemanticChunker
+
+        src = "%let root = /SASData;\ndata a; infile \"&root/in/cust.csv\"; input x; run;\n"
+        chunks = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(src).chunks
+        refs = [r for c in chunks for r in c.metadata.external_refs]
+        [item] = build_plan((), refs, config=_config()).items
+        assert (item.source.locator, item.source.object_name) == ("/SASData/in", "cust")
+        assert not item.source.has_macro_ref
+        assert item.blockers == ()
+
     def test_an_ftp_filename_becomes_an_sftp_source(self):
         plan = _plan("filename raw ftp '/incoming/cust.csv' host='h';")
         assert plan.items[0].source.kind is SourceKind.SFTP
@@ -157,6 +185,7 @@ class TestPathSources:
             "filename mail email 'ops@example.com';",  # a mailbox
             "filename cmd pipe 'ls -l';",  # a command line
             "ods html file='/reports/out.html';",  # a report destination
+            "proc printto log='/logs/job.log' print='/out/job.lst'; run;",  # the job's log
         ],
     )
     def test_references_that_move_no_data_are_not_items(self, source):
@@ -548,3 +577,239 @@ class TestRunner:
         assert report.written == 1
         assert report.outcomes[0].status is ItemStatus.WRITTEN
         assert report.outcomes[0].rows == 42
+
+
+# ---------------------------------------------------------------------------
+# Database tables: SQL pass-through and named members of a database LIBNAME
+# ---------------------------------------------------------------------------
+
+PASS_THROUGH = """proc sql
+connect to oracle (user=&ora_user password=&ora_pass path=&ora_path);
+create table nonip as select * from connection to oracle
+(select cov_month, count as count from edw_export.current_nonip where table_cd='MED');
+disconnect from oracle;
+quit;
+"""
+
+
+def _db(source: str, source_id: str = "t.sas"):
+    """``(engine_refs, path_refs, db_tables)`` for *source*, via the real chunker."""
+    from chunker import SasSemanticChunker
+
+    result = SasSemanticChunker().chunk_text(source, source_id=source_id)
+    meta = [c.metadata for c in result.chunks]
+    return (
+        [r for m in meta for r in m.engine_refs],
+        [r for m in meta for r in m.external_refs],
+        [t for m in meta for t in m.db_tables],
+    )
+
+
+class TestDatabaseTables:
+    def test_a_pass_through_read_is_its_own_item(self):
+        engine_refs, path_refs, tables = _db(PASS_THROUGH)
+        plan = build_plan(
+            engine_refs, path_refs, db_tables=tables, config=_config(schema=None)
+        )
+        (item,) = plan.items
+        assert item.source.kind is SourceKind.ORACLE
+        assert item.source.object_name == "edw_export.current_nonip"
+        assert (item.source.connection, item.source.libref) == ("oracle", None)
+        assert item.source.locator == "&ora_path"
+        # No libref to name the schema after, so the Oracle owner does.
+        assert item.target_table == "main.edw_export.current_nonip"
+        assert "password, path, user" in item.blockers[0]
+
+    def test_writes_are_never_sources(self):
+        _, _, tables = _db(
+            "proc sql;\nconnect to oracle (path=P);\n"
+            "execute (truncate table stage.tmp) by oracle;\nquit;\n"
+        )
+        assert tables and build_plan(db_tables=tables, config=_config()).items == []
+
+    def test_a_libname_whose_tables_are_named_is_planned_per_table(self):
+        source = (
+            "libname edw oracle path=EDWPRO schema=fr_dm;\n"
+            "libname quiet oracle path=EDWPRO schema=other;\n"
+            "data work.a; set edw.accounts; run;\n"
+            "data work.b; set edw.orders; run;\n"
+        )
+        engine_refs, path_refs, tables = _db(source)
+        plan = build_plan(
+            engine_refs, path_refs, db_tables=tables, config=_config(schema=None)
+        )
+        objects = sorted(i.source.object_name for i in plan.items)
+        # edw's schema-level stand-in gives way to its two named tables; the
+        # LIBNAME nothing reads from keeps the stand-in it had.
+        assert objects == ["fr_dm.accounts", "fr_dm.orders", "other"]
+        targets = sorted(i.target_table for i in plan.items)
+        assert targets == ["main.edw.accounts", "main.edw.orders", "main.quiet.other"]
+
+    def test_one_table_read_by_two_files_is_one_item(self):
+        # Appending one copy per reader would load the rows twice.
+        _, _, first = _db(PASS_THROUGH, "a.sas")
+        _, _, second = _db(PASS_THROUGH, "b.sas")
+        plan = build_corpus_plan(
+            {}, db_tables={"a.sas": first, "b.sas": second}, config=_config()
+        )
+        (item,) = plan.items
+        assert item.write_mode is WriteMode.OVERWRITE
+        assert item.source.source_id == "a.sas"
+
+    def test_an_unknown_engine_and_a_dblink_block_the_item(self):
+        _, _, tables = _db(
+            "proc sql;\ncreate table a as select * from connection to mydb\n"
+            "(select * from s.t@prodlink);\nquit;\n"
+        )
+        (item,) = build_plan(db_tables=tables, config=_config()).items
+        joined = " ".join(item.blockers)
+        assert "connection 'mydb' is unknown" in joined
+        assert "database link 'prodlink'" in joined
+
+    def test_a_database_no_reader_connects_to_is_blocked(self):
+        # Planned through the SQL path so the plan lists it, but the one SQL
+        # reader speaks Oracle: run as planned, it would ask the wrong database.
+        _, _, tables = _db(
+            "proc sql;\nconnect to teradata (server=tdprod user=svc);\n"
+            "create table a as select * from connection to teradata\n"
+            "(select * from dw.accounts);\nquit;\n"
+        )
+        (item,) = build_plan(db_tables=tables, config=_config()).items
+        assert item.source.object_name == "dw.accounts"
+        assert "a teradata database" in item.blockers[0]
+        (item,) = _plan("libname td teradata server=tdprod schema=dw user=svc;").items
+        assert "a teradata database" in item.blockers[0]
+
+    def test_a_list_of_tables_is_one_item_for_the_operator_to_name(self):
+        source = (
+            "libname edw oracle path=EDWPRO schema=fr_dm;\n"
+            "data work.a; set edw.acct_: edw.orders; run;\n"
+            "proc copy in=edw out=work; run;\n"
+        )
+        engine_refs, path_refs, tables = _db(source)
+        plan = build_plan(
+            engine_refs, path_refs, db_tables=tables, config=_config(schema=None)
+        )
+        items = {i.source.object_name: i for i in plan.items}
+        assert sorted(items) == ["fr_dm.:", "fr_dm.acct_:", "fr_dm.orders"]
+        assert items["fr_dm.orders"].blockers == ()
+        # Which tables a list covers only the database knows: no target, and
+        # a blocker that says what the list is.
+        acct, every = items["fr_dm.acct_:"], items["fr_dm.:"]
+        assert (acct.target_table, every.target_table) == (UNRESOLVED_TARGET,) * 2
+        assert acct.blockers == (
+            "edw.acct_: reads a list of tables — every fr_dm table whose name starts "
+            "'acct_': the plan cannot name them without asking the database; list "
+            "the tables the job needs",
+        )
+        assert "every fr_dm table:" in every.blockers[0]
+
+    def test_the_reader_selects_owner_and_table(self):
+        from data_hydration.sources.oracle import OracleReader
+
+        _, _, qualified = _db(PASS_THROUGH)
+        _, _, bare = _db(
+            "proc sql;\ncreate table a as select * from connection to oracle\n"
+            "(select * from current_nonip);\nquit;\n"
+        )
+        config = _config()
+        reads = {
+            OracleReader(item, config)._sql()
+            for tables in (qualified, bare)
+            for item in build_plan(db_tables=tables, config=config).items
+        }
+        assert reads == {
+            'SELECT * FROM "EDW_EXPORT"."CURRENT_NONIP"',
+            'SELECT * FROM "CURRENT_NONIP"',
+        }
+
+    def test_the_credential_is_keyed_on_the_connection(self, monkeypatch):
+        import types
+
+        import data_hydration.sources.oracle as oracle
+
+        seen: list[str] = []
+        monkeypatch.setattr(
+            oracle, "resolve_secret", lambda name, **_: seen.append(name) or "pw"
+        )
+        monkeypatch.setitem(
+            sys.modules, "oracledb", types.SimpleNamespace(connect=lambda **_: object())
+        )
+        _, _, tables = _db(
+            "proc sql;\nconnect to oracle as edw (path=EDWPRO user=svc);\n"
+            "create table a as select * from connection to edw (select * from s.t);\n"
+            "quit;\n"
+        )
+        (item,) = build_plan(db_tables=tables, config=_config()).items
+        oracle.connect(item, _config())
+        assert seen == ["oracle_password_edw"]
+
+    def test_the_cli_resolves_a_libname_in_another_file(self, tmp_path):
+        import argparse
+
+        from data_hydration.__main__ import _build_plan
+
+        (tmp_path / "a_setup.sas").write_text(
+            "libname edw oracle path=EDWPRO schema=fr_dm;\n"
+        )
+        (tmp_path / "b_job.sas").write_text(
+            "data work.a; set edw.accounts; run;\n" + PASS_THROUGH
+        )
+        args = argparse.Namespace(source_dir=tmp_path, pattern="*.sas", only=None)
+        plan = _build_plan(args, _config(schema=None))
+        assert sorted(i.source.object_name for i in plan.items) == [
+            "edw_export.current_nonip",
+            "fr_dm.accounts",
+        ]
+
+    def test_the_cli_gives_a_shared_table_to_the_first_file_that_reads_it(self, tmp_path):
+        import argparse
+
+        from data_hydration.__main__ import _build_plan
+
+        # a_reads.sas reads only the table; b_both.sas reads a file as well.
+        (tmp_path / "a_reads.sas").write_text(PASS_THROUGH)
+        (tmp_path / "b_both.sas").write_text(
+            "data x; infile '/data/in.csv'; input a; run;\n" + PASS_THROUGH
+        )
+        args = argparse.Namespace(source_dir=tmp_path, pattern="*.sas", only=None)
+        plan = _build_plan(args, _config(schema=None))
+        owners = {
+            i.source.object_name: pathlib.Path(i.source.source_id or "").name
+            for i in plan.items
+        }
+        assert owners == {"edw_export.current_nonip": "a_reads.sas", "in": "b_both.sas"}
+
+
+class TestMacroResolvedTables:
+    """Oracle names spelled through macro variables, as the plan sees them."""
+
+    PULL = (
+        "%macro pull(schema=edw_export, tbl=, out=);\n"
+        "proc sql;\nconnect to oracle (path=EDWPRO);\n"
+        "create table &out as select * from connection to oracle\n"
+        "  (select * from &schema..&tbl);\n"
+        "quit;\n%mend;\n"
+    )
+
+    def test_a_calls_table_is_planned_and_the_template_is_not(self):
+        _, _, tables = _db(self.PULL + "%pull(tbl=current_nonip, out=nonip);\n")
+        plan = build_plan(db_tables=tables, config=_config(schema=None))
+        (item,) = plan.items
+        assert item.source.object_name == "edw_export.current_nonip"
+        assert item.target_table == "main.edw_export.current_nonip"
+        assert item.blockers == ()
+
+    def test_a_macro_nobody_calls_hydrates_nothing(self):
+        _, _, tables = _db(self.PULL)
+        assert tables and build_plan(db_tables=tables, config=_config()).items == []
+
+    def test_a_let_resolved_schema_is_planned_resolved(self):
+        _, _, tables = _db(
+            "%let sch = EDW_EXPORT;\nproc sql;\nconnect to oracle (path=EDWPRO);\n"
+            "create table a as select * from connection to oracle "
+            "(select * from &sch..current_nonip);\nquit;\n"
+        )
+        (item,) = build_plan(db_tables=tables, config=_config(schema=None)).items
+        assert item.source.object_name == "edw_export.current_nonip"
+        assert item.blockers == ()

@@ -123,12 +123,39 @@ _ADDITIONAL_MACRO_FUNCTION_WORDS = frozenset(
     }
 )
 
+# Macro statements that are neither macro calls nor control flow: they act at
+# once, like %LET, so the scanner reads each as a GLOBAL_STATEMENT (SAS Macro
+# Language: Reference, "Macro Statements"; %SYSLPUT and %SYSRPUT are
+# SAS/CONNECT's). Several are absent from Appendix 1, so this set also widens
+# the macro-call exclusion: `%syslput x = 1;` invokes no macro named syslput.
+_MACRO_STATEMENT_WORDS = frozenset(
+    {
+        "copy",
+        "display",
+        "input",
+        "keydef",
+        "symdel",
+        "syscall",
+        "syslput",
+        "sysmacdelete",
+        "sysmstoreclear",
+        "sysrput",
+        "window",
+    }
+)
+
+# Every word the macro language owns: the full exclusion set for macro-call
+# detection, as a set (the scanner) and as a regex alternation (below).
+_MACRO_LANGUAGE_WORDS = (
+    _RESERVED_WORDS | _ADDITIONAL_MACRO_FUNCTION_WORDS | _MACRO_STATEMENT_WORDS
+)
+
 # Longest words first so the alternation doesn't short-circuit on a shorter
 # word that is a prefix of a longer one.
 _RESERVED_WORDS_PATTERN = "|".join(
     re.escape(w)
     for w in sorted(
-        _RESERVED_WORDS | _ADDITIONAL_MACRO_FUNCTION_WORDS,
+        _MACRO_LANGUAGE_WORDS,
         key=len,
         reverse=True,
     )
@@ -426,11 +453,30 @@ SAS_HOST_COMMAND_TOKENS: frozenset[str] = frozenset(
     {"x", "systask", "sysexec", "waitfor"}
 )
 
+# Global statements recognised by their keyword alone (SAS Global Statements:
+# Reference; SAS Viya's CAS and CASLIB; SAS/GRAPH's GOPTIONS, AXIS, SYMBOL,
+# LEGEND and PATTERN; and the SAS/CONNECT statements that start, feed and end
+# a remote session).
+_MISC_GLOBAL_STATEMENTS = frozenset(
+    {
+        "endsas", "dm", "sasfile", "lock", "missing", "page", "skip", "catname",
+        "resetline", "sysecho", "cas", "caslib",
+        "goptions", "axis", "symbol", "legend", "pattern",
+        "signon", "signoff", "rsubmit", "endrsubmit", "rdisplay", "rget",
+        "listtask", "killtask",
+    }
+)
+
+# Global statements written with an occurrence number: title2, axis1, symbol3.
+_NUMBERED_GLOBAL_STATEMENTS = frozenset(
+    {"title", "footnote", "axis", "symbol", "legend", "pattern"}
+)
+
 # Every token `SasChunkMetadata.global_statement_keyword` can hold. Public for
 # the same reason as the DATA-step vocabulary above: it is what an instruction
 # scopes on (`[when: global_statement:x]`), and a rule naming anything outside
-# it can never fire. `title`/`footnote` are recorded without their optional
-# occurrence digit, so `title2` is `title`.
+# it can never fire. A numbered statement is recorded without its occurrence
+# number, so `title2` is `title`; a macro statement without its `%`.
 SAS_GLOBAL_STATEMENT_TOKENS: frozenset[str] = (
     frozenset(
         {
@@ -439,7 +485,79 @@ SAS_GLOBAL_STATEMENT_TOKENS: frozenset[str] = (
         }
     )
     | SAS_HOST_COMMAND_TOKENS
+    | _MISC_GLOBAL_STATEMENTS
+    | _MACRO_STATEMENT_WORDS
 )
+
+# PROCs that run in groups — SAS calls them interactive procedures. RUN
+# executes the statements submitted so far and the PROC stays active for more,
+# until QUIT or the next step: `proc datasets; delete a; run; delete b; quit;`
+# is one step. PROC SQL and FEDSQL run each statement as it comes, so RUN does
+# nothing there; PROC DS2 runs the program before it.
+RUN_GROUP_PROCS: frozenset[str] = frozenset(
+    {
+        "sql", "fedsql", "ds2", "datasets", "catalog", "document", "iml",
+        "optmodel", "cas", "casutil",
+        "plot", "reg", "glm", "anova", "catmod", "arima", "model",
+        "gplot", "gchart", "gmap", "g3d", "gcontour", "greplay", "gslide",
+        "gradar", "gbarline", "pmenu", "trantab",
+    }
+)
+
+# What a PROC's options name, for chunker.statements. Either a dataset the step
+# reads, writes or updates in place ("read", "write", "update"), or a value
+# that only looks like one:
+#   - a "libref" (PROC COPY's IN= and OUT=);
+#   - a "fileref" (PROC HTTP's OUT=);
+#   - a "package" — the lib.member.package PROC FCMP's OUTLIB= names, which
+#     writes lib.member.
+# PROC_OPTION_DEFAULTS holds in every PROC. PROC_OPTION_ROLES adds a PROC's own
+# options, and overrides what a default option names there. An option neither
+# table lists names no dataset: FORMAT's LIBRARY= is a catalog, PRINTTO's LOG=
+# a file. Lowercase throughout.
+PROC_OPTION_DEFAULTS: dict[str, str] = {
+    "data": "read",
+    "out": "write",
+    "outdata": "write",
+    # Statistics and modelling: estimates, statistics, fitted models and trees
+    # out; a fitted model, estimates, test data or class levels in.
+    "outest": "write",
+    "outmodel": "write",
+    "outstat": "write",
+    "outtree": "write",
+    "outseed": "write",
+    "testout": "write",
+    "inmodel": "read",
+    "inest": "read",
+    "testdata": "read",
+    "classdata": "read",
+}
+
+PROC_OPTION_ROLES: dict[str, dict[str, str]] = {
+    # BASE= has DATA='s rows added to it: read and rewritten in place.
+    "append": {"base": "update", "new": "read"},
+    "compare": {"base": "read", "compare": "read", "outstats": "write"},
+    "sort": {"dupout": "write", "uniqueout": "write"},
+    "format": {"cntlin": "read", "cntlout": "write"},
+    "contents": {"out2": "write"},
+    "corr": {"outp": "write", "outs": "write", "outk": "write", "outh": "write"},
+    # FASTCLUS reads its initial seeds from SEED= and writes the cluster means
+    # to MEAN=. Everywhere else SEED= is a random-number seed.
+    "fastclus": {"seed": "read", "mean": "write", "instat": "read"},
+    "score": {"score": "read"},
+    "phreg": {"covariates": "read"},
+    "copy": {"in": "libref", "out": "libref"},
+    "upload": {"inlib": "libref", "outlib": "libref"},
+    "download": {"inlib": "libref", "outlib": "libref"},
+    "http": {
+        "in": "fileref",
+        "out": "fileref",
+        "headerin": "fileref",
+        "headerout": "fileref",
+    },
+    "json": {"out": "fileref"},
+    "fcmp": {"outlib": "package"},
+}
 
 # A function call is ``name(`` where the name is not glued to a preceding ``%``,
 # ``&``, or ``.``; a CALL routine is ``CALL name`` at a word boundary. Both

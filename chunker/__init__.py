@@ -7,7 +7,11 @@ from .batcher import (
     replace_dataset_names,
 )
 from .chunker import SasSemanticChunker
+from .metadata import resolve_corpus_references
 from .models import (
+    DatasetRole,
+    DbTableAccess,
+    DbTableVia,
     PathLocation,
     SasBatch,
     SasBatchResult,
@@ -16,9 +20,12 @@ from .models import (
     SasChunkMetadata,
     SasChunkResult,
     SasCorpus,
+    SasDatasetRef,
+    SasDbTableRef,
     SasDiagnostic,
     SasDiagnosticSeverity,
     SasEngineRef,
+    SasIncludeFile,
     SasPathRef,
 )
 from .paths import (
@@ -43,6 +50,8 @@ __all__ = [
     "SasChunk",
     "SasChunkKind",
     "SasChunkMetadata",
+    "SasDatasetRef",
+    "DatasetRole",
     "SasChunkResult",
     "SasDiagnostic",
     "SasDiagnosticSeverity",
@@ -53,6 +62,7 @@ __all__ = [
     "SasCorpus",
     # physical/remote path recognition — the grammar xref.pre also reads
     "SasPathRef",
+    "SasIncludeFile",
     "PathLocation",
     "PATH_STATEMENTS",
     "classify_location",
@@ -61,4 +71,10 @@ __all__ = [
     "SasEngineRef",
     "ENGINE_LIBNAMES",
     "extract_engine_refs",
+    # database tables (SQL pass-through and engine LIBNAMEs) — what it reads
+    "SasDbTableRef",
+    "DbTableAccess",
+    "DbTableVia",
+    # cross-file name resolution for callers that do not batch
+    "resolve_corpus_references",
 ]

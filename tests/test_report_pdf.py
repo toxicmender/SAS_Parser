@@ -216,7 +216,13 @@ def test_report_from_verdicts_renders_to_pdf():
 def test_report_from_thread_reads_stored_verdicts():
     from memory.store import MemoryHub
 
-    from chunker.models import SasChunk, SasChunkKind, SasChunkMetadata
+    from chunker.models import (
+        DatasetRole,
+        SasChunk,
+        SasChunkKind,
+        SasChunkMetadata,
+        SasDatasetRef,
+    )
     from validation import LiveValidator
 
     kv = MemoryHub().kv
@@ -231,7 +237,10 @@ def test_report_from_thread_reads_stored_verdicts():
         start_char=0,
         end_char=len(text),
         metadata=SasChunkMetadata(
-            input_datasets=["work.a"], output_datasets=["work.x"]
+            dataset_refs=(
+                SasDatasetRef(name="work.a", role=DatasetRole.READ),
+                SasDatasetRef(name="work.x", role=DatasetRole.WRITE),
+            )
         ),
     )
     LiveValidator().validate_item(

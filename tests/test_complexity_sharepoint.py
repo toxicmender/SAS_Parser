@@ -322,6 +322,44 @@ def test_end_to_end_uploads_the_whole_tree(_wired):
     assert all(n.startswith(root) for n in names)
 
 
+class _ListingTransport(_FakeTransport):
+    """The fake library, browsable folder by folder as the include check
+    walks it."""
+
+    def list_directory(self, path=""):
+        names = self.files.get(path, [])
+        nested = {
+            folder[len(path) + 1:].split("/", 1)[0]
+            for folder in self.files
+            if folder.startswith(f"{path}/")
+        }
+        return [{"name": n, "is_folder": False} for n in names] + [
+            {"name": n, "is_folder": True} for n in sorted(nested)
+        ]
+
+
+def test_check_includes_looks_in_the_applications_scripts_folder(_wired, tmp_path):
+    folder = f"{BASE}/MyApp/scripts_original"
+    transport = _wired(
+        _ListingTransport(
+            rows=[_row()],
+            files={folder: ["etl.sas"], f"{folder}/macros": ["Util.sas"]},
+            texts={
+                f"{folder}/etl.sas": "%include '/sas/util.sas';\n%include '/sas/gone.sas';\n"
+                + _SAS
+            },
+        )
+    )
+    status = cli.main(
+        ["--sharepoint", "--app", "MyApp", "--check-includes", "--no-upload", "--out-dir", str(tmp_path)]
+    )
+    assert status == 0
+    report = (tmp_path / "complexity-report.md").read_text(encoding="utf-8")
+    assert f"| `util.sas` | etl.sas:1 | — | `{folder}/macros/Util.sas` |" in report
+    assert "| `gone.sas` | etl.sas:2 | — | **not found** |" in report
+    assert transport.uploaded == []
+
+
 def test_source_id_is_the_drive_relative_path(_wired):
     # No temporary files: chunk_text takes the text with an explicit
     # source_id, and the library path is exactly the id wanted.

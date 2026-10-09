@@ -105,6 +105,41 @@ def test_format_batch_message_covers_the_single_member_case():
     assert "data work.out; set work.in; run;" in msg
 
 
+def test_format_batch_message_names_database_tables_with_their_sas_copy():
+    # The one place the model learns that work.nonip *is* the Oracle table —
+    # and the connection's credentials never reach the prompt.
+    from chunker.passthrough import db_table_ref
+    from chunker.models import DbTableAccess, DbTableVia
+
+    table = db_table_ref(
+        "edw_export.current_nonip",
+        access=DbTableAccess.READ,
+        via=DbTableVia.CONNECTION_TO,
+        connection="oracle",
+        engine="oracle",
+        sas_targets=("work.nonip",),
+        options=(("password", "&ora_pass"),),
+    )
+    chunk = _mk_chunk(
+        "f1-chunk-0001", "etl.sas", "proc sql; ... quit;", db_tables=[table]
+    )
+    msg = _format_batch_message(_wrap(chunk), index=1, total=1, diagnostics=[])
+
+    assert (
+        "- Database tables   : oracle:edw_export.current_nonip → work.nonip "
+        "(read via connection_to oracle)"
+    ) in msg
+    assert "&ora_pass" not in msg
+
+    plain = _format_batch_message(
+        _wrap(_mk_chunk("f1-chunk-0002", "etl.sas", "data a; run;")),
+        index=1,
+        total=1,
+        diagnostics=[],
+    )
+    assert "- Database tables   : none" in plain
+
+
 def test_format_batch_message_includes_all_members_and_cross_file_flag():
     c1 = _mk_chunk(
         "f1-chunk-0001",

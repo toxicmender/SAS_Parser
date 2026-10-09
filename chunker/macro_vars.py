@@ -47,6 +47,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Mapping
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -119,28 +120,68 @@ def strip_quotes(value: str) -> str:
     return value
 
 
+def name_value(raw: str) -> str | None:
+    """*raw* as a value that can name a dataset, a library or part of one —
+    lowercased, quotes stripped — or ``None`` when it cannot.
+
+    The one test every source of macro-variable values applies, so ``%LET``,
+    ``CALL SYMPUTX``, a ``%MACRO`` parameter's default and a call's argument
+    cannot disagree about what counts as a name.
+    """
+    value = strip_quotes(raw)
+    if not value or len(value) > _MAX_VALUE_LEN or not _NAME_VALUE_RE.match(value):
+        return None
+    return value.lower()
+
+
+#: Longest %LET value kept as text for a path. A path is rarely longer.
+_MAX_TEXT_LEN = 1024
+
+
+def text_value(raw: str) -> str | None:
+    """*raw* as a value pasted into a path — case, separators and quotes kept —
+    or ``None`` when its value is not knowable here.
+
+    The counterpart of :func:`name_value` for a reference inside a quoted path
+    (``"&root/setup.sas"``), where SAS pastes the value as written:
+    ``/SAS/Prod``, ``C:\\Projects``, or a quoted ``'/sas/x.sas'`` that
+    ``%include &f;`` reads as its own quoted path. A value that calls a macro
+    function (``%sysget(HOME)``, ``%sysfunc(getoption(work))``) is computed at
+    run time, so it is unknown, as an empty one is.
+    """
+    value = raw.strip()
+    if not value or len(value) > _MAX_TEXT_LEN or "%" in value:
+        return None
+    return value
+
+
+def let_assignments(text: str) -> list[tuple[str, str]]:
+    """Every ``%LET`` in *text*, in order: ``(name, value as written)``.
+
+    Name lowercased, value stripped of surrounding whitespace and nothing
+    else — the raw material :func:`let_values` and a called macro's
+    global-assignment analysis (``chunker.metadata._MacroDef``) both read.
+    """
+    return [
+        (m.group(1).lower(), m.group(2).strip()) for m in _LET_ASSIGN_RE.finditer(text)
+    ]
+
+
 def let_values(text: str) -> dict[str, str]:
-    """Every ``%LET`` assignment in *text* that assigns a *name*, lowercased.
+    """The value each ``%LET`` in *text* leaves its variable holding, lowercased.
 
     *text* must be the comments-blanked, strings-intact form (``cf`` in
     :func:`chunker.metadata._metadata_for`): a %LET written inside a comment
     assigns nothing, and a quoted value has to survive to be unquoted here.
 
-    Values that could not be a dataset or library name, or part of one, are
-    dropped (see :data:`_NAME_VALUE_RE`), and a repeated name keeps the last
-    assignment — what a sequential SAS session would hold by the chunk's end.
-    Keys and values are both lowercased, consistent with the package's
-    lowercase-everything policy: a value here only ever becomes part of a
-    dataset or libref name.
+    A value that could not be a dataset or library name, or part of one (see
+    :func:`name_value`), maps to ``""`` — *unknown from here on* — rather than
+    being left out: ``%let sch = edw; ... %let sch = %scan(&list, 2);`` must not
+    leave a later ``&sch`` resolving to the stale ``edw``. A repeated name keeps
+    the last assignment — what a sequential SAS session would hold by the
+    chunk's end.
     """
-    values: dict[str, str] = {}
-    for m in _LET_ASSIGN_RE.finditer(text):
-        value = strip_quotes(m.group(2))
-        if not value or len(value) > _MAX_VALUE_LEN:
-            continue
-        if not _NAME_VALUE_RE.match(value):
-            continue
-        values[m.group(1).lower()] = value.lower()
+    values = {name: name_value(raw) or "" for name, raw in let_assignments(text)}
     if values and logger.isEnabledFor(logging.DEBUG):
         logger.debug(f"let_values: {values}")
     return values
@@ -168,10 +209,13 @@ def _expand_once(
             if not rescan:
                 return m.group(0)
             return f"{amps[1:]}{name}{dot}"
-        if name in skip or name not in table:
+        # An empty value means *unknown* throughout this package — it is how a
+        # layer hides a name it shadows — so it resolves nothing.
+        value = None if name in skip else table.get(name)
+        if not value:
             return m.group(0)
         expanded.add(name)
-        return table[name]
+        return value
 
     return _REF_RE.sub(_sub, text), expanded
 
@@ -237,3 +281,193 @@ def is_dataset_shaped(value: str) -> bool:
     position, whereas a two-level one names a library on sight.
     """
     return bool(_DATASET_SHAPE_RE.match(value))
+
+
+# ---------------------------------------------------------------------------
+# Macro call arguments
+# ---------------------------------------------------------------------------
+# The grammar of a call's argument list, used by the batcher to resolve a
+# macro body's parameterised datasets per call site and by
+# chunker.metadata to resolve the database tables a called macro's
+# pass-through SQL names. Pure, like the rest of this module.
+
+# Locates the opening of a macro call's argument list: %macroname( . The
+# balanced closing paren is found by _extract_call_arg_text below.
+_CALL_OPEN_RE = re.compile(r"%\s*[A-Za-z_]\w*\s*\(")
+
+# A keyword argument is name= at the start of the (stripped) argument, so a
+# positional value like f(x=1) is not mistaken for keyword 'f(x'.
+_KW_ARG_RE = re.compile(r"([A-Za-z_]\w*)\s*=(.*)$", re.DOTALL)
+
+# One call in a run of them: %name, then its argument list when a "(" follows.
+# Semicolons between calls are empty statements.
+_CALL_RUN_RE = re.compile(r"[\s;]*(%\s*([A-Za-z_]\w*))\s*(\()?")
+_PAREN_RE = re.compile(r"[()]")
+
+
+class CallSpan(NamedTuple):
+    """One macro call found by :func:`call_spans`."""
+
+    name: str  # lowercased
+    start: int  # the "%"
+    end: int  # past its closing ")", or its name when no list follows
+    closed: bool  # False: the argument list runs to the end of the text
+
+
+def call_spans(mt: str) -> list[CallSpan]:
+    """Each macro call *mt* opens with, back to back.
+
+    A call needs no semicolon: it ends at the parenthesis closing its argument
+    list — or at its name, when no list follows — so ``%pull(tbl=a)`` and
+    ``%pull(tbl=b)`` on consecutive lines are two calls, and the next starts
+    only where another ``%name`` follows; anything else ends the run.
+
+    *mt* must be sanitised text (comments and string interiors blanked), so a
+    parenthesis inside a quoted argument cannot end a call. A list left open
+    runs to the end of the text and is not ``closed``. Offsets index *mt*,
+    which is char-aligned with the text it was made from. The parentheses are
+    found by regex, not character by character: the scanner runs this on every
+    statement that opens with a call.
+    """
+    spans: list[CallSpan] = []
+    pos = 0
+    while m := _CALL_RUN_RE.match(mt, pos):
+        end, closed = m.end(1), True
+        if m.group(3) is not None:
+            depth, end, closed = 0, len(mt), False
+            for paren in _PAREN_RE.finditer(mt, m.start(3)):
+                depth += 1 if paren.group() == "(" else -1
+                if depth == 0:
+                    end, closed = paren.end(), True
+                    break
+        spans.append(CallSpan(m.group(2).lower(), m.start(1), end, closed))
+        pos = end
+    return spans
+
+
+def _balanced_text(text: str, start: int) -> str:
+    """The text from *start*, just past an opening paren, to its balanced
+    closing paren.
+
+    Walks characters with a paren-depth counter, treating single- and
+    double-quoted spans as opaque, so nested constructs like
+    ``%clean(%str(a,b), out=f(x))`` yield the full argument text instead
+    of stopping at the first ``)``.  Unbalanced (a truncated chunk), it is
+    everything after the opening paren.
+    """
+    depth = 1
+    quote: str | None = None
+    for i in range(start, len(text)):
+        ch = text[i]
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start:i]
+    return text[start:]
+
+
+def _extract_call_arg_text(call_text: str) -> str | None:
+    """Return the text between the call's balanced outer parens, or None."""
+    m = _CALL_OPEN_RE.search(call_text)
+    if not m:
+        return None
+    return _balanced_text(call_text, m.end())
+
+
+# A %MACRO statement's name, and the paren its parameter list opens with.
+_MACRO_HEAD_RE = re.compile(r"%\s*macro\s+([A-Za-z_]\w*)\s*(\()?", re.IGNORECASE)
+
+
+def macro_signature(text: str) -> list[tuple[str, str | None]]:
+    """The ``(name, default)`` parameters of the first ``%MACRO`` statement
+    in *text*, in signature order, names lowercased; ``default`` is ``None``
+    for a positional parameter.
+
+    The list is read with balanced parentheses and split on top-level commas,
+    so a default holding either — ``list=%str(a,b)``, ``fmt=put(x, 8.)`` — is
+    one parameter, as SAS reads it.
+    """
+    m = _MACRO_HEAD_RE.search(text)
+    if m is None or m.group(2) is None:
+        return []
+    params: list[tuple[str, str | None]] = []
+    for part in _split_call_args(_balanced_text(text, m.end())):
+        name, eq, default = part.partition("=")
+        params.append((name.strip().lower(), default.strip() if eq else None))
+    return params
+
+
+def _split_call_args(raw_args: str) -> list[str]:
+    """Split an argument list on top-level commas (quote- and paren-aware)."""
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    quote: str | None = None
+    for ch in raw_args:
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    parts.append("".join(buf))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _parse_call_args(
+    call_text: str, *, as_written: bool = False
+) -> tuple[list[str], dict[str, str]]:
+    """
+    Parse a MACRO_CALL chunk's raw text into (positional_args, keyword_args).
+
+    Used by Fix B (parameterised macro output/input resolution): the
+    definition's ``body_param_outputs``/``body_param_inputs`` reference a
+    parameter by name and positional index, and this function recovers the
+    actual values supplied at the call site so those references can be
+    resolved to concrete dataset names.
+
+    Quoting and trailing dots are stripped from each value so that
+    ``work.orders``, ``'work.orders'``, and ``work.orders.`` all normalise
+    to the same lowercase dataset key. *as_written* keeps each value as the
+    call spells it, only trimmed — what a path the macro builds from it reads
+    (``%setpaths(/SAS/Prod)``).
+    """
+    raw_args = _extract_call_arg_text(call_text)
+    if raw_args is None:
+        return [], {}
+
+    clean = str.strip if as_written else _clean_arg_value
+    positional: list[str] = []
+    keyword: dict[str, str] = {}
+
+    for part in _split_call_args(raw_args):
+        kw = _KW_ARG_RE.match(part)
+        if kw:
+            keyword[kw.group(1).lower()] = clean(kw.group(2))
+        else:
+            positional.append(clean(part))
+
+    return positional, keyword
+
+
+def _clean_arg_value(value: str) -> str:
+    """Strip quotes and a single trailing dot from a macro call argument."""
+    v = value.strip()
+    if v.startswith(("'", '"')) and v.endswith(("'", '"')):
+        v = v[1:-1]
+    return v.rstrip(".").lower()
