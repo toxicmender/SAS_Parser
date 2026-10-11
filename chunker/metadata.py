@@ -1179,6 +1179,9 @@ class _MacroDef:
                 name = name.lstrip("&").rstrip(".")
                 if _IDENT_RE.fullmatch(name):
                     declared[m.group(1).lower()].add(name.lower())
+        # A definition's produces_macrovars lists its CALL SYMPUTs alone; a
+        # PROC SQL INTO in the body overwrites a global just the same.
+        into = _extract_sql_into_vars(mt) if "into" in mt.lower() else []
         return cls(
             name=meta.macro_name or "",
             positional=tuple(n for n, d in params if d is None),
@@ -1187,7 +1190,7 @@ class _MacroDef:
             global_names=frozenset(declared["global"]),
             local_names=frozenset(declared["local"]),
             assignments=tuple(let_assignments(cf)),
-            produces=frozenset(meta.produces_macrovars),
+            produces=frozenset([*meta.produces_macrovars, *into]),
             conditional=bool(_MACRO_CONTROL_RE.search(mt)),
             db_tables=tuple(meta.db_tables),
         )

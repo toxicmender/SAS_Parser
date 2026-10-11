@@ -3452,6 +3452,21 @@ class TestIncludeCheckCLI(unittest.TestCase):
         self.assertTrue(looked[0].endswith("MyApp/scripts_original"))
         self.assertIn(f"| `gone.sas` | job.sas:2 | **not found** | `{looked[0]}/gone.sas` |", report)
 
+    def test_a_sharepoint_folder_that_cannot_be_listed_keeps_the_report(self):
+        import data_hydration.includes as includes
+
+        def unreachable(folder, **_):
+            raise ConnectionError("SharePoint is down")
+
+        original = includes.sharepoint_index
+        includes.sharepoint_index = unreachable
+        self.addCleanup(setattr, includes, "sharepoint_index", original)
+        with self.assertLogs("complexity", level="ERROR") as logs:
+            report = self._report("--check-includes", "--app", "MyApp")
+        self.assertIn("could not list SharePoint folder", "\n".join(logs.output))
+        # The local search stands; SharePoint's column says nothing was there.
+        self.assertIn("| `util.sas` | job.sas:1 | `macros/util.sas` | — |", report)
+
     def test_without_the_flag_the_report_is_unchanged(self):
         self.assertNotIn("Included scripts", self._report())
 

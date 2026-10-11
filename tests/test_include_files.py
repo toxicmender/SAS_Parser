@@ -160,6 +160,27 @@ def test_a_variable_holding_a_fileref_member_is_followed():
     assert (util.path, util.raw, util.fileref) == ("/Code/Dir/util.sas", "&f", "src")
 
 
+def test_a_variable_holding_neither_a_file_nor_a_fileref_stays_unresolved():
+    # Two files at once, or text: not one place this include can be said to read.
+    for value in ("'/a.sas' '/b.sas'", "%str(a b)"):
+        [x] = _files(f"%let f = {value};\n%include &f;\n")
+        assert (x.path, x.resolved) == ("&f", False), value
+
+
+def test_references_print_as_written_and_as_resolved():
+    src = (
+        "%let root = /SAS;\nfilename src '/code';\n"
+        "%include \"&root/x.sas\";\n%include src(util);\n%include &f;\n"
+    )
+    assert [str(f) for f in _files(src)] == [
+        "/SAS/x.sas",
+        "/code/util.sas (via src)",
+        "&f (via &f) [unresolved]",
+    ]
+    [ref] = [r for c in _chunks(src) for r in c.metadata.external_refs if r.raw.startswith("&root")]
+    assert str(ref) == "include [filesystem] &root/x.sas → /SAS/x.sas"
+
+
 def test_a_value_known_only_at_run_time_stays_unresolved():
     never_assigned = '%include "&root/x.sas";\n'
     from_the_environment = '%let root = %sysget(HOME);\n%include "&root/x.sas";\n'

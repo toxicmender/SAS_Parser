@@ -38,6 +38,7 @@ from chunker import (
 from chunker.batcher import MultiFileBatcher
 from chunker.metadata import resolve_references
 from chunker.models import SasChunkKind
+from chunker.passthrough import mask
 from chunker.sql import SqlStatement, split_table_name
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -225,6 +226,35 @@ class TestConnections(unittest.TestCase):
         self.assertIsNone(table.engine)
         self.assertEqual(table.connection, "edw")
 
+    def test_a_stray_parenthesis_ends_no_statement_early(self):
+        src = (
+            "proc sql;\nconnect to oracle (path=P));\n"
+            "create table a as select * from connection to oracle (select * from s.t);\nquit;\n"
+        )
+        (table,) = _chunk(src).chunks[0].metadata.db_tables
+        self.assertEqual((table.qualified, table.sas_targets), ("s.t", ("work.a",)))
+
+    def test_a_connect_without_options(self):
+        src = (
+            "proc sql;\nconnect to oracle;\n"
+            "create table a as select * from connection to oracle (select * from s.t);\n"
+            "quit;\n"
+        )
+        (table,) = _chunk(src).chunks[0].metadata.db_tables
+        self.assertEqual((table.engine, table.options), ("oracle", ()))
+
+    def test_a_connect_inside_native_sql_opens_no_connection(self):
+        # The SAS scan leaves a database's own -- comments in place; what they
+        # say is the query's, never a statement.
+        src = (
+            "proc sql;\nconnect to oracle (path=P);\n"
+            "create table a as select * from connection to oracle\n"
+            "  (select * from s.t -- connect to teradata (x)\n  );\nquit;\n"
+        )
+        (table,) = _chunk(src).chunks[0].metadata.db_tables
+        self.assertEqual((table.engine, table.qualified), ("oracle", "s.t"))
+        self.assertEqual(table.option_map, {"path": "P"})
+
 
 # ── 3. EXECUTE ... BY ──────────────────────────────────────────────────────
 
@@ -308,9 +338,21 @@ class TestNativeSql(unittest.TestCase):
     def test_table_functions_lateral_partition_and_sample(self):
         reads, _ = _native(
             "select * from table(f(x)) t, s.big partition (p1) b, "
-            "lateral (select 1 from s.lat) l, s.smp sample (10) z"
+            "lateral (select 1 from s.lat) l, s.smp sample (10) z, "
+            "s.blk sample block (5) k"
         )
-        self.assertEqual(sorted(reads), ["s.big", "s.lat", "s.smp"])
+        self.assertEqual(sorted(reads), ["s.big", "s.blk", "s.lat", "s.smp"])
+
+    def test_a_with_that_opens_no_query(self):
+        # Teradata's WITH DATA, Synapse's table options, DB2's isolation level.
+        for sql in (
+            "create table s.t as (select * from s.src) with data",
+            "create table s.t with (distribution = hash(id)) as select * from s.src",
+            "select * from s.src with ur",
+        ):
+            with self.subTest(sql=sql):
+                reads, _ = _native(sql)
+                self.assertEqual(reads, ["s.src"])
 
     def test_write_forms(self):
         cases = {
@@ -325,6 +367,9 @@ class TestNativeSql(unittest.TestCase):
             "drop table stage.old purge": ([], ["stage.old"]),
             "insert into s.t (a, b) values (1, 2)": ([], ["s.t"]),
             "select * from s.t for update of c": (["s.t"], []),
+            # Oracle's DELETE needs no FROM; a session is no table.
+            "delete s.old where x = 1": ([], ["s.old"]),
+            "alter session set nls_date_format = 'yyyy'": ([], []),
         }
         for sql, expected in cases.items():
             with self.subTest(sql=sql):
@@ -342,6 +387,8 @@ class TestNativeSql(unittest.TestCase):
         self.assertEqual(split_table_name("edw.&tbl."), ("edw", "&tbl", None))
         self.assertEqual(split_table_name("db..t"), ("db", "t", None))
         self.assertEqual(split_table_name("t"), (None, "t", None))
+        # No name at all: nothing to split.
+        self.assertEqual(split_table_name(""), (None, "", None))
 
     def test_quoted_identifiers_keep_their_spelling_in_raw(self):
         src = (
@@ -462,6 +509,11 @@ class TestMasking(unittest.TestCase):
         self.assertEqual(meta.input_datasets, ["work.lookup"])
         self.assertEqual(meta.output_datasets, ["work.out"])
         self.assertEqual([t.qualified for t in meta.db_tables], ["edw.t"])
+
+    def test_mask_blanks_each_span_once(self):
+        # Spans may overlap or be empty; the text keeps its length and lines.
+        self.assertEqual(mask("abcdefgh", [(5, 4), (2, 3), (1, 3)]), "a  defgh")
+        self.assertEqual(mask("ab\ncd", [(0, 5)]), "  \n  ")
 
 
 # ── 7. Macro variables in names ────────────────────────────────────────────
@@ -750,6 +802,20 @@ class TestMacroCalls(unittest.TestCase):
             [t.qualified for t, _ in _read(src + _query("select * from &sch..t"))],
             ["&sch..t"],
         )
+
+    def test_a_global_a_called_macro_overwrites_at_run_time_is_unknown(self):
+        # CALL SYMPUTX or PROC SQL INTO in the body replaces the global when the
+        # call runs, with a value the source does not hold.
+        for body in (
+            "data _null_; set cfg; call symputx('sch', s); run;\n",
+            "proc sql noprint; select s into :sch from cfg; quit;\n",
+        ):
+            with self.subTest(body=body):
+                src = f"%let sch = dev;\n%macro reset;\n{body}%mend;\n%reset;\n"
+                self.assertEqual(
+                    [t.qualified for t, _ in _read(src + _query("select * from &sch..t"))],
+                    ["&sch..t"],
+                )
 
     def test_local_and_undeclared_assignments_stay_in_the_macro(self):
         local = "%let sch = dev;\n%macro loc;\n%local sch;\n%let sch = inner;\n%mend;\n%loc;\n"

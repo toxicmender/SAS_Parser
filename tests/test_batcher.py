@@ -860,6 +860,34 @@ class TestPatternDatasetFlow(unittest.TestCase):
             [c.chunk_id for c in br.batches[0].chunks], ["chunk-0002", "chunk-0003"]
         )
 
+    def test_an_exact_producer_after_a_copy_is_the_nearer(self):
+        """The DATA step rewrote tgt.cust after the COPY: the reader depends on
+        it, and the COPY stays out."""
+        src = (
+            "proc copy in=src out=tgt; run;\n"
+            "data tgt.cust; set raw.c; run;\n"
+            "data work.x; set tgt.cust; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertEqual(
+            [c.chunk_id for c in br.batches[0].chunks], ["chunk-0002", "chunk-0003"]
+        )
+
+    def test_prefix_input_ignores_other_libraries_and_later_copies(self):
+        src = (
+            "data zz.sales_e; set raw.e; run;\n"
+            "proc copy in=a out=other; run;\n"
+            "data _null_; set zz.sales_:; run;\n"
+            "proc copy in=src out=zz; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertEqual(
+            [c.chunk_id for c in br.batches[0].chunks], ["chunk-0001", "chunk-0003"]
+        )
+        self.assertEqual(_singleton_ids(br), ["chunk-0002", "chunk-0004"])
+
     def test_last_skips_a_pattern_output(self):
         """_LAST_ is the last data set created; a whole-library COPY creates
         no one data set, so PROC PRINT with no DATA= reads work.a."""
@@ -1038,6 +1066,26 @@ class TestGlobalContextBatch(unittest.TestCase):
         self.assertEqual(len(br.batches), 1)
         self.assertFalse(br.batches[0].is_global_context)
         self.assertEqual(br.batches[0].batch_id, "batch-001")
+
+    def test_a_context_statement_before_a_global_macro_joins_its_batch(self):
+        """OPTIONS (or a %LET) just before a macro two pipelines call is
+        absorbed into the global-context batch, which absorption may re-root;
+        the batch is still emitted first, and the pipelines stay apart."""
+        for context in ("options nocenter;\n", "%let x = 1;\n", "filename src '/code';\n"):
+            src = (
+                f"{context}%macro load(ds); data out; set &ds; run; %mend;\n"
+                "%load(raw.a);\ndata x; set y; run;\n%load(raw.c);\n"
+            )
+            with self.subTest(context=context):
+                _, br = _chunk_and_batch(src)
+                globals_batch = br.batches[0]
+                self.assertTrue(globals_batch.is_global_context)
+                self.assertEqual(
+                    [c.chunk_id for c in globals_batch.chunks], ["chunk-0001", "chunk-0002"]
+                )
+                self.assertEqual(
+                    _ordered_chunk_ids(br), [f"chunk-{i:04d}" for i in range(1, 6)]
+                )
 
 
 # ── 12. Call-argument parsing with nested parens ──────────────────────────

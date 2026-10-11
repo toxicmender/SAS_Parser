@@ -83,7 +83,7 @@ def test_what_a_sas_table_position_may_hold():
     # SAS's own metadata.
     sql = (
         "select * from '/data/in.sas7bdat' a, 'my data'n b, &lib..&tbl c, "
-        "%src(x) d, dictionary.tables t"
+        "%src(x) d, %all e, dictionary.tables t"
     )
     assert [name for name, _, _ in _refs(sql)] == [
         "'/data/in.sas7bdat'",
@@ -97,9 +97,42 @@ def test_strings_and_functions_hide_no_tables():
     assert _refs(sql) == [("a", R, "from")]
 
 
-def test_a_cte_is_no_table():
-    sql = "with recent as (select * from lib.log) select * from recent"
-    assert _refs(sql) == [("lib.log", R, "from")]
+@pytest.mark.parametrize(
+    ("sql", "reads"),
+    [
+        ("with recent as (select * from lib.log) select * from recent", ["lib.log"]),
+        # A column list, several queries, a materialisation hint.
+        ("with c(a, b) as (select x, y from lib.src) select * from c", ["lib.src"]),
+        (
+            "with a as (select * from s1), b as (select * from s2) select * from a join b on 1",
+            ["s1", "s2"],
+        ),
+        ("with c as materialized (select * from s1) select * from c", ["s1"]),
+        ("with c as not materialized (select * from s1) select * from c", ["s1"]),
+    ],
+)
+def test_a_cte_is_no_table(sql, reads):
+    assert _refs(sql) == [(name, R, "from") for name in reads]
+
+
+@pytest.mark.parametrize("dialect", list(Dialect))
+@pytest.mark.parametrize(
+    ("sql", "reads"),
+    [
+        # Cut short — by a macro, or a statement still being written.
+        ("select * from", []),
+        ("select * from ;", []),
+        ("select * from a,", ["a"]),
+        # Unbalanced, or a clause without its list: the rest still reads.
+        ("select (a)) from t", ["t"]),
+        ("select * from t partition p1", ["t"]),
+        ("with x as y select * from t", ["t"]),
+        # DELETE from a subquery deletes from no table this names.
+        ("delete from (select * from a)", ["a"]),
+    ],
+)
+def test_malformed_sql_names_what_is_there(sql, reads, dialect):
+    assert SqlStatement(sql, dialect).refs() == [(name, R, "from") for name in reads]
 
 
 def test_the_native_dialect_reads_a_function_where_sas_reads_options():

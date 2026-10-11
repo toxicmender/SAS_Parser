@@ -420,3 +420,22 @@ class TestFilerefResolution:
         refs = self._refs("%let f = in;\nfilename &f '/data/x.csv';\ndata a; infile in; run;\n")
         assert refs[2] == [("infile", "filesystem", "/data/x.csv")]
 
+
+    def test_a_fileref_form_has_no_value_to_rewrite(self):
+        # xref.pre rewrites quoted values in place; `%include src(util);` and
+        # `infile in;` name their place through a FILENAME, never here.
+        from chunker.paths import PATH_STATEMENTS
+
+        source = "%include src(util);\n%include src;\ndata a; infile in; file out; run;\n"
+        found = [
+            (spec.statement, spec.location_for(m), spec.value_spans(m))
+            for spec in PATH_STATEMENTS
+            if spec.fileref
+            for m in spec.pattern.finditer(source)
+        ]
+        assert found == [
+            ("include", PathLocation.FILEREF, []),
+            ("include", PathLocation.FILEREF, []),
+            ("infile", PathLocation.FILEREF, []),
+            ("file", PathLocation.FILEREF, []),
+        ]

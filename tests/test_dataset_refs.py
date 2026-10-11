@@ -124,6 +124,19 @@ def test_lists_build_the_references_behind_them():
     assert _ref("work.a", W) in meta.dataset_refs
 
 
+def test_a_reference_built_with_a_role_name_takes_the_role():
+    # A dataclass is not validated: "read" must still be READ for the views.
+    ref = SasDatasetRef("work.a", "read")  # pyright: ignore[reportArgumentType]
+    assert ref.role is R
+    assert _meta(ref).input_datasets == ["work.a"]
+
+
+def test_a_reference_prints_its_role_name_and_provenance():
+    assert str(_ref("work.a", R)) == "read work.a"
+    assert str(_ref("lib.b", U, via="modify")) == "update lib.b (modify)"
+    assert str(_param("ds", 0, W)) == "write &ds (body, param ds#0)"
+
+
 def test_old_json_without_references_loads():
     meta = SasChunkMetadata.model_validate({"step_name": "c", **LISTS})
     assert meta.step_name == "c"

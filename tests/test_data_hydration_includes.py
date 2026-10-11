@@ -126,6 +126,13 @@ def test_the_sharepoint_index_walks_every_folder():
     assert set(index) == {"job.sas", "readme.md", "util.sas"}
 
 
+def test_an_entry_with_no_name_is_no_file():
+    library = _Library({"a": ["x.sas"]})
+    listed = library.list_directory
+    library.list_directory = lambda path="": [*listed(path), {"is_folder": False}, {"name": ""}]
+    assert sharepoint_index("a", client=library) == {"x.sas": ("a/x.sas",)}
+
+
 def test_a_sharepoint_walk_stops_at_its_folder_limit(monkeypatch, caplog):
     import data_hydration.includes as includes
 
@@ -183,6 +190,11 @@ def test_the_checks_name_each_script_once_with_everyone_who_includes_it():
     assert checks["&f"].status == "unnamed"
     # Unchecked: nobody looked.
     assert {c.status for c in include_checks(_rows(job=SRC))} == {"unchecked"}
+
+
+def test_one_statement_including_two_copies_of_a_script_is_one_site():
+    [check] = include_checks(_rows(job="%include '/a/util.sas' '/b/UTIL.sas';\n"))
+    assert (check.file_name, check.included_by) == ("util.sas", (("job.sas", 1),))
 
 
 def test_the_matches_survive_the_table_round_trip():

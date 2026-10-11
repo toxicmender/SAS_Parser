@@ -744,6 +744,16 @@ def test_pre_rewrites_infile_file_and_include():
     assert len(stats.rewritten) == 3
 
 
+def test_pre_rewrites_a_filename_and_leaves_what_names_it_alone():
+    # The fileref's path moves; `%include src(util);` and `infile src;` name
+    # that FILENAME, not a path of their own.
+    src = "filename src '/code';\n%include src(util);\ndata x; infile src; run;\n"
+    out, stats = pre.rewrite_source_text(src, _paths(**{"/code": "/repo/code"}))
+
+    assert out == src.replace("'/code'", "'/repo/code'")
+    assert stats.rewritten == {"/code": "/repo/code"}
+
+
 def test_pre_applies_the_longest_matching_key_first():
     # The reference sorts keys longest-first to avoid partial overlaps; the
     # specific mapping must win over the prefix one.

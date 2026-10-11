@@ -1162,7 +1162,9 @@ def _absorb_context(
         is_comment = kind in _COMMENT_KINDS and include_comments
         if not (is_option or is_comment):
             continue
-        if globals_root is not None and uf.find(idx) == globals_root:
+        # Found again each time: a context chunk absorbed into the globals
+        # component (one just before a promoted %MACRO) may become its root.
+        if globals_root is not None and uf.find(idx) == uf.find(globals_root):
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     f"absorb-skip[globals]: {chunk.chunk_id} is in the global-context component"
@@ -1488,6 +1490,8 @@ def _extract_result(
     singletons: list[SasChunk] = []
 
     if globals_root is not None:
+        # Context absorption may have re-rooted the component since.
+        globals_root = uf.find(globals_root)
         members = components.pop(globals_root)
         batch = _make_batch(
             global_indices=members,

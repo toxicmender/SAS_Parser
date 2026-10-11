@@ -770,7 +770,8 @@ otherwise-independent components is promoted into a single **global-context
 batch**, emitted first (`is_global_context=True`) — so one widely-used
 `%let` or utility macro cannot fuse the whole corpus into one mega-batch.
 OPTIONS/GLOBAL_STATEMENT (and optionally comment) chunks are then absorbed
-into the following substantive chunk's component, same-file only.
+into the following substantive chunk's component, same-file only — the
+global-context batch, when that chunk is a promoted macro.
 
 Dataset names are canonicalised (`_canon_ds`): one-level names become
 `work.<name>` (a `USER_LIBRARY_ASSIGNED` diagnostic flags the case where

@@ -247,6 +247,9 @@ class TestMacroSignature(unittest.TestCase):
         self.assertEqual(macro_signature("%macro m;"), [])
         self.assertEqual(macro_signature("data a; run;"), [])
 
+    def test_a_list_that_never_closes_runs_to_the_end(self):
+        self.assertEqual(macro_signature("%macro m(a, b=1"), [("a", None), ("b", "1")])
+
     def test_comments_in_the_parameter_list_are_no_parameters(self):
         (chunk,) = _chunk(
             "%macro load(lib=, /* the library */ tbl= /* its table */);\n"
@@ -490,6 +493,62 @@ class TestScope(unittest.TestCase):
         )
         step = _kind(_chunk(src), SasChunkKind.DATA_STEP)[0]
         self.assertEqual(step.metadata.output_datasets, ["&target"])
+
+    def test_a_global_a_called_macro_overwrites_at_run_time_is_unknown(self):
+        """CALL SYMPUTX or PROC SQL INTO in the body replaces the global when
+        the call runs: the earlier %LET no longer names the table."""
+        for body in (
+            "data _null_; set cfg; call symputx('cut', x); run;",
+            "proc sql noprint; select max(x) into :cut from cfg; quit;",
+        ):
+            with self.subTest(body=body):
+                src = f"%let cut = five;\n%macro recut;\n  {body}\n%mend;\n%recut;\ndata lib.t_&cut; run;\n"
+                step = _kind(_chunk(src), SasChunkKind.DATA_STEP)[-1]
+                self.assertEqual(step.metadata.output_datasets, ["lib.t_&cut"])
+        # Into a %LOCAL of the same name, the global is untouched.
+        src = (
+            "%let cut = five;\n%macro recut;\n  %local cut;\n"
+            "  proc sql noprint; select max(x) into :cut from cfg; quit;\n%mend;\n"
+            "%recut;\ndata lib.t_&cut; run;\n"
+        )
+        step = _kind(_chunk(src), SasChunkKind.DATA_STEP)[-1]
+        self.assertEqual(step.metadata.output_datasets, ["lib.t_five"])
+
+    def test_a_body_that_rewrites_its_parameter_still_reads_the_calls(self):
+        """`%let ds = %upcase(&ds);` keeps the argument the call passed: the
+        body's &ds is still that parameter, for names and paths alike."""
+        src = (
+            "%let ds = work.global_one;\n%let dir = /global;\n"
+            "%macro m(ds, dir);\n  %let ds = %upcase(&ds);\n  %let dir = %trim(&dir);\n"
+            '  data work.out; set &ds; run;\n  %include "&dir/x.sas";\n%mend;\n'
+        )
+        macro = _kind(_chunk(src), SasChunkKind.MACRO_DEFINITION)[0]
+        self.assertEqual(macro.metadata.body_param_inputs, [{"param": "ds", "pos": 0}])
+        self.assertEqual(
+            [(f.path, f.resolved) for f in macro.metadata.include_files], [("&dir/x.sas", False)]
+        )
+
+    def test_a_macro_invoked_inside_a_step_leaves_its_globals(self):
+        """Its defaults alone bind it; its %GLOBAL values hold after the step,
+        for names and for paths."""
+        src = (
+            "%macro setlib;\n  %global lib root;\n  %let lib = prod;\n  %let root = /sas/prod;\n%mend;\n"
+            "data _null_; %setlib; run;\n"
+            "data work.x; set &lib..t; run;\n"
+            '%include "&root/setup.sas";\n'
+        )
+        result = _chunk(src)
+        self.assertEqual(_kind(result, SasChunkKind.DATA_STEP)[-1].metadata.input_datasets, ["prod.t"])
+        (include,) = [f for c in result.chunks for f in c.metadata.include_files]
+        self.assertEqual((include.path, include.resolved), ("/sas/prod/setup.sas", True))
+
+    def test_a_symput_with_a_computed_name_assigns_nothing(self):
+        src = (
+            "%let v = old;\n"
+            "data _null_; call symputx(cats('v', 1), 'new'); call symputx('w'); run;\n"
+            "data lib.&v; run;\n"
+        )
+        self.assertEqual(_kind(_chunk(src), SasChunkKind.DATA_STEP)[-1].metadata.output_datasets, ["lib.old"])
 
     def test_a_reference_before_its_let_is_not_resolved(self):
         src = "data &later; run;\n%let later = work.after;\n"

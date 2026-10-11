@@ -31,7 +31,13 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from chunker import SasChunkBatcher, SasChunkKind, SasCorpus, SasSemanticChunker
+from chunker import (
+    SasChunkBatcher,
+    SasChunkKind,
+    SasCorpus,
+    SasSemanticChunker,
+    resolve_corpus_datasets,
+)
 from chunker.batcher import MultiFileBatcher, _parse_call_args
 
 _C = SasSemanticChunker(min_words=1, max_words=9_999)
@@ -389,6 +395,37 @@ class TestParameterisedMacroBodyBatching(unittest.TestCase):
         for b in br.batches[1:]:
             self.assertEqual(len(b.chunks), 2)
             self.assertIn("load", b.required_macros)
+
+
+class TestResolveCorpusDatasets(unittest.TestCase):
+    """resolve_corpus_datasets: the batcher's passes, without batching."""
+
+    def test_each_call_names_what_its_macro_reads_and_writes(self):
+        macros = _C.chunk_text(
+            "%macro load(ds, out=); data &out; set &ds; run; %mend;\n",
+            source_id="macros.sas",
+        )
+        job = _C.chunk_text(
+            "%load(raw.c, out=work.out);\n%load(raw.d, out=lib.d);\n", source_id="job.sas"
+        )
+        corpus = SasCorpus(file_results=[macros, job])
+        resolved = resolve_corpus_datasets(corpus)
+        calls = resolved.file_results[1].chunks
+        self.assertEqual([c.chunk_id for c in calls], ["f2-chunk-0001", "f2-chunk-0002"])
+        self.assertEqual(
+            [[(r.name, str(r.role), r.via) for r in c.metadata.dataset_refs] for c in calls],
+            [
+                [("work.out", "write", "macro_call"), ("raw.c", "read", "macro_call")],
+                [("lib.d", "write", "macro_call"), ("raw.d", "read", "macro_call")],
+            ],
+        )
+        # The corpus passed in is left as it was.
+        self.assertEqual(job.chunks[0].metadata.dataset_refs, ())
+        self.assertEqual(job.chunks[0].chunk_id, "chunk-0001")
+
+    def test_an_empty_corpus_is_returned_as_it_is(self):
+        corpus = SasCorpus(file_results=[])
+        self.assertIs(resolve_corpus_datasets(corpus), corpus)
 
 
 # ---------------------------------------------------------------------------

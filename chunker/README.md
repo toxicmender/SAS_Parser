@@ -464,7 +464,8 @@ Values come from more than `%LET` in open code, and `_MacroScope` (in
 - **A called `%MACRO`** sets a global by SAS's rule: a `%LET` to a name declared
   `%GLOBAL` there, or already global and neither a parameter nor `%LOCAL`.
   Anything else stays in the macro's local table. A body with `%IF`/`%DO`/`%GOTO`
-  may or may not run an assignment, so what it could set becomes *unknown*.
+  may or may not run an assignment, so what it could set becomes *unknown*, as
+  does a global its `CALL SYMPUT` or PROC SQL `INTO` may overwrite.
 - **Unknown is a value too.** A variable reassigned to something that is not a
   name, filled at run time (`INTO :sch`, `call symputx('sch', column)`), or
   given two different literal values by one step stops resolving: a stale
@@ -583,7 +584,8 @@ components is promoted into a single **global-context batch**, emitted first
 (`is_global_context=True`) — so one widely-used `%let` or utility macro cannot
 fuse the whole corpus into one mega-batch. OPTIONS / GLOBAL_STATEMENT (and
 optionally comment) chunks are then absorbed into the following substantive
-chunk's component, same-file only.
+chunk's component, same-file only — the global-context batch, when that chunk
+is a promoted macro.
 
 Dataset names are canonicalised (`_canon_ds`): one-level names become
 `work.<name>` (a `USER_LIBRARY_ASSIGNED` diagnostic flags the case where that

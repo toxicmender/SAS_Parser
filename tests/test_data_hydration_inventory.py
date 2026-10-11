@@ -198,6 +198,18 @@ def test_connection_coordinates_and_macro_references_are_kept():
     assert dict(table.options) == {"database": "edw", "user": "u", "using": "<redacted>"}
 
 
+def test_references_that_differ_only_in_a_secret_are_one_row():
+    # Redacted, the two LIBNAMEs of one macro say the same thing.
+    rows = _rows(
+        job=(
+            "%macro conn;\n  libname edw oracle path=P user=etl password=one;\n"
+            "  libname edw oracle path=P user=etl password=two;\n%mend;\n"
+        )
+    )
+    [engine] = [r for r in rows if r.kind is RefKind.ENGINE]
+    assert engine.raw == "libname edw oracle path=P user=etl password=<redacted>;"
+
+
 def test_rows_survive_the_table_round_trip():
     rows = _rows(job="libname edw oracle path=P schema=s;\ndata a; set edw.t; run;\n" + PASS_THROUGH)
     for row in rows:
@@ -209,6 +221,9 @@ def test_rows_survive_the_table_round_trip():
         stored["recorded_at"] = row.recorded_at.replace(tzinfo=None)
         back = InventoryRow.model_validate(stored)
         assert back.model_copy(update={"recorded_at": row.recorded_at}) == row
+    # A row with no options may come back with a null.
+    stored = rows[0].model_dump() | {"options": None}
+    assert InventoryRow.model_validate(stored).options == ()
 
 
 def test_the_columns_are_the_row_fields_in_order():
@@ -243,6 +258,8 @@ def test_the_plan_from_the_inventory_is_the_plan_from_the_chunks():
             "%let root = /SASData;\nlibname edw oracle path=EDWPRO schema=fr_dm user=svc;\n"
             "libname raw \"&root/raw\";\nlibname spd spde '/data/spde';\n"
             "filename in '/data/in/cust.csv';\n"
+            # A database library nothing reads from: the library is the item.
+            "libname arch oracle path=ARCHPRO schema=hist;\n"
         ),
         job=(
             "data a; set edw.accounts raw.customers; run;\n"
@@ -253,7 +270,8 @@ def test_the_plan_from_the_inventory_is_the_plan_from_the_chunks():
     from_chunks = _chunk_plan(results)
     from_rows = plan_from_inventory(inventory_rows(results), config=_config())
     assert from_rows.items == from_chunks.items
-    assert len(from_rows.items) == 6
+    assert len(from_rows.items) == 7
+    assert "oracle:ARCHPRO/hist (arch)" in [str(i.source) for i in from_rows.items]
 
 
 def test_only_keeps_one_librefs_references():
@@ -382,6 +400,17 @@ def test_a_read_through_an_unresolved_library_keeps_every_library_item():
     assert "library directory" in library.blockers[0]
 
 
+def test_a_library_declared_twice_is_planned_once():
+    # Assigned again in another file, or again in the same one: one item per
+    # member read, where the library is first declared.
+    for files in (
+        {"a_setup": "libname raw '/data/raw';\n", "b_job": "libname raw '/data/raw';\ndata a; set raw.customers; run;\n"},
+        {"job": "libname raw '/data/raw';\nlibname raw '/data/raw';\ndata a; set raw.customers; run;\n"},
+    ):
+        [item] = _plan(**files).items
+        assert str(item.source) == "sas7bdat:/data/raw/customers (raw)", files
+
+
 def test_an_spde_library_is_not_split_into_members():
     [item] = _plan(job="libname spd spde '/data/spde';\ndata a; set spd.big; run;\n").items
     assert item.source.kind is SourceKind.SPDE
@@ -449,6 +478,22 @@ def test_nothing_to_write_touches_no_table():
     spark = _FakeSpark()
     assert write_inventory([], "main.meta.sas_refs", spark=spark) == 0
     assert spark.sql_log == [] and spark.created == []
+
+
+def test_without_a_session_the_active_one_is_used(monkeypatch):
+    import app_config.spark
+
+    spark = _FakeSpark()
+    asked: list[str] = []
+    monkeypatch.setattr(
+        app_config.spark, "active_or_new_session", lambda name: asked.append(name) or spark
+    )
+    rows = _rows(job="data a; set b; run;\n")
+    assert write_inventory(rows, "sas_refs") == len(rows)
+    assert asked == ["sas-parser-hydration"]
+    # A one-part name lives in the session's current schema: none to create.
+    [create_table] = spark.sql_log
+    assert create_table.startswith("CREATE TABLE IF NOT EXISTS `sas_refs`")
 
 
 @pytest.mark.parametrize(
@@ -546,11 +591,56 @@ def test_a_table_that_cannot_be_written_fails_the_run_not_the_plan(corpus_dir, m
     assert "sas7bdat:/data/raw/customers (raw)" in capsys.readouterr().out
 
 
+def test_a_real_run_loads_the_plan_and_fails_on_a_table_it_could_not_keep(corpus_dir, monkeypatch):
+    import data_hydration.inventory as inventory
+    import data_hydration.runner as runner
+    from data_hydration.models import HydrationReport
+
+    ran: list[int] = []
+    monkeypatch.setattr(
+        runner, "execute", lambda plan, **_: ran.append(len(plan.items)) or HydrationReport(plan=plan)
+    )
+    monkeypatch.setattr(inventory, "write_inventory", lambda rows, table, **_: len(rows))
+    assert _main(str(corpus_dir), "--inventory-table", "main.meta.refs") == 0
+
+    def refuse(*_, **__):
+        raise RuntimeError("no Spark here")
+
+    monkeypatch.setattr(inventory, "write_inventory", refuse)
+    assert _main(str(corpus_dir), "--inventory-table", "main.meta.refs") == 1
+    # The table costs the run its status, never its loads.
+    assert ran == [1, 1]
+
+
+@pytest.mark.parametrize(
+    ("read", "message"),
+    [
+        (RuntimeError("table not found"), "could not read the reference inventory"),
+        ([], "no inventory run to plan from"),
+    ],
+)
+def test_an_inventory_that_cannot_be_read_or_is_empty_plans_nothing(read, message, monkeypatch, capsys):
+    import data_hydration.inventory as inventory
+
+    def read_inventory(*_, **__):
+        if isinstance(read, Exception):
+            raise read
+        return read
+
+    monkeypatch.setattr(inventory, "read_inventory", read_inventory)
+    argv = ("--from-inventory", "--inventory-table", "main.meta.refs", "--corpus", "etl", "--dry-run")
+    assert _main(*argv) == 1
+    captured = capsys.readouterr()
+    assert message in captured.err
+    assert "Hydration plan" not in captured.out
+
+
 @pytest.mark.parametrize(
     ("argv", "message"),
     [
         (["--from-inventory", "SRC"], "not a source directory"),
         ([], "a source directory is required"),
+        (["MISSING"], "source directory not found"),
         (["SRC", "--run-id", "r1"], "needs --from-inventory"),
         # The table may hold many corpora: name the one, or the run.
         (["--from-inventory"], "needs --corpus"),
@@ -558,7 +648,8 @@ def test_a_table_that_cannot_be_written_fails_the_run_not_the_plan(corpus_dir, m
     ],
 )
 def test_argument_errors(argv, message, corpus_dir, capsys):
-    argv = [str(corpus_dir) if a == "SRC" else a for a in argv]
+    places = {"SRC": str(corpus_dir), "MISSING": str(corpus_dir / "nowhere")}
+    argv = [places[a] if a in places else a for a in argv]
     assert _main(*argv) == 2
     assert message in capsys.readouterr().err
 

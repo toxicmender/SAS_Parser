@@ -125,6 +125,8 @@ def test_a_subsetting_if_has_no_core():
 def test_the_core_follows_macro_if_then_and_else():
     src = "%if &x %then %do; data a; run; %end; %else data b;"
     assert [kw for kw, *_ in _statements(src)] == ["%do", "data", "run", "%end", "data"]
+    # Without its %THEN, a %IF has no core to read.
+    assert _statements("%if &x data b;") == []
 
 
 def test_comments_and_in_stream_data_are_no_statements():
@@ -180,6 +182,12 @@ def test_set_reads_every_dataset_up_to_its_options():
         ("lib.p8-lib.p10", ["lib.p8", "lib.p9", "lib.p10"]),
         # Too wide to be a range anyone meant: the bounds, not 5,000 names.
         ("d1-d5000", ["work.d1", "work.d5000"]),
+        # No range at all: two stems, or counting down. The bounds, as written.
+        ("a1-b3", ["work.a1", "work.b3"]),
+        ("a3-a1", ["work.a3", "work.a1"]),
+        # A bound SAS reserves, or none: what is left.
+        ("a - _null_", ["work.a"]),
+        ("a1 -", ["work.a1"]),
     ],
 )
 def test_a_numbered_range_names_every_dataset_it_spans(operands, names):
@@ -203,6 +211,22 @@ def test_quoted_paths_and_name_literals():
 
 def test_a_macro_call_among_the_operands_names_nothing_it_can_see():
     assert [n for n, *_ in _refs("data x; set %list(lib) work.y; run;")] == ["work.x", "work.y"]
+    assert [n for n, *_ in _refs("data x; set %list work.y; run;")] == ["work.x", "work.y"]
+
+
+@pytest.mark.parametrize(
+    ("src", "reads"),
+    [
+        # A group that never closes holds the rest of its statement.
+        ("data x; set a(where=(y=1); set b; run;", ["work.a", "work.b"]),
+        # The last statement of a file may have no semicolon.
+        ("data x; set b", ["work.b"]),
+        # A quote that never closes is SAS's unmatched quote: nothing after it.
+        ("data x; set a 'lib/x", ["work.a"]),
+    ],
+)
+def test_an_unfinished_statement_names_what_it_lists(src, reads):
+    assert [n for n, role, _ in _refs(src) if role is R] == reads
 
 
 def test_update_reads_both_and_modify_rewrites_its_master():
@@ -224,6 +248,21 @@ def test_update_reads_both_and_modify_rewrites_its_master():
     ]
 
 
+def test_a_modify_step_is_settled_where_the_next_step_begins():
+    # A macro body is one region: the DATA step's MODIFY is settled when the
+    # PROC after it begins, not at the end of the body.
+    meta = _body(
+        "%macro m;\n  data lib.m; modify lib.m; x = 1; run;\n  proc print data=lib.m; run;\n%mend;\n"
+    )
+    assert [(r.name, r.role, r.via) for r in meta.dataset_refs] == [
+        ("lib.m", U, "modify"),
+        ("lib.m", R, "data="),
+    ]
+    # A master named through a macro call cannot be seen: the DATA statement's
+    # table stays a creation.
+    assert _refs("data m; modify %master; x = 1; run;") == [("work.m", W, "data")]
+
+
 def test_output_writes_every_dataset_it_names():
     assert _refs("data a b; set s; if x then output a; else output b; run;")[-2:] == [
         ("work.a", W, "output"),
@@ -238,6 +277,8 @@ def test_a_hash_object_reads_its_dataset_and_its_output_method_writes_one():
         "  declare hash g(dataset: dsname);\nrun;\n"
     )
     assert _refs(src) == [("lib.lk", R, "hash"), ("work.out", W, "hash")]
+    # A literal that is no name (a macro function, text) names nothing either.
+    assert _refs("data _null_; declare hash h(dataset: '%scan(&l, 1)'); run;") == []
 
 
 def test_statements_that_only_look_like_dataset_positions():
@@ -329,6 +370,11 @@ def test_proc_options_come_from_the_statements_that_carry_them():
     assert _refs(src) == [("work.a", R, "data="), ("work.f", W, "out="), ("work.nope", R, "data=")]
     # A dataset's own options are not the statement's.
     assert _refs("proc print data=a(rename=(data=d2 out=o2)); run;") == [("work.a", R, "data=")]
+    # A stray closing parenthesis hides no option after it.
+    assert _refs("proc sort data=a) out=b(keep=x); by x; run;") == [
+        ("work.a", R, "data="),
+        ("work.b", W, "out="),
+    ]
 
 
 def test_proc_datasets_names_members_of_its_library():
@@ -358,6 +404,12 @@ def test_proc_datasets_names_members_of_its_library():
 def test_proc_datasets_kill_deletes_every_member():
     assert _refs("proc datasets lib=scratch kill nolist; quit;") == [("scratch.:", D, "kill")]
     assert _refs("proc datasets lib=kill nolist; delete a; quit;") == [("kill.a", D, "delete")]
+
+
+def test_proc_datasets_statements_that_name_no_member():
+    # COPY without OUT= copies nowhere; a name SAS reserves is no member.
+    assert _refs("proc datasets lib=a nolist; copy in=a; run; quit;") == []
+    assert _refs("proc datasets lib=a nolist; change _null_=b; quit;") == []
 
 
 def test_run_cancel_runs_nothing():
@@ -448,6 +500,23 @@ def test_ods_output_in_a_macro_body_is_the_bodys():
     assert meta.body_param_outputs == [{"param": "o", "pos": 0}]
 
 
+def test_every_slice_of_a_split_proc_writes_its_ods_output():
+    src = (
+        "ods output Summary=s1;\nproc means data=a;\n  var x1 x2 x3 x4 x5;\n"
+        "  class c1 c2 c3 c4;\n  by g1 g2 g3;\nrun;\n"
+    )
+    chunks = SasSemanticChunker(min_words=1, max_words=12).chunk_text(src).chunks
+    proc, *slices = [c for c in chunks if c.kind is SasChunkKind.PROC_STEP]
+    assert slices and {c.parent_id for c in slices} == {proc.chunk_id}
+    assert {tuple(c.metadata.output_datasets) for c in [proc, *slices]} == {("work.s1",)}
+
+
+def test_an_ods_statement_other_than_output_names_nothing():
+    assert _refs("ods html close;\nproc means data=a; ods select all; run;\n") == [
+        ("work.a", R, "data=")
+    ]
+
+
 def test_proc_ds2_reads_and_writes_its_tables():
     src = (
         "proc ds2;\n"
@@ -487,6 +556,18 @@ def test_proc_sql_clauses():
         ("lib.b", R, "join"),
         ("work.d", U, "insert"),
         ("work.e", R, "from"),
+    ]
+
+
+def test_proc_sql_reads_a_physical_path_and_a_name_literal():
+    src = (
+        "proc sql;\n  create table x as select * from 'C:\\Data\\A.sas7bdat' as a,"
+        " 'my data'n as b, _null_;\nquit;\n"
+    )
+    assert _refs(src) == [
+        ("work.x", W, "create"),
+        ("'c:/data/a.sas7bdat'", R, "from"),
+        ("'my data'", R, "from"),
     ]
 
 

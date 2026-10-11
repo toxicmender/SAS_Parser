@@ -690,6 +690,7 @@ class TestStatementStructure(unittest.TestCase):
             "%let c = %quote(a;b) %nrquote(c;d) %bquote(e;f) %nrbquote(g;h);\n",
             "%let n = %str(%nrstr(a;b) (c;d));\n",
             "%let s = %str('a;b' /* c;d */);\n",
+            "%let d = %str('it''s;' \"a \"\"b;\"\"\");\n",  # doubled quotes
         ):
             with self.subTest(statement=statement):
                 result = self._chunks(statement + "data a; set b; run;\n")
@@ -700,6 +701,19 @@ class TestStatementStructure(unittest.TestCase):
     def test_a_quoting_function_that_never_closes_quotes_nothing(self):
         result = self._chunks("%put %str(a;\ndata x; set y; run;\n")
         self.assertEqual(self._kinds(result), [GLOBAL, DATA])
+        # One inside it that closes still quotes its own semicolon.
+        result = self._chunks("%put %str(%str(a;b) c;\ndata x; set y; run;\n")
+        self.assertEqual(self._kinds(result), [GLOBAL, DATA])
+        self.assertEqual(result.chunks[0].text, "%put %str(%str(a;b) c;\n")
+
+    def test_an_unmatched_quote_or_comment_in_a_quoting_function_runs_on(self):
+        # SAS reads on to the quote or comment's end as it would anywhere: what
+        # follows is inside it, not a step.
+        for statement in ("%let x = %str(it's);\n", "%let x = %str(a /* b;\n"):
+            with self.subTest(statement=statement):
+                result = self._chunks(statement + "data a; set b; run;\n")
+                self.assertEqual(self._kinds(result), [GLOBAL])
+                self.assertEqual(result.chunks[0].metadata.input_datasets, [])
 
     def test_sanitise_blanks_quoted_semicolons_only_with_strings(self):
         from chunker.scanner import _sanitise
@@ -759,6 +773,7 @@ class TestStatementStructure(unittest.TestCase):
             ("datalines4;", "a;b\nc;d;\n", ";;;;\nrun;\n"),
             ("lines;", "x\n", ";\nrun;\n"),
             ("parmcards4;", "x;\n", "  ;;;;\nrun;\n"),
+            ("datalines;", "", ";\nrun;\n"),  # no data at all
         ):
             source = f"data x; input a $; {opener}\n{data}{rest}data y; set x; run;\n"
             with self.subTest(opener=opener):
@@ -766,6 +781,23 @@ class TestStatementStructure(unittest.TestCase):
                 self.assertEqual(self._kinds(result), [DATA, DATA])
                 self.assertTrue(result.chunks[0].text.endswith(f"{data}{rest}"))
                 self.assertEqual(result.diagnostics, [])
+
+    def test_in_stream_data_that_never_ends_runs_to_the_end_of_the_file(self):
+        for opener in ("datalines;", "datalines4;"):
+            with self.subTest(opener=opener):
+                result = self._chunks(f"data x; input a $; {opener}\nset lib.z\nproc\n")
+                self.assertEqual(self._kinds(result), [DATA])
+                self.assertEqual(result.chunks[0].metadata.referenced_datasets, ["work.x"])
+
+    def test_in_stream_data_or_submit_code_outside_a_step_is_no_step(self):
+        for block in ("datalines;\n1 2\n;\n", "submit;\nprint('x')\nendsubmit;\n"):
+            with self.subTest(block=block):
+                result = self._chunks(block + "data a; set b; run;\n")
+                self.assertEqual(
+                    self._kinds(result), [SasChunkKind.UNKNOWN_STATEMENT_GROUP, DATA]
+                )
+        # An empty SUBMIT block is no block at all.
+        self.assertEqual(self._kinds(self._chunks("proc python;\nsubmit;\nendsubmit;\nrun;\n")), [PROC])
 
     def test_a_call_before_datalines_is_cut_off(self):
         result = self._chunks(
@@ -986,6 +1018,58 @@ class TestMergeMeta(unittest.TestCase):
         # The computed views split the merged list by location.
         self.assertEqual(merged.physical_paths, [child_only, shared])
         self.assertEqual(merged.remote_paths, [remote])
+
+
+class TestDebugLogging(unittest.TestCase):
+    """Every DEBUG line is built only when DEBUG is on: a run with it on must
+    format each one, and must not change a result."""
+
+    SOURCES = {
+        "setup.sas": (
+            "libname edw oracle path=EDWPRO schema=fr_dm;\n"
+            "filename src '/code';\n"
+            "%macro load(ds, out=); data &out; set &ds; run; data work.stage; run; %mend;\n"
+        ),
+        "job.sas": (
+            "%include src(util);\n"
+            "%load(raw.a, out=work.b)\n%load(raw.c, out=work.d)\n"
+            "data work.e; set edw.accounts work.b; run;\n"
+            "ods output ParameterEstimates=pe;\n"
+            "proc reg data=work.e; model y = x; run;\n  model y = z; run;\n"
+            "%let n = 1;\nproc contents data=edw._all_; run;\n"
+            "proc sql;\nconnect to oracle (path=P);\n"
+            "create table work.f as select * from connection to oracle (select * from s.t);\n"
+            "quit;\n"
+        ),
+    }
+
+    def _run(self):
+        from chunker import MultiFileBatcher, SasCorpus
+
+        chunker = SasSemanticChunker(min_words=1, max_words=9_999)
+        results = [chunker.chunk_text(text, source_id=name) for name, text in self.SOURCES.items()]
+        batched = MultiFileBatcher().batch(SasCorpus(file_results=results))
+        return results, batched
+
+    def test_a_debug_run_logs_each_pass_and_changes_nothing(self):
+        quiet = self._run()
+        with self.assertLogs("chunker", level="DEBUG") as logs:
+            loud = self._run()
+        self.assertEqual(loud[0], quiet[0])
+        self.assertEqual(loud[1].model_dump(), quiet[1].model_dump())
+        text = "\n".join(logs.output)
+        for line in (
+            "_scan_units: stmt",  # a statement cut after its calls
+            "_collect_block: PROC REG ended at its last RUN",
+            "scan_pass_through:",
+            "resolve_db_librefs:",
+            "resolve_filerefs:",
+            "resolve_ods_outputs:",
+            "index[ds-literal-body]",
+            "macro_body_dataset: resolved param",
+            "edge-skip[ds]",
+        ):
+            self.assertIn(line, text)
 
 
 if __name__ == "__main__":
