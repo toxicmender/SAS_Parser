@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable, Mapping, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from .config import HydrationConfig
 from .models import (
@@ -413,7 +413,7 @@ def build_plan(
     path_refs: Sequence["SasPathRef"] = (),
     *,
     db_tables: Sequence["SasDbTableRef"] = (),
-    datasets: Sequence["SasDatasetRef"] = (),
+    datasets: Sequence[Sequence["SasDatasetRef"]] = (),
     config: HydrationConfig | None = None,
     probe: SourceProbe | None = None,
     source_id: str | None = None,
@@ -432,9 +432,9 @@ def build_plan(
         source), and a database LIBNAME whose tables appear here is planned
         through them instead of as one schema-level item.
     datasets
-        ``chunk.metadata.dataset_refs`` from the same chunks: a directory
-        LIBNAME whose datasets are read here is planned per dataset (see
-        :func:`build_corpus_plan`).
+        Each of the same chunks' ``metadata.dataset_refs``, chunk by chunk: a
+        directory LIBNAME whose datasets are read here is planned per dataset
+        (see :func:`build_corpus_plan`).
     config
         ``None`` builds one with :meth:`HydrationConfig.from_env`.
     probe
@@ -508,55 +508,96 @@ def _directory_library(ref: "SasPathRef") -> bool:
 _Library = tuple[str | None, str]
 
 
+#: The writes that take effect before their step ends: PROC DATASETS's CHANGE
+#: and a library COPY make their tables for the statements after them.
+_IMMEDIATE_WRITES = frozenset({"change", "copy"})
+
+
+class _Members(NamedTuple):
+    """What :func:`_library_members` finds."""
+
+    #: Each directory library's datasets to load, as ``(member, reading
+    #: file)``, in first-read order.
+    named: dict[_Library, list[tuple[str, str | None]]]
+    #: The libraries a list (``raw.sales_:``) is read from.
+    listed: set[_Library]
+    #: Some read names its dataset through a libref nothing resolved
+    #: (``&lib..x``, ``&ds``): any library may hold what it reads.
+    unknown: bool
+
+
 def _library_members(
     by_source: Mapping[str, tuple[Sequence["SasEngineRef"], Sequence["SasPathRef"]]],
-    datasets: Mapping[str, Sequence["SasDatasetRef"]],
-) -> tuple[dict[_Library, list[tuple[str, str | None]]], set[_Library]]:
-    """The datasets to load from each directory library, and the libraries a
-    list is read from.
+    datasets: Mapping[str, Sequence[Sequence["SasDatasetRef"]]],
+) -> _Members:
+    """The datasets to load from each directory library.
 
     A dataset the corpus reads, or updates, through a libref a directory
-    LIBNAME binds, and that no step creates, is a member of that directory to
-    load: ``set raw.customers;`` after ``libname raw '/data/raw';`` reads
-    ``/data/raw/customers.sas7bdat``. The LIBNAME in force is the latest one
-    before the read in corpus order, a file's LIBNAMEs taken before its reads,
-    as SAS would have run them. A dataset some step creates is the job's own,
-    not a source; a list (``raw.sales_:``) has members only a listing knows.
+    LIBNAME binds is a member of that directory to load — ``set raw.customers;``
+    after ``libname raw '/data/raw';`` reads ``/data/raw/customers.sas7bdat`` —
+    unless the job made it first. *datasets* holds each file's chunks' dataset
+    references, in order, because the order decides that:
 
-    Returns each library's members as ``(member, reading file)`` in first-read
-    order, and the libraries a list is read from.
+    - an earlier step of the same file, or a step of another file, that creates
+      the dataset makes it the job's own (another file is taken to run first,
+      as the batcher links it);
+    - the step that reads it creating it too does not: ``data raw.a; set
+      raw.a;`` and an in-place ``proc sort data=raw.a;`` need the table that
+      was there before. A step writes when it ends — save for a rename or a
+      copy, which takes effect for the statements after it: ``proc datasets;
+      change old=new; modify new;`` modifies the ``new`` it just made.
+
+    The LIBNAME in force is the latest one before the read in corpus order, a
+    file's LIBNAMEs taken before its reads, as SAS would have run them. A
+    parameter's template in a ``%MACRO`` body reads nothing until a call names
+    it, and each call's reading is its own reference
+    (``chunker.resolve_corpus_datasets``).
     """
-    created = {
-        ref.name for refs in datasets.values() for ref in refs if str(ref.role) == "write"
-    }
+    writers: dict[str, set[str]] = {}
+    for source_id, chunks in datasets.items():
+        for refs in chunks:
+            for ref in refs:
+                if str(ref.role) == "write":
+                    writers.setdefault(ref.name, set()).add(source_id)
     bound: dict[str, str] = {}
-    members: dict[_Library, list[tuple[str, str | None]]] = {}
-    listed: set[_Library] = set()
+    found = _Members({}, set(), False)
     seen: set[tuple[str, str]] = set()
     for source_id in dict.fromkeys([*by_source, *datasets]):
         for ref in by_source.get(source_id, ((), ()))[1]:
             if _directory_library(ref) and ref.binds:
                 bound[ref.binds] = ref.effective_path
-        for ref in datasets.get(source_id, ()):
-            if str(ref.role) not in ("read", "update") or ref.param is not None:
-                continue
-            libref, _, member = ref.name.partition(".")
-            if libref not in bound or not member:
-                continue
-            library = (libref, bound[libref])
-            if ref.pattern:
-                listed.add(library)
-            elif ref.name not in created and (library[1], member) not in seen:
-                seen.add((library[1], member))
-                members.setdefault(library, []).append((member, source_id or None))
-    return members, listed
+        made_here: set[str] = set()  # by this file's earlier steps
+        for refs in datasets.get(source_id, ()):
+            made_now: set[str] = set()  # renamed or copied by this step so far
+            for ref in refs:
+                if str(ref.role) == "write" and ref.via in _IMMEDIATE_WRITES:
+                    made_now.add(ref.name)
+                if str(ref.role) not in ("read", "update") or ref.param is not None:
+                    continue
+                if ref.name.startswith("&"):
+                    found = found._replace(unknown=True)
+                    continue
+                libref, _, member = ref.name.partition(".")
+                if libref not in bound or not member:
+                    continue
+                library = (libref, bound[libref])
+                if ref.pattern:
+                    found.listed.add(library)
+                    continue
+                if ref.name in made_here | made_now or writers.get(ref.name, set()) - {source_id}:
+                    continue
+                if (library[1], member) not in seen:
+                    seen.add((library[1], member))
+                    found.named.setdefault(library, []).append((member, source_id or None))
+            made_here.update(ref.name for ref in refs if str(ref.role) == "write")
+    return found
 
 
 def build_corpus_plan(
     by_source: Mapping[str, tuple[Sequence["SasEngineRef"], Sequence["SasPathRef"]]],
     *,
     db_tables: Mapping[str, Sequence["SasDbTableRef"]] | None = None,
-    datasets: Mapping[str, Sequence["SasDatasetRef"]] | None = None,
+    datasets: Mapping[str, Sequence[Sequence["SasDatasetRef"]]] | None = None,
     config: HydrationConfig | None = None,
     probe: SourceProbe | None = None,
 ) -> HydrationPlan:
@@ -577,11 +618,16 @@ def build_corpus_plan(
     read in several places is **one** item, owned by the first file that reads
     it: appending one copy per reader would load its rows several times over.
 
-    *datasets* maps them to ``chunk.metadata.dataset_refs``, and is how a
-    directory LIBNAME is planned per dataset rather than as one blocked
-    library item (see :func:`_library_members`): each member read is a
-    ``sas7bdat`` item, owned by the first file that reads it. The library item
-    stays only when a list is read from it.
+    *datasets* maps them to each chunk's ``metadata.dataset_refs``, chunk by
+    chunk in order, from a corpus resolved with
+    ``chunker.resolve_corpus_datasets`` (so each macro call carries what its
+    macro reads). It is how a directory LIBNAME is planned per dataset rather
+    than as one blocked library item (see :func:`_library_members`): each
+    member read is a ``sas7bdat`` item, owned by the first file that reads it.
+    The library item stays where no member is named, where a list is read
+    from it, and while some read names its library through a macro variable
+    nothing resolved — so no dataset the job needs drops out of the plan
+    unannounced.
     """
     config = config or HydrationConfig.from_env()
     validate_template(config.table_template)
@@ -594,7 +640,7 @@ def build_corpus_plan(
         for table in tables
         if str(table.via) == "libname"
     )
-    members, listed = _library_members(by_source, datasets or {})
+    members = _library_members(by_source, datasets or {})
     expanded: set[_Library] = set()
     code_filerefs = _code_filerefs(by_source)
 
@@ -612,7 +658,7 @@ def build_corpus_plan(
             code_filerefs=code_filerefs,
         ):
             library = (source.libref, source.locator)
-            if source.kind is SourceKind.FILE and not source.object_name and library in members:
+            if source.kind is SourceKind.FILE and not source.object_name and library in members.named:
                 # A directory whose datasets are named: one item per dataset,
                 # where the library is first declared.
                 if library not in expanded:
@@ -629,9 +675,9 @@ def build_corpus_plan(
                             ),
                             (),
                         )
-                        for member, reader in members[library]
+                        for member, reader in members.named[library]
                     ]
-                if library not in listed:
+                if library not in members.listed and not members.unknown:
                     continue
             if source.connection is not None:
                 identity = source.model_copy(update={"source_id": None})

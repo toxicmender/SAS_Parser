@@ -172,6 +172,21 @@ def test_a_value_known_only_at_run_time_stays_unresolved():
         assert (x.path, x.resolved) == ("&root/x.sas", False), src
 
 
+def test_a_chunks_filenames_take_effect_in_order():
+    # Clearing every fileref, then assigning one, leaves that one bound...
+    src = (
+        "%macro setup; filename _all_ clear; filename src '/code/macros'; %mend;\n"
+        "%setup;\n%include src(util);\n"
+    )
+    assert [(f.path, f.resolved) for f in _files(src)] == [("/code/macros/util.sas", True)]
+    # ...and assigning one, then clearing it, leaves nothing.
+    src = (
+        "%macro setup; filename src '/code/macros'; filename src clear; %mend;\n"
+        "%setup;\n%include src(util);\n"
+    )
+    assert [(f.path, f.resolved) for f in _files(src)] == [("src(util)", False)]
+
+
 def test_a_single_quoted_path_is_the_file_named():
     # Between single quotes SAS reads & as a character, so no %LET applies.
     src = "%let root = /A;\n%include '&root/x.sas';\n%inc \"&root/y.sas\";\n"

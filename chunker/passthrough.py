@@ -86,7 +86,7 @@ _DISCONNECT_RE = re.compile(
 )
 # FROM|JOIN CONNECTION TO <alias> ( — the match ends on the query's open paren.
 _CONNECTION_TO_RE = re.compile(
-    rf"\b(?:from|join)\s+connection\s+to\s+(?P<alias>{_CONN_NAME})\s*\(",
+    rf"\b(?:from|join)\s+(?P<clause>connection\s+to\s+(?P<alias>{_CONN_NAME}))\s*\(",
     re.IGNORECASE,
 )
 # EXECUTE ( <stmt> ) BY <alias>, or the newer EXECUTE BY <alias> ( <stmt> ). A
@@ -334,6 +334,13 @@ def scan_pass_through(cf: str, mt: str) -> PassThroughScan:
                 connection_for(_conn_name(m.group("alias"))),
                 _sas_targets(mt, structure, start),
             )
+            # FROM (or JOIN) and the query's parentheses stay: SAS reads the
+            # result as an inline view, so a table joined beside it by comma
+            # (`from connection to x (...) as a, work.lookup as b`) is still a
+            # FROM item. Only the connection and the native SQL are blanked.
+            spans += [(m.start("clause"), open_idx), (open_idx + 1, body_end)]
+            claimed = end
+            continue
         else:  # execute
             open_idx = m.end() - 1
             body_end, after = structure.body(open_idx)

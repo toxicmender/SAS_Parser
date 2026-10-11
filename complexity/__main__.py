@@ -81,7 +81,7 @@ from chunker import (
     MultiFileBatcher,
     SasCorpus,
     SasSemanticChunker,
-    resolve_corpus_references,
+    resolve_corpus_datasets,
 )
 
 from .analyzer import ComplexityAnalyzer
@@ -479,8 +479,27 @@ def _analyse(
     return report, texts, analyzer
 
 
-def _hydration_plan(args: argparse.Namespace, sources: _Sources):  # type: ignore[no-untyped-def]
-    """The hydration plan for *sources*, or ``None`` without ``--hydration``.
+def _corpus_inventory(args: argparse.Namespace, sources: _Sources) -> list[Any] | None:
+    """The reference inventory of *sources*, when ``--hydration`` or
+    ``--check-includes`` reads it; else ``None``.
+
+    Built once for both: the corpus resolved as the batcher resolves it — a
+    database LIBNAME or %LET in a setup file reaches the reads after it, and
+    each macro call names the datasets its macro reads — then flattened into
+    rows (:mod:`data_hydration.inventory`), as ``python -m data_hydration``
+    builds it.
+    """
+    if not (args.hydration or args.check_includes):
+        return None
+    from data_hydration.inventory import inventory_rows
+
+    corpus = resolve_corpus_datasets(SasCorpus(file_results=sources.file_results))
+    return inventory_rows(corpus.file_results, corpus=sources.label)
+
+
+def _hydration_plan(args: argparse.Namespace, rows: list[Any] | None):  # type: ignore[no-untyped-def]
+    """The hydration plan for the inventory *rows*, or ``None`` without
+    ``--hydration``.
 
     Built from the metadata the chunker already produced, with ``probe=None`` —
     so this stays what the rest of ``complexity`` is: an offline read of the
@@ -491,17 +510,13 @@ def _hydration_plan(args: argparse.Namespace, sources: _Sources):  # type: ignor
     template) is reported and the rest of the report is still written: hydration
     is an addition to the report, never a reason to lose it.
     """
-    if not args.hydration:
+    if not args.hydration or rows is None:
         return None
-    from data_hydration.inventory import inventory_rows, plan_from_inventory
+    from data_hydration.inventory import plan_from_inventory
     from data_hydration.naming import TableNameError
 
-    # Resolved as one corpus, so a database LIBNAME in a setup file reaches the
-    # reads in the files after it, as it does in the batched analysis. Planned
-    # from the corpus's reference inventory, as python -m data_hydration plans.
-    corpus = resolve_corpus_references(SasCorpus(file_results=sources.file_results))
     try:
-        return plan_from_inventory(inventory_rows(corpus.file_results), probe=None)
+        return plan_from_inventory(rows, probe=None)
     except TableNameError as exc:
         logger.error(
             f"--hydration: {exc}; the complexity report is written without it"
@@ -511,7 +526,7 @@ def _hydration_plan(args: argparse.Namespace, sources: _Sources):  # type: ignor
 
 def _include_checks(
     args: argparse.Namespace,
-    sources: _Sources,
+    rows: list[Any] | None,
     *,
     application: str | None,
     client: Any | None = None,
@@ -526,7 +541,7 @@ def _include_checks(
     left unsearched: the check is an addition to the report, never a reason
     to lose it.
     """
-    if not args.check_includes:
+    if not args.check_includes or rows is None:
         return None
     from data_hydration.includes import (
         include_checks,
@@ -534,9 +549,7 @@ def _include_checks(
         match_includes,
         sharepoint_index,
     )
-    from data_hydration.inventory import inventory_rows
 
-    corpus = resolve_corpus_references(SasCorpus(file_results=sources.file_results))
     local = local_index(args.sas_dir) if args.sas_dir is not None else None
     sharepoint = None
     if application:
@@ -550,10 +563,7 @@ def _include_checks(
                 f"--check-includes: could not list SharePoint folder {folder!r} "
                 f"({type(exc).__name__}: {exc}); scripts not looked for there"
             )
-    rows = match_includes(
-        inventory_rows(corpus.file_results), local=local, sharepoint=sharepoint
-    )
-    return include_checks(rows)
+    return include_checks(match_includes(rows, local=local, sharepoint=sharepoint))
 
 
 # ---------------------------------------------------------------------------
@@ -666,13 +676,14 @@ def _run_local(args: argparse.Namespace) -> int:
     if sources is None:
         return 1
     report, texts, _ = _analyse(args, sources, target=args.target)
+    rows = _corpus_inventory(args, sources)
     status, _ = _deliver(
         args,
         report,
         texts,
         out_dir=args.out_dir,
-        hydration=_hydration_plan(args, sources),
-        includes=_include_checks(args, sources, application=args.app),
+        hydration=_hydration_plan(args, rows),
+        includes=_include_checks(args, rows, application=args.app),
     )
     return status
 
@@ -782,6 +793,7 @@ def _run_request(args: argparse.Namespace, row: Any, *, client: Any) -> int:
     if sources is None:
         return 1
     report, texts, analyzer = _analyse(args, sources, target=target)
+    inventory = _corpus_inventory(args, sources)
 
     # The label records what produced the estimate: the model when the LLM
     # pass ran, else the rules profile that did — which still means something
@@ -797,9 +809,9 @@ def _run_request(args: argparse.Namespace, row: Any, *, client: Any) -> int:
             out_dir=staging,
             model=model,
             run_llm_eval=run_llm_eval,
-            hydration=_hydration_plan(args, sources),
+            hydration=_hydration_plan(args, inventory),
             includes=_include_checks(
-                args, sources, application=row.application, client=client
+                args, inventory, application=row.application, client=client
             ),
         )
         summary = sp.render_run_summary(

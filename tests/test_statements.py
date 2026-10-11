@@ -368,6 +368,11 @@ def test_run_cancel_runs_nothing():
     assert _refs(src) == [("work.t1", D, "delete")]
 
 
+def test_run_cancel_keeps_the_proc_statements_library():
+    src = "proc datasets lib=mylib nolist; delete a; run cancel; delete b; run; quit;"
+    assert _refs(src) == [("mylib.b", D, "delete")]
+
+
 def test_a_macro_library_keeps_its_delimiter_dot():
     assert _refs("proc datasets lib=&lib; delete a; quit;") == [("&lib..a", D, "delete")]
 
@@ -512,6 +517,26 @@ def test_a_name_built_around_one_parameter_keeps_its_spelling():
         ("&lib..customers", "lib", 0)
     ]
     assert meta.body_param_inputs == [{"param": "lib", "pos": 0}]
+
+
+@pytest.mark.parametrize(
+    ("statement", "found"),
+    [
+        ("proc datasets lib=&lib nolist; modify customers; run; quit;", [("&lib..customers", U)]),
+        ("proc datasets lib=&lib nolist; delete customers; quit;", [("&lib..customers", D)]),
+        (
+            "proc datasets lib=&lib nolist; append base=customers data=x; quit;",
+            [("&lib..customers", U), ("&lib..x", R)],
+        ),
+        ("proc copy in=src out=&lib; select customers; run;", [("&lib..customers", W)]),
+    ],
+)
+def test_a_member_of_a_library_named_by_a_parameter_is_the_calls(statement, found):
+    # The member's own spelling has no &; the library the statement gives it
+    # does, so the call site fills it in: %m(prod) names prod.customers.
+    meta = _body(f"%macro m(lib);\n  {statement}\n%mend;\n")
+    refs = [(r.name, r.role) for r in meta.dataset_refs if r.param == "lib"]
+    assert refs == found
 
 
 def test_a_body_step_after_a_run_group_proc_ends_at_its_run():

@@ -550,8 +550,13 @@ it left.
 `resolve_references` runs the macro pass, then this one — the one order —
 from `chunk_text` (per file) and `MultiFileBatcher` (corpus-wide).
 `resolve_corpus_references(corpus)` does the same for callers that do not
-batch, which is how `data_hydration` and `complexity --hydration` see a LIBNAME
-in `setup.sas` reach the reads in `job.sas`.
+batch. `resolve_corpus_datasets(corpus)` goes one step further, for a caller
+that wants every dataset a job touches without batching: the passes
+`MultiFileBatcher` runs before it groups anything — the references resolved,
+`_LAST_` made concrete, and each macro call given the datasets its macro's body
+reads and writes through its parameters (`via="macro_call"`). It is how
+`data_hydration` and `complexity --hydration` see a LIBNAME in `setup.sas`
+reach the reads in `job.sas`, and `%load(raw.c)` read `raw.c`.
 
 Options ride on each record, so a consumer never joins by alias. The one-line
 `str()` form — what reaches the LLM prompt — leaves them out, because that is

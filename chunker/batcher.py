@@ -1053,6 +1053,54 @@ class _EdgeDiscovery:
                 )
 
 
+def _resolve_corpus_chunks(flat_chunks: list[SasChunk], uf: _UF, file_of: list[int]) -> list[_Edge]:
+    """The dataset passes over a flattened corpus, in place, in the one order
+    that works; returns the edges they found.
+
+    Reference resolution (corpus-wide %LET and LIBNAME tables): each file
+    resolved its own when it was chunked, and this run is what lets a %LET or
+    a database LIBNAME in one file give meaning to a name another file uses
+    (a no-op for names already resolved). Then implicit datasets (_LAST_,
+    _DATA_, a step with no DATA=), then edge discovery, which gives each macro
+    call the datasets its macro reads and writes through its parameters
+    (:meth:`_EdgeDiscovery._resolve_macro_body`).
+    """
+    resolve_references(flat_chunks)
+    _resolve_implicit_datasets(flat_chunks)
+    return _discover_edges(flat_chunks, uf, file_of=file_of)
+
+
+def resolve_corpus_datasets(corpus: SasCorpus) -> SasCorpus:
+    """*corpus* with every chunk's datasets as :class:`MultiFileBatcher` sees them.
+
+    The same passes the batcher runs before it groups anything
+    (:func:`_resolve_corpus_chunks`): names resolved across the corpus,
+    ``_LAST_`` made concrete, and each macro call given the datasets its
+    macro's body reads and writes through its parameters — ``%load(raw.c)``
+    of ``%macro load(ds); set &ds; …`` reads ``raw.c``, with ``via`` set to
+    ``"macro_call"``. For a caller that wants every dataset a job touches
+    without batching: the reference inventory (``data_hydration``).
+
+    Chunk ids are the batcher's (``f2-chunk-0003`` across several files).
+    *corpus* itself is left as it was.
+    """
+    if not corpus.all_chunks:
+        return corpus
+    flat_chunks, file_offsets = _build_flat_index(corpus.file_results)
+    flat_chunks = list(flat_chunks)
+    n = len(flat_chunks)
+    _resolve_corpus_chunks(flat_chunks, _UF(n), _file_of_map(file_offsets, n))
+    bounds = [*file_offsets, n]
+    return corpus.model_copy(
+        update={
+            "file_results": [
+                result.model_copy(update={"chunks": flat_chunks[bounds[i] : bounds[i + 1]]})
+                for i, result in enumerate(corpus.file_results)
+            ]
+        }
+    )
+
+
 def _discover_edges(
     flat_chunks: list[SasChunk],
     uf: _UF,
@@ -1990,17 +2038,8 @@ class MultiFileBatcher:
             f"MultiFileBatcher.batch: flat index  total={n}  file_offsets={file_offsets}"
         )
 
-        # ── reference resolution (corpus-wide %LET and LIBNAME tables) ──────
-        # Each file already resolved its own when it was chunked; this run is
-        # what lets a %LET or a database LIBNAME in one file give meaning to a
-        # name another file uses, and it is a no-op for names already resolved.
-        resolve_references(flat_chunks)
-
-        # ── implicit dataset resolution (_LAST_ / _DATA_ / no DATA=) ────────
-        _resolve_implicit_datasets(flat_chunks)
-
-        # ── edge discovery ──────────────────────────────────────────────────
-        edges = _discover_edges(flat_chunks, uf, file_of=file_of)
+        # ── reference resolution, implicit datasets, edge discovery ─────────
+        edges = _resolve_corpus_chunks(flat_chunks, uf, file_of)
 
         # ── weak-edge resolution (absorb or promote to global context) ──────
         globals_root = _resolve_weak_edges(uf, edges, flat_chunks)

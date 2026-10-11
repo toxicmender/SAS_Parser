@@ -232,6 +232,22 @@ class TestValues:
         source = "%include '/code/a.sas';\n%include '/code/a.sas';\n"
         assert len(extract_paths(source)) == 1
 
+    def test_records_sort_one_way_whatever_the_set_order(self):
+        # Two spellings of one place share its path; every field decides.
+        from chunker.models import SasPathRef, _path_ref_sort_key
+
+        spelled = SasPathRef(
+            statement="include", location=PathLocation.FILESYSTEM, path="/sas/x.sas",
+            raw="&root/x.sas", resolved_path="/SAS/x.sas",
+        )
+        written = SasPathRef(
+            statement="include", location=PathLocation.FILESYSTEM, path="/sas/x.sas",
+            raw="/SAS/x.sas",
+        )
+        assert sorted([spelled, written], key=_path_ref_sort_key) == sorted(
+            [written, spelled], key=_path_ref_sort_key
+        )
+
     def test_records_are_hashable(self):
         # _merge_meta deduplicates these through a set, so this is a contract,
         # not an implementation detail.
@@ -284,6 +300,16 @@ class TestEngineLibnames:
         )
         assert ref.option_map["server"] == "tdprod"
         assert ref.option_map["mode"] == "teradata"
+
+    def test_an_unterminated_statement_with_many_quotes_parses_quickly(self):
+        # With no ';' to end on, the option tail must not try every way of
+        # splitting its quotes: 18 of them took 11 s before, exponential in N.
+        import time
+
+        text = "libname x oracle " + " ".join(f"o{i}='v'" for i in range(18))
+        started = time.perf_counter()
+        assert extract_engine_refs(text) == []
+        assert time.perf_counter() - started < 1.0
 
     def test_a_quoted_value_may_hold_semicolons(self):
         # An ODBC connection string is one value, its semicolons included.

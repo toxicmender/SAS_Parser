@@ -678,6 +678,11 @@ class _ProcStep:
         else:
             yield from _statement_option_refs(st, self.roles)
 
+    def cancel(self) -> None:
+        """RUN CANCEL: the group's pending copy runs nothing. What the PROC
+        statement set, PROC DATASETS's library, still holds."""
+        self.copy = None
+
     def close(self) -> Iterator[_Ref]:
         """What the step names once it ends: a copy without SELECT."""
         if self.copy is not None:
@@ -850,15 +855,24 @@ def _body_ref(
     op: _Operand, role: DatasetRole, via: str, param_pos: Mapping[str, int]
 ) -> SasDatasetRef | None:
     """The macro-body reference *op* makes, by how its name is spelled; None
-    for one built from the macro's parameters, which no call names whole."""
-    key, kind = _classify_ref(op.raw, param_pos)
+    for one built from the macro's parameters, which no call names whole.
+
+    The spelling is the operand's, or the whole name's when the statement adds
+    a library spelled through a macro variable: PROC DATASETS's ``lib=&lib``
+    with ``modify customers`` names ``&lib..customers``, and PROC COPY's
+    ``in=&src`` with ``select a`` names ``&src..a``.
+    """
+    spelled = op.raw
+    if set(_VAR_REF_RE.findall(op.name)) - set(_VAR_REF_RE.findall(op.raw)):
+        spelled = op.name
+    key, kind = _classify_ref(spelled, param_pos)
     if kind == _REF_CALL_SITE:
         return None
     if kind == _REF_PARAM:
         # The parameter itself (`&ds`), or a name built around it
         # (`&lib..customers`), which keeps its spelling for the call site to
         # fill in: the parameter's argument alone would name another dataset.
-        whole = _WHOLE_PARAM_RE.fullmatch(op.raw.strip()) is not None
+        whole = _WHOLE_PARAM_RE.fullmatch(spelled.strip()) is not None
         return SasDatasetRef(
             f"&{key}" if whole else op.name,
             role,
@@ -946,7 +960,7 @@ def dataset_refs(
                 group_start = len(refs)
             if cancel:
                 del refs[group_start:]
-                step = _ProcStep(st.proc)  # and nothing pending at its close
+                step.cancel()  # and nothing pending at its close
             else:
                 add(step.read(st), st.in_macro)
                 if st.keyword == "run":

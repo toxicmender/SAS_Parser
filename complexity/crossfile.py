@@ -176,7 +176,10 @@ def _dataset_readers(
     a list covering it (*lists*); for a list created, every dataset read under
     it. A whole library read is no one's reader."""
     key = name.lower()
-    found = set(index.get(key, ()))
+    # A whole library read names nothing to depend on, by its own name too:
+    # `stage.:` created by a COPY is not "read" by a CONTENTS of stage._all_,
+    # just as that CONTENTS imports nothing (see the imports in _resolve_chunk).
+    found = set() if _whole_library(key) else set(index.get(key, ()))
     if key.endswith(":"):
         prefix = key[:-1]
         for read, files in index.items():

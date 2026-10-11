@@ -34,7 +34,8 @@ without the SAS source:
 
 ```bash
 python -m data_hydration path/to/sas --dry-run --inventory-table main.meta.sas_refs
-python -m data_hydration --from-inventory --inventory-table main.meta.sas_refs
+python -m data_hydration --from-inventory --inventory-table main.meta.sas_refs \
+    --corpus "$(realpath path/to/sas)"
 ```
 
 ## Plan, then execute
@@ -89,27 +90,37 @@ produces, never sources.
   `effective_path`, case kept). Only a reference still unresolved becomes a
   blocker.
 
-Pass metadata resolved across the corpus — `chunker.resolve_corpus_references`
-— or a LIBNAME in a setup file cannot reach the reads in the files after it.
-The CLI and `complexity --hydration` both do.
+Pass metadata resolved across the corpus — `chunker.resolve_corpus_datasets`,
+the passes `MultiFileBatcher` runs — or a LIBNAME in a setup file cannot reach
+the reads in the files after it, and a macro call names none of the datasets
+its macro reads. The CLI and `complexity --hydration` both do.
 
 ### SAS data libraries
 
-`build_corpus_plan(..., datasets=...)` takes `chunk.metadata.dataset_refs`, and
-plans a **directory LIBNAME per dataset**, the way a database LIBNAME is planned
-per table. `set raw.customers;` after `libname raw '/data/raw';` is a
-`sas7bdat` item for `/data/raw/customers.sas7bdat`, target
-`<catalog>.raw.customers`, owned by the first file that reads it.
+`build_corpus_plan(..., datasets=...)` takes each chunk's
+`metadata.dataset_refs`, chunk by chunk, and plans a **directory LIBNAME per
+dataset**, the way a database LIBNAME is planned per table. `set raw.customers;`
+after `libname raw '/data/raw';` is a `sas7bdat` item for
+`/data/raw/customers.sas7bdat`, target `<catalog>.raw.customers`, owned by the
+first file that reads it. A macro call's reads count:
+`chunker.resolve_corpus_datasets` gives `%load(raw.customers)` the read its
+macro's `set &ds;` makes.
 
-- **Only what the job needs from outside.** A dataset some step creates is the
-  job's own and is never loaded; one only updated in place (`proc append
-  base=`) must already exist, so it is.
+- **Only what the job needs from outside.** A dataset an earlier step of the
+  same file creates, or a step of another file (taken to run first, as the
+  batcher links it), is the job's own and is never loaded. The step that reads
+  a table and rewrites it — `data raw.a; set raw.a;`, an in-place `proc sort` —
+  needs the one that was there, so it is loaded; so is one only updated in
+  place (`proc append base=`), which must already exist. A step's writes land
+  when it ends, save a rename or a copy (`proc datasets; change old=new;
+  modify new;`), which serves the statements after it.
 - **The LIBNAME in force** is the latest one before the read, in corpus order
   (a file's LIBNAMEs before its reads). A read before any LIBNAME binds its
   libref is not planned.
-- **The library item stays** where no member is named, blocked as before, and
-  where a list (`raw.sales_:`) is read from it: which members that covers, only
-  a listing knows.
+- **The library item stays** where no member is named, blocked as before;
+  where a list (`raw.sales_:`) is read from it, since which members that covers
+  only a listing knows; and while any read names its library through a macro
+  variable nothing resolved (`&where..t`), since that may be this library.
 - A member spelled through an unresolved macro variable (`raw.&tbl`) is an
   item, blocked; an SPD Engine library is not split (see below).
 
@@ -121,27 +132,37 @@ dataset a step reads or writes, each database table and each database LIBNAME.
 `resolved` says which still hold an unresolved `&macro`; `raw` is the SAS
 spelling, `value` the place or name SAS reads, `name` the comparison key.
 
-- **`inventory_rows(file_results)`** builds the rows from the chunker's results
-  (top-level chunks only, so a chunk split for size is not read twice).
+- **`inventory_rows(file_results, corpus=...)`** builds the rows from the
+  chunker's results, resolved with `chunker.resolve_corpus_datasets` (top-level
+  chunks only, so a chunk split for size is not read twice). Every row names
+  its `corpus`, so one table can hold several.
 - **`write_inventory(rows, table)`** appends them to a Delta table as one *run*:
   `run_id` is `<UTC stamp>-<8 hex>`, so the latest run sorts last and the table
   keeps the history. The table and its schema are created when missing, never
-  its catalog. **`read_inventory(table)`** reads the latest run back, or a
-  given `run_id`.
+  its catalog. **`read_inventory(table, corpus=...)`** reads the corpus's latest
+  run back, or a given `run_id`.
 - **`plan_from_inventory(rows)`** plans from the rows alone. The CLI and
   `complexity --hydration` plan this way, so the inventory is the planner's
   one input, and `--from-inventory` plans from the table with no SAS source
   and no chunker.
-- **No secret is stored.** A connection option whose key names a password
-  (`pass=`, `password=`, `pwd=`, ...) is stored as `<redacted>`, in `options`
-  and in the statement's `raw`, and so is a `PWD=` inside a connection string.
-  A `&macro` reference is kept: it is no secret, and the plan's blocker names
+- **No secret is stored.** A connection option keeps its value only when its
+  key says where the connection goes or as whom (`path`, `server`, `schema`,
+  `user`, `dsn`, ...); every other value is stored as `<redacted>`, and a
+  connection string (`noprompt=`, `url=`) is redacted pair by pair, credentials
+  in a URL too. SAS/ACCESS spells a password many ways — `PASSWORD=`, `PASS=`,
+  `PW=`, `PWD=`, `USING=` — so a list of the safe keys holds where a list of
+  the secret ones leaks. A database LIBNAME's `raw` is rebuilt from those
+  options, since the statement as written carries every secret they do. A
+  `&macro` reference is kept: it is no secret, and the plan's blocker names
   it. No reader takes a password from these options anyway (invariant 6).
 
 The CLI writes the inventory when `--inventory-table` or
-`data_hydration.inventory_table` names a table, with `--dry-run` too: it is a
-record of the corpus, not a load. A table that cannot be written fails the run's
-exit status, never its plan.
+`data_hydration.inventory_table` names a table, under the name `--corpus` gives
+(the source directory's absolute path by default). A `--dry-run` writes only
+when `--inventory-table` is on its own command line: a table from config is the
+deployment's, and a trial plan of another corpus does not belong in it.
+`--from-inventory` plans the latest run of `--corpus`, or `--run-id`'s. A table
+that cannot be written fails the run's exit status, never its plan.
 
 ### Included scripts
 

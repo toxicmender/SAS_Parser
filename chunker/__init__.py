@@ -5,6 +5,7 @@ from .batcher import (
     SasChunkBatcher,
     parse_databricks_mapping_csv,
     replace_dataset_names,
+    resolve_corpus_datasets,
 )
 from .chunker import SasSemanticChunker
 from .metadata import resolve_corpus_references
@@ -77,4 +78,6 @@ __all__ = [
     "DbTableVia",
     # cross-file name resolution for callers that do not batch
     "resolve_corpus_references",
+    # ... and every dataset as the batcher sees it, macro calls resolved
+    "resolve_corpus_datasets",
 ]

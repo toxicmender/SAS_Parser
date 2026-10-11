@@ -396,3 +396,18 @@ class TestTheReferenceInventory:
         pinned = read_inventory(inventory, spark=delta_spark, run_id=first[0].run_id)
         assert names(pinned) == {"lib.one", "work.a"}
         assert delta_spark.table(inventory).count() == len(first) + len(second)
+
+    def test_the_latest_run_is_the_corpus_asked_for(self, delta_spark, inventory):
+        from data_hydration.inventory import read_inventory, write_inventory
+
+        prod = self._rows("data a; set lib.prod; run;\n", run_id="20260101T000000Z-00000001")
+        trial = self._rows("data a; set lib.trial; run;\n", run_id="20260102T000000Z-00000002")
+        write_inventory([r.model_copy(update={"corpus": "prod"}) for r in prod], inventory, spark=delta_spark)
+        write_inventory([r.model_copy(update={"corpus": "trial"}) for r in trial], inventory, spark=delta_spark)
+
+        def names(rows):
+            return {r.name for r in rows}
+
+        # The trial run is newer, but it is not prod's.
+        assert names(read_inventory(inventory, spark=delta_spark, corpus="prod")) == {"lib.prod", "work.a"}
+        assert read_inventory(inventory, spark=delta_spark, corpus="nobody") == []

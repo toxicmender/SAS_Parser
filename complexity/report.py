@@ -635,7 +635,13 @@ def _include_summary(checks: Sequence[Any] | None, names: Mapping[str, str]) -> 
     """
     if not checks:
         return []
-    missing = sum(1 for c in checks if c.status != "found")
+    statuses = [c.status for c in checks]
+    counts = [f"found {statuses.count('found')}", f"not found **{statuses.count('missing')}**"]
+    if statuses.count("unnamed"):
+        counts.append(f"no file name {statuses.count('unnamed')}")
+    if statuses.count("unchecked"):
+        # Nowhere to look (SharePoint could not be listed, say): not missing.
+        counts.append(f"not looked for {statuses.count('unchecked')}")
     lines = [
         "",
         "## Included scripts",
@@ -643,8 +649,7 @@ def _include_summary(checks: Sequence[Any] | None, names: Mapping[str, str]) -> 
         "Each script a `%INCLUDE` pulls in, looked for by file name in the "
         "scored directory and in the application's SharePoint scripts folder.",
         "",
-        f"- Scripts included: **{len(checks)}** — found {len(checks) - missing}, "
-        f"not found **{missing}**",
+        f"- Scripts included: **{len(checks)}** — {', '.join(counts)}",
         "",
         "| Script | Included by | Local | SharePoint |",
         "| --- | --- | --- | --- |",

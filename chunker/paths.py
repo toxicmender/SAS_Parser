@@ -494,10 +494,13 @@ ENGINE_LIBNAMES: frozenset[str] = frozenset(
 # The option tail spans newlines by design — a connection statement with a
 # dozen options is routinely wrapped across lines, and the terminator is the
 # semicolon, not the line end. A quoted value is one unit, since a connection
-# string holds semicolons of its own: noprompt="DSN=dw;UID=u;".
+# string holds semicolons of its own: noprompt="DSN=dw;UID=u;". The repeat is
+# possessive: a quote also matches [^;] (an unmatched one, as in O'Neil, must),
+# and with no ';' to end on, giving characters back would try every way of
+# splitting the quotes — time exponential in their number.
 _ENGINE_LIBNAME_RE = re.compile(
     rf"\blibname\s+(?P<binds>{DS_REF_TOKEN})\s+(?P<engine>[A-Za-z_]\w*)\b"
-    r"""(?P<opts>(?:"[^"\n]*"|'[^'\n]*'|[^;])*);""",
+    r"""(?P<opts>(?:"[^"\n]*"|'[^'\n]*'|[^;])*+);""",
     re.IGNORECASE,
 )
 

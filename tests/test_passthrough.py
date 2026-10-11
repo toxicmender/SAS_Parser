@@ -450,6 +450,19 @@ class TestMasking(unittest.TestCase):
         self.assertEqual(meta.input_datasets, ["work.local"])
         self.assertEqual([t.qualified for t in meta.db_tables], ["s.t"])
 
+    def test_a_table_comma_joined_after_a_connection_is_still_read(self):
+        # FROM stays visible, the query an inline view: the comma join after it
+        # is a FROM item like any other.
+        src = (
+            "proc sql;\nconnect to oracle (path=P);\ncreate table work.out as\n"
+            "  select a.*, b.x from connection to oracle (select id from edw.t) as a,\n"
+            "  work.lookup as b where a.id = b.id;\nquit;\n"
+        )
+        meta = _chunk(src).chunks[0].metadata
+        self.assertEqual(meta.input_datasets, ["work.lookup"])
+        self.assertEqual(meta.output_datasets, ["work.out"])
+        self.assertEqual([t.qualified for t in meta.db_tables], ["edw.t"])
+
 
 # ── 7. Macro variables in names ────────────────────────────────────────────
 

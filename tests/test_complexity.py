@@ -1343,6 +1343,20 @@ class TestDatasetListsAcrossFiles(unittest.TestCase):
             ["stage.sales_jan read by year.sas", "stage.sales_feb read by year.sas"],
         )
 
+    def test_a_whole_library_read_reads_no_list_either(self):
+        # CONTENTS of stage._all_ reads no dataset, so the COPY that writes
+        # stage.: exports nothing to it, as it imports nothing from the COPY.
+        report = ComplexityAnalyzer().analyze_corpus(
+            _corpus(
+                make="proc copy in=src out=stage; run;\n",
+                look="proc contents data=stage._all_; run;\n",
+            )
+        )
+        for source_id in ("make.sas", "look.sas"):
+            profile = _file(report, source_id).cross_file
+            assert profile is not None
+            self.assertEqual((profile.imports, profile.exports), ([], []), source_id)
+
     def test_a_whole_library_read_names_no_dataset(self):
         # COPY reads src.: — every member of src, none of them a dataset any
         # file is expected to write.
@@ -3440,6 +3454,34 @@ class TestIncludeCheckCLI(unittest.TestCase):
 
     def test_without_the_flag_the_report_is_unchanged(self):
         self.assertNotIn("Included scripts", self._report())
+
+    def test_a_script_nobody_looked_for_is_not_counted_missing(self):
+        from complexity.report import _include_summary
+        from data_hydration.includes import IncludeCheck
+
+        unchecked = IncludeCheck("util.sas", "/x/util.sas", (("job.sas", 1),), None, None)
+        unnamed = IncludeCheck(None, "&f", (("job.sas", 2),), (), ())
+        lines = _include_summary([unchecked, unnamed], {})
+        self.assertIn(
+            "- Scripts included: **2** — found 0, not found **0**, no file name 1, "
+            "not looked for 1",
+            lines,
+        )
+
+    def test_the_corpus_is_resolved_once_for_both_sections(self):
+        import complexity.__main__ as cli
+
+        calls: list[int] = []
+        original = cli.resolve_corpus_datasets
+
+        def counted(corpus):
+            calls.append(1)
+            return original(corpus)
+
+        cli.resolve_corpus_datasets = counted
+        self.addCleanup(setattr, cli, "resolve_corpus_datasets", original)
+        self._report("--check-includes", "--hydration")
+        self.assertEqual(len(calls), 1)
 
     def test_app_alone_still_needs_sharepoint(self):
         from complexity.__main__ import main

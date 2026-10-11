@@ -844,7 +844,8 @@ The overall report gains one row per script:
 The file name is the one SAS opens: macro variables the corpus assigns are
 expanded and filerefs followed, so `%include src(util);` looks for `util.sas`.
 `—` is a place nobody looked; **not found** is a dependency the corpus is
-missing. The matching lives in `data_hydration.includes`, so
+missing. A script nowhere could be searched for (the SharePoint folder could
+not be listed) counts as *not looked for*, never as missing. The matching lives in `data_hydration.includes`, so
 `python -m data_hydration --check-includes` answers the same way and keeps the
 answer in the reference inventory. Off by default, and a run without it writes
 exactly the report it did before.

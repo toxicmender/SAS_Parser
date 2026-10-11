@@ -208,15 +208,29 @@ class SasIncludeFile(BaseModel, frozen=True):
         return f"{self.path}{via}{unresolved}"
 
 
-def _path_ref_sort_key(ref: SasPathRef) -> tuple[str, str, str, str]:
+def _path_ref_sort_key(
+    ref: SasPathRef,
+) -> tuple[str, str, str, str, str, str, str, str, bool]:
     """Total order over :class:`SasPathRef`, defined once.
 
     Both places that deduplicate these records through a set —
     ``chunker.metadata._merge_meta`` and :attr:`SasBatch.external_refs` — sort
     the result with this, because set iteration order is not stable across runs
-    and batch output is pinned by tests (invariant 9).
+    and batch output is pinned by tests (invariant 9). Every field takes part:
+    two spellings of one place (``&root/x.sas`` and ``/SAS/x.sas``) share a
+    ``path``, and would otherwise come out in either order.
     """
-    return (str(ref.location), ref.statement, ref.path, ref.binds or "")
+    return (
+        str(ref.location),
+        ref.statement,
+        ref.path,
+        ref.binds or "",
+        ref.raw,
+        ref.resolved_path or "",
+        ref.device or "",
+        ref.engine or "",
+        ref.has_macro_ref,
+    )
 
 
 class SasEngineRef(BaseModel, frozen=True):

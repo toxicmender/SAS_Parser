@@ -22,7 +22,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import pytest
 
-from chunker import SasCorpus, SasSemanticChunker, resolve_corpus_references
+from chunker import SasCorpus, SasSemanticChunker, resolve_corpus_datasets
 from data_hydration.config import HydrationConfig
 from data_hydration.includes import (
     include_checks,
@@ -40,7 +40,7 @@ def _rows(**files: str) -> list[InventoryRow]:
     corpus = SasCorpus(
         file_results=[chunker.chunk_text(t, source_id=f"{n}.sas") for n, t in files.items()]
     )
-    return inventory_rows(resolve_corpus_references(corpus).file_results)
+    return inventory_rows(resolve_corpus_datasets(corpus).file_results)
 
 
 def _includes(src: str) -> list[InventoryRow]:

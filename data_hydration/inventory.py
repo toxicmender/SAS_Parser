@@ -20,11 +20,16 @@ Two rules the rows keep:
 
 * **Only top-level chunks are read.** A chunk split for size has children whose
   text is part of the parent's; reading both would list each reference twice.
-* **Credentials are redacted.** A connection option whose key names a password
-  (``pass=``, ``password=``, ``pwd=``, ...) is stored as ``<redacted>``, and so
-  is a ``PWD=`` inside a connection string. A macro reference (``&user_pass.``)
-  is kept: it is no secret, and the planner's blocker names it. No reader takes
-  a password from these options — :mod:`data_hydration.secrets` resolves it.
+* **No secret is stored.** A connection option keeps its value only when its
+  key says where the connection goes or as whom (:data:`_KEPT_OPTIONS`:
+  ``path``, ``server``, ``schema``, ``user``, ...); every other value is stored
+  as ``<redacted>``, and a connection string (``noprompt="DSN=dw;PWD=x"``) is
+  redacted pair by pair the same way. SAS/ACCESS spells a password many ways —
+  ``PASSWORD=``, ``PASS=``, ``PW=``, ``PWD=``, ``USING=`` — so a list of the
+  safe keys holds where a list of the secret ones leaks. A macro reference
+  (``&user_pass.``) is kept: it is no secret, and the planner's blocker names
+  it. No reader takes a password from these options —
+  :mod:`data_hydration.secrets` resolves it.
 
 Like the planner, this module imports :mod:`chunker` for annotations only, and
 pyspark only inside the two functions that touch Delta.
@@ -85,7 +90,11 @@ class InventoryRow(BaseModel, frozen=True):
     ----------
     run_id
         The inventory run: ``<UTC stamp>-<8 hex>``, so the latest run of a
-        table is its greatest ``run_id``.
+        corpus is its greatest ``run_id``.
+    corpus
+        Which corpus the run took — a name the writer gives it, the source
+        directory by default — so one table can keep several corpora and
+        :func:`read_inventory` reads the latest run of the one asked for.
     recorded_at
         When the run was taken.
     file_order, ref_order
@@ -133,7 +142,8 @@ class InventoryRow(BaseModel, frozen=True):
     engine
         A path's LIBNAME engine (``spde``), or a database's (``oracle``).
     options
-        Connection options, password values redacted.
+        Connection options, every value but a connection coordinate's
+        redacted (see the module docstring).
     pattern
         A list rather than one object: ``lib.sales_:``, or ``edw.acct_:``.
     in_macro_body, macro_param, macro_param_pos
@@ -147,6 +157,7 @@ class InventoryRow(BaseModel, frozen=True):
     """
 
     run_id: str
+    corpus: str
     recorded_at: datetime
     file_order: int
     ref_order: int
@@ -203,44 +214,62 @@ class InventoryRow(BaseModel, frozen=True):
 # ---------------------------------------------------------------------------
 
 _REDACTED = "<redacted>"
-# Option keys that hold a password: pass, password, pw, pwd, dbpass, orapw, ...
-_SECRET_KEY_RE = re.compile(r"pass|pw", re.IGNORECASE)
-# A password inside a connection string: `noprompt="DSN=x;UID=u;PWD=secret;"`.
-# A macro reference (`PWD=&pw.`) is no secret and stays.
-_SECRET_IN_VALUE_RE = re.compile(r"\b((?:pwd|password)\s*=\s*)(?!&)[^;\"'\s]+", re.IGNORECASE)
-# A password option as a statement spells it: `pass="secret"`, `pw=secret`.
-_SECRET_OPTION_RE = re.compile(
-    r"""(\b\w*(?:pass|pw)\w*\s*=\s*)("[^"]*"|'[^']*'|[^\s;)]+)""", re.IGNORECASE
+
+#: Connection options whose values are kept: where a connection goes and as
+#: whom — what the planner and its readers use (``path``, ``server``,
+#: ``schema``, ``user``) and what a person reading the inventory needs to
+#: recognise it. Every other value is redacted (see the module docstring).
+_KEPT_OPTIONS = frozenset(
+    {
+        "access", "account", "authdomain", "catalog", "connection", "database",
+        "databasename", "datasrc", "db", "dbname", "driver", "dsn", "host",
+        "hostname", "mode", "path", "port", "project", "role", "schema",
+        "server", "service", "service_name", "sid", "tdpid", "uid", "user",
+        "warehouse",
+    }
+)  # fmt: skip
+#: Options whose value is a connection string of its own ``key=value;`` pairs,
+#: redacted pair by pair.
+_CONNECTION_STRINGS = frozenset(
+    {"complete", "conopts", "init_string", "noprompt", "prompt", "required", "uri", "url"}
 )
+# One pair of a connection string; a braced ODBC value may hold ';' and spaces.
+_PAIR_RE = re.compile(r"([^;=]+)=(\{[^}]*\}|[^;]*)")
+# Credentials written into a URL: scheme://user:password@host.
+_URL_PASSWORD_RE = re.compile(r"(//[^/:@;]+:)[^@/;]+(@)")
 
 
 def _is_macro_ref(value: str) -> bool:
     return value.strip("'\" ").startswith("&")
 
 
+def _kept_value(key: str, value: str) -> str:
+    """*value* of option *key*, or ``<redacted>`` (see :data:`_KEPT_OPTIONS`)."""
+    key = key.strip().lower()
+    if _is_macro_ref(value) or key in _KEPT_OPTIONS:
+        return value
+    if key in _CONNECTION_STRINGS:
+        return _URL_PASSWORD_RE.sub(
+            rf"\g<1>{_REDACTED}\g<2>",
+            _PAIR_RE.sub(lambda m: f"{m.group(1)}={_kept_value(m.group(1), m.group(2))}", value),
+        )
+    return _REDACTED
+
+
 def _redacted(options: Iterable[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
-    """*options* with every literal password replaced by ``<redacted>``."""
-    kept: list[tuple[str, str]] = []
+    """*options* with every value but a connection coordinate's redacted."""
+    return tuple((key, _kept_value(key, value)) for key, value in options)
+
+
+def _statement(binds: str, engine: str, options: Iterable[tuple[str, str]]) -> str:
+    """A database LIBNAME as a statement, from its (redacted) options: what the
+    inventory keeps for ``raw``, since the statement as written carries every
+    secret its options do."""
+    words = [f"libname {binds} {engine}"]
     for key, value in options:
-        if _SECRET_KEY_RE.search(key) and not _is_macro_ref(value):
-            value = _REDACTED
-        else:
-            value = _SECRET_IN_VALUE_RE.sub(rf"\g<1>{_REDACTED}", value)
-        kept.append((key, value))
-    return tuple(kept)
-
-
-def _redacted_statement(text: str) -> str:
-    """*text*, a statement as written, with its literal passwords redacted by
-    :func:`_redacted`'s rules."""
-
-    def hide(match: re.Match[str]) -> str:
-        if _is_macro_ref(match.group(2)):
-            return match.group(0)
-        return f"{match.group(1)}{_REDACTED}"
-
-    text = _SECRET_OPTION_RE.sub(hide, text)
-    return _SECRET_IN_VALUE_RE.sub(rf"\g<1>{_REDACTED}", text)
+        quoted = any(c in value for c in " ;'\"") and not value.startswith(("(", '"', "'"))
+        words.append(f'{key}="{value}"' if quoted else f"{key}={value}")
+    return " ".join(words) + ";"
 
 
 def _dataset_parts(name: str) -> tuple[str | None, str | None]:
@@ -263,16 +292,20 @@ def new_run_id(now: datetime | None = None) -> str:
 def inventory_rows(
     file_results: Iterable[Any],
     *,
+    corpus: str = "",
     run_id: str | None = None,
     recorded_at: datetime | None = None,
 ) -> list[InventoryRow]:
     """Every reference *file_results* make, as rows, in corpus order.
 
     *file_results* are :class:`chunker.SasChunkResult` objects (read by
-    attribute), resolved across the corpus first —
-    ``chunker.resolve_corpus_references`` — so a ``%LET`` or LIBNAME in one
-    file reaches the references in the next. Only top-level chunks are read;
-    a reference a chunk names twice is one row.
+    attribute), resolved across the corpus first with
+    ``chunker.resolve_corpus_datasets``: a ``%LET`` or LIBNAME in one file
+    reaches the references in the next, ``_LAST_`` is made concrete, and each
+    macro call carries the datasets its macro reads through its parameters —
+    without that last, ``%load(raw.c)`` names nothing here. Only top-level
+    chunks are read; a reference a chunk names twice is one row. *corpus*
+    names the corpus on every row (see :attr:`InventoryRow.corpus`).
     """
     recorded_at = recorded_at or datetime.now(timezone.utc)
     run_id = run_id or new_run_id(recorded_at)
@@ -285,6 +318,7 @@ def inventory_rows(
                 continue
             where = {
                 "run_id": run_id,
+                "corpus": corpus,
                 "recorded_at": recorded_at,
                 "file_order": file_order,
                 "source_id": source_id,
@@ -311,16 +345,12 @@ def _chunk_refs(meta: Any) -> Iterable[dict[str, Any]]:
     """The row fields of every reference on one chunk's metadata."""
     for ref in meta.engine_refs:
         options = _redacted(ref.options)
-        # The statement as written carries its options, passwords included.
-        raw = _redacted_statement(ref.raw) or " ".join(
-            ["libname", ref.binds, ref.engine, *(f"{k}={v}" for k, v in options)]
-        )
         yield {
             "kind": RefKind.ENGINE,
             "statement": "libname",
             "role": "bind",
             "name": ref.binds,
-            "raw": raw,
+            "raw": _statement(ref.binds, ref.engine, options),
             "value": ref.binds,
             "resolved": not ref.has_macro_ref,
             "has_macro_ref": ref.has_macro_ref,
@@ -538,7 +568,11 @@ def plan_from_inventory(
     wanted = {libref.lower() for libref in only}
     by_source: dict[str, tuple[list[Any], list[Any]]] = {}
     db_tables: dict[str, list[Any]] = {}
-    datasets: dict[str, list[Any]] = {}
+    # Each file's datasets chunk by chunk: a step that reads a table and
+    # rewrites it needs it from outside, one after the step that created it
+    # does not (see planner._library_members).
+    datasets: dict[str, list[list[Any]]] = {}
+    chunk_of: dict[str, str] = {}
     for row in sorted(rows, key=lambda r: (r.file_order, r.ref_order)):
         engine_refs, path_refs = by_source.setdefault(row.source_id, ([], []))
         if wanted and (row.libref or "") not in wanted:
@@ -550,7 +584,11 @@ def plan_from_inventory(
         elif row.kind is RefKind.DB_TABLE:
             db_tables.setdefault(row.source_id, []).append(_DbTableRecord.of(row))
         else:
-            datasets.setdefault(row.source_id, []).append(_DatasetRecord.of(row))
+            chunks = datasets.setdefault(row.source_id, [])
+            if not chunks or chunk_of[row.source_id] != row.chunk_id:
+                chunks.append([])
+                chunk_of[row.source_id] = row.chunk_id
+            chunks[-1].append(_DatasetRecord.of(row))
     return build_corpus_plan(
         by_source, db_tables=db_tables, datasets=datasets, config=config, probe=probe
     )
@@ -564,6 +602,7 @@ def plan_from_inventory(
 #: :class:`InventoryRow` documents each.
 _COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("run_id", "STRING", "inventory run; the latest is the greatest"),
+    ("corpus", "STRING", "the corpus the run took: a name, or its directory"),
     ("recorded_at", "TIMESTAMP", "when the run was taken"),
     ("file_order", "INT", "place of the file in the corpus"),
     ("ref_order", "INT", "place of the reference in its file"),
@@ -679,18 +718,25 @@ def write_inventory(rows: Sequence[InventoryRow], table: str, *, spark: Any = No
 
 
 def read_inventory(
-    table: str, *, spark: Any = None, run_id: str | None = None
+    table: str,
+    *,
+    spark: Any = None,
+    run_id: str | None = None,
+    corpus: str | None = None,
 ) -> list[InventoryRow]:
-    """The rows of one run of the inventory *table*, in corpus order: *run_id*,
-    or the latest run when it is ``None``. Empty when the table holds none."""
+    """The rows of one run of the inventory *table*, in corpus order: *run_id*;
+    else the latest run of *corpus*; else the table's latest run, whichever
+    corpus it took. Empty when there is no such run."""
     spark = _session(spark)
     from pyspark.sql import functions as F
 
     frame = spark.table(_quoted_table(table))
     if run_id is None:
-        run_id = frame.agg(F.max("run_id")).first()[0]
+        runs = frame if corpus is None else frame.filter(F.col("corpus") == corpus)
+        run_id = runs.agg(F.max("run_id")).first()[0]
         if run_id is None:
-            logger.warning(f"read_inventory: {table} holds no run")
+            which = "no run" if corpus is None else f"no run of corpus {corpus!r}"
+            logger.warning(f"read_inventory: {table} holds {which}")
             return []
     selected = frame.filter(F.col("run_id") == run_id).orderBy("file_order", "ref_order")
     rows = [InventoryRow.model_validate(row.asDict(recursive=True)) for row in selected.collect()]

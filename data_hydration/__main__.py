@@ -67,7 +67,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print the plan and stop. Opens no connection.",
+        help=(
+            "Print the plan and stop. Opens no connection, unless "
+            "--inventory-table asks for the inventory to be written."
+        ),
     )
     parser.add_argument(
         "--stage",
@@ -95,18 +98,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Delta table (catalog.schema.table) for the reference inventory: "
             "every path and dataset the corpus names, resolved or not. A run "
-            "appends its references to it, even with --dry-run. "
-            "Default: data_hydration.inventory_table."
+            "appends its references to it — a --dry-run only when this flag "
+            "names the table. Default: data_hydration.inventory_table."
+        ),
+    )
+    parser.add_argument(
+        "--corpus",
+        metavar="NAME",
+        help=(
+            "The corpus's name in the inventory: written with each run "
+            "(default: the source directory's absolute path), and the corpus "
+            "--from-inventory plans."
         ),
     )
     parser.add_argument(
         "--from-inventory",
         action="store_true",
-        help="Plan from the latest run in the inventory table instead of a source directory.",
+        help=(
+            "Plan from the inventory table instead of a source directory: the "
+            "latest run of --corpus, or the run --run-id names."
+        ),
     )
     parser.add_argument(
         "--run-id",
-        help="With --from-inventory: plan from this inventory run, not the latest.",
+        help="With --from-inventory: plan from this inventory run.",
     )
     parser.add_argument(
         "--check-includes",
@@ -138,6 +153,9 @@ def _argument_error(args: argparse.Namespace) -> str | None:
     if args.from_inventory:
         if args.source_dir is not None:
             return "--from-inventory plans from the inventory table, not a source directory"
+        if not (args.corpus or args.run_id):
+            # The table may hold many corpora: its latest run is anybody's.
+            return "--from-inventory needs --corpus (the name the run was written under) or --run-id"
     elif args.source_dir is None:
         return "a source directory is required (or --from-inventory)"
     elif not args.source_dir.is_dir():
@@ -183,7 +201,7 @@ def _corpus_inventory(args: argparse.Namespace) -> list[InventoryRow]:
     itself must not depend on it (see the README's decoupling contract), and
     this entry point is a caller like any other.
     """
-    from chunker import SasCorpus, SasSemanticChunker, resolve_corpus_references
+    from chunker import SasCorpus, SasSemanticChunker, resolve_corpus_datasets
 
     from .inventory import inventory_rows
 
@@ -193,9 +211,11 @@ def _corpus_inventory(args: argparse.Namespace) -> list[InventoryRow]:
         for path in sorted(args.source_dir.rglob(args.pattern))
     ]
     # Resolved as one corpus, so a database LIBNAME (or a %LET) in a setup file
-    # reaches the reads in the files after it — chunk_file sees one file alone.
-    corpus = resolve_corpus_references(SasCorpus(file_results=results))
-    return inventory_rows(corpus.file_results)
+    # reaches the reads in the files after it — chunk_file sees one file alone
+    # — and each macro call names the datasets its macro reads and writes.
+    corpus = resolve_corpus_datasets(SasCorpus(file_results=results))
+    name = getattr(args, "corpus", None) or str(args.source_dir.resolve())
+    return inventory_rows(corpus.file_results, corpus=name)
 
 
 def _build_plan(
@@ -246,11 +266,12 @@ def _inventory(
 ) -> tuple[list[InventoryRow] | None, bool]:
     """The inventory to plan from, and whether keeping it failed.
 
-    With ``--from-inventory``, one run read from the table — ``None`` when
-    there is no table to read or nothing in it. Otherwise the source
-    directory's, appended to the table when one is configured. A table that
-    cannot be written costs the run its exit status, never its plan: the
-    inventory is in hand either way.
+    With ``--from-inventory``, one run read from the table — the latest of
+    ``--corpus``, or ``--run-id`` — and ``None`` when there is no table to
+    read or nothing in it. Otherwise the source directory's, appended to the
+    table when one is configured (on a dry run, only one ``--inventory-table``
+    names). A table that cannot be written costs the run its exit status,
+    never its plan: the inventory is in hand either way.
     """
     from .inventory import read_inventory, write_inventory
 
@@ -263,7 +284,7 @@ def _inventory(
             )
             return None, False
         try:
-            rows = read_inventory(table, run_id=args.run_id)
+            rows = read_inventory(table, run_id=args.run_id, corpus=args.corpus)
         except Exception as exc:
             logger.error(
                 f"could not read the reference inventory from {table} — "
@@ -275,7 +296,10 @@ def _inventory(
             return None, False
         return _match_includes(args, rows)
     rows, failed = _match_includes(args, _corpus_inventory(args))
-    if not table:
+    # A dry run writes only when its own command line asks: a table set in
+    # config.json or the environment is the deployment's, and a trial plan of
+    # some other corpus does not belong in it.
+    if not table or (args.dry_run and not args.inventory_table):
         return rows, failed
     try:
         write_inventory(rows, table)

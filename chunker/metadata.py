@@ -1792,13 +1792,23 @@ def resolve_filerefs(chunks: list[SasChunk]) -> None:
         refs = meta.external_refs
         named = {r.binds: r for r in refs if r.statement == "filename" and r.binds}
         if named or meta.global_statement_keyword == "filename":
-            bound.update(named)
-            for m in _FILENAME_STMT_RE.finditer(_sanitise(chunk.text)):
+            # In source order: `filename _all_ clear;` then `filename src
+            # '/x';` leaves src bound, and the reverse leaves nothing.
+            text = _sanitise(chunk.text)
+            seen: set[str] = set()
+            for m in _FILENAME_STMT_RE.finditer(text):
                 fref = m.group(1).lower()
+                semi = text.find(";", m.end())
+                tail = text[m.end() : semi if semi >= 0 else len(text)]
                 if fref == "_all_":
                     bound.clear()
-                elif fref not in named:
+                elif fref in named and ("'" in tail or '"' in tail):
+                    bound[fref] = named[fref]
+                    seen.add(fref)
+                else:
                     bound.pop(fref, None)
+            for fref in named.keys() - seen:
+                bound[fref] = named[fref]  # a statement the scan above misread
         if not bound or not any(map(_named_through_fileref, refs)):
             continue
         resolved = [

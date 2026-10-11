@@ -27,7 +27,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import pytest
 
-from chunker import SasCorpus, SasSemanticChunker, resolve_corpus_references
+from chunker import SasCorpus, SasSemanticChunker, resolve_corpus_datasets
 from data_hydration.config import HydrationConfig
 from data_hydration.inventory import (
     _COLUMNS,
@@ -56,7 +56,7 @@ def _results(chunker: SasSemanticChunker | None = None, /, **files: str):
             chunker.chunk_text(src, source_id=f"{name}.sas") for name, src in files.items()
         ]
     )
-    return resolve_corpus_references(corpus).file_results
+    return resolve_corpus_datasets(corpus).file_results
 
 
 def _rows(**files: str) -> list[InventoryRow]:
@@ -150,6 +150,54 @@ def test_passwords_are_redacted_and_macro_references_kept():
     }
 
 
+@pytest.mark.parametrize(
+    ("statement", "secret"),
+    [
+        # USING= is PASSWORD= on the ODBC, DB2, OLE DB and SQL Server engines.
+        ("libname dw odbc datasrc=edw user=etl using=S3cr3t;", "S3cr3t"),
+        ('libname d db2 database=edw user=etl using="S3cr3t";', "S3cr3t"),
+        # A braced ODBC value holds ';' and spaces, all of it the password.
+        ('libname o odbc noprompt="DSN=x;UID=u;PWD={s3c r3t};";', "s3c r3t"),
+        ('libname o odbc noprompt="DSN=x;Password=s3cr3t";', "s3cr3t"),
+        # Credentials written into a URL.
+        ('libname h hadoop uri="jdbc:hive2://etl:s3cr3t@hive:10000/edw";', "s3cr3t"),
+        # An option nobody listed as safe, whatever it holds.
+        ("libname o oracle path=P user=u orapw=s3cr3t;", "s3cr3t"),
+    ],
+)
+def test_no_spelling_of_a_password_reaches_a_row(statement, secret):
+    rows = _rows(job=statement + "\n")
+    [engine] = [r for r in rows if r.kind is RefKind.ENGINE]
+    stored = f"{engine.raw} {engine.options}"
+    # No piece of it either: a braced value is the password whole.
+    assert not any(piece in stored for piece in secret.split())
+    assert engine.raw.startswith("libname ") and engine.raw.endswith(";")
+    assert engine.raw.count('"') % 2 == 0, engine.raw  # its quotes still pair
+
+
+def test_connection_coordinates_and_macro_references_are_kept():
+    [engine] = [
+        r
+        for r in _rows(
+            job="libname o odbc noprompt=\"DSN=dw;UID=u;PWD=x\" schema=s readbuff=100 pass=&p.;\n"
+        )
+        if r.kind is RefKind.ENGINE
+    ]
+    assert dict(engine.options) == {
+        "noprompt": "DSN=dw;UID=u;PWD=<redacted>",
+        "schema": "s",
+        "readbuff": "<redacted>",
+        "pass": "&p.",
+    }
+    # The pass-through CONNECT options are redacted the same way.
+    tables = _rows(
+        job="proc sql;\nconnect to db2 (database=edw user=u using=S3cr3t);\n"
+        "create table a as select * from connection to db2 (select * from s.t);\nquit;\n"
+    )
+    [table] = [r for r in tables if r.kind is RefKind.DB_TABLE]
+    assert dict(table.options) == {"database": "edw", "user": "u", "using": "<redacted>"}
+
+
 def test_rows_survive_the_table_round_trip():
     rows = _rows(job="libname edw oracle path=P schema=s;\ndata a; set edw.t; run;\n" + PASS_THROUGH)
     for row in rows:
@@ -178,10 +226,13 @@ def _chunk_plan(results):
     def refs(result, field):
         return [r for c in result.chunks if c.parent_id is None for r in getattr(c.metadata, field)]
 
+    def per_chunk(result):
+        return [list(c.metadata.dataset_refs) for c in result.chunks if c.parent_id is None]
+
     return build_corpus_plan(
         {r.source_id: (refs(r, "engine_refs"), refs(r, "external_refs")) for r in results},
         db_tables={r.source_id: refs(r, "db_tables") for r in results},
-        datasets={r.source_id: refs(r, "dataset_refs") for r in results},
+        datasets={r.source_id: per_chunk(r) for r in results},
         config=_config(),
     )
 
@@ -281,6 +332,56 @@ def test_the_libname_in_force_is_the_latest_before_the_read():
     assert ("/two", "mid") in located and ("/two", "late") in located
 
 
+def test_a_table_a_step_reads_and_rewrites_is_loaded():
+    # An in-place sort and `data raw.a; set raw.a;` need the table that was
+    # there before them: the step's own write does not make it the job's.
+    plan = _plan(
+        job=(
+            "libname raw '/data/raw';\nproc sort data=raw.customers; by id; run;\n"
+            "data raw.accounts; set raw.accounts; where active; run;\n"
+            "data work.o; set raw.orders; run;\n"
+        )
+    )
+    assert sorted(i.source.object_name for i in plan.items) == ["accounts", "customers", "orders"]
+
+
+def test_a_table_renamed_into_place_is_the_jobs_own():
+    # CHANGE makes `new` for the statements after it; `old` must exist first.
+    plan = _plan(job="libname raw '/data/raw';\nproc datasets lib=raw nolist; change old=new; modify new; quit;\n")
+    assert [i.source.object_name for i in plan.items] == ["old"]
+
+
+def test_a_table_created_before_it_is_read_is_the_jobs_own():
+    plan = _plan(
+        a_make="libname raw '/data/raw';\ndata raw.made_a; x = 1; run;\n",
+        b_read="data work.o; set raw.made_a raw.made_c raw.extern; run;\n",
+        c_make="data raw.made_c; x = 1; run;\n",
+    )
+    # made_a by an earlier file, made_c by another file (taken to run first,
+    # as the batcher links it): neither is loaded. extern is nobody's.
+    assert [i.source.object_name for i in plan.items] == ["extern"]
+
+
+def test_a_member_a_macro_call_reads_is_planned():
+    src = (
+        "libname raw '/data/raw';\n%macro load(ds); data work.copy; set &ds; run; %mend;\n"
+        "data work.o; set raw.orders; run;\n%load(raw.customers);\n"
+    )
+    plan = _plan(job=src)
+    assert [i.source.object_name for i in plan.items] == ["orders", "customers"]
+    # The call is where the read happens, so the call's file owns it.
+    assert {i.source.source_id for i in plan.items} == {"job.sas"}
+
+
+def test_a_read_through_an_unresolved_library_keeps_every_library_item():
+    # &where could be raw: what it reads is in no list the plan can make.
+    plan = _plan(job="libname raw '/data/raw';\ndata work.o; set raw.orders &where..t; run;\n")
+    kinds = sorted((i.source.kind.value, i.source.object_name) for i in plan.items)
+    assert kinds == [("file", ""), ("sas7bdat", "orders")]
+    [library] = [i for i in plan.items if i.source.kind is SourceKind.FILE]
+    assert "library directory" in library.blockers[0]
+
+
 def test_an_spde_library_is_not_split_into_members():
     [item] = _plan(job="libname spd spde '/data/spde';\ndata a; set spd.big; run;\n").items
     assert item.source.kind is SourceKind.SPDE
@@ -338,7 +439,7 @@ def test_a_write_appends_one_run_to_a_delta_table():
     [(data, schema)] = spark.created
     assert schema.split(", ")[0] == "`run_id` STRING"
     # One tuple per row, in column order, in types Spark takes.
-    assert data[0][: len(("run_id", "recorded_at"))] == (rows[0].run_id, rows[0].recorded_at)
+    assert data[0][:3] == (rows[0].run_id, rows[0].corpus, rows[0].recorded_at)
     assert all(len(values) == len(_COLUMNS) for values in data)
     assert isinstance(data[0][[n for n, _, _ in _COLUMNS].index("kind")], str)
     assert spark.write_log == [("format", "delta"), ("mode", "append"), ("saveAsTable", "main.meta.sas_refs")]
@@ -382,17 +483,56 @@ def test_the_cli_keeps_the_inventory_and_plans_from_it(corpus_dir, monkeypatch, 
     monkeypatch.setattr(
         inventory, "write_inventory", lambda rows, table, **_: stored.setdefault(table, rows)
     )
-    assert _main(str(corpus_dir), "--dry-run", "--inventory-table", "main.meta.refs") == 0
+    argv = (str(corpus_dir), "--dry-run", "--inventory-table", "main.meta.refs", "--corpus", "etl")
+    assert _main(*argv) == 0
     written = capsys.readouterr().out
-    assert {r.name for r in stored["main.meta.refs"]} >= {"/data/raw", "raw.customers"}
+    rows = stored["main.meta.refs"]
+    assert {r.name for r in rows} >= {"/data/raw", "raw.customers"}
+    assert {r.corpus for r in rows} == {"etl"}
     assert "sas7bdat:/data/raw/customers (raw)" in written
 
     # A later job plans from the table: no source directory, no chunker.
-    monkeypatch.setattr(
-        inventory, "read_inventory", lambda table, run_id=None, **_: stored[table]
-    )
-    assert _main("--from-inventory", "--inventory-table", "main.meta.refs", "--dry-run") == 0
+    asked: list[tuple[str | None, str | None]] = []
+
+    def read(table, run_id=None, corpus=None, **_):
+        asked.append((corpus, run_id))
+        return stored[table]
+
+    monkeypatch.setattr(inventory, "read_inventory", read)
+    argv = ("--from-inventory", "--inventory-table", "main.meta.refs", "--corpus", "etl", "--dry-run")
+    assert _main(*argv) == 0
+    assert asked == [("etl", None)]
     assert capsys.readouterr().out.splitlines()[2:] == written.splitlines()[2:]
+
+
+def test_a_dry_run_leaves_a_configured_table_alone(corpus_dir, monkeypatch, capsys):
+    # The deployment's table, from config: a trial plan writes nothing to it.
+    import data_hydration.__main__ as cli
+    import data_hydration.inventory as inventory
+
+    written: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "_config_for",
+        lambda args: HydrationConfig(catalog="main", inventory_table=args.inventory_table or "prod.meta.refs"),
+    )
+    monkeypatch.setattr(inventory, "write_inventory", lambda rows, table, **_: written.append(table))
+    assert _main(str(corpus_dir), "--dry-run") == 0
+    assert written == []
+    # Named on the command line, the table is written to, dry run or not.
+    assert _main(str(corpus_dir), "--dry-run", "--inventory-table", "dev.meta.refs") == 0
+    assert written == ["dev.meta.refs"]
+
+
+def test_a_corpus_is_named_by_its_directory_unless_given_a_name(corpus_dir, monkeypatch):
+    import data_hydration.inventory as inventory
+
+    stored: dict[str, list[InventoryRow]] = {}
+    monkeypatch.setattr(
+        inventory, "write_inventory", lambda rows, table, **_: stored.setdefault(table, rows)
+    )
+    assert _main(str(corpus_dir), "--dry-run", "--inventory-table", "m.s.t") == 0
+    assert {r.corpus for r in stored["m.s.t"]} == {str(corpus_dir.resolve())}
 
 
 def test_a_table_that_cannot_be_written_fails_the_run_not_the_plan(corpus_dir, monkeypatch, capsys):
@@ -412,6 +552,8 @@ def test_a_table_that_cannot_be_written_fails_the_run_not_the_plan(corpus_dir, m
         (["--from-inventory", "SRC"], "not a source directory"),
         ([], "a source directory is required"),
         (["SRC", "--run-id", "r1"], "needs --from-inventory"),
+        # The table may hold many corpora: name the one, or the run.
+        (["--from-inventory"], "needs --corpus"),
         (["SRC", "--inventory-table", "main.meta.refs; drop"], "identifier parts"),
     ],
 )
@@ -428,7 +570,7 @@ def test_from_inventory_needs_a_table(monkeypatch, capsys):
     monkeypatch.setattr(
         cli, "_config_for", lambda args: HydrationConfig(catalog="main", inventory_table=None)
     )
-    assert _main("--from-inventory", "--dry-run") == 2
+    assert _main("--from-inventory", "--corpus", "etl", "--dry-run") == 2
     assert "needs an inventory table" in capsys.readouterr().err
 
 
