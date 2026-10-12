@@ -29,6 +29,12 @@ batcher = SasChunkBatcher()
 batches = batcher.batch(result)
 ```
 
+`chunk_file` reads UTF-8 and, when a file is not valid UTF-8, reads it as
+Latin-1, the session encoding SAS uses on UNIX unless told otherwise. Code from
+an AIX or Linux SAS server is Latin-1 more often than not. Pass `encoding=`, or
+set `sas_chunker.encoding`, to read every file strictly in one encoding
+(`read_sas_source` is the same rule on its own).
+
 Multiple files (cross-file dependencies resolved):
 
 ```python

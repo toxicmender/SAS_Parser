@@ -7,7 +7,7 @@ from .batcher import (
     replace_dataset_names,
     resolve_corpus_datasets,
 )
-from .chunker import SasSemanticChunker
+from .chunker import SasSemanticChunker, read_sas_source
 from .metadata import resolve_corpus_references
 from .models import (
     DatasetRole,
@@ -40,6 +40,7 @@ from .paths import (
 __all__ = [
     # chunker
     "SasSemanticChunker",
+    "read_sas_source",
     # single-file batcher
     "SasChunkBatcher",
     # multi-file batcher

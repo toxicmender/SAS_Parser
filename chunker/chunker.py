@@ -116,6 +116,34 @@ def _record_user_library(
 # ---------------------------------------------------------------------------
 
 
+#: What a file that is not valid UTF-8 is read as: the session encoding SAS
+#: uses on UNIX unless told otherwise (ENCODING= ``latin1`` for ``en_US``), and
+#: an encoding in which every byte decodes, so no file is ever lost to one.
+_FALLBACK_ENCODING = "latin-1"
+
+
+def read_sas_source(path: str | Path, encoding: str | None = None) -> str:
+    """The text of the SAS file at *path*.
+
+    With *encoding*, decoded strictly in it. Without, as UTF-8 — a byte-order
+    mark dropped, since Windows editors add one — and, when the bytes are not
+    valid UTF-8, as Latin-1. Code written on an AIX or Linux SAS server is
+    Latin-1 more often than not, and a single ``é`` in a comment, or the
+    ``¬=`` SAS reads as *not equal*, made a strict UTF-8 read raise.
+    """
+    data = Path(path).read_bytes()
+    if encoding is not None:
+        return data.decode(encoding)
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        logger.info(
+            f"read_sas_source: '{path}' is not UTF-8 (byte {exc.start}); "
+            f"read as {_FALLBACK_ENCODING}"
+        )
+        return data.decode(_FALLBACK_ENCODING)
+
+
 class SasSemanticChunker:
     """
     Chunk Base SAS source into source-preserving semantic regions.
@@ -138,6 +166,11 @@ class SasSemanticChunker:
         so far (a background watchdog also logs the stuck phase throughout).
         Pass ``None`` to disable both safeguards and parse unbounded.  Defaults
         to 60s, comfortably above any healthy parse.
+    encoding : str | None
+        How ``chunk_file`` decodes a file, strictly. ``None`` (default) reads
+        ``sas_chunker.encoding`` from config.json, and failing that decodes
+        each file as UTF-8 and, when it is not valid UTF-8, as Latin-1 — see
+        :func:`read_sas_source`.
     """
 
     def __init__(
@@ -146,10 +179,14 @@ class SasSemanticChunker:
         min_words: int | None = None,
         max_words: int | None = None,
         timeout: float | None = 60.0,
+        encoding: str | None = None,
     ) -> None:
         self.min_words = app_config.resolve(min_words, "sas_chunker", "min_words", 300)
         self.max_words = app_config.resolve(max_words, "sas_chunker", "max_words", 700)
         self.timeout = timeout
+        self.encoding: str | None = app_config.resolve(
+            encoding, "sas_chunker", "encoding", None
+        )
         logger.debug(
             f"SasSemanticChunker  min_words={min_words}  max_words={max_words}  "
             f"timeout={timeout}"
@@ -166,7 +203,7 @@ class SasSemanticChunker:
         if not fp.exists():
             logger.error(f"chunk_file: file not found '{fp}'")
             raise FileNotFoundError(fp)
-        source = fp.read_text(encoding="utf-8")
+        source = read_sas_source(fp, self.encoding)
         line_count = source.count("\n") + 1
         logger.debug(f"chunk_file: {len(source)} bytes / {line_count} lines  '{fp}'")
         return self.chunk_text(source, source_id=str(fp))
