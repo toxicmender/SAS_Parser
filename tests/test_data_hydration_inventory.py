@@ -343,11 +343,25 @@ def test_the_libname_in_force_is_the_latest_before_the_read():
         b_setup="libname raw '/one';\n",
         c_job="data b; set raw.mid; run;\nlibname raw '/two';\ndata c; set raw.late; run;\n",
     )
-    # raw.early is read before any LIBNAME binds raw; within a file the
-    # LIBNAMEs are taken before the reads, so c_job reads from /two.
+    # raw.early is read before any LIBNAME binds raw. Within c_job, raw.mid is
+    # read while b_setup's LIBNAME is in force, and only raw.late after c_job
+    # rebinds raw to /two.
     located = [(i.source.locator, i.source.object_name) for i in plan.items]
     assert ("/one", "early") not in located
-    assert ("/two", "mid") in located and ("/two", "late") in located
+    assert ("/one", "mid") in located and ("/two", "late") in located
+    assert ("/two", "mid") not in located
+
+
+def test_a_libname_rebound_in_one_file_binds_only_the_reads_after_it():
+    plan = _plan(
+        job=(
+            "libname raw '/data/2025';\ndata a; set raw.x; run;\n"
+            "libname raw '/data/2026';\ndata b; set raw.y; run;\n"
+        )
+    )
+    located = {(i.source.locator, i.source.object_name) for i in plan.items}
+    assert located == {("/data/2025", "x"), ("/data/2026", "y")}
+    assert not any(i.blockers for i in plan.items)
 
 
 def test_a_table_a_step_reads_and_rewrites_is_loaded():

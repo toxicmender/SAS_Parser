@@ -563,9 +563,12 @@ def _library_members(
       copy, which takes effect for the statements after it: ``proc datasets;
       change old=new; modify new;`` modifies the ``new`` it just made.
 
-    The LIBNAME in force is the latest one before the read in corpus order, a
-    file's LIBNAMEs taken before its reads, as SAS would have run them. A
-    parameter's template in a ``%MACRO`` body reads nothing until a call names
+    The LIBNAME in force is the latest one before the read in corpus order, as
+    SAS would have run them: ``libname raw '/data/2025'; set raw.x; libname raw
+    '/data/2026'; set raw.y;`` reads ``/data/2025/x`` and ``/data/2026/y``.
+    Records that say where they stand in their file (an ``order``, as the
+    inventory's do) are bound in place; without one, a file's LIBNAMEs are
+    taken before its reads. A parameter's template in a ``%MACRO`` body reads nothing until a call names
     it, and each call's reading is its own reference
     (``chunker.resolve_corpus_datasets``).
     """
@@ -579,11 +582,25 @@ def _library_members(
     found = _Members({}, set(), False)
     seen: set[tuple[str, str]] = set()
     for source_id in dict.fromkeys([*by_source, *datasets]):
-        for ref in by_source.get(source_id, ((), ()))[1]:
-            if _directory_library(ref) and ref.binds:
-                bound[ref.binds] = ref.effective_path
+        libnames = sorted(
+            (
+                ref
+                for ref in by_source.get(source_id, ((), ()))[1]
+                if _directory_library(ref) and ref.binds
+            ),
+            key=lambda ref: (_position(ref) is not None, _position(ref) or 0),
+        )
         made_here: set[str] = set()  # by this file's earlier steps
         for refs in datasets.get(source_id, ()):
+            # Every LIBNAME that stands before this chunk binds its libref now.
+            start = min((p for r in refs if (p := _position(r)) is not None), default=None)
+            while libnames and (
+                start is None
+                or (position := _position(libnames[0])) is None
+                or position < start
+            ):
+                ref = libnames.pop(0)
+                bound[ref.binds] = ref.effective_path
             made_now: set[str] = set()  # renamed or copied by this step so far
             for ref in refs:
                 if str(ref.role) == "write" and ref.via in _IMMEDIATE_WRITES:
@@ -606,7 +623,14 @@ def _library_members(
                     seen.add((library[1], member))
                     found.named.setdefault(library, []).append((member, source_id or None))
             made_here.update(ref.name for ref in refs if str(ref.role) == "write")
+        for ref in libnames:  # after the file's last read: in force for the next
+            bound[ref.binds] = ref.effective_path
     return found
+
+
+def _position(ref: object) -> int | None:
+    """Where *ref* stands in its file, when its record says (``order``)."""
+    return getattr(ref, "order", None)
 
 
 def build_corpus_plan(

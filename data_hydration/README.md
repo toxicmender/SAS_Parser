@@ -115,8 +115,9 @@ macro's `set &ds;` makes.
   when it ends, save a rename or a copy (`proc datasets; change old=new;
   modify new;`), which serves the statements after it.
 - **The LIBNAME in force** is the latest one before the read, in corpus order
-  (a file's LIBNAMEs before its reads). A read before any LIBNAME binds its
-  libref is not planned.
+  and within a file: `libname raw '/data/2025'; set raw.x; libname raw
+  '/data/2026'; set raw.y;` reads `/data/2025/x` and `/data/2026/y`. A read
+  before any LIBNAME binds its libref is not planned.
 - **The library item stays** where no member is named, blocked as before;
   where a list (`raw.sales_:`) is read from it, since which members that covers
   only a listing knows; and while any read names its library through a macro

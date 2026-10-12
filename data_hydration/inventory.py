@@ -436,6 +436,9 @@ class _PathRecord:
     engine: str | None
     has_macro_ref: bool
     resolved_path: str | None
+    #: Where the reference stands in its file (``ref_order``): a LIBNAME binds
+    #: its libref for the reads after it, not the ones before.
+    order: int | None = None
 
     @property
     def effective_path(self) -> str:
@@ -453,6 +456,7 @@ class _PathRecord:
             engine=row.engine,
             has_macro_ref=row.has_macro_ref,
             resolved_path=row.value if row.value != row.raw else None,
+            order=row.ref_order,
         )
 
 
@@ -532,6 +536,7 @@ class _DatasetRecord:
     param: str | None
     param_pos: int | None
     pattern: bool
+    order: int | None = None  # as _PathRecord.order
 
     @classmethod
     def of(cls, row: InventoryRow) -> "_DatasetRecord":
@@ -544,6 +549,7 @@ class _DatasetRecord:
             param=row.macro_param,
             param_pos=row.macro_param_pos,
             pattern=row.pattern,
+            order=row.ref_order,
         )
 
 
