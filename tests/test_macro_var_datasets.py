@@ -131,6 +131,56 @@ class TestLetValues(unittest.TestCase):
         # An oversized split can cut a chunk before the semicolon.
         self.assertEqual(let_values("%let ds = work.orders"), {"ds": "work.orders"})
 
+    def test_symdel_leaves_its_names_unknown_where_it_stands(self):
+        # %SYMDEL "deletes the specified variable or variables from the macro
+        # global symbol table": unknown after it, until a %LET assigns again.
+        self.assertEqual(
+            let_values("%let a = x; %let b = y; %symdel a b / nowarn; %let b = z;"),
+            {"a": "", "b": "z"},
+        )
+        self.assertEqual(let_values("%symdel &list;"), {})
+
+
+class TestSymdel(unittest.TestCase):
+    """A deleted variable stops resolving: before, `&lib` still answered prod
+    after `%symdel lib;`, and the step was recorded as reading prod.t."""
+
+    def _reads(self, source: str) -> list[str]:
+        from chunker import resolve_corpus_datasets
+
+        result = _chunk(source)
+        corpus = resolve_corpus_datasets(SasCorpus(file_results=[result]))
+        return [
+            r.name
+            for c in corpus.file_results[0].chunks
+            for r in c.metadata.dataset_refs
+            if r.role.value == "read"
+        ]
+
+    def test_a_symdel_statement(self):
+        self.assertEqual(
+            self._reads("%let lib = prod;\n%symdel lib;\ndata x; set &lib..t; run;\n"),
+            ["&lib..t"],
+        )
+
+    def test_a_let_after_the_symdel_assigns_again(self):
+        src = "%let lib = prod;\n%symdel lib;\n%let lib = dev;\ndata x; set &lib..t; run;\n"
+        self.assertEqual(self._reads(src), ["dev.t"])
+
+    def test_call_symdel_deletes_when_the_step_has_run(self):
+        src = (
+            "%let lib = prod;\ndata _null_; call symdel('lib'); run;\n"
+            "data x; set &lib..t; run;\n"
+        )
+        self.assertEqual(self._reads(src), ["&lib..t"])
+
+    def test_a_macro_that_deletes_a_global(self):
+        src = (
+            "%let lib = prod;\n%macro drop; %symdel lib; %mend;\n%drop;\n"
+            "data x; set &lib..t; run;\n"
+        )
+        self.assertEqual(self._reads(src), ["&lib..t"])
+
 
 class TestStripQuotes(unittest.TestCase):
     def test_matching_quotes_removed(self):

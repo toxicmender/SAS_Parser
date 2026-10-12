@@ -76,6 +76,11 @@ _REF_RE = re.compile(r"(&+)([A-Za-z_]\w*)(\.?)")
 # computed, so there is no key to store the value under. Deliberately does not
 # require the ``;`` — a %LET truncated by an oversized split still assigns.
 _LET_ASSIGN_RE = re.compile(r"%\s*let\s+([A-Za-z_]\w*)\s*=\s*([^;]*)", re.IGNORECASE)
+# %SYMDEL name ... </ NOWARN>; — deletes the named variables from the global
+# symbol table. Names a text expression generates (`%symdel &list;`) are not
+# knowable here and are left alone.
+_SYMDEL_RE = re.compile(r"%\s*symdel\b([^;/]*)", re.IGNORECASE)
+_SYMDEL_NAME_RE = re.compile(r"[A-Za-z_]\w*\Z")
 
 # A %LET value worth keeping: one that could be a dataset or library name, or
 # *part* of one. Any string at all can be a %LET value — an expression, a WHERE
@@ -161,10 +166,24 @@ def let_assignments(text: str) -> list[tuple[str, str]]:
     Name lowercased, value stripped of surrounding whitespace and nothing
     else — the raw material :func:`let_values` and a called macro's
     global-assignment analysis (``chunker.metadata._MacroDef``) both read.
+
+    A name ``%SYMDEL`` deletes is assigned ``""`` where the statement stands:
+    after ``%let lib = prod; %symdel lib;`` nothing is known of ``&lib``,
+    which an empty value says everywhere in this package.
     """
-    return [
-        (m.group(1).lower(), m.group(2).strip()) for m in _LET_ASSIGN_RE.finditer(text)
+    found = [
+        (m.start(), m.group(1).lower(), m.group(2).strip())
+        for m in _LET_ASSIGN_RE.finditer(text)
     ]
+    if "symdel" in text.lower():
+        found += [
+            (m.start(), name.lower(), "")
+            for m in _SYMDEL_RE.finditer(text)
+            for name in m.group(1).split()
+            if _SYMDEL_NAME_RE.match(name)
+        ]
+        found.sort(key=lambda event: event[0])
+    return [(name, value) for _, name, value in found]
 
 
 def let_values(text: str) -> dict[str, str]:

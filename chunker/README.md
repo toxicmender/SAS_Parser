@@ -476,6 +476,9 @@ Values come from more than `%LET` in open code, and `_MacroScope` (in
   name, filled at run time (`INTO :sch`, `call symputx('sch', column)`), or
   given two different literal values by one step stops resolving: a stale
   `%let sch = old;` must not keep answering for it.
+- **A deleted variable is unknown.** `%SYMDEL` (in open code, or in a called
+  macro's body) and `CALL SYMDEL('name')` (once its step has run) delete a
+  global, so `&lib` stops resolving until a `%LET` assigns it again.
 
 Two scope rules keep this from over-reaching. A macro's own parameters shadow
 the table, so `&ds` inside `%macro m(ds);` stays a `body_param_*` entry the

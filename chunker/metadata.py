@@ -243,6 +243,12 @@ _CALL_SYMPUT_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# CALL SYMDEL('name') — deletes a global at run time. Only a quoted name is
+# knowable here.
+_CALL_SYMDEL_RE = re.compile(
+    r"""\bcall\s+symdel\s*\(\s*(['"])([A-Za-z_]\w*)\1""", re.IGNORECASE
+)
+
 # Matches CALL EXECUTE(...) and captures its single argument.
 _CALL_EXECUTE_RE = re.compile(
     r"\bcall\s+execute\s*\(([^;]*?)\)\s*;",
@@ -632,8 +638,9 @@ def _metadata_for(region: _Region) -> SasChunkMetadata:
 
     # ── macro-variable values, for the %LET-driven name resolution pass ─────
     # Scanned on `cf` so a quoted value survives to be unquoted; the pass that
-    # consumes this is resolve_macro_var_refs, below.
-    macro_var_values = let_values(cf) if "let" in lowcf else {}
+    # consumes this is resolve_macro_var_refs, below. A %SYMDEL leaves its
+    # names unknown (""), so it is read here too.
+    macro_var_values = let_values(cf) if "let" in lowcf or "symdel" in lowcf else {}
 
     # ── recognised SAS functions and CALL routines ──────────────────────────
     # Scanned on `mt` (string literals blanked), with %MACRO headers and
@@ -1140,16 +1147,29 @@ def _run_time_values(
     must stop answering for ``&sch`` once ``select s into :sch`` has replaced it.
     Applied after the chunk, never to it — SAS resolves a step's own ``&refs``
     when the step is compiled, before any of its CALLs run.
+
+    A ``CALL SYMDEL`` deletes its variable when the step runs, so the name is
+    unknown after it as well.
     """
     names = chunk.metadata.produces_macrovars
-    if not names:
+    deleted = (
+        [
+            m.group(2).lower()
+            for m in _CALL_SYMDEL_RE.finditer(_sanitise(chunk.text, blank_strings=False))
+        ]
+        if "symdel" in chunk.text.lower()
+        else []
+    )
+    if not names and not deleted:
         return {}
     static = (
         _symput_values(_sanitise(chunk.text, blank_strings=False), convert)
         if "symput" in chunk.text.lower()
         else {}
     )
-    return {name: static.get(name, "") for name in names}
+    values = {name: static.get(name, "") for name in names}
+    values.update(dict.fromkeys(deleted, ""))
+    return values
 
 
 @dataclass(frozen=True)
