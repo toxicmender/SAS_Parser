@@ -352,6 +352,18 @@ def test_the_libname_in_force_is_the_latest_before_the_read():
     assert ("/two", "mid") not in located
 
 
+def test_a_transport_file_is_planned_blocked_once():
+    # PROC CIMPORT reads a CPORT transport file, which no reader here opens:
+    # planned, blocked, once — by path, or through the FILENAME it names.
+    for job in (
+        "proc cimport data=work.x infile='/t/x.cpt'; run;\n",
+        "filename tf '/t/x.cpt';\nproc cimport ds=x infile=tf; run;\n",
+    ):
+        [item] = _plan(job=job).items
+        assert (item.source.locator, item.source.object_name) == ("/t", "x.cpt")
+        assert "transport file" in item.blockers[0]
+
+
 def test_a_table_appended_to_through_out_is_loaded():
     # OUT= is BASE='s alias in PROC APPEND: the table must already exist, so
     # it is loaded, as with BASE=. Read as a plain write, it dropped out and

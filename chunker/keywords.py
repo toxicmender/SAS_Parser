@@ -505,10 +505,12 @@ RUN_GROUP_PROCS: frozenset[str] = frozenset(
 )
 
 # What a PROC's options name, for chunker.statements. Either a dataset the step
-# reads, writes or updates in place ("read", "write", "update"), or a value
-# that only looks like one:
+# reads, writes or updates in place ("read", "write", "update"), every member
+# of a library it writes ("library": PROC CIMPORT's LIBRARY=), or a value that
+# only looks like a dataset:
 #   - a "libref" (PROC COPY's IN= and OUT=);
 #   - a "fileref" (PROC HTTP's OUT=);
+#   - a "catalog" (PROC CIMPORT's CATALOG=);
 #   - a "package" — the lib.member.package PROC FCMP's OUTLIB= names, which
 #     writes lib.member.
 # PROC_OPTION_DEFAULTS holds in every PROC. PROC_OPTION_ROLES adds a PROC's own
@@ -576,6 +578,21 @@ PROC_OPTION_ROLES: dict[str, dict[str, str]] = {
     },
     "json": {"out": "fileref"},
     "fcmp": {"outlib": "package"},
+    # PROC CIMPORT's destination is what it *creates* from the transport file
+    # INFILE= names: DATA= (DS=, D=) one data set, LIBRARY= (LIB=, L=) the
+    # members of a library, CATALOG= (CAT=, C=) a catalog, which holds none.
+    "cimport": {
+        "data": "write",
+        "ds": "write",
+        "d": "write",
+        "library": "library",
+        "lib": "library",
+        "l": "library",
+        "catalog": "catalog",
+        "cat": "catalog",
+        "c": "catalog",
+        "infile": "fileref",
+    },
 }
 
 # A function call is ``name(`` where the name is not glued to a preceding ``%``,

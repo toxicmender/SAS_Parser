@@ -125,6 +125,17 @@ class TestStatementForms:
         assert ref.statement == "proc_import"
         assert ref.path == "/in/a.xlsx"
 
+    def test_proc_cimport_infile(self):
+        # The transport file PROC CIMPORT imports, by path or by fileref.
+        ref = _one("proc cimport library=x infile='/t/all.cpt'; run;")
+        assert (ref.statement, ref.path) == ("proc_cimport", "/t/all.cpt")
+        ref = _one("proc cimport data=y infile=tf; run;")
+        assert (ref.statement, ref.location, ref.binds) == (
+            "proc_cimport",
+            PathLocation.FILEREF,
+            "tf",
+        )
+
     def test_proc_export_outfile(self):
         ref = _one("proc export data=work.a outfile='/out/a.csv'; run;")
         assert ref.statement == "proc_export"

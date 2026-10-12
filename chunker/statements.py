@@ -541,12 +541,17 @@ def _option_refs(
     for m in _NAMED_OPTION_RE.finditer(_blank_groups(st.mt[start:stop])):
         option = m.group(1).lower()
         role = roles.get(option)
-        dataset_role = WRITE if role == "package" else _ROLES.get(role or "")
+        dataset_role = WRITE if role in ("package", "library") else _ROLES.get(role or "")
         if dataset_role is None:
             continue  # no option of this PROC's, or a libref or fileref
         at = _ws_end(st.mt, start + m.end())
         token = _TOKEN_RE.match(st.mt, at)
         written = st.cf[token.start() : token.end()].lower() if token else ""
+        if role == "library":
+            # Every member the step creates in that library: the pattern lib.:.
+            if written and "." not in written:
+                yield _Operand(written, _member(written, ":"), pattern=True), WRITE, f"{option}="
+            continue
         if written == "_all_" or written.endswith("._all_"):
             lib = written[:-6] or library
             yield _Operand(written, _member(lib, ":"), pattern=True), dataset_role, f"{option}="

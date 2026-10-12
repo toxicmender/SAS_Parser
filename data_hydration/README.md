@@ -254,7 +254,7 @@ storage `Sales.CSV` and `sales.csv` are two different files, and the reader
 takes the format from the suffix. The target table is named from the stem
 (`Sales.CSV` → `sales`).
 
-Three things that look alike and are not:
+Four things that look alike and are not:
 
 - **`.sas7bdat` — data.** Read with `pyreadstat`, no SAS installation.
   `metadataonly=True` gives the schema and row count for free, and
@@ -265,6 +265,10 @@ Three things that look alike and are not:
   question, so the columns become a candidate `CLUSTER BY`, applied only when
   `apply_index_clustering` is on. Column recovery is best-effort and usually
   returns nothing; the file's presence is the reliable part.
+- **A CPORT transport file (PROC CIMPORT's `infile=`) — data no reader here
+  opens.** It is planned, blocked, once (through its FILENAME when a fileref
+  names it): import it with PROC CIMPORT in SAS and load the data sets it
+  creates.
 - **SPD Engine (`libname x spde '/path'`) — a partitioned directory.** Planning
   is static: the `.dpf` components are counted from a directory listing, with no
   SAS needed. **Reading requires `saspy`** — there is no open-source `.dpf`

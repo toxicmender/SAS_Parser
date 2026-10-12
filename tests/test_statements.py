@@ -391,6 +391,27 @@ def test_a_documented_option_alias_names_what_its_option_does(src, refs):
     assert _refs(src) == refs
 
 
+@pytest.mark.parametrize(
+    ("src", "refs"),
+    [
+        # PROC CIMPORT's destination is what it creates from the transport
+        # file. Before, DATA= read as a read and the aliases named nothing.
+        ("proc cimport data=work.x infile='/t/x.cpt'; run;", [("work.x", W, "data=")]),
+        ("proc cimport ds=y infile=tf; run;", [("work.y", W, "ds=")]),
+        ("proc cimport d=lib.z infile=tf; run;", [("lib.z", W, "d=")]),
+        # LIBRARY= (LIB=, L=): every member of the transport file.
+        ("proc cimport library=mylib infile=tf; run;", [("mylib.:", W, "library=")]),
+        ("proc cimport lib=x infile=tf; run;", [("x.:", W, "lib=")]),
+        ("proc cimport l=x infile=tf; run;", [("x.:", W, "l=")]),
+        # CATALOG= (CAT=, C=) holds no data set.
+        ("proc cimport catalog=lib.cat infile=tf; run;", []),
+        ("proc cimport c=lib.cat infile=tf; run;", []),
+    ],
+)
+def test_proc_cimport_creates_its_destination(src, refs):
+    assert _refs(src) == refs
+
+
 def test_proc_options_come_from_the_statements_that_carry_them():
     src = (
         "proc freq data=a;\n  tables g / out=f;\n  label out = 'Output';\n"

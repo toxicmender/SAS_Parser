@@ -346,8 +346,11 @@ they can never collide with identifiers.
 `external_refs` is one stored list of `SasPathRef` records — every location a
 chunk's statements name, whatever kind of place it is. `paths.py` recognises
 `LIBNAME`, `FILENAME`, `INFILE` / `FILE`, `%INCLUDE`, PROC IMPORT/EXPORT's
-`datafile=` / `outfile=`, PROC PRINTTO's `log=` / `print=`, ODS `file=` /
-`path=`, and `options sasautos=`.
+`datafile=` / `outfile=`, PROC CIMPORT's `infile=` (the transport file, by
+path or fileref), PROC PRINTTO's `log=` / `print=`, ODS `file=` / `path=`, and
+`options sasautos=`. What PROC CIMPORT creates is a dataset write: `data=`
+(`ds=`, `d=`) one data set, `library=` (`lib=`, `l=`) the pattern `lib.:`;
+`catalog=` names none.
 
 A `FILENAME` device keyword redirects the same syntax somewhere that is not the
 filesystem, so each record carries a `PathLocation` — `FILESYSTEM`, `REMOTE`

@@ -385,6 +385,23 @@ PATH_STATEMENTS: tuple[PathSpec, ...] = (
         keyword="outfile",
         pattern=re.compile(r"(?P<head>\boutfile\s*=\s*)" + _VALUE, re.IGNORECASE),
     ),
+    # PROC CIMPORT infile='<path>' / infile=<fileref>: the transport file it
+    # imports. Anchored on the PROC, since INFILE= alone is common.
+    PathSpec(
+        statement="proc_cimport",
+        keyword="cimport",
+        pattern=re.compile(
+            r"(?P<head>\bcimport\b[^;]*?\binfile\s*=\s*)" + _VALUE, re.IGNORECASE
+        ),
+    ),
+    PathSpec(
+        statement="proc_cimport",
+        keyword="cimport",
+        pattern=re.compile(
+            rf"\bcimport\b[^;]*?\binfile\s*=\s*(?P<binds>{_FREF})\b", re.IGNORECASE
+        ),
+        fileref=True,
+    ),
     # PROC PRINTTO log='<path>' / print='<path>': where a job sends its log and
     # its output. Anchored on the PROC, since LOG= and PRINT= alone are too
     # common as words; one spec per option, so a statement naming both yields

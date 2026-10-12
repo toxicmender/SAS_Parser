@@ -240,8 +240,8 @@ def _path_source(ref: "SasPathRef", source_id: str | None) -> HydrationSource | 
         return None
     # ``infile in;`` reads through a fileref, at the path its FILENAME names
     # (chunker.metadata.resolve_filerefs): that FILENAME's own reference is
-    # the source, planned once.
-    if ref.statement == "infile" and ref.binds is not None:
+    # the source, planned once. So does PROC CIMPORT's ``infile=tf``.
+    if ref.statement in ("infile", "proc_cimport") and ref.binds is not None:
         return None
     # A .sas7bndx is an INDEX, not data. Left in, it would be planned as an
     # ordinary file and — because it shares its stem with the dataset it indexes
@@ -396,6 +396,7 @@ def _sources_for(
     db_tables: Sequence["SasDbTableRef"] = (),
     named: frozenset[tuple[str, tuple[tuple[str, str], ...]]] = frozenset(),
     code_filerefs: frozenset[str] = frozenset(),
+    transport_filerefs: frozenset[str] = frozenset(),
 ) -> list[tuple[HydrationSource, tuple[str, ...]]]:
     """Every hydratable source one file's refs name, in reading order, each with
     the blockers only its kind can have.
@@ -405,6 +406,8 @@ def _sources_for(
     schema-level item, which stands in when no table is known, is left out.
     *code_filerefs* are the filerefs only ``%INCLUDE`` reads
     (:func:`_code_filerefs`): their FILENAMEs name SAS source, not data.
+    *transport_filerefs* are the ones only PROC CIMPORT reads: their FILENAMEs
+    name a transport file, planned blocked as one named by INFILE= is.
     """
     sources: list[tuple[HydrationSource, tuple[str, ...]]] = [
         (_oracle_source(ref, source_id), _engine_blocker(ref.engine))
@@ -416,7 +419,10 @@ def _sources_for(
             continue
         source = _path_source(path_ref, source_id)
         if source is not None:
-            sources.append((source, ()))
+            transport = path_ref.statement == "proc_cimport" or (
+                path_ref.statement == "filename" and path_ref.binds in transport_filerefs
+            )
+            sources.append((source, _TRANSPORT_BLOCKER if transport else ()))
     for table in db_tables:
         planned = _db_table_source(table, source_id)
         if planned is not None:
@@ -493,14 +499,29 @@ def _code_filerefs(
     a quoted path is not. A fileref an INFILE or FILE statement also uses
     holds data, and stays.
     """
-    included: set[str] = set()
+    return _filerefs_only(by_source, "include")
+
+
+def _filerefs_only(
+    by_source: Mapping[str, tuple[Sequence["SasEngineRef"], Sequence["SasPathRef"]]],
+    statement: str,
+) -> frozenset[str]:
+    """The filerefs the corpus uses through *statement* and nothing else."""
+    only: set[str] = set()
     other: set[str] = set()
     for _, path_refs in by_source.values():
         for ref in path_refs:
             if not ref.binds or ref.statement == "filename":
                 continue
-            (included if ref.statement == "include" else other).add(ref.binds)
-    return frozenset(included - other)
+            (only if ref.statement == statement else other).add(ref.binds)
+    return frozenset(only - other)
+
+
+#: A transport file is CPORT's format: no reader here opens one.
+_TRANSPORT_BLOCKER = (
+    "a transport file PROC CIMPORT imports: no reader here opens one — import "
+    "it with PROC CIMPORT in SAS, then load the data sets it creates",
+)
 
 
 #: LIBNAME engines whose directory holds each dataset as ``<member>.sas7bdat``:
@@ -683,6 +704,7 @@ def build_corpus_plan(
     members = _library_members(by_source, datasets or {})
     expanded: set[_Library] = set()
     code_filerefs = _code_filerefs(by_source)
+    transport_filerefs = _filerefs_only(by_source, "proc_cimport")
 
     sources: list[tuple[HydrationSource, tuple[str, ...]]] = []
     planned_tables: set[HydrationSource] = set()
@@ -696,6 +718,7 @@ def build_corpus_plan(
             db_tables=db_tables.get(source_id, ()),
             named=named,
             code_filerefs=code_filerefs,
+            transport_filerefs=transport_filerefs,
         ):
             library = (source.libref, source.locator)
             if source.kind is SourceKind.FILE and not source.object_name and library in members.named:
