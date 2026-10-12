@@ -282,8 +282,12 @@ THEN`, `ELSE`, `WHEN (…)` or `OTHERWISE`; a subsetting `IF` has none. Then:
   (APPEND's `base=` is UPDATE, COMPARE's `compare=` and FORMAT's `cntlin=`
   read, SORT's `dupout=` writes) or says an option is no dataset (COPY's
   `in=`/`out=` are librefs, HTTP's `out=` a fileref; FCMP's
-  `outlib=lib.member.package` writes `lib.member`). `lib._all_` is the pattern
-  `lib.:`. Options are read anywhere in the PROC statement and in `output`,
+  `outlib=lib.member.package` writes `lib.member`). Every alias SAS documents
+  sits beside its option: APPEND's `out=` is `base=` (UPDATE, not a new
+  table), COMPARE's `c=`/`comp=` are `compare=`, SORT's `uniout=` is
+  `uniqueout=`, COPY's `inlib=`/`indd=` and `outlib=`/`outdd=` are `in=` and
+  `out=` (in PROC DATASETS's COPY too), and DATASETS's `dd=`/`ddname=`/`lib=`
+  are `library=`. `lib._all_` is the pattern `lib.:`. Options are read anywhere in the PROC statement and in `output`,
   `score`, `baseline` and `forecast`; in any other statement only after its
   `/`, and never in an assignment (`out = x + 1;` in PHREG, NLMIXED, FCMP,
   IML) — so `label out = 'x';` names nothing, nor does an option inside a

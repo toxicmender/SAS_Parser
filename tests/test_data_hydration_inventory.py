@@ -352,6 +352,16 @@ def test_the_libname_in_force_is_the_latest_before_the_read():
     assert ("/two", "mid") not in located
 
 
+def test_a_table_appended_to_through_out_is_loaded():
+    # OUT= is BASE='s alias in PROC APPEND: the table must already exist, so
+    # it is loaded, as with BASE=. Read as a plain write, it dropped out and
+    # the whole library was blocked instead.
+    for option in ("base", "out"):
+        plan = _plan(job=f"libname prod '/data/prod';\nproc append {option}=prod.master data=new; run;\n")
+        located = [(i.source.locator, i.source.object_name, i.blockers) for i in plan.items]
+        assert located == [("/data/prod", "master", ())], option
+
+
 def test_a_libname_rebound_in_one_file_binds_only_the_reads_after_it():
     plan = _plan(
         job=(

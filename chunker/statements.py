@@ -593,12 +593,18 @@ def _ods_output_refs(st: Statement) -> Iterator[_Ref]:
 # ---------------------------------------------------------------------------
 
 # The libraries PROC COPY copies between, and UPLOAD and DOWNLOAD when they
-# copy a library rather than one dataset.
-_COPY_LIBRARIES = {
-    "copy": ("in", "out"),
-    "upload": ("inlib", "outlib"),
-    "download": ("inlib", "outlib"),
+# copy a library rather than one dataset: each option with its aliases (IN=
+# "Alias INLIB= and INDD=", OUT= "Alias OUTLIB= and OUTDD="). PROC DATASETS's
+# COPY statement takes the same.
+_COPY_IN = ("in", "inlib", "indd")
+_COPY_OUT = ("out", "outlib", "outdd")
+_COPY_LIBRARIES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "copy": (_COPY_IN, _COPY_OUT),
+    "upload": (("inlib",), ("outlib",)),
+    "download": (("inlib",), ("outlib",)),
 }
+# PROC DATASETS's library: LIBRARY= "Aliases DDNAME= DD= LIB=".
+_DATASETS_LIBRARY = ("library", "lib", "ddname", "dd")
 # A bare word option, never an option's value: `kill` in `proc datasets lib=x
 # kill;`, not in `lib=kill`.
 _KILL_RE = re.compile(r"(?:^|[^=\s])\s+kill\b", re.IGNORECASE)
@@ -700,13 +706,13 @@ class _ProcStep:
         yield from refs
         flags = _blank_groups(st.mt)
         if self.proc == "datasets":
-            self.library = _option_value(st, ("library", "lib")) or "work"
+            self.library = _option_value(st, _DATASETS_LIBRARY) or "work"
             if _KILL_RE.search(flags):
                 yield _Operand("kill", _member(self.library, ":"), True), DROP, "kill"
         elif self.proc in _COPY_LIBRARIES:
-            source_option, target_option = _COPY_LIBRARIES[self.proc]
-            source = _option_value(st, (source_option,))
-            target = _option_value(st, (target_option,))
+            source_options, target_options = _COPY_LIBRARIES[self.proc]
+            source = _option_value(st, source_options)
+            target = _option_value(st, target_options)
             if source and target:
                 self.copy = _CopyGroup(source, target, bool(_MOVE_RE.search(flags)))
 
@@ -718,8 +724,8 @@ class _ProcStep:
             yield from _option_refs(st, {"data": "read"}, after, library=lib)
             yield from _option_refs(st, {"out": "write", "out2": "write"}, after)
         elif kw == "copy":
-            source = _option_value(st, ("in",)) or lib
-            target = _option_value(st, ("out",))
+            source = _option_value(st, _COPY_IN) or lib
+            target = _option_value(st, _COPY_OUT)
             if target:
                 self.copy = _CopyGroup(source, target, bool(_MOVE_RE.search(st.mt)))
         elif kw == "delete":

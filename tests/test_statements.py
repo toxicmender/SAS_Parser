@@ -360,6 +360,37 @@ def test_a_proc_option_names_what_its_proc_says(src, refs):
     assert _refs(src) == refs
 
 
+@pytest.mark.parametrize(
+    ("src", "refs"),
+    [
+        # BASE= "Alias OUT=": the table appended to, not a new one.
+        ("proc append out=lib.m data=new; run;", [("lib.m", U, "out="), ("work.new", R, "data=")]),
+        ("proc append base=lib.m new=new; run;", [("lib.m", U, "base="), ("work.new", R, "new=")]),
+        # COMPARE= "Alias COMP=, C=".
+        ("proc compare base=a c=b; run;", [("work.a", R, "base="), ("work.b", R, "c=")]),
+        ("proc compare data=a comp=b out=d; run;",
+         [("work.a", R, "data="), ("work.b", R, "comp="), ("work.d", W, "out=")]),
+        # UNIQUEOUT= "Alias UNIOUT=".
+        ("proc sort data=a out=b nouniquekey uniout=u; by k; run;",
+         [("work.a", R, "data="), ("work.b", W, "out="), ("work.u", W, "uniout=")]),
+        # IN= "Alias INLIB= and INDD=", OUT= "Alias OUTLIB= and OUTDD=".
+        ("proc copy inlib=src outlib=tgt; select a; run;",
+         [("src.a", R, "copy"), ("tgt.a", W, "copy")]),
+        ("proc copy indd=src outdd=tgt; select a; run;",
+         [("src.a", R, "copy"), ("tgt.a", W, "copy")]),
+        ("proc datasets lib=x; copy inlib=src outlib=tgt; select a; run; quit;",
+         [("src.a", R, "copy"), ("tgt.a", W, "copy")]),
+        # LIBRARY= "Aliases DDNAME= DD= LIB=": before, DD= left the library
+        # WORK and `delete a` deleted work.a.
+        ("proc datasets dd=mylib nolist; delete a; quit;", [("mylib.a", D, "delete")]),
+        ("proc datasets ddname=mylib nolist; delete a; quit;", [("mylib.a", D, "delete")]),
+        ("proc datasets library=mylib nolist; delete a; quit;", [("mylib.a", D, "delete")]),
+    ],
+)
+def test_a_documented_option_alias_names_what_its_option_does(src, refs):
+    assert _refs(src) == refs
+
+
 def test_proc_options_come_from_the_statements_that_carry_them():
     src = (
         "proc freq data=a;\n  tables g / out=f;\n  label out = 'Output';\n"

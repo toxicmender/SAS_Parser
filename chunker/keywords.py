@@ -533,11 +533,21 @@ PROC_OPTION_DEFAULTS: dict[str, str] = {
     "classdata": "read",
 }
 
+# A documented alias is listed beside its option: SAS's procedure guide names
+# them (BASE= "Alias OUT=", COMPARE= "Alias COMP=, C=", UNIQUEOUT= "Alias
+# UNIOUT="), and an alias left out reads as the default role or as nothing.
 PROC_OPTION_ROLES: dict[str, dict[str, str]] = {
-    # BASE= has DATA='s rows added to it: read and rewritten in place.
-    "append": {"base": "update", "new": "read"},
-    "compare": {"base": "read", "compare": "read", "outstats": "write"},
-    "sort": {"dupout": "write", "uniqueout": "write"},
+    # BASE= has DATA='s rows added to it: read and rewritten in place. OUT= is
+    # BASE='s alias here, not a new dataset.
+    "append": {"base": "update", "out": "update", "new": "read"},
+    "compare": {
+        "base": "read",
+        "compare": "read",
+        "comp": "read",
+        "c": "read",
+        "outstats": "write",
+    },
+    "sort": {"dupout": "write", "uniqueout": "write", "uniout": "write"},
     "format": {"cntlin": "read", "cntlout": "write"},
     "contents": {"out2": "write"},
     "corr": {"outp": "write", "outs": "write", "outk": "write", "outh": "write"},
@@ -546,7 +556,16 @@ PROC_OPTION_ROLES: dict[str, dict[str, str]] = {
     "fastclus": {"seed": "read", "mean": "write", "instat": "read"},
     "score": {"score": "read"},
     "phreg": {"covariates": "read"},
-    "copy": {"in": "libref", "out": "libref"},
+    "copy": {
+        "in": "libref",
+        "inlib": "libref",
+        "indd": "libref",
+        "out": "libref",
+        "outlib": "libref",
+        "outdd": "libref",
+    },
+    # LIBRARY= and its aliases name the library its member statements act in.
+    "datasets": {"library": "libref", "lib": "libref", "ddname": "libref", "dd": "libref"},
     "upload": {"inlib": "libref", "outlib": "libref"},
     "download": {"inlib": "libref", "outlib": "libref"},
     "http": {
