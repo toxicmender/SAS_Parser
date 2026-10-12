@@ -416,12 +416,25 @@ def _hash_refs(st: Statement) -> Iterator[_Ref]:
             yield op, role, "hash"
 
 
+# A DATA statement that names no data set: `data;` or `data / debug;`. SAS
+# names what it creates DATA1, DATA2, … (the DATAn convention), as for
+# `data _data_;`. Not `data _null_;`, nor `data view=v;` / `data pgm=p;`,
+# which describe a view or run a stored program.
+_UNNAMED_DATA_RE = re.compile(r"\s*(?:/|;|\Z)")
+
+
 def _data_step_refs(st: Statement) -> Iterator[_Ref]:
     after = len(st.keyword)
     if st.keyword in ("data", "set", "merge", "update", "output"):
         role = WRITE if st.keyword in ("data", "output") else READ
+        found = False
         for op in _operands(st.mt, st.cf, after):
+            found = True
             yield op, role, st.keyword
+        if not found and st.keyword == "data" and _UNNAMED_DATA_RE.match(st.mt, after):
+            # The batcher's implicit pass names it work.data<n>, which _LAST_
+            # then is.
+            yield _Operand("_data_", "_data_"), WRITE, "data"
     elif st.keyword == "modify":
         # MODIFY rewrites its master in place; the transaction is read.
         for i, op in enumerate(_operands(st.mt, st.cf, after)):

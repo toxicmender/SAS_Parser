@@ -196,6 +196,33 @@ class TestImplicitLastResolution(unittest.TestCase):
         self.assertEqual(len(br.batches), 1)
         self.assertIn("work.data1", br.batches[0].output_datasets)
 
+    def test_an_unnamed_data_step_creates_datan_and_becomes_last(self):
+        # `data;` "automatically creates data sets with the names DATA1,
+        # DATA2, and so on": PROC PRINT with no DATA= then reads it, not the
+        # named step before. Before, the unnamed step wrote nothing, and the
+        # PRINT was linked to work.a.
+        src = (
+            "data work.a; x=1; run;\n"
+            "data; set work.a; y=2; run;\n"
+            "proc print; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertIn("work.data1", br.batches[0].output_datasets)
+        self.assertIn("dataset_flow(work.data1)", br.batches[0].reason)
+
+    def test_only_a_data_statement_naming_no_data_set_creates_datan(self):
+        chunker = SasSemanticChunker(min_words=1, max_words=9_999)
+        for src in ("data / debug; x=1; run;\n", "data; x=1; run;\n"):
+            [chunk] = chunker.chunk_text(src).chunks
+            self.assertEqual(
+                [(r.name, r.role.value) for r in chunk.metadata.dataset_refs],
+                [("_data_", "write")],
+            )
+        for src in ("data _null_; x=1; run;\n", "data view=v; describe; run;\n"):
+            [chunk] = chunker.chunk_text(src).chunks
+            self.assertEqual(list(chunk.metadata.dataset_refs), [], src)
+
     def test_datan_counter_increments(self):
         src = (
             "data _data_; x=1; run;\n"

@@ -633,6 +633,9 @@ take part on both sides:
   nearer than any step that wrote `tgt.cust` by name.
 - `_LAST_` skips a pattern output, since a COPY of a whole library creates no
   one data set.
+- A DATA statement that names no data set (`data;`, `data / debug;`) writes
+  `_DATA_`, as `data _data_;` does: SAS names it DATA1, DATA2, …, the batcher
+  makes it `work.data<n>`, and it becomes `_LAST_`.
 
 The same nearest-producer lookup serves `dataset_flow`, `macro_arg_dataset` and
 the resolved inputs of `macro_body_dataset`.
