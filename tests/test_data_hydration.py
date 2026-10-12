@@ -170,9 +170,41 @@ class TestPathSources:
         chunks = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(src).chunks
         refs = [r for c in chunks for r in c.metadata.external_refs]
         [item] = build_plan((), refs, config=_config()).items
-        assert (item.source.locator, item.source.object_name) == ("/SASData/in", "cust")
+        assert (item.source.locator, item.source.object_name) == ("/SASData/in", "cust.csv")
         assert not item.source.has_macro_ref
         assert item.blockers == ()
+
+    def test_a_file_is_named_as_sas_reads_it_and_targets_its_stem(self):
+        # On AIX and Linux `Sales.CSV` and `sales` are different files, and the
+        # reader takes the format from the suffix: the object keeps both, while
+        # the table is still named from the stem.
+        [item] = _plan("data a; infile '/Data/In/Sales.CSV' dsd; input x; run;").items
+        assert (item.source.locator, item.source.object_name) == ("/Data/In", "Sales.CSV")
+        assert item.target_table == "main.staging.sales"
+        [dataset] = _plan("infile '/Data/Marts/Sales.sas7bdat';", schema="s").items
+        assert dataset.source.object_name == "Sales"
+        assert dataset.target_table == "main.s.sales"
+
+    def test_a_planned_file_opens_at_the_path_sas_reads(self, tmp_path):
+        # Run end to end: before, the reader opened `<dir>/sales` — no suffix,
+        # lowercased — and every planned flat file raised FileNotFoundError.
+        pytest.importorskip("pandas")
+        from chunker import SasSemanticChunker
+        from data_hydration.sources.base import reader_for
+
+        (tmp_path / "In").mkdir()
+        (tmp_path / "In" / "Sales.CSV").write_text("x\n1\n2\n", encoding="utf-8")
+        src =f"filename s '{tmp_path}/In/Sales.CSV';\ndata a; infile s dsd firstobs=2; input x; run;\n"
+        chunks = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(src).chunks
+        refs = [r for c in chunks for r in c.metadata.external_refs]
+        [item] = build_plan((), refs, config=_config()).items
+        frames = list(reader_for(item, _config()).batches())
+        assert sum(len(frame) for frame in frames) == 2
+
+    def test_a_remote_file_keeps_its_suffix(self):
+        [item] = _plan("filename raw ftp '/incoming/Cust.parquet' host='h';").items
+        assert (item.source.locator, item.source.object_name) == ("/incoming", "Cust.parquet")
+        assert item.target_table == "main.staging.cust"
 
     def test_an_ftp_filename_becomes_an_sftp_source(self):
         plan = _plan("filename raw ftp '/incoming/cust.csv' host='h';")
@@ -778,7 +810,7 @@ class TestDatabaseTables:
             i.source.object_name: pathlib.Path(i.source.source_id or "").name
             for i in plan.items
         }
-        assert owners == {"edw_export.current_nonip": "a_reads.sas", "in": "b_both.sas"}
+        assert owners == {"edw_export.current_nonip": "a_reads.sas", "in.csv": "b_both.sas"}
 
 
 class TestMacroResolvedTables:

@@ -247,6 +247,12 @@ too holds data, and stays.
 
 ## What the SAS formats actually are
 
+A flat file (CSV, TSV, Parquet, Excel) is opened by the name SAS reads:
+`object_name` keeps the file name's case and suffix. On AIX, Linux and object
+storage `Sales.CSV` and `sales.csv` are two different files, and the reader
+takes the format from the suffix. The target table is named from the stem
+(`Sales.CSV` → `sales`).
+
 Three things that look alike and are not:
 
 - **`.sas7bdat` — data.** Read with `pyreadstat`, no SAS installation.

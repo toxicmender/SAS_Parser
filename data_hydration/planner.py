@@ -55,6 +55,12 @@ _REMOTE_KINDS: dict[str, SourceKind] = {
     "azure": SourceKind.BLOB,
 }
 
+#: Sources whose :attr:`~data_hydration.models.HydrationSource.object_name` is
+#: a file name, suffix included — what their readers open.
+_FILE_KINDS = frozenset(
+    {SourceKind.FILE, SourceKind.SFTP, SourceKind.BLOB, SourceKind.ADLS}
+)
+
 #: Path suffixes that identify a SAS data file.
 _SAS_DATA_SUFFIX = ".sas7bdat"
 _SAS_INDEX_SUFFIX = ".sas7bndx"
@@ -281,10 +287,16 @@ def _path_source(ref: "SasPathRef", source_id: str | None) -> HydrationSource | 
             has_macro_ref=ref.has_macro_ref,
             source_id=source_id,
         )
+    # The object is named as SAS reads it, case and suffix kept, from the
+    # unnormalised path: on AIX, Linux and object storage `Sales.CSV` and
+    # `sales` are two files, and a file reader takes the format from the suffix.
+    # A SAS dataset keeps only its stem — its reader adds `.sas7bdat` — and
+    # either way the target table is named from the stem (`_target_for`).
+    name = _basename(ref.effective_path)
     return HydrationSource(
         kind=kind,
         locator=_directory(ref.effective_path),
-        object_name=_stem(ref.path),
+        object_name=_stem(name) if kind is SourceKind.SAS_DATASET else name,
         libref=ref.binds,
         has_macro_ref=ref.has_macro_ref,
         source_id=source_id,
@@ -343,6 +355,10 @@ def _target_for(
     """
     schema_name = config.schema or source.libref
     table_name = source.object_name
+    if source.kind in _FILE_KINDS:
+        # A file is named by its stem: `Sales.CSV` lands as `sales`, the name
+        # its dataset would have had (render lowercases every part).
+        table_name = _stem(table_name)
     if source.connection is not None and table_name.endswith(":"):
         # A list of tables has a target per table, so none of its own; its
         # blocker (_list_blocker) says why.
