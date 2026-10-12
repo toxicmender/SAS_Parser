@@ -62,7 +62,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--pattern",
         default="*.sas",
-        help="Glob for SAS files under the source directory (default: *.sas).",
+        help=(
+            "Glob for SAS files under the source directory, case ignored "
+            "(default: *.sas, which also finds LOAD.SAS)."
+        ),
+    )
+    parser.add_argument(
+        "--encoding",
+        help=(
+            "Encoding of the SAS files, e.g. latin1 or cp1252 (default: UTF-8, "
+            "falling back to Latin-1 for a file that is not valid UTF-8)."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -194,8 +204,15 @@ def _config_for(args: argparse.Namespace) -> HydrationConfig:
     return config
 
 
-def _corpus_inventory(args: argparse.Namespace) -> list[InventoryRow]:
-    """Chunk the corpus and take its reference inventory.
+def _corpus_inventory(
+    args: argparse.Namespace,
+) -> tuple[list[InventoryRow], list[str]]:
+    """Chunk the corpus and take its reference inventory; and the files that
+    could not be chunked.
+
+    A file that cannot be read or parsed is logged and left out rather than
+    ending the run: the plan of the other files is still worth having, and the
+    run's exit status says it is incomplete (:func:`_inventory`).
 
     :mod:`chunker` is imported *here* rather than at module scope: the package
     itself must not depend on it (see the README's decoupling contract), and
@@ -205,17 +222,30 @@ def _corpus_inventory(args: argparse.Namespace) -> list[InventoryRow]:
 
     from .inventory import inventory_rows
 
-    chunker = SasSemanticChunker()
-    results = [
-        chunker.chunk_file(str(path))
-        for path in sorted(args.source_dir.rglob(args.pattern))
-    ]
+    chunker = SasSemanticChunker(encoding=getattr(args, "encoding", None))
+    results = []
+    unreadable: list[str] = []
+    for path in _sas_files(args.source_dir, args.pattern):
+        try:
+            results.append(chunker.chunk_file(str(path)))
+        except Exception as exc:
+            logger.error(f"could not chunk {path} — {type(exc).__name__}: {exc}")
+            unreadable.append(str(path))
     # Resolved as one corpus, so a database LIBNAME (or a %LET) in a setup file
     # reaches the reads in the files after it — chunk_file sees one file alone
     # — and each macro call names the datasets its macro reads and writes.
     corpus = resolve_corpus_datasets(SasCorpus(file_results=results))
     name = getattr(args, "corpus", None) or str(args.source_dir.resolve())
-    return inventory_rows(corpus.file_results, corpus=name)
+    return inventory_rows(corpus.file_results, corpus=name), unreadable
+
+
+def _sas_files(root: Path, pattern: str) -> list[Path]:
+    """The files under *root* that *pattern* names, sorted, case ignored.
+
+    On AIX and Linux a glob is case-sensitive, and `*.sas` alone would skip
+    `LOAD.SAS` — common in code that came by way of Windows or a mainframe.
+    """
+    return sorted(root.rglob(pattern, case_sensitive=False))
 
 
 def _build_plan(
@@ -232,7 +262,7 @@ def _build_plan(
     from .inventory import plan_from_inventory
 
     if rows is None:
-        rows = _corpus_inventory(args)
+        rows, _ = _corpus_inventory(args)
     logger.info(
         f"_build_plan: {len({r.source_id for r in rows})} file(s) name "
         f"{len(rows)} reference(s)"
@@ -270,8 +300,9 @@ def _inventory(
     ``--corpus``, or ``--run-id`` — and ``None`` when there is no table to
     read or nothing in it. Otherwise the source directory's, appended to the
     table when one is configured (on a dry run, only one ``--inventory-table``
-    names). A table that cannot be written costs the run its exit status,
-    never its plan: the inventory is in hand either way.
+    names). A file that cannot be chunked, or a table that cannot be written,
+    costs the run its exit status, never its plan: the inventory of
+    everything else is in hand either way.
     """
     from .inventory import read_inventory, write_inventory
 
@@ -295,7 +326,9 @@ def _inventory(
             logger.error(f"no inventory run to plan from in {table}")
             return None, False
         return _match_includes(args, rows)
-    rows, failed = _match_includes(args, _corpus_inventory(args))
+    rows, unreadable = _corpus_inventory(args)
+    rows, failed = _match_includes(args, rows)
+    failed = failed or bool(unreadable)
     # A dry run writes only when its own command line asks: a table set in
     # config.json or the environment is the deployment's, and a trial plan of
     # some other corpus does not belong in it.

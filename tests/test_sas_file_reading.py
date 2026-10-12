@@ -67,3 +67,52 @@ class TestReadingASource:
         with pytest.raises(UnicodeDecodeError):
             SasSemanticChunker(encoding="ascii").chunk_file(str(path))
 
+
+@pytest.fixture
+def corpus(tmp_path):
+    """A UTF-8 file, a Latin-1 one, and one with an upper-case extension."""
+    (tmp_path / "a.sas").write_text(UTF8, encoding="utf-8")
+    (tmp_path / "b.sas").write_bytes(LATIN1)
+    (tmp_path / "LOAD.SAS").write_text(
+        "libname up '/data/up';\ndata c; set up.v; run;\n", encoding="utf-8"
+    )
+    return tmp_path
+
+
+class TestTheHydrationCli:
+    def _dry_run(self, corpus, capsys, *args):
+        from data_hydration.__main__ import main
+
+        status = main([str(corpus), "--dry-run", "--catalog", "main", *args])
+        return status, capsys.readouterr().out
+
+    def test_every_file_is_planned_whatever_its_encoding_or_extension_case(
+        self, corpus, capsys
+    ):
+        status, out = self._dry_run(corpus, capsys)
+        assert status == 0
+        for place in ("/data/raw/t", "/data/stg/u", "/data/up/v"):
+            assert place in out
+
+    def test_a_file_that_cannot_be_read_costs_the_exit_status_not_the_plan(
+        self, corpus, capsys
+    ):
+        # A strict encoding the Latin-1 file is not valid in: that file is
+        # logged and left out, the others are still planned.
+        status, out = self._dry_run(corpus, capsys, "--encoding", "utf-8")
+        assert status == 1
+        assert "/data/raw/t" in out and "/data/up/v" in out
+        assert "/data/stg/u" not in out
+
+
+class TestTheComplexityCli:
+    def test_every_file_is_scored_whatever_its_encoding_or_extension_case(
+        self, corpus
+    ):
+        from complexity.__main__ import main
+
+        out = corpus / "report.md"
+        assert main([str(corpus), "--out", str(out)]) == 0
+        text = out.read_text(encoding="utf-8")
+        for name in ("a.sas", "b.sas", "LOAD.SAS"):
+            assert name in text

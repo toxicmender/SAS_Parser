@@ -81,8 +81,9 @@ translations are printed but no notebooks are written.
 Useful local options:
 
 ```bash
-# Use a different filename pattern and emit PySpark instead of the configured target.
-uv run sas-parser path/to/sas --pattern "*.SAS" --output-language PySpark --out-dir out/
+# Use a different filename pattern (case is ignored, so it also finds ETL_LOAD.SAS)
+# and emit PySpark instead of the configured target.
+uv run sas-parser path/to/sas --pattern "etl_*.sas" --output-language PySpark --out-dir out/
 
 # Choose the model exposed by the gateway and retain run memory in Delta.
 uv run sas-parser path/to/sas --model <gateway-model-id> --delta-table default.sas_parser_memory

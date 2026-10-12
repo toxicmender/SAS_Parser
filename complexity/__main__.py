@@ -117,7 +117,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--pattern",
         default="*.sas",
-        help="Glob for SAS files within sas_dir (default: *.sas).",
+        help="Glob for SAS files within sas_dir, case ignored (default: *.sas, "
+        "which also finds LOAD.SAS).",
+    )
+    parser.add_argument(
+        "--encoding",
+        help=(
+            "Encoding of the SAS files, e.g. latin1 or cp1252 (default: UTF-8, "
+            "falling back to Latin-1 for a file that is not valid UTF-8)."
+        ),
     )
     parser.add_argument(
         "--target",
@@ -390,13 +398,14 @@ def _load_local_sources(args: argparse.Namespace) -> _Sources | None:
     ``None`` when the directory holds no matching file, which is a failed run
     rather than an empty report.
     """
-    sas_files = sorted(args.sas_dir.rglob(args.pattern))
+    # Case ignored: on AIX and Linux `*.sas` alone would skip LOAD.SAS.
+    sas_files = sorted(args.sas_dir.rglob(args.pattern, case_sensitive=False))
     if not sas_files:
         logger.error(f"no files matching {args.pattern!r} under {args.sas_dir}")
         return None
     logger.info(f"scoring {len(sas_files)} SAS file(s) under {args.sas_dir}")
 
-    chunker = SasSemanticChunker()
+    chunker = SasSemanticChunker(encoding=getattr(args, "encoding", None))
     results: list[Any] = []
     failures: list[str] = []
     for path in sas_files:
