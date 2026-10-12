@@ -155,6 +155,19 @@ class TestConnections(unittest.TestCase):
         self.assertEqual((table.engine, table.connection), ("oracle", "edw"))
         self.assertEqual(table.option_map, {"path": "EDWPRO"})
 
+    def test_connection_to_after_a_comma_in_the_from_list(self):
+        # SAS takes CONNECTION TO "in any FROM clause": after a comma as well as
+        # after FROM or JOIN. Read as SAS, it made up work.connection and s.t.
+        src = (
+            "proc sql;\nconnect to oracle (path=P);\n"
+            "create table x as select * from work.a, connection to oracle "
+            "(select * from s.t) b;\nquit;\n"
+        )
+        (chunk,) = _chunk(src).chunks
+        self.assertEqual([t.qualified for t in chunk.metadata.db_tables], ["s.t"])
+        refs = {(r.name, r.role.value) for r in chunk.metadata.dataset_refs}
+        self.assertEqual(refs, {("work.a", "read"), ("work.x", "write")})
+
     def test_an_engine_named_alias_without_a_connect_is_that_engine(self):
         # The CONNECT was made by a macro call this chunk cannot see.
         src = (

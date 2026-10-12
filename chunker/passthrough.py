@@ -84,9 +84,12 @@ _CONNECT_USING_RE = re.compile(
 _DISCONNECT_RE = re.compile(
     rf"\bdisconnect\s+from\s+(?P<alias>{_CONN_NAME})", re.IGNORECASE
 )
-# FROM|JOIN CONNECTION TO <alias> ( — the match ends on the query's open paren.
+# FROM|JOIN|, CONNECTION TO <alias> ( — the match ends on the query's open
+# paren. SAS takes CONNECTION TO "in any FROM clause", so it can follow a comma
+# in a FROM list (`from work.a, connection to oracle (...) b`) as well.
 _CONNECTION_TO_RE = re.compile(
-    rf"\b(?:from|join)\s+(?P<clause>connection\s+to\s+(?P<alias>{_CONN_NAME}))\s*\(",
+    rf"(?:\b(?:from|join)\s+|,\s*)"
+    rf"(?P<clause>connection\s+to\s+(?P<alias>{_CONN_NAME}))\s*\(",
     re.IGNORECASE,
 )
 # EXECUTE ( <stmt> ) BY <alias>, or the newer EXECUTE BY <alias> ( <stmt> ). A

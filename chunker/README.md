@@ -506,8 +506,9 @@ data work.accts; set edw.accounts; run;
 ```
 
 **Explicit pass-through** is `passthrough.py`'s grammar: `CONNECT TO` (alias →
-engine and options, in statement order), `CONNECT USING`, `(FROM|JOIN)
-CONNECTION TO` (reads), `EXECUTE … BY` (writes and reads), `DISCONNECT`. The
+engine and options, in statement order), `CONNECT USING`, `CONNECTION TO`
+after FROM, JOIN or a comma in a FROM list — SAS takes it "in any FROM clause"
+— (reads), `EXECUTE … BY` (writes and reads), `DISCONNECT`. The
 native SQL gets its own token walk — comma FROM lists, joins, subqueries, table
 functions, CTE names and `DUAL` excluded, `EXTRACT(… FROM …)`, Oracle `'…'`
 literals and `--` comments, `"QUOTED"` identifiers, `@dblink`, and every
