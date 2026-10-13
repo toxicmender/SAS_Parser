@@ -347,6 +347,25 @@ class TestEngineLibnames:
         # database nobody has heard of.
         assert extract_engine_refs("libname x notadatabase foo=bar;") == []
 
+    @pytest.mark.parametrize(
+        "engine",
+        [
+            # Each from its SAS/ACCESS 9.4 LIBNAME page. Before, these named
+            # nothing, so a read through the library gave an empty plan.
+            "snow", "jdbc", "greenplm", "sapase", "sapiq", "ybrick", "vertica",
+            "impala", "hawq", "aster", "mongo", "sforce",
+            # The previous names SAS still accepts for SAP ASE and SAP IQ.
+            "sybase", "sybaseiq",
+        ],
+    )
+    def test_every_documented_engine_is_a_database(self, engine):
+        ref = self._one_engine(f"libname d {engine} server=h user=u;")
+        assert (ref.engine, ref.binds) == (engine, "d")
+
+    def test_snowflake_is_not_an_engine_name(self):
+        # Snowflake's engine is SNOW; `snowflake` appears on no SAS page.
+        assert extract_engine_refs("libname d snowflake server=h;") == []
+
     def test_every_known_engine_is_lowercase(self):
         # The scan lowercases before the membership test, so an upper-case
         # entry in the set could never match.

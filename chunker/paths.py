@@ -480,29 +480,50 @@ def extract_paths(text: str) -> list[SasPathRef]:
 
 #: LIBNAME engines that reach a *database*, not a directory. Lowercased.
 #:
+#: The engine names SAS/ACCESS 9.4 documents, each from its LIBNAME page
+#: (``LIBNAME libref snow``, ``LIBNAME libref sapase``, …): the relational
+#: interfaces, the previous names SAS still accepts (``sybase`` for SAP ASE,
+#: ``sybaseiq`` for SAP IQ), and MongoDB and Salesforce from SAS/ACCESS for
+#: Nonrelational Databases. Snowflake's engine is ``snow``, not ``snowflake``.
+#: Not every one runs on every host — Snowflake, Spark, BigQuery and MongoDB
+#: run on Linux but not AIX, OLE DB only on Windows — but a name is recognised
+#: wherever it appears.
+#:
 #: ``spde`` is deliberately absent: the SPD Engine takes a quoted directory, so
 #: it is a path LIBNAME that :data:`PATH_STATEMENTS` already matches, and it is
 #: told apart from a plain one by :attr:`~chunker.models.SasPathRef.engine`.
 #: An engine here takes no path at all — its location is the connection.
 ENGINE_LIBNAMES: frozenset[str] = frozenset(
     {
-        "oracle",
-        "odbc",
-        "teradata",
-        "sqlsvr",
-        "oledb",
+        "aster",
+        "bigquery",
         "db2",
-        "postgres",
+        "greenplm",
+        "hadoop",
+        "hawq",
+        "impala",
+        "informix",
+        "jdbc",
+        "mongo",
         "mysql",
         "netezza",
-        "snowflake",
+        "odbc",
+        "oledb",
+        "oracle",
+        "postgres",
         "redshift",
+        "sapase",
         "saphana",
-        "sybase",
-        "informix",
-        "hadoop",
+        "sapiq",
+        "sforce",
+        "snow",
         "spark",
-        "bigquery",
+        "sqlsvr",
+        "sybase",
+        "sybaseiq",
+        "teradata",
+        "vertica",
+        "ybrick",
     }
 )
 

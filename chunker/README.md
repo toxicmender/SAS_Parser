@@ -503,7 +503,11 @@ which is what lets a `%LET` in one file name a dataset another file reads.
 SAS reaches a database's own tables two ways, and both produce
 `SasDbTableRef` records on `SasChunkMetadata.db_tables` (rolled up as
 `SasBatch.db_tables`) — the table in the database's terms, linked to the SAS
-dataset the read lands in:
+dataset the read lands in. A database LIBNAME is one whose engine is in
+`paths.ENGINE_LIBNAMES`: every engine name SAS/ACCESS 9.4 documents (`oracle`,
+`snow` — not `snowflake` — `jdbc`, `greenplm`, `sapase` and its older `sybase`,
+`sapiq`/`sybaseiq`, `ybrick`, `vertica`, `mongo`, `sforce`, …), whichever host
+it runs on.
 
 ```sas
 proc sql;

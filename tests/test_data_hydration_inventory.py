@@ -352,6 +352,17 @@ def test_the_libname_in_force_is_the_latest_before_the_read():
     assert ("/two", "mid") not in located
 
 
+def test_a_read_through_any_documented_engine_is_planned():
+    # SNOW, JDBC, GREENPLM, VERTICA, ... are SAS/ACCESS engines. Unrecognised,
+    # their LIBNAME was neither a database nor a directory, and the read gave
+    # an empty plan; now it is a database table, blocked like any non-Oracle one.
+    for engine in ("snow", "jdbc", "greenplm", "vertica", "ybrick", "sapase", "mongo"):
+        plan = _plan(job=f"libname d {engine} server=h user=u;\ndata a; set d.orders; run;\n")
+        [item] = plan.items
+        assert item.source.object_name == "orders", engine
+        assert f"a {engine} database" in item.blockers[0], engine
+
+
 def test_a_transport_file_is_planned_blocked_once():
     # PROC CIMPORT reads a CPORT transport file, which no reader here opens:
     # planned, blocked, once — by path, or through the FILENAME it names.
