@@ -581,7 +581,10 @@ _IN_STREAM_RE = re.compile(
     rf"\s*(?:(?:datalines|cards|lines|parmcards)(4)?|(submit)\b{_NOT_A_VARIABLE}[^;]*)\s*;",
     re.IGNORECASE,
 )
-_DATALINES4_END_RE = re.compile(r"^[ \t]*;;;;", re.MULTILINE)
+# A 4-form's data ends at "four consecutive semicolons that are located in
+# columns 1 through 4" (DATALINES4; CARDS4 and LINES4 are its aliases): an
+# indented ;;;; is a data line.
+_DATALINES4_END_RE = re.compile(r"^;;;;", re.MULTILINE)
 _ENDSUBMIT_RE = re.compile(r"^[ \t]*endsubmit\s*;", re.IGNORECASE | re.MULTILINE)
 
 
@@ -600,8 +603,8 @@ def _in_stream_units(
     SUBMIT code runs to its ENDSUBMIT line as one FOREIGN unit; nothing in
     it is SAS, quotes included. In-stream data is one DATALINES unit, ended by
     the first line holding a semicolon — which SAS then reads as statements,
-    so ``run;`` may end the data — or, for a 4-form, by a line opening with
-    ``;;;;``, a CODE unit of its own. Unterminated, either runs to the end.
+    so ``run;`` may end the data — or, for a 4-form, by ``;;;;`` in columns 1
+    to 4, a CODE unit of its own. Unterminated, either runs to the end.
     """
     eof = len(source)
     if opener.group(2):

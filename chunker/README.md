@@ -155,7 +155,8 @@ this is a considered decision, not an accident.
 - **Statement roles (`UnitRole`):** every unit is CODE, COMMENT (a `/* */`
   block, a `* …;` statement or a `%* …;` macro comment), DATALINES (the
   in-stream data after `DATALINES`/`CARDS`/`LINES`/`PARMCARDS`, ended by the
-  first line holding a semicolon, or by a `;;;;` line for the `…4` forms) or
+  first line holding a semicolon, or for the `…4` forms by `;;;;` in columns
+  1 to 4 — an indented `;;;;` is data) or
   FOREIGN (another language's code from `SUBMIT` to the `ENDSUBMIT` line, in
   PROC PYTHON, LUA, IML, …). Only CODE is SAS: the others never open or close
   a block, a quote in them opens no string, and metadata reads the region with

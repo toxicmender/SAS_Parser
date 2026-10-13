@@ -772,7 +772,7 @@ class TestStatementStructure(unittest.TestCase):
             ("datalines;", "1 2\n", "run;\n"),
             ("datalines4;", "a;b\nc;d;\n", ";;;;\nrun;\n"),
             ("lines;", "x\n", ";\nrun;\n"),
-            ("parmcards4;", "x;\n", "  ;;;;\nrun;\n"),
+            ("parmcards4;", "x;\n", ";;;;\nrun;\n"),
             ("datalines;", "", ";\nrun;\n"),  # no data at all
         ):
             source = f"data x; input a $; {opener}\n{data}{rest}data y; set x; run;\n"
@@ -781,6 +781,18 @@ class TestStatementStructure(unittest.TestCase):
                 self.assertEqual(self._kinds(result), [DATA, DATA])
                 self.assertTrue(result.chunks[0].text.endswith(f"{data}{rest}"))
                 self.assertEqual(result.diagnostics, [])
+
+    def test_an_indented_four_semicolons_is_a_data_line(self):
+        # A 4-form ends at "four consecutive semicolons that are located in
+        # columns 1 through 4": an indented ;;;; is data, and so is the
+        # `set lib.z;` after it. Before, the indented line ended the data and
+        # the next one was read as SAS, a made-up read of lib.z.
+        result = self._chunks(
+            "data x; input a $40.; datalines4;\n  ;;;;\nset lib.z;\n;;;;\nrun;\n"
+        )
+        self.assertEqual(self._kinds(result), [DATA])
+        self.assertEqual(result.chunks[0].metadata.input_datasets, [])
+        self.assertEqual(result.chunks[0].metadata.referenced_datasets, ["work.x"])
 
     def test_in_stream_data_that_never_ends_runs_to_the_end_of_the_file(self):
         for opener in ("datalines;", "datalines4;"):
