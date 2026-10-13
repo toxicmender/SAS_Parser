@@ -29,6 +29,7 @@ from .keywords import (
     _SAS_SET_MULTI_RE,
     _SAS_SUBSETTING_IF_RE,
     _SAS_SUM_STATEMENT_RE,
+    RUN_GROUP_PROCS,
     SAS_GLOBAL_STATEMENT_TOKENS,
 )
 from .macro_vars import (
@@ -458,6 +459,16 @@ _DATASET_KINDS = frozenset(
 _ODS_OUTPUT_END_RE = re.compile(
     r"ods\s+(?:output\s+(?:close|clear)|_all_\s+close)\b", re.IGNORECASE
 )
+# A request kept past its procedure: `Summary(persist=proc)=s` (or =run),
+# on the strings-blanked text. "PROC maintains the list of definitions even
+# after the procedure ends, until you explicitly modify it" (SAS 9.4 ODS
+# User's Guide, ODS OUTPUT Statement).
+_ODS_PERSIST_RE = re.compile(
+    rf"\(([^()]*\bpersist\s*=\s*(?:proc|run)\b[^()]*)\)\s*=\s*({DS_REF_TOKEN})",
+    re.IGNORECASE,
+)
+# A step its QUIT ended, rather than its last RUN.
+_QUIT_END_RE = re.compile(r"\bquit\s*;\s*\Z", re.IGNORECASE)
 
 
 def _metadata_for(region: _Region) -> SasChunkMetadata:
@@ -1695,6 +1706,19 @@ def resolve_ods_outputs(chunks: list[SasChunk]) -> None:
     them; each stays on its statement as a MENTION, named but never written. A
     request nothing takes or cancels stays as it is.
 
+    Two cases follow SAS's own rules (SAS 9.4 ODS User's Guide, ODS OUTPUT
+    Statement; SAS/STAT User's Guide, RUN-Group Processing):
+
+    - A request made while a RUN-group PROC its last RUN left running is
+      still active is that PROC's, not the next one's: "the ODS OUTPUT
+      statement corresponds to the PROC REG step because PROC REG is still
+      active". Nothing of it runs after the request, which is cleared when
+      it ends, so the request stays a MENTION.
+    - ``Summary(persist=proc)=s`` (or ``=run``) "maintains the list of
+      definitions even after the procedure ends": every later PROC writes
+      ``s``, until the list is closed or cleared. Which of them produce the
+      output object the statement cannot tell, so each is taken to.
+
     Moving is idempotent: a request once moved or cancelled is no longer a
     WRITE on its statement, so the corpus-level run finds none to move. An ODS
     OUTPUT inside a PROC, or in a ``%MACRO`` body, is that PROC's or that
@@ -1723,13 +1747,35 @@ def resolve_ods_outputs(chunks: list[SasChunk]) -> None:
             name in runs_proc for name in chunk.metadata.invokes_macros
         )
 
+    def persistent(chunk: SasChunk) -> set[str]:
+        """The data sets *chunk*'s requests keep past their procedure, as
+        written, lowercased."""
+        return {m.group(2).lower() for m in _ODS_PERSIST_RE.finditer(_sanitise(chunk.text))}
+
+    def kept(ref: SasDatasetRef, names: set[str]) -> bool:
+        return ref.raw.split("(")[0].strip().lower() in names
+
+    def mention(idx: int, refs: Callable[[SasDatasetRef], bool]) -> None:
+        """Turn the requests of chunks[idx] that *refs* picks into MENTIONs."""
+        meta = chunks[idx].metadata
+        mentioned = tuple(
+            replace(ref, role=DatasetRole.MENTION) if requested(ref) and refs(ref) else ref
+            for ref in meta.dataset_refs
+        )
+        chunks[idx] = chunks[idx].model_copy(
+            update={"metadata": meta.model_copy(update={"dataset_refs": mentioned})}
+        )
+
     pending: list[int] = []  # ODS statements whose requests wait for a PROC
+    persisting: tuple[SasDatasetRef, ...] = ()  # requests every later PROC takes
+    open_proc = False  # a RUN-group PROC its last RUN left running
     source: str | None = None
     claimed_by: str | None = None
     taken: tuple[SasDatasetRef, ...] = ()
     for idx, chunk in enumerate(chunks):
         if idx == 0 or chunk.source_id != source:
             source, pending, claimed_by = chunk.source_id, [], None
+            persisting, open_proc = (), False
         if claimed_by is not None and chunk.parent_id == claimed_by:
             chunks[idx] = _with_dataset_refs(chunk, taken)  # a split slice
             continue
@@ -1740,30 +1786,33 @@ def resolve_ods_outputs(chunks: list[SasChunk]) -> None:
         ):
             if _ODS_OUTPUT_END_RE.match(_sanitise(chunk.text).lstrip()):
                 for i in pending:
-                    meta = chunks[i].metadata
-                    refs = tuple(
-                        replace(ref, role=DatasetRole.MENTION) if requested(ref) else ref
-                        for ref in meta.dataset_refs
-                    )
-                    chunks[i] = chunks[i].model_copy(
-                        update={"metadata": meta.model_copy(update={"dataset_refs": refs})}
-                    )
-                pending = []
+                    mention(i, lambda ref: True)
+                pending, persisting = [], ()
             elif any(map(requested, chunk.metadata.dataset_refs)):
-                pending.append(idx)
-        elif chunk.parent_id is None and pending and runs_a_proc(chunk):
-            taken = tuple(
-                ref
+                if open_proc:
+                    # The running PROC's, and cleared when it ends, unless kept.
+                    names = persistent(chunk)
+                    mention(idx, lambda ref, names=names: not kept(ref, names))
+                if any(map(requested, chunks[idx].metadata.dataset_refs)):
+                    pending.append(idx)
+        elif chunk.parent_id is None and (pending or persisting) and runs_a_proc(chunk):
+            requests = [
+                (ref, kept(ref, names))
                 for i in pending
+                for names in (persistent(chunks[i]),)
                 for ref in chunks[i].metadata.dataset_refs
                 if requested(ref)
-            )
+            ]
             for i in pending:
                 ods = chunks[i]
-                kept = ods.metadata.map_dataset_names(
+                remaining = ods.metadata.map_dataset_names(
                     lambda ref: None if requested(ref) else ref.name
                 )
-                chunks[i] = ods.model_copy(update={"metadata": kept})
+                chunks[i] = ods.model_copy(update={"metadata": remaining})
+            taken = tuple(dict.fromkeys([*persisting, *(ref for ref, _ in requests)]))
+            persisting = tuple(
+                dict.fromkeys([*persisting, *(ref for ref, keep in requests if keep)])
+            )
             chunks[idx] = _with_dataset_refs(chunk, taken)
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
@@ -1771,6 +1820,17 @@ def resolve_ods_outputs(chunks: list[SasChunk]) -> None:
                     f"{[ref.name for ref in taken]}"
                 )
             claimed_by, pending = chunk.chunk_id, []
+        if chunk.parent_id is None and (
+            runs_a_proc(chunk)
+            or chunk.kind in (SasChunkKind.DATA_STEP, SasChunkKind.STEP_BOUNDARY)
+        ):
+            # A step ends the PROC before it; a RUN-group PROC its QUIT did
+            # not end runs on into what follows.
+            open_proc = (
+                chunk.kind is SasChunkKind.PROC_STEP
+                and chunk.metadata.proc_name in RUN_GROUP_PROCS
+                and not _QUIT_END_RE.search(_sanitise(chunk.text).rstrip())
+            )
 
 
 # A PROC step a %MACRO body runs: `proc` opening a statement.

@@ -579,6 +579,53 @@ def test_ods_output_in_open_code_is_written_by_the_next_proc():
     assert [c.metadata.dataset_refs for c in chunks] == before
 
 
+def test_ods_output_while_a_run_group_proc_runs_is_that_procs():
+    # "The ODS OUTPUT statement corresponds to the PROC REG step because PROC
+    # REG is still active", and its request is cleared when REG ends (SAS/STAT
+    # User's Guide, RUN-Group Processing). Before, the next PROC took it.
+    src = (
+        "proc reg data=a; model y=x; run;\nods output ParameterEstimates=pe;\n"
+        "proc glm data=a; model y=x; run; quit;\n"
+    )
+    reg, ods, glm = _CHUNKER.chunk_text(src).chunks
+    assert [(r.name, r.role) for r in ods.metadata.dataset_refs] == [("work.pe", M)]
+    assert glm.metadata.output_datasets == []
+    # Its QUIT ended REG first: the request is the next PROC's.
+    src = src.replace("model y=x; run;\nods", "model y=x; run; quit;\nods")
+    *_, glm = _CHUNKER.chunk_text(src).chunks
+    assert glm.metadata.output_datasets == ["work.pe"]
+
+
+def test_ods_output_persisting_is_written_by_every_later_proc():
+    # PERSIST=PROC "maintains the list of definitions even after the procedure
+    # ends, until you explicitly modify it" (SAS 9.4 ODS User's Guide, ODS
+    # OUTPUT): REG and GLM both write pe. Before, only REG did.
+    src = (
+        "ods output ParameterEstimates(persist=proc)=pe Summary=s;\n"
+        "proc reg data=a; model y=x; run; quit;\nproc glm data=a; model y=x; run; quit;\n"
+        "ods output close;\nproc means data=a; run;\n"
+    )
+    chunks = _CHUNKER.chunk_text(src).chunks
+    assert [c.metadata.output_datasets for c in chunks] == [
+        [],
+        ["work.pe", "work.s"],
+        ["work.pe"],
+        [],
+        [],
+    ]
+    before = [c.metadata.dataset_refs for c in chunks]
+    resolve_references(chunks)
+    assert [c.metadata.dataset_refs for c in chunks] == before
+    # Kept past a RUN-group PROC that was still running, too.
+    src = (
+        "proc reg data=a; model y=x; run;\nods output pe(persist=run)=pe2 x=x2;\n"
+        "proc glm data=a; model y=x; run; quit;\n"
+    )
+    _, ods, glm = _CHUNKER.chunk_text(src).chunks
+    assert [(r.name, r.role) for r in ods.metadata.dataset_refs] == [("work.x2", M)]
+    assert glm.metadata.output_datasets == ["work.pe2"]
+
+
 def test_ods_output_before_a_macro_call_is_written_by_the_proc_it_runs():
     src = (
         "%macro fit(data=);\n  proc reg data=&data; model y = x; run; quit;\n%mend;\n"

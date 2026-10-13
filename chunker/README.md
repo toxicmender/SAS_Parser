@@ -315,7 +315,10 @@ THEN`, `ELSE`, `WHEN (…)` or `OTHERWISE`; a subsetting `IF` has none. Then:
     that PROC does. In open code the statement records them, and
     `metadata.resolve_ods_outputs` hands them to the next PROC_STEP of the
     file. `ods output close|clear` before one cancels them; they stay on the
-    statement as MENTIONs.
+    statement as MENTIONs. So does a request made while a RUN-group PROC its
+    last RUN left running is still active: it is that PROC's, cleared when
+    it ends. One made with `persist=proc` (or `=run`) is written by every
+    later PROC until the list is closed or cleared.
   - **PROC DS2:** a DATA program writes its tables (`/ overwrite=` aside);
     SET and MERGE read theirs, a `set {select …}` query's through the SQL
     grammar; `set from th;` reads a THREAD program's rows, no table.
