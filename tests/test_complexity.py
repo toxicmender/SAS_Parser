@@ -3194,7 +3194,8 @@ class TestPathsSection(unittest.TestCase):
         scored = _file(_analyze("data work.r; infile rawin; input x; run;\n"), "t.sas")
         text = render_file_report(scored, texts={})
         self.assertIn("- Filerefs no FILENAME in the corpus assigns:", text)
-        self.assertIn("`rawin` — infile `rawin`", text)
+        # With the file SAS on UNIX reads when no fileref of that name exists.
+        self.assertIn("`rawin` → `rawin.dat` — infile `rawin`", text)
 
     def test_a_fileref_a_filename_assigns_is_reported_where_it_points(self):
         scored = _file(

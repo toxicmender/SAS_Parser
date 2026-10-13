@@ -673,8 +673,22 @@ class TestFilerefResolution:
             "filename in temp;\ndata c; infile in; run;\n"
         )
         assert refs[2] == [("infile", "filesystem", "/b.csv")]
-        assert refs[4] == [("infile", "fileref", "in")]
+        # Cleared, `in` is a bare word again: the in.dat SAS reads without a
+        # fileref. TEMP assigns one, to a scratch file and no place.
+        assert refs[4] == [("infile", "fileref", "in.dat")]
         assert refs[6] == [("infile", "fileref", "in")]
+
+    def test_a_fileref_assigned_to_a_device_keeps_it(self):
+        from chunker import SasSemanticChunker
+
+        result = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(
+            "filename t temp;\ndata _null_; file t; put 'x'; run;\ndata a; infile t; input v; run;\n"
+        )
+        assert [
+            (r.statement, str(r.location), r.raw, r.device)
+            for c in result.chunks
+            for r in c.metadata.external_refs
+        ] == [("file", "fileref", "t", "temp"), ("infile", "fileref", "t", "temp")]
 
     def test_a_fileref_spelled_through_a_macro_variable(self):
         refs = self._refs("%let f = in;\nfilename &f '/data/x.csv';\ndata a; infile in; run;\n")
@@ -740,6 +754,42 @@ class TestFilerefResolution:
             "/code/TEMP",
             "/code/Temp.sas",
         ]
+
+    def test_a_name_no_fileref_assigns_is_a_file_in_the_current_directory(self):
+        # "If there is no qtr fileref already defined, you can omit the
+        # quotation marks and the file extension in the %INCLUDE statement:
+        # %include qtr;" — SAS reads qtr.sas from its current directory, and
+        # INFILE and FILE assume .dat (SAS 9.4 Companion for UNIX
+        # Environments, Specifying Pathnames). It stays FILEREF, since a
+        # fileref assigned outside the corpus would win. Before, it named no
+        # file at all.
+        refs = self._refs(
+            "%include QTR;\ndata a; infile qtr; input x; run;\n"
+            "filename qtr '/q/qtr.csv';\ndata b; infile qtr; input y; run;\n"
+            "%include src(util);\nproc import datafile=imp out=w dbms=csv; run;\n"
+        )
+        assert refs[0] == [("include", "fileref", "qtr.sas")]
+        assert refs[1] == [("infile", "fileref", "qtr.dat")]
+        assert refs[3] == [("infile", "filesystem", "/q/qtr.csv")]
+        # A member needs a directory; PROC IMPORT names a fileref or a quoted
+        # path, never a bare file.
+        assert refs[4] == [("include", "fileref", "src(util)")]
+        assert refs[5] == [("proc_import", "fileref", "imp")]
+
+    def test_a_fileref_another_file_assigns_wins_over_the_current_directory(self):
+        from chunker import SasSemanticChunker
+        from chunker.metadata import resolve_filerefs
+
+        chunker = SasSemanticChunker(min_words=1, max_words=9_999)
+        setup = chunker.chunk_text("filename qtr '/code/qtr.sas';\n", source_id="a.sas")
+        job = chunker.chunk_text("%include qtr;\n", source_id="b.sas")
+        assert [f.path for f in job.chunks[0].metadata.include_files] == ["qtr.sas"]
+        chunks = [*setup.chunks, *job.chunks]
+        resolve_filerefs(chunks)
+        assert [(f.path, f.resolved) for f in chunks[1].metadata.include_files] == [
+            ("/code/qtr.sas", True)
+        ]
+        assert chunks[1].metadata.includes == ["/code/qtr.sas"]
 
     def test_proc_python_follows_its_fileref(self):
         refs = self._refs("filename py '/scripts/prep.py';\nproc python infile=py; run;\n")

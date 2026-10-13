@@ -73,8 +73,10 @@ def _includes(src: str) -> list[InventoryRow]:
         # No file name to look for.
         ("%include &f;", None),
         ('%include "/lib/&name..sas";', None),
-        # A whole-file fileref nothing binds: its name is the FILENAME's.
-        ("%include setup;", None),
+        # A name no fileref is assigned to: the file SAS on UNIX reads from
+        # its current directory, lowercased, with .sas.
+        ("%include setup;", "setup.sas"),
+        ("%include QTR;", "qtr.sas"),
     ],
 )
 def test_the_file_name_an_include_opens(src, name):

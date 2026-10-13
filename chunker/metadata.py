@@ -70,9 +70,11 @@ from .paths import (
     ENGINE_LIBNAMES,
     extract_engine_refs,
     extract_paths,
+    DEFAULT_EXTENSIONS,
     in_using_clause,
     member_file,
     normalise_path,
+    unquoted_file,
 )
 from .scanner import _blank_span, _Region, _sanitise
 from .statements import _ODS_OUTPUT_RE, _VAR_REF_RE, _canon_ds
@@ -1870,6 +1872,52 @@ def _through_fileref(ref: SasPathRef, filename: SasPathRef) -> SasPathRef:
     )
 
 
+# A fileref spelled as a bare word, the one form SAS also reads as a file.
+_BARE_NAME_RE = re.compile(r"[A-Za-z_]\w*\Z")
+
+
+def _without_fileref(ref: SasPathRef) -> SasPathRef:
+    """*ref*, named by a bare word no FILENAME or environment variable binds
+    where it stands (``%include qtr;``, ``infile qtr;``), with the file SAS on
+    UNIX reads when no fileref of that name exists as its place: the word,
+    lowercased, with the statement's extension, in the current directory. "If
+    there is no qtr fileref already defined, you can omit the quotation marks
+    and the file extension in the %INCLUDE statement: %include qtr;" (SAS 9.4
+    Companion for UNIX Environments, Specifying Pathnames).
+
+    It stays FILEREF: a fileref assigned outside the corpus (an autoexec, the
+    configuration, the environment) would still win, and a FILENAME a later
+    run over the corpus finds binds it as it binds any other. A member
+    (``src(util)``) needs a directory, and PROC IMPORT, EXPORT, CIMPORT and
+    PYTHON take a fileref or a quoted path, never a bare file: those are
+    left as they are, as is one spelled through a macro variable nothing
+    resolved."""
+    if ref.location is not PathLocation.FILEREF or ref.statement not in DEFAULT_EXTENSIONS:
+        return ref
+    spelling = ref.resolved_path or ref.raw
+    if not _BARE_NAME_RE.match(spelling):
+        return ref
+    place = unquoted_file(spelling, ref.statement)
+    return ref.model_copy(update={"path": normalise_path(place), "resolved_path": place})
+
+
+def _at_device(ref: SasPathRef, device: str) -> SasPathRef:
+    """*ref*, through a fileref a FILENAME assigned to *device* and no place
+    (``filename t temp;``): FILEREF still, as written, with the device."""
+    if ref.location is PathLocation.FILEREF and ref.device == device:
+        return ref
+    return ref.model_copy(
+        update={
+            "location": PathLocation.FILEREF,
+            "path": normalise_path(ref.raw),
+            "resolved_path": None,
+            "device": device,
+            "has_macro_ref": "&" in ref.raw,
+            "concat_index": None,
+        }
+    )
+
+
 def _filename_places(refs: list[SasPathRef]) -> dict[str, list[SasPathRef]]:
     """The places each FILENAME among *refs* gives its fileref: one, or a
     concatenation's in order — ``filename f ('/q1.sas' '/q2.sas');`` gives
@@ -1908,6 +1956,11 @@ def resolve_filerefs(chunks: list[SasChunk]) -> None:
     earlier in the walk (a ``setenv`` reference) is followed where no FILENAME
     binds the name — SAS uses the fileref when both exist.
 
+    A FILENAME that names no quoted place but a device (``filename t temp;``,
+    ``dummy``) assigns the fileref all the same: a reference through it keeps
+    FILEREF and records that device. A bare word nothing binds is the file SAS
+    on UNIX reads when no fileref of that name exists (:func:`_without_fileref`).
+
     A FILENAME may concatenate places (``filename f ('/q1.sas' '/q2.sas');``):
     a reference to the whole fileref (``%include f;``) reads every file in
     turn, so it becomes one reference per file; one to a member (``%include
@@ -1917,6 +1970,8 @@ def resolve_filerefs(chunks: list[SasChunk]) -> None:
     """
     bound: dict[str, list[SasPathRef]] = {}
     env: dict[str, list[SasPathRef]] = {}
+    # Filerefs a FILENAME assigns to a device and no place: `temp`, `dummy`.
+    devices: dict[str, str] = {}
     for idx, chunk in enumerate(chunks):
         meta = chunk.metadata
         refs = meta.external_refs
@@ -1933,25 +1988,36 @@ def resolve_filerefs(chunks: list[SasChunk]) -> None:
                 fref = m.group(1).lower()
                 semi = text.find(";", m.end())
                 tail = text[m.end() : semi if semi >= 0 else len(text)]
+                device = tail.split()[0].lower() if tail.split() else "clear"
                 if fref == "_all_":
                     bound.clear()
+                    devices.clear()
                 elif fref in named and ("'" in tail or '"' in tail):
                     bound[fref] = named[fref]
+                    devices.pop(fref, None)
                     seen.add(fref)
                 else:
                     bound.pop(fref, None)
+                    if device == "clear":
+                        devices.pop(fref, None)
+                    else:
+                        devices[fref] = device
             for fref in named.keys() - seen:
                 bound[fref] = named[fref]  # a statement the scan above misread
-        if not (bound or env) or not any(map(_named_through_fileref, refs)):
+        if not any(map(_named_through_fileref, refs)):
             continue
         followed: list[SasPathRef] = []
         for r in refs:
-            places = (
-                (bound.get(r.binds) or env.get(r.binds))
-                if _named_through_fileref(r) and r.binds is not None
-                else None
-            )
-            followed += [r] if places is None else [_through_fileref(r, p) for p in places]
+            if not _named_through_fileref(r) or r.binds is None:
+                followed.append(r)
+            elif places := bound.get(r.binds):
+                followed += [_through_fileref(r, p) for p in places]
+            elif (device := devices.get(r.binds)) is not None:
+                followed.append(_at_device(r, device))
+            elif places := env.get(r.binds):
+                followed += [_through_fileref(r, p) for p in places]
+            else:
+                followed.append(_without_fileref(r))
         # Following again what an earlier run followed gives the same places,
         # once each.
         resolved = list(dict.fromkeys(followed))

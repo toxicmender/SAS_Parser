@@ -142,6 +142,13 @@ macro's `set &ds;` makes.
   (WORK, SASHELP, SASUSER, MAPS) need none, a dataset the job makes first is no
   input, and while some LIBNAME's libref is an unresolved `&lib` nothing is
   claimed unassigned.
+- **So is a fileref the corpus never assigns.** `infile qtr;` with no FILENAME
+  or environment variable for `qtr` anywhere in the corpus is one
+  `sas_session` item, blocked, naming the reads and — for a bare word — the
+  file SAS on UNIX reads when no fileref of that name exists: `qtr.dat` in the
+  current directory, placed where a cd says which. Before, the read dropped out
+  of the plan. A fileref a FILENAME assigns to a device (`filename t temp;`) is
+  assigned, to no place, and needs no item.
 - **A path the SAS server completes is blocked.** On UNIX `~/` is `$HOME/`,
   `~name/` that user's home, `!sasroot` the directory SAS is installed in, and
   `$VARIABLE` an environment variable. Where those point only the server

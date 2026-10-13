@@ -407,9 +407,17 @@ with `.sas` added for `%INCLUDE` and `.dat` for INFILE and FILE (`src(One)` →
 quoted, as written (`src(One.sas)`, `src("One")`), since UNIX file names are
 case sensitive (SAS 9.4 Companion for UNIX Environments, Specifying
 Pathnames). `path` stays a case-folded comparison key; `effective_path` is the
-file SAS opens. A fileref nothing binds stays `FILEREF`. A file read through a
+file SAS opens. A fileref nothing binds stays `FILEREF`; when it is a bare
+word, its `resolved_path` is the file SAS on UNIX reads if no fileref of that
+name exists anywhere — `%include qtr;` reads `qtr.sas`, `infile qtr;`
+`qtr.dat`, in the current directory ("If there is no qtr fileref already
+defined, you can omit the quotation marks and the file extension in the
+%INCLUDE statement", SAS 9.4 Companion for UNIX Environments) — while a
+FILENAME a later run finds still binds it. One a FILENAME assigns to a device
+and no place (`filename t temp;`) records the device. A file read through a
 fileref is the FILENAME's file, so the hydration planner plans it once, from
-the FILENAME.
+the FILENAME; a read through a fileref nothing in the corpus assigns is one
+blocked item.
 
 A statement may also **concatenate** places, which SAS treats as one:
 `libname x ('/a' '/b');` (commas allowed, and an assigned libref in place of a

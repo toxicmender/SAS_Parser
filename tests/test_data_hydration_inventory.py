@@ -397,6 +397,29 @@ def test_an_environment_variable_is_a_libref_or_fileref_on_unix():
     ]
 
 
+def test_a_read_through_a_fileref_nothing_assigns_is_one_blocked_item():
+    # With no fileref qtr, `infile qtr;` reads qtr.dat from SAS's current
+    # directory (SAS 9.4 Companion for UNIX Environments); a fileref assigned
+    # outside the corpus would win. Before, the read dropped out of the plan
+    # without a word, as one of a member of an unassigned directory did.
+    plan = _plan(
+        job=(
+            "x cd /users/mkt;\ndata a; infile qtr; input x; run;\n"
+            "data b; infile qtr; input z; run;\ndata c; infile prices(cars); input y; run;\n"
+        )
+    )
+    assert [(i.source.kind.value, i.source.libref) for i in plan.items] == [
+        ("sas_session", "qtr"),
+        ("sas_session", "prices"),
+    ]
+    [qtr, prices] = [i.blockers for i in plan.items]
+    assert "/users/mkt/qtr.dat" in qtr[0] and "QTR" in qtr[0]
+    assert "prices(cars)" in prices[0]
+    # One assigned before the read is planned from its FILENAME, as before.
+    plan = _plan(job="filename qtr '/in/q.csv';\ndata a; infile qtr; input x; run;\n")
+    assert [(i.source.locator, i.source.object_name) for i in plan.items] == [("/in", "q.csv")]
+
+
 def test_an_environment_variable_nothing_reads_through_is_no_item():
     # A variable is just a variable until a read goes through it; and "if a
     # variable and a libref have the same name ... SAS uses the libref".

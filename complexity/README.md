@@ -813,7 +813,10 @@ reference nothing assigns is flagged as unresolved — it is not what SAS
 resolves at run time, so it cannot be mapped as written. A fileref used by
 `INFILE`, `FILE` or `%INCLUDE` is reported where its `FILENAME` points; one that
 no `FILENAME` in the corpus assigns (an autoexec or the job's JCL does) gets
-its own last group, *Filerefs no FILENAME in the corpus assigns*.
+its own last group, *Filerefs no FILENAME in the corpus assigns*; a bare word
+there points at the file SAS on UNIX reads when no fileref of that name exists
+(`` `qtr` → `qtr.sas` — include `qtr` ``: lowercased, with `.sas` for
+`%INCLUDE` or `.dat` for `INFILE` and `FILE`, in its current directory).
 
 Reported, never scored. Like the dataset interface, it says what a migration has
 to provision, which is a different question from how hard the code is. A file

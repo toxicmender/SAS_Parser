@@ -846,6 +846,69 @@ def _unassigned_blocker(libref: str, read: Sequence[str]) -> str:
     )
 
 
+def _unassigned_filerefs(
+    by_source: Mapping[str, tuple[Sequence["SasEngineRef"], Sequence["SasPathRef"]]],
+    directories: "_WorkingDirectories",
+) -> dict[str, tuple[list[str], str | None, str | None]]:
+    """Each fileref an INFILE reads through that no FILENAME or environment
+    variable in the corpus assigns, in first-read order: the reads as the job
+    spells them, the first file to read one, and for a bare word the file SAS
+    on UNIX reads when no fileref of that name exists — the one
+    :func:`chunker.metadata.resolve_filerefs` recorded, in the current
+    directory a cd set where one did. A fileref a FILENAME assigns to a device
+    and no place (``filename t temp;``) is assigned: its reads carry the
+    device."""
+    assigned = {
+        ref.binds
+        for _, path_refs in by_source.values()
+        for ref in path_refs
+        if ref.statement in ("filename", "setenv") and ref.binds
+    }
+    found: dict[str, tuple[list[str], str | None, str | None]] = {}
+    for source_id, (_, path_refs) in by_source.items():
+        for ref in path_refs:
+            if (
+                ref.statement != "infile"
+                or str(ref.location) != "fileref"
+                or ref.device
+                or not ref.binds
+                or ref.binds in assigned
+            ):
+                continue
+            read, reader, place = found.setdefault(ref.binds, ([], source_id or None, None))
+            if ref.raw not in read:
+                read.append(ref.raw)
+            file = ref.resolved_path
+            if place is None and file and "(" not in file and "&" not in file:
+                cwd = directories.at(source_id, _position(ref))
+                found[ref.binds] = (read, reader, file if cwd is None else _under(cwd, file))
+    return found
+
+
+def _unassigned_fileref_blocker(fileref: str, read: Sequence[str], place: str | None) -> str:
+    """Why an item for a fileref nothing in the corpus assigns is blocked.
+    *read* names the reads as the job spells them; *place* is the file SAS
+    on UNIX reads for a bare word when no fileref of that name exists."""
+    shown = ", ".join(f"infile {r}" for r in read[:5])
+    more = f" and {len(read) - 5} more" if len(read) > 5 else ""
+    if place is None:
+        otherwise = ""
+    elif place.startswith("/"):
+        otherwise = f"; with no fileref of that name, SAS on UNIX reads {place}"
+    else:
+        otherwise = (
+            f"; with no fileref of that name, SAS on UNIX reads {place} from its "
+            f"current directory, which no cd in the corpus sets"
+        )
+    return (
+        f"fileref '{fileref}' is never assigned in the corpus, yet the job reads "
+        f"through it ({shown}{more}) — its FILENAME is elsewhere: an autoexec.sas, "
+        f"a configuration file, or an environment variable {fileref.upper()} holding "
+        f"the file's path{otherwise}; add it to the corpus or point the plan at "
+        f"that file"
+    )
+
+
 def _library_members(
     by_source: Mapping[str, tuple[Sequence["SasEngineRef"], Sequence["SasPathRef"]]],
     datasets: Mapping[str, Sequence[Sequence["SasDatasetRef"]]],
@@ -1432,6 +1495,20 @@ def build_corpus_plan(
                 target_table=UNRESOLVED_TARGET,
                 strategy_reason="not planned: the library is assigned outside the corpus",
                 blockers=(_unassigned_blocker(libref, read),),
+            )
+        )
+
+    # A fileref the corpus reads through but never assigns: one item each, as
+    # for a library, so the read does not drop out of the plan unannounced.
+    for fileref, (read, reader, place) in _unassigned_filerefs(by_source, directories).items():
+        items.append(
+            HydrationItem(
+                source=HydrationSource(
+                    kind=SourceKind.SAS_SESSION, libref=fileref, source_id=reader
+                ),
+                target_table=UNRESOLVED_TARGET,
+                strategy_reason="not planned: the fileref is assigned outside the corpus",
+                blockers=(_unassigned_fileref_blocker(fileref, read, place),),
             )
         )
 
