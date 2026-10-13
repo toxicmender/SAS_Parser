@@ -27,6 +27,7 @@ Logger name: ``data_hydration.planner``.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -331,6 +332,48 @@ def _absolute(path: str) -> bool:
     )
 
 
+# An environment variable in a UNIX path: $HOME, $PROJ.
+_ENV_VAR_RE = re.compile(r"\$([A-Za-z_]\w*)")
+
+
+def _server_parts(path: str) -> list[str]:
+    """What in *path* the SAS server fills in when it reads it, each said in
+    words: on UNIX, ``~/`` is ``$HOME/``, ``~name/`` that user's home
+    directory, ``!sasroot`` the directory SAS is installed in — each only at
+    the start — and ``$VARIABLE`` an environment variable (SAS 9.4 Companion
+    for UNIX Environments, Character Substitutions in Pathnames)."""
+    parts: list[str] = []
+    if path.startswith("~"):
+        user = path[1:].replace("\\", "/").split("/", 1)[0]
+        parts.append(
+            f"~{user} is {user}'s home directory"
+            if user
+            else "~ is the home directory of the user SAS runs as"
+        )
+    elif path.lower().startswith("!sasroot"):
+        parts.append("!SASROOT is the directory SAS is installed in")
+    parts += [
+        f"${name} is an environment variable of the SAS server"
+        for name in _ENV_VAR_RE.findall(path)
+    ]
+    return parts
+
+
+def _server_blocker(source: HydrationSource) -> tuple[str, ...]:
+    """A blocker for a filesystem source whose path the SAS server completes
+    (:func:`_server_parts`): the plan cannot know where it points."""
+    if source.kind not in (SourceKind.FILE, SourceKind.SAS_DATASET, SourceKind.SPDE):
+        return ()
+    path = f"{source.locator}/{source.object_name}" if source.object_name else source.locator
+    parts = _server_parts(path)
+    if not parts:
+        return ()
+    return (
+        f"'{path}' is completed by the SAS server: {'; '.join(parts)} — point "
+        f"this item at the place it names there",
+    )
+
+
 def _quoted_dataset(path: str, reader: str | None) -> tuple[HydrationSource, tuple[str, ...]]:
     """The source for a data set the job reads by its path, and why it is
     blocked, if it is.
@@ -351,7 +394,7 @@ def _quoted_dataset(path: str, reader: str | None) -> tuple[HydrationSource, tup
         source_id=reader,
     )
     blockers: list[str] = []
-    if not _absolute(path):
+    if not _absolute(path) and not _server_parts(path):
         blockers.append(
             f"'{path}' is not a full path: SAS reads it from the directory it "
             f"runs in, which the corpus does not say — point this item at the "
@@ -1096,7 +1139,7 @@ def build_corpus_plan(
     seen_tables: set[str] = set()
     for source, extra in sources:
         target, name_blockers = _target_for(source, config, run_date)
-        blockers = [*_macro_blocker(source), *extra]
+        blockers = [*_macro_blocker(source), *_server_blocker(source), *extra]
         library = _library_blocker(source)
         blockers += library
         # A library directory has no table name *because* it is a directory, so

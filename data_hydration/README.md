@@ -142,6 +142,11 @@ macro's `set &ds;` makes.
   (WORK, SASHELP, SASUSER, MAPS) need none, a dataset the job makes first is no
   input, and while some LIBNAME's libref is an unresolved `&lib` nothing is
   claimed unassigned.
+- **A path the SAS server completes is blocked.** On UNIX `~/` is `$HOME/`,
+  `~name/` that user's home, `!sasroot` the directory SAS is installed in, and
+  `$VARIABLE` an environment variable. Where those point only the server
+  knows, so an item whose path holds one says which, the variable's case
+  kept (`$PROJ`), and asks for the place it names.
 - **A data set read by its path is an item too.** `set
   '/u/2011/budgets/may';` reads `may.sas7bdat` there (SAS adds the
   extension), so it is a `sas7bdat` item, the path's case kept; with no

@@ -588,6 +588,28 @@ def test_a_name_literal_is_a_member_not_a_path():
     assert (item.source.locator, item.source.object_name) == ("/data/p", "my data")
 
 
+def test_a_path_the_sas_server_completes_is_blocked():
+    # On UNIX, ~/ is $HOME/, ~name/ a user's home, !sasroot SAS's own
+    # directory, and $VARIABLE an environment variable (SAS 9.4 Companion for
+    # UNIX Environments, Character Substitutions in Pathnames). Before, each
+    # was planned as a literal directory, e.g. sas7bdat:~/data/t, unblocked.
+    cases = {
+        "libname h '~/data';\ndata a; set h.t; run;\n": "~ is the home directory",
+        "data a; infile '~sasdemo/in/x.csv'; input v; run;\n": "~sasdemo is sasdemo's home",
+        "libname p '$PROJ/raw';\ndata a; set p.t; run;\n": "$PROJ is an environment variable",
+        "data a; infile '/data/$ENV/in.csv'; input v; run;\n": "$ENV is an environment variable",
+        "filename s '!sasroot/samples/x.dat';\ndata a; infile s; input v; run;\n": "!SASROOT is",
+        "data a; set '~/data/t'; run;\n": "~ is the home directory",
+    }
+    for job, why in cases.items():
+        [item] = _plan(job=job).items
+        assert any("completed by the SAS server" in b and why in b for b in item.blockers), job
+        # Not "not a full path" as well: the server says where it is.
+        assert not any("not a full path" in b for b in item.blockers), job
+    [item] = _plan(job="libname q '/data/q';\ndata a; set q.t; run;\n").items
+    assert not any("SAS server" in b for b in item.blockers)
+
+
 def test_a_read_through_any_documented_engine_is_planned():
     # SNOW, JDBC, GREENPLM, VERTICA, ... are SAS/ACCESS engines. Unrecognised,
     # their LIBNAME was neither a database nor a directory, and the read gave
