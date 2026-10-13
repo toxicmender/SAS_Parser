@@ -504,6 +504,45 @@ def test_a_concatenation_survives_the_rows():
     assert [(i.source.locator, i.source.object_name) for i in from_rows.items] == [("/v9", "m")]
 
 
+def test_a_view_s_own_libname_serves_its_query_and_nothing_after():
+    # CREATE VIEW ... USING LIBNAME: "the scope of the libref is local to the
+    # view". Before, it rebound raw for every later read, and a libref only a
+    # view assigns counted as assigned.
+    plan = _plan(
+        job=(
+            "libname raw '/data/raw';\nproc sql;\n"
+            "create view work.v as select * from raw.t, a.u using libname raw '/other', libname a '/a';\n"
+            "quit;\ndata x; set raw.x; set a.k; run;\n"
+        )
+    )
+    located = [(i.source.kind, i.source.locator, i.source.object_name) for i in plan.items]
+    assert located == [
+        (SourceKind.SAS_DATASET, "/data/raw", "x"),
+        (SourceKind.SAS_DATASET, "/other", "t"),
+        (SourceKind.SAS_DATASET, "/a", "u"),
+        (SourceKind.SAS_SESSION, "", ""),
+    ]
+    assert "a.k" in plan.items[-1].blockers[0] and plan.items[-1].source.libref == "a"
+    rows = _rows(job="proc sql;\ncreate view v as select * from q.t using libname q '/q';\nquit;\n")
+    assert [(r.statement, r.role) for r in rows if r.kind is RefKind.PATH] == [("using_libname", "bind")]
+
+
+def test_a_view_s_own_database_libname_serves_its_query_and_nothing_after():
+    plan = _plan(
+        job=(
+            "libname ora oracle path=P schema=s1;\nproc sql;\n"
+            "create view work.v as select * from ora.t using libname ora oracle path=Q schema=s2;\n"
+            "quit;\ndata x; set ora.x; run;\n"
+        )
+    )
+    assert [(i.source.locator, i.source.object_name) for i in plan.items] == [
+        ("Q", "s2.t"),
+        ("P", "s1.x"),
+    ]
+    rows = _rows(job="proc sql;\ncreate view v as select * from q.t using libname q oracle path=Q;\nquit;\n")
+    assert [r.statement for r in rows if r.kind is RefKind.ENGINE] == ["using_libname"]
+
+
 def test_a_read_through_any_documented_engine_is_planned():
     # SNOW, JDBC, GREENPLM, VERTICA, ... are SAS/ACCESS engines. Unrecognised,
     # their LIBNAME was neither a database nor a directory, and the read gave

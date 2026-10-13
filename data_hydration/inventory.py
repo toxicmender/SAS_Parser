@@ -71,6 +71,7 @@ class RefKind(StrEnum):
 #: name to it, an INFILE or %INCLUDE reads it, a FILE or ODS destination writes.
 _PATH_ROLES = {
     "libname": "bind",
+    "using_libname": "bind",
     "filename": "bind",
     "infile": "read",
     "include": "read",
@@ -109,7 +110,9 @@ class InventoryRow(BaseModel, frozen=True):
         What named it: a path's statement (``libname``, ``infile``, ...), a
         dataset's ``via`` (``set``, ``data=``, ``from``, ...), a database
         table's ``via`` (``connection_to``, ``execute``, ``libname``), or
-        ``libname`` for a database LIBNAME.
+        ``libname`` for a database LIBNAME. A LIBNAME clause of a CREATE
+        VIEW's USING list, path or database, is ``using_libname``: its libref
+        is the view's alone.
     role
         What the statement does with it: a dataset's role (``read``,
         ``write``, ``update``, ``drop``, ``mention``), a database table's access
@@ -352,7 +355,7 @@ def _chunk_refs(meta: Any) -> Iterable[dict[str, Any]]:
         options = _redacted(ref.options)
         yield {
             "kind": RefKind.ENGINE,
-            "statement": "libname",
+            "statement": ref.statement,
             "role": "bind",
             "name": ref.binds,
             "raw": _statement(ref.binds, ref.engine, options),
@@ -475,6 +478,7 @@ class _EngineRecord:
     options: tuple[tuple[str, str], ...]
     has_macro_ref: bool
     raw: str
+    statement: str = "libname"
 
     @property
     def option_map(self) -> dict[str, str]:
@@ -488,6 +492,7 @@ class _EngineRecord:
             options=row.options,
             has_macro_ref=row.has_macro_ref,
             raw=row.raw,
+            statement=row.statement,
         )
 
 

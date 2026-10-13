@@ -117,7 +117,11 @@ macro's `set &ds;` makes.
 - **The LIBNAME in force** is the latest one before the read, in corpus order
   and within a file: `libname raw '/data/2025'; set raw.x; libname raw
   '/data/2026'; set raw.y;` reads `/data/2025/x` and `/data/2026/y`. A read
-  before any LIBNAME binds its libref is not planned.
+  before any LIBNAME binds its libref is not planned. A CREATE VIEW's `using
+  libname raw '/other'` serves the view's own query alone: the view's
+  `raw.t` is planned from `/other`, and the next step's `raw.x` from the
+  session's `raw`. A libref only a view assigns is not assigned in the
+  session.
 - **The library item stays** where no member is named, blocked as before;
   where a list (`raw.sales_:`) is read from it, since which members that covers
   only a listing knows; and while any read names its library through a macro

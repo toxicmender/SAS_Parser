@@ -538,9 +538,10 @@ _BASE_ENGINES = frozenset({"", "base", "v9", "v8", "v7"})
 
 
 def _directory_library(ref: "SasPathRef") -> bool:
-    """Whether *ref* is a LIBNAME binding a directory of SAS datasets."""
+    """Whether *ref* is a LIBNAME binding a directory of SAS datasets: in the
+    session, or, a clause of a CREATE VIEW's USING list, for the view."""
     return (
-        ref.statement == "libname"
+        ref.statement in ("libname", "using_libname")
         and bool(ref.binds)
         and not (ref.binds or "").startswith("&")
         and str(ref.location) == "filesystem"
@@ -622,7 +623,12 @@ def _assigned_librefs(
     nothing resolved, which could be any of them."""
     librefs: set[str] = set()
     for engine_refs, path_refs in by_source.values():
-        librefs.update(ref.binds for ref in engine_refs if ref.binds)
+        # A view's own (statement using_libname) is assigned only in the view.
+        librefs.update(
+            ref.binds
+            for ref in engine_refs
+            if ref.binds and getattr(ref, "statement", "libname") == "libname"
+        )
         for ref in path_refs:
             # An environment variable is a libref on UNIX too (_env_library).
             if ref.statement not in ("libname", "setenv") or not ref.binds:
@@ -717,12 +723,18 @@ def _library_members(
         for refs in datasets.get(source_id, ()):
             # Every LIBNAME that stands before this chunk binds its libref now.
             start = min((p for r in refs if (p := _position(r)) is not None), default=None)
+            views: list["SasPathRef"] = []  # a CREATE VIEW's own, for this chunk
             while libnames and (
                 start is None
                 or (position := _position(libnames[0])) is None
                 or position < start
             ):
-                libraries.bind(libnames.pop(0))
+                ref = libnames.pop(0)
+                if ref.statement != "using_libname":
+                    libraries.bind(ref)
+                elif _position(ref) is not None:  # unplaced, it has no chunk
+                    views.append(ref)
+            hidden = libraries.scoped(views)
             made_now: set[str] = set()  # renamed or copied by this step so far
             for ref in refs:
                 if str(ref.role) == "write" and ref.via in _IMMEDIATE_WRITES:
@@ -775,9 +787,11 @@ def _library_members(
                             libref, places, member
                         )
                 found.covered.update(place for place in places[1:] if place[1])
+            libraries.restore(hidden)
             made_here.update(ref.name for ref in refs if str(ref.role) == "write")
         for ref in libnames:  # after the file's last read: in force for the next
-            libraries.bind(ref)
+            if ref.statement != "using_libname":
+                libraries.bind(ref)
     return found
 
 
@@ -794,6 +808,22 @@ class _Libraries:
         """Where SAS looks for a member of *libref*, in order. A LIBNAME wins
         over an environment variable of the same name."""
         return self.bound.get(libref) or self.env.get(libref) or ()
+
+    def scoped(self, refs: Sequence["SasPathRef"]) -> dict[str, tuple[_Library, ...] | None]:
+        """Put *refs* — the LIBNAME clauses of a CREATE VIEW's USING list — in
+        force, and return the bindings they hide, for :meth:`restore`."""
+        hidden = {ref.binds: self.bound.get(ref.binds) for ref in refs if ref.binds}
+        for ref in refs:
+            self.bind(ref)
+        return hidden
+
+    def restore(self, hidden: Mapping[str, tuple[_Library, ...] | None]) -> None:
+        """Put back the bindings :meth:`scoped` hid."""
+        for libref, places in hidden.items():
+            if places is None:
+                self.bound.pop(libref, None)
+            else:
+                self.bound[libref] = places
 
     def bind(self, ref: "SasPathRef") -> None:
         """Put the LIBNAME, or environment variable, *ref* in force. A later

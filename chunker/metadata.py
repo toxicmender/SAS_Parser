@@ -64,7 +64,13 @@ from .models import (
     _path_ref_sort_key,
 )
 from .passthrough import db_table_ref, mask, scan_pass_through
-from .paths import ENGINE_LIBNAMES, extract_engine_refs, extract_paths, normalise_path
+from .paths import (
+    ENGINE_LIBNAMES,
+    extract_engine_refs,
+    extract_paths,
+    in_using_clause,
+    normalise_path,
+)
 from .scanner import _blank_span, _Region, _sanitise
 from .statements import _ODS_OUTPUT_RE, _VAR_REF_RE, _canon_ds
 from .statements import dataset_refs as statement_dataset_refs
@@ -532,9 +538,16 @@ def _metadata_for(region: _Region) -> SasChunkMetadata:
         if kind == SasChunkKind.MACRO_DEFINITION
         else []
     )
-    # Librefs this chunk assigns; ``_all_`` targets every assigned libref.
+    # Librefs this chunk assigns; ``_all_`` targets every assigned libref. A
+    # LIBNAME clause of a CREATE VIEW's USING list assigns its libref only
+    # while the view runs, never in the session.
     defines_librefs = sorted(
-        {_nid(m.group(1)) for m in _LIBNAME_REF_RE.finditer(mt)} - {"_all_"}
+        {
+            _nid(m.group(1))
+            for m in _LIBNAME_REF_RE.finditer(mt)
+            if not in_using_clause(mt, m.start())
+        }
+        - {"_all_"}
         if "libname" in low
         else set()
     )
@@ -1611,6 +1624,10 @@ def resolve_db_librefs(chunks: list[SasChunk]) -> None:
     - ``schema=`` is resolved against the ``%LET`` table where the LIBNAME
       stands; the options themselves stay as written.
     - ``CONNECT USING`` records get their engine and options here.
+    - A LIBNAME clause in a CREATE VIEW's USING list (``using libname ora
+      oracle ...``) binds for the view's own query, in its chunk, and then the
+      session's binding of that libref is back: "the scope of the libref is
+      local to the view" (SAS 9.4 SQL Procedure User's Guide).
 
     Replaces each chunk's ``via=LIBNAME`` records rather than adding to them, so
     the per-file run in ``chunk_text`` and the corpus-level run in the batcher
@@ -1624,6 +1641,10 @@ def resolve_db_librefs(chunks: list[SasChunk]) -> None:
         scope, own = macros.enter(chunk)
         for libref in meta.defines_librefs:
             engines.pop(libref, None)
+        # A view's own librefs hide the session's until the chunk is done.
+        local = {r.binds for r in meta.external_refs if r.statement == "using_libname"}
+        local |= {e.binds for e in meta.engine_refs if e.statement == "using_libname"}
+        hidden = {libref: engines.pop(libref, None) for libref in local if libref}
         for engine_ref in meta.engine_refs:
             db_schema = engine_ref.option_map.get("schema")
             engines[engine_ref.binds] = (
@@ -1639,6 +1660,11 @@ def resolve_db_librefs(chunks: list[SasChunk]) -> None:
             dict.fromkeys([*tables, *_libname_tables(meta, engines)]),
             key=_db_table_sort_key,
         )
+        for libref, session in hidden.items():
+            if session is None:
+                engines.pop(libref, None)
+            else:
+                engines[libref] = session
         if tables != meta.db_tables:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(

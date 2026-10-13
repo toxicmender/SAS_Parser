@@ -215,6 +215,37 @@ class TestStatementForms:
         assert ref.path == "/mac/a"
 
 
+class TestViewLibnames:
+    """A LIBNAME clause in the USING list of PROC SQL's CREATE VIEW: its
+    libref is the view's alone (SAS 9.4 SQL Procedure User's Guide)."""
+
+    SOURCE = (
+        "proc sql;\ncreate view work.v as select * from a.t, b.u, c.w\n"
+        "  using libname a '/a', libname b oracle path=x schema=s,\n"
+        "        libname c odbc dsn=\"d;q\";\nquit;\nlibname a '/session';\n"
+    )
+
+    def test_each_clause_is_a_using_libname(self):
+        assert [(r.statement, r.binds, r.path) for r in extract_paths(self.SOURCE)] == [
+            ("using_libname", "a", "/a"),
+            ("libname", "a", "/session"),
+        ]
+
+    def test_a_database_clause_ends_at_the_comma_before_the_next(self):
+        refs = extract_engine_refs(self.SOURCE)
+        assert [(r.statement, r.binds, r.engine, r.options) for r in refs] == [
+            ("using_libname", "b", "oracle", (("path", "x"), ("schema", "s"))),
+            ("using_libname", "c", "odbc", (("dsn", "d;q"),)),
+        ]
+        assert str(refs[0]).startswith("using libname b oracle")
+
+    def test_a_view_assigns_no_session_libref(self):
+        from chunker import SasSemanticChunker
+
+        chunks = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(self.SOURCE).chunks
+        assert [c.metadata.defines_librefs for c in chunks] == [[], ["a"]]
+
+
 class TestConcatenation:
     """One statement naming several places SAS treats as one: each place is a
     reference of its own, with its position in the list (SAS 9.4 Global

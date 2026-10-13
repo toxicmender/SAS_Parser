@@ -954,6 +954,37 @@ class TestLibnameAccess(unittest.TestCase):
         (table,) = resolved.file_results[1].chunks[0].metadata.db_tables
         self.assertEqual(table.qualified, "fr_dm.accounts")
 
+    def test_a_view_s_own_libname_reaches_its_query_and_nothing_after(self):
+        # "The scope of the libref is local to the view, and will not conflict
+        # with any identically named librefs in the SAS session" (SAS 9.4 SQL
+        # Procedure User's Guide, CREATE VIEW). Before, the view's LIBNAME
+        # rebound edw for every later step.
+        result = _chunk(
+            LIBNAME
+            + "proc sql;\ncreate view work.v as select * from edw.accounts\n"
+            "  using libname edw oracle path=TESTDB schema=qa_dm;\nquit;\n"
+            "data work.a; set edw.accounts; run;\n"
+        )
+        (view,) = _of_kind(result, SasChunkKind.PROC_STEP)
+        (step,) = _of_kind(result, SasChunkKind.DATA_STEP)
+        (viewed,) = view.metadata.db_tables
+        self.assertEqual((viewed.qualified, viewed.option_map["path"]), ("qa_dm.accounts", "TESTDB"))
+        self.assertEqual(view.metadata.defines_librefs, [])
+        (read,) = step.metadata.db_tables
+        self.assertEqual((read.qualified, read.option_map["path"]), ("fr_dm.accounts", "EDWPRO"))
+
+    def test_a_view_s_own_path_libname_hides_a_database_libref_for_the_view_only(self):
+        result = _chunk(
+            LIBNAME
+            + "proc sql;\ncreate view work.v as select * from edw.accounts\n"
+            "  using libname edw '/data/edw';\nquit;\n"
+            "data work.a; set edw.accounts; run;\n"
+        )
+        (view,) = _of_kind(result, SasChunkKind.PROC_STEP)
+        (step,) = _of_kind(result, SasChunkKind.DATA_STEP)
+        self.assertEqual(view.metadata.db_tables, [])
+        self.assertEqual(step.metadata.db_tables[0].qualified, "fr_dm.accounts")
+
     def test_resolution_is_idempotent(self):
         result = _chunk(LIBNAME + EXAMPLE + "data work.a; set edw.accounts; run;\n")
         chunks = list(result.chunks)

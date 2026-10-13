@@ -239,6 +239,13 @@ class PathSpec:
                 refs += self._through_fileref(fref, source.group("members"))
         return refs
 
+    def _statement_at(self, match: re.Match[str]) -> str:
+        """The statement *match* is: a LIBNAME clause in a CREATE VIEW's USING
+        list is ``using_libname`` (:func:`in_using_clause`)."""
+        if self.statement == "libname" and in_using_clause(match.string, match.start()):
+            return "using_libname"
+        return self.statement
+
     def _quoted_ref(
         self, match: re.Match[str], start: int, end: int, index: int | None = None
     ) -> SasPathRef | None:
@@ -251,7 +258,7 @@ class PathSpec:
         engine = _group(match, "engine")
         binds = _group(match, "binds")
         return SasPathRef(
-            statement=self.statement,
+            statement=self._statement_at(match),
             location=classify_location(device),
             path=normalise_path(raw),
             raw=raw,
@@ -282,7 +289,7 @@ class PathSpec:
             elif self.statement == "libname":
                 refs.append(
                     SasPathRef(
-                        statement=self.statement,
+                        statement=self._statement_at(match),
                         location=PathLocation.LIBREF,
                         path=word.lower(),
                         raw=word,
@@ -315,6 +322,26 @@ class PathSpec:
             )
             for raw in spelled
         ]
+
+
+def in_using_clause(text: str, pos: int) -> bool:
+    """Whether the LIBNAME at *pos* of *text* is a clause in the USING list
+    that ends a PROC SQL CREATE VIEW — ``using libname x '/p', libname y
+    oracle ...;`` — after USING, or after the comma between two clauses.
+
+    Its libref is "local to the view, and will not conflict with any
+    identically named librefs in the SAS session" (SAS 9.4 SQL Procedure
+    User's Guide, CREATE VIEW Statement): assigned while the view runs, never
+    in the session. A LIBNAME statement stands after a ``;``, never a comma.
+    """
+    i = pos
+    while i > 0 and text[i - 1].isspace():
+        i -= 1
+    if i > 0 and text[i - 1] == ",":
+        return True
+    if text[max(0, i - 5) : i].lower() != "using":
+        return False
+    return i == 5 or not (text[i - 6].isalnum() or text[i - 6] == "_")
 
 
 def _at_statement(text: str, pos: int) -> bool:
@@ -701,10 +728,12 @@ ENGINE_LIBNAMES: frozenset[str] = frozenset(
 # string holds semicolons of its own: noprompt="DSN=dw;UID=u;". The repeat is
 # possessive: a quote also matches [^;] (an unmatched one, as in O'Neil, must),
 # and with no ';' to end on, giving characters back would try every way of
-# splitting the quotes — time exponential in their number.
+# splitting the quotes — time exponential in their number. In a CREATE VIEW's
+# USING list a clause also ends at the comma before the next LIBNAME.
 _ENGINE_LIBNAME_RE = re.compile(
     rf"\blibname\s+(?P<binds>{DS_REF_TOKEN})\s+(?P<engine>[A-Za-z_]\w*)\b"
-    r"""(?P<opts>(?:"[^"\n]*"|'[^'\n]*'|[^;])*+);""",
+    r"""(?P<opts>(?:"[^"\n]*"|'[^'\n]*'|(?!,\s*libname\b)[^;])*+)"""
+    r"(?:;|(?=,\s*libname\b))",
     re.IGNORECASE,
 )
 
@@ -764,6 +793,9 @@ def extract_engine_refs(text: str) -> list[SasEngineRef]:
             # itself arrive through a macro reference.
             has_macro_ref="&" in match.group(0),
             raw=" ".join(match.group(0).split()),
+            statement=(
+                "using_libname" if in_using_clause(text, match.start()) else "libname"
+            ),
         )
         if ref not in seen:
             seen.add(ref)

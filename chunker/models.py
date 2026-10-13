@@ -99,7 +99,10 @@ class SasPathRef(BaseModel, frozen=True):
         ``file``, ``include``, ``proc_import``, ``proc_cimport`` (its INFILE=
         transport file), ``proc_export``, ``printto``,
         ``ods``, ``sasautos``, ``setenv`` (an environment variable ``x
-        setenv`` or ``options set=`` defines: on UNIX a libref or fileref).
+        setenv`` or ``options set=`` defines: on UNIX a libref or fileref),
+        ``using_libname`` (a LIBNAME clause in the USING list of PROC SQL's
+        CREATE VIEW: its libref is local to the view, assigned while the view
+        runs, and leaves the session's alone).
     location
         See :class:`PathLocation`.
     path
@@ -296,6 +299,10 @@ class SasEngineRef(BaseModel, frozen=True):
     raw
         The statement as written, whitespace-collapsed — what a human needs to
         recognise it in their own source.
+    statement
+        ``libname``, or ``using_libname`` for a LIBNAME clause in the USING
+        list of PROC SQL's CREATE VIEW, whose libref is local to the view (as
+        :attr:`SasPathRef.statement`).
     """
 
     engine: str
@@ -303,6 +310,7 @@ class SasEngineRef(BaseModel, frozen=True):
     options: tuple[tuple[str, str], ...] = ()
     has_macro_ref: bool = False
     raw: str = ""
+    statement: str = "libname"
 
     @property
     def option_map(self) -> dict[str, str]:
@@ -311,17 +319,18 @@ class SasEngineRef(BaseModel, frozen=True):
 
     def __str__(self) -> str:
         opts = " ".join(f"{k}={v}" for k, v in self.options)
-        return f"libname {self.binds} {self.engine}{' ' + opts if opts else ''}"
+        using = "using " if self.statement == "using_libname" else ""
+        return f"{using}libname {self.binds} {self.engine}{' ' + opts if opts else ''}"
 
 
-def _engine_ref_sort_key(ref: SasEngineRef) -> tuple[str, str]:
+def _engine_ref_sort_key(ref: SasEngineRef) -> tuple[str, str, str]:
     """Total order over :class:`SasEngineRef`, defined once.
 
     The counterpart of :func:`_path_ref_sort_key`, and it exists for the same
     reason: ``_merge_meta`` and :attr:`SasBatch.engine_refs` both deduplicate
     through a set, whose iteration order is not stable across runs.
     """
-    return (ref.engine, ref.binds)
+    return (ref.engine, ref.binds, ref.statement)
 
 
 class DbTableAccess(StrEnum):

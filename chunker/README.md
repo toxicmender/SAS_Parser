@@ -565,6 +565,13 @@ credentials). A SAS name under such a libref keeps its place in the I/O lists â€
 SAS code does name `edw.accounts` â€” and also gains a `via=libname` record.
 `CONNECT USING` records get their engine and options here.
 
+A LIBNAME clause in the USING list that ends a PROC SQL CREATE VIEW (`using
+libname edw oracle ..., libname raw '/x'`) is the view's alone: "the scope of
+the libref is local to the view". Its records have statement `using_libname`,
+it is not in `defines_librefs`, and the walk binds it for the view's own query,
+then gives the libref back to the session's LIBNAME. A database clause's
+options end at the comma before the next clause.
+
 **Names spelled through macro variables** resolve like any other: in the
 schema, the table or both (`&sch..&tbl`, `edw_export.t_&sfx._v`,
 `"&SCH"."&TBL"`, `&full_name`, indirect `&&sch_&env...t`), and in the

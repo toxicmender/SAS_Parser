@@ -841,6 +841,9 @@ and old JSON still loads. These changes are visible to callers.
     `resolve_filerefs` turns a reference through a concatenated fileref
     into one per place. The inventory gains a `concat_index` column, which
     an existing table takes on at its next write (Delta schema merge).
+  - A LIBNAME clause of a CREATE VIEW's USING list is statement
+    `using_libname` (`SasPathRef` and the new `SasEngineRef.statement`): the
+    view's alone, never in `defines_librefs` or the session's bindings.
 - **Resolution order.** `resolve_references` runs macro variables, then
   filerefs, ODS OUTPUT and database librefs. Call it rather than the passes
   one by one.
