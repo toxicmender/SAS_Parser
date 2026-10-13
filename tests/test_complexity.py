@@ -2097,8 +2097,16 @@ class TestFileReport(unittest.TestCase):
         self.assertIn("## Drivers", text)
 
     def test_a_floored_size_says_which_kind_floored_it(self):
-        self.assertEqual(self.file.floored_by, "MACRO_DEFINITION")
-        self.assertIn("floored", self._render())
+        # A macro too small to band above SMALL is floored by its definition.
+        # (load.sas no longer is: its %load; reads raw.a through the lib=
+        # default, and that I/O bands it at the floor on its own.)
+        report, texts = _batched(tiny="%macro tiny;\n  %put hello;\n%mend tiny;\n%tiny;\n")
+        file = _file(report, "tiny.sas")
+        self.assertEqual(file.floored_by, "MACRO_DEFINITION")
+        self.assertIn(
+            "floored",
+            render_file_report(file, texts=texts, target_display=report.target_display),
+        )
 
 
 class TestOverallReport(unittest.TestCase):

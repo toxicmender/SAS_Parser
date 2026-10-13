@@ -694,6 +694,22 @@ def test_a_read_of_a_shell_command_is_one_blocked_item():
     assert _plan(job="filename o pipe 'lpr';\ndata _null_; file o; put 'x'; run;\n").items == []
 
 
+def test_a_read_through_a_keyword_default_is_planned():
+    # `%load();` reads raw.feed through `src=`'s default (SAS 9.4 Macro
+    # Language: Reference, %MACRO Statement). Before, the call read nothing,
+    # and /data/raw was planned as one blocked library item.
+    plan = _plan(
+        job=(
+            "libname raw '/data/raw';\n"
+            "%macro load(out=work.loaded, src=raw.feed);\n  data &out; set &src; run;\n%mend;\n"
+            "%load();\n"
+        )
+    )
+    assert [(i.source.locator, i.source.object_name, i.blockers) for i in plan.items] == [
+        ("/data/raw", "feed", ())
+    ]
+
+
 def test_a_file_proc_import_reads_through_a_fileref_is_data():
     # The FILENAME is planned once, PROC IMPORT reading it as INFILE does.
     # Before, the read went unrecorded, so a fileref an %INCLUDE also named

@@ -20,7 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .keywords import _STANDARD_AUTOCALL_MACROS
-from .macro_vars import _parse_call_args, resolve_refs
+from .macro_vars import _parse_call_args, macro_signature, resolve_refs
 from .metadata import _canon_ds, resolve_references
 from .models import (
     DatasetRole,
@@ -34,6 +34,7 @@ from .models import (
     SasDatasetRef,
     _db_table_sort_key,
 )
+from .scanner import _sanitise
 
 logger = logging.getLogger(__name__)
 
@@ -632,6 +633,9 @@ class _EdgeDiscovery:
         self.produces_ds: dict[str, list[int]] = defaultdict(list)
         # macro name → global index of defining chunk (last definition wins)
         self.defines_macro: dict[str, int] = {}
+        # defining chunk's global index → its keyword parameters' defaults,
+        # read from the %MACRO header the first time a call needs them
+        self._defaults: dict[int, dict[str, str]] = {}
         # macro variable name → global indices of chunks that create it, via
         # SYMPUT/SQL-INTO side effects or %LET/%GLOBAL/%LOCAL declarations
         # (both treated identically).
@@ -939,6 +943,34 @@ class _EdgeDiscovery:
                     via=ds_norm,
                 )
 
+    def _keyword_defaults(self, didx: int) -> dict[str, str]:
+        """The default each keyword parameter of the macro defined at *didx*
+        takes when a call names no value for it: "You can specify default
+        values after the equal signs" (SAS 9.4 Macro Language: Reference,
+        %MACRO Statement). One with none after its ``=`` is null, and absent
+        here."""
+        defaults = self._defaults.get(didx)
+        if defaults is None:
+            text = _sanitise(self._header_chunk(didx).text, blank_strings=False)
+            defaults = {name: value for name, value in macro_signature(text) if value}
+            self._defaults[didx] = defaults
+        return defaults
+
+    def _header_chunk(self, didx: int) -> SasChunk:
+        """The chunk whose text opens with the %MACRO header of the definition
+        at *didx*: that chunk, or for a slice of a split definition (which
+        ``defines_macro`` names by its last slice), the region it was cut
+        from, which comes before its slices in the same file."""
+        chunk = self.flat_chunks[didx]
+        if chunk.parent_id is None:
+            return chunk
+        for i in range(didx - 1, -1, -1):
+            if self.file_of[i] != self.file_of[didx]:
+                break
+            if self.flat_chunks[i].chunk_id == chunk.parent_id:
+                return self.flat_chunks[i]
+        return chunk
+
     def _resolve_macro_body(
         self,
         cidx: int,
@@ -966,6 +998,8 @@ class _EdgeDiscovery:
                     f"macro_body_dataset: call {chunk.chunk_id} invokes %{mac}  pos_args={pos_args}  kw_args={kw_args}"
                 )
 
+            defaults = self._keyword_defaults(didx)
+
             def _resolve(pname: str, pos: int | None) -> str | None:
                 if pos is not None and pos >= 0:
                     if pos < len(pos_args):
@@ -973,8 +1007,8 @@ class _EdgeDiscovery:
                     if pname in kw_args:
                         return kw_args[pname]
                     return None
-                # keyword-only parameter
-                return kw_args.get(pname)
+                # keyword-only parameter: the call's value, else its default
+                return kw_args.get(pname, defaults.get(pname))
 
             # Each body reference spelled through a parameter, resolved with the
             # role the body gives it: `data &ds;` creates the argument, `set

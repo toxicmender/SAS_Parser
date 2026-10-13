@@ -283,6 +283,63 @@ class TestMacroInvocation(unittest.TestCase):
             br.batches[0].reason,
         )
 
+    def test_a_call_that_leaves_a_keyword_parameter_out_uses_its_default(self):
+        """A keyword parameter the call names no value for holds its default
+        (SAS 9.4 Macro Language: Reference, %MACRO Statement). Before, the
+        call read and wrote nothing through it, so `%load();` created no
+        work.loaded and the PROC PRINT reading it stood alone."""
+        src = (
+            "%macro load(out=work.loaded, src=raw.feed);\n"
+            "  data &out; set &src; run;\n%mend;\n"
+            "%load();\nproc print data=work.loaded; run;\n"
+            "%load(out=work.x, src=);\n"
+            "%macro two(ds, lib=prod);\n  data &ds; set &lib..t; run;\n%mend;\n"
+            "%two(a);\n"
+        )
+        cr, br = _chunk_and_batch(src)
+        calls = {
+            c.text.strip(): (c.metadata.input_datasets, c.metadata.output_datasets)
+            for b in br.batches
+            for c in b.chunks
+            if c.kind is SasChunkKind.MACRO_CALL
+        } | {
+            c.text.strip(): (c.metadata.input_datasets, c.metadata.output_datasets)
+            for c in br.singletons
+            if c.kind is SasChunkKind.MACRO_CALL
+        }
+        self.assertEqual(
+            calls,
+            {
+                "%load();": (["raw.feed"], ["work.loaded"]),
+                # `src=` names an empty value, which is no default.
+                "%load(out=work.x, src=);": ([], ["work.x"]),
+                "%two(a);": (["prod.t"], ["work.a"]),
+            },
+        )
+        [batch] = [b for b in br.batches if "work.loaded" in b.output_datasets]
+        self.assertIn("dataset_flow(work.loaded)", batch.reason)
+
+    def test_the_defaults_of_a_split_definition_come_from_its_header(self):
+        """A definition cut into slices is indexed by its last slice, which
+        holds no %MACRO header; the defaults are read from the region."""
+        body = "".join(f"  data work.t{i}; set work.s{i}; x = {i}; y = x * 2; run;\n" for i in range(12))
+        src = (
+            "%macro load(out=work.loaded, src=raw.feed);\n" + body
+            + "  data &out; set &src; run;\n%mend;\n%load();\n"
+        )
+        result = SasSemanticChunker(min_words=1, max_words=40).chunk_text(src, source_id="t.sas")
+        self.assertGreater(sum(c.parent_id is not None for c in result.chunks), 1)
+        br = SasChunkBatcher().batch(result)
+        [call] = [
+            c
+            for c in (*(c for b in br.batches for c in b.chunks), *br.singletons)
+            if c.kind is SasChunkKind.MACRO_CALL
+        ]
+        self.assertEqual(
+            (call.metadata.input_datasets, call.metadata.output_datasets),
+            (["raw.feed"], ["work.loaded"]),
+        )
+
     def test_macro_def_two_callsites_globals_batch(self):
         """One macro definition + two independent call sites: the definition
         is consumed by two separate components, so it is promoted to the

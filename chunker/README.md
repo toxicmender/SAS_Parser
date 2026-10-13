@@ -340,8 +340,10 @@ THEN`, `ELSE`, `WHEN (…)` or `OTHERWISE`; a subsetting `IF` has none. Then:
 - **Open code** names no dataset but through ODS OUTPUT: not a `%PUT`, a
   `%LET`, or a macro call's arguments.
 - **A `%MACRO` body** is read the same way, and its references are classified
-  by spelling: exactly one of its parameters (`&ds`, resolved per call site),
-  built from several (dropped: no call names one dataset), or written out or
+  by spelling: exactly one of its parameters (`&ds`, resolved per call site:
+  the call's value, or for a keyword parameter the call leaves out, the
+  default its `%MACRO` header gives it), built from several (dropped: no call
+  names one dataset), or written out or
   through some other macro variable (a literal). A body statement outside any
   step it opens may complete its caller's step (`%macro sets; set a b;
   %mend;`), so it is read as what its keyword makes it — a DATA step
