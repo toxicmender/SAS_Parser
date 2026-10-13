@@ -610,6 +610,23 @@ def test_a_path_the_sas_server_completes_is_blocked():
     assert not any("SAS server" in b for b in item.blockers)
 
 
+def test_a_file_read_through_a_wildcard_is_blocked():
+    # UNIX lets FILENAME and INFILE name every file a pattern matches: *, ?
+    # and [ ] (SAS 9.4 Companion for UNIX Environments). Before, the plan
+    # loaded a file literally named "wild*.dat".
+    for job, path in (
+        ("filename wild '/data/in/wild*.dat';\ndata; infile wild; input; run;\n", "/data/in/wild*.dat"),
+        ("data a; infile '/data/in/m?_[0-9].csv'; input v; run;\n", "/data/in/m?_[0-9].csv"),
+        ("filename subfiles '/data/*/*';\ndata; infile subfiles; input; run;\n", "/data/*/*"),
+    ):
+        [item] = _plan(job=job).items
+        # One reason: not also "a library directory", nor "no target name".
+        [blocker] = item.blockers
+        assert blocker.startswith(f"'{path}' is a wildcard"), job
+    plan = _plan(job="filename f ('/a/x*.csv' '/b/y.csv');\ndata; infile f; input; run;\n")
+    assert [bool(i.blockers) for i in plan.items] == [True, False]
+
+
 def test_a_read_through_any_documented_engine_is_planned():
     # SNOW, JDBC, GREENPLM, VERTICA, ... are SAS/ACCESS engines. Unrecognised,
     # their LIBNAME was neither a database nor a directory, and the read gave

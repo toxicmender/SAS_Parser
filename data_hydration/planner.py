@@ -279,8 +279,13 @@ def _path_source(ref: "SasPathRef", source_id: str | None) -> HydrationSource | 
         )
     # A path with no file suffix is a directory — a LIBNAME binding a whole
     # library, not one dataset. It keeps the whole path as its locator and no
-    # object name, which is what ``_library_blocker`` reads.
-    if kind is SourceKind.FILE and "." not in _basename(ref.path):
+    # object name, which is what ``_library_blocker`` reads. A wildcard
+    # (``'/data/*/*'``) names files, whatever its last part.
+    if (
+        kind is SourceKind.FILE
+        and "." not in _basename(ref.path)
+        and not _WILDCARD_RE.search(_basename(ref.path))
+    ):
         return HydrationSource(
             kind=kind,
             locator=ref.effective_path,
@@ -357,6 +362,28 @@ def _server_parts(path: str) -> list[str]:
         for name in _ENV_VAR_RE.findall(path)
     ]
     return parts
+
+
+# A UNIX wildcard in an input path: *, ? or a [ ] set (SAS 9.4 Companion for
+# UNIX Environments, Using Wildcards in Pathnames).
+_WILDCARD_RE = re.compile(r"[*?]|\[[^\]]*\]")
+
+
+def _wildcard_blocker(source: HydrationSource) -> tuple[str, ...]:
+    """A blocker for a file read through a wildcard: ``filename wild
+    '/data/in/wild*.dat';`` reads every file the pattern matches, one after
+    another — ``*`` one or more characters, ``?`` one, ``[ ]`` one of a set
+    — which only a listing of the server's directory can tell."""
+    if source.kind is not SourceKind.FILE:
+        return ()
+    path = f"{source.locator}/{source.object_name}" if source.object_name else source.locator
+    if not _WILDCARD_RE.search(path):
+        return ()
+    return (
+        f"'{path}' is a wildcard: SAS reads every file it matches, one after "
+        f"another — list them on the SAS server and hydrate each, or point "
+        f"this item at one",
+    )
 
 
 def _server_blocker(source: HydrationSource) -> tuple[str, ...]:
@@ -1139,13 +1166,14 @@ def build_corpus_plan(
     seen_tables: set[str] = set()
     for source, extra in sources:
         target, name_blockers = _target_for(source, config, run_date)
-        blockers = [*_macro_blocker(source), *_server_blocker(source), *extra]
+        wildcard = _wildcard_blocker(source)
+        blockers = [*_macro_blocker(source), *_server_blocker(source), *wildcard, *extra]
         library = _library_blocker(source)
         blockers += library
         # A library directory has no table name *because* it is a directory, so
         # its rendering failure is already explained; reporting both would say
-        # the same thing twice in less useful words.
-        if not library:
+        # the same thing twice in less useful words. So has a wildcard.
+        if not library and not wildcard:
             blockers += name_blockers
         if source.kind is SourceKind.SPDE and not config.has_sas_session:
             blockers.append(

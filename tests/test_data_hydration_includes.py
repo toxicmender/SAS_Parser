@@ -25,6 +25,7 @@ import pytest
 from chunker import SasCorpus, SasSemanticChunker, resolve_corpus_datasets
 from data_hydration.config import HydrationConfig
 from data_hydration.includes import (
+    found_in,
     include_checks,
     include_file_name,
     is_include,
@@ -190,6 +191,33 @@ def test_the_checks_name_each_script_once_with_everyone_who_includes_it():
     assert checks["&f"].status == "unnamed"
     # Unchecked: nobody looked.
     assert {c.status for c in include_checks(_rows(job=SRC))} == {"unchecked"}
+
+
+def test_a_wildcard_include_finds_every_script_it_matches():
+    # `%include '/code/macros/*.sas';` reads every match (SAS 9.4 Companion for
+    # UNIX Environments, Using Wildcards in Pathnames): * is one or more
+    # characters, never a leading period. Before, "*.sas" was looked for by
+    # that name and reported missing.
+    index = {
+        "a.sas": ("m/a.sas",),
+        "util1.sas": ("m/util1.sas",),
+        "util22.sas": ("m/util22.sas",),
+        ".hidden.sas": ("m/.hidden.sas",),
+        "notes.txt": ("m/notes.txt",),
+        "b.sas": ("other/b.sas",),
+    }
+    assert found_in(index, "*.sas") == ("m/a.sas", "other/b.sas", "m/util1.sas", "m/util22.sas")
+    assert found_in(index, "util?.sas") == ("m/util1.sas",)
+    assert found_in(index, "[ab].sas") == ("m/a.sas", "other/b.sas")
+    assert found_in(index, "Util1.SAS") == ("m/util1.sas",)
+    assert found_in(index, "u*1.sas") == ("m/util1.sas",)
+    rows = match_includes(_rows(job="%include '/code/macros/util*.sas';\n"), local=index)
+    [check] = include_checks(rows)
+    assert (check.file_name, check.status, check.local) == (
+        "util*.sas",
+        "found",
+        ("m/util1.sas", "m/util22.sas"),
+    )
 
 
 def test_one_statement_including_two_copies_of_a_script_is_one_site():

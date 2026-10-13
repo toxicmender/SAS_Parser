@@ -147,6 +147,10 @@ macro's `set &ds;` makes.
   `$VARIABLE` an environment variable. Where those point only the server
   knows, so an item whose path holds one says which, the variable's case
   kept (`$PROJ`), and asks for the place it names.
+- **A wildcard is blocked.** On UNIX, FILENAME and INFILE may name every file
+  a pattern matches — `'/data/in/wild*.dat'`, `'/data/*/*'`, `[0-9]` — read
+  one after another. Which files those are only a listing on the SAS server
+  says, so such an item is blocked, for that reason alone.
 - **A data set read by its path is an item too.** `set
   '/u/2011/budgets/may';` reads `may.sas7bdat` there (SAS adds the
   extension), so it is a `sas7bdat` item, the path's case kept; with no
@@ -227,7 +231,9 @@ the answer in `found_local` / `found_sharepoint` (`None` where nobody looked, an
 empty list where the script is missing), and the CLI prints one line per
 script. A folder SharePoint cannot list fails the run's exit status, never the
 rest of the check. `python -m complexity --check-includes` uses the same
-matching for its report.
+matching for its report. A wildcard (`%include '/code/macros/util*.sas';`)
+finds every script it matches, as SAS on UNIX reads one: `*` is one or more
+characters and never a leading period, `?` one, `[ ]` one of a set.
 
 An `%INCLUDE` also says what a FILENAME is: `filename src '/code/macros';` read
 only through `%include src(util);` names SAS source, so the plan leaves it out,

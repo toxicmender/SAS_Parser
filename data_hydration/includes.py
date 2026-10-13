@@ -24,6 +24,7 @@ Logger name: ``data_hydration.includes``.
 
 from __future__ import annotations
 
+import fnmatch
 import logging
 import re
 from collections.abc import Iterable, Mapping
@@ -72,6 +73,28 @@ def include_file_name(row: InventoryRow) -> str | None:
     if not name or "&" in name:
         return None
     return name
+
+
+# A UNIX wildcard in a file name: *, ? or a [ ] set.
+_WILDCARD_RE = re.compile(r"[*?]|\[[^\]]*\]")
+
+
+def found_in(index: FileIndex, name: str) -> tuple[str, ...]:
+    """The scripts of *index* named *name*, ignoring case: one name, or for
+    a wildcard (``%include '/code/macros/*.sas';``) every name it matches,
+    in name order. As SAS on UNIX reads one, ``*`` is one or more characters
+    and never matches a leading period, ``?`` is one, ``[ ]`` one of a set
+    (SAS 9.4 Companion for UNIX Environments, Using Wildcards in Pathnames)."""
+    key = name.lower()
+    if not _WILDCARD_RE.search(key):
+        return tuple(index.get(key, ()))
+    pattern = re.compile(fnmatch.translate(key.replace("*", "?*")))
+    return tuple(
+        path
+        for file_name, paths in sorted(index.items())
+        if pattern.match(file_name) and not (file_name.startswith(".") and key[0] != ".")
+        for path in paths
+    )
 
 
 def local_index(root: Path) -> dict[str, tuple[str, ...]]:
@@ -146,11 +169,10 @@ def match_includes(
             matched.append(row)
             continue
         name = include_file_name(row)
-        key = name.lower() if name else None
         update: dict[str, tuple[str, ...]] = {}
         for column, index in (("found_local", local), ("found_sharepoint", sharepoint)):
             if index is not None:
-                update[column] = tuple(index.get(key, ())) if key else ()
+                update[column] = found_in(index, name) if name else ()
         matched.append(row.model_copy(update=update) if update else row)
     return matched
 
