@@ -102,7 +102,8 @@ class SasPathRef(BaseModel, frozen=True):
         setenv`` or ``options set=`` defines: on UNIX a libref or fileref),
         ``using_libname`` (a LIBNAME clause in the USING list of PROC SQL's
         CREATE VIEW: its libref is local to the view, assigned while the view
-        runs, and leaves the session's alone).
+        runs, and leaves the session's alone), ``cd`` (SAS's own cd command,
+        ``x cd /dir;``: the current directory relative paths are read from).
     location
         See :class:`PathLocation`.
     path

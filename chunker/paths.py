@@ -377,6 +377,9 @@ def _governing_quote(match: re.Match[str], start: int) -> str:
         for literal in _QUOTED_RE.finditer(match.string, lo, hi):
             if literal.start() < start < literal.end():
                 return literal.group()[0]
+    # A quoted command (`x 'cd &dir';`): its quotes govern the value in it.
+    if "q" in match.re.groupindex and match.group("q") and match.start("q") < start:
+        return match.group("q")
     return match.string[start - 1] if start else ""
 
 
@@ -624,6 +627,38 @@ PATH_STATEMENTS: tuple[PathSpec, ...] = (
             r"(?P<head>(?i:\boptions\b[^;]*?\bset)\s*=\s*\(?\s*"
             r"(?P<binds>[A-Z_][A-Z0-9_]*)\s*=?\s*)(?P<q>['\"])(?P<path>/[^'\"\n]*)(?P=q)"
         ),
+    ),
+    # SAS's own cd command, which "changes the current directory of your SAS
+    # session": relative file names are looked for there from then on. Only
+    # as the one command of an X statement, CALL SYSTEM or %SYSEXEC — among
+    # several (`x 'cd /a; ls';`) it runs in a child shell and changes nothing
+    # (SAS 9.4 Companion for UNIX Environments, Executing Operating System
+    # Commands from Your SAS Session).
+    PathSpec(
+        statement="cd",
+        keyword="cd",
+        pattern=re.compile(
+            r"(?P<head>(?i:\bx\s+(?P<q>['\"]?)\s*cd)\s+)(?P<path>[^\s;'\"]+)"
+            r"\s*(?P=q)\s*(?=;|\Z)"
+        ),
+        at_statement=True,
+    ),
+    PathSpec(
+        statement="cd",
+        keyword="system",
+        pattern=re.compile(
+            r"(?P<head>(?i:\bcall\s+system\s*\(\s*)(?P<q>['\"])\s*(?i:cd)\s+)"
+            r"(?P<path>[^\s;'\"]+)\s*(?P=q)\s*\)"
+        ),
+        at_statement=True,
+    ),
+    PathSpec(
+        statement="cd",
+        keyword="sysexec",
+        pattern=re.compile(
+            r"(?P<head>(?i:%\s*sysexec\s+cd)\s+)(?P<path>[^\s;'\"]+)\s*(?=;|\Z)"
+        ),
+        at_statement=True,
     ),
     # options sasautos='<path>' — see the module docstring on the list form.
     PathSpec(

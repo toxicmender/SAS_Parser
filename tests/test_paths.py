@@ -180,6 +180,24 @@ class TestStatementForms:
         assert extract_paths("x setenv educ /lower;") == []
         assert extract_paths("options set=TMP 'relative';") == []
 
+    def test_a_cd_command_names_the_current_directory(self):
+        # SAS's own cd, as the only command of X, CALL SYSTEM or %SYSEXEC.
+        src = (
+            "x cd /a;\nx 'cd /b';\nx \"cd &dir\";\n"
+            "data _null_; call system('cd /c'); run;\n%sysexec cd /d;\n"
+            "x 'cd /e; ls';\nput 'x cd /f';\n"
+        )
+        refs = extract_paths(src)
+        assert [(r.statement, r.raw, r.has_macro_ref) for r in refs] == [
+            ("cd", "/a", False),
+            ("cd", "/b", False),
+            ("cd", "&dir", True),
+            ("cd", "/c", False),
+            ("cd", "/d", False),
+        ]
+        # In single quotes SAS reads & as a character.
+        assert _one("x 'cd &dir';").has_macro_ref is False
+
     def test_proc_export_outfile(self):
         ref = _one("proc export data=work.a outfile='/out/a.csv'; run;")
         assert ref.statement == "proc_export"

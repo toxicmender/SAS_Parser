@@ -68,7 +68,8 @@ class RefKind(StrEnum):
 
 
 #: What a statement does with the place it names: a LIBNAME or FILENAME binds a
-#: name to it, an INFILE or %INCLUDE reads it, a FILE or ODS destination writes.
+#: name to it, and a cd binds the current directory; an INFILE or %INCLUDE
+#: reads it, a FILE or ODS destination writes.
 _PATH_ROLES = {
     "libname": "bind",
     "using_libname": "bind",
@@ -81,6 +82,7 @@ _PATH_ROLES = {
     "proc_export": "write",
     "ods": "write",
     "printto": "write",
+    "cd": "bind",
 }
 
 

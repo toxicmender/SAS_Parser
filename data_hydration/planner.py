@@ -26,10 +26,14 @@ Logger name: ``data_hydration.planner``.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
+import posixpath
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, NamedTuple
+
+from pydantic import BaseModel
 
 from .config import HydrationConfig
 from .models import (
@@ -237,7 +241,7 @@ def _path_source(ref: "SasPathRef", source_id: str | None) -> HydrationSource | 
     """
     # Where a job writes (FILE, PROC EXPORT, ODS, PROC PRINTTO's log and
     # listing) and the SAS it pulls in are no data to load.
-    if ref.statement in {"include", "ods", "sasautos", "file", "proc_export", "printto"}:
+    if ref.statement in {"include", "ods", "sasautos", "file", "proc_export", "printto", "cd"}:
         return None
     # ``infile in;`` reads through a fileref, at the path its FILENAME names
     # (chunker.metadata.resolve_filerefs): that FILENAME's own reference is
@@ -337,6 +341,35 @@ def _absolute(path: str) -> bool:
     )
 
 
+def _full_path(source: HydrationSource) -> str:
+    """*source*'s place in one path: its directory and object, or either."""
+    if source.locator and source.object_name:
+        return f"{source.locator}/{source.object_name}"
+    return source.locator or source.object_name
+
+
+def _relative(path: str) -> bool:
+    """Whether *path* is relative: SAS reads it from its current directory.
+    One the server completes, or spelled through a macro variable, is not
+    taken for one."""
+    return bool(path) and not _absolute(path) and not _server_parts(path) and "&" not in path
+
+
+def _relative_blocker(source: HydrationSource) -> tuple[str, ...]:
+    """A blocker for a filesystem source left relative: no cd before it in
+    the corpus says which directory SAS reads it from."""
+    if source.kind not in (SourceKind.FILE, SourceKind.SAS_DATASET, SourceKind.SPDE):
+        return ()
+    path = _full_path(source)
+    if not _relative(path):
+        return ()
+    return (
+        f"'{path}' is a relative path: SAS reads it from its current directory, "
+        f"which no cd before it sets (x cd, CALL SYSTEM('cd ...'), %SYSEXEC cd) "
+        f"— point this item at the directory it names",
+    )
+
+
 # An environment variable in a UNIX path: $HOME, $PROJ.
 _ENV_VAR_RE = re.compile(r"\$([A-Za-z_]\w*)")
 
@@ -376,7 +409,7 @@ def _wildcard_blocker(source: HydrationSource) -> tuple[str, ...]:
     — which only a listing of the server's directory can tell."""
     if source.kind is not SourceKind.FILE:
         return ()
-    path = f"{source.locator}/{source.object_name}" if source.object_name else source.locator
+    path = _full_path(source)
     if not _WILDCARD_RE.search(path):
         return ()
     return (
@@ -391,7 +424,7 @@ def _server_blocker(source: HydrationSource) -> tuple[str, ...]:
     (:func:`_server_parts`): the plan cannot know where it points."""
     if source.kind not in (SourceKind.FILE, SourceKind.SAS_DATASET, SourceKind.SPDE):
         return ()
-    path = f"{source.locator}/{source.object_name}" if source.object_name else source.locator
+    path = _full_path(source)
     parts = _server_parts(path)
     if not parts:
         return ()
@@ -408,9 +441,8 @@ def _quoted_dataset(path: str, reader: str | None) -> tuple[HydrationSource, tup
     ``set '/u/2011/budgets/may';`` reads the SAS data file
     ``/u/2011/budgets/may.sas7bdat`` — on UNIX "if you do not specify an
     extension, SAS uses .sas7bdat" — so the item loads it as a SAS data set.
-    A path that is not a full one is read from the directory SAS runs in,
-    which the corpus does not say, and one with another extension names no
-    SAS data file.
+    One with another extension names no SAS data file. A relative path is
+    the current directory's (:class:`_WorkingDirectories`).
     """
     member = _member_of(path)
     source = HydrationSource(
@@ -421,12 +453,6 @@ def _quoted_dataset(path: str, reader: str | None) -> tuple[HydrationSource, tup
         source_id=reader,
     )
     blockers: list[str] = []
-    if not _absolute(path) and not _server_parts(path):
-        blockers.append(
-            f"'{path}' is not a full path: SAS reads it from the directory it "
-            f"runs in, which the corpus does not say — point this item at the "
-            f"directory that holds it"
-        )
     if "." in member:
         blockers.append(
             f"'{path}' names no SAS data file (.sas7bdat) — check what the "
@@ -799,6 +825,9 @@ def _unassigned_blocker(libref: str, read: Sequence[str]) -> str:
 def _library_members(
     by_source: Mapping[str, tuple[Sequence["SasEngineRef"], Sequence["SasPathRef"]]],
     datasets: Mapping[str, Sequence[Sequence["SasDatasetRef"]]],
+    *,
+    directories: "_WorkingDirectories | None" = None,
+    relative: dict[str, tuple[str, str]] | None = None,
 ) -> _Members:
     """The datasets to load from each directory library.
 
@@ -883,8 +912,14 @@ def _library_members(
                     writers.get(ref.name, set()) - {source_id}
                 )
                 if ref.name.startswith("'"):
-                    # Named by its path, through no libref: its own item.
+                    # Named by its path, through no libref: its own item, a
+                    # relative path read from the current directory.
                     path = _quoted_spelling(ref)
+                    cwd = directories.at(source_id, _position(ref)) if directories else None
+                    if cwd is not None and _relative(path):
+                        if relative is not None:
+                            relative.setdefault(_under(cwd, path), (path, cwd))
+                        path = _under(cwd, path)
                     key = (_directory(path), _member_of(path).lower())
                     if not made and key not in seen:
                         seen.add(key)
@@ -1054,6 +1089,95 @@ def _position(ref: object) -> int | None:
     return getattr(ref, "order", None)
 
 
+def _change_directory(current: str | None, target: str) -> str | None:
+    """The current directory after ``cd target`` from *current*: *target*
+    when it is a full path (or one the server completes), else *target*
+    under *current*; ``None`` when that cannot be known."""
+    if "&" in target:
+        return None
+    if not _relative(target):
+        return posixpath.normpath(target) if target.startswith("/") else target
+    return None if current is None else _under(current, target)
+
+
+def _under(directory: str, relative: str) -> str:
+    """*relative* read from *directory*: ``data/x`` under ``/users/smith`` is
+    ``/users/smith/data/x``, ``..`` and ``.`` taken as the shell takes them."""
+    return posixpath.normpath(f"{directory.rstrip('/')}/{relative}")
+
+
+class _WorkingDirectories:
+    """SAS's current directory as the corpus runs: the one the last single
+    cd before a statement set — ``x cd /users/smith/report;``, ``call
+    system('cd ...');`` or ``%sysexec cd ...;`` — kept from one file to the
+    next, in corpus order. "The search for any relative (partial) filenames
+    during the SAS session now begins in" it (SAS 9.4 Companion for UNIX
+    Environments). Before the first, or after a cd it cannot follow, it is
+    unknown (``None``): the directory SAS was started in."""
+
+    def __init__(
+        self, by_source: Mapping[str, tuple[Sequence["SasEngineRef"], Sequence["SasPathRef"]]]
+    ) -> None:
+        self._start: dict[str, str | None] = {}
+        self._changes: dict[str, list[tuple[int | None, str | None]]] = {}
+        current: str | None = None
+        for source_id, (_, path_refs) in by_source.items():
+            self._start[source_id] = current
+            changes: list[tuple[int | None, str | None]] = []
+            cds = [ref for ref in path_refs if ref.statement == "cd"]
+            for ref in sorted(cds, key=lambda r: (_position(r) is not None, _position(r) or 0)):
+                current = _change_directory(current, ref.effective_path)
+                changes.append((_position(ref), current))
+            self._changes[source_id] = changes
+
+    def at(self, source_id: str, position: int | None) -> str | None:
+        """The current directory where *position* stands in *source_id*. A
+        record that does not say where it stands sees all of its file's."""
+        current = self._start.get(source_id)
+        for changed_at, directory in self._changes.get(source_id, ()):
+            if position is not None and changed_at is not None and changed_at >= position:
+                break
+            current = directory
+        return current
+
+
+def _placed(ref: "SasPathRef", place: str) -> "SasPathRef":
+    """*ref*, a chunk's record or an inventory row's, read at *place*."""
+    if isinstance(ref, BaseModel):
+        return ref.model_copy(update={"resolved_path": place})
+    return dataclasses.replace(ref, resolved_path=place)  # type: ignore[type-var]
+
+
+def _from_current_directory(
+    by_source: Mapping[str, tuple[Sequence["SasEngineRef"], Sequence["SasPathRef"]]],
+    directories: _WorkingDirectories,
+    relative: dict[str, tuple[str, str]],
+) -> dict[str, tuple[Sequence["SasEngineRef"], Sequence["SasPathRef"]]]:
+    """*by_source* with each relative filesystem path read from the current
+    directory where it stands, when a cd says which: ``x cd /users/smith;
+    infile 'in/x.csv';`` reads ``/users/smith/in/x.csv``. *relative* gains
+    each such place, with its spelling and the directory, for the item's
+    note. One no cd before it explains stays relative, and its item is
+    blocked (:func:`_relative_blocker`)."""
+    placed: dict[str, tuple[Sequence["SasEngineRef"], Sequence["SasPathRef"]]] = {}
+    for source_id, (engine_refs, path_refs) in by_source.items():
+        refs: list["SasPathRef"] = []
+        for ref in path_refs:
+            spelled = ref.effective_path
+            if (
+                str(ref.location) == "filesystem"
+                and ref.statement not in ("cd", "setenv")
+                and _relative(spelled)
+                and (cwd := directories.at(source_id, _position(ref))) is not None
+            ):
+                place = _under(cwd, spelled)
+                relative.setdefault(place, (spelled, cwd))
+                ref = _placed(ref, place)
+            refs.append(ref)
+        placed[source_id] = (engine_refs, refs)
+    return placed
+
+
 def build_corpus_plan(
     by_source: Mapping[str, tuple[Sequence["SasEngineRef"], Sequence["SasPathRef"]]],
     *,
@@ -1101,7 +1225,13 @@ def build_corpus_plan(
         for table in tables
         if str(table.via) == "libname"
     )
-    members = _library_members(by_source, datasets or {})
+    # Relative paths read from the current directory a cd sets, where one does.
+    relative: dict[str, tuple[str, str]] = {}
+    directories = _WorkingDirectories(by_source)
+    by_source = _from_current_directory(by_source, directories, relative)
+    members = _library_members(
+        by_source, datasets or {}, directories=directories, relative=relative
+    )
     if members.unassigned and logger.isEnabledFor(logging.DEBUG):
         logger.debug(f"build_corpus_plan: unassigned libraries {sorted(members.unassigned)}")
     expanded: set[_Library] = set()
@@ -1167,7 +1297,13 @@ def build_corpus_plan(
     for source, extra in sources:
         target, name_blockers = _target_for(source, config, run_date)
         wildcard = _wildcard_blocker(source)
-        blockers = [*_macro_blocker(source), *_server_blocker(source), *wildcard, *extra]
+        blockers = [
+            *_macro_blocker(source),
+            *_server_blocker(source),
+            *_relative_blocker(source),
+            *wildcard,
+            *extra,
+        ]
         library = _library_blocker(source)
         blockers += library
         # A library directory has no table name *because* it is a directory, so
@@ -1188,6 +1324,13 @@ def build_corpus_plan(
             probe=probe,
         )
         notes = _index_note(source, path_ref_list)
+        # A relative place: the file's own, or its library directory's.
+        spelled = relative.get(_full_path(source)) or relative.get(source.locator)
+        if spelled is not None:
+            notes += (
+                f"'{spelled[0]}' is relative: planned in {spelled[1]}, the "
+                f"current directory the last cd before it set",
+            )
         if source.kind is SourceKind.SAS_DATASET and (
             concatenation := members.notes.get((source.locator, source.object_name))
         ):

@@ -147,6 +147,15 @@ macro's `set &ds;` makes.
   `$VARIABLE` an environment variable. Where those point only the server
   knows, so an item whose path holds one says which, the variable's case
   kept (`$PROJ`), and asks for the place it names.
+- **A relative path is read from the current directory.** SAS looks for
+  one in its current directory, which a lone `cd` changes — `x cd
+  /users/smith;`, `x 'cd /users/smith';`, `call system('cd /users/smith');`,
+  `%sysexec cd /users/smith;` — and a `cd` among other commands, run in a
+  child shell, does not. So `infile 'in/x.csv';` after one is planned from
+  `/users/smith/in/x.csv`, with a note, and a LIBNAME or a data set named by
+  a relative path likewise; the current directory carries on into the next
+  file, in corpus order. Before any `cd`, SAS reads from the directory it
+  was started in, which the corpus does not say: such an item is blocked.
 - **A wildcard is blocked.** On UNIX, FILENAME and INFILE may name every file
   a pattern matches — `'/data/in/wild*.dat'`, `'/data/*/*'`, `[0-9]` — read
   one after another. Which files those are only a listing on the SAS server

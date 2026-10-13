@@ -567,7 +567,7 @@ def test_a_data_set_read_by_a_relative_path_is_blocked():
     # `merge 'jan' 'feb';` reads from the directory SAS runs in.
     plan = _plan(job="data a; merge 'jan' 'feb'; by id; run;\n")
     assert [(i.source.locator, i.source.object_name) for i in plan.items] == [("", "jan"), ("", "feb")]
-    assert all("not a full path" in i.blockers[0] for i in plan.items)
+    assert all("is a relative path" in i.blockers[0] for i in plan.items)
 
 
 def test_a_data_set_the_job_writes_by_its_path_is_its_own():
@@ -604,8 +604,8 @@ def test_a_path_the_sas_server_completes_is_blocked():
     for job, why in cases.items():
         [item] = _plan(job=job).items
         assert any("completed by the SAS server" in b and why in b for b in item.blockers), job
-        # Not "not a full path" as well: the server says where it is.
-        assert not any("not a full path" in b for b in item.blockers), job
+        # Not "a relative path" as well: the server says where it is.
+        assert not any("relative path" in b for b in item.blockers), job
     [item] = _plan(job="libname q '/data/q';\ndata a; set q.t; run;\n").items
     assert not any("SAS server" in b for b in item.blockers)
 
@@ -625,6 +625,52 @@ def test_a_file_read_through_a_wildcard_is_blocked():
         assert blocker.startswith(f"'{path}' is a wildcard"), job
     plan = _plan(job="filename f ('/a/x*.csv' '/b/y.csv');\ndata; infile f; input; run;\n")
     assert [bool(i.blockers) for i in plan.items] == [True, False]
+
+
+def test_a_relative_path_is_read_from_the_directory_a_cd_sets():
+    # "The search for any relative (partial) filenames during the SAS session
+    # now begins in" the directory a cd sets — x cd, CALL SYSTEM('cd ...') or
+    # %SYSEXEC cd, as the only command (SAS 9.4 Companion for UNIX
+    # Environments). Before, `in/x.csv` was planned as written.
+    for cd in (
+        "x cd /users/smith/report;",
+        "x 'cd /users/smith/report';",
+        "data _null_; call system('cd /users/smith/report'); run;",
+        "%sysexec cd /users/smith/report;",
+    ):
+        plan = _plan(
+            job=f"{cd}\ndata a; infile 'in/x.csv'; input v; run;\n"
+            "libname l 'sasdata';\ndata b; set l.t; set 'jan'; run;\n"
+        )
+        located = [(i.source.locator, i.source.object_name) for i in plan.items]
+        assert located == [
+            ("/users/smith/report/in", "x.csv"),
+            ("/users/smith/report/sasdata", "t"),
+            ("/users/smith/report", "jan"),
+        ], cd
+        assert all("planned in /users/smith/report" in i.notes[-1] for i in plan.items), cd
+        assert not any("relative path" in b for i in plan.items for b in i.blockers), cd
+
+
+def test_the_current_directory_is_the_last_cd_before_the_read():
+    plan = _plan(
+        a="data a; infile 'early.csv'; input v; run;\nx cd /w;\nx cd sub;\n",
+        b="data b; infile '../late.csv'; input v; run;\n",
+    )
+    [early, late] = plan.items
+    # Before any cd SAS reads from where it was started, which nobody says.
+    assert "is a relative path" in early.blockers[0]
+    # A cd carries on into the next file; a relative cd is read from the last.
+    assert (late.source.locator, late.source.object_name) == ("/w", "late.csv")
+    assert not any("relative path" in b for b in late.blockers)
+
+
+def test_a_cd_among_several_commands_changes_nothing():
+    # `x 'cd /w; ls';` runs in a child shell; SAS's own directory stays put.
+    [item] = _plan(job="x 'cd /w; ls';\ndata a; infile 'x.csv'; input v; run;\n").items
+    assert "is a relative path" in item.blockers[0]
+    rows = _rows(job="x cd /w;\n")
+    assert [(r.statement, r.role, r.name) for r in rows] == [("cd", "bind", "/w")]
 
 
 def test_a_read_through_any_documented_engine_is_planned():
