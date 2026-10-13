@@ -368,6 +368,8 @@ A `FILENAME` device keyword redirects the same syntax somewhere that is not the
 filesystem, so each record carries a `PathLocation` — `FILESYSTEM`, `REMOTE`
 (FTP, URL, …), `EMAIL`, `PIPE` (a shell command), or `DEVICE` for a keyword this
 module does not know. An unknown device is never silently treated as a path.
+INFILE and FILE take a device type after their quoted value too (`infile 'ps
+-e' pipe;`, `device=pipe`), as SAS requires it, immediately.
 `FILEREF` and `LIBREF` (below) are places named through a fileref or libref.
 
 A statement may name several places: `%include '/a.sas' '/b.sas';` is two

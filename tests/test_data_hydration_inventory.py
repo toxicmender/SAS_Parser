@@ -673,6 +673,27 @@ def test_a_cd_among_several_commands_changes_nothing():
     assert [(r.statement, r.role, r.name) for r in rows] == [("cd", "bind", "/w")]
 
 
+def test_a_read_of_a_shell_command_is_one_blocked_item():
+    # A pipe's data is what its command prints (SAS 9.4 Companion for UNIX
+    # Environments, Reading from and Writing to UNIX Commands). Before, the
+    # read dropped out of the plan without a word.
+    for job in (
+        "filename f pipe 'gunzip -c /data/x.gz';\ndata a; infile f; input v; run;\n"
+        "data b; infile f; input v; run;\n",
+        "data a; infile 'gunzip -c /data/x.gz' pipe truncover; input v; run;\n",
+    ):
+        [item] = _plan(job=job).items
+        assert (item.source.kind, item.source.locator, item.target_table) == (
+            SourceKind.SAS_SESSION,
+            "gunzip -c /data/x.gz",
+            UNRESOLVED_TARGET,
+        ), job
+        [blocker] = item.blockers
+        assert "read from a shell command" in blocker and "(it names /data/x.gz)" in blocker
+    # Output sent to a command is the job's, and no source.
+    assert _plan(job="filename o pipe 'lpr';\ndata _null_; file o; put 'x'; run;\n").items == []
+
+
 def test_a_read_through_any_documented_engine_is_planned():
     # SNOW, JDBC, GREENPLM, VERTICA, ... are SAS/ACCESS engines. Unrecognised,
     # their LIBNAME was neither a database nor a directory, and the read gave

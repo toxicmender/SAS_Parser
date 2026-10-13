@@ -156,6 +156,11 @@ macro's `set &ds;` makes.
   a relative path likewise; the current directory carries on into the next
   file, in corpus order. Before any `cd`, SAS reads from the directory it
   was started in, which the corpus does not say: such an item is blocked.
+- **A read of a shell command is one blocked item.** `filename f pipe 'gunzip
+  -c /data/x.gz'; infile f;` (or `infile '...' pipe;`) reads what the command
+  prints, which only the SAS server can produce. Each command read is a
+  `sas_session` item naming it, and the paths it names, which are often the
+  data itself. Output sent to a command (`file f;`) is no source.
 - **A wildcard is blocked.** On UNIX, FILENAME and INFILE may name every file
   a pattern matches — `'/data/in/wild*.dat'`, `'/data/*/*'`, `[0-9]` — read
   one after another. Which files those are only a listing on the SAS server

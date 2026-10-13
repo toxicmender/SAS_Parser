@@ -683,6 +683,23 @@ def _filerefs_only(
     return frozenset(only - other)
 
 
+def _pipe_blocker(command: str) -> str:
+    """Why an item for a read of a command's output is blocked. The paths
+    the command names, if any, are said: they are often the data itself
+    (``gunzip -c /data/x.gz``)."""
+    named = [
+        token.strip("'\"|;")
+        for token in command.split()
+        if token.strip("'\"|;").startswith(("/", "~", "$"))
+    ]
+    names = f" (it names {', '.join(named[:3])})" if named else ""
+    return (
+        f"read from a shell command: SAS runs '{command}' on its server and reads "
+        f"what it prints{names} — load the data the command reads, or run it "
+        f"there and load its output"
+    )
+
+
 #: A transport file is CPORT's format: no reader here opens one.
 _TRANSPORT_BLOCKER = (
     "a transport file PROC CIMPORT imports: no reader here opens one — import "
@@ -1369,6 +1386,32 @@ def build_corpus_plan(
                     blockers=tuple(blockers),
                 )
             )
+
+    # A read of a shell command's output — `filename f pipe 'gunzip -c
+    # /data/x.gz'; infile f;` or `infile '...' pipe;` — one item per command:
+    # only the SAS server can run it.
+    pipes: dict[str, tuple[str | None, str | None, bool]] = {}
+    for source_id, (_, path_refs) in by_source.items():
+        for ref in path_refs:
+            if ref.statement == "infile" and str(ref.location) == "pipe":
+                pipes.setdefault(
+                    ref.effective_path, (source_id or None, ref.binds, ref.has_macro_ref)
+                )
+    for command, (reader, fileref, has_macro_ref) in pipes.items():
+        items.append(
+            HydrationItem(
+                source=HydrationSource(
+                    kind=SourceKind.SAS_SESSION,
+                    locator=command,
+                    libref=fileref,
+                    has_macro_ref=has_macro_ref,
+                    source_id=reader,
+                ),
+                target_table=UNRESOLVED_TARGET,
+                strategy_reason="not planned: the data is a shell command's output",
+                blockers=(_pipe_blocker(command),),
+            )
+        )
 
     # A library the corpus reads from but never assigns: one item each, so
     # its data does not drop out of the plan unannounced. Only a SAS session

@@ -198,6 +198,23 @@ class TestStatementForms:
         # In single quotes SAS reads & as a character.
         assert _one("x 'cd &dir';").has_macro_ref is False
 
+    def test_a_device_type_after_an_infile_or_file_value(self):
+        # "device-type ... must immediately follow file-specification" (SAS 9.4
+        # DATA Step Statements, INFILE): a command's output, not a file. Before,
+        # `infile 'gunzip -c /data/x.gz' pipe;` was a filesystem path.
+        refs = extract_paths(
+            "infile 'gunzip -c /data/x.gz' pipe;\ninfile 'ps -e' device=PIPE truncover;\n"
+            "infile 'https://h/x.csv' url;\nfile 'lpr -Pq' pipe;\n"
+            "infile '/a.csv' truncover dsd;\n"
+        )
+        assert [(r.statement, r.location, r.raw, r.device) for r in refs] == [
+            ("infile", PathLocation.PIPE, "gunzip -c /data/x.gz", "pipe"),
+            ("infile", PathLocation.PIPE, "ps -e", "pipe"),
+            ("infile", PathLocation.REMOTE, "https://h/x.csv", "url"),
+            ("infile", PathLocation.FILESYSTEM, "/a.csv", None),
+            ("file", PathLocation.PIPE, "lpr -Pq", "pipe"),
+        ]
+
     def test_proc_export_outfile(self):
         ref = _one("proc export data=work.a outfile='/out/a.csv'; run;")
         assert ref.statement == "proc_export"

@@ -88,6 +88,15 @@ _PIPE_DEVICES = frozenset({"pipe"})
 #: reads a local file, not somewhere else to read it from.
 _FILESYSTEM_DEVICES = frozenset({"disk", "temp", "dummy", "clipbrd"})
 
+#: The device types an INFILE or FILE statement may name after a quoted file
+#: specification, or as DEVICE= (SAS 9.4 DATA Step Statements, INFILE
+#: Statement: "device-type ... must immediately follow file-specification"):
+#: ``infile 'ps -e' pipe;`` reads what the command prints.
+_DEVICE_TYPES = (
+    "activemq|catalog|clipboard|disk|dummy|email|ftp|gterm|hadoop|jms|pipe"
+    "|plotter|printer|sftp|socket|tape|terminal|uprinter|url|webdav|zip"
+)
+
 
 def classify_location(device: str | None) -> PathLocation:
     """The :class:`~chunker.models.PathLocation` a device keyword implies.
@@ -387,6 +396,8 @@ def _governing_quote(match: re.Match[str], start: int) -> str:
 # the same quote again. A SAS statement's quoted literal does not span lines.
 _VALUE = r"(?P<q>['\"])(?P<path>[^'\"\n]*)(?P=q)"
 _VALUE_RE = re.compile(_VALUE)
+# The device type an INFILE or FILE may name after its quoted value.
+_DEVICE_AFTER = rf"(?:\s+(?:device\s*=\s*)?(?P<device>{_DEVICE_TYPES})\b)?"
 # One quoted value, ungrouped, to repeat in a list.
 _QUOTED = r"""(?:'[^'\n]*'|"[^"\n]*")"""
 _QUOTED_RE = re.compile(_QUOTED)
@@ -479,12 +490,14 @@ PATH_STATEMENTS: tuple[PathSpec, ...] = (
         many=True,
         concat=True,
     ),
-    # infile '<path>' / file '<path>' — the unquoted form names a fileref a
-    # FILENAME already declared, so there is no path here to record.
+    # infile '<path>' [<device>] / file '<path>' [<device>] — the unquoted
+    # form names a fileref a FILENAME already declared, so there is no path
+    # here to record. A device type turns the value into what it addresses:
+    # `infile 'gunzip -c /data/x.gz' pipe;` reads a command's output.
     PathSpec(
         statement="infile",
         keyword="infile",
-        pattern=re.compile(r"(?P<head>\binfile\s+)" + _VALUE, re.IGNORECASE),
+        pattern=re.compile(r"(?P<head>\binfile\s+)" + _VALUE + _DEVICE_AFTER, re.IGNORECASE),
     ),
     # infile '("<path>" "<path>")': files read one after another, the list
     # inside one quoted string (Concatenating Filenames, as above).
@@ -503,7 +516,7 @@ PATH_STATEMENTS: tuple[PathSpec, ...] = (
     PathSpec(
         statement="file",
         keyword="file",
-        pattern=re.compile(r"(?P<head>\bfile\s+)" + _VALUE, re.IGNORECASE),
+        pattern=re.compile(r"(?P<head>\bfile\s+)" + _VALUE + _DEVICE_AFTER, re.IGNORECASE),
     ),
     # %include <source> ...: quoted files ('/a.sas', or '("/a.sas" "/b.sas")'),
     # whole files filerefs name (src), and members of the directory one names
