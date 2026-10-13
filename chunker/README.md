@@ -350,8 +350,11 @@ they can never collide with identifiers.
 chunk's statements name, whatever kind of place it is. `paths.py` recognises
 `LIBNAME`, `FILENAME`, `INFILE` / `FILE`, `%INCLUDE`, PROC IMPORT/EXPORT's
 `datafile=` / `outfile=`, PROC CIMPORT's `infile=` (the transport file, by
-path or fileref), PROC PRINTTO's `log=` / `print=`, ODS `file=` / `path=`, and
-`options sasautos=`. What PROC CIMPORT creates is a dataset write: `data=`
+path or fileref), PROC PRINTTO's `log=` / `print=`, ODS `file=` / `path=`,
+`options sasautos=`, and the environment variables `x setenv NAME /path` and
+`options set=NAME '/path'` define (statement `setenv`): on UNIX an upper-case
+one holding a full path is a libref or fileref where no LIBNAME or FILENAME
+assigns the name, so `resolve_filerefs` follows `infile ined;` to it. What PROC CIMPORT creates is a dataset write: `data=`
 (`ds=`, `d=`) one data set, `library=` (`lib=`, `l=`) the pattern `lib.:`;
 `catalog=` names none.
 

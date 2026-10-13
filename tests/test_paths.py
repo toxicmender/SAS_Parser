@@ -136,6 +136,21 @@ class TestStatementForms:
             "tf",
         )
 
+    def test_an_environment_variable_assignment(self):
+        # `x setenv` (quoted or not) and `options set=` define a variable that
+        # UNIX SAS reads as a libref or fileref: upper-case, a full path.
+        for source, binds, path in (
+            ("x setenv EDUC /users/mydir/educ;", "educ", "/users/mydir/educ"),
+            ("x 'setenv INED /users/myid/educ.dat';", "ined", "/users/myid/educ.dat"),
+            ("options set=EDUC '/users/mydir/educ';", "educ", "/users/mydir/educ"),
+            ("options nodate set=(EDUC '/u/e');", "educ", "/u/e"),
+        ):
+            ref = _one(source)
+            assert (ref.statement, ref.binds, ref.path) == ("setenv", binds, path)
+        # Lower case, or a relative value, is no libref or fileref.
+        assert extract_paths("x setenv educ /lower;") == []
+        assert extract_paths("options set=TMP 'relative';") == []
+
     def test_proc_export_outfile(self):
         ref = _one("proc export data=work.a outfile='/out/a.csv'; run;")
         assert ref.statement == "proc_export"

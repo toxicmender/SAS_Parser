@@ -432,6 +432,29 @@ PATH_STATEMENTS: tuple[PathSpec, ...] = (
         keyword="path=",
         pattern=re.compile(r"(?P<head>\bpath\s*=\s*)" + _VALUE, re.IGNORECASE),
     ),
+    # `x setenv NAME /path;` (the SAS setenv command, quoted or not) and
+    # `options set=NAME '/path';` define an environment variable. On UNIX one
+    # whose name is upper-case and whose value is a full path serves as a
+    # libref (a directory) or a fileref (a file) wherever no LIBNAME or
+    # FILENAME assigns that name (SAS 9.4 Companion for UNIX Environments,
+    # Using Environment Variables as Librefs / to Assign Filerefs). `binds` is
+    # the name, lowercased as a libref is.
+    PathSpec(
+        statement="setenv",
+        keyword="setenv",
+        pattern=re.compile(
+            r"(?P<head>(?i:\bx\s+['\"]?\s*setenv)\s+(?P<binds>[A-Z_][A-Z0-9_]*)\s+)"
+            r"(?P<path>/[^\s;'\"]*)"
+        ),
+    ),
+    PathSpec(
+        statement="setenv",
+        keyword="options",
+        pattern=re.compile(
+            r"(?P<head>(?i:\boptions\b[^;]*?\bset)\s*=\s*\(?\s*"
+            r"(?P<binds>[A-Z_][A-Z0-9_]*)\s*=?\s*)(?P<q>['\"])(?P<path>/[^'\"\n]*)(?P=q)"
+        ),
+    ),
     # options sasautos='<path>' — see the module docstring on the list form.
     PathSpec(
         statement="sasautos",

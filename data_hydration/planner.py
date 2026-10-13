@@ -397,6 +397,7 @@ def _sources_for(
     named: frozenset[tuple[str, tuple[tuple[str, str], ...]]] = frozenset(),
     code_filerefs: frozenset[str] = frozenset(),
     transport_filerefs: frozenset[str] = frozenset(),
+    env_used: frozenset[tuple[str, str]] = frozenset(),
 ) -> list[tuple[HydrationSource, tuple[str, ...]]]:
     """Every hydratable source one file's refs name, in reading order, each with
     the blockers only its kind can have.
@@ -408,6 +409,8 @@ def _sources_for(
     (:func:`_code_filerefs`): their FILENAMEs name SAS source, not data.
     *transport_filerefs* are the ones only PROC CIMPORT reads: their FILENAMEs
     name a transport file, planned blocked as one named by INFILE= is.
+    *env_used* are the environment variables a read goes through,
+    ``(name, place)`` (:func:`_env_in_use`): any other is just a variable.
     """
     sources: list[tuple[HydrationSource, tuple[str, ...]]] = [
         (_oracle_source(ref, source_id), _engine_blocker(ref.engine))
@@ -416,6 +419,11 @@ def _sources_for(
     ]
     for path_ref in path_refs:
         if path_ref.statement == "filename" and path_ref.binds in code_filerefs:
+            continue
+        if (
+            path_ref.statement == "setenv"
+            and (path_ref.binds, path_ref.effective_path) not in env_used
+        ):
             continue
         source = _path_source(path_ref, source_id)
         if source is not None:
@@ -541,6 +549,18 @@ def _directory_library(ref: "SasPathRef") -> bool:
     )
 
 
+def _env_library(ref: "SasPathRef") -> bool:
+    """Whether *ref* is an environment variable naming a directory: on UNIX,
+    a libref wherever no LIBNAME assigns the name (``x setenv EDUC
+    /users/mydir/educ;`` lets ``set educ.class;`` read that library)."""
+    return (
+        ref.statement == "setenv"
+        and bool(ref.binds)
+        and str(ref.location) == "filesystem"
+        and "." not in _basename(ref.path)
+    )
+
+
 #: A directory library: its libref and directory, as a library item has them.
 _Library = tuple[str | None, str]
 
@@ -581,7 +601,8 @@ def _assigned_librefs(
     for engine_refs, path_refs in by_source.values():
         librefs.update(ref.binds for ref in engine_refs if ref.binds)
         for ref in path_refs:
-            if ref.statement != "libname" or not ref.binds:
+            # An environment variable is a libref on UNIX too (_env_library).
+            if ref.statement not in ("libname", "setenv") or not ref.binds:
                 continue
             if ref.binds.startswith("&"):
                 return None
@@ -640,6 +661,7 @@ def _library_members(
                     writers.setdefault(ref.name, set()).add(source_id)
     assigned = _assigned_librefs(by_source)
     bound: dict[str, str] = {}
+    env: dict[str, str] = {}  # environment variables: librefs no LIBNAME assigns
     found = _Members({}, set(), False, {})
     seen: set[tuple[str, str]] = set()
     for source_id in dict.fromkeys([*by_source, *datasets]):
@@ -647,7 +669,7 @@ def _library_members(
             (
                 ref
                 for ref in by_source.get(source_id, ((), ()))[1]
-                if _directory_library(ref) and ref.binds
+                if (_directory_library(ref) or _env_library(ref)) and ref.binds
             ),
             key=lambda ref: (_position(ref) is not None, _position(ref) or 0),
         )
@@ -661,7 +683,7 @@ def _library_members(
                 or position < start
             ):
                 ref = libnames.pop(0)
-                bound[ref.binds] = ref.effective_path
+                (env if ref.statement == "setenv" else bound)[ref.binds] = ref.effective_path
             made_now: set[str] = set()  # renamed or copied by this step so far
             for ref in refs:
                 if str(ref.role) == "write" and ref.via in _IMMEDIATE_WRITES:
@@ -674,7 +696,9 @@ def _library_members(
                 libref, _, member = ref.name.partition(".")
                 if not member:
                     continue
-                if libref not in bound:
+                # A LIBNAME wins over an environment variable of the same name.
+                place = bound.get(libref) or env.get(libref)
+                if place is None:
                     if (
                         assigned is not None
                         and libref not in assigned
@@ -691,7 +715,7 @@ def _library_members(
                         if member not in names:
                             names.append(member)
                     continue
-                library = (libref, bound[libref])
+                library = (libref, place)
                 if ref.pattern:
                     found.listed.add(library)
                     continue
@@ -702,8 +726,38 @@ def _library_members(
                     found.named.setdefault(library, []).append((member, source_id or None))
             made_here.update(ref.name for ref in refs if str(ref.role) == "write")
         for ref in libnames:  # after the file's last read: in force for the next
-            bound[ref.binds] = ref.effective_path
+            (env if ref.statement == "setenv" else bound)[ref.binds] = ref.effective_path
     return found
+
+
+def _env_in_use(
+    by_source: Mapping[str, tuple[Sequence["SasEngineRef"], Sequence["SasPathRef"]]],
+    members: _Members,
+) -> frozenset[tuple[str, str]]:
+    """The environment variables a read goes through, as ``(name, place)``:
+    as a libref (a library whose datasets are read) or as a fileref no
+    FILENAME binds (``infile ined;``). Any other variable is just a variable —
+    ``x setenv TMPDIR /tmp;`` names no data."""
+    libraries = set(members.named) | members.listed
+    filenames: set[str] = set()
+    through: set[str] = set()
+    for _, path_refs in by_source.values():
+        for ref in path_refs:
+            if not ref.binds:
+                continue
+            if ref.statement == "filename":
+                filenames.add(ref.binds)
+            elif ref.statement not in ("libname", "setenv"):
+                through.add(ref.binds)
+    used: set[tuple[str, str]] = set()
+    for _, path_refs in by_source.values():
+        for ref in path_refs:
+            if ref.statement != "setenv" or not ref.binds:
+                continue
+            place = (ref.binds, ref.effective_path)
+            if place in libraries or (ref.binds in through and ref.binds not in filenames):
+                used.add(place)
+    return frozenset(used)
 
 
 def _position(ref: object) -> int | None:
@@ -764,6 +818,7 @@ def build_corpus_plan(
     expanded: set[_Library] = set()
     code_filerefs = _code_filerefs(by_source)
     transport_filerefs = _filerefs_only(by_source, "proc_cimport")
+    env_used = _env_in_use(by_source, members)
 
     sources: list[tuple[HydrationSource, tuple[str, ...]]] = []
     planned_tables: set[HydrationSource] = set()
@@ -778,6 +833,7 @@ def build_corpus_plan(
             named=named,
             code_filerefs=code_filerefs,
             transport_filerefs=transport_filerefs,
+            env_used=env_used,
         ):
             library = (source.libref, source.locator)
             if source.kind is SourceKind.FILE and not source.object_name and library in members.named:

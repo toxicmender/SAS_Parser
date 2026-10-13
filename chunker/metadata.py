@@ -1808,11 +1808,20 @@ def resolve_filerefs(chunks: list[SasChunk]) -> None:
     again, from the FILENAME in force: the same answer when nothing changed,
     and the corpus-level run's answer when a ``%LET`` in another file has since
     resolved the FILENAME's own path.
+
+    On UNIX an environment variable can stand for a fileref: ``x setenv INED
+    /users/myid/educ.dat;`` lets ``infile ined;`` read that file. One set
+    earlier in the walk (a ``setenv`` reference) is followed where no FILENAME
+    binds the name — SAS uses the fileref when both exist.
     """
     bound: dict[str, SasPathRef] = {}
+    env: dict[str, SasPathRef] = {}
     for idx, chunk in enumerate(chunks):
         meta = chunk.metadata
         refs = meta.external_refs
+        for r in refs:
+            if r.statement == "setenv" and r.binds:
+                env[r.binds] = r
         named = {r.binds: r for r in refs if r.statement == "filename" and r.binds}
         if named or meta.global_statement_keyword == "filename":
             # In source order: `filename _all_ clear;` then `filename src
@@ -1832,11 +1841,13 @@ def resolve_filerefs(chunks: list[SasChunk]) -> None:
                     bound.pop(fref, None)
             for fref in named.keys() - seen:
                 bound[fref] = named[fref]  # a statement the scan above misread
-        if not bound or not any(map(_named_through_fileref, refs)):
+        if not (bound or env) or not any(map(_named_through_fileref, refs)):
             continue
         resolved = [
-            _through_fileref(r, bound[r.binds])
-            if _named_through_fileref(r) and r.binds in bound
+            _through_fileref(r, place)
+            if _named_through_fileref(r)
+            and r.binds is not None
+            and (place := bound.get(r.binds) or env.get(r.binds)) is not None
             else r
             for r in refs
         ]

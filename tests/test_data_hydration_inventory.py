@@ -384,6 +384,29 @@ def test_no_item_for_a_library_assigned_written_or_out_of_reach():
         assert all(i.source.kind is not SourceKind.SAS_SESSION for i in plan.items), job
 
 
+def test_an_environment_variable_is_a_libref_or_fileref_on_unix():
+    # "An environment variable can be used as a libref": before, educ.class
+    # (and ined's file) dropped out of the plan, read through no LIBNAME.
+    for setenv in ("x setenv EDUC /users/mydir/educ;", "options set=EDUC '/users/mydir/educ';"):
+        plan = _plan(job=f"{setenv}\nproc print data=educ.class; run;\n")
+        located = [(i.source.locator, i.source.object_name, i.blockers) for i in plan.items]
+        assert located == [("/users/mydir/educ", "class", ())], setenv
+    plan = _plan(job="x setenv INED /users/myid/educ.dat;\ndata a; infile ined; input x; run;\n")
+    assert [(i.source.locator, i.source.object_name) for i in plan.items] == [
+        ("/users/myid", "educ.dat")
+    ]
+
+
+def test_an_environment_variable_nothing_reads_through_is_no_item():
+    # A variable is just a variable until a read goes through it; and "if a
+    # variable and a libref have the same name ... SAS uses the libref".
+    assert _plan(job="x setenv TMPDIR /tmp/work;\ndata a; x=1; run;\n").items == []
+    plan = _plan(
+        job="x setenv EDUC /env/educ;\nlibname educ '/lib/educ';\nproc print data=educ.class; run;\n"
+    )
+    assert [(i.source.locator, i.source.object_name) for i in plan.items] == [("/lib/educ", "class")]
+
+
 def test_a_read_through_any_documented_engine_is_planned():
     # SNOW, JDBC, GREENPLM, VERTICA, ... are SAS/ACCESS engines. Unrecognised,
     # their LIBNAME was neither a database nor a directory, and the read gave

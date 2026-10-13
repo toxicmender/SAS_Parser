@@ -92,7 +92,8 @@ class SasPathRef(BaseModel, frozen=True):
         Which statement named it — ``libname``, ``filename``, ``infile``,
         ``file``, ``include``, ``proc_import``, ``proc_cimport`` (its INFILE=
         transport file), ``proc_export``, ``printto``,
-        ``ods``, ``sasautos``.
+        ``ods``, ``sasautos``, ``setenv`` (an environment variable ``x
+        setenv`` or ``options set=`` defines: on UNIX a libref or fileref).
     location
         See :class:`PathLocation`.
     path

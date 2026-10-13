@@ -124,6 +124,11 @@ macro's `set &ds;` makes.
   variable nothing resolved (`&where..t`), since that may be this library.
 - A member spelled through an unresolved macro variable (`raw.&tbl`) is an
   item, blocked; an SPD Engine library is not split (see below).
+- **An environment variable is a libref on UNIX.** After `x setenv EDUC
+  /users/mydir/educ;` or `options set=EDUC '/users/mydir/educ';`, `set
+  educ.class;` reads `/users/mydir/educ/class.sas7bdat`, and `infile ined;` the
+  file a variable INED holds. A LIBNAME or FILENAME of the same name wins, as
+  in SAS, and a variable nothing reads through is not planned.
 - **A library the corpus never assigns is one item, blocked.** A read from
   `xwrk.batch_med` when no LIBNAME anywhere in the corpus assigns `xwrk` comes
   from a library the SAS server assigns itself — an `autoexec.sas` (on UNIX in
