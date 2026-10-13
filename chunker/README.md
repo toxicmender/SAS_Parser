@@ -367,12 +367,13 @@ chunk's statements name, whatever kind of place it is. `paths.py` recognises
 `datafile=` / `outfile=` (by path or fileref), PROC CIMPORT's `infile=` (the
 transport file, by path or fileref), PROC PYTHON's `infile=` (the Python
 script it runs, by path or fileref), PROC PRINTTO's `log=` / `print=`, ODS
-`file=` / `path=`, `options sasautos=`, SAS's own `cd` (statement `cd`:
-`x cd /dir;`, `call system('cd /dir');` or `%sysexec cd /dir;` as the only
-command, which sets the directory relative paths are read from), and the
-environment variables `x setenv NAME /path` and `options set=NAME '/path'`
-define (statement `setenv`): on UNIX an upper-case one holding a full path is
-a libref or fileref where no LIBNAME or FILENAME assigns the name, so
+`file=` / `path=`, `options sasautos=`, `options user=` (statement `user`: the
+User library's directory), SAS's own `cd` (statement `cd`: `x cd /dir;`,
+`call system('cd /dir');` or `%sysexec cd /dir;` as the only command, which
+sets the directory relative paths are read from), and the environment
+variables `x setenv NAME /path` and `options set=NAME '/path'` define
+(statement `setenv`): on UNIX an upper-case one holding a full path is a
+libref or fileref where no LIBNAME or FILENAME assigns the name, so
 `resolve_filerefs` follows `infile ined;` to it. What PROC CIMPORT creates is
 a dataset write: `data=` (`ds=`, `d=`) one data set, `library=` (`lib=`, `l=`)
 the pattern `lib.:`; `catalog=` names none.
@@ -682,13 +683,15 @@ chunk's component, same-file only — the global-context batch, when that chunk
 is a promoted macro.
 
 Dataset names are canonicalised (`_canon_ds`): one-level names become
-`work.<name>` — or, after `libname user '<dir>';` or `options user=<libref>;`,
-`<libref>.<name>` (`resolve_user_library`, until `libname user clear` or
-`options user=work`; a `USER_LIBRARY_ASSIGNED` diagnostic notes it, since one
-assigned at invocation is not seen); a name still holding a `&` is left alone,
-since its libref is not knowable yet. Consumers link to the **nearest preceding producer** in
-corpus order — the state a sequential SAS session would actually read — so
-unrelated jobs reusing `work.tmp` stay separate.
+`work.<name>` — or, after `libname user '<dir>';`, `options user='<dir>';`
+(recorded as a path, statement `user`, binding the User libref) or
+`options user=<libref>;`, `<libref>.<name>` (`resolve_user_library`, until
+`libname user clear` or `options user=work`; a `USER_LIBRARY_ASSIGNED`
+diagnostic notes it, since one assigned at invocation is not seen); a name
+still holding a `&` is left alone, since its libref is not knowable yet.
+Consumers link to the **nearest preceding producer** in corpus order — the
+state a sequential SAS session would actually read — so unrelated jobs reusing
+`work.tmp` stay separate.
 
 The roles decide what counts as a producer. Only a WRITE ref produces its name.
 A step that updates a table in place (`PROC APPEND BASE=`, SQL `INSERT`,

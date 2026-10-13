@@ -2051,10 +2051,10 @@ def resolve_user_library(chunks: list[SasChunk]) -> None:
     A one-level name is a WORK member unless the User libref is assigned: to
     "store files with one-level names in a permanent library, you must first
     assign the User libref to an existing directory" — ``libname user
-    '/data/perm';``, or
-    ``options user=mine;`` to equate an assigned libref to User (SAS 9.4
-    Companion for UNIX Environments, Using One-Level Names to Access
-    Permanent Files). After either, ``set y;`` reads the permanent
+    '/data/perm';``, ``options user='/data/perm';``, or ``options
+    user=mine;`` to equate an assigned libref to User (SAS 9.4 Companion for
+    UNIX Environments, Using One-Level Names to Access Permanent Files; USER
+    System Option: UNIX). After any of them, ``set y;`` reads the permanent
     ``/data/perm/y``, not ``work.y``.
 
     Walks *chunks* in source order and moves each one-level name — spelled
@@ -2086,8 +2086,14 @@ def resolve_user_library(chunks: list[SasChunk]) -> None:
         elif chunk.kind is SasChunkKind.OPTIONS:
             for token in meta.options:
                 if token.startswith("user="):
+                    # A quoted value is a directory, which USER= makes the
+                    # User library's (a path ref, statement `user`); any
+                    # other is a libref it equates to User.
                     value = token[5:]
-                    user = None if value == "work" else value
+                    if value == "work":
+                        user = None
+                    else:
+                        user = "user" if value[:1] in ("'", '"') else value
 
 
 def _one_level(ref: SasDatasetRef) -> bool:

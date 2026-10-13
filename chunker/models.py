@@ -104,7 +104,9 @@ class SasPathRef(BaseModel, frozen=True):
         ``using_libname`` (a LIBNAME clause in the USING list of PROC SQL's
         CREATE VIEW: its libref is local to the view, assigned while the view
         runs, and leaves the session's alone), ``cd`` (SAS's own cd command,
-        ``x cd /dir;``: the current directory relative paths are read from).
+        ``x cd /dir;``: the current directory relative paths are read from),
+        ``user`` (``options user='/dir';``: the User library's directory,
+        bound to the libref ``user`` as by ``libname user '/dir';``).
     location
         See :class:`PathLocation`.
     path

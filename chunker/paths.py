@@ -751,6 +751,19 @@ PATH_STATEMENTS: tuple[PathSpec, ...] = (
             r"(?P<head>\bsasautos\s*=\s*\(?\s*)" + _VALUE, re.IGNORECASE
         ),
     ),
+    # options user='<path>': the directory of the User library, where
+    # one-level names live — "USER='pathname' | libref ... pathname identifies
+    # the directory containing your default permanent SAS library" (SAS 9.4
+    # Companion for UNIX Environments, USER System Option: UNIX). It assigns
+    # the User libref as `libname user '<path>';` does. Anchored on OPTIONS,
+    # since USER= is also an FTP login.
+    PathSpec(
+        statement="user",
+        keyword="user",
+        pattern=re.compile(
+            r"(?P<head>\boptions\b[^;]*?\b(?P<binds>user)\s*=\s*)" + _VALUE, re.IGNORECASE
+        ),
+    ),
 )
 
 

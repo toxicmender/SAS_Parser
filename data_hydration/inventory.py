@@ -73,6 +73,7 @@ class RefKind(StrEnum):
 _PATH_ROLES = {
     "libname": "bind",
     "using_libname": "bind",
+    "user": "bind",
     "filename": "bind",
     "infile": "read",
     "include": "read",

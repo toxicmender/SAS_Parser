@@ -720,9 +720,10 @@ _BASE_ENGINES = frozenset({"", "base", "v9", "v8", "v7"})
 
 def _directory_library(ref: "SasPathRef") -> bool:
     """Whether *ref* is a LIBNAME binding a directory of SAS datasets: in the
-    session, or, a clause of a CREATE VIEW's USING list, for the view."""
+    session (``options user='/dir';`` binds the User libref so too), or, a
+    clause of a CREATE VIEW's USING list, for the view."""
     return (
-        ref.statement in ("libname", "using_libname")
+        ref.statement in ("libname", "using_libname", "user")
         and bool(ref.binds)
         and not (ref.binds or "").startswith("&")
         and str(ref.location) == "filesystem"
@@ -815,8 +816,9 @@ def _assigned_librefs(
             if ref.binds and getattr(ref, "statement", "libname") == "libname"
         )
         for ref in path_refs:
-            # An environment variable is a libref on UNIX too (_env_library).
-            if ref.statement not in ("libname", "setenv") or not ref.binds:
+            # An environment variable is a libref on UNIX too (_env_library),
+            # and USER= assigns the User libref.
+            if ref.statement not in ("libname", "setenv", "user") or not ref.binds:
                 continue
             if ref.binds.startswith("&"):
                 return None
@@ -1158,7 +1160,7 @@ def _env_in_use(
                 continue
             if ref.statement == "filename":
                 filenames.add(ref.binds)
-            elif ref.statement not in ("libname", "setenv"):
+            elif ref.statement not in ("libname", "setenv", "user"):
                 through.add(ref.binds)
     used: set[tuple[str, str]] = set()
     for _, path_refs in by_source.values():

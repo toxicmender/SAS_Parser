@@ -212,18 +212,42 @@ class TestUserLibraryNames(unittest.TestCase):
             [("mine.x", "write"), ("mine.y", "read"), ("work.q", "write"), ("work.r", "read")],
         )
 
-    def test_the_permanent_dataset_is_planned(self):
+    def test_options_user_names_a_directory(self):
+        # "USER='pathname' | libref ... pathname identifies the directory
+        # containing your default permanent SAS library" (SAS 9.4 Companion for
+        # UNIX Environments, USER System Option: UNIX). Before, the quote was
+        # taken for a libref: `set y;` read '.y.
+        for option in ("user='/data/perm'", 'USER="/data/perm"', "nodate user='/data/perm'"):
+            src = f"options {option};\ndata x; set y; run;\n"
+            self.assertEqual(self._names(src), [("user.x", "write"), ("user.y", "read")], option)
+        refs = [
+            (r.statement, str(r.location), r.path, r.binds)
+            for c in SasSemanticChunker(min_words=1, max_words=9_999)
+            .chunk_text("options user='/Data/Perm';\n")
+            .chunks
+            for r in c.metadata.external_refs
+        ]
+        self.assertEqual(refs, [("user", "filesystem", "/data/perm", "user")])
+        # USER= of another statement (FTP's login) is no library.
+        self.assertEqual(self._names("filename f ftp 'x' user='bob';\ndata a; set b; run;\n")[1], ("work.b", "read"))
+
+    def _plan(self, src: str):
         from chunker import SasCorpus, resolve_corpus_datasets
         from data_hydration.config import HydrationConfig
         from data_hydration.inventory import inventory_rows, plan_from_inventory
 
-        src = "libname user '/data/perm';\ndata x; set y; run;\n"
         result = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(src, source_id="j.sas")
         rows = inventory_rows(resolve_corpus_datasets(SasCorpus(file_results=[result])).file_results)
-        plan = plan_from_inventory(rows, config=HydrationConfig(catalog="main"))
-        self.assertEqual(
-            [(i.source.locator, i.source.object_name) for i in plan.items], [("/data/perm", "y")]
-        )
+        return plan_from_inventory(rows, config=HydrationConfig(catalog="main"))
+
+    def test_the_permanent_dataset_is_planned(self):
+        for assign in ("libname user '/data/perm';", "options user='/data/perm';"):
+            plan = self._plan(f"{assign}\ndata x; set y; run;\n")
+            self.assertEqual(
+                [(i.source.locator, i.source.object_name, i.blockers) for i in plan.items],
+                [("/data/perm", "y", ())],
+                assign,
+            )
 
 
 # ── 4. Implicit _LAST_ / _DATA_ resolution ─────────────────────────────────
