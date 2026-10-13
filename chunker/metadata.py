@@ -1859,18 +1859,82 @@ def resolve_filerefs(chunks: list[SasChunk]) -> None:
         )
 
 
+# `libname user clear;` (or `_all_ clear`) ends the User library.
+_USER_CLEAR_RE = re.compile(r"\blibname\s+(?:user|_all_)\s+clear\b", re.IGNORECASE)
+
+
+def resolve_user_library(chunks: list[SasChunk]) -> None:
+    """Give one-level dataset names to the User library while one is
+    assigned, in place.
+
+    A one-level name is a WORK member unless the User libref is assigned: to
+    "store files with one-level names in a permanent library, you must first
+    assign the User libref to an existing directory" — ``libname user
+    '/data/perm';``, or
+    ``options user=mine;`` to equate an assigned libref to User (SAS 9.4
+    Companion for UNIX Environments, Using One-Level Names to Access
+    Permanent Files). After either, ``set y;`` reads the permanent
+    ``/data/perm/y``, not ``work.y``.
+
+    Walks *chunks* in source order and moves each one-level name — spelled
+    without a libref, ``work.`` only by canonicalisation — to that library,
+    until ``libname user clear`` or ``options user=work`` ends it. A name
+    written ``work.x`` stays in WORK, as SAS keeps it there. A ``%MACRO``
+    body's names wait for a call: the call site gets its own. One assigned at
+    invocation (``-user``) or in a config file is not seen. Idempotent: a
+    moved name is no longer a WORK one.
+    """
+    user: str | None = None
+    for idx, chunk in enumerate(chunks):
+        meta = chunk.metadata
+        if user is not None:
+            lib = user
+
+            def moved(ref: SasDatasetRef) -> str:
+                if ref.in_macro_body or not ref.name.startswith("work.") or not _one_level(ref):
+                    return ref.name
+                return f"{lib}.{ref.name[5:]}"
+
+            updated = meta.map_dataset_names(moved)
+            if updated is not meta:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"resolve_user_library: {chunk.chunk_id} one-level names in {lib}")
+                chunks[idx] = chunk.model_copy(update={"metadata": updated})
+        if "user" in meta.defines_librefs:
+            user = None if _USER_CLEAR_RE.search(_sanitise(chunk.text)) else "user"
+        elif chunk.kind is SasChunkKind.OPTIONS:
+            for token in meta.options:
+                if token.startswith("user="):
+                    value = token[5:]
+                    user = None if value == "work" else value
+
+
+def _one_level(ref: SasDatasetRef) -> bool:
+    """Whether *ref* was spelled as a one-level name: no libref, no quoted
+    path, and not one of the ``_name_`` placeholders SAS reserves."""
+    raw = ref.raw.strip().lower().split("(")[0].strip()
+    return (
+        bool(raw)
+        and "." not in raw
+        and raw[0] not in "'\""
+        and not (raw.startswith("_") and raw.endswith("_"))
+    )
+
+
 def resolve_references(chunks: list[SasChunk]) -> None:
     """Every cross-chunk name resolution, in the one order that works, in place.
 
     Macro variables first — a libref, a dataset, a fileref and a pass-through
-    table can all be spelled through one — then filerefs, ODS OUTPUT
-    requests, moved to their PROCs with their names resolved, and database
-    librefs, which read the resolved names where they end up.
+    table can all be spelled through one — then the User library, which moves
+    one-level names out of WORK, then filerefs, ODS OUTPUT requests, moved to
+    their PROCs with their names resolved, and database librefs, which read
+    the resolved names where they end up.
     :meth:`~chunker.chunker.SasSemanticChunker.chunk_text`,
     :class:`~chunker.batcher.MultiFileBatcher` and
     :func:`resolve_corpus_references` all call this, so the order lives here.
     """
     resolve_macro_var_refs(chunks)
+    resolve_user_library(chunks)
     resolve_filerefs(chunks)
     resolve_ods_outputs(chunks)
     resolve_db_librefs(chunks)

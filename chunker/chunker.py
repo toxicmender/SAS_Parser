@@ -71,9 +71,10 @@ def _record_user_library(
     Per the SAS Programmer's Guide: Essentials (pp. 236, 252-253), assigning
     a USER library — via the ``USER=`` system option or a ``libname user``
     statement — redirects one-level dataset names to that (permanent)
-    library instead of the temporary WORK library.  That invalidates the
-    ``work.``-canonicalisation :func:`_canon_ds` applies, so the condition
-    is surfaced as a diagnostic rather than silently mis-resolved.
+    library instead of the temporary WORK library.
+    :func:`~chunker.metadata.resolve_user_library` moves the names it can see
+    after the assignment; the diagnostic says so, since one made at invocation
+    (``-user``) moves names this parse cannot see.
     Idempotent, mirroring :func:`_record_parser_timeout`.
 
     Called on the whole chunk list once :func:`resolve_macro_var_refs` has run,
@@ -89,21 +90,22 @@ def _record_user_library(
         )
         if not assigns_user:
             continue
-        logger.warning(
+        logger.info(
             f"_record_user_library: USER library assigned near line "
-            f"{chunk.start_line}; one-level dataset names resolve to USER, "
-            f"not WORK — canonicalised names may be inaccurate"
+            f"{chunk.start_line}; one-level dataset names after it resolve to "
+            f"USER, not WORK"
         )
         diagnostics.append(
             SasDiagnostic(
                 code="USER_LIBRARY_ASSIGNED",
                 message=(
                     "A USER library is assigned (USER= system option or "
-                    "LIBNAME USER), so one-level dataset names resolve to "
-                    "the USER library, not WORK; the work.-canonicalised "
-                    "dataset names in this result may be inaccurate."
+                    "LIBNAME USER), so one-level dataset names after it "
+                    "resolve to that library, not WORK, and are recorded "
+                    "there. A USER library assigned at invocation (-user) "
+                    "is not seen."
                 ),
-                severity=SasDiagnosticSeverity.WARNING,
+                severity=SasDiagnosticSeverity.INFO,
                 start_line=chunk.start_line,
                 end_line=chunk.end_line,
             )

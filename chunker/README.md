@@ -109,7 +109,7 @@ For running the work items end-to-end through an LLM, see the
 | `sql.py` | The one SQL grammar: `SqlStatement(text, dialect)`, a token walk that reads a statement's tables by clause and verb, and `split_table_name`. `Dialect.NATIVE` reads a database's own SQL for pass-through; `Dialect.SAS` reads PROC SQL and PROC FEDSQL and gives each table its role (`SqlStatement.refs`). |
 | `passthrough.py` | SQL pass-through — `CONNECT TO` / `CONNECTION TO` / `EXECUTE … BY` / `DISCONNECT`, and the native SQL inside them read by `sql.SqlStatement`: `scan_pass_through` (tables + the spans to mask), `mask`, `db_table_ref` (the one `SasDbTableRef` builder). The **single owner** of the pass-through statements. |
 | `statements.py` | What each statement does to the datasets it names: `statements_of` (a region's statements, each with where it stands — open code, a DATA step, a PROC, a `%MACRO` body), the operand lists they read, and `dataset_refs` (the region's `SasDatasetRef`s, a macro body's classified as parameter, literal or macro variable). The **single owner** of dataset positions, for steps and macro bodies alike; `_canon_ds` lives here. |
-| `metadata.py` | Per-chunk semantic extraction: `_metadata_for` (datasets from `statements.dataset_refs`, plus the macro, path, function and symput / SQL-INTO / CALL EXECUTE scans), `_merge_meta`, the extraction regex catalogue, and the whole-list resolution passes — `resolve_macro_var_refs`, `resolve_filerefs`, `resolve_ods_outputs`, `resolve_db_librefs`, composed in order by `resolve_references` (and across files by `resolve_corpus_references`). |
+| `metadata.py` | Per-chunk semantic extraction: `_metadata_for` (datasets from `statements.dataset_refs`, plus the macro, path, function and symput / SQL-INTO / CALL EXECUTE scans), `_merge_meta`, the extraction regex catalogue, and the whole-list resolution passes — `resolve_macro_var_refs`, `resolve_user_library`, `resolve_filerefs`, `resolve_ods_outputs`, `resolve_db_librefs`, composed in order by `resolve_references` (and across files by `resolve_corpus_references`). |
 | `chunker.py` | `SasSemanticChunker` orchestration (scan → group → build chunks, oversized-split with overlap). |
 | `batcher.py` | `_EdgeDiscovery` + Union-Find grouping, weak-edge resolution, context absorption, batch construction. `SasChunkBatcher` is a one-file convenience over `MultiFileBatcher`. |
 | `_repl.py` | `print_iterable` REPL helper (imported by nothing). |
@@ -608,9 +608,11 @@ chunk's component, same-file only — the global-context batch, when that chunk
 is a promoted macro.
 
 Dataset names are canonicalised (`_canon_ds`): one-level names become
-`work.<name>` (a `USER_LIBRARY_ASSIGNED` diagnostic flags the case where that
-rewrite is inexact); a name still holding a `&` is left alone, since its libref
-is not knowable yet. Consumers link to the **nearest preceding producer** in
+`work.<name>` — or, after `libname user '<dir>';` or `options user=<libref>;`,
+`<libref>.<name>` (`resolve_user_library`, until `libname user clear` or
+`options user=work`; a `USER_LIBRARY_ASSIGNED` diagnostic notes it, since one
+assigned at invocation is not seen); a name still holding a `&` is left alone,
+since its libref is not knowable yet. Consumers link to the **nearest preceding producer** in
 corpus order — the state a sequential SAS session would actually read — so
 unrelated jobs reusing `work.tmp` stay separate.
 

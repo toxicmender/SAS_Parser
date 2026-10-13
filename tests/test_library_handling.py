@@ -9,7 +9,8 @@ Guide: Essentials (Ch. 3 "Words and Names", Ch. 11 "SAS Libraries"):
 - LIBNAME statements populate ``defines_librefs``, and batches report the
   librefs they use but do not assign via ``SasBatch.required_librefs``;
 - a USER library assignment (``options user=...`` / ``libname user ...``)
-  emits the ``USER_LIBRARY_ASSIGNED`` diagnostic;
+  moves the one-level names after it into that library, and emits the
+  ``USER_LIBRARY_ASSIGNED`` diagnostic;
 - implicit _LAST_ flow (PROC with no DATA=, bare ``set;``, literal
   ``_last_``) and the _DATA_ / DATAn naming convention resolve to concrete
   dataset names in the batcher;
@@ -163,6 +164,59 @@ class TestUserLibraryDiagnostic(unittest.TestCase):
             "options nodate;\nlibname mylib '/data';\ndata q1; x=1; run;\n"
         )
         self.assertNotIn("USER_LIBRARY_ASSIGNED", codes)
+
+
+class TestUserLibraryNames(unittest.TestCase):
+    """One-level names after a USER assignment live in that library. Before,
+    they stayed work.-canonicalised: `set y;` read a temporary work.y, and the
+    permanent /data/perm/y it really reads dropped out of the plan."""
+
+    def _names(self, src: str) -> list[tuple[str, str]]:
+        cr, _ = _chunk_and_batch(src)
+        return [
+            (r.name, r.role.value) for c in cr.chunks for r in c.metadata.dataset_refs
+        ]
+
+    def test_libname_user_moves_one_level_names_until_cleared(self):
+        src = (
+            "libname user '/data/perm';\ndata x; set y; run;\n"
+            "data z; set work.y; run;\nlibname user clear;\ndata q; set r; run;\n"
+        )
+        self.assertEqual(
+            self._names(src),
+            [
+                ("user.x", "write"),
+                ("user.y", "read"),
+                # A two-level WORK name stays in WORK.
+                ("user.z", "write"),
+                ("work.y", "read"),
+                ("work.q", "write"),
+                ("work.r", "read"),
+            ],
+        )
+
+    def test_options_user_equates_a_libref_to_user(self):
+        src = (
+            "libname mine '/data/perm';\noptions user=mine;\ndata x; set y; run;\n"
+            "options user=work;\ndata q; set r; run;\n"
+        )
+        self.assertEqual(
+            self._names(src),
+            [("mine.x", "write"), ("mine.y", "read"), ("work.q", "write"), ("work.r", "read")],
+        )
+
+    def test_the_permanent_dataset_is_planned(self):
+        from chunker import SasCorpus, resolve_corpus_datasets
+        from data_hydration.config import HydrationConfig
+        from data_hydration.inventory import inventory_rows, plan_from_inventory
+
+        src = "libname user '/data/perm';\ndata x; set y; run;\n"
+        result = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(src, source_id="j.sas")
+        rows = inventory_rows(resolve_corpus_datasets(SasCorpus(file_results=[result])).file_results)
+        plan = plan_from_inventory(rows, config=HydrationConfig(catalog="main"))
+        self.assertEqual(
+            [(i.source.locator, i.source.object_name) for i in plan.items], [("/data/perm", "y")]
+        )
 
 
 # ── 4. Implicit _LAST_ / _DATA_ resolution ─────────────────────────────────
