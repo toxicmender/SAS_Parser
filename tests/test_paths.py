@@ -215,6 +215,20 @@ class TestStatementForms:
             ("file", PathLocation.PIPE, "lpr -Pq", "pipe"),
         ]
 
+    def test_proc_import_and_export_through_a_fileref(self):
+        # DATAFILE= and OUTFILE= take "the complete path and filename or
+        # fileref" (SAS 9.4 Procedures Guide). Before, the fileref form named
+        # nothing.
+        refs = extract_paths(
+            "proc import datafile=inref out=x dbms=csv; run;\n"
+            "proc export data=x outfile=outref dbms=csv; run;\n"
+            "proc import datafile=sales.csv out=y; run;\n"
+        )
+        assert [(r.statement, r.location, r.binds) for r in refs] == [
+            ("proc_import", PathLocation.FILEREF, "inref"),
+            ("proc_export", PathLocation.FILEREF, "outref"),
+        ]
+
     def test_proc_export_outfile(self):
         ref = _one("proc export data=work.a outfile='/out/a.csv'; run;")
         assert ref.statement == "proc_export"
@@ -663,6 +677,15 @@ class TestFilerefResolution:
             ("include", "filesystem", "/p2/report.sas"),
         ]
         assert refs[4] == [("infile", "filesystem", "/q1.sas"), ("infile", "filesystem", "/q2.sas")]
+
+    def test_proc_import_and_export_follow_their_fileref(self):
+        refs = self._refs(
+            "filename src '/data/in/sales.csv';\nfilename dst '/data/out/r.csv';\n"
+            "proc import datafile=src out=work.s dbms=csv replace; run;\n"
+            "proc export data=work.s outfile=dst dbms=csv; run;\n"
+        )
+        assert refs[2] == [("proc_import", "filesystem", "/data/in/sales.csv")]
+        assert refs[3] == [("proc_export", "filesystem", "/data/out/r.csv")]
 
     def test_a_mixed_include_follows_each_fileref(self):
         refs = self._refs("filename src '/code';\n%include '/a.sas' src(b) src;\n")

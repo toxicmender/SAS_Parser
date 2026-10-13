@@ -245,8 +245,9 @@ def _path_source(ref: "SasPathRef", source_id: str | None) -> HydrationSource | 
         return None
     # ``infile in;`` reads through a fileref, at the path its FILENAME names
     # (chunker.metadata.resolve_filerefs): that FILENAME's own reference is
-    # the source, planned once. So does PROC CIMPORT's ``infile=tf``.
-    if ref.statement in ("infile", "proc_cimport") and ref.binds is not None:
+    # the source, planned once. So do PROC CIMPORT's ``infile=tf`` and PROC
+    # IMPORT's ``datafile=in``.
+    if ref.statement in ("infile", "proc_cimport", "proc_import") and ref.binds is not None:
         return None
     # A .sas7bndx is an INDEX, not data. Left in, it would be planned as an
     # ordinary file and — because it shares its stem with the dataset it indexes

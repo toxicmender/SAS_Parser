@@ -694,6 +694,21 @@ def test_a_read_of_a_shell_command_is_one_blocked_item():
     assert _plan(job="filename o pipe 'lpr';\ndata _null_; file o; put 'x'; run;\n").items == []
 
 
+def test_a_file_proc_import_reads_through_a_fileref_is_data():
+    # The FILENAME is planned once, PROC IMPORT reading it as INFILE does.
+    # Before, the read went unrecorded, so a fileref an %INCLUDE also named
+    # looked like SAS source, and the data dropped out of the plan.
+    plan = _plan(
+        job=(
+            "filename src '/data/in/sales.csv';\n"
+            "proc import datafile=src out=work.s dbms=csv replace; run;\n%include src;\n"
+        )
+    )
+    assert [(i.source.locator, i.source.object_name, i.source.libref) for i in plan.items] == [
+        ("/data/in", "sales.csv", "src")
+    ]
+
+
 def test_a_read_through_any_documented_engine_is_planned():
     # SNOW, JDBC, GREENPLM, VERTICA, ... are SAS/ACCESS engines. Unrecognised,
     # their LIBNAME was neither a database nor a directory, and the read gave

@@ -571,6 +571,25 @@ PATH_STATEMENTS: tuple[PathSpec, ...] = (
         keyword="outfile",
         pattern=re.compile(r"(?P<head>\boutfile\s*=\s*)" + _VALUE, re.IGNORECASE),
     ),
+    # datafile=<fileref> / outfile=<fileref>: "the complete path and filename
+    # or fileref" (SAS 9.4 Procedures Guide, IMPORT and EXPORT). A name
+    # running on into a path (`datafile=sales.csv`) is no fileref.
+    PathSpec(
+        statement="proc_import",
+        keyword="datafile",
+        pattern=re.compile(
+            rf"\bdatafile\s*=\s*(?P<binds>{_FREF})(?![\w.&\\/:])", re.IGNORECASE
+        ),
+        fileref=True,
+    ),
+    PathSpec(
+        statement="proc_export",
+        keyword="outfile",
+        pattern=re.compile(
+            rf"\boutfile\s*=\s*(?P<binds>{_FREF})(?![\w.&\\/:])", re.IGNORECASE
+        ),
+        fileref=True,
+    ),
     # PROC CIMPORT infile='<path>' / infile=<fileref>: the transport file it
     # imports. Anchored on the PROC, since INFILE= alone is common.
     PathSpec(

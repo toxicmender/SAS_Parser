@@ -359,17 +359,17 @@ library as any one-level name does, and its file is `my data.sas7bdat`.
 `external_refs` is one stored list of `SasPathRef` records — every location a
 chunk's statements name, whatever kind of place it is. `paths.py` recognises
 `LIBNAME`, `FILENAME`, `INFILE` / `FILE`, `%INCLUDE`, PROC IMPORT/EXPORT's
-`datafile=` / `outfile=`, PROC CIMPORT's `infile=` (the transport file, by
-path or fileref), PROC PRINTTO's `log=` / `print=`, ODS `file=` / `path=`,
-`options sasautos=`, SAS's own `cd` (statement `cd`: `x cd /dir;`, `call
-system('cd /dir');` or `%sysexec cd /dir;` as the only command, which sets
-the directory relative paths are read from), and the environment variables
-`x setenv NAME /path` and
-`options set=NAME '/path'` define (statement `setenv`): on UNIX an upper-case
-one holding a full path is a libref or fileref where no LIBNAME or FILENAME
-assigns the name, so `resolve_filerefs` follows `infile ined;` to it. What PROC CIMPORT creates is a dataset write: `data=`
-(`ds=`, `d=`) one data set, `library=` (`lib=`, `l=`) the pattern `lib.:`;
-`catalog=` names none.
+`datafile=` / `outfile=` (by path or fileref), PROC CIMPORT's `infile=` (the
+transport file, by path or fileref), PROC PRINTTO's `log=` / `print=`, ODS
+`file=` / `path=`, `options sasautos=`, SAS's own `cd` (statement `cd`:
+`x cd /dir;`, `call system('cd /dir');` or `%sysexec cd /dir;` as the only
+command, which sets the directory relative paths are read from), and the
+environment variables `x setenv NAME /path` and `options set=NAME '/path'`
+define (statement `setenv`): on UNIX an upper-case one holding a full path is
+a libref or fileref where no LIBNAME or FILENAME assigns the name, so
+`resolve_filerefs` follows `infile ined;` to it. What PROC CIMPORT creates is
+a dataset write: `data=` (`ds=`, `d=`) one data set, `library=` (`lib=`, `l=`)
+the pattern `lib.:`; `catalog=` names none.
 
 A `FILENAME` device keyword redirects the same syntax somewhere that is not the
 filesystem, so each record carries a `PathLocation` — `FILESYSTEM`, `REMOTE`

@@ -910,7 +910,9 @@ def _resolve_binds(refs: list[_BindsRefT], table: Mapping[str, str]) -> list[_Bi
 
 # Statements that may name their place through a fileref (`infile in;`,
 # `%include src(one);`): the forms chunker.paths records as FILEREF.
-_FILEREF_STATEMENTS = frozenset({"include", "infile", "file", "proc_cimport"})
+_FILEREF_STATEMENTS = frozenset(
+    {"include", "infile", "file", "proc_cimport", "proc_import", "proc_export"}
+)
 # What a macro variable standing for a fileref may hold: the fileref, or one
 # member of the directory it names — `src`, `src(setup)`.
 _FILEREF_SPELLING_RE = re.compile(
