@@ -236,6 +236,7 @@ _PATH_GROUPS: tuple[tuple[PathLocation, str], ...] = (
     (PathLocation.PIPE, "Shell pipes (a command, not a location)"),
     (PathLocation.DEVICE, "Other devices"),
     (PathLocation.FILEREF, "Filerefs no FILENAME in the corpus assigns"),
+    (PathLocation.LIBREF, "Libraries a concatenation names by libref (placed by their own LIBNAME)"),
 )
 
 

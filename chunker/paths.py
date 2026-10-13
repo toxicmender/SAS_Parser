@@ -40,6 +40,12 @@ A statement may also name a place through a fileref (``infile in;``,
 :func:`chunker.metadata.resolve_filerefs` gives each the place the FILENAME in
 force names.
 
+Or it may concatenate places SAS treats as one — ``libname x ('/a' v9);``,
+``filename f ('/q1.sas' '/q2.sas');``, ``infile '("/a.csv" "/b.csv")';`` — and
+then each place is a reference with its position in the list
+(:attr:`~chunker.models.SasPathRef.concat_index`). A library a LIBNAME names by
+its libref is :attr:`~chunker.models.PathLocation.LIBREF`: no place of its own.
+
 Not every LIBNAME names a place
 -------------------------------
 ``libname edwprod oracle path=... user=... pass=...`` has no quoted directory, so
@@ -60,7 +66,7 @@ import logging
 import re
 from dataclasses import dataclass
 
-from .macro_vars import DS_REF_TOKEN
+from .macro_vars import DS_REF_TOKEN, DS_REF_TOKEN_POSSESSIVE
 from .models import PathLocation, SasEngineRef, SasPathRef
 
 logger = logging.getLogger(__name__)
@@ -148,6 +154,12 @@ class PathSpec:
         PUT string, a TITLE or a ``%PUT`` message would read as a FILE
         statement naming a fileref. Checked after the match rather than by a
         lookbehind, which would cost the pattern its literal prefix.
+    concat
+        The ``paths`` group is a concatenation (``libname x ('/a' '/b');``):
+        each place it names carries its position
+        (:attr:`~chunker.models.SasPathRef.concat_index`), and a bare word in
+        a LIBNAME's list is a libref
+        (:attr:`~chunker.models.PathLocation.LIBREF`). Implies *many*.
     """
 
     statement: str
@@ -156,6 +168,7 @@ class PathSpec:
     many: bool = False
     fileref: bool = False
     at_statement: bool = False
+    concat: bool = False
 
     def location_for(self, match: re.Match[str]) -> PathLocation:
         """Where this match points, from its device group if it has one."""
@@ -181,26 +194,61 @@ class PathSpec:
         """
         if self.fileref:
             return self._fileref_refs(match)
+        if self.concat:
+            return self._concat_refs(match)
+        refs = [self._quoted_ref(match, start, end) for start, end in self.value_spans(match)]
+        return [ref for ref in refs if ref is not None]
+
+    def _quoted_ref(
+        self, match: re.Match[str], start: int, end: int, index: int | None = None
+    ) -> SasPathRef | None:
+        """The reference for the quoted value at ``[start, end)`` of
+        ``match.string``, or ``None`` when the value is empty."""
+        raw = match.string[start:end].strip()
+        if not raw:
+            return None
         device = _group(match, "device")
         engine = _group(match, "engine")
         binds = _group(match, "binds")
+        return SasPathRef(
+            statement=self.statement,
+            location=classify_location(device),
+            path=normalise_path(raw),
+            raw=raw,
+            binds=binds.lower() if binds else None,
+            device=device.lower() if device else None,
+            engine=engine.lower() if engine else None,
+            # SAS resolves macro references in a double-quoted value only:
+            # in '/data/R&D/x.csv' the & is a character of the name.
+            has_macro_ref="&" in raw and _governing_quote(match, start) != "'",
+            concat_index=index,
+        )
+
+    def _concat_refs(self, match: re.Match[str]) -> list[SasPathRef]:
+        """One reference per place a concatenation names, each with its
+        position: ``/a`` (0), ``v9`` (1) and ``/b`` (2) for ``libname x ('/a'
+        v9 '/b');``. A LIBNAME's engine applies to the directories it names,
+        not to a library named by its libref (SAS 9.4 Global Statements,
+        LIBNAME Statement: Rules for Library Concatenation)."""
+        start, end = match.span("paths")
+        binds = _group(match, "binds")
         refs: list[SasPathRef] = []
-        for start, end in self.value_spans(match):
-            raw = match.string[start:end].strip()
-            if raw:
-                # SAS resolves macro references in a double-quoted value only:
-                # in '/data/R&D/x.csv' the & is a character of the name.
-                quote = match.string[start - 1] if start else ""
+        for index, member in enumerate(_CONCAT_MEMBER_RE.finditer(match.string, start, end)):
+            word = member.group("libref")
+            if word is None:
+                ref = self._quoted_ref(match, *member.span("path"), index)
+                if ref is not None:
+                    refs.append(ref)
+            elif self.statement == "libname":
                 refs.append(
                     SasPathRef(
                         statement=self.statement,
-                        location=classify_location(device),
-                        path=normalise_path(raw),
-                        raw=raw,
+                        location=PathLocation.LIBREF,
+                        path=word.lower(),
+                        raw=word,
                         binds=binds.lower() if binds else None,
-                        device=device.lower() if device else None,
-                        engine=engine.lower() if engine else None,
-                        has_macro_ref="&" in raw and quote != "'",
+                        has_macro_ref="&" in word,
+                        concat_index=index,
                     )
                 )
         return refs
@@ -255,12 +303,32 @@ def _group(match: re.Match[str], name: str) -> str | None:
     return match.groupdict().get(name)
 
 
+def _governing_quote(match: re.Match[str], start: int) -> str:
+    """The quote SAS reads the value at *start* between: its own, or, in a
+    quoted list of files (``'("/a.sas" "/b.sas")'``), the list's — which
+    decides whether a ``&`` in it is a macro reference."""
+    if "paths" in match.re.groupindex:
+        lo, hi = match.span("paths")
+        for literal in _QUOTED_RE.finditer(match.string, lo, hi):
+            if literal.start() < start < literal.end():
+                return literal.group()[0]
+    return match.string[start - 1] if start else ""
+
+
 # The quoted-value tail every spec ends with: an opening quote, the value, and
 # the same quote again. A SAS statement's quoted literal does not span lines.
 _VALUE = r"(?P<q>['\"])(?P<path>[^'\"\n]*)(?P=q)"
 _VALUE_RE = re.compile(_VALUE)
 # One quoted value, ungrouped, to repeat in a list.
 _QUOTED = r"""(?:'[^'\n]*'|"[^"\n]*")"""
+_QUOTED_RE = re.compile(_QUOTED)
+# One place in a concatenation: a quoted value, or a LIBNAME's libref.
+_CONCAT_MEMBER_RE = re.compile(rf"{_VALUE}|(?P<libref>{DS_REF_TOKEN})")
+# One library in a LIBNAME concatenation, and the blank or comma between two.
+# Possessive, so a list with no closing parenthesis fails at once instead of
+# trying every way of splitting its words.
+_LIBRARY = rf"(?:{_QUOTED}|{DS_REF_TOKEN_POSSESSIVE})"
+_LIST_SEP = r"\s*+,?\s*+"
 # A fileref, and the members of a directory it names: `src(one two)`.
 _FREF = r"[A-Za-z_&][\w&]*"
 _MEMBER_RE = re.compile(r"""'[^'\n]*'|"[^"\n]*"|[\w&.$]+""")
@@ -293,6 +361,23 @@ PATH_STATEMENTS: tuple[PathSpec, ...] = (
             re.IGNORECASE,
         ),
     ),
+    # libname <libref> [<engine>] (<library> ...): a concatenation, one library
+    # SAS searches in order. Each library is a quoted directory or a libref
+    # already assigned, separated by blanks or commas: `libname profits
+    # (income, costs, '/u/2011/capgain');` (SAS 9.4 Global Statements, LIBNAME
+    # Statement, Form 4).
+    PathSpec(
+        statement="libname",
+        keyword="libname",
+        pattern=re.compile(
+            rf"(?P<head>\blibname\s+(?P<binds>{DS_REF_TOKEN})"
+            r"(?:\s+(?P<engine>[A-Za-z_]\w*))?\s*)"
+            rf"\(\s*(?P<paths>{_LIBRARY}(?:{_LIST_SEP}{_LIBRARY})*+)\s*\)",
+            re.IGNORECASE,
+        ),
+        many=True,
+        concat=True,
+    ),
     # filename <fileref> [<device>] '<path>'
     PathSpec(
         statement="filename",
@@ -303,12 +388,42 @@ PATH_STATEMENTS: tuple[PathSpec, ...] = (
             re.IGNORECASE,
         ),
     ),
+    # filename <fileref> ('<path>' ...): files read one after another, or
+    # directories searched in order for a member (SAS 9.4 Companion for UNIX
+    # Environments, Concatenating Filenames; Assigning a Fileref to Several
+    # Directories).
+    PathSpec(
+        statement="filename",
+        keyword="filename",
+        pattern=re.compile(
+            rf"(?P<head>\bfilename\s+(?P<binds>{DS_REF_TOKEN})"
+            r"(?:\s+(?P<device>[A-Za-z_]\w*))?\s*)"
+            rf"\(\s*(?P<paths>{_QUOTED}(?:{_LIST_SEP}{_QUOTED})*+)\s*\)",
+            re.IGNORECASE,
+        ),
+        many=True,
+        concat=True,
+    ),
     # infile '<path>' / file '<path>' — the unquoted form names a fileref a
     # FILENAME already declared, so there is no path here to record.
     PathSpec(
         statement="infile",
         keyword="infile",
         pattern=re.compile(r"(?P<head>\binfile\s+)" + _VALUE, re.IGNORECASE),
+    ),
+    # infile '("<path>" "<path>")': files read one after another, the list
+    # inside one quoted string (Concatenating Filenames, as above).
+    PathSpec(
+        statement="infile",
+        keyword="infile",
+        pattern=re.compile(
+            r"(?P<head>\binfile\s+)(?P<paths>"
+            rf"""'\(\s*"[^"\n]*"(?:{_LIST_SEP}"[^"\n]*")*+\s*\)'"""
+            rf"""|"\(\s*'[^'\n]*'(?:{_LIST_SEP}'[^'\n]*')*+\s*\)")""",
+            re.IGNORECASE,
+        ),
+        many=True,
+        concat=True,
     ),
     PathSpec(
         statement="file",

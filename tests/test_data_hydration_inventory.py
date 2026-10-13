@@ -407,6 +407,103 @@ def test_an_environment_variable_nothing_reads_through_is_no_item():
     assert [(i.source.locator, i.source.object_name) for i in plan.items] == [("/lib/educ", "class")]
 
 
+def test_a_read_through_a_concatenated_library_is_planned_from_the_first():
+    # libname x ('/a' '/b') is one library SAS searches in order. Before, the
+    # statement was not recognised: x.m dropped out of the plan, or became a
+    # library "never assigned".
+    for statement in ("libname x ('/a' '/b');", "libname x v9 ('/a', \"/b\");"):
+        plan = _plan(job=f"{statement}\ndata t; set x.m; run;\n")
+        [item] = plan.items
+        assert (item.source.kind, item.source.locator, item.source.object_name) == (
+            SourceKind.SAS_DATASET,
+            "/a",
+            "m",
+        ), statement
+        assert item.blockers == ()
+        [note] = item.notes
+        assert "searches in the order /a, /b" in note and "planned from /a" in note
+
+
+def test_a_concatenation_takes_a_libref_as_assigned_then():
+    # (income, costs, '/u/capgain') searches income's directories, then
+    # costs', then /u/capgain; income reassigned afterwards changes nothing.
+    plan = _plan(
+        job=(
+            "libname income ('/u/corpsale', '/u/retail');\n"
+            "libname costs ('/u/salaries', '/u/expenses');\n"
+            "libname profits (income, costs, '/u/capgain');\n"
+            "libname income '/u/elsewhere';\n"
+            "data t; set profits.m; run;\n"
+        )
+    )
+    [item] = [i for i in plan.items if i.source.kind is SourceKind.SAS_DATASET]
+    assert (item.source.locator, item.source.object_name, item.source.libref) == (
+        "/u/corpsale",
+        "m",
+        "income",
+    )
+    assert "/u/corpsale, /u/retail, /u/salaries, /u/expenses, /u/capgain" in item.notes[0]
+    # The directories searched after the first need no items; the new income,
+    # which nothing reads, is a library item as any unread one is.
+    assert [i.source.locator for i in plan.items if i is not item] == ["/u/elsewhere"]
+
+
+def test_a_concatenation_searching_an_unassigned_library_first_is_blocked():
+    # SAS looks in prod first, and only a session that assigns prod says where
+    # it is; /x stays in the plan, since the member may be there instead.
+    plan = _plan(job="libname all (prod '/x');\ndata t; set all.m; run;\n")
+    kinds = {i.source.kind: i for i in plan.items}
+    assert set(kinds) == {SourceKind.SAS_SESSION, SourceKind.FILE}
+    blocker = kinds[SourceKind.SAS_SESSION].blockers[0]
+    assert "library 'prod' is never assigned" in blocker
+    assert "all.m (the concatenation all searches prod first)" in blocker
+    assert kinds[SourceKind.FILE].source.locator == "/x"
+    # Searched after a directory, it is only named in the note.
+    [item] = _plan(job="libname all ('/x' prod);\ndata t; set all.m; run;\n").items
+    assert item.source.locator == "/x"
+    assert "/x, library prod (assigned outside the corpus)" in item.notes[0]
+
+
+def test_a_list_read_through_a_concatenation_keeps_every_directory():
+    plan = _plan(job="libname x ('/a' '/b');\ndata t; set x.sales_:; run;\n")
+    assert [(i.source.locator, i.source.object_name) for i in plan.items] == [
+        ("/a", ""),
+        ("/b", ""),
+    ]
+
+
+def test_a_concatenated_fileref_plans_each_file():
+    plan = _plan(job="filename f ('/in/q1.csv' '/in/q2.csv');\ndata t; infile f; input x; run;\n")
+    assert [(i.source.locator, i.source.object_name) for i in plan.items] == [
+        ("/in", "q1.csv"),
+        ("/in", "q2.csv"),
+    ]
+
+
+def test_a_concatenation_survives_the_rows():
+    # The plan from the rows is the plan from the chunks: the rows keep each
+    # place's position, and one concatenation's rows follow each other.
+    source = "libname v9 '/v9';\nlibname all (v9 '/x');\ndata t; set all.m; run;\n"
+    rows = _rows(job=source)
+    assert [(r.name, r.location, r.concat_index) for r in rows if r.statement == "libname"] == [
+        ("/v9", "filesystem", None),
+        ("v9", "libref", 0),
+        ("/x", "filesystem", 1),
+    ]
+    [result] = _results(job=source)
+    chunks = [c for c in result.chunks if c.parent_id is None]
+    from_chunks = build_corpus_plan(
+        {"job.sas": ([], [r for c in chunks for r in c.metadata.external_refs])},
+        datasets={"job.sas": [list(c.metadata.dataset_refs) for c in chunks]},
+        config=_config(),
+    )
+    from_rows = plan_from_inventory(rows, config=_config())
+    assert [(i.source.locator, i.source.object_name, i.notes) for i in from_rows.items] == [
+        (i.source.locator, i.source.object_name, i.notes) for i in from_chunks.items
+    ]
+    assert [(i.source.locator, i.source.object_name) for i in from_rows.items] == [("/v9", "m")]
+
+
 def test_a_read_through_any_documented_engine_is_planned():
     # SNOW, JDBC, GREENPLM, VERTICA, ... are SAS/ACCESS engines. Unrecognised,
     # their LIBNAME was neither a database nor a directory, and the read gave
@@ -533,6 +630,10 @@ class _FakeWriter:
         self.log.append(("mode", name))
         return self
 
+    def option(self, key, value):
+        self.log.append(("option", key, value))
+        return self
+
     def saveAsTable(self, table):
         self.log.append(("saveAsTable", table))
 
@@ -573,7 +674,13 @@ def test_a_write_appends_one_run_to_a_delta_table():
     assert data[0][:3] == (rows[0].run_id, rows[0].corpus, rows[0].recorded_at)
     assert all(len(values) == len(_COLUMNS) for values in data)
     assert isinstance(data[0][[n for n, _, _ in _COLUMNS].index("kind")], str)
-    assert spark.write_log == [("format", "delta"), ("mode", "append"), ("saveAsTable", "main.meta.sas_refs")]
+    # The schema merges, so a table made before a column was added gains it.
+    assert spark.write_log == [
+        ("format", "delta"),
+        ("mode", "append"),
+        ("option", "mergeSchema", "true"),
+        ("saveAsTable", "main.meta.sas_refs"),
+    ]
 
 
 def test_nothing_to_write_touches_no_table():

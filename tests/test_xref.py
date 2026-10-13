@@ -754,6 +754,20 @@ def test_pre_rewrites_a_filename_and_leaves_what_names_it_alone():
     assert stats.rewritten == {"/code": "/repo/code"}
 
 
+def test_pre_rewrites_every_directory_of_a_concatenation():
+    # Each quoted place moves where it stands; a library named by its libref
+    # is no path, and the list's commas and parentheses stay as written.
+    src = (
+        "libname all ('/data/in/a', v9, '/data/in/b');\n"
+        "filename f (\"/data/in/q1.sas\" '/data/in/q2.sas');\n"
+        "data x; infile '(\"/data/in/c.csv\" \"/data/in/d.csv\")'; run;\n"
+    )
+    out, stats = pre.rewrite_source_text(src, _paths(**{"/data/in": "/mnt/bronze"}))
+
+    assert out == src.replace("/data/in/", "/mnt/bronze/")
+    assert len(stats.rewritten) == 6
+
+
 def test_pre_applies_the_longest_matching_key_first():
     # The reference sorts keys longest-first to avoid partial overlaps; the
     # specific mapping must win over the prefix one.

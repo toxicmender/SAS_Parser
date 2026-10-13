@@ -138,6 +138,17 @@ macro's `set &ds;` makes.
   (WORK, SASHELP, SASUSER, MAPS) need none, a dataset the job makes first is no
   input, and while some LIBNAME's libref is an unresolved `&lib` nothing is
   claimed unassigned.
+- **A concatenated library is searched in order.** `libname x ('/a' '/b');` is
+  one library: SAS reads a member from the first directory that holds it.
+  Only a listing says which that is, so `set x.m;` is planned from `/a`, with
+  a note naming the search order; if `m` is not there, the load fails rather
+  than read the wrong file. The directories searched after the first need no
+  items of their own, unless a list is read through the library. A library
+  named by its libref (`libname all (v9 '/x');`) is taken as that libref is
+  assigned at that point, so `all.m` is planned from v9's directory, as a v9
+  member. One the corpus never assigns, searched first, is a `sas_session`
+  item naming the read (`all.m`). A concatenated fileref
+  (`filename f ('/q1.csv' '/q2.csv');`) plans each file.
 
 ## The reference inventory
 
@@ -154,8 +165,10 @@ spelling, `value` the place or name SAS reads, `name` the comparison key.
 - **`write_inventory(rows, table)`** appends them to a Delta table as one *run*:
   `run_id` is `<UTC stamp>-<8 hex>`, so the latest run sorts last and the table
   keeps the history. The table and its schema are created when missing, never
-  its catalog. **`read_inventory(table, corpus=...)`** reads the corpus's latest
-  run back, or a given `run_id`.
+  its catalog, and a table created before a column was added (`concat_index`,
+  a path's place in a concatenation) gains it on the next write, null in the
+  earlier runs. **`read_inventory(table, corpus=...)`** reads the corpus's
+  latest run back, or a given `run_id`.
 - **`plan_from_inventory(rows)`** plans from the rows alone. The CLI and
   `complexity --hydration` plan this way, so the inventory is the planner's
   one input, and `--from-inventory` plans from the table with no SAS source

@@ -835,6 +835,12 @@ and old JSON still loads. These changes are visible to callers.
     hydration planner's locator uses `effective_path`.
   - New, additive: `include_files` on the metadata (`SasIncludeFile`
     records).
+  - A concatenation (`libname x ('/a' v9);`, `filename f ('/q1.sas'
+    '/q2.sas');`, `infile '("/a.csv" "/b.csv")';`) records each place with
+    `concat_index`; a library named by its libref is `PathLocation.LIBREF`.
+    `resolve_filerefs` turns a reference through a concatenated fileref
+    into one per place. The inventory gains a `concat_index` column, which
+    an existing table takes on at its next write (Delta schema merge).
 - **Resolution order.** `resolve_references` runs macro variables, then
   filerefs, ODS OUTPUT and database librefs. Call it rather than the passes
   one by one.
@@ -876,9 +882,11 @@ and old JSON still loads. These changes are visible to callers.
   - The Datasets section adds "Updated in place" and "Deleted" lines.
   - A table a file only updates is an input, imported from the file that
     creates it, not an intermediate.
-  - The Paths section lists filerefs no FILENAME assigns.
+  - The Paths section lists filerefs no FILENAME assigns, and the librefs a
+    concatenation names.
 - **Hydration.** A file read through a fileref is planned once, from its
-  FILENAME.
+  FILENAME. A dataset read through a concatenated library is planned from
+  the first library SAS searches, with a note naming the rest.
 
 ## Pipeline and memory
 

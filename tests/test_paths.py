@@ -186,6 +186,69 @@ class TestStatementForms:
         assert ref.path == "/mac/a"
 
 
+class TestConcatenation:
+    """One statement naming several places SAS treats as one: each place is a
+    reference of its own, with its position in the list (SAS 9.4 Global
+    Statements, LIBNAME Statement, Form 4; SAS 9.4 Companion for UNIX
+    Environments, Concatenating Filenames)."""
+
+    def test_a_library_of_directories(self):
+        refs = extract_paths("libname x ('/a' \"/b\");")
+        assert [(r.statement, r.binds, r.location, r.path, r.concat_index) for r in refs] == [
+            ("libname", "x", PathLocation.FILESYSTEM, "/a", 0),
+            ("libname", "x", PathLocation.FILESYSTEM, "/b", 1),
+        ]
+
+    def test_librefs_directories_and_commas(self):
+        # The UNIX companion's own example.
+        refs = extract_paths("libname profits (income, costs, '/u/2011/capgain');")
+        assert [(r.location, r.raw, r.binds, r.concat_index) for r in refs] == [
+            (PathLocation.LIBREF, "income", "profits", 0),
+            (PathLocation.LIBREF, "costs", "profits", 1),
+            (PathLocation.FILESYSTEM, "/u/2011/capgain", "profits", 2),
+        ]
+
+    def test_an_engine_applies_to_the_directories_only(self):
+        refs = extract_paths("libname x v9('/a' V6);")
+        assert [(r.raw, r.path, r.engine) for r in refs] == [("/a", "/a", "v9"), ("V6", "v6", None)]
+
+    def test_a_fileref_of_several_files_or_directories(self):
+        refs = extract_paths("filename f ('/q1.sas', \"/q2.sas\");\nfilename g ftp ('a.txt' 'b.txt');\n")
+        assert [(r.binds, r.location, r.path, r.concat_index) for r in refs] == [
+            ("f", PathLocation.FILESYSTEM, "/q1.sas", 0),
+            ("f", PathLocation.FILESYSTEM, "/q2.sas", 1),
+            ("g", PathLocation.REMOTE, "a.txt", 0),
+            ("g", PathLocation.REMOTE, "b.txt", 1),
+        ]
+
+    def test_files_an_infile_lists_in_one_string(self):
+        refs = extract_paths("infile '(\"/d/a.csv\" \"/d/b.csv\")' dlm=',';")
+        assert [(r.statement, r.path, r.concat_index) for r in refs] == [
+            ("infile", "/d/a.csv", 0),
+            ("infile", "/d/b.csv", 1),
+        ]
+
+    def test_the_quotes_around_a_list_decide_its_macro_references(self):
+        # SAS reads a list inside one string by that string's quotes: between
+        # single quotes & is a character, between double quotes a reference.
+        single = extract_paths("%include '(\"&r/a.sas\")';\ninfile '(\"&r/a.csv\")';\n")
+        assert [r.has_macro_ref for r in single] == [False, False]
+        double = extract_paths("%include \"('&r/a.sas')\";\ninfile \"('&r/a.csv')\";\n")
+        assert [r.has_macro_ref for r in double] == [True, True]
+
+    def test_a_place_named_alone_has_no_index(self):
+        assert _one("libname x '/a';").concat_index is None
+        assert {r.concat_index for r in extract_paths("%include '/a.sas' '/b.sas';")} == {None}
+
+    def test_a_list_without_its_closing_parenthesis_fails_at_once(self):
+        # Possessive: a long word is not tried split every way.
+        import time
+
+        started = time.perf_counter()
+        assert extract_paths("libname x (" + "a" * 60 + ";\nfilename f ('/a' " + "'/b' " * 3000) == []
+        assert time.perf_counter() - started < 1
+
+
 class TestLocationClassification:
     """A quoted argument is not automatically a directory."""
 
@@ -464,6 +527,39 @@ class TestFilerefResolution:
     def test_a_fileref_spelled_through_a_macro_variable(self):
         refs = self._refs("%let f = in;\nfilename &f '/data/x.csv';\ndata a; infile in; run;\n")
         assert refs[2] == [("infile", "filesystem", "/data/x.csv")]
+
+    def test_a_concatenated_fileref_reads_each_file_and_searches_each_directory(self):
+        # `%include f;` reads both files in turn; `progs(report)` is looked for
+        # in /p1, then /p2 (SAS 9.4 Companion for UNIX Environments).
+        refs = self._refs(
+            "filename f ('/q1.sas' '/q2.sas');\n%include f;\n"
+            "filename progs (\"/p1\" '/p2');\n%inc progs(report);\n"
+            "data a; infile f; input x; run;\n"
+        )
+        assert refs[1] == [
+            ("include", "filesystem", "/q1.sas"),
+            ("include", "filesystem", "/q2.sas"),
+        ]
+        assert refs[3] == [
+            ("include", "filesystem", "/p1/report.sas"),
+            ("include", "filesystem", "/p2/report.sas"),
+        ]
+        assert refs[4] == [("infile", "filesystem", "/q1.sas"), ("infile", "filesystem", "/q2.sas")]
+
+    def test_following_a_concatenation_again_changes_nothing(self):
+        from chunker import SasSemanticChunker
+        from chunker.metadata import resolve_filerefs
+
+        result = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(
+            "filename f ('/q1.sas' '/q2.sas');\n%include f;\n"
+        )
+        chunks = list(result.chunks)
+        before = [c.metadata for c in chunks]
+        resolve_filerefs(chunks)
+        assert [c.metadata for c in chunks] == before
+        included = before[1]
+        assert [(r.raw, r.concat_index) for r in included.external_refs] == [("f", 0), ("f", 1)]
+        assert [f.path for f in included.include_files] == ["/q1.sas", "/q2.sas"]
 
 
     def test_a_fileref_form_has_no_value_to_rewrite(self):

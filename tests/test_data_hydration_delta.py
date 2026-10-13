@@ -411,3 +411,43 @@ class TestTheReferenceInventory:
         # The trial run is newer, but it is not prod's.
         assert names(read_inventory(inventory, spark=delta_spark, corpus="prod")) == {"lib.prod", "work.a"}
         assert read_inventory(inventory, spark=delta_spark, corpus="nobody") == []
+
+    def test_a_table_made_before_a_column_was_added_gains_it(self, delta_spark, inventory):
+        # A table created before concat_index existed, with a run in it: the
+        # next write adds the column, and the old run reads null there.
+        from data_hydration.inventory import _COLUMNS, read_inventory, write_inventory
+
+        old = [(name, sql_type) for name, sql_type, _ in _COLUMNS if name != "concat_index"]
+        delta_spark.sql(
+            f"CREATE TABLE {inventory} ("
+            + ", ".join(f"`{name}` {sql_type}" for name, sql_type in old)
+            + ") USING DELTA"
+        )
+        first = self._rows("data a; set lib.one; run;\n", run_id="20260101T000000Z-00000001")
+        values = [
+            tuple(v for (name, _, _), v in zip(_COLUMNS, _row_values(row)) if name != "concat_index")
+            for row in first
+        ]
+        delta_spark.createDataFrame(
+            values, schema=", ".join(f"`{name}` {sql_type}" for name, sql_type in old)
+        ).write.format("delta").mode("append").saveAsTable(inventory)
+
+        second = self._rows(
+            "libname x ('/a' '/b');\ndata a; set x.m; run;\n", run_id="20260102T000000Z-00000002"
+        )
+        write_inventory(second, inventory, spark=delta_spark)
+        assert "concat_index" in delta_spark.table(inventory).columns
+        back = read_inventory(inventory, spark=delta_spark)
+        assert [(r.name, r.concat_index) for r in back if r.statement == "libname"] == [
+            ("/a", 0),
+            ("/b", 1),
+        ]
+        pinned = read_inventory(inventory, spark=delta_spark, run_id=first[0].run_id)
+        assert {r.name for r in pinned} == {"lib.one", "work.a"}
+        assert all(r.concat_index is None for r in pinned)
+
+
+def _row_values(row):
+    from data_hydration.inventory import _values
+
+    return _values(row)

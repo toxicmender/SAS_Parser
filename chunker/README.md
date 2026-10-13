@@ -362,6 +362,7 @@ A `FILENAME` device keyword redirects the same syntax somewhere that is not the
 filesystem, so each record carries a `PathLocation` — `FILESYSTEM`, `REMOTE`
 (FTP, URL, …), `EMAIL`, `PIPE` (a shell command), or `DEVICE` for a keyword this
 module does not know. An unknown device is never silently treated as a path.
+`FILEREF` and `LIBREF` (below) are places named through a fileref or libref.
 
 A statement may name several places: `%include '/a.sas' '/b.sas';` is two
 records (a `PathSpec` with `many=True`; `xref.pre` rewrites each value through
@@ -378,6 +379,20 @@ later reference takes the FILENAME's location and path — a member of a
 directory as `<dir>/one.sas`, SAS adding `.sas` for `%INCLUDE`. A fileref
 nothing binds stays `FILEREF`. A file read through a fileref is the FILENAME's
 file, so the hydration planner plans it once, from the FILENAME.
+
+A statement may also **concatenate** places, which SAS treats as one:
+`libname x ('/a' '/b');` (commas allowed, and an assigned libref in place of a
+directory: `libname all (v9 v6 '/x');`), `filename f ('/q1.sas' '/q2.sas');`
+and `infile '("/a.csv" "/b.csv")';`. Each place is a record of its own with its
+position in `concat_index`, from 0; a library named by its libref is
+`PathLocation.LIBREF`, a place only through that libref's own LIBNAME, and the
+LIBNAME's engine applies to the directories alone. SAS searches a concatenated
+library in order, reading a member from the first directory that holds it.
+`resolve_filerefs` turns a reference to a whole concatenated fileref
+(`%include f;`) into one per file, which SAS reads in turn, and a member
+(`%include f(m);`) into one per directory, which SAS searches in turn; each
+keeps its place's `concat_index`. Inside a list in one string,
+`'("&r/a.sas")'`, the outer quotes decide whether `&` is a macro reference.
 
 **Paths spelled through macro variables** resolve from the values in force
 where the statement stands, in the same source-order walk that resolves dataset

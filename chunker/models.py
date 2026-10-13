@@ -69,6 +69,11 @@ class PathLocation(StrEnum):
     ``%include src(one);``) whose FILENAME the corpus does not show where it
     stands. :func:`chunker.metadata.resolve_filerefs` gives every reference it
     can the FILENAME's location and path; the rest stay FILEREF.
+
+    ``LIBREF`` is a library a concatenation names by its libref rather than its
+    directory: ``v9`` and ``v6`` in ``libname all (v9 v6 '/x');``. It is no
+    place of its own — the LIBNAME that assigned that libref says where it is,
+    and the hydration planner follows it there.
     """
 
     FILESYSTEM = "filesystem"
@@ -77,6 +82,7 @@ class PathLocation(StrEnum):
     PIPE = "pipe"
     DEVICE = "device"
     FILEREF = "fileref"
+    LIBREF = "libref"
 
 
 class SasPathRef(BaseModel, frozen=True):
@@ -133,6 +139,16 @@ class SasPathRef(BaseModel, frozen=True):
         gives a value, so its real value is not knowable without running SAS.
         Recorded rather than dropped: a path that cannot be resolved is exactly
         what a migration needs told about.
+    concat_index
+        The place's position, from 0, in a concatenation: one statement naming
+        several places that SAS treats as one. ``libname x ('/a' '/b');`` is
+        one library that SAS searches in order, reading a member from the
+        first directory that holds it and writing to the first.
+        ``filename f ('/q1.sas' '/q2.sas');`` reads its files one after
+        another, and ``%include f(m);`` searches its directories in order.
+        ``infile '("/a.csv" "/b.csv")';`` reads its files one after another.
+        A reference made through a concatenated fileref keeps the index of the
+        place it was given. ``None`` for a place named alone.
     """
 
     statement: str
@@ -144,6 +160,7 @@ class SasPathRef(BaseModel, frozen=True):
     engine: str | None = None
     has_macro_ref: bool = False
     resolved_path: str | None = None
+    concat_index: int | None = None
 
     @property
     def effective_path(self) -> str:
@@ -212,7 +229,7 @@ class SasIncludeFile(BaseModel, frozen=True):
 
 def _path_ref_sort_key(
     ref: SasPathRef,
-) -> tuple[str, str, str, str, str, str, str, str, bool]:
+) -> tuple[str, str, str, str, str, str, str, str, bool, int]:
     """Total order over :class:`SasPathRef`, defined once.
 
     Both places that deduplicate these records through a set —
@@ -232,6 +249,7 @@ def _path_ref_sort_key(
         ref.device or "",
         ref.engine or "",
         ref.has_macro_ref,
+        -1 if ref.concat_index is None else ref.concat_index,
     )
 
 

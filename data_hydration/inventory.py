@@ -154,6 +154,10 @@ class InventoryRow(BaseModel, frozen=True):
         corpus and in the application's SharePoint scripts folder
         (:func:`data_hydration.includes.match_includes`); ``None`` where
         nobody looked.
+    concat_index
+        A path's place in a concatenation (``libname x ('/a' '/b');``), from
+        0 — see :attr:`~chunker.models.SasPathRef.concat_index`. The rows of
+        one concatenation follow each other in ``ref_order``.
     """
 
     run_id: str
@@ -190,6 +194,7 @@ class InventoryRow(BaseModel, frozen=True):
     parameterised: bool = False
     found_local: tuple[str, ...] | None = None
     found_sharepoint: tuple[str, ...] | None = None
+    concat_index: int | None = None
 
     @field_validator("options", mode="before")
     @classmethod
@@ -373,6 +378,7 @@ def _chunk_refs(meta: Any) -> Iterable[dict[str, Any]]:
             "location": location,
             "engine": ref.engine,
             "device": ref.device,
+            "concat_index": ref.concat_index,
         }
     for ref in meta.db_tables:
         yield {
@@ -439,6 +445,7 @@ class _PathRecord:
     #: Where the reference stands in its file (``ref_order``): a LIBNAME binds
     #: its libref for the reads after it, not the ones before.
     order: int | None = None
+    concat_index: int | None = None
 
     @property
     def effective_path(self) -> str:
@@ -457,6 +464,7 @@ class _PathRecord:
             has_macro_ref=row.has_macro_ref,
             resolved_path=row.value if row.value != row.raw else None,
             order=row.ref_order,
+            concat_index=row.concat_index,
         )
 
 
@@ -645,6 +653,9 @@ _COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("parameterised", "BOOLEAN", "a template built from the parameters of its macro"),
     ("found_local", "ARRAY<STRING>", "an included script found in the local corpus"),
     ("found_sharepoint", "ARRAY<STRING>", "an included script found in SharePoint"),
+    # Columns added after the table's first release go last: an existing table
+    # gains them on the next write (write_inventory), null in earlier runs.
+    ("concat_index", "INT", "place of a path in a concatenation, from 0"),
 )
 
 # Unity Catalog identifiers: one to three parts of letters, digits and _.
@@ -709,7 +720,9 @@ def write_inventory(rows: Sequence[InventoryRow], table: str, *, spark: Any = No
 
     One run per call: the rows are one corpus's references at one instant, and
     earlier runs stay as they were — the table is the history, and
-    :func:`read_inventory` reads the latest. The table is created when missing.
+    :func:`read_inventory` reads the latest. The table is created when missing,
+    and a table created before a column was added gains it here (Delta schema
+    merge), the earlier runs reading null in it.
     """
     if not rows:
         logger.warning(f"write_inventory: no references to write to {table}")
@@ -718,7 +731,7 @@ def write_inventory(rows: Sequence[InventoryRow], table: str, *, spark: Any = No
     ensure_inventory_table(table, spark=spark)
     schema = ", ".join(f"`{name}` {sql_type}" for name, sql_type, _ in _COLUMNS)
     frame = spark.createDataFrame([_values(row) for row in rows], schema=schema)
-    frame.write.format("delta").mode("append").saveAsTable(table)
+    frame.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(table)
     logger.info(f"write_inventory: {len(rows)} row(s) -> {table} (run {rows[0].run_id})")
     return len(rows)
 

@@ -1787,8 +1787,24 @@ def _through_fileref(ref: SasPathRef, filename: SasPathRef) -> SasPathRef:
             "resolved_path": place,
             "device": filename.device,
             "has_macro_ref": "&" in place,
+            "concat_index": filename.concat_index,
         }
     )
+
+
+def _filename_places(refs: list[SasPathRef]) -> dict[str, list[SasPathRef]]:
+    """The places each FILENAME among *refs* gives its fileref: one, or a
+    concatenation's in order — ``filename f ('/q1.sas' '/q2.sas');`` gives
+    ``f`` both files."""
+    places: dict[str, list[SasPathRef]] = {}
+    for r in refs:
+        if r.statement != "filename" or not r.binds:
+            continue
+        if r.concat_index:  # the next place of the same concatenation
+            places.setdefault(r.binds, []).append(r)
+        else:
+            places[r.binds] = [r]
+    return places
 
 
 def resolve_filerefs(chunks: list[SasChunk]) -> None:
@@ -1813,16 +1829,23 @@ def resolve_filerefs(chunks: list[SasChunk]) -> None:
     /users/myid/educ.dat;`` lets ``infile ined;`` read that file. One set
     earlier in the walk (a ``setenv`` reference) is followed where no FILENAME
     binds the name — SAS uses the fileref when both exist.
+
+    A FILENAME may concatenate places (``filename f ('/q1.sas' '/q2.sas');``):
+    a reference to the whole fileref (``%include f;``) reads every file in
+    turn, so it becomes one reference per file; one to a member (``%include
+    f(m);``) is looked for in each directory in turn, the first holding it
+    read, so it becomes one reference per directory, in that order. Each
+    carries the :attr:`~chunker.models.SasPathRef.concat_index` of its place.
     """
-    bound: dict[str, SasPathRef] = {}
-    env: dict[str, SasPathRef] = {}
+    bound: dict[str, list[SasPathRef]] = {}
+    env: dict[str, list[SasPathRef]] = {}
     for idx, chunk in enumerate(chunks):
         meta = chunk.metadata
         refs = meta.external_refs
         for r in refs:
             if r.statement == "setenv" and r.binds:
-                env[r.binds] = r
-        named = {r.binds: r for r in refs if r.statement == "filename" and r.binds}
+                env[r.binds] = [r]
+        named = _filename_places(refs)
         if named or meta.global_statement_keyword == "filename":
             # In source order: `filename _all_ clear;` then `filename src
             # '/x';` leaves src bound, and the reverse leaves nothing.
@@ -1843,14 +1866,17 @@ def resolve_filerefs(chunks: list[SasChunk]) -> None:
                 bound[fref] = named[fref]  # a statement the scan above misread
         if not (bound or env) or not any(map(_named_through_fileref, refs)):
             continue
-        resolved = [
-            _through_fileref(r, place)
-            if _named_through_fileref(r)
-            and r.binds is not None
-            and (place := bound.get(r.binds) or env.get(r.binds)) is not None
-            else r
-            for r in refs
-        ]
+        followed: list[SasPathRef] = []
+        for r in refs:
+            places = (
+                (bound.get(r.binds) or env.get(r.binds))
+                if _named_through_fileref(r) and r.binds is not None
+                else None
+            )
+            followed += [r] if places is None else [_through_fileref(r, p) for p in places]
+        # Following again what an earlier run followed gives the same places,
+        # once each.
+        resolved = list(dict.fromkeys(followed))
         if resolved == refs:
             continue
         if logger.isEnabledFor(logging.DEBUG):

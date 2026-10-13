@@ -561,7 +561,22 @@ def _env_library(ref: "SasPathRef") -> bool:
     )
 
 
+def _concatenated(ref: "SasPathRef") -> bool:
+    """Whether *ref* is one library of a LIBNAME concatenation (``libname x
+    ('/a' v9);``): a directory, a libref, or a library of another engine,
+    which takes its place in the search order all the same."""
+    return (
+        ref.statement == "libname"
+        and getattr(ref, "concat_index", None) is not None
+        and bool(ref.binds)
+        and not (ref.binds or "").startswith("&")
+    )
+
+
 #: A directory library: its libref and directory, as a library item has them.
+#: In a concatenation's search order, a directory of ``""`` stands for a
+#: library named by a libref the corpus never assigns (or one spelled through
+#: a macro variable nothing resolved): its place is somebody else's to say.
 _Library = tuple[str | None, str]
 
 
@@ -582,8 +597,16 @@ class _Members(NamedTuple):
     #: (``&lib..x``, ``&ds``): any library may hold what it reads.
     unknown: bool
     #: Each libref the corpus reads from but never assigns, with the datasets
-    #: read and the first file to read one, in first-read order.
+    #: read, as the job names them, and the first file to read one, in
+    #: first-read order. A concatenation that searches the library first
+    #: reads it under its own libref.
     unassigned: dict[str, tuple[list[str], str | None]]
+    #: Directories a concatenation searches after the first, whose datasets
+    #: the job reads from the first: their own items are not needed.
+    covered: set[_Library]
+    #: For a dataset read through a concatenation, ``(directory, member)``,
+    #: the note naming the libraries SAS would search after the one planned.
+    notes: dict[tuple[str, str], str]
 
 
 #: The librefs SAS assigns itself: in a SAS session they need no LIBNAME.
@@ -610,10 +633,19 @@ def _assigned_librefs(
     return frozenset(librefs)
 
 
-def _unassigned_blocker(libref: str, members: Sequence[str]) -> str:
-    """Why an item for a library nothing in the corpus assigns is blocked."""
-    shown = ", ".join(f"{libref}.{m}" for m in members[:5])
-    more = f" and {len(members) - 5} more" if len(members) > 5 else ""
+def _unassigned_blocker(libref: str, read: Sequence[str]) -> str:
+    """Why an item for a library nothing in the corpus assigns is blocked.
+    *read* names the datasets as the job reads them: through the library's
+    own libref, or a concatenation's that searches it first."""
+
+    def shown_as(name: str) -> str:
+        through = name.partition(".")[0]
+        if through == libref:
+            return name
+        return f"{name} (the concatenation {through} searches {libref} first)"
+
+    shown = ", ".join(map(shown_as, read[:5]))
+    more = f" and {len(read) - 5} more" if len(read) > 5 else ""
     return (
         f"library '{libref}' is never assigned in the corpus, yet the job reads "
         f"{shown}{more} — its LIBNAME is elsewhere: an autoexec.sas (on UNIX, "
@@ -652,6 +684,14 @@ def _library_members(
     taken before its reads. A parameter's template in a ``%MACRO`` body reads nothing until a call names
     it, and each call's reading is its own reference
     (``chunker.resolve_corpus_datasets``).
+
+    A concatenation (``libname x ('/a' '/b');``) is one library SAS searches
+    in order, reading a member from the first library that holds it. Which
+    one holds it only a listing can tell, so a member is planned from the
+    first, with a note naming the rest, which need no items of their own
+    (``covered``). A library a concatenation names by its libref is taken as
+    that libref is assigned then: ``libname all (v9 '/x');`` reads
+    ``all.m`` from v9's directory first.
     """
     writers: dict[str, set[str]] = {}
     for source_id, chunks in datasets.items():
@@ -660,16 +700,16 @@ def _library_members(
                 if str(ref.role) == "write":
                     writers.setdefault(ref.name, set()).add(source_id)
     assigned = _assigned_librefs(by_source)
-    bound: dict[str, str] = {}
-    env: dict[str, str] = {}  # environment variables: librefs no LIBNAME assigns
-    found = _Members({}, set(), False, {})
+    libraries = _Libraries()
+    found = _Members({}, set(), False, {}, set(), {})
     seen: set[tuple[str, str]] = set()
     for source_id in dict.fromkeys([*by_source, *datasets]):
         libnames = sorted(
             (
                 ref
                 for ref in by_source.get(source_id, ((), ()))[1]
-                if (_directory_library(ref) or _env_library(ref)) and ref.binds
+                if (_directory_library(ref) or _env_library(ref) or _concatenated(ref))
+                and ref.binds
             ),
             key=lambda ref: (_position(ref) is not None, _position(ref) or 0),
         )
@@ -682,8 +722,7 @@ def _library_members(
                 or (position := _position(libnames[0])) is None
                 or position < start
             ):
-                ref = libnames.pop(0)
-                (env if ref.statement == "setenv" else bound)[ref.binds] = ref.effective_path
+                libraries.bind(libnames.pop(0))
             made_now: set[str] = set()  # renamed or copied by this step so far
             for ref in refs:
                 if str(ref.role) == "write" and ref.via in _IMMEDIATE_WRITES:
@@ -696,38 +735,112 @@ def _library_members(
                 libref, _, member = ref.name.partition(".")
                 if not member:
                     continue
-                # A LIBNAME wins over an environment variable of the same name.
-                place = bound.get(libref) or env.get(libref)
-                if place is None:
+                made = ref.name in made_here | made_now or bool(
+                    writers.get(ref.name, set()) - {source_id}
+                )
+                places = libraries.search(libref)
+                outside = (places[0][0] or "") if places and not places[0][1] else None
+                if not places or outside is not None:
+                    # Searched first: a library no LIBNAME in the corpus
+                    # assigns. SAS assigned it some other way, and its data
+                    # is needed.
+                    first = libref if outside is None else outside
                     if (
                         assigned is not None
-                        and libref not in assigned
-                        and libref not in _SAS_LIBRARIES
-                        and not libref.startswith("&")
-                        and ref.name not in made_here | made_now
-                        and not writers.get(ref.name, set()) - {source_id}
+                        and first not in assigned
+                        and first not in _SAS_LIBRARIES
+                        and not first.startswith("&")
+                        and not made
                     ):
-                        # A library no LIBNAME in the corpus assigns: SAS
-                        # assigned it some other way, and its data is needed.
-                        names, _ = found.unassigned.setdefault(
-                            libref, ([], source_id or None)
-                        )
-                        if member not in names:
-                            names.append(member)
+                        names, _ = found.unassigned.setdefault(first, ([], source_id or None))
+                        if ref.name not in names:
+                            names.append(ref.name)
+                    elif outside is not None and not made:
+                        # A concatenation that searches a library spelled
+                        # through a macro variable first: any library may
+                        # hold what it reads.
+                        found = found._replace(unknown=True)
                     continue
-                library = (libref, place)
+                library = places[0]
                 if ref.pattern:
-                    found.listed.add(library)
+                    found.listed.update(place for place in places if place[1])
                     continue
-                if ref.name in made_here | made_now or writers.get(ref.name, set()) - {source_id}:
+                if made:
                     continue
                 if (library[1], member) not in seen:
                     seen.add((library[1], member))
                     found.named.setdefault(library, []).append((member, source_id or None))
+                    if len(places) > 1:
+                        found.notes[(library[1], member)] = _concatenation_note(
+                            libref, places, member
+                        )
+                found.covered.update(place for place in places[1:] if place[1])
             made_here.update(ref.name for ref in refs if str(ref.role) == "write")
         for ref in libnames:  # after the file's last read: in force for the next
-            (env if ref.statement == "setenv" else bound)[ref.binds] = ref.effective_path
+            libraries.bind(ref)
     return found
+
+
+class _Libraries:
+    """The libraries in force while the corpus is walked: each libref's
+    directories in the order SAS searches them — one, or a concatenation's."""
+
+    def __init__(self) -> None:
+        self.bound: dict[str, tuple[_Library, ...]] = {}
+        # Environment variables: librefs no LIBNAME assigns.
+        self.env: dict[str, tuple[_Library, ...]] = {}
+
+    def search(self, libref: str) -> tuple[_Library, ...]:
+        """Where SAS looks for a member of *libref*, in order. A LIBNAME wins
+        over an environment variable of the same name."""
+        return self.bound.get(libref) or self.env.get(libref) or ()
+
+    def bind(self, ref: "SasPathRef") -> None:
+        """Put the LIBNAME, or environment variable, *ref* in force. A later
+        library of a concatenation joins the ones before it."""
+        if not ref.binds:
+            return
+        if ref.statement == "setenv":
+            self.env[ref.binds] = ((ref.binds, ref.effective_path),)
+            return
+        places = self._places(ref)
+        if getattr(ref, "concat_index", None):
+            places = self.bound.get(ref.binds, ()) + places
+        self.bound[ref.binds] = tuple(dict.fromkeys(places))
+
+    def _places(self, ref: "SasPathRef") -> tuple[_Library, ...]:
+        """The directories one library of a LIBNAME adds to the search."""
+        if str(ref.location) == "libref":
+            # As that libref is assigned now: assigning it again later does
+            # not change the concatenation (SAS 9.4 Global Statements, LIBNAME
+            # Statement: Rules for Library Concatenation). WORK and the other
+            # libraries SAS assigns hold no data a job loads.
+            name = ref.effective_path.lower()
+            if name in _SAS_LIBRARIES:
+                return ()
+            return self.search(name) or ((name, ""),)
+        if _directory_library(ref):
+            return ((ref.binds, ref.effective_path),)
+        return ()  # a library of another engine holds no member files
+
+
+def _concatenation_note(libref: str, places: Sequence[_Library], member: str) -> str:
+    """The note on a dataset read through the concatenation *libref*."""
+
+    def where(place: _Library) -> str:
+        name, directory = place
+        if directory:
+            return directory
+        return f"{name} (unresolved)" if (name or "").startswith("&") else (
+            f"library {name} (assigned outside the corpus)"
+        )
+
+    return (
+        f"read as {libref}.{member} from a concatenation SAS searches in the order "
+        f"{', '.join(map(where, places))}: it reads {member} from the first that "
+        f"holds it — planned from {places[0][1]}; if {member} is not there, point "
+        f"this item at the one that holds it"
+    )
 
 
 def _env_in_use(
@@ -836,10 +949,16 @@ def build_corpus_plan(
             env_used=env_used,
         ):
             library = (source.libref, source.locator)
-            if source.kind is SourceKind.FILE and not source.object_name and library in members.named:
+            if (
+                source.kind is SourceKind.FILE
+                and not source.object_name
+                and (library in members.named or library in members.covered)
+            ):
                 # A directory whose datasets are named: one item per dataset,
-                # where the library is first declared.
-                if library not in expanded:
+                # where the library is first declared. One a concatenation
+                # searches after the directory its reads are planned from
+                # needs none.
+                if library in members.named and library not in expanded:
                     expanded.add(library)
                     sources += [
                         (
@@ -890,6 +1009,10 @@ def build_corpus_plan(
             probe=probe,
         )
         notes = _index_note(source, path_ref_list)
+        if source.kind is SourceKind.SAS_DATASET and (
+            concatenation := members.notes.get((source.locator, source.object_name))
+        ):
+            notes += (concatenation,)
 
         # The first item for a table replaces it and the rest add to it, so a
         # re-run is idempotent whatever order the runner executes in.

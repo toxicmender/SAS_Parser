@@ -3208,6 +3208,14 @@ class TestPathsSection(unittest.TestCase):
         self.assertIn("`&root/in` → `/SASData/in` — libname `raw`", text)
         self.assertNotIn("unresolved macro reference", text)
 
+    def test_a_concatenation_reports_each_directory_and_each_libref(self):
+        # A library named by its libref is no place: its own group says so.
+        scored = _file(_analyze("libname all (v9 '/data/x');\n"), "t.sas")
+        text = render_file_report(scored, texts={})
+        self.assertIn("`/data/x` — libname `all`", text)
+        self.assertIn("- Libraries a concatenation names by libref", text)
+        self.assertIn("`v9` — libname `all`", text)
+
 
 class TestDatabaseTablesSection(unittest.TestCase):
     """Database tables beside the Paths section, in the database's own terms.
