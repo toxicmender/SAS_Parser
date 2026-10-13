@@ -157,7 +157,8 @@ this is a considered decision, not an accident.
   in-stream data after `DATALINES`/`CARDS`/`LINES`/`PARMCARDS`, ended by the
   first line holding a semicolon, or for the `…4` forms by `;;;;` in columns
   1 to 4 — an indented `;;;;` is data) or
-  FOREIGN (another language's code from `SUBMIT` to the `ENDSUBMIT` line, in
+  FOREIGN (another language's code from `SUBMIT` to the `ENDSUBMIT` line, or
+  PROC PYTHON's from `INTERACTIVE` to the `ENDINTERACTIVE` line, in
   PROC PYTHON, LUA, IML, …). Only CODE is SAS: the others never open or close
   a block, a quote in them opens no string, and metadata reads the region with
   them blanked (`_Region.code_text`), so commented-out code, data lines and
@@ -188,7 +189,8 @@ this is a considered decision, not an accident.
 Known limits, each a decision rather than an oversight:
 
 - **Other languages' code.** Code between SUBMIT and ENDSUBMIT (Python, R,
-  Lua, Groovy) is FOREIGN: whatever datasets it touches are not recorded.
+  Lua, Groovy), and PROC PYTHON's between INTERACTIVE and ENDINTERACTIVE, is
+  FOREIGN: whatever datasets it touches are not recorded.
 - **Remote WORK.** Statements inside RSUBMIT are recognised, but `work.x` on
   the remote session is not told apart from the local WORK library.
 - **CAS actions.** PROC CAS action calls (`table.loadTable`, `casOut=`) name

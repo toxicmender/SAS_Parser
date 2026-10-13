@@ -575,17 +575,24 @@ def _sanitise_quoting(text: str) -> str:
 
 # A statement after which the source is not SAS until a terminator line:
 # in-stream data (DATALINES, CARDS, LINES or PARMCARDS; group 1 marks a 4-form,
-# whose data may hold semicolons) or a SUBMIT block of another language's code
-# (group 2). Matched whole against the statement, its semicolon included.
+# whose data may hold semicolons) or a block of another language's code (group
+# 2): SUBMIT, or PROC PYTHON's INTERACTIVE. Matched whole against the
+# statement, its semicolon included.
 _IN_STREAM_RE = re.compile(
-    rf"\s*(?:(?:datalines|cards|lines|parmcards)(4)?|(submit)\b{_NOT_A_VARIABLE}[^;]*)\s*;",
+    r"\s*(?:(?:datalines|cards|lines|parmcards)(4)?"
+    rf"|(submit|interactive)\b{_NOT_A_VARIABLE}[^;]*)\s*;",
     re.IGNORECASE,
 )
 # A 4-form's data ends at "four consecutive semicolons that are located in
 # columns 1 through 4" (DATALINES4; CARDS4 and LINES4 are its aliases): an
 # indented ;;;; is a data line.
 _DATALINES4_END_RE = re.compile(r"^;;;;", re.MULTILINE)
-_ENDSUBMIT_RE = re.compile(r"^[ \t]*endsubmit\s*;", re.IGNORECASE | re.MULTILINE)
+# Where each kind of foreign block ends: SUBMIT at its ENDSUBMIT line, PROC
+# PYTHON's INTERACTIVE at its ENDINTERACTIVE line.
+_FOREIGN_END_RE = {
+    opener: re.compile(rf"^[ \t]*end{opener}\s*;", re.IGNORECASE | re.MULTILINE)
+    for opener in ("submit", "interactive")
+}
 
 
 def _opaque(source: str, start: int, stop: int, role: UnitRole, closed: bool) -> list[_Unit]:
@@ -600,15 +607,16 @@ def _in_stream_units(
     """The units after the statement *opener* matched (:data:`_IN_STREAM_RE`),
     from *start* — the line after it — and where SAS statements resume.
 
-    SUBMIT code runs to its ENDSUBMIT line as one FOREIGN unit; nothing in
-    it is SAS, quotes included. In-stream data is one DATALINES unit, ended by
+    SUBMIT code runs to its ENDSUBMIT line as one FOREIGN unit, and PROC
+    PYTHON's INTERACTIVE code to its ENDINTERACTIVE line; nothing in either is
+    SAS, quotes included — an apostrophe in a Python comment opens no string. In-stream data is one DATALINES unit, ended by
     the first line holding a semicolon — which SAS then reads as statements,
     so ``run;`` may end the data — or, for a 4-form, by ``;;;;`` in columns 1
     to 4, a CODE unit of its own. Unterminated, either runs to the end.
     """
     eof = len(source)
     if opener.group(2):
-        last = _ENDSUBMIT_RE.search(source, start)
+        last = _FOREIGN_END_RE[opener.group(2).lower()].search(source, start)
         stop = eof if last is None else last.start()
         return _opaque(source, start, stop, UnitRole.FOREIGN, last is not None), stop
     if opener.group(1):

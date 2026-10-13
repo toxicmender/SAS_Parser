@@ -801,6 +801,21 @@ class TestStatementStructure(unittest.TestCase):
                 self.assertEqual(self._kinds(result), [DATA])
                 self.assertEqual(result.chunks[0].metadata.referenced_datasets, ["work.x"])
 
+    def test_proc_python_interactive_code_is_python(self):
+        # PROC PYTHON's second form holds its code between INTERACTIVE and
+        # ENDINTERACTIVE. Read as SAS, the apostrophe in `don't` opened a
+        # string that never closed, and the rest of the file — the read of
+        # lib.d included — vanished into the PROC PYTHON chunk.
+        for block, end in (("interactive", "endinteractive"), ("submit", "endsubmit")):
+            source = (
+                f"proc python;\n{block};\n# don't stage twice\nx = 1\n{end};\nrun;\n"
+                "data c; set lib.d; run;\n"
+            )
+            with self.subTest(block=block):
+                result = self._chunks(source)
+                self.assertEqual(self._kinds(result), [PROC, DATA])
+                self.assertEqual(result.chunks[1].metadata.input_datasets, ["lib.d"])
+
     def test_in_stream_data_or_submit_code_outside_a_step_is_no_step(self):
         for block in ("datalines;\n1 2\n;\n", "submit;\nprint('x')\nendsubmit;\n"):
             with self.subTest(block=block):

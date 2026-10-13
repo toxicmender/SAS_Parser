@@ -686,7 +686,8 @@ simplification — this is a considered decision, not an accident.
   just before %MEND;/RUN; cannot hide the terminator. A semicolon inside
   %STR(…) and the other macro quoting functions ends nothing.
 - **Statement roles:** a unit is CODE, COMMENT (`/* */`, `*;`, `%*;`),
-  DATALINES (in-stream data) or FOREIGN (SUBMIT…ENDSUBMIT code). Only CODE
+  DATALINES (in-stream data) or FOREIGN (SUBMIT…ENDSUBMIT code, and PROC
+  PYTHON's INTERACTIVE…ENDINTERACTIVE). Only CODE
   opens or closes blocks, and metadata reads the region with the rest
   blanked, so commented-out code, data lines and Python name nothing.
 - **Block collection rule:** only a new DATA/PROC/%MACRO header or an
