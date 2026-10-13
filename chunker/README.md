@@ -302,8 +302,10 @@ THEN`, `ELSE`, `WHEN (…)` or `OTHERWISE`; a subsetting `IF` has none. Then:
   depends on the sort.
   - **PROC DATASETS** names members of its `lib=` library: `append` (base
     UPDATE, data READ), `delete` (DROP), `change old=new` (old READ and DROP,
-    new WRITE), `exchange` and `modify` and `age` (UPDATE), `contents`, and
-    `kill` (DROP of the pattern `lib.:`).
+    new WRITE), `exchange` and `modify` (UPDATE), `age a b c` (a rename
+    chain: a READ and DROP, b READ and WRITE, c WRITE, the old c deleted),
+    `contents`, `kill` (DROP of the pattern `lib.:`) and `save a b` (DROP of
+    `lib.:`, every member but the ones it names, which are MENTIONs).
   - **A library copy** — PROC COPY, PROC DATASETS's `copy`, UPLOAD and
     DOWNLOAD with `inlib=`/`outlib=` — reads each `select`ed member from the
     source and writes it to the target. Without `select` (or with `exclude`)

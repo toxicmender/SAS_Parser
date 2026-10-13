@@ -467,8 +467,9 @@ def test_proc_datasets_names_members_of_its_library():
         ("lib.x", U, "exchange"),
         ("lib.y", U, "exchange"),
         ("lib.m", U, "modify"),
-        ("lib.a1", U, "age"),
-        ("lib.a2", U, "age"),
+        ("lib.a1", R, "age"),
+        ("lib.a1", D, "age"),
+        ("lib.a2", W, "age"),
         ("lib.c", R, "data="),
         ("work.meta", W, "out="),
     ]
@@ -477,6 +478,31 @@ def test_proc_datasets_names_members_of_its_library():
 def test_proc_datasets_kill_deletes_every_member():
     assert _refs("proc datasets lib=scratch kill nolist; quit;") == [("scratch.:", D, "kill")]
     assert _refs("proc datasets lib=kill nolist; delete a; quit;") == [("kill.a", D, "delete")]
+
+
+def test_proc_datasets_age_renames_down_a_chain():
+    # AGE "renames the current-name to the name of the first name in the
+    # related-SAS-files, renames the first ... to the second, and so on ...
+    # then deletes the last file" (SAS 9.4 Procedures Guide, DATASETS). Before,
+    # every name was an update in place, so a later read of a renamed table
+    # had no producer.
+    assert _refs("proc datasets lib=lib nolist; age cur b1 b2 / memtype=data; quit;") == [
+        ("lib.cur", R, "age"),
+        ("lib.cur", D, "age"),
+        ("lib.b1", R, "age"),
+        ("lib.b1", W, "age"),
+        ("lib.b2", W, "age"),
+    ]
+
+
+def test_proc_datasets_save_deletes_every_member_it_does_not_name():
+    # "Deletes all the SAS files in a library except the ones listed in the
+    # SAVE statement". Before, SAVE named nothing.
+    assert _refs("proc datasets lib=elder; save chronic aging / memtype=data; run;") == [
+        ("elder.:", D, "save"),
+        ("elder.chronic", M, "save"),
+        ("elder.aging", M, "save"),
+    ]
 
 
 def test_proc_datasets_statements_that_name_no_member():

@@ -757,8 +757,9 @@ _Library = tuple[str | None, str]
 
 
 #: The writes that take effect before their step ends: PROC DATASETS's CHANGE
-#: and a library COPY make their tables for the statements after them.
-_IMMEDIATE_WRITES = frozenset({"change", "copy"})
+#: and AGE, which rename, and a library COPY make their tables for the
+#: statements after them.
+_IMMEDIATE_WRITES = frozenset({"change", "age", "copy"})
 
 
 class _Members(NamedTuple):

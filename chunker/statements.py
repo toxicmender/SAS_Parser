@@ -661,7 +661,7 @@ _PAIR_RE = re.compile(rf"({DS_REF_TOKEN})\s*=\s*({DS_REF_TOKEN})")
 _SQL_PROCS = frozenset({"sql", "fedsql"})
 # PROC DATASETS statements that name members of its library.
 _DATASETS_STATEMENTS = frozenset(
-    {"append", "change", "exchange", "copy", "delete", "modify", "age", "contents"}
+    {"append", "change", "exchange", "copy", "delete", "modify", "age", "save", "contents"}
 )
 
 
@@ -777,10 +777,24 @@ class _ProcStep:
         elif kw == "delete":
             for op in _operands(st.mt, st.cf, after, library=lib):
                 yield op, DROP, "delete"
-        elif kw in ("modify", "age"):
-            limit = 1 if kw == "modify" else 0
-            for op in _operands(st.mt, st.cf, after, limit=limit, library=lib):
+        elif kw == "save":
+            # "Deletes all the SAS files in a library except the ones listed":
+            # every member, those kept named.
+            yield _Operand("save", _member(lib, ":"), True), DROP, kw
+            for op in _operands(st.mt, st.cf, after, library=lib):
+                yield op, DatasetRole.MENTION, kw
+        elif kw == "modify":
+            for op in _operands(st.mt, st.cf, after, limit=1, library=lib):
                 yield op, UPDATE, kw
+        elif kw == "age":
+            # `age a b c;` renames a to b and b to c, and deletes the c there
+            # was: a's rows go on and a is gone, b's go on and a's arrive,
+            # and c ends up holding b's.
+            ops = _operands(st.mt, st.cf, after, library=lib)
+            for i, op in enumerate(ops):
+                if i < len(ops) - 1:
+                    yield op, READ, kw
+                yield op, DROP if i == 0 else WRITE, kw
         else:  # change old=new; exchange a=b
             scan = _blank_groups(st.mt)
             slash = scan.find("/")
