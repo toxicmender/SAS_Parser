@@ -352,6 +352,38 @@ def test_the_libname_in_force_is_the_latest_before_the_read():
     assert ("/two", "mid") not in located
 
 
+def test_a_library_the_corpus_never_assigns_is_one_blocked_item():
+    # The manual example's shape: xwrk is assigned by the SAS server (an
+    # autoexec, say), never in the corpus. Before, its reads dropped out and
+    # the plan said "No external data sources found."
+    plan = _plan(
+        job=(
+            "%let lname = xwrk;\ndata a; set &lname..batch_med; run;\n"
+            "data b; set xwrk.other; set sashelp.class; run;\n"
+        )
+    )
+    [item] = plan.items
+    assert (item.source.kind, item.source.libref) == (SourceKind.SAS_SESSION, "xwrk")
+    assert item.target_table == UNRESOLVED_TARGET
+    [blocker] = item.blockers
+    assert "xwrk.batch_med, xwrk.other" in blocker and "never assigned" in blocker
+    assert "autoexec" in blocker and "XWRK" in blocker
+
+
+def test_no_item_for_a_library_assigned_written_or_out_of_reach():
+    # A LIBNAME anywhere in the corpus assigns it; a table the job makes first
+    # is no input; a LIBNAME spelled through a macro variable could assign any
+    # libref, so nothing is claimed unassigned; SAS's own librefs need none.
+    for job in (
+        "data a; set raw.early; run;\nlibname raw '/one';\n",
+        "data stg.x; set src; run;\ndata y; set stg.x; run;\n",
+        "libname &lib '/x';\ndata a; set q.t; run;\n",
+        "data a; set sashelp.class; set sasuser.prefs; run;\n",
+    ):
+        plan = _plan(job=job)
+        assert all(i.source.kind is not SourceKind.SAS_SESSION for i in plan.items), job
+
+
 def test_a_read_through_any_documented_engine_is_planned():
     # SNOW, JDBC, GREENPLM, VERTICA, ... are SAS/ACCESS engines. Unrecognised,
     # their LIBNAME was neither a database nor a directory, and the read gave

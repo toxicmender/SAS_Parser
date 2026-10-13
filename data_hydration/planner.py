@@ -561,6 +561,45 @@ class _Members(NamedTuple):
     #: Some read names its dataset through a libref nothing resolved
     #: (``&lib..x``, ``&ds``): any library may hold what it reads.
     unknown: bool
+    #: Each libref the corpus reads from but never assigns, with the datasets
+    #: read and the first file to read one, in first-read order.
+    unassigned: dict[str, tuple[list[str], str | None]]
+
+
+#: The librefs SAS assigns itself: in a SAS session they need no LIBNAME.
+#: (Maps only with SAS/GRAPH, but a read from it is not data a job loads.)
+_SAS_LIBRARIES = frozenset({"work", "sashelp", "sasuser", "maps", "mapsgfk", "mapssas"})
+
+
+def _assigned_librefs(
+    by_source: Mapping[str, tuple[Sequence["SasEngineRef"], Sequence["SasPathRef"]]],
+) -> frozenset[str] | None:
+    """Every libref a LIBNAME in the corpus assigns, by path or engine — or
+    ``None`` when some LIBNAME's libref is spelled through a macro variable
+    nothing resolved, which could be any of them."""
+    librefs: set[str] = set()
+    for engine_refs, path_refs in by_source.values():
+        librefs.update(ref.binds for ref in engine_refs if ref.binds)
+        for ref in path_refs:
+            if ref.statement != "libname" or not ref.binds:
+                continue
+            if ref.binds.startswith("&"):
+                return None
+            librefs.add(ref.binds)
+    return frozenset(librefs)
+
+
+def _unassigned_blocker(libref: str, members: Sequence[str]) -> str:
+    """Why an item for a library nothing in the corpus assigns is blocked."""
+    shown = ", ".join(f"{libref}.{m}" for m in members[:5])
+    more = f" and {len(members) - 5} more" if len(members) > 5 else ""
+    return (
+        f"library '{libref}' is never assigned in the corpus, yet the job reads "
+        f"{shown}{more} — its LIBNAME is elsewhere: an autoexec.sas (on UNIX, "
+        f"in the current, home or !SASROOT directory), a configuration file, or "
+        f"an environment variable {libref.upper()} holding the directory; add "
+        f"it to the corpus or point the plan at that library"
+    )
 
 
 def _library_members(
@@ -599,8 +638,9 @@ def _library_members(
             for ref in refs:
                 if str(ref.role) == "write":
                     writers.setdefault(ref.name, set()).add(source_id)
+    assigned = _assigned_librefs(by_source)
     bound: dict[str, str] = {}
-    found = _Members({}, set(), False)
+    found = _Members({}, set(), False, {})
     seen: set[tuple[str, str]] = set()
     for source_id in dict.fromkeys([*by_source, *datasets]):
         libnames = sorted(
@@ -632,7 +672,24 @@ def _library_members(
                     found = found._replace(unknown=True)
                     continue
                 libref, _, member = ref.name.partition(".")
-                if libref not in bound or not member:
+                if not member:
+                    continue
+                if libref not in bound:
+                    if (
+                        assigned is not None
+                        and libref not in assigned
+                        and libref not in _SAS_LIBRARIES
+                        and not libref.startswith("&")
+                        and ref.name not in made_here | made_now
+                        and not writers.get(ref.name, set()) - {source_id}
+                    ):
+                        # A library no LIBNAME in the corpus assigns: SAS
+                        # assigned it some other way, and its data is needed.
+                        names, _ = found.unassigned.setdefault(
+                            libref, ([], source_id or None)
+                        )
+                        if member not in names:
+                            names.append(member)
                     continue
                 library = (libref, bound[libref])
                 if ref.pattern:
@@ -702,6 +759,8 @@ def build_corpus_plan(
         if str(table.via) == "libname"
     )
     members = _library_members(by_source, datasets or {})
+    if members.unassigned and logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"build_corpus_plan: unassigned libraries {sorted(members.unassigned)}")
     expanded: set[_Library] = set()
     code_filerefs = _code_filerefs(by_source)
     transport_filerefs = _filerefs_only(by_source, "proc_cimport")
@@ -809,6 +868,21 @@ def build_corpus_plan(
                     blockers=tuple(blockers),
                 )
             )
+
+    # A library the corpus reads from but never assigns: one item each, so
+    # its data does not drop out of the plan unannounced. Only a SAS session
+    # that assigns it can say where it is.
+    for libref, (read, reader) in members.unassigned.items():
+        items.append(
+            HydrationItem(
+                source=HydrationSource(
+                    kind=SourceKind.SAS_SESSION, libref=libref, source_id=reader
+                ),
+                target_table=UNRESOLVED_TARGET,
+                strategy_reason="not planned: the library is assigned outside the corpus",
+                blockers=(_unassigned_blocker(libref, read),),
+            )
+        )
 
     logger.info(
         f"build_corpus_plan: {len(sources)} source(s) across "

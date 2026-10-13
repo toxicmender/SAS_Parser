@@ -124,6 +124,15 @@ macro's `set &ds;` makes.
   variable nothing resolved (`&where..t`), since that may be this library.
 - A member spelled through an unresolved macro variable (`raw.&tbl`) is an
   item, blocked; an SPD Engine library is not split (see below).
+- **A library the corpus never assigns is one item, blocked.** A read from
+  `xwrk.batch_med` when no LIBNAME anywhere in the corpus assigns `xwrk` comes
+  from a library the SAS server assigns itself — an `autoexec.sas` (on UNIX in
+  the current, home or `!SASROOT` directory), a configuration file, or an
+  environment variable `XWRK`. It is planned as a `sas_session` item naming
+  the datasets read, so it no longer drops out of the plan. SAS's own librefs
+  (WORK, SASHELP, SASUSER, MAPS) need none, a dataset the job makes first is no
+  input, and while some LIBNAME's libref is an unresolved `&lib` nothing is
+  claimed unassigned.
 
 ## The reference inventory
 
