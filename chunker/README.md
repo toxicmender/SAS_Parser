@@ -147,11 +147,14 @@ this is a considered decision, not an accident.
   just before `%MEND;` or `RUN;` no longer hides the terminator and leaves its
   block open. `%vname(x) = 1;` — the call writes part of the statement — stays
   whole, as do macro statements (`%mend m;`, `%symdel x;`), which run to their
-  semicolon. A call that ends the file is complete, not unterminated. Inside a
-  macro quoting function (`%STR`, `%NRSTR`, `%QUOTE`, `%NRQUOTE`, `%BQUOTE`,
-  `%NRBQUOTE`) a semicolon is text, so `%let sep = %str(;);` is one statement;
-  `%'`, `%"`, `%(` and `%)` are escapes there. An argument that never closes
-  quotes nothing.
+  semicolon. A call that ends the file is complete, not unterminated. Inside
+  `%STR` or `%NRSTR`, the compilation quoting functions, a semicolon is text,
+  so `%let sep = %str(;);` is one statement; `%'`, `%"`, `%(` and `%)` are
+  escapes there. An argument that never closes quotes nothing. `%QUOTE`,
+  `%NRQUOTE`, `%BQUOTE` and `%NRBQUOTE` quote only at execution, a value
+  macro resolution produced (SAS 9.4 Macro Language: Reference, Macro
+  Quoting), so a semicolon written in their argument ends the statement, as it
+  does to SAS.
 - **Statement roles (`UnitRole`):** every unit is CODE, COMMENT (a `/* */`
   block, a `* …;` statement or a `%* …;` macro comment), DATALINES (the
   in-stream data after `DATALINES`/`CARDS`/`LINES`/`PARMCARDS`, ended by the

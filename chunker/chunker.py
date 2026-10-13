@@ -56,10 +56,10 @@ logger = logging.getLogger(__name__)
 
 # The characters _scan_units cares about outside a quoted string: a statement
 # terminator, a quote opener, a block-comment opener ("/" alone is ordinary
-# statement text and deliberately not an event), or a macro quoting function
-# (%STR and kin), whose argument may hold semicolons. Every alternative opens
-# with a literal, so the engine skips ahead on the first characters alone.
-_SCAN_EVENT_RE = re.compile(r";|'|\"|/\*|%(?:nr)?b?(?:str|quote)\s*\(", re.IGNORECASE)
+# statement text and deliberately not an event), or %STR / %NRSTR, whose
+# argument may hold semicolons (scanner._MACRO_QUOTE_RE). Every alternative
+# opens with a literal, so the engine skips ahead on the first characters alone.
+_SCAN_EVENT_RE = re.compile(r";|'|\"|/\*|%(?:nr)?str\s*\(", re.IGNORECASE)
 
 
 def _record_user_library(

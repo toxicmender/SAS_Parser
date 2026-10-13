@@ -685,7 +685,8 @@ simplification — this is a considered decision, not an accident.
   name): the scanner cuts there when what follows opens a statement of its
   own, so back-to-back semicolon-less calls are separate units and a call
   just before %MEND;/RUN; cannot hide the terminator. A semicolon inside
-  %STR(…) and the other macro quoting functions ends nothing.
+  %STR(…) or %NRSTR(…) ends nothing; one inside %QUOTE(…) and the other
+  execution-time quoting functions ends the statement, as it does to SAS.
 - **Statement roles:** a unit is CODE, COMMENT (`/* */`, `*;`, `%*;`),
   DATALINES (in-stream data) or FOREIGN (SUBMIT…ENDSUBMIT code, and PROC
   PYTHON's INTERACTIVE…ENDINTERACTIVE). Only CODE

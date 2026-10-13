@@ -461,8 +461,12 @@ def _sanitise(text: str, *, blank_strings: bool = True) -> str:
 # ---------------------------------------------------------------------------
 
 # A macro quoting function whose argument hides semicolons from the statement
-# scan: %STR, %NRSTR, %QUOTE, %NRQUOTE, %BQUOTE and %NRBQUOTE.
-_MACRO_QUOTE_RE = re.compile(r"%(?:nr)?b?(?:str|quote)\s*\(", re.IGNORECASE)
+# scan: %STR or %NRSTR. "The %STR and %NRSTR functions are compilation
+# functions"; %QUOTE, %NRQUOTE, %BQUOTE and %NRBQUOTE mask only what resolving
+# a macro expression produces, at execution (SAS 9.4 Macro Language:
+# Reference, Macro Quoting), so a semicolon written in their argument ends the
+# statement.
+_MACRO_QUOTE_RE = re.compile(r"%(?:nr)?str\s*\(", re.IGNORECASE)
 # Inside such an argument: a %-escaped character (an unmatched quote or
 # parenthesis, or a percent sign), a quote, a parenthesis or a block comment.
 _QUOTED_ARG_EVENT_RE = re.compile(r"%['\"()%]|['\"()]|/\*")

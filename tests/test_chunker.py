@@ -687,7 +687,6 @@ class TestStatementStructure(unittest.TestCase):
             "%let sep = %str(;);\n",
             "%let q = %str(%');\n",  # an escaped unmatched quote
             "%let p = %nrstr(%();\n",  # an escaped unmatched parenthesis
-            "%let c = %quote(a;b) %nrquote(c;d) %bquote(e;f) %nrbquote(g;h);\n",
             "%let n = %str(%nrstr(a;b) (c;d));\n",
             "%let s = %str('a;b' /* c;d */);\n",
             "%let d = %str('it''s;' \"a \"\"b;\"\"\");\n",  # doubled quotes
@@ -697,6 +696,22 @@ class TestStatementStructure(unittest.TestCase):
                 self.assertEqual(self._kinds(result), [GLOBAL, DATA])
                 self.assertEqual(result.chunks[1].metadata.input_datasets, ["work.b"])
                 self.assertEqual(result.diagnostics, [])
+
+    def test_only_str_and_nrstr_hide_a_semicolon(self):
+        # "The %STR and %NRSTR functions are compilation functions"; %QUOTE,
+        # %NRQUOTE, %BQUOTE and %NRBQUOTE act on a resolved value, at
+        # execution (SAS 9.4 Macro Language: Reference, Macro Quoting). A
+        # semicolon written in their argument ends the statement, as it does
+        # to SAS. Before, it was hidden like one in %STR.
+        from chunker.scanner import _sanitise
+
+        for fn in ("quote", "nrquote", "bquote", "nrbquote", "QUOTE"):
+            with self.subTest(fn=fn):
+                result = self._chunks(f"%let c = %{fn}(e;f);\ndata a; set b; run;\n")
+                self.assertEqual(result.chunks[0].text, f"%let c = %{fn}(e;")
+                self.assertEqual(self._kinds(result)[-1], DATA)
+                text = f"%let c = %{fn}(e;f) %str(g;h);"
+                self.assertEqual(_sanitise(text).count(";"), 2)
 
     def test_a_quoting_function_that_never_closes_quotes_nothing(self):
         result = self._chunks("%put %str(a;\ndata x; set y; run;\n")
