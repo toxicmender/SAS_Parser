@@ -543,6 +543,14 @@ def test_a_view_s_own_database_libname_serves_its_query_and_nothing_after():
     assert [r.statement for r in rows if r.kind is RefKind.ENGINE] == ["using_libname"]
 
 
+def test_a_name_literal_is_a_member_not_a_path():
+    # 'src tab'n is a WORK member, never a file to load; in a library, the
+    # member's file is named without the literal's quotes and n.
+    assert _plan(job="data a; set 'src tab'n; run;\n").items == []
+    [item] = _plan(job="libname p '/data/p';\ndata a; set p.'My Data'n; run;\n").items
+    assert (item.source.locator, item.source.object_name) == ("/data/p", "my data")
+
+
 def test_a_read_through_any_documented_engine_is_planned():
     # SNOW, JDBC, GREENPLM, VERTICA, ... are SAS/ACCESS engines. Unrecognised,
     # their LIBNAME was neither a database nor a directory, and the read gave

@@ -195,6 +195,13 @@ class TestUserLibraryNames(unittest.TestCase):
             ],
         )
 
+    def test_a_name_literal_is_a_one_level_name(self):
+        src = "libname user '/data/perm';\ndata 'My Data'n; set 'src tab'n; run;\n"
+        self.assertEqual(
+            self._names(src),
+            [("user.'my data'n", "write"), ("user.'src tab'n", "read")],
+        )
+
     def test_options_user_equates_a_libref_to_user(self):
         src = (
             "libname mine '/data/perm';\noptions user=mine;\ndata x; set y; run;\n"

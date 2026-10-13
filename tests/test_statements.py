@@ -201,11 +201,32 @@ def test_a_prefix_list_is_a_pattern():
 
 
 def test_quoted_paths_and_name_literals():
-    src = "data 'C:\\Tmp\\Out'; set \"/data/in.sas7bdat\" 'my data'n; run;"
+    # A quoted path names a file; a name literal names a member, which lives
+    # in WORK as any one-level name does — never in the path namespace.
+    src = "data 'C:\\Tmp\\Out'; set \"/data/in.sas7bdat\" 'my data'n \"Src Tab\"N; run;"
     assert _refs(src) == [
         ("'c:/tmp/out'", W, "data"),
         ("'/data/in.sas7bdat'", R, "set"),
-        ("'my data'", R, "set"),
+        ("work.'my data'n", R, "set"),
+        ("work.'src tab'n", R, "set"),
+    ]
+
+
+def test_a_library_s_name_literal_is_one_name():
+    # lib.'my data'n names one member of lib, in DATA steps, PROC options and
+    # SQL alike. Before, it split into "p." and a WORK member.
+    src = (
+        "data p.'Out Tab'n; set p.'x y'n (keep=a) q.r; run;\n"
+        "proc print data=p.'k l'n; run;\n"
+        "proc sql; create table p.'Q R'n as select * from p.'src tab'n; quit;\n"
+    )
+    assert _refs(src) == [
+        ("p.'out tab'n", W, "data"),
+        ("p.'x y'n", R, "set"),
+        ("q.r", R, "set"),
+        ("p.'k l'n", R, "data="),
+        ("p.'q r'n", W, "create"),
+        ("p.'src tab'n", R, "from"),
     ]
 
 
@@ -619,7 +640,7 @@ def test_proc_sql_reads_a_physical_path_and_a_name_literal():
     assert _refs(src) == [
         ("work.x", W, "create"),
         ("'c:/data/a.sas7bdat'", R, "from"),
-        ("'my data'", R, "from"),
+        ("work.'my data'n", R, "from"),
     ]
 
 

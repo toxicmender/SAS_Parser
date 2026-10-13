@@ -126,9 +126,12 @@ _IDENT = r'(?:"[^"\n]*"|[A-Za-z_&][\w$#&]*)'
 _NATIVE_REF = rf"{_IDENT}(?:\.+{_IDENT})*(?:@[\w$#.&]+)?"
 _NATIVE_TOKEN_RE = re.compile(rf"{_NATIVE_REF}|[(),;]")
 # SAS: a string (a path or, with its n, a name literal where a table stands), a
-# macro call's name, a dataset name that may hold &refs, punctuation.
+# library's name literal (lib.'my data'n), a macro call's name, a dataset name
+# that may hold &refs, punctuation.
 _SAS_TOKEN_RE = re.compile(
-    rf"""'(?:[^']|'')*'n?|"(?:[^"]|"")*"n?|%\s*[A-Za-z_]\w*|{DS_REF_TOKEN}|[(),;]""",
+    r"""'(?:[^']|'')*'n?|"(?:[^"]|"")*"n?"""
+    r"""|[A-Za-z_&][\w&]*\.(?:'(?:[^']|'')*'|"(?:[^"]|"")*")n"""
+    rf"""|%\s*[A-Za-z_]\w*|{DS_REF_TOKEN}|[(),;]""",
     re.IGNORECASE,
 )
 _WORD_RE = re.compile(r"[A-Za-z_]\w*")

@@ -276,8 +276,9 @@ THEN`, `ELSE`, `WHEN (…)` or `OTHERWISE`; a subsetting `IF` has none. Then:
   ends at an option (`end=`, `key=`, `nobs=`, `point=`, …), a `/` or the
   statement's end, and skips each dataset's `(…)` options and macro calls.
   `ds1-ds3` (and `m01-m10`) expands, up to 1,000 names; `lib.pre:` is one
-  pattern reference (`pattern=True`); a quoted path or `'name'n` is kept as
-  written, lowercased.
+  pattern reference (`pattern=True`); a quoted path is kept as written,
+  lowercased (`'/data/x'`), and a name literal is the member it names, in its
+  library or WORK (`'My Data'n` → `work.'my data'n`, `p.'x y'n`).
 - **PROC:** an option names what `keywords.PROC_OPTION_ROLES` says it names
   in that PROC, over `PROC_OPTION_DEFAULTS` (`data=` reads; `out=`,
   `outdata=`, `outest=`, `outstat=`, `outmodel=`, … write; `inmodel=`,
@@ -342,7 +343,9 @@ THEN`, `ELSE`, `WHEN (…)` or `OTHERWISE`; a subsetting `IF` has none. Then:
   that reads or writes.
 
 Names are lowercased at extraction; quoted physical paths keep a leading `'` so
-they can never collide with identifiers.
+they can never collide with identifiers. A name literal is no path: it keeps its
+quotes and `n` behind a libref, `work.'my data'n`, so it moves to the User
+library as any one-level name does, and its file is `my data.sas7bdat`.
 
 ### External references
 

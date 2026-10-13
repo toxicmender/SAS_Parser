@@ -1974,8 +1974,12 @@ def resolve_user_library(chunks: list[SasChunk]) -> None:
 
 def _one_level(ref: SasDatasetRef) -> bool:
     """Whether *ref* was spelled as a one-level name: no libref, no quoted
-    path, and not one of the ``_name_`` placeholders SAS reserves."""
-    raw = ref.raw.strip().lower().split("(")[0].strip()
+    path, and not one of the ``_name_`` placeholders SAS reserves. A name
+    literal (``'my data'n``) is one."""
+    raw = ref.raw.strip().lower()
+    if raw[:1] in ("'", '"'):
+        return len(raw) > 2 and raw[-1] == "n" and raw[-2] == raw[0]
+    raw = raw.split("(")[0].strip()
     return (
         bool(raw)
         and "." not in raw

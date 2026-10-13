@@ -109,6 +109,16 @@ def _quoted_path(raw: str) -> str:
     return f"'{inner}'"
 
 
+def _name_literal(raw: str, library: str = "work") -> str:
+    """A name literal (``'my data'n``) as a member of *library*:
+    ``work.'my data'n``. It names a member whose name holds blanks or other
+    special characters, not a file, so it lives where a one-level name does —
+    never in the quoted-path namespace of :func:`_quoted_path`. Lowercased,
+    as SAS matches member names whatever their case."""
+    inner = raw.strip()[1:-2].lower()
+    return _member(library, f"'{inner}'n")
+
+
 def _ds_name(raw: str) -> str | None:
     """*raw* lowercased, its dataset options dropped; ``None`` for a name SAS
     reserves (``_null_``, ``_all_``, a library's name alone)."""
@@ -343,10 +353,13 @@ def _operands(
             close = mt.find(c, pos + 1)
             if close == -1:
                 break
-            found.append(_Operand(cf[pos : close + 1], _quoted_path(cf[pos : close + 1])))
-            pos = close + 1
-            if pos < n and mt[pos] in "nN":  # a name literal: 'my data'n
-                pos += 1
+            if close + 1 < n and mt[close + 1] in "nN":  # a name literal: 'my data'n
+                raw = cf[pos : close + 2]
+                found.append(_Operand(raw, _name_literal(raw, library)))
+                pos = close + 2
+            else:
+                found.append(_Operand(cf[pos : close + 1], _quoted_path(cf[pos : close + 1])))
+                pos = close + 1
             continue
         if c == "%" and (call := _MACRO_CALL_HEAD_RE.match(mt, pos)):
             pos = _ws_end(mt, call.end())
@@ -366,6 +379,20 @@ def _operands(
         token = _TOKEN_RE.match(mt, pos)
         if token is None:
             break
+        end = token.end()
+        if (
+            mt[end - 1] == "."
+            and end < n
+            and mt[end] in "'\""
+            and (close := mt.find(mt[end], end + 1)) != -1
+            and close + 1 < n
+            and mt[close + 1] in "nN"
+        ):  # a library's name literal: lib.'my data'n
+            literal = cf[end : close + 2]
+            library_name = cf[token.start() : end - 1].lower()
+            found.append(_Operand(cf[token.start() : close + 2], _name_literal(literal, library_name)))
+            pos = close + 2
+            continue
         after = _ws_end(mt, token.end())
         if after < n and mt[after] == "=":  # an option: the datasets are done
             break
@@ -446,9 +473,10 @@ def _sql_refs(st: Statement, start: int = 0, end: int | None = None) -> Iterator
     """The tables a SAS SQL statement names — PROC SQL, PROC FEDSQL, or the
     query in ``st.cf[start:end]`` — by the one SQL grammar."""
     for raw, role, via in SqlStatement(st.cf[start:end], Dialect.SAS).refs():
-        if raw[0] in "'\"":  # a physical path, or a name literal: 'my data'n
-            quoted = raw[:-1] if raw[-1] in "nN" else raw
-            yield _Operand(raw, _quoted_path(quoted)), role, via
+        if raw[0] in "'\"" and raw[-1] in "nN":  # a name literal: 'my data'n
+            yield _Operand(raw, _name_literal(raw)), role, via
+        elif raw[0] in "'\"":  # a physical path
+            yield _Operand(raw, _quoted_path(raw)), role, via
         elif op := _token_operand(raw):
             yield op, role, via
 

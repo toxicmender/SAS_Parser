@@ -779,6 +779,9 @@ def _library_members(
                     continue
                 if made:
                     continue
+                if member[:1] in ("'", '"') and member.endswith("n"):
+                    # A name literal, 'my data'n: its file is my data.sas7bdat.
+                    member = member[1:-2]
                 if (library[1], member) not in seen:
                     seen.add((library[1], member))
                     found.named.setdefault(library, []).append((member, source_id or None))
