@@ -103,7 +103,9 @@ chunker/
                         line-offset helpers, and the _Deadline/_ParseWatchdog
                         stuck-parser machinery.
   macro_vars.py         Macro-variable values and the reference expansion that
-                        resolves names: let_values (the %LET symbol table),
+                        resolves names: let_values (the %LET symbol table,
+                        %GLOBAL / READONLY name=value included),
+                        scope_declarations (what %GLOBAL and %LOCAL declare),
                         resolve_refs (&name / &name. / &&name&i, delimiter-dot
                         semantics included), and DS_REF_TOKEN — the one
                         definition of a dataset token that may embed &refs,

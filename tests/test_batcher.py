@@ -1268,6 +1268,15 @@ class TestDatabricksMapping(unittest.TestCase):
         self.assertIn("%global src;", joined)  # declaration untouched
         self.assertIn("%let src = prod.sales.orders;", joined)
 
+    def test_readonly_declaration_value_rewritten(self):
+        # `%global / readonly src=...;` assigns as %LET does (SAS 9.4 Macro
+        # Language: Reference, %GLOBAL), so its value is mapped too.
+        src = "%global / readonly src = mylib.orders;\ndata work.a; set &src; run;\n"
+        _, br = _chunk_and_batch(src, databricks_mapping=self.MAPPING)
+        joined = self._all_texts(br)
+        self.assertIn("%global / readonly src = prod.sales.orders;", joined)
+        self.assertNotIn("mylib.orders", joined)
+
     def test_quoted_let_value_rewritten_preserving_quotes(self):
         src = "%let src = 'mylib.orders';\ndata work.a; set mylib.orders; run;\n"
         _, br = _chunk_and_batch(src, databricks_mapping=self.MAPPING)

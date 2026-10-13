@@ -254,12 +254,13 @@ def _resolve_implicit_datasets(flat_chunks: list[SasChunk]) -> None:
 # ---------------------------------------------------------------------------
 
 # A ``%let name = value`` assignment (any chunk kind — GLOBAL_STATEMENT
-# chunks, but also %LET statements inside macro bodies and steps).  Group 1
-# is everything up to the value; group 2 the raw value text up to the
+# chunks, but also %LET statements inside macro bodies and steps), or the
+# ``%global / readonly name = value`` (or ``%local``) that assigns as one.
+# Group 1 is everything up to the value; group 2 the raw value text up to the
 # terminating semicolon.  The optional leading ``&`` mirrors _LET_TARGET_RE
 # in metadata.py (indirect targets whose outer name is still literal).
 _LET_ASSIGN_RE = re.compile(
-    r"(%\s*let\s+&*[A-Za-z_]\w*\s*=\s*)([^;]*)",
+    r"(%\s*(?:let\s+&*|(?:global|local)\s*/\s*readonly\s+)[A-Za-z_]\w*\s*=\s*)([^;]*)",
     re.IGNORECASE,
 )
 

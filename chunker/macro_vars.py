@@ -76,6 +76,18 @@ _REF_RE = re.compile(r"(&+)([A-Za-z_]\w*)(\.?)")
 # computed, so there is no key to store the value under. Deliberately does not
 # require the ``;`` — a %LET truncated by an oversized split still assigns.
 _LET_ASSIGN_RE = re.compile(r"%\s*let\s+([A-Za-z_]\w*)\s*=\s*([^;]*)", re.IGNORECASE)
+# ``%GLOBAL / READONLY name=value`` and %LOCAL's like form: one new read-only
+# variable, assigned as a %LET would — "Omitting value produces a null value"
+# (SAS 9.4 Macro Language: Reference, %GLOBAL and %LOCAL Macro Statements).
+_READONLY_ASSIGN_RE = re.compile(
+    r"%\s*(?:global|local)\s*/\s*readonly\s+([A-Za-z_]\w*)\s*=\s*([^;]*)", re.IGNORECASE
+)
+# A %GLOBAL or %LOCAL statement: its scope, and what it declares up to the
+# semicolon — a list of names, or the READONLY form's one assignment.
+_SCOPE_DECL_RE = re.compile(r"%\s*(global|local)\b([^;]*);", re.IGNORECASE)
+_READONLY_DECL_RE = re.compile(r"\s*/\s*readonly\s+([A-Za-z_]\w*)", re.IGNORECASE)
+_DECL_SPLIT_RE = re.compile(r"[,\s]+")
+_DECL_NAME_RE = re.compile(r"[A-Za-z_]\w*\Z")
 # %SYMDEL name ... </ NOWARN>; — deletes the named variables from the global
 # symbol table. Names a text expression generates (`%symdel &list;`) are not
 # knowable here and are left alone.
@@ -167,23 +179,57 @@ def let_assignments(text: str) -> list[tuple[str, str]]:
     else — the raw material :func:`let_values` and a called macro's
     global-assignment analysis (``chunker.metadata._MacroDef``) both read.
 
-    A name ``%SYMDEL`` deletes is assigned ``""`` where the statement stands:
-    after ``%let lib = prod; %symdel lib;`` nothing is known of ``&lib``,
-    which an empty value says everywhere in this package.
+    ``%global / readonly lib=prod;`` (or ``%local``) assigns as ``%let lib =
+    prod;`` does; which table it lands in is :func:`scope_declarations`'
+    to say. A name ``%SYMDEL`` deletes is assigned ``""`` where the statement
+    stands: after ``%let lib = prod; %symdel lib;`` nothing is known of
+    ``&lib``, which an empty value says everywhere in this package.
     """
     found = [
         (m.start(), m.group(1).lower(), m.group(2).strip())
         for m in _LET_ASSIGN_RE.finditer(text)
     ]
-    if "symdel" in text.lower():
+    lowered = text.lower()
+    interleaved = False
+    if "readonly" in lowered:
+        found += [
+            (m.start(), m.group(1).lower(), m.group(2).strip())
+            for m in _READONLY_ASSIGN_RE.finditer(text)
+        ]
+        interleaved = True
+    if "symdel" in lowered:
         found += [
             (m.start(), name.lower(), "")
             for m in _SYMDEL_RE.finditer(text)
             for name in m.group(1).split()
             if _SYMDEL_NAME_RE.match(name)
         ]
+        interleaved = True
+    if interleaved:
         found.sort(key=lambda event: event[0])
     return [(name, value) for _, name, value in found]
+
+
+def scope_declarations(text: str) -> list[tuple[str, str]]:
+    """``(scope, name)`` for each variable a ``%GLOBAL`` or ``%LOCAL`` in
+    *text* declares, in order: scope ``global`` or ``local``, name lowercased.
+
+    A list declares every name in it (``%global a b;``). The READONLY form
+    declares its one variable, ``i`` in ``%local / readonly i=1;``, never the
+    word ``readonly``.
+    """
+    found: list[tuple[str, str]] = []
+    for m in _SCOPE_DECL_RE.finditer(text):
+        scope = m.group(1).lower()
+        readonly = _READONLY_DECL_RE.match(m.group(2))
+        if readonly is not None:
+            found.append((scope, readonly.group(1).lower()))
+            continue
+        for name in _DECL_SPLIT_RE.split(m.group(2).strip()):
+            name = name.lstrip("&").rstrip(".")
+            if _DECL_NAME_RE.match(name):
+                found.append((scope, name.lower()))
+    return found
 
 
 def let_values(text: str) -> dict[str, str]:

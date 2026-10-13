@@ -43,6 +43,7 @@ from .macro_vars import (
     macro_signature,
     name_value,
     resolve_refs,
+    scope_declarations,
     strip_quotes,
     text_value,
 )
@@ -163,13 +164,6 @@ _GLOBAL_STMT_KW_RE = re.compile(
 # (double-ampersand-resolved) targets whose outer name is still literal.
 _LET_TARGET_RE = re.compile(r"%\s*let\s+&*([A-Za-z_]\w*)", re.IGNORECASE)
 
-# ``%GLOBAL``/``%LOCAL`` declaration list up to the terminating semicolon; the
-# caller splits on whitespace/commas.
-_GLOBAL_LOCAL_DECL_RE = re.compile(
-    r"%\s*(?:global|local)\s+([^;]+?)\s*;",
-    re.IGNORECASE,
-)
-
 # Which control-flow keyword begins a MACRO_CONTROL_FLOW chunk, matched against
 # the start of its sanitised text (mirrors _MACRO_VAR_OP_RE).
 _CONTROL_FLOW_OP_RE = re.compile(
@@ -178,8 +172,6 @@ _CONTROL_FLOW_OP_RE = re.compile(
 )
 
 # Shared precompiled token helpers reused across the extractors below.
-_IDENT_RE = re.compile(r"[A-Za-z_]\w*")  # bare SAS identifier
-_SPLIT_WS_COMMA_RE = re.compile(r"[,\s]+")  # %global/%local list separator
 _NUM_SUFFIX_RE = re.compile(r"^([A-Za-z_]+?)(\d+)$")  # split trailing integer
 
 # _VAR_REF_RE (from chunker.statements): any "&name" or "&name." reference —
@@ -651,20 +643,22 @@ def _metadata_for(region: _Region) -> SasChunkMetadata:
     ):
         produces_macrovars.extend(_extract_sql_into_vars(cf))
 
-    # ── macro-language-level declarations (%LET and %GLOBAL/%LOCAL lists) ───
+    # ── macro-language-level declarations (%LET and %GLOBAL/%LOCAL) ─────────
     declared: list[str] = [m.group(1).lower() for m in _LET_TARGET_RE.finditer(cf)]
-    for m in _GLOBAL_LOCAL_DECL_RE.finditer(cf):
-        for name in _SPLIT_WS_COMMA_RE.split(m.group(1).strip()):
-            name = name.lstrip("&").rstrip(".")
-            if _IDENT_RE.fullmatch(name):
-                declared.append(name.lower())
+    if "global" in lowcf or "local" in lowcf:
+        declared += [name for _, name in scope_declarations(cf)]
     declared_macro_vars = sorted(set(declared))
 
     # ── macro-variable values, for the %LET-driven name resolution pass ─────
     # Scanned on `cf` so a quoted value survives to be unquoted; the pass that
-    # consumes this is resolve_macro_var_refs, below. A %SYMDEL leaves its
-    # names unknown (""), so it is read here too.
-    macro_var_values = let_values(cf) if "let" in lowcf or "symdel" in lowcf else {}
+    # consumes this is resolve_macro_var_refs, below. `%global / readonly
+    # x=v;` assigns as %LET does, and a %SYMDEL leaves its names unknown (""),
+    # so both are read here too.
+    macro_var_values = (
+        let_values(cf)
+        if "let" in lowcf or "symdel" in lowcf or "readonly" in lowcf
+        else {}
+    )
 
     # ── recognised SAS functions and CALL routines ──────────────────────────
     # Scanned on `mt` (string literals blanked), with %MACRO headers and
@@ -1124,8 +1118,6 @@ def _resolved_meta(
 
 # Macro control flow: an assignment under one of these may or may not run.
 _MACRO_CONTROL_RE = re.compile(r"%\s*(?:if|do|goto)\b", re.IGNORECASE)
-# %GLOBAL / %LOCAL declaration lists, told apart (unlike _GLOBAL_LOCAL_DECL_RE).
-_SCOPE_DECL_RE = re.compile(r"%\s*(global|local)\s+([^;]+?)\s*;", re.IGNORECASE)
 
 
 def _assign(table: dict[str, str], name: str, value: str) -> None:
@@ -1220,11 +1212,8 @@ class _MacroDef:
         mt = _sanitise(chunk.text)
         params = macro_signature(cf)
         declared: dict[str, set[str]] = {"global": set(), "local": set()}
-        for m in _SCOPE_DECL_RE.finditer(mt):
-            for name in _SPLIT_WS_COMMA_RE.split(m.group(2).strip()):
-                name = name.lstrip("&").rstrip(".")
-                if _IDENT_RE.fullmatch(name):
-                    declared[m.group(1).lower()].add(name.lower())
+        for scope, name in scope_declarations(mt):
+            declared[scope].add(name)
         # A definition's produces_macrovars lists its CALL SYMPUTs alone; a
         # PROC SQL INTO in the body overwrites a global just the same.
         into = _extract_sql_into_vars(mt) if "into" in mt.lower() else []

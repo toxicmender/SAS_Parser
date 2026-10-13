@@ -140,6 +140,19 @@ class TestLetValues(unittest.TestCase):
         )
         self.assertEqual(let_values("%symdel &list;"), {})
 
+    def test_a_readonly_declaration_assigns(self):
+        # "%GLOBAL / READONLY macro-variable=value" creates a new read-only
+        # variable and assigns it, as %LOCAL's form does; omitting the value
+        # "produces a null value" (SAS 9.4 Macro Language: Reference). Before,
+        # the value went unread. The list form assigns nothing.
+        self.assertEqual(
+            let_values(
+                "%global / readonly lib=Prod;\n%global/readonly ds = 'lib.t';\n"
+                "%local / READONLY i=;\n%global lib2 ds2;\n"
+            ),
+            {"lib": "prod", "ds": "lib.t", "i": ""},
+        )
+
 
 class TestSymdel(unittest.TestCase):
     """A deleted variable stops resolving: before, `&lib` still answered prod
@@ -180,6 +193,36 @@ class TestSymdel(unittest.TestCase):
             "data x; set &lib..t; run;\n"
         )
         self.assertEqual(self._reads(src), ["&lib..t"])
+
+
+class TestReadOnly(unittest.TestCase):
+    """A read-only variable holds what its declaration assigns. Before,
+    `%global / readonly lib=prod;` set nothing the chunker read, and
+    `&lib..t` stayed unresolved."""
+
+    _reads = TestSymdel._reads
+
+    def test_a_readonly_global(self):
+        src = "%global / readonly lib=prod;\ndata x; set &lib..t; run;\n"
+        self.assertEqual(self._reads(src), ["prod.t"])
+
+    def test_a_macro_that_creates_a_readonly_global(self):
+        src = (
+            "%macro setup; %global / readonly lib=prod; %mend;\n%setup;\n"
+            "data x; set &lib..t; run;\n"
+        )
+        self.assertEqual(self._reads(src), ["prod.t"])
+
+    def test_a_readonly_local_ends_with_its_macro(self):
+        src = "%macro m; %local / readonly lib=prod; %mend;\n%m;\ndata x; set &lib..t; run;\n"
+        self.assertEqual(self._reads(src), ["&lib..t"])
+
+    def test_the_declaration_names_its_variable(self):
+        # Before, the list was read as names: `readonly` was declared, `lib`
+        # was not, and `%global/readonly` with no blank declared nothing.
+        result = _chunk("%global / readonly lib=prod;\n%global/readonly ds=a.b;\n")
+        declared = {v for c in result.chunks for v in c.metadata.declared_macro_vars}
+        self.assertEqual(declared, {"lib", "ds"})
 
 
 class TestStripQuotes(unittest.TestCase):

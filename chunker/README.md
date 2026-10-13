@@ -529,6 +529,12 @@ Values come from more than `%LET` in open code, and `_MacroScope` (in
 - **A deleted variable is unknown.** `%SYMDEL` (in open code, or in a called
   macro's body) and `CALL SYMDEL('name')` (once its step has run) delete a
   global, so `&lib` stops resolving until a `%LET` assigns it again.
+- **A read-only variable is assigned where it is declared.**
+  `%global / readonly lib=prod;` creates `lib` holding `prod`, as
+  `%let lib = prod;` would, and `%local / readonly` does the same in a
+  macro's local table (SAS 9.4 Macro Language: Reference, %GLOBAL and %LOCAL
+  Macro Statements). SAS rejects any later `%LET` or `%SYMDEL` of one; code
+  that does so is taken as written.
 
 Two scope rules keep this from over-reaching. A macro's own parameters shadow
 the table, so `&ds` inside `%macro m(ds);` stays a `body_param_*` entry the
