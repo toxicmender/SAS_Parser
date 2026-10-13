@@ -100,6 +100,35 @@ class TestStatementForms:
             ("lib2", "lib2", PathLocation.FILEREF),
         ]
 
+    def test_an_include_mixing_its_sources_keeps_every_one_in_order(self):
+        # "You can specify any number of sources in a %INCLUDE statement, and
+        # you can mix the types of included sources" (SAS 9.4 Global
+        # Statements). Before, only the quoted files were kept.
+        refs = extract_paths(
+            "%include '/a.sas' src(b) setup \"/c.sas\";\n"
+            "%include mylib(testcode1, testcode2, \"testcode3.txt\") '/d.sas' / source2;\n"
+        )
+        assert [(r.raw, r.location, r.binds) for r in refs] == [
+            ("/a.sas", PathLocation.FILESYSTEM, None),
+            ("src(b)", PathLocation.FILEREF, "src"),
+            ("setup", PathLocation.FILEREF, "setup"),
+            ("/c.sas", PathLocation.FILESYSTEM, None),
+            ("mylib(testcode1)", PathLocation.FILEREF, "mylib"),
+            ("mylib(testcode2)", PathLocation.FILEREF, "mylib"),
+            ('mylib("testcode3.txt")', PathLocation.FILEREF, "mylib"),
+            ("/d.sas", PathLocation.FILESYSTEM, None),
+        ]
+
+    def test_internal_lines_and_the_keyboard_name_no_file(self):
+        refs = extract_paths("%include '/a.sas' 1-3 4:5 *;\n%include 7;\n")
+        assert [r.raw for r in refs] == ["/a.sas"]
+
+    def test_a_quoted_include_counts_in_call_execute_text(self):
+        # Generated code runs: its quoted file is a dependency. A bare word in
+        # a string names no fileref, as before.
+        src = "data _null_; call execute('%include \"/gen/a.sas\";'); put '%include src(z);'; run;\n"
+        assert [r.raw for r in extract_paths(src)] == ["/gen/a.sas"]
+
     def test_inc_is_include(self):
         refs = extract_paths("%inc '/code/a.sas';\n%inc src(b);\n%INC setup;\n")
         assert [(r.statement, r.raw) for r in refs] == [
@@ -546,6 +575,14 @@ class TestFilerefResolution:
         ]
         assert refs[4] == [("infile", "filesystem", "/q1.sas"), ("infile", "filesystem", "/q2.sas")]
 
+    def test_a_mixed_include_follows_each_fileref(self):
+        refs = self._refs("filename src '/code';\n%include '/a.sas' src(b) src;\n")
+        assert refs[1] == [
+            ("include", "filesystem", "/a.sas"),
+            ("include", "filesystem", "/code/b.sas"),
+            ("include", "filesystem", "/code"),
+        ]
+
     def test_following_a_concatenation_again_changes_nothing(self):
         from chunker import SasSemanticChunker
         from chunker.metadata import resolve_filerefs
@@ -567,16 +604,16 @@ class TestFilerefResolution:
         # `infile in;` name their place through a FILENAME, never here.
         from chunker.paths import PATH_STATEMENTS
 
-        source = "%include src(util);\n%include src;\ndata a; infile in; file out; run;\n"
+        source = "%include src(util);\n%include src('b.sas');\ndata a; infile in; file out; run;\n"
         found = [
-            (spec.statement, spec.location_for(m), spec.value_spans(m))
+            (spec.statement, spec.value_spans(m))
             for spec in PATH_STATEMENTS
-            if spec.fileref
+            if spec.fileref or spec.sources
             for m in spec.pattern.finditer(source)
         ]
         assert found == [
-            ("include", PathLocation.FILEREF, []),
-            ("include", PathLocation.FILEREF, []),
-            ("infile", PathLocation.FILEREF, []),
-            ("file", PathLocation.FILEREF, []),
+            ("include", []),
+            ("include", []),
+            ("infile", []),
+            ("file", []),
         ]
