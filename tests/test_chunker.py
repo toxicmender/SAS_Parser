@@ -881,6 +881,37 @@ class TestStatementStructure(unittest.TestCase):
         self.assertEqual(self._kinds(result), [PROC, GLOBAL])
         self.assertEqual(result.diagnostics, [])
 
+    def test_the_documented_run_group_procs_hold_their_second_group(self):
+        # CHART and the SAS/GRAPH procedures SAS lists (Usage Note 58486), and
+        # FACTEX, OPTEX and PLAN among the interactive ones (Usage Note 37105).
+        # Before, each one's second RUN group was an unknown statement.
+        for proc, group in (
+            ("chart", "vbar x;"),
+            ("gareabar", "hbar x*y;"),
+            ("gkpi", "hbullet actual=.5 bounds=(0 1);"),
+            ("gtile", "tile x tileby=(y);"),
+            ("factex", "factors a b;"),
+            ("optex", "generate n=10;"),
+            ("plan", "factors a=4;"),
+        ):
+            with self.subTest(proc=proc):
+                result = self._chunks(
+                    f"proc {proc} data=a;\n  {group}\nrun;\n  {group}\nrun;\nquit;\n"
+                )
+                self.assertEqual(self._kinds(result), [PROC])
+                self.assertEqual(result.diagnostics, [])
+
+    def test_g3d_and_gcontour_end_at_their_run(self):
+        # Neither supports RUN-group processing (SAS/GRAPH 9.4 Reference), so
+        # a second PLOT after RUN is no part of the step: SAS rejects it.
+        for proc in ("g3d", "gcontour"):
+            with self.subTest(proc=proc):
+                result = self._chunks(
+                    f"proc {proc} data=a;\n  plot y*x=z;\nrun;\n  plot b*a=c;\nrun;\n"
+                )
+                self.assertEqual(result.chunks[0].kind, PROC)
+                self.assertNotIn("plot b*a=c", result.chunks[0].text)
+
     def test_a_run_group_proc_without_run_is_unclosed(self):
         result = self._chunks("proc sql;\n  create table b as select * from a;\ndata c; set b; run;\n")
         self.assertEqual(self._kinds(result), [PROC, DATA])

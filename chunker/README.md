@@ -169,7 +169,9 @@ this is a considered decision, not an accident.
   treated as boundaries, and a DATA or PROC keyword used as a variable
   (`data = 1;`) is no header. A `%MACRO` block closes only on its own
   (nesting-balanced) `%MEND`. A PROC in `keywords.RUN_GROUP_PROCS` (DATASETS,
-  REG, GLM, SQL, IML, …) runs in groups: `RUN;` does not end it, `QUIT;` does;
+  REG, GLM, SQL, IML, …: SAS's own lists of RUN-group and interactive
+  procedures, so CHART, GKPI and PLAN but not G3D) runs in groups: `RUN;`
+  does not end it, `QUIT;` does;
   met by the next step or the end of the file after a `RUN;`, it ended at its
   last `RUN;`, and what followed is open code again (no `UNCLOSED_*`). PROC DS2
   holds DATA programs of its own, so their headers do not end it.

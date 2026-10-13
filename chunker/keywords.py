@@ -494,13 +494,21 @@ SAS_GLOBAL_STATEMENT_TOKENS: frozenset[str] = (
 # until QUIT or the next step: `proc datasets; delete a; run; delete b; quit;`
 # is one step. PROC SQL and FEDSQL run each statement as it comes, so RUN does
 # nothing there; PROC DS2 runs the program before it.
+#
+# The documented lists: Base SAS's CATALOG, CHART, DATASETS, DOCUMENT and
+# PLOT, and SAS/GRAPH's GAREABAR, GBARLINE, GCHART, GKPI, GMAP, GPLOT, GRADAR,
+# GREPLAY, GSLIDE and GTILE (Usage Note 58486; SAS/GRAPH 9.4 Reference, each
+# with "Supports: RUN-group processing" — G3D and GCONTOUR do not); the
+# interactive ANOVA, ARIMA, CATMOD, FACTEX, GLM, MODEL, OPTEX, PLAN and REG
+# (Usage Note 37105).
 RUN_GROUP_PROCS: frozenset[str] = frozenset(
     {
         "sql", "fedsql", "ds2", "datasets", "catalog", "document", "iml",
-        "optmodel", "cas", "casutil",
+        "optmodel", "cas", "casutil", "chart",
         "plot", "reg", "glm", "anova", "catmod", "arima", "model",
-        "gplot", "gchart", "gmap", "g3d", "gcontour", "greplay", "gslide",
-        "gradar", "gbarline", "pmenu", "trantab",
+        "factex", "optex", "plan",
+        "gplot", "gchart", "gmap", "greplay", "gslide", "gradar", "gbarline",
+        "gareabar", "gkpi", "gtile", "pmenu", "trantab",
     }
 )
 
