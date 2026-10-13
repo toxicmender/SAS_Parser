@@ -545,6 +545,29 @@ class TestScanScope:
         refs = extract_paths(_sanitise(source, blank_strings=False))
         assert [r.path for r in refs] == ["/current"]
 
+    def test_a_slash_star_inside_a_string_opens_no_comment(self):
+        # '/data/in/*.csv' is a UNIX wildcard path. Before, the strings-kept
+        # form read its /* as a comment and blanked the rest of the text, so
+        # the path and everything after it went unrecorded.
+        from chunker.scanner import _sanitise
+
+        source = (
+            "filename wild '/data/in/*.csv';\n/* a 'note' */\n"
+            "filename sub '/data/*/*';\nlibname out '/data/out';\n"
+        )
+        cf = _sanitise(source, blank_strings=False)
+        assert [r.path for r in extract_paths(cf)] == ["/data/out", "/data/in/*.csv", "/data/*/*"]
+        assert "note" not in cf
+
+    def test_a_chunk_keeps_what_follows_such_a_path(self):
+        from chunker import SasSemanticChunker
+
+        (chunk,) = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(
+            "data a; infile '/data/in/*.csv'; input x; set raw.t; run;\n"
+        ).chunks
+        assert [r.path for r in chunk.metadata.external_refs] == ["/data/in/*.csv"]
+        assert chunk.metadata.input_datasets == ["raw.t"]
+
     def test_empty_text(self):
         assert extract_paths("") == []
 

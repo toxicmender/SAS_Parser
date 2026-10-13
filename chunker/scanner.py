@@ -396,8 +396,6 @@ _COMMENT_OR_STRING_RE = re.compile(
     r'|"(?:""|[^"])*(?:"|\Z)',
     re.DOTALL,
 )
-# Comment-only variant (blank_strings=False): string literals stay intact.
-_COMMENT_ONLY_RE = re.compile(r"/\*.*?(?:\*/|\Z)", re.DOTALL)
 # Every non-newline character; blanks a span to spaces while preserving breaks.
 _NON_NEWLINE_RE = re.compile(r"[^\r\n]")
 
@@ -406,6 +404,12 @@ def _blank_span(s: str) -> str:
     """Map every character of *s* to a space, except newlines: ``\\r`` and
     ``\\n`` both become ``\\n`` so downstream line alignment is preserved."""
     return _NON_NEWLINE_RE.sub(" ", s).replace("\r", "\n")
+
+
+def _comment_repl(m: re.Match[str]) -> str:
+    """A block comment blanked, delimiters included; a string kept as it is."""
+    s = m.group(0)
+    return _blank_span(s) if s[0] == "/" else s
 
 
 def _sanitise_repl(m: re.Match[str]) -> str:
@@ -432,7 +436,8 @@ def _sanitise(text: str, *, blank_strings: bool = True) -> str:
     become spaces, with the doubled-quote escape (``''`` / ``""``) handled
     so it doesn't end the string early.  Pass ``blank_strings=False`` to
     keep quoted text intact, e.g. when extracting a literal filename from
-    ``%include 'path.sas'``.
+    ``%include 'path.sas'``. Strings are found either way, so a ``/*``
+    inside one (``infile '/data/in/*.csv';``) opens no comment.
 
     With ``blank_strings`` the argument of a macro quoting function is
     sanitised too (:func:`_sanitise_quoting`): its semicolons are blanked, so
@@ -445,7 +450,7 @@ def _sanitise(text: str, *, blank_strings: bool = True) -> str:
     substantially faster on real source where most characters are neither.
     """
     if not blank_strings:
-        return _COMMENT_ONLY_RE.sub(lambda m: _blank_span(m.group(0)), text)
+        return _COMMENT_OR_STRING_RE.sub(_comment_repl, text)
     if "%" in text and _MACRO_QUOTE_RE.search(text) is not None:
         return _sanitise_quoting(text)
     return _COMMENT_OR_STRING_RE.sub(_sanitise_repl, text)
