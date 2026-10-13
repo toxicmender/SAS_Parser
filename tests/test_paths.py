@@ -707,6 +707,40 @@ class TestFilerefResolution:
         assert refs[2] == [("proc_import", "filesystem", "/data/in/sales.csv")]
         assert refs[3] == [("proc_export", "filesystem", "/data/out/r.csv")]
 
+    def test_a_member_is_the_file_sas_on_unix_opens(self):
+        # Unquoted and without an extension, a member is lowercased and given
+        # the statement's extension (.sas for %INCLUDE, .dat for INFILE and
+        # FILE); with an extension, or quoted, it is the file as written (SAS
+        # 9.4 Companion for UNIX Environments, Specifying Pathnames). Before,
+        # `code(PROGRAM)` opened /code/PROGRAM.sas, `code("TEMP")`
+        # /code/TEMP.sas and `prices(cars)` /users/pat/cars.
+        from chunker import SasSemanticChunker
+
+        result = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(
+            "filename code '/code';\nfilename prices '/users/pat';\n"
+            '%include code(PROGRAM);\n%include code("TEMP");\n%include code(Temp.sas);\n'
+            "data a; infile prices(cars); input x; run;\n"
+            "data _null_; file prices('Out.txt'); put 'x'; run;\n"
+        )
+        opened = [
+            (r.effective_path, r.path)
+            for c in result.chunks
+            for r in c.metadata.external_refs
+            if r.statement != "filename"
+        ]
+        assert opened == [
+            ("/code/program.sas", "/code/program.sas"),
+            ("/code/TEMP", "/code/temp"),
+            ("/code/Temp.sas", "/code/temp.sas"),
+            ("/users/pat/cars.dat", "/users/pat/cars.dat"),
+            ("/users/pat/Out.txt", "/users/pat/out.txt"),
+        ]
+        assert [f.path for c in result.chunks for f in c.metadata.include_files] == [
+            "/code/program.sas",
+            "/code/TEMP",
+            "/code/Temp.sas",
+        ]
+
     def test_proc_python_follows_its_fileref(self):
         refs = self._refs("filename py '/scripts/prep.py';\nproc python infile=py; run;\n")
         assert refs[1] == [("proc_python", "filesystem", "/scripts/prep.py")]

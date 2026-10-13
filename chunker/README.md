@@ -395,14 +395,21 @@ records, in that order — and internal lines (`1-5`) and the keyboard (`*`)
 name no file. Being
 bare words, these forms count only where a statement starts — after a `;`, a
 THEN or an ELSE — so "the file written" in a PUT string, a TITLE or a `%PUT`
-names no fileref, while a quoted file in CALL EXECUTE text still counts. Those are recorded as
-`FILEREF`, the fileref in `binds`, and `metadata.resolve_filerefs` walks the
-corpus in source order with the FILENAMEs in force: the latest binding of a
-fileref wins, `clear` or a FILENAME with no quoted place ends it, and each
-later reference takes the FILENAME's location and path — a member of a
-directory as `<dir>/one.sas`, SAS adding `.sas` for `%INCLUDE`. A fileref
-nothing binds stays `FILEREF`. A file read through a fileref is the FILENAME's
-file, so the hydration planner plans it once, from the FILENAME.
+names no fileref, while a quoted file in CALL EXECUTE text still counts. Those
+are recorded as `FILEREF`, the fileref in `binds`, and
+`metadata.resolve_filerefs` walks the corpus in source order with the
+FILENAMEs in force: the latest binding of a fileref wins, `clear` or a
+FILENAME with no quoted place ends it, and each later reference takes the
+FILENAME's location and path — a member of a directory as the file SAS on UNIX
+opens (`paths.member_file`): unquoted and without an extension, lowercased
+with `.sas` added for `%INCLUDE` and `.dat` for INFILE and FILE (`src(One)` →
+`<dir>/one.sas`, `prices(cars)` → `<dir>/cars.dat`); with an extension, or
+quoted, as written (`src(One.sas)`, `src("One")`), since UNIX file names are
+case sensitive (SAS 9.4 Companion for UNIX Environments, Specifying
+Pathnames). `path` stays a case-folded comparison key; `effective_path` is the
+file SAS opens. A fileref nothing binds stays `FILEREF`. A file read through a
+fileref is the FILENAME's file, so the hydration planner plans it once, from
+the FILENAME.
 
 A statement may also **concatenate** places, which SAS treats as one:
 `libname x ('/a' '/b');` (commas allowed, and an assigned libref in place of a

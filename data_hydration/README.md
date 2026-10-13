@@ -232,7 +232,9 @@ that cannot be written fails the run's exit status, never its plan.
 Python files PROC PYTHON's `INFILE=` runs (`proc python infile=py;`). The path
 either names is the SAS server's, so each script is looked for by **file
 name** — the one SAS opens, macro variables expanded and filerefs followed
-(`src(util)` opens `util.sas`) — ignoring case and at any depth:
+(`src(UTIL)` opens `util.sas`, `src("Util")` opens `Util`) — at any depth:
+exactly in the source directory, since UNIX file names are case sensitive,
+and ignoring case in SharePoint, as SharePoint does:
 
 ```bash
 python -m data_hydration path/to/sas --dry-run --check-includes

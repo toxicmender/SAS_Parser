@@ -4,8 +4,10 @@
 on the SAS server — a path that means nothing here. A migration needs that
 script all the same, so it is looked for by **file name**: ``util.sas`` in the
 local corpus directory and in the application's SharePoint scripts folder, at
-any depth, ignoring case (a SAS server on Windows would). Found in neither, it
-is a dependency the corpus is missing. So is the Python file PROC PYTHON's
+any depth. Locally the name must match exactly, since on UNIX "a file named
+PROGRAM is not the same as a file named program" (SAS 9.4 Companion for UNIX
+Environments); SharePoint ignores case in its own names, so the search there
+does too. Found in neither, it is a dependency the corpus is missing. So is the Python file PROC PYTHON's
 ``INFILE=`` runs (``proc python infile='/sas/py/prep.py';``): a script the job
 needs as much as one it includes.
 
@@ -63,18 +65,20 @@ def is_include(row: InventoryRow) -> bool:
 def include_file_name(row: InventoryRow) -> str | None:
     """The file name *row*'s ``%INCLUDE`` opens: ``util.sas`` for
     ``/sas/macros/util.sas`` or ``C:\\sas\\util.sas``, and for a member of a
-    fileref's directory, ``src(util)``, the member with the ``.sas`` SAS adds.
+    fileref's directory the file SAS on UNIX opens for it
+    (:func:`chunker.paths.member_file`): ``src(UTIL)`` opens ``util.sas``,
+    ``src(Util.sas)`` and ``src("Util")`` the name as written.
 
     ``None`` when no file name is known: the last segment is still a macro
     reference (``%include &f;``), or a fileref no FILENAME binds names a whole
     file (``%include setup;``) whose name is the FILENAME's to say.
     """
+    from chunker.paths import member_file
+
     text = row.value.strip().strip("'\"")
     member = _MEMBER_RE.fullmatch(text)
     if member:
-        name = member.group(1).strip("'\"")
-        if "." not in name:
-            name += ".sas"
+        name = member_file(member.group(1), "include")
     elif row.libref and text.lower() == row.libref:
         return None  # an unbound fileref: no file name yet
     else:
@@ -88,22 +92,33 @@ def include_file_name(row: InventoryRow) -> str | None:
 _WILDCARD_RE = re.compile(r"[*?]|\[[^\]]*\]")
 
 
-def found_in(index: FileIndex, name: str) -> tuple[str, ...]:
-    """The scripts of *index* named *name*, ignoring case: one name, or for
-    a wildcard (``%include '/code/macros/*.sas';``) every name it matches,
-    in name order. As SAS on UNIX reads one, ``*`` is one or more characters
-    and never matches a leading period, ``?`` is one, ``[ ]`` one of a set
-    (SAS 9.4 Companion for UNIX Environments, Using Wildcards in Pathnames)."""
+def found_in(index: FileIndex, name: str, *, exact: bool = False) -> tuple[str, ...]:
+    """The scripts of *index* named *name*: one name, or for a wildcard
+    (``%include '/code/macros/*.sas';``) every name it matches, in name order.
+    As SAS on UNIX reads one, ``*`` is one or more characters and never
+    matches a leading period, ``?`` is one, ``[ ]`` one of a set (SAS 9.4
+    Companion for UNIX Environments, Using Wildcards in Pathnames).
+
+    Case is ignored unless *exact*, which keeps only the scripts whose own
+    name has the case *name* is written in, as a UNIX file name must."""
     key = name.lower()
     if not _WILDCARD_RE.search(key):
-        return tuple(index.get(key, ()))
+        found = tuple(index.get(key, ()))
+        return tuple(p for p in found if _file_name(p) == name) if exact else found
     pattern = re.compile(fnmatch.translate(key.replace("*", "?*")))
+    written = re.compile(fnmatch.translate(name.replace("*", "?*")))
     return tuple(
         path
         for file_name, paths in sorted(index.items())
         if pattern.match(file_name) and not (file_name.startswith(".") and key[0] != ".")
         for path in paths
+        if not exact or written.match(_file_name(path))
     )
+
+
+def _file_name(path: str) -> str:
+    """The last segment of an index path, case kept."""
+    return path.rsplit("/", 1)[-1]
 
 
 def local_index(root: Path) -> dict[str, tuple[str, ...]]:
@@ -165,8 +180,9 @@ def match_includes(
     sharepoint: FileIndex | None = None,
 ) -> list[InventoryRow]:
     """*rows*, each ``%INCLUDE`` with the scripts of its file name found in
-    *local* and in *sharepoint* (an index ``None`` is not looked in, and its
-    column stays ``None``). Every other row is returned as it is.
+    *local*, by its exact name, and in *sharepoint*, ignoring case (an index
+    ``None`` is not looked in, and its column stays ``None``). Every other row
+    is returned as it is.
 
     A script with no known file name (:func:`include_file_name`) is found
     nowhere: its columns are empty, not ``None``, since the places were
@@ -179,9 +195,12 @@ def match_includes(
             continue
         name = include_file_name(row)
         update: dict[str, tuple[str, ...]] = {}
-        for column, index in (("found_local", local), ("found_sharepoint", sharepoint)):
+        for column, index, exact in (
+            ("found_local", local, True),
+            ("found_sharepoint", sharepoint, False),
+        ):
             if index is not None:
-                update[column] = found_in(index, name) if name else ()
+                update[column] = found_in(index, name, exact=exact) if name else ()
         matched.append(row.model_copy(update=update) if update else row)
     return matched
 
@@ -229,14 +248,14 @@ class IncludeCheck:
 
 def include_checks(rows: Iterable[InventoryRow]) -> list[IncludeCheck]:
     """One :class:`IncludeCheck` per script *rows* include, in the order the
-    corpus first includes it. Scripts are one by file name, ignoring case;
-    an include with no file name is one by its spelling."""
+    corpus first includes it. Scripts are one by file name, case and all, as
+    UNIX names a file; an include with no file name is one by its spelling."""
     found: dict[str, IncludeCheck] = {}
     for row in sorted(rows, key=lambda r: (r.file_order, r.ref_order)):
         if not is_include(row):
             continue
         name = include_file_name(row)
-        key = name.lower() if name else f"&{row.raw}"
+        key = name if name else f"&{row.raw}"
         site = (row.source_id, row.start_line)
         seen = found.get(key)
         if seen is None:

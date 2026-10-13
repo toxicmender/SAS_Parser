@@ -63,6 +63,12 @@ def _includes(src: str) -> list[InventoryRow]:
         ("filename src '/code';\n%include src(util);", "util.sas"),
         ("%include src(util);", "util.sas"),
         ("%include src('setup.txt');", "setup.txt"),
+        # As SAS on UNIX names it: unquoted with no extension, lowercased;
+        # with one, or quoted, as written (Specifying Pathnames).
+        ("filename src '/code';\n%include src(UTIL);", "util.sas"),
+        ("%include src(Util);", "util.sas"),
+        ("%include src(Util.sas);", "Util.sas"),
+        ('%include src("Util");', "Util"),
         ("%let f = src(util);\n%include &f;", "util.sas"),
         # No file name to look for.
         ("%include &f;", None),
@@ -156,12 +162,12 @@ SRC = (
 
 
 def test_each_include_records_where_its_script_was_found():
-    local = {"util.sas": ("macros/util.sas",)}
+    local = {"util.sas": ("macros/Util.sas",)}
     sharepoint = {"common.sas": ("App/scripts_original/common.sas",), "util.sas": ("App/u/util.sas",)}
     rows = match_includes(_rows(job=SRC), local=local, sharepoint=sharepoint)
     found = {r.raw: (r.found_local, r.found_sharepoint) for r in rows if is_include(r)}
     assert found == {
-        "/sas/prod/Util.sas": (("macros/util.sas",), ("App/u/util.sas",)),
+        "/sas/prod/Util.sas": (("macros/Util.sas",), ("App/u/util.sas",)),
         "/sas/prod/common.sas": ((), ("App/scripts_original/common.sas",)),
         "/elsewhere/missing.sas": ((), ()),
         # Searched, but there was no name to search for.
@@ -179,14 +185,16 @@ def test_a_place_nobody_looked_in_stays_none():
 
 def test_the_checks_name_each_script_once_with_everyone_who_includes_it():
     rows = match_includes(
-        _rows(a=SRC, b="%include '/other/place/UTIL.sas';\n"),
-        local={"util.sas": ("macros/util.sas",)},
+        _rows(a=SRC, b="%include '/other/place/Util.sas';\n%include '/x/UTIL.sas';\n"),
+        local={"util.sas": ("macros/Util.sas",)},
     )
     checks = {c.file_name or c.spelled: c for c in include_checks(rows)}
-    assert list(checks) == ["Util.sas", "common.sas", "missing.sas", "&f"]
+    # UTIL.sas is another file on UNIX, and no copy of it was found.
+    assert list(checks) == ["Util.sas", "common.sas", "missing.sas", "&f", "UTIL.sas"]
     util = checks["Util.sas"]
     assert util.included_by == (("a.sas", 1), ("b.sas", 1))
-    assert (util.status, util.local, util.sharepoint) == ("found", ("macros/util.sas",), None)
+    assert (util.status, util.local, util.sharepoint) == ("found", ("macros/Util.sas",), None)
+    assert checks["UTIL.sas"].status == "missing"
     assert checks["missing.sas"].status == "missing"
     assert checks["&f"].status == "unnamed"
     # Unchecked: nobody looked.
@@ -232,7 +240,7 @@ def test_a_python_script_proc_python_runs_is_looked_for_too():
                 "proc python infile=gone; run;\n"
             )
         ),
-        local={"prep.py": ("py/prep.py",)},
+        local={"prep.py": ("py/Prep.py",)},
     )
     checks = include_checks(rows)
     assert [(c.file_name or c.spelled, c.status, c.included_by) for c in checks] == [
@@ -243,8 +251,27 @@ def test_a_python_script_proc_python_runs_is_looked_for_too():
     ]
 
 
+def test_a_local_copy_is_found_by_its_exact_name_and_sharepoint_ignores_case():
+    # File names on UNIX are case sensitive: "a file named PROGRAM is not the
+    # same as a file named program" (SAS 9.4 Companion for UNIX Environments).
+    # SharePoint ignores case in its own names. Before, both ignored it.
+    index = {"util.sas": ("m/util.sas", "n/UTIL.sas"), "util1.sas": ("m/Util1.sas", "n/util1.sas")}
+    assert found_in(index, "UTIL.sas", exact=True) == ("n/UTIL.sas",)
+    assert found_in(index, "Util.sas", exact=True) == ()
+    assert found_in(index, "Util.sas") == ("m/util.sas", "n/UTIL.sas")
+    assert found_in(index, "Util*.sas", exact=True) == ("m/Util1.sas",)
+    assert found_in(index, "util*.sas", exact=True) == ("n/util1.sas",)
+    rows = match_includes(
+        _rows(job="%include '/sas/prod/Util.sas';\n"),
+        local={"util.sas": ("macros/util.sas",)},
+        sharepoint={"util.sas": ("App/util.sas",)},
+    )
+    [row] = [r for r in rows if is_include(r)]
+    assert (row.found_local, row.found_sharepoint) == ((), ("App/util.sas",))
+
+
 def test_one_statement_including_two_copies_of_a_script_is_one_site():
-    [check] = include_checks(_rows(job="%include '/a/util.sas' '/b/UTIL.sas';\n"))
+    [check] = include_checks(_rows(job="%include '/a/util.sas' '/b/util.sas';\n"))
     assert (check.file_name, check.included_by) == ("util.sas", (("job.sas", 1),))
 
 
@@ -253,14 +280,14 @@ def test_the_matches_survive_the_table_round_trip():
 
     [row] = [
         r
-        for r in match_includes(_rows(job=SRC), local={"util.sas": ("m/util.sas",)})
+        for r in match_includes(_rows(job=SRC), local={"util.sas": ("m/Util.sas",)})
         if r.raw.endswith("Util.sas")
     ]
     stored = row.model_dump()
-    stored["found_local"] = ["m/util.sas"]
+    stored["found_local"] = ["m/Util.sas"]
     assert InventoryRow.model_validate(stored) == row
     values = dict(zip(InventoryRow.model_fields, _values(row)))
-    assert (values["found_local"], values["found_sharepoint"]) == (["m/util.sas"], None)
+    assert (values["found_local"], values["found_sharepoint"]) == (["m/Util.sas"], None)
 
 
 # ── the plan ─────────────────────────────────────────────────────────────────

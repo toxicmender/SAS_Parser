@@ -71,6 +71,7 @@ from .paths import (
     extract_engine_refs,
     extract_paths,
     in_using_clause,
+    member_file,
     normalise_path,
 )
 from .scanner import _blank_span, _Region, _sanitise
@@ -1837,8 +1838,10 @@ _FILEREF_MEMBER_RE = re.compile(r"(?P<fref>[^(]+)\((?P<member>.*)\)\Z", re.DOTAL
 
 def _through_fileref(ref: SasPathRef, filename: SasPathRef) -> SasPathRef:
     """*ref*, made through a fileref, at the place the FILENAME *filename*
-    gave it: the file itself, or a member of the directory — ``%include
-    src(one)`` reads ``<dir>/one.sas``, SAS adding the extension.
+    gave it: the file itself, or a member of the directory, named as SAS on
+    UNIX names it (:func:`~chunker.paths.member_file`) — ``%include
+    src(One)`` reads ``<dir>/one.sas``, ``infile src(cars)`` ``<dir>/cars.dat``
+    and ``%include src("One")`` ``<dir>/One``.
 
     Built from the FILENAME's place as SAS reads it (its macro variables
     expanded, case kept), joined with the separator that place uses, so
@@ -1852,9 +1855,7 @@ def _through_fileref(ref: SasPathRef, filename: SasPathRef) -> SasPathRef:
     )
     place = filename.effective_path
     if (m := _FILEREF_MEMBER_RE.match(spelling)) is not None:
-        member = m.group("member").strip().strip("'\"")
-        if ref.statement == "include" and "." not in member:
-            member += ".sas"
+        member = member_file(m.group("member"), ref.statement)
         sep = "\\" if "\\" in place and "/" not in place else "/"
         place = place.rstrip("/\\") + sep + member
     return ref.model_copy(

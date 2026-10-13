@@ -127,10 +127,41 @@ def normalise_path(raw: str) -> str:
     The same normalisation :func:`chunker.statements._quoted_path` applies to
     quoted dataset references, minus its quote wrapper — that exists only to keep
     a path key out of the dataset *identifier* namespace, and nothing here shares
-    a namespace with identifiers. Per-OS case sensitivity is ignored, consistent
-    with the module's lowercase-everything policy.
+    a namespace with identifiers. A key, never a place: UNIX file names are case
+    sensitive, so what SAS opens is a reference's ``effective_path``, case kept
+    (see :func:`member_file`).
     """
     return raw.strip().replace("\\", "/").lower()
+
+
+#: The extension SAS on UNIX gives a file named without quotation marks and
+#: without an extension of its own: "the FILE and INFILE statements assume a
+#: file extension of '.dat'. The %INCLUDE statement assumes a file extension of
+#: '.sas'" (SAS 9.4 Companion for UNIX Environments, Specifying Pathnames).
+DEFAULT_EXTENSIONS: dict[str, str] = {"include": ".sas", "infile": ".dat", "file": ".dat"}
+
+
+def unquoted_file(name: str, statement: str) -> str:
+    """The file SAS on UNIX opens for *name*, written in *statement* without
+    quotation marks: as written when it has an extension (``Temp.sas``);
+    otherwise lowercased, with the statement's extension added — ``PROGRAM``
+    becomes ``program.sas`` in an %INCLUDE, ``cars`` ``cars.dat`` in an INFILE
+    (SAS 9.4 Companion for UNIX Environments, Specifying Pathnames)."""
+    if "." in name:
+        return name
+    return name.lower() + DEFAULT_EXTENSIONS.get(statement, "")
+
+
+def member_file(spelled: str, statement: str) -> str:
+    """The file a member of a directory fileref names, as *statement* spells
+    it (``src(util)``, ``src("Util")``) and SAS on UNIX opens it: quoted, the
+    name exactly as written, extension and all; unquoted, by
+    :func:`unquoted_file`. "%include code(TEMP.sas); %include code("TEMP"); In
+    both of these cases, SAS does not convert TEMP to lowercase."""
+    name = spelled.strip()
+    if len(name) >= 2 and name[0] in "'\"" and name[-1] == name[0]:
+        return name[1:-1]
+    return unquoted_file(name, statement)
 
 
 @dataclass(frozen=True)
