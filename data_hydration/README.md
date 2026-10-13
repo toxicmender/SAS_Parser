@@ -142,6 +142,13 @@ macro's `set &ds;` makes.
   (WORK, SASHELP, SASUSER, MAPS) need none, a dataset the job makes first is no
   input, and while some LIBNAME's libref is an unresolved `&lib` nothing is
   claimed unassigned.
+- **A data set read by its path is an item too.** `set
+  '/u/2011/budgets/may';` reads `may.sas7bdat` there (SAS adds the
+  extension), so it is a `sas7bdat` item, the path's case kept; with no
+  libref, its target needs a configured schema. A path that is not a full
+  one (`merge 'jan' 'feb';`) is read from the directory SAS runs in, which
+  the corpus does not say, so its item is blocked. A name literal
+  (`'my data'n`) is a member, not a path.
 - **A concatenated library is searched in order.** `libname x ('/a' '/b');` is
   one library: SAS reads a member from the first directory that holds it.
   Only a listing says which that is, so `set x.m;` is planned from `/a`, with

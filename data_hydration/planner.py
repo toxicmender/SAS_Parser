@@ -303,6 +303,68 @@ def _path_source(ref: "SasPathRef", source_id: str | None) -> HydrationSource | 
     )
 
 
+def _quoted_spelling(ref: "SasDatasetRef") -> str:
+    """The path a data set named by its path (``set '/Data/Prod/Master';``)
+    is read from, quotes and data set options dropped: as written, case kept,
+    unless a double-quoted spelling holds a ``&``, which only the resolved
+    name can expand."""
+    raw = (ref.raw or ref.name).strip()
+    quote = raw[:1]
+    end = raw.find(quote, 1) if quote in ("'", '"') else -1
+    if end > 0 and ("&" not in raw[:end] or quote == "'"):
+        return raw[1:end].strip()
+    return ref.name.strip().strip("'")
+
+
+def _member_of(path: str) -> str:
+    """The data set a path names: its last part, less the ``.sas7bdat`` SAS
+    gives a data file."""
+    name = _basename(path)
+    return name[: -len(_SAS_DATA_SUFFIX)] if name.lower().endswith(_SAS_DATA_SUFFIX) else name
+
+
+def _absolute(path: str) -> bool:
+    """Whether *path* is a full path: from the root (``/data``), or, on a
+    Windows server, a drive (``D:\\data``) or a share (``\\\\host\\share``)."""
+    return path.startswith(("/", "\\\\")) or (
+        len(path) > 2 and path[1] == ":" and path[2] in "/\\"
+    )
+
+
+def _quoted_dataset(path: str, reader: str | None) -> tuple[HydrationSource, tuple[str, ...]]:
+    """The source for a data set the job reads by its path, and why it is
+    blocked, if it is.
+
+    ``set '/u/2011/budgets/may';`` reads the SAS data file
+    ``/u/2011/budgets/may.sas7bdat`` — on UNIX "if you do not specify an
+    extension, SAS uses .sas7bdat" — so the item loads it as a SAS data set.
+    A path that is not a full one is read from the directory SAS runs in,
+    which the corpus does not say, and one with another extension names no
+    SAS data file.
+    """
+    member = _member_of(path)
+    source = HydrationSource(
+        kind=SourceKind.SAS_DATASET,
+        locator=_directory(path),
+        object_name=member,
+        has_macro_ref="&" in path,
+        source_id=reader,
+    )
+    blockers: list[str] = []
+    if not _absolute(path):
+        blockers.append(
+            f"'{path}' is not a full path: SAS reads it from the directory it "
+            f"runs in, which the corpus does not say — point this item at the "
+            f"directory that holds it"
+        )
+    if "." in member:
+        blockers.append(
+            f"'{path}' names no SAS data file (.sas7bdat) — check what the "
+            f"job reads there"
+        )
+    return source, tuple(blockers)
+
+
 def _index_note(
     source: HydrationSource, path_refs: Iterable["SasPathRef"]
 ) -> tuple[str, ...]:
@@ -608,6 +670,9 @@ class _Members(NamedTuple):
     #: For a dataset read through a concatenation, ``(directory, member)``,
     #: the note naming the libraries SAS would search after the one planned.
     notes: dict[tuple[str, str], str]
+    #: Each data set read by its path (``set '/data/prod/master';``), as
+    #: written, with the first file to read it, in first-read order.
+    quoted: dict[str, str | None]
 
 
 #: The librefs SAS assigns itself: in a SAS session they need no LIBNAME.
@@ -707,7 +772,7 @@ def _library_members(
                     writers.setdefault(ref.name, set()).add(source_id)
     assigned = _assigned_librefs(by_source)
     libraries = _Libraries()
-    found = _Members({}, set(), False, {}, set(), {})
+    found = _Members({}, set(), False, {}, set(), {}, {})
     seen: set[tuple[str, str]] = set()
     for source_id in dict.fromkeys([*by_source, *datasets]):
         libnames = sorted(
@@ -744,12 +809,20 @@ def _library_members(
                 if ref.name.startswith("&"):
                     found = found._replace(unknown=True)
                     continue
-                libref, _, member = ref.name.partition(".")
-                if not member:
-                    continue
                 made = ref.name in made_here | made_now or bool(
                     writers.get(ref.name, set()) - {source_id}
                 )
+                if ref.name.startswith("'"):
+                    # Named by its path, through no libref: its own item.
+                    path = _quoted_spelling(ref)
+                    key = (_directory(path), _member_of(path).lower())
+                    if not made and key not in seen:
+                        seen.add(key)
+                        found.quoted.setdefault(path, source_id or None)
+                    continue
+                libref, _, member = ref.name.partition(".")
+                if not member:
+                    continue
                 places = libraries.search(libref)
                 outside = (places[0][0] or "") if places and not places[0][1] else None
                 if not places or outside is not None:
@@ -1016,6 +1089,8 @@ def build_corpus_plan(
                 planned_tables.add(identity)
             sources.append((source, extra))
         path_ref_list += list(path_refs)
+    # A data set read by its path, through no libref.
+    sources += [_quoted_dataset(path, reader) for path, reader in members.quoted.items()]
 
     items: list[HydrationItem] = []
     seen_tables: set[str] = set()

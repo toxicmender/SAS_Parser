@@ -543,6 +543,43 @@ def test_a_view_s_own_database_libname_serves_its_query_and_nothing_after():
     assert [r.statement for r in rows if r.kind is RefKind.ENGINE] == ["using_libname"]
 
 
+def test_a_data_set_read_by_its_path_is_planned():
+    # `set '/u/2011/budgets/may';` reads may.sas7bdat there: "if you do not
+    # specify an extension, SAS uses .sas7bdat" (SAS 9.4 Companion for UNIX
+    # Environments). Before, such a read dropped out of the plan, or, holding
+    # a dot, became a library "never assigned" named after half the path.
+    plan = _plan(
+        job=(
+            "data a; set '/Data/Prod/Master.sas7bdat' '/u/2011/budgets/may'; run;\n"
+            "proc print data='/data/p/y.sas7bdat'; run;\n"
+        )
+    )
+    located = [(i.source.kind, i.source.locator, i.source.object_name) for i in plan.items]
+    assert located == [
+        (SourceKind.SAS_DATASET, "/Data/Prod", "Master"),
+        (SourceKind.SAS_DATASET, "/u/2011/budgets", "may"),
+        (SourceKind.SAS_DATASET, "/data/p", "y"),
+    ]
+    assert not any("never assigned" in b for i in plan.items for b in i.blockers)
+
+
+def test_a_data_set_read_by_a_relative_path_is_blocked():
+    # `merge 'jan' 'feb';` reads from the directory SAS runs in.
+    plan = _plan(job="data a; merge 'jan' 'feb'; by id; run;\n")
+    assert [(i.source.locator, i.source.object_name) for i in plan.items] == [("", "jan"), ("", "feb")]
+    assert all("not a full path" in i.blockers[0] for i in plan.items)
+
+
+def test_a_data_set_the_job_writes_by_its_path_is_its_own():
+    plan = _plan(job="data '/out/res'; set a; run;\ndata b; set '/out/res'; run;\n")
+    assert plan.items == []
+    # A path a library also reaches is one item, from the first read.
+    plan = _plan(job="libname p '/data/prod';\ndata a; set p.master; set '/data/prod/master'; run;\n")
+    assert [(i.source.locator, i.source.object_name, i.source.libref) for i in plan.items] == [
+        ("/data/prod", "master", "p")
+    ]
+
+
 def test_a_name_literal_is_a_member_not_a_path():
     # 'src tab'n is a WORK member, never a file to load; in a library, the
     # member's file is named without the literal's quotes and n.
