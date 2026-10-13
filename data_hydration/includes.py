@@ -5,11 +5,13 @@ on the SAS server — a path that means nothing here. A migration needs that
 script all the same, so it is looked for by **file name**: ``util.sas`` in the
 local corpus directory and in the application's SharePoint scripts folder, at
 any depth, ignoring case (a SAS server on Windows would). Found in neither, it
-is a dependency the corpus is missing.
+is a dependency the corpus is missing. So is the Python file PROC PYTHON's
+``INFILE=`` runs (``proc python infile='/sas/py/prep.py';``): a script the job
+needs as much as one it includes.
 
 The input is the reference inventory (:mod:`data_hydration.inventory`): its
-``%INCLUDE`` rows carry the place SAS reads (``value``, macro variables
-expanded and filerefs followed) and the spelling (``raw``).
+``%INCLUDE`` and PROC PYTHON rows carry the place SAS reads (``value``, macro
+variables expanded and filerefs followed) and the spelling (``raw``).
 :func:`match_includes` returns the rows with ``found_local`` /
 ``found_sharepoint`` filled in, so the inventory table records the answer
 beside the reference; :func:`include_checks` folds them into one
@@ -46,9 +48,16 @@ MAX_SHAREPOINT_FOLDERS = 1_000
 _MEMBER_RE = re.compile(r"[\w&]+\s*\(\s*(.+?)\s*\)")
 
 
+# The statements that name a script the job runs: the SAS an %INCLUDE pulls
+# in, and the Python PROC PYTHON's INFILE= names (SAS 9.4 Procedures Guide,
+# PROC PYTHON Statement).
+_SCRIPT_STATEMENTS = frozenset({"include", "proc_python"})
+
+
 def is_include(row: InventoryRow) -> bool:
-    """Whether *row* is a script an ``%INCLUDE`` pulls in."""
-    return row.kind is RefKind.PATH and row.statement == "include"
+    """Whether *row* is a script the job runs: one an ``%INCLUDE`` pulls in,
+    or the Python file PROC PYTHON's ``INFILE=`` names."""
+    return row.kind is RefKind.PATH and row.statement in _SCRIPT_STATEMENTS
 
 
 def include_file_name(row: InventoryRow) -> str | None:

@@ -360,7 +360,8 @@ library as any one-level name does, and its file is `my data.sas7bdat`.
 chunk's statements name, whatever kind of place it is. `paths.py` recognises
 `LIBNAME`, `FILENAME`, `INFILE` / `FILE`, `%INCLUDE`, PROC IMPORT/EXPORT's
 `datafile=` / `outfile=` (by path or fileref), PROC CIMPORT's `infile=` (the
-transport file, by path or fileref), PROC PRINTTO's `log=` / `print=`, ODS
+transport file, by path or fileref), PROC PYTHON's `infile=` (the Python
+script it runs, by path or fileref), PROC PRINTTO's `log=` / `print=`, ODS
 `file=` / `path=`, `options sasautos=`, SAS's own `cd` (statement `cd`:
 `x cd /dir;`, `call system('cd /dir');` or `%sysexec cd /dir;` as the only
 command, which sets the directory relative paths are read from), and the

@@ -230,10 +230,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--check-includes",
         action="store_true",
-        help="Look for every %%INCLUDEd script by file name: in the scored "
-        "directory, and in the application's SharePoint scripts folder (with "
-        "--sharepoint, or --app on a local run). Reported in the overall "
-        "report's Included scripts section.",
+        help="Look for every %%INCLUDEd script, and every Python script PROC "
+        "PYTHON runs, by file name: in the scored directory, and in the "
+        "application's SharePoint scripts folder (with --sharepoint, or --app "
+        "on a local run). Reported in the overall report's Included scripts "
+        "section.",
     )
     parser.add_argument(
         "--llm-eval",

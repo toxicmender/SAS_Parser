@@ -220,6 +220,29 @@ def test_a_wildcard_include_finds_every_script_it_matches():
     )
 
 
+def test_a_python_script_proc_python_runs_is_looked_for_too():
+    # PROC PYTHON's INFILE= names the Python file the step runs (SAS 9.4
+    # Procedures Guide, PROC PYTHON Statement): a script the job depends on,
+    # as an %INCLUDE's is. Before, it was never looked for.
+    rows = match_includes(
+        _rows(
+            job=(
+                "proc python infile='/sas/py/Prep.py'; run;\n"
+                "filename py '/sas/py/score.py';\nproc python infile=py; run;\n"
+                "proc python infile=gone; run;\n"
+            )
+        ),
+        local={"prep.py": ("py/prep.py",)},
+    )
+    checks = include_checks(rows)
+    assert [(c.file_name or c.spelled, c.status, c.included_by) for c in checks] == [
+        ("Prep.py", "found", (("job.sas", 1),)),
+        ("score.py", "missing", (("job.sas", 3),)),
+        # A fileref no FILENAME binds: its file name is the FILENAME's.
+        ("gone", "unnamed", (("job.sas", 4),)),
+    ]
+
+
 def test_one_statement_including_two_copies_of_a_script_is_one_site():
     [check] = include_checks(_rows(job="%include '/a/util.sas' '/b/UTIL.sas';\n"))
     assert (check.file_name, check.included_by) == ("util.sas", (("job.sas", 1),))
@@ -251,6 +274,18 @@ def test_a_fileref_only_include_reads_names_code_not_data():
     plan = plan_from_inventory(rows, config=HydrationConfig(catalog="main"))
     # The macro directory is SAS to convert; the feed directory holds data.
     assert [i.source.locator for i in plan.items] == ["/data/feed"]
+
+
+def test_a_python_script_is_code_not_data():
+    # The script PROC PYTHON runs is code to convert, by path or through a
+    # FILENAME nothing else reads. Before, that FILENAME was planned as data.
+    rows = _rows(
+        job=(
+            "proc python infile='/sas/py/prep.py'; run;\n"
+            "filename py '/sas/py/score.py';\nproc python infile=py; run;\n"
+        )
+    )
+    assert plan_from_inventory(rows, config=HydrationConfig(catalog="main")).items == []
 
 
 def test_a_fileref_also_read_by_infile_holds_data():

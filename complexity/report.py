@@ -628,7 +628,8 @@ def _hydration_summary(plan: Any | None) -> list[str]:
 
 
 def _include_summary(checks: Sequence[Any] | None, names: Mapping[str, str]) -> list[str]:
-    """Where each ``%INCLUDE``d script was found, or nothing without a check.
+    """Where each script the corpus runs was found — one an ``%INCLUDE`` pulls
+    in, or PROC PYTHON's ``INFILE=`` — or nothing without a check.
 
     *checks* are :class:`data_hydration.includes.IncludeCheck` records, one per
     script. A place nobody looked is ``—``; one looked in without finding the
@@ -647,8 +648,9 @@ def _include_summary(checks: Sequence[Any] | None, names: Mapping[str, str]) -> 
         "",
         "## Included scripts",
         "",
-        "Each script a `%INCLUDE` pulls in, looked for by file name in the "
-        "scored directory and in the application's SharePoint scripts folder.",
+        "Each script a `%INCLUDE` pulls in or PROC PYTHON runs (`INFILE=`), "
+        "looked for by file name in the scored directory and in the "
+        "application's SharePoint scripts folder.",
         "",
         f"- Scripts included: **{len(checks)}** — {', '.join(counts)}",
         "",

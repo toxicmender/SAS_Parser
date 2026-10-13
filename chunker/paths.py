@@ -607,6 +607,26 @@ PATH_STATEMENTS: tuple[PathSpec, ...] = (
         ),
         fileref=True,
     ),
+    # PROC PYTHON infile='<path>' / infile=<fileref>: "a source file or
+    # fileref that contains Python statements to run" (SAS 9.4 Procedures
+    # Guide, PROC PYTHON Statement) — a script the job depends on, as an
+    # %INCLUDE's is. Anchored on the PROC: PROC LUA's INFILE= names a script
+    # on its LUAPATH, not a file.
+    PathSpec(
+        statement="proc_python",
+        keyword="python",
+        pattern=re.compile(
+            r"(?P<head>\bproc\s+python\b[^;]*?\binfile\s*=\s*)" + _VALUE, re.IGNORECASE
+        ),
+    ),
+    PathSpec(
+        statement="proc_python",
+        keyword="python",
+        pattern=re.compile(
+            rf"\bproc\s+python\b[^;]*?\binfile\s*=\s*(?P<binds>{_FREF})\b", re.IGNORECASE
+        ),
+        fileref=True,
+    ),
     # PROC PRINTTO log='<path>' / print='<path>': where a job sends its log and
     # its output. Anchored on the PROC, since LOG= and PRINT= alone are too
     # common as words; one spec per option, so a statement naming both yields

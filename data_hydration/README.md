@@ -228,8 +228,9 @@ that cannot be written fails the run's exit status, never its plan.
 
 ### Included scripts
 
-`includes.py` answers where the scripts a corpus `%INCLUDE`s are. The path an
-`%INCLUDE` names is the SAS server's, so each script is looked for by **file
+`includes.py` answers where the scripts a corpus `%INCLUDE`s are, and the
+Python files PROC PYTHON's `INFILE=` runs (`proc python infile=py;`). The path
+either names is the SAS server's, so each script is looked for by **file
 name** — the one SAS opens, macro variables expanded and filerefs followed
 (`src(util)` opens `util.sas`) — ignoring case and at any depth:
 
@@ -238,21 +239,23 @@ python -m data_hydration path/to/sas --dry-run --check-includes
 python -m data_hydration path/to/sas --dry-run --sharepoint-app MyApp
 ```
 
-`--check-includes` looks in the source directory; `--sharepoint-app` also looks
-in the application's SharePoint scripts folder (`{base}/{app}/scripts_original`,
-`conversion.paths`) and implies it. Each `%INCLUDE` row of the inventory records
-the answer in `found_local` / `found_sharepoint` (`None` where nobody looked, an
-empty list where the script is missing), and the CLI prints one line per
-script. A folder SharePoint cannot list fails the run's exit status, never the
-rest of the check. `python -m complexity --check-includes` uses the same
-matching for its report. A wildcard (`%include '/code/macros/util*.sas';`)
-finds every script it matches, as SAS on UNIX reads one: `*` is one or more
-characters and never a leading period, `?` one, `[ ]` one of a set.
+`--check-includes` looks in the source directory; `--sharepoint-app` also
+looks in the application's SharePoint scripts folder
+(`{base}/{app}/scripts_original`, `conversion.paths`) and implies it. Each
+`%INCLUDE` and PROC PYTHON row of the inventory records the answer in
+`found_local` / `found_sharepoint` (`None` where nobody looked, an empty list
+where the script is missing), and the CLI prints one line per script. A folder
+SharePoint cannot list fails the run's exit status, never the rest of the
+check. `python -m complexity --check-includes` uses the same matching for its
+report. A wildcard (`%include '/code/macros/util*.sas';`) finds every script
+it matches, as SAS on UNIX reads one: `*` is one or more characters and never
+a leading period, `?` one, `[ ]` one of a set.
 
 An `%INCLUDE` also says what a FILENAME is: `filename src '/code/macros';` read
 only through `%include src(util);` names SAS source, so the plan leaves it out,
-as it leaves out an `%INCLUDE` of a quoted path. A fileref INFILE or FILE reads
-too holds data, and stays.
+as it leaves out an `%INCLUDE` of a quoted path. So does PROC PYTHON: a
+FILENAME only its `INFILE=` reads names a Python script. A fileref INFILE or
+FILE reads too holds data, and stays.
 
 ## Package layout
 
@@ -264,7 +267,7 @@ too holds data, and stays.
 | `naming.py` | The target-name template |
 | `planner.py` | Refs → plan. Pure |
 | `inventory.py` | Refs → inventory rows → plan; the inventory's Delta table |
-| `includes.py` | Where each `%INCLUDE`d script is: local, SharePoint, or missing |
+| `includes.py` | Where each `%INCLUDE`d or PROC PYTHON script is: local, SharePoint, or missing |
 | `partition.py` | Which partitioning strategy, and why |
 | `runner.py` | Executes a plan, one item at a time |
 | `rawio.py` | `RangedRawIO` — object storage as a file object |

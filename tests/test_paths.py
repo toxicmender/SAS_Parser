@@ -165,6 +165,26 @@ class TestStatementForms:
             "tf",
         )
 
+    def test_proc_python_infile(self):
+        # INFILE= 'file-name' | fileref: "a source file or fileref that
+        # contains Python statements to run" (SAS 9.4 Procedures Guide, PROC
+        # PYTHON Statement). Before, the script a step runs was not recorded.
+        ref = _one("proc python terminate infile='/scripts/Prep.py'; run;")
+        assert (ref.statement, ref.location, ref.path) == (
+            "proc_python",
+            PathLocation.FILESYSTEM,
+            "/scripts/prep.py",
+        )
+        ref = _one("proc python infile=py; submit;\nx = 1\nendsubmit; run;")
+        assert (ref.statement, ref.location, ref.binds) == (
+            "proc_python",
+            PathLocation.FILEREF,
+            "py",
+        )
+        # Another PROC's INFILE= is not PROC PYTHON's: PROC LUA's names a
+        # script on its LUAPATH, not a file.
+        assert extract_paths("proc lua infile='prep'; run;\n") == []
+
     def test_an_environment_variable_assignment(self):
         # `x setenv` (quoted or not) and `options set=` define a variable that
         # UNIX SAS reads as a libref or fileref: upper-case, a full path.
@@ -686,6 +706,10 @@ class TestFilerefResolution:
         )
         assert refs[2] == [("proc_import", "filesystem", "/data/in/sales.csv")]
         assert refs[3] == [("proc_export", "filesystem", "/data/out/r.csv")]
+
+    def test_proc_python_follows_its_fileref(self):
+        refs = self._refs("filename py '/scripts/prep.py';\nproc python infile=py; run;\n")
+        assert refs[1] == [("proc_python", "filesystem", "/scripts/prep.py")]
 
     def test_a_mixed_include_follows_each_fileref(self):
         refs = self._refs("filename src '/code';\n%include '/a.sas' src(b) src;\n")

@@ -240,8 +240,11 @@ def _path_source(ref: "SasPathRef", source_id: str | None) -> HydrationSource | 
     than of every string in the corpus.
     """
     # Where a job writes (FILE, PROC EXPORT, ODS, PROC PRINTTO's log and
-    # listing) and the SAS it pulls in are no data to load.
-    if ref.statement in {"include", "ods", "sasautos", "file", "proc_export", "printto", "cd"}:
+    # listing) and the code it runs (the SAS an %INCLUDE pulls in, the Python
+    # PROC PYTHON's INFILE= names) are no data to load.
+    if ref.statement in {
+        "include", "proc_python", "ods", "sasautos", "file", "proc_export", "printto", "cd"
+    }:
         return None
     # ``infile in;`` reads through a fileref, at the path its FILENAME names
     # (chunker.metadata.resolve_filerefs): that FILENAME's own reference is
@@ -659,28 +662,30 @@ def build_plan(
 def _code_filerefs(
     by_source: Mapping[str, tuple[Sequence["SasEngineRef"], Sequence["SasPathRef"]]],
 ) -> frozenset[str]:
-    """The filerefs the corpus only ``%INCLUDE``s through.
+    """The filerefs the corpus only runs code through: ``%INCLUDE`` and PROC
+    PYTHON's ``INFILE=``.
 
     ``filename src '/code/macros'; %include src(util);`` names a directory of
-    SAS source: more code to convert, not data to load, as an ``%INCLUDE`` of
-    a quoted path is not. A fileref an INFILE or FILE statement also uses
+    SAS source, and ``filename py '/py/prep.py'; proc python infile=py;`` a
+    Python script: more code to convert, not data to load, as either by a
+    quoted path is not. A fileref an INFILE or FILE statement also uses
     holds data, and stays.
     """
-    return _filerefs_only(by_source, "include")
+    return _filerefs_only(by_source, "include", "proc_python")
 
 
 def _filerefs_only(
     by_source: Mapping[str, tuple[Sequence["SasEngineRef"], Sequence["SasPathRef"]]],
-    statement: str,
+    *statements: str,
 ) -> frozenset[str]:
-    """The filerefs the corpus uses through *statement* and nothing else."""
+    """The filerefs the corpus uses through *statements* and nothing else."""
     only: set[str] = set()
     other: set[str] = set()
     for _, path_refs in by_source.values():
         for ref in path_refs:
             if not ref.binds or ref.statement == "filename":
                 continue
-            (only if ref.statement == statement else other).add(ref.binds)
+            (only if ref.statement in statements else other).add(ref.binds)
     return frozenset(only - other)
 
 

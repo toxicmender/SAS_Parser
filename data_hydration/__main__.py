@@ -137,8 +137,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--check-includes",
         action="store_true",
         help=(
-            "Look for every %%INCLUDEd script by file name in the source "
-            "directory, and report the ones found nowhere."
+            "Look for every %%INCLUDEd script, and every Python script PROC "
+            "PYTHON runs, by file name in the source directory, and report the "
+            "ones found nowhere."
         ),
     )
     parser.add_argument(
@@ -377,7 +378,8 @@ def _match_includes(
 
 
 def _print_includes(rows: list[InventoryRow]) -> None:
-    """Where each %INCLUDEd script was found, when anyone looked."""
+    """Where each script the corpus runs (%INCLUDE, PROC PYTHON) was found,
+    when anyone looked."""
     from .includes import include_checks
 
     checks = [c for c in include_checks(rows) if c.status != "unchecked"]
