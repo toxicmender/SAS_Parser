@@ -255,6 +255,27 @@ class TestUserLibraryNames(unittest.TestCase):
             src = f"{setup}\nlibname _all_ clear;\ndata x; set y; run;\n"
             self.assertEqual(self._names(src), [("work.x", "write"), ("work.y", "read")], setup)
 
+    def test_a_name_spelled_through_a_macro_variable_is_the_one_sas_reads(self):
+        # `set &t;` reads the name &t holds. Before, it counted as a one-level
+        # name, so work.x moved to user.x.
+        for value, read in (("work.x", "work.x"), ("x", "user.x"), ("prod.x", "prod.x")):
+            src = f"%let t = {value};\nlibname user '/data/perm';\ndata y; set &t; run;\n"
+            self.assertEqual(self._names(src)[-1], (read, "read"), value)
+
+    def test_options_user_through_a_macro_variable(self):
+        # Before, `y` became `&ulib.y`, which SAS reads as the one-level
+        # `permy`, and each run of the passes added another `perm`.
+        from chunker import SasCorpus, resolve_corpus_datasets
+
+        src = "%let ulib = perm;\nlibname perm '/p';\noptions user=&ulib;\ndata x; set y; run;\n"
+        self.assertEqual(self._names(src), [("perm.x", "write"), ("perm.y", "read")])
+        # Unknown, the libref stays spelled through it, a dot for each part.
+        src = "options user=&ulib;\ndata x; set y; run;\n"
+        self.assertEqual(self._names(src), [("&ulib..x", "write"), ("&ulib..y", "read")])
+        result = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(src, source_id="j.sas")
+        once = resolve_corpus_datasets(SasCorpus(file_results=[result]))
+        self.assertEqual(resolve_corpus_datasets(once).model_dump(), once.model_dump())
+
     def _plan(self, src: str):
         from chunker import SasCorpus, resolve_corpus_datasets
         from data_hydration.config import HydrationConfig

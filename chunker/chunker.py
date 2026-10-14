@@ -22,8 +22,8 @@ from .metadata import (
     _merge_meta,
     _metadata_for,
     _title,
+    assigns_user_library,
     resolve_references,
-    user_option_values,
 )
 from .models import (
     SasBatchResult,
@@ -89,11 +89,7 @@ def _record_user_library(
     if any(d.code == "USER_LIBRARY_ASSIGNED" for d in diagnostics):
         return
     for chunk in chunks:
-        meta = chunk.metadata
-        assigns_user = "user" in meta.defines_librefs or (
-            chunk.kind == SasChunkKind.OPTIONS and bool(user_option_values(meta.options))
-        )
-        if not assigns_user:
+        if not assigns_user_library(chunk):
             continue
         logger.info(
             f"_record_user_library: USER library assigned near line "

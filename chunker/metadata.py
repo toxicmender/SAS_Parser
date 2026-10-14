@@ -2063,6 +2063,20 @@ def user_option_values(options: list[str]) -> list[str]:
     return [m.group(1) for m in _USER_OPTION_RE.finditer(" ".join(options))]
 
 
+def assigns_user_library(chunk: SasChunk) -> bool:
+    """Whether *chunk* assigns the User library: ``libname user …``, or an
+    OPTIONS statement's USER=."""
+    meta = chunk.metadata
+    return "user" in meta.defines_librefs or (
+        chunk.kind is SasChunkKind.OPTIONS and bool(user_option_values(meta.options))
+    )
+
+
+# A libref that ends in a macro variable reference (`&ulib`): the dot after it
+# ends the reference, so a member name needs a second one.
+_ENDS_IN_REF_RE = re.compile(r"&[A-Za-z_]\w*$")
+
+
 def resolve_user_library(chunks: list[SasChunk]) -> None:
     """Give one-level dataset names to the User library while one is
     assigned, in place.
@@ -2084,15 +2098,42 @@ def resolve_user_library(chunks: list[SasChunk]) -> None:
     body's names wait for a call: the call site gets its own. One assigned at
     invocation (``-user``) or in a config file is not seen. Idempotent: a
     moved name is no longer a WORK one.
+
+    A name or a USER= value spelled through a macro variable is read as SAS
+    reads it, by the variable's value where it stands (:class:`_MacroScope`):
+    after ``%let t = work.x;``, ``set &t;`` names a two-level WORK member and
+    stays there, and after ``%let ulib = perm;``, ``options user=&ulib;``
+    puts one-level names in perm. While a libref's value is unknown, ``y`` is
+    ``&ulib..y``, for a later run to resolve.
     """
+    if not any(map(assigns_user_library, chunks)):
+        return
+    # Carrying the values costs a walk of the macro scope: keep them only
+    # when a name or a USER= value is spelled through a macro variable.
+    spelled = any("&" in r.raw for c in chunks for r in c.metadata.dataset_refs) or any(
+        "&" in value
+        for c in chunks
+        if c.kind is SasChunkKind.OPTIONS
+        for value in user_option_values(c.metadata.options)
+    )
+    macros = _MacroScope() if spelled else None
+    values: Mapping[str, str] = {}
+    own: dict[str, str] = {}
     user: str | None = None
     for idx, chunk in enumerate(chunks):
         meta = chunk.metadata
+        if macros is not None:
+            values, own = macros.enter(chunk)
         if user is not None:
             lib = user
+            scope = values
 
             def moved(ref: SasDatasetRef) -> str:
-                if ref.in_macro_body or not ref.name.startswith("work.") or not _one_level(ref):
+                if (
+                    ref.in_macro_body
+                    or not ref.name.startswith("work.")
+                    or not _one_level(ref, scope)
+                ):
                     return ref.name
                 return f"{lib}.{ref.name[5:]}"
 
@@ -2105,26 +2146,36 @@ def resolve_user_library(chunks: list[SasChunk]) -> None:
             user = "user"
         elif chunk.kind is SasChunkKind.OPTIONS:
             for value in user_option_values(meta.options):
+                if "&" in value:
+                    value = resolve_refs(value, values)
                 # A quoted value is a directory, which USER= makes the User
                 # library's (a path ref, statement `user`); any other is a
                 # libref it equates to User.
                 if value == "work":
                     user = None
+                elif value[:1] in ("'", '"'):
+                    user = "user"
                 else:
-                    user = "user" if value[:1] in ("'", '"') else value
+                    user = f"{value}." if _ENDS_IN_REF_RE.search(value) else value
         if (
             user is not None
             and "clear" in chunk.text.lower()
             and _USER_CLEAR_RE.search(_sanitise(chunk.text))
         ):
             user = None
+        if macros is not None:
+            macros.leave(chunk, own)
 
 
-def _one_level(ref: SasDatasetRef) -> bool:
+def _one_level(ref: SasDatasetRef, values: Mapping[str, str] | None = None) -> bool:
     """Whether *ref* was spelled as a one-level name: no libref, no quoted
     path, and not one of the ``_name_`` placeholders SAS reserves. A name
-    literal (``'my data'n``) is one."""
+    literal (``'my data'n``) is one. A name spelled through a macro variable
+    is judged by what SAS reads once *values* resolve it: ``&t`` holding
+    ``work.x`` is two-level."""
     raw = ref.raw.strip().lower()
+    if values is not None and "&" in raw:
+        raw = resolve_refs(raw, values)
     if raw[:1] in ("'", '"'):
         return len(raw) > 2 and raw[-1] == "n" and raw[-2] == raw[0]
     raw = raw.split("(")[0].strip()

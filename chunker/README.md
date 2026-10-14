@@ -690,14 +690,24 @@ chunk's component, same-file only — the global-context batch, when that chunk
 is a promoted macro.
 
 Dataset names are canonicalised (`_canon_ds`): one-level names become
-`work.<name>` — or, after `libname user '<dir>';`, `options user='<dir>';`
-(recorded as a path, statement `user`, binding the User libref) or
-`options user=<libref>;` (blanks around the `=` allowed), `<libref>.<name>`
-(`resolve_user_library`, until `libname user clear`, `libname _all_ clear`,
-which clears every libref but Sasuser, Sashelp and Work, or
-`options user=work`; a `USER_LIBRARY_ASSIGNED`
-diagnostic notes it, since one assigned at invocation is not seen); a name
-still holding a `&` is left alone, since its libref is not knowable yet.
+`work.<name>`, and a name still holding a `&` is left alone, since its libref
+is not knowable yet. While the User library is assigned, one-level names
+belong to it instead (`resolve_user_library`; a `USER_LIBRARY_ASSIGNED`
+diagnostic notes it, since one assigned at invocation is not seen):
+
+- `libname user '<dir>';` or `options user='<dir>';` (recorded as a path,
+  statement `user`, binding the User libref) assigns it, and `y` is `user.y`;
+- `options user=<libref>;` equates that libref to User, and `y` is
+  `<libref>.y`. Blanks around the `=` are allowed;
+- `libname user clear`, `libname _all_ clear` (which clears every libref but
+  Sasuser, Sashelp and Work) or `options user=work` ends it.
+
+A name or a USER= value spelled through a macro variable is judged by the
+variable's value where it stands: `set &t;` with `t` holding `work.x` stays in
+WORK, and `options user=&ulib;` with `ulib` holding `perm` puts `y` in
+`perm.y`. While `ulib` is unknown, `y` is `&ulib..y`, which a later run
+resolves.
+
 Consumers link to the **nearest preceding producer** in corpus order — the
 state a sequential SAS session would actually read — so unrelated jobs reusing
 `work.tmp` stay separate.
