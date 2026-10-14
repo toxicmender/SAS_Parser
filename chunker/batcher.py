@@ -20,7 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .keywords import _STANDARD_AUTOCALL_MACROS
-from .macro_vars import _parse_call_args, macro_signature, resolve_refs
+from .macro_vars import _clean_arg_value, _parse_call_args, macro_signature, resolve_refs
 from .metadata import _canon_ds, resolve_references
 from .models import (
     DatasetRole,
@@ -948,11 +948,16 @@ class _EdgeDiscovery:
         takes when a call names no value for it: "You can specify default
         values after the equal signs" (SAS 9.4 Macro Language: Reference,
         %MACRO Statement). One with none after its ``=`` is null, and absent
-        here."""
+        here. Each is cleaned as a call's argument is (``_clean_arg_value``):
+        ``OUT=Work.Final`` binds ``work.final``."""
         defaults = self._defaults.get(didx)
         if defaults is None:
             text = _sanitise(self._header_chunk(didx).text, blank_strings=False)
-            defaults = {name: value for name, value in macro_signature(text) if value}
+            defaults = {
+                name: cleaned
+                for name, value in macro_signature(text)
+                if value and (cleaned := _clean_arg_value(value))
+            }
             self._defaults[didx] = defaults
         return defaults
 

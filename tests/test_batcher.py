@@ -319,6 +319,20 @@ class TestMacroInvocation(unittest.TestCase):
         [batch] = [b for b in br.batches if "work.loaded" in b.output_datasets]
         self.assertIn("dataset_flow(work.loaded)", batch.reason)
 
+    def test_a_default_is_read_as_an_argument_would_be(self):
+        """A default is cleaned as a call's argument is: lowercased, quotes
+        and a trailing dot stripped. Before, `OUT=Work.Final` wrote
+        `Work.Final`, which no lowercase reader matched, and
+        `out='work.f2'` a quoted-path dataset."""
+        for header, name in (("OUT=Work.Final", "work.final"), ("out='work.f2'", "work.f2")):
+            src = (
+                f"%MACRO LOAD({header});\n  data &out; set sashelp.class; run;\n%MEND;\n"
+                f"%LOAD();\ndata y; set {name}; run;\n"
+            )
+            _, br = _chunk_and_batch(src)
+            self.assertEqual((len(br.batches), len(br.singletons)), (1, 0), header)
+            self.assertIn(f"dataset_flow({name}): chunk-0002 → chunk-0003", br.batches[0].reason, header)
+
     def test_the_defaults_of_a_split_definition_come_from_its_header(self):
         """A definition cut into slices is indexed by its last slice, which
         holds no %MACRO header; the defaults are read from the region."""
