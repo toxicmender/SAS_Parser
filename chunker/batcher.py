@@ -1021,19 +1021,29 @@ class _EdgeDiscovery:
             # are canonicalised (one-level → work.) to match the producer index;
             # a value still containing ``&`` is unresolvable and kept verbatim,
             # matching nothing rather than a guessed name.
+            # Each keeps the name as the call spells it (`raw`), and a list
+            # (`raw.sales_:`) stays a list.
             resolved: list[SasDatasetRef] = []
             for ref in def_meta.dataset_refs:
                 if ref.param is None or not (ref.role.reads or ref.role.writes):
                     continue
-                val = _resolve(ref.param, ref.param_pos)
-                if not val:
+                spelled = _resolve(ref.param, ref.param_pos)
+                if not spelled:
                     continue
                 if ref.name != f"&{ref.param}":
                     # A name built around the parameter: `&lib..customers`
                     # with lib=prod is prod.customers.
-                    val = resolve_refs(ref.name, {ref.param: val})
-                val = val if "&" in val else _canon_ds(val)
-                resolved.append(SasDatasetRef(name=val, role=ref.role, via="macro_call"))
+                    spelled = resolve_refs(ref.name, {ref.param: spelled})
+                val = spelled if "&" in spelled else _canon_ds(spelled)
+                resolved.append(
+                    SasDatasetRef(
+                        name=val,
+                        role=ref.role,
+                        raw=spelled,
+                        via="macro_call",
+                        pattern=val.endswith(":"),
+                    )
+                )
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
                         f"macro_body_dataset: resolved param '{ref.param}' → {ref.role} '{val}'  (call {chunk.chunk_id})"

@@ -733,6 +733,21 @@ def test_a_read_through_a_keyword_default_is_planned():
     ]
 
 
+def test_a_list_passed_to_a_macro_is_read_as_a_list():
+    # `%stack(raw.sales_:);` reads every raw.sales_* its body's `set &ds;`
+    # names, as `set raw.sales_:;` does: the library is kept, blocked. Before,
+    # the call's read was one dataset named `sales_:`, planned unblocked, and
+    # its load would fail.
+    job = "libname raw '/data/raw';\n%macro stack(ds);\n  data all; set &ds; run;\n%mend;\n"
+    plans = [_plan(job=job + "%stack(raw.sales_:);\n"), _plan(job=job + "data all; set raw.sales_:; run;\n")]
+    for plan in plans:
+        [item] = plan.items
+        assert (item.source.locator, item.source.object_name) == ("/data/raw", "")
+        assert "library directory" in item.blockers[0]
+    [row] = [r for r in _rows(job=job + "%stack(raw.sales_:);\n") if r.statement == "macro_call"]
+    assert (row.raw, row.pattern) == ("raw.sales_:", True)
+
+
 def test_a_file_proc_import_reads_through_a_fileref_is_data():
     # The FILENAME is planned once, PROC IMPORT reading it as INFILE does.
     # Before, the read went unrecorded, so a fileref an %INCLUDE also named
