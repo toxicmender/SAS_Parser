@@ -28,8 +28,10 @@ Two rules the rows keep:
   ``PASSWORD=``, ``PASS=``, ``PW=``, ``PWD=``, ``USING=`` — so a list of the
   safe keys holds where a list of the secret ones leaks. A macro reference
   (``&user_pass.``) is kept: it is no secret, and the planner's blocker names
-  it. No reader takes a password from these options —
-  :mod:`data_hydration.secrets` resolves it.
+  it. A password written into a place — ``https://etl:pw@host/x.csv``, or
+  ``jdbc:oracle:thin:etl/pw@db`` — is redacted wherever the place is stored,
+  a path row's name, spelling and value included. No reader takes a password
+  from these options — :mod:`data_hydration.secrets` resolves it.
 
 Like the planner, this module imports :mod:`chunker` for annotations only, and
 pyspark only inside the two functions that touch Delta.
@@ -246,23 +248,32 @@ _CONNECTION_STRINGS = frozenset(
 )
 # One pair of a connection string; a braced ODBC value may hold ';' and spaces.
 _PAIR_RE = re.compile(r"([^;=]+)=(\{[^}]*\}|[^;]*)")
-# Credentials written into a URL: scheme://user:password@host.
-_URL_PASSWORD_RE = re.compile(r"(//[^/:@;]+:)[^@/;]+(@)")
+# A password written into a place: a URL's `scheme://user:password@host`, or an
+# Oracle JDBC thin URL's `jdbc:oracle:thin:user/password@host`.
+_PLACE_PASSWORD_RE = re.compile(r"(//[^/:@;]+:|:thin:[^/:@;]+/)[^@/;]+(@)", re.IGNORECASE)
 
 
 def _is_macro_ref(value: str) -> bool:
     return value.strip("'\" ").startswith("&")
 
 
+def _without_password(place: str) -> str:
+    """*place*, a path, URL or connection coordinate, with any password
+    written into it redacted; the user and the host are kept, as they say
+    where the data is."""
+    return _PLACE_PASSWORD_RE.sub(rf"\g<1>{_REDACTED}\g<2>", place) if "@" in place else place
+
+
 def _kept_value(key: str, value: str) -> str:
-    """*value* of option *key*, or ``<redacted>`` (see :data:`_KEPT_OPTIONS`)."""
+    """*value* of option *key*, or ``<redacted>`` (see :data:`_KEPT_OPTIONS`).
+    A value kept still loses a password written into it
+    (``path="//etl:pw@db/svc"``)."""
     key = key.strip().lower()
     if _is_macro_ref(value) or key in _KEPT_OPTIONS:
-        return value
+        return _without_password(value)
     if key in _CONNECTION_STRINGS:
-        return _URL_PASSWORD_RE.sub(
-            rf"\g<1>{_REDACTED}\g<2>",
-            _PAIR_RE.sub(lambda m: f"{m.group(1)}={_kept_value(m.group(1), m.group(2))}", value),
+        return _without_password(
+            _PAIR_RE.sub(lambda m: f"{m.group(1)}={_kept_value(m.group(1), m.group(2))}", value)
         )
     return _REDACTED
 
@@ -375,9 +386,9 @@ def _chunk_refs(meta: Any) -> Iterable[dict[str, Any]]:
             "kind": RefKind.PATH,
             "statement": ref.statement,
             "role": _PATH_ROLES.get(ref.statement, "read"),
-            "name": ref.path,
-            "raw": ref.raw,
-            "value": ref.effective_path,
+            "name": _without_password(ref.path),
+            "raw": _without_password(ref.raw),
+            "value": _without_password(ref.effective_path),
             "resolved": not ref.has_macro_ref and location != "fileref",
             "has_macro_ref": ref.has_macro_ref,
             "libref": ref.binds,

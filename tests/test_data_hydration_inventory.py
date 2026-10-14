@@ -175,6 +175,32 @@ def test_no_spelling_of_a_password_reaches_a_row(statement, secret):
     assert engine.raw.count('"') % 2 == 0, engine.raw  # its quotes still pair
 
 
+@pytest.mark.parametrize(
+    "job",
+    [
+        "filename f url 'https://etl:s3cr3t@host/data/x.csv';\ndata a; infile f; input; run;\n",
+        "data a; infile 'ftp://etl:s3cr3t@host/x.dat'; input; run;\n",
+        'libname o oracle path="//etl:s3cr3t@db:1521/svc" schema=s;\ndata a; set o.t; run;\n',
+        "libname j jdbc url='jdbc:oracle:thin:etl/s3cr3t@db:1521:orcl' schema=s;\n"
+        "data a; set j.t; run;\n",
+    ],
+)
+def test_a_password_written_into_a_place_reaches_no_row_or_plan(job):
+    # Before, a path row kept `https://etl:s3cr3t@host/...` as its name,
+    # spelling and value; a kept option (`path`) and a JDBC thin URL kept
+    # theirs; and the plan built from the rows held them all.
+    rows = _rows(job=job)
+    assert "s3cr3t" not in repr(rows)
+    assert "s3cr3t" not in plan_from_inventory(rows, config=_config()).model_dump_json()
+    # The user and the host stay: they say where the data is.
+    assert any("etl" in f"{r.value} {r.options}" and "<redacted>@" in f"{r.value} {r.options}" for r in rows)
+
+
+def test_a_place_with_no_password_is_kept_as_written():
+    rows = _rows(job="data a; infile '//nas/share/a@b.dat'; input; run;\n")
+    assert [r.value for r in rows if r.kind is RefKind.PATH] == ["//nas/share/a@b.dat"]
+
+
 def test_connection_coordinates_and_macro_references_are_kept():
     [engine] = [
         r

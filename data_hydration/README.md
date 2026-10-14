@@ -217,8 +217,11 @@ spelling, `value` the place or name SAS reads, `name` the comparison key.
 - **No secret is stored.** A connection option keeps its value only when its
   key says where the connection goes or as whom (`path`, `server`, `schema`,
   `user`, `dsn`, ...); every other value is stored as `<redacted>`, and a
-  connection string (`noprompt=`, `url=`) is redacted pair by pair, credentials
-  in a URL too. SAS/ACCESS spells a password many ways — `PASSWORD=`, `PASS=`,
+  connection string (`noprompt=`, `url=`) is redacted pair by pair. A password
+  written into a place (`https://etl:pw@host/x.csv`, `path="//etl:pw@db/svc"`,
+  `jdbc:oracle:thin:etl/pw@db`) is redacted wherever the place is stored: a
+  kept option, a connection string, and a path row's `name`, `raw` and
+  `value`. SAS/ACCESS spells a password many ways — `PASSWORD=`, `PASS=`,
   `PW=`, `PWD=`, `USING=` — so a list of the safe keys holds where a list of
   the secret ones leaks. A database LIBNAME's `raw` is rebuilt from those
   options, since the statement as written carries every secret they do. A
