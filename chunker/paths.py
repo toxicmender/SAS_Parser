@@ -621,6 +621,50 @@ PATH_STATEMENTS: tuple[PathSpec, ...] = (
         ),
         fileref=True,
     ),
+    # FILE= is the alias of both: "DATAFILE="filename" | "fileref" ... Alias:
+    # FILE=" and "OUTFILE="filename" | "fileref" ... Alias: FILE" (SAS 9.4
+    # Procedures Guide, PROC IMPORT and PROC EXPORT Statements). Anchored on
+    # the PROC, since FILE= alone is an option of ODS, PRINTTO and CPORT too.
+    *(
+        spec
+        for proc in ("import", "export")
+        for spec in (
+            PathSpec(
+                statement=f"proc_{proc}",
+                keyword=proc,
+                pattern=re.compile(
+                    rf"(?P<head>\bproc\s+{proc}\b[^;]*?\bfile\s*=\s*)" + _VALUE, re.IGNORECASE
+                ),
+            ),
+            PathSpec(
+                statement=f"proc_{proc}",
+                keyword=proc,
+                pattern=re.compile(
+                    rf"\bproc\s+{proc}\b[^;]*?\bfile\s*=\s*(?P<binds>{_FREF})(?![\w.&\\/:])",
+                    re.IGNORECASE,
+                ),
+                fileref=True,
+            ),
+        )
+    ),
+    # PROC CPORT file='<path>' / file=<fileref>: "the filename of the
+    # transport file to write to" (SAS 9.4 Procedures Guide, PROC CPORT
+    # Statement). Anchored on the PROC.
+    PathSpec(
+        statement="proc_cport",
+        keyword="cport",
+        pattern=re.compile(
+            r"(?P<head>\bcport\b[^;]*?\bfile\s*=\s*)" + _VALUE, re.IGNORECASE
+        ),
+    ),
+    PathSpec(
+        statement="proc_cport",
+        keyword="cport",
+        pattern=re.compile(
+            rf"\bcport\b[^;]*?\bfile\s*=\s*(?P<binds>{_FREF})\b", re.IGNORECASE
+        ),
+        fileref=True,
+    ),
     # PROC CIMPORT infile='<path>' / infile=<fileref>: the transport file it
     # imports. Anchored on the PROC, since INFILE= alone is common.
     PathSpec(
@@ -669,24 +713,32 @@ PATH_STATEMENTS: tuple[PathSpec, ...] = (
             r"(?P<head>\bprintto\b[^;]*?\blog\s*=\s*)" + _VALUE, re.IGNORECASE
         ),
     ),
+    # PRINT= has the aliases "FILE=, NAME=" (SAS 9.4 Procedures Guide, PROC
+    # PRINTTO Statement).
     PathSpec(
         statement="printto",
         keyword="printto",
         pattern=re.compile(
-            r"(?P<head>\bprintto\b[^;]*?\bprint\s*=\s*)" + _VALUE, re.IGNORECASE
+            r"(?P<head>\bprintto\b[^;]*?\b(?:print|file|name)\s*=\s*)" + _VALUE, re.IGNORECASE
         ),
     ),
-    # ODS destinations: file='<path>' / path='<path>'. The \b keeps this off
-    # ``outfile=``, whose 'file' has no word boundary before it.
-    PathSpec(
-        statement="ods",
-        keyword="file=",
-        pattern=re.compile(r"(?P<head>\bfile\s*=\s*)" + _VALUE, re.IGNORECASE),
-    ),
-    PathSpec(
-        statement="ods",
-        keyword="path=",
-        pattern=re.compile(r"(?P<head>\bpath\s*=\s*)" + _VALUE, re.IGNORECASE),
+    # ODS destinations: the files and directories they write. BODY= names "the
+    # file that contains the primary output", with the alias FILE=; PATH= "the
+    # location of an aggregate storage location ... for all markup files";
+    # GPATH= the graphics'; CONTENTS=, FRAME= and PAGE= the other files (SAS
+    # 9.4 Output Delivery System: User's Guide, ODS HTML Statement). Anchored
+    # on the ODS statement: PATH= is an Oracle LIBNAME's or CONNECT's connect
+    # identifier and a CAS action's table too, and FILE= an option of PROC
+    # IMPORT, EXPORT, PRINTTO and CPORT. The \b keeps FILE= off ``outfile=``.
+    *(
+        PathSpec(
+            statement="ods",
+            keyword="ods",
+            pattern=re.compile(
+                rf"(?P<head>\bods\b[^;]*?\b{option}\s*=\s*)" + _VALUE, re.IGNORECASE
+            ),
+        )
+        for option in ("file", "body", "path", "gpath", "contents", "frame", "page")
     ),
     # `x setenv NAME /path;` (the SAS setenv command, quoted or not) and
     # `options set=NAME '/path';` define an environment variable. On UNIX one

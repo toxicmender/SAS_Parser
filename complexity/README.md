@@ -789,8 +789,8 @@ a reader who doubts a rollup can find the chunk that put each name in it.
 
 Beside the dataset interface, a file reports everywhere outside the SAS
 libraries it reaches — the locations behind its `LIBNAME`, `FILENAME`,
-`INFILE` / `FILE`, `%INCLUDE`, PROC IMPORT/EXPORT, ODS and `sasautos=`
-statements, recognised by `chunker/paths.py`:
+`INFILE` / `FILE`, `%INCLUDE`, PROC IMPORT/EXPORT/CIMPORT/CPORT/PRINTTO, ODS
+and `sasautos=` statements, recognised by `chunker/paths.py`:
 
 ```
 ## Paths

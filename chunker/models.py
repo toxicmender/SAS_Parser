@@ -97,9 +97,10 @@ class SasPathRef(BaseModel, frozen=True):
     statement
         Which statement named it — ``libname``, ``filename``, ``infile``,
         ``file``, ``include``, ``proc_import``, ``proc_cimport`` (its INFILE=
-        transport file), ``proc_python`` (its INFILE= Python script),
-        ``proc_export``, ``printto``,
-        ``ods``, ``sasautos``, ``setenv`` (an environment variable ``x
+        transport file), ``proc_cport`` (the transport file its FILE= writes),
+        ``proc_python`` (its INFILE= Python script), ``proc_export``,
+        ``printto``, ``ods`` (an ODS destination's files and directories),
+        ``sasautos``, ``setenv`` (an environment variable ``x
         setenv`` or ``options set=`` defines: on UNIX a libref or fileref),
         ``using_libname`` (a LIBNAME clause in the USING list of PROC SQL's
         CREATE VIEW: its libref is local to the view, assigned while the view

@@ -275,6 +275,56 @@ class TestStatementForms:
         refs = extract_paths("proc export outfile='/out/a.csv'; run;")
         assert [r.statement for r in refs] == ["proc_export"]
 
+    def test_path_and_file_outside_an_ods_statement_are_no_ods_paths(self):
+        # PATH= is an Oracle connect identifier and a CAS action's table too.
+        # Before, any `path=` or `file=` was an ODS output: the inventory
+        # stored a connect identifier as a file the job writes.
+        assert extract_paths(
+            "libname o oracle path='EDWPRO' schema=s;\n"
+            "proc sql; connect to oracle (path='EDWPRO' user=u); quit;\n"
+            "proc cas; table.loadTable / path='x.csv' casOut={name='t'}; quit;\n"
+        ) == []
+
+    def test_every_file_an_ods_destination_writes(self):
+        # BODY= names "the file that contains the primary output" (alias
+        # FILE=), PATH= and GPATH= directories, CONTENTS=, FRAME= and PAGE= the
+        # other files (SAS 9.4 ODS User's Guide, ODS HTML Statement). Before,
+        # only FILE= and PATH= were read, and FILE= only with no blank before
+        # its `=`.
+        refs = extract_paths(
+            "ods html path='/out' (url=none) body='b.html' contents='c.html' frame='f.html'"
+            " page='p.html' gpath='/out/img';\nods pdf file = '/out/r.pdf';\n"
+        )
+        assert {(r.statement, r.path) for r in refs} == {
+            ("ods", p)
+            for p in ("/out", "b.html", "c.html", "f.html", "p.html", "/out/img", "/out/r.pdf")
+        }
+
+    def test_the_file_aliases_of_import_export_printto_and_cport(self):
+        # DATAFILE= has the "Alias: FILE=", OUTFILE= the "Alias: FILE", PRINT=
+        # the "Alias: FILE=, NAME=", and CPORT's FILE= names "the transport
+        # file to write to" (SAS 9.4 Procedures Guide). Before, each FILE= was
+        # an ODS output, so the file PROC IMPORT reads dropped out of the
+        # plan, and NAME= named nothing.
+        refs = extract_paths(
+            "proc import file='/data/in.csv' out=a dbms=csv; run;\n"
+            "proc import file=inref out=b dbms=csv; run;\n"
+            "proc export data=a file='/out/a.csv' dbms=csv; run;\n"
+            "proc printto file='/out/list.lst' new; run;\n"
+            "proc printto name='/out/n.lst'; run;\n"
+            "proc cport library=work file='/out/tran.cpt'; run;\n"
+            "proc cport data=a file=tranfile; run;\n"
+        )
+        assert {(r.statement, str(r.location), r.raw) for r in refs} == {
+            ("proc_import", "filesystem", "/data/in.csv"),
+            ("proc_import", "fileref", "inref"),
+            ("proc_export", "filesystem", "/out/a.csv"),
+            ("printto", "filesystem", "/out/list.lst"),
+            ("printto", "filesystem", "/out/n.lst"),
+            ("proc_cport", "filesystem", "/out/tran.cpt"),
+            ("proc_cport", "fileref", "tranfile"),
+        }
+
     def test_sasautos_reports_the_first_entry_of_a_list(self):
         # Documented limit: the concatenation form needs a scan the
         # head/path substitution shape cannot express. Reporting the first

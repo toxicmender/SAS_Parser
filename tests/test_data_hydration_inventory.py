@@ -743,6 +743,15 @@ def test_a_read_of_a_shell_command_is_one_blocked_item():
     assert _plan(job="filename o pipe 'lpr';\ndata _null_; file o; put 'x'; run;\n").items == []
 
 
+def test_the_file_proc_import_reads_by_its_file_alias_is_planned():
+    # FILE= is DATAFILE='s alias. Before, it was read as an ODS output, and
+    # the CSV dropped out of the plan.
+    plan = _plan(job="proc import file='/data/in/sales.csv' out=work.s dbms=csv replace; run;\n")
+    assert [(i.source.locator, i.source.object_name) for i in plan.items] == [
+        ("/data/in", "sales.csv")
+    ]
+
+
 def test_a_read_through_a_keyword_default_is_planned():
     # `%load();` reads raw.feed through `src=`'s default (SAS 9.4 Macro
     # Language: Reference, %MACRO Statement). Before, the call read nothing,

@@ -240,10 +240,12 @@ def _path_source(ref: "SasPathRef", source_id: str | None) -> HydrationSource | 
     than of every string in the corpus.
     """
     # Where a job writes (FILE, PROC EXPORT, ODS, PROC PRINTTO's log and
-    # listing) and the code it runs (the SAS an %INCLUDE pulls in, the Python
-    # PROC PYTHON's INFILE= names) are no data to load.
+    # listing, PROC CPORT's transport file) and the code it runs (the SAS an
+    # %INCLUDE pulls in, the Python PROC PYTHON's INFILE= names) are no data
+    # to load.
     if ref.statement in {
-        "include", "proc_python", "ods", "sasautos", "file", "proc_export", "printto", "cd"
+        "include", "proc_python", "ods", "sasautos", "file", "proc_export", "proc_cport",
+        "printto", "cd",
     }:
         return None
     # ``infile in;`` reads through a fileref, at the path its FILENAME names

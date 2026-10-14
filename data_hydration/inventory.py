@@ -83,6 +83,7 @@ _PATH_ROLES = {
     "sasautos": "read",
     "file": "write",
     "proc_export": "write",
+    "proc_cport": "write",
     "ods": "write",
     "printto": "write",
     "cd": "bind",

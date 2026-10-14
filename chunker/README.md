@@ -364,10 +364,14 @@ library as any one-level name does, and its file is `my data.sas7bdat`.
 `external_refs` is one stored list of `SasPathRef` records — every location a
 chunk's statements name, whatever kind of place it is. `paths.py` recognises
 `LIBNAME`, `FILENAME`, `INFILE` / `FILE`, `%INCLUDE`, PROC IMPORT/EXPORT's
-`datafile=` / `outfile=` (by path or fileref), PROC CIMPORT's `infile=` (the
-transport file, by path or fileref), PROC PYTHON's `infile=` (the Python
-script it runs, by path or fileref), PROC PRINTTO's `log=` / `print=`, ODS
-`file=` / `path=`, `options sasautos=`, `options user=` (statement `user`: the
+`datafile=` / `outfile=` and their alias `file=` (by path or fileref), PROC
+CIMPORT's `infile=` (the transport file, by path or fileref), PROC CPORT's
+`file=` (the transport file it writes, statement `proc_cport`), PROC PYTHON's
+`infile=` (the Python script it runs, by path or fileref), PROC PRINTTO's
+`log=` / `print=` (and `print=`'s aliases `file=` and `name=`), an ODS
+statement's `file=` / `body=`, `path=`, `gpath=`, `contents=`, `frame=` and
+`page=` (only in an ODS statement: elsewhere `path=` is an Oracle connect
+identifier or a CAS table), `options sasautos=`, `options user=` (statement `user`: the
 User library's directory), SAS's own `cd` (statement `cd`: `x cd /dir;`,
 `call system('cd /dir');` or `%sysexec cd /dir;` as the only command, which
 sets the directory relative paths are read from), and the environment
