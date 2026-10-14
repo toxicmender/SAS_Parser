@@ -648,11 +648,11 @@ from `chunk_text` (per file) and `MultiFileBatcher` (corpus-wide).
 `resolve_corpus_references(corpus)` does the same for callers that do not
 batch. `resolve_corpus_datasets(corpus)` goes one step further, for a caller
 that wants every dataset a job touches without batching: the passes
-`MultiFileBatcher` runs before it groups anything — the references resolved,
-`_LAST_` made concrete, and each macro call given the datasets its macro's body
-reads and writes through its parameters (`via="macro_call"`). It is how
-`data_hydration` and `complexity --hydration` see a LIBNAME in `setup.sas`
-reach the reads in `job.sas`, and `%load(raw.c)` read `raw.c`.
+`MultiFileBatcher` runs before it groups anything — each macro call given the
+datasets its macro's body reads and writes through its parameters
+(`via="macro_call"`), then the references resolved and `_LAST_` made concrete.
+It is how `data_hydration` and `complexity --hydration` see a LIBNAME in
+`setup.sas` reach the reads in `job.sas`, and `%load(raw.c)` read `raw.c`.
 
 Options ride on each record, so a consumer never joins by alias. The one-line
 `str()` form — what reaches the LLM prompt — leaves them out, because that is
@@ -719,6 +719,9 @@ take part on both sides:
   `_DATA_`, as `data _data_;` does: SAS names it DATA1, DATA2, …, the batcher
   makes it `work.data<n>`, and it becomes `_LAST_`.
 
+A macro call's datasets are the call's own (invariant 1), so `proc print;`
+after `%make(b);`, whose body writes `data &out;`, reads `work.b`.
+
 The same nearest-producer lookup serves `dataset_flow`, `macro_arg_dataset` and
 the resolved inputs of `macro_body_dataset`.
 
@@ -727,17 +730,18 @@ the resolved inputs of `macro_body_dataset`.
 Things that look like implementation details but are contracts. Breaking any of
 these silently changes behavior.
 
-1. **Edge discovery is one walk, in corpus order.**
-   `_EdgeDiscovery._resolve_macro_body` mutates `produces_ds` mid-walk: what a
-   macro call site's resolved arguments create is registered at the moment the
-   call is visited, which implements "a macro's output exists only once the call
-   has executed" under nearest-preceding-producer bisection. Splitting the edge
-   families into separate corpus walks would let a consumer link to a producer
-   that does not exist yet at its position — or miss one that does.
+1. **A macro call's datasets are bound before any name is resolved.**
+   `_bind_macro_calls` gives each call what its macro reads and writes through
+   its parameters (`via="macro_call"`) first, so every resolution pass after it
+   sees those names as any other: a database LIBNAME, the User library, a
+   macro variable in an argument. Their writes are indexed at the call's
+   position, so the nearest-preceding-producer bisection is what makes "a
+   macro's output exists only once the call has executed"; edge discovery
+   links the call's reads as `macro_body_dataset` edges.
 2. **Producer lists stay sorted by global index.** The nearest-preceding lookups
-   are `bisect_left` over `produces_ds[name]`; mid-walk registration therefore
-   uses `insort`, never `append`. `ds_names`, the sorted index pattern inputs
-   bisect, gets a new name the same way.
+   are `bisect_left` over `produces_ds[name]`, built in global-index order.
+   `ds_names`, the sorted index pattern inputs bisect, is sorted once the
+   index is built.
 3. **`output_datasets` is insertion-ordered, never sorted.**
    `_resolve_implicit_datasets` treats the last of `output_datasets` that is not
    a pattern as "the last dataset named" when resolving `_LAST_` / `_DATA_` /

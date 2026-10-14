@@ -733,6 +733,24 @@ def test_a_read_through_a_keyword_default_is_planned():
     ]
 
 
+def test_a_database_table_a_macro_call_reads_is_planned():
+    # `%load(edw.accounts);` reads an Oracle table through its macro's `set
+    # &ds;`. Before, the call's read was added after the database LIBNAMEs
+    # had been resolved, so it had no database table and dropped out of the
+    # plan without a word, while the direct read of customers was planned.
+    plan = _plan(
+        job=(
+            "libname edw oracle path=EDWPRO schema=fr_dm user=etl;\n"
+            "%macro load(ds);\n  data work.copy; set &ds; run;\n%mend;\n"
+            "data work.c; set edw.customers; run;\n%load(edw.accounts);\n"
+        )
+    )
+    assert sorted(i.source.object_name for i in plan.items) == [
+        "fr_dm.accounts",
+        "fr_dm.customers",
+    ]
+
+
 def test_a_list_passed_to_a_macro_is_read_as_a_list():
     # `%stack(raw.sales_:);` reads every raw.sales_* its body's `set &ds;`
     # names, as `set raw.sales_:;` does: the library is kept, blocked. Before,

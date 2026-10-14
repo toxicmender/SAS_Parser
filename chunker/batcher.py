@@ -14,7 +14,7 @@ import io
 import logging
 import re
 import time
-from bisect import bisect_left, insort
+from bisect import bisect_left
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -600,18 +600,13 @@ class _EdgeDiscovery:
     Union-Find, and the growing edge list — so each edge family reads as
     its own small method instead of one interleaved loop body.
 
-    INVARIANT — one walk, in corpus order.  :meth:`discover` must remain a
-    single pass over ``flat_chunks`` in global-index order, with the edge
-    families applied per chunk in the order written there, because
-    :meth:`_resolve_macro_body` mutates ``produces_ds`` mid-walk: a macro
-    call site's resolved outputs are registered as producers at the moment
-    the call is visited, which is exactly what implements "a macro's output
-    exists only once the call has executed" under the
-    nearest-preceding-producer bisection used by :meth:`_dataset_flow` and
-    :meth:`_macro_arg_datasets`.  Splitting the families into separate
-    corpus walks would let a consumer link to a producer that, in
-    sequential SAS execution, does not exist yet at its position — or miss
-    one that does.
+    INVARIANT — a consumer links only to a producer before it, by global
+    index: the nearest-preceding-producer bisection :meth:`_dataset_flow`,
+    :meth:`_macro_arg_datasets` and :meth:`_resolve_macro_body` share. That
+    is what makes "a macro's output exists only once the call has executed":
+    a call's datasets are on the call chunk (:func:`_bind_macro_calls`), so
+    its writes are indexed at the call's position, and nothing before the
+    call can see them.
     """
 
     def __init__(
@@ -633,9 +628,6 @@ class _EdgeDiscovery:
         self.produces_ds: dict[str, list[int]] = defaultdict(list)
         # macro name → global index of defining chunk (last definition wins)
         self.defines_macro: dict[str, int] = {}
-        # defining chunk's global index → its keyword parameters' defaults,
-        # read from the %MACRO header the first time a call needs them
-        self._defaults: dict[int, dict[str, str]] = {}
         # macro variable name → global indices of chunks that create it, via
         # SYMPUT/SQL-INTO side effects or %LET/%GLOBAL/%LOCAL declarations
         # (both treated identically).
@@ -767,7 +759,7 @@ class _EdgeDiscovery:
                 # and both passes below need the same (positional, keyword) split.
                 call_args = _parse_call_args(chunk.text)
                 self._macro_arg_datasets(cidx, chunk, call_args)
-                self._resolve_macro_body(cidx, chunk, meta, call_args)
+                self._resolve_macro_body(cidx, chunk, meta)
 
         cf_count = sum(1 for e in self.edges if e.cross_file)
         logger.info(
@@ -790,8 +782,10 @@ class _EdgeDiscovery:
         # order — the state a sequential SAS session would read — so independent
         # jobs reusing a scratch name like work.tmp stay in separate components.
         # Producers are the steps that create a table; a step updating it in
-        # place reads it here like any consumer (its inputs include it).
-        for ds in meta.input_datasets:
+        # place reads it here like any consumer (its inputs include it). What a
+        # macro call reads through its macro's parameters is linked by
+        # _resolve_macro_body instead.
+        for ds in _own_inputs(meta):
             if ds.endswith(":"):
                 self._pattern_flow(cidx, chunk, ds)
                 continue
@@ -943,6 +937,123 @@ class _EdgeDiscovery:
                     via=ds_norm,
                 )
 
+    def _resolve_macro_body(
+        self, cidx: int, chunk: SasChunk, meta: SasChunkMetadata
+    ) -> None:
+        """Link a macro call to the nearest preceding creator of each table it
+        reads or updates through its macro's parameters — the references
+        :func:`_bind_macro_calls` gave it, resolved since like every other
+        name — as ``macro_body_dataset`` edges. What it writes is indexed
+        already, at the call's position (:meth:`_build_indices`)."""
+        reads = dict.fromkeys(
+            ref.name for ref in meta.dataset_refs if ref.via == "macro_call" and ref.role.reads
+        )
+        for ds in reads:
+            if ds.endswith(":"):
+                self._pattern_flow(cidx, chunk, ds, kind="macro_body_dataset")
+                continue
+            preceding = self._nearest_producer(ds, cidx)
+            if preceding is None:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"macro_body_dataset: resolved input '{ds}' has no preceding producer in corpus (call {chunk.chunk_id})"
+                    )
+                continue
+            self._add_edge(
+                kind="macro_body_dataset",
+                from_idx=preceding,
+                to_idx=cidx,
+                via=ds,
+            )
+
+
+def _own_inputs(meta: SasChunkMetadata) -> list[str]:
+    """*meta*'s inputs but those only a macro call's parameters read
+    (``via="macro_call"``)."""
+    inputs = meta.input_datasets
+    call = {r.name for r in meta.dataset_refs if r.via == "macro_call"}
+    if not call:
+        return inputs
+    own = {r.name for r in meta.dataset_refs if r.via != "macro_call" and r.role.reads}
+    return [ds for ds in inputs if ds not in call or ds in own]
+
+
+class _CallBinder:
+    """What a macro call reads and writes through its macro's parameters
+    (:func:`_bind_macro_calls`): the definitions, last one wins, as the
+    batcher indexes them, and each one's keyword defaults."""
+
+    def __init__(self, flat_chunks: list[SasChunk], file_of: list[int]) -> None:
+        self.flat_chunks = flat_chunks
+        self.file_of = file_of
+        self.defines_macro: dict[str, int] = {}
+        for gidx, chunk in enumerate(flat_chunks):
+            for mac in chunk.metadata.defines_macros:
+                self.defines_macro[mac] = gidx
+        # defining chunk's global index → its keyword parameters' defaults,
+        # read from the %MACRO header the first time a call needs them
+        self._defaults: dict[int, dict[str, str]] = {}
+
+    def refs(self, chunk: SasChunk) -> list[SasDatasetRef]:
+        """Each dataset the call *chunk* reads or writes through a parameter
+        of a macro it invokes, resolved with the call's arguments and the
+        role the body gives it: `data &ds;` creates the argument, `set &ds;`
+        reads it, `proc append base=&ds` updates it. Canonicalised (one-level
+        → work.) to match the producer index; one still holding ``&`` stays
+        as spelled, for the macro-variable pass to resolve."""
+        pos_args, kw_args = _parse_call_args(chunk.text)
+        found: list[SasDatasetRef] = []
+        for mac in chunk.metadata.invokes_macros:
+            didx = self.defines_macro.get(mac)
+            if didx is None:
+                continue
+            def_meta = self.flat_chunks[didx].metadata
+            if not (def_meta.body_param_outputs or def_meta.body_param_inputs):
+                continue
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"macro_body_dataset: call {chunk.chunk_id} invokes %{mac}  pos_args={pos_args}  kw_args={kw_args}"
+                )
+            defaults = self._keyword_defaults(didx)
+
+            def _resolve(pname: str, pos: int | None) -> str | None:
+                if pos is not None and pos >= 0:
+                    if pos < len(pos_args):
+                        return pos_args[pos]
+                    if pname in kw_args:
+                        return kw_args[pname]
+                    return None
+                # keyword-only parameter: the call's value, else its default
+                return kw_args.get(pname, defaults.get(pname))
+
+            # Each keeps the name as the call spells it (`raw`), and a list
+            # (`raw.sales_:`) stays a list.
+            for ref in def_meta.dataset_refs:
+                if ref.param is None or not (ref.role.reads or ref.role.writes):
+                    continue
+                spelled = _resolve(ref.param, ref.param_pos)
+                if not spelled:
+                    continue
+                if ref.name != f"&{ref.param}":
+                    # A name built around the parameter: `&lib..customers`
+                    # with lib=prod is prod.customers.
+                    spelled = resolve_refs(ref.name, {ref.param: spelled})
+                val = spelled if "&" in spelled else _canon_ds(spelled)
+                found.append(
+                    SasDatasetRef(
+                        name=val,
+                        role=ref.role,
+                        raw=spelled,
+                        via="macro_call",
+                        pattern=val.endswith(":"),
+                    )
+                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"macro_body_dataset: resolved param '{ref.param}' → {ref.role} '{val}'  (call {chunk.chunk_id})"
+                    )
+        return list(dict.fromkeys(found))
+
     def _keyword_defaults(self, didx: int) -> dict[str, str]:
         """The default each keyword parameter of the macro defined at *didx*
         takes when a call names no value for it: "You can specify default
@@ -964,8 +1075,8 @@ class _EdgeDiscovery:
     def _header_chunk(self, didx: int) -> SasChunk:
         """The chunk whose text opens with the %MACRO header of the definition
         at *didx*: that chunk, or for a slice of a split definition (which
-        ``defines_macro`` names by its last slice), the region it was cut
-        from, which comes before its slices in the same file."""
+        the index names by its last slice), the region it was cut from,
+        which comes before its slices in the same file."""
         chunk = self.flat_chunks[didx]
         if chunk.parent_id is None:
             return chunk
@@ -976,149 +1087,51 @@ class _EdgeDiscovery:
                 return self.flat_chunks[i]
         return chunk
 
-    def _resolve_macro_body(
-        self,
-        cidx: int,
-        chunk: SasChunk,
-        meta: SasChunkMetadata,
-        call_args: tuple[list[str], dict[str, str]],
-    ) -> None:
-        # Parameterised resolution: the call invokes a macro whose body
-        # references a dataset only through a parameter (e.g. "data &ds.;" in
-        # %clean(ds)). Resolve using the actual argument at this call site, then
-        # treat the resolved name as if this chunk produced/consumed it. Under
-        # nearest-preceding-producer semantics this mid-walk registration is
-        # correct: the output exists only once the call has executed.
-        pos_args, kw_args = call_args
-        for mac in meta.invokes_macros:
-            if mac not in self.defines_macro:
-                continue
-            didx = self.defines_macro[mac]
-            def_meta = self.flat_chunks[didx].metadata
-            if not (def_meta.body_param_outputs or def_meta.body_param_inputs):
-                continue
 
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    f"macro_body_dataset: call {chunk.chunk_id} invokes %{mac}  pos_args={pos_args}  kw_args={kw_args}"
-                )
+def _bind_macro_calls(flat_chunks: list[SasChunk], file_of: list[int]) -> None:
+    """Give each macro call the datasets its macro reads and writes through
+    its parameters, in place: ``%load(raw.c)`` of ``%macro load(ds); set
+    &ds; …`` reads raw.c, ``via="macro_call"`` (:class:`_CallBinder`).
 
-            defaults = self._keyword_defaults(didx)
-
-            def _resolve(pname: str, pos: int | None) -> str | None:
-                if pos is not None and pos >= 0:
-                    if pos < len(pos_args):
-                        return pos_args[pos]
-                    if pname in kw_args:
-                        return kw_args[pname]
-                    return None
-                # keyword-only parameter: the call's value, else its default
-                return kw_args.get(pname, defaults.get(pname))
-
-            # Each body reference spelled through a parameter, resolved with the
-            # role the body gives it: `data &ds;` creates the argument, `set
-            # &ds;` reads it, `proc append base=&ds` updates it. Resolved values
-            # are canonicalised (one-level → work.) to match the producer index;
-            # a value still containing ``&`` is unresolvable and kept verbatim,
-            # matching nothing rather than a guessed name.
-            # Each keeps the name as the call spells it (`raw`), and a list
-            # (`raw.sales_:`) stays a list.
-            resolved: list[SasDatasetRef] = []
-            for ref in def_meta.dataset_refs:
-                if ref.param is None or not (ref.role.reads or ref.role.writes):
-                    continue
-                spelled = _resolve(ref.param, ref.param_pos)
-                if not spelled:
-                    continue
-                if ref.name != f"&{ref.param}":
-                    # A name built around the parameter: `&lib..customers`
-                    # with lib=prod is prod.customers.
-                    spelled = resolve_refs(ref.name, {ref.param: spelled})
-                val = spelled if "&" in spelled else _canon_ds(spelled)
-                resolved.append(
-                    SasDatasetRef(
-                        name=val,
-                        role=ref.role,
-                        raw=spelled,
-                        via="macro_call",
-                        pattern=val.endswith(":"),
-                    )
-                )
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        f"macro_body_dataset: resolved param '{ref.param}' → {ref.role} '{val}'  (call {chunk.chunk_id})"
-                    )
-            resolved = list(dict.fromkeys(resolved))
-            resolved_inputs = [r.name for r in resolved if r.role.reads]
-
-            # Register this call site as the producer of what it creates, so
-            # later chunks get linked via the normal dataset_flow pass. insort
-            # (not append) keeps produces_ds sorted, the invariant the
-            # nearest-preceding bisect lookups rely on. A pattern written (a
-            # whole-library COPY's `tgt.:`) is indexed by its prefix too, as
-            # _build_indices indexes one written outright.
-            for ref in resolved:
-                if ref.role is not DatasetRole.WRITE:
-                    continue
-                ds = ref.name
-                if ds not in self.produces_ds:
-                    insort(self.ds_names, ds)
-                if ds.endswith(":"):
-                    self.pattern_outputs[ds[:-1]] = self.produces_ds[ds]
-                if cidx not in self.produces_ds[ds]:
-                    insort(self.produces_ds[ds], cidx)
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(
-                            f"index[ds-call-resolved]: chunk {chunk.chunk_id} (g{cidx}) resolved-creates '{ds}' via %{mac}"
-                        )
-
-            # Persist the resolved references back onto the chunk's metadata so
-            # _make_batch and other consumers see them through the normal fields.
-            # Appended after the chunk's own, in the body's order.
-            updated_meta = chunk.metadata.add_dataset_refs(resolved)
-            if updated_meta is not chunk.metadata:
-                chunk = chunk.model_copy(update={"metadata": updated_meta})
-                self.flat_chunks[cidx] = chunk
-                meta = updated_meta
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        f"macro_body_dataset: chunk {chunk.chunk_id} metadata updated  output_datasets={meta.output_datasets}  input_datasets={meta.input_datasets}"
-                    )
-
-            # Link this call site to the nearest preceding creator of each
-            # table it resolves to read or update (whose actual name is only
-            # known at this site).
-            for ds in resolved_inputs:
-                if ds.endswith(":"):
-                    self._pattern_flow(cidx, chunk, ds, kind="macro_body_dataset")
-                    continue
-                preceding = self._nearest_producer(ds, cidx)
-                if preceding is None:
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(
-                            f"macro_body_dataset: resolved input '{ds}' has no preceding producer in corpus (call {chunk.chunk_id})"
-                        )
-                    continue
-                self._add_edge(
-                    kind="macro_body_dataset",
-                    from_idx=preceding,
-                    to_idx=cidx,
-                    via=ds,
-                )
+    Run before any name is resolved, so the passes after it treat these as
+    every other dataset: a database LIBNAME makes ``%load(edw.accounts)`` a
+    database table read, the User library takes a one-level argument, and a
+    macro variable in an argument (``%load(&lib..t)``) resolves. A call that
+    has its references already is left as it is, so binding again changes
+    nothing.
+    """
+    binder: _CallBinder | None = None
+    for cidx, chunk in enumerate(flat_chunks):
+        if chunk.kind != SasChunkKind.MACRO_CALL or not chunk.metadata.invokes_macros:
+            continue
+        if any(ref.via == "macro_call" for ref in chunk.metadata.dataset_refs):
+            continue
+        binder = binder or _CallBinder(flat_chunks, file_of)
+        refs = binder.refs(chunk)
+        if not refs:
+            continue
+        flat_chunks[cidx] = chunk.model_copy(
+            update={"metadata": chunk.metadata.add_dataset_refs(refs)}
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"_bind_macro_calls: {chunk.chunk_id} {[str(r) for r in refs]}"
+            )
 
 
 def _resolve_corpus_chunks(flat_chunks: list[SasChunk], uf: _UF, file_of: list[int]) -> list[_Edge]:
     """The dataset passes over a flattened corpus, in place, in the one order
     that works; returns the edges they found.
 
-    Reference resolution (corpus-wide %LET and LIBNAME tables): each file
-    resolved its own when it was chunked, and this run is what lets a %LET or
-    a database LIBNAME in one file give meaning to a name another file uses
-    (a no-op for names already resolved). Then implicit datasets (_LAST_,
-    _DATA_, a step with no DATA=), then edge discovery, which gives each macro
-    call the datasets its macro reads and writes through its parameters
-    (:meth:`_EdgeDiscovery._resolve_macro_body`).
+    Each macro call first gets the datasets its macro reads and writes
+    through its parameters (:func:`_bind_macro_calls`), so everything after
+    sees them. Then reference resolution (corpus-wide %LET and LIBNAME
+    tables): each file resolved its own when it was chunked, and this run is
+    what lets a %LET or a database LIBNAME in one file give meaning to a name
+    another file uses (a no-op for names already resolved). Then implicit
+    datasets (_LAST_, _DATA_, a step with no DATA=), then edge discovery.
     """
+    _bind_macro_calls(flat_chunks, file_of)
     resolve_references(flat_chunks)
     _resolve_implicit_datasets(flat_chunks)
     return _discover_edges(flat_chunks, uf, file_of=file_of)
@@ -1128,11 +1141,11 @@ def resolve_corpus_datasets(corpus: SasCorpus) -> SasCorpus:
     """*corpus* with every chunk's datasets as :class:`MultiFileBatcher` sees them.
 
     The same passes the batcher runs before it groups anything
-    (:func:`_resolve_corpus_chunks`): names resolved across the corpus,
-    ``_LAST_`` made concrete, and each macro call given the datasets its
+    (:func:`_resolve_corpus_chunks`): each macro call given the datasets its
     macro's body reads and writes through its parameters — ``%load(raw.c)``
     of ``%macro load(ds); set &ds; …`` reads ``raw.c``, with ``via`` set to
-    ``"macro_call"``. For a caller that wants every dataset a job touches
+    ``"macro_call"`` — then names resolved across the corpus and ``_LAST_``
+    made concrete. For a caller that wants every dataset a job touches
     without batching: the reference inventory (``data_hydration``).
 
     Chunk ids are the batcher's (``f2-chunk-0003`` across several files).

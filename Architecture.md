@@ -1035,20 +1035,18 @@ against a Delta table.
 Things that look like implementation details but are contracts. Breaking
 any of these silently changes behavior.
 
-1. **Edge discovery is one walk, in corpus order.**
-   `_EdgeDiscovery._resolve_macro_body` mutates `produces_ds` mid-walk: what
-   a macro call site's resolved arguments create is registered at the moment
-   the call is visited, which is what implements "a macro's output
-   exists only once the call has executed" under nearest-preceding-producer
-   bisection. Splitting the edge families into separate corpus walks would
-   let a consumer link to a producer that does not exist yet at its
-   position — or miss one that does.
+1. **A macro call's datasets are bound before any name is resolved.**
+   `_bind_macro_calls` gives each call what its macro reads and writes
+   through its parameters first, so every resolution pass after it sees
+   those names as any other (a database LIBNAME, the User library, a macro
+   variable in an argument). Their writes are indexed at the call's
+   position, so nearest-preceding-producer bisection is what makes "a
+   macro's output exists only once the call has executed".
 
 2. **Producer lists stay sorted by global index.** The nearest-preceding
-   lookups are `bisect_left` over `produces_ds[name]`; mid-walk
-   registration therefore uses `insort`, never `append`. `ds_names`, the
-   sorted name index a pattern input (`set lib.sales_:;`) bisects, gets a new
-   name the same way.
+   lookups are `bisect_left` over `produces_ds[name]`, built in
+   global-index order. `ds_names`, the sorted name index a pattern input
+   (`set lib.sales_:;`) bisects, is sorted once the index is built.
 
 3. **`output_datasets` is insertion-ordered, never sorted.**
    `_resolve_implicit_datasets` treats the last of `output_datasets` that is

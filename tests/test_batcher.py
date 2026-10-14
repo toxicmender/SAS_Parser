@@ -333,6 +333,35 @@ class TestMacroInvocation(unittest.TestCase):
             self.assertEqual((len(br.batches), len(br.singletons)), (1, 0), header)
             self.assertIn(f"dataset_flow({name}): chunk-0002 → chunk-0003", br.batches[0].reason, header)
 
+    def test_a_call_s_datasets_are_resolved_like_any_others(self):
+        """A call's datasets are bound before names are resolved, so the
+        passes that resolve them see these too: the User library takes a
+        one-level argument, and a macro variable in one resolves. Before,
+        `%load(customers)` read work.customers after `libname user`, and
+        `%load(&lib..t)` read `&lib..t`."""
+        from chunker import SasCorpus, resolve_corpus_datasets
+
+        macro = "%macro load(ds);\n  data out; set &ds; run;\n%mend;\n"
+        for setup, call, read in (
+            ("libname user '/data/perm';\n", "%load(customers);\n", "user.customers"),
+            ("%let lib = prod;\n", "%load(&lib..t);\n", "prod.t"),
+        ):
+            result = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(
+                setup + macro + call, source_id="t.sas"
+            )
+            [chunks] = [r.chunks for r in resolve_corpus_datasets(SasCorpus(file_results=[result])).file_results]
+            [call_chunk] = [c for c in chunks if c.kind is SasChunkKind.MACRO_CALL]
+            self.assertEqual(call_chunk.metadata.input_datasets, [read], call)
+
+    def test_binding_the_calls_again_changes_nothing(self):
+        from chunker import SasCorpus, resolve_corpus_datasets
+
+        src = "libname user '/u';\n%macro load(ds);\n  data out; set &ds; run;\n%mend;\n%load(c);\n"
+        result = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(src, source_id="t.sas")
+        once = resolve_corpus_datasets(SasCorpus(file_results=[result]))
+        twice = resolve_corpus_datasets(once)
+        self.assertEqual(once.model_dump(), twice.model_dump())
+
     def test_a_library_a_macro_call_copies_supplies_its_readers(self):
         """A whole-library COPY through a call writes `stage.:`, which a later
         `set stage.a;` reads, as it does when the COPY is written out. Before,
@@ -983,6 +1012,21 @@ class TestPatternDatasetFlow(unittest.TestCase):
             [c.chunk_id for c in br.batches[0].chunks], ["chunk-0001", "chunk-0003"]
         )
         self.assertIn("dataset_flow(work.a)", br.batches[0].reason)
+
+    def test_last_is_what_a_macro_call_created_last(self):
+        """`%make(b);` creates work.b, so a PROC PRINT with no DATA= after it
+        reads work.b. Before, the call's datasets were added after _LAST_ was
+        resolved, so it read work.a."""
+        src = (
+            "data a; x = 1; run;\n"
+            "%macro make(out);\n  data &out; set a; run;\n%mend;\n"
+            "%make(b);\n"
+            "proc print; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        reasons = " ".join(b.reason for b in br.batches)
+        self.assertIn("dataset_flow(work.b): chunk-0003 → chunk-0004", reasons)
+        self.assertNotIn("dataset_flow(work.a)", reasons)
 
     def test_macro_argument_pattern_resolves_through_the_body(self):
         src = (
