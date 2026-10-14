@@ -553,6 +553,13 @@ Values come from more than `%LET` in open code, and `_MacroScope` (in
   macro's local table (SAS 9.4 Macro Language: Reference, %GLOBAL and %LOCAL
   Macro Statements). SAS rejects any later `%LET` or `%SYMDEL` of one; code
   that does so is taken as written.
+- **A `%*` comment hides the macro statements in it.** In a called macro's
+  body, `%* %let lib = test;` sets nothing, while SAS runs the `%LET` in
+  `* %let lib = test;;`: "Only macro comment statements and PL/1-style
+  comments in the form /* commentary */ … can be used to hide macro
+  statements from processing by the macro facility" (SAS 9.4 Macro Language:
+  Reference, %* Macro Comment Macro Statement). The comment ends at its first
+  semicolon not in quotation marks.
 
 Two scope rules keep this from over-reaching. A macro's own parameters shadow
 the table, so `&ds` inside `%macro m(ds);` stays a `body_param_*` entry the

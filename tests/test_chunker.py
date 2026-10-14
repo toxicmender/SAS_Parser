@@ -740,6 +740,18 @@ class TestStatementStructure(unittest.TestCase):
         self.assertIn("%str(a b% )", mt)
         self.assertEqual(_sanitise(text, blank_strings=False), text)
 
+    def test_a_macro_comment_is_blanked_to_its_first_unquoted_semicolon(self):
+        # One in a string is no comment, and one with no semicolon runs on.
+        from chunker.scanner import _sanitise, _without_macro_comments
+
+        text = "%* a ';' %let x = 1;\n%let y = '%* no comment;';\n%* open"
+        cf, mt = _without_macro_comments(_sanitise(text, blank_strings=False), _sanitise(text))
+        self.assertEqual((len(cf), len(mt)), (len(text), len(text)))
+        self.assertEqual(
+            [line.strip() for line in cf.split("\n")], ["", "%let y = '%* no comment;';", ""]
+        )
+        self.assertEqual(mt.split("\n")[1], "%let y = '              ';")
+
     def test_an_argument_that_never_closes_is_walked_once(self):
         # The first walk pairs every parenthesis it passes (none close), so
         # the quoting functions inside it are answered without another walk:

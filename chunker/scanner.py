@@ -456,6 +456,40 @@ def _sanitise(text: str, *, blank_strings: bool = True) -> str:
     return _COMMENT_OR_STRING_RE.sub(_sanitise_repl, text)
 
 
+# A %* macro comment in text whose strings are blanked, where a quoted
+# semicolon is a space: it runs to the first semicolon left.
+_MACRO_COMMENT_RE = re.compile(r"%\*[^;]*;?")
+
+
+def _without_macro_comments(cf: str, mt: str) -> tuple[str, str]:
+    """*cf* and *mt*, one text after :func:`_sanitise` kept and blanked its
+    strings, with every ``%*`` macro comment blanked, line breaks kept.
+
+    "Only macro comment statements and PL/1-style comments in the form /*
+    commentary */ in macro definitions or open code can be used to hide macro
+    statements from processing by the macro facility", and a macro comment
+    ends at the first semicolon not "enclosed in quotation marks" (SAS 9.4
+    Macro Language: Reference, %* Macro Comment Macro Statement). So the
+    ``%LET`` in ``%* %let x = 1;`` never runs, while SAS runs the one in
+    ``* %let x = 1;;``. The scanner's units mark these comments already; this
+    is for code that reads a chunk's text again.
+    """
+    spans = [m.span() for m in _MACRO_COMMENT_RE.finditer(mt)]
+    if not spans:
+        return cf, mt
+
+    def blank(text: str) -> str:
+        out: list[str] = []
+        pos = 0
+        for start, end in spans:
+            out += (text[pos:start], _blank_span(text[start:end]))
+            pos = end
+        out.append(text[pos:])
+        return "".join(out)
+
+    return blank(cf), blank(mt)
+
+
 # ---------------------------------------------------------------------------
 # Macro quoting
 # ---------------------------------------------------------------------------

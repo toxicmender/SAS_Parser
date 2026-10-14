@@ -76,7 +76,7 @@ from .paths import (
     normalise_path,
     unquoted_file,
 )
-from .scanner import _blank_span, _Region, _sanitise
+from .scanner import _blank_span, _Region, _sanitise, _without_macro_comments
 from .statements import _ODS_OUTPUT_RE, _VAR_REF_RE, _canon_ds
 from .statements import dataset_refs as statement_dataset_refs
 
@@ -1211,8 +1211,11 @@ class _MacroDef:
     @classmethod
     def of(cls, chunk: SasChunk) -> "_MacroDef":
         meta = chunk.metadata
-        cf = _sanitise(chunk.text, blank_strings=False)
-        mt = _sanitise(chunk.text)
+        # Read from the text, so a %* comment's statements are blanked here;
+        # a * comment's run when the macro does.
+        cf, mt = _without_macro_comments(
+            _sanitise(chunk.text, blank_strings=False), _sanitise(chunk.text)
+        )
         params = macro_signature(cf)
         declared: dict[str, set[str]] = {"global": set(), "local": set()}
         for scope, name in scope_declarations(mt):
@@ -1337,7 +1340,10 @@ class _MacroScope:
         scope: Mapping[str, str] = ChainMap(overlay, hidden, self._texts)
         own: dict[str, str] = {}
         if meta.macro_var_values:
-            for name, raw in let_assignments(_sanitise(chunk.text, blank_strings=False)):
+            cf = _sanitise(chunk.text, blank_strings=False)
+            if "%*" in cf:
+                cf, _ = _without_macro_comments(cf, _sanitise(chunk.text))
+            for name, raw in let_assignments(cf):
                 value = text_value(raw) or ""
                 own[name] = resolve_refs(value, scope) if has_macro_ref(value) else value
                 if name not in hidden:

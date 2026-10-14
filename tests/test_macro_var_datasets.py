@@ -225,6 +225,51 @@ class TestReadOnly(unittest.TestCase):
         self.assertEqual(declared, {"lib", "ds"})
 
 
+class TestMacroComments(unittest.TestCase):
+    """"Only macro comment statements and PL/1-style comments in the form /*
+    commentary */ in macro definitions or open code can be used to hide macro
+    statements from processing by the macro facility" (SAS 9.4 Macro
+    Language: Reference, %* Macro Comment Macro Statement). Before, a call ran
+    the %LET and %GLOBAL in its macro's %* comments, and a %LET in a %*
+    comment inside a step set the path a later reference read."""
+
+    _reads = TestSymdel._reads
+
+    @staticmethod
+    def _call(body: str) -> str:
+        return (
+            f"%let lib = prod;\n%macro m;\n  {body}\n  %put done;\n%mend;\n%m;\n"
+            "data y; set &lib..t; run;\n"
+        )
+
+    def test_a_let_in_a_macro_comment_never_runs(self):
+        # The comment ends at its first semicolon not in quotation marks.
+        for body in ("%* %let lib = test;", "%* a ';' %let lib = test;"):
+            with self.subTest(body=body):
+                self.assertEqual(self._reads(self._call(body)), ["prod.t"])
+
+    def test_a_global_in_a_macro_comment_declares_nothing(self):
+        # So the %LET after it sets a local that ends with the call.
+        src = (
+            "%macro m;\n  %* %global lib;\n  %let lib = test;\n%mend;\n%m;\n"
+            "data y; set &lib..t; run;\n"
+        )
+        self.assertEqual(self._reads(src), ["&lib..t"])
+
+    def test_a_let_in_an_asterisk_comment_runs(self):
+        # "The macro statements that are embedded in commentary are executed
+        # regardless of the asterisk or COMMENT".
+        self.assertEqual(self._reads(self._call("* %let lib = test;;")), ["test.t"])
+
+    def test_a_path_in_a_macro_comment_is_never_assigned(self):
+        src = (
+            "data _null_;\n  %let root = /a;\n  %* %let root = /b;\n"
+            '  infile "&root/x.txt";\n  input;\nrun;\n%include "&root/y.sas";\n'
+        )
+        paths = [r.path for c in _chunk(src).chunks for r in c.metadata.external_refs]
+        self.assertEqual(paths, ["/a/x.txt", "/a/y.sas"])
+
+
 class TestStripQuotes(unittest.TestCase):
     def test_matching_quotes_removed(self):
         self.assertEqual(strip_quotes("  'lib.member' "), "lib.member")
