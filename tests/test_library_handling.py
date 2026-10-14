@@ -231,6 +231,30 @@ class TestUserLibraryNames(unittest.TestCase):
         # USER= of another statement (FTP's login) is no library.
         self.assertEqual(self._names("filename f ftp 'x' user='bob';\ndata a; set b; run;\n")[1], ("work.b", "read"))
 
+    def test_blanks_around_the_equals_sign(self):
+        # Before, only `user=` written as one word assigned the library, and
+        # `set y;` read work.y.
+        for setup, lib in (
+            ("options user = '/data/perm';", "user"),
+            ("options obs=max user ='/data/perm' nonotes;", "user"),
+            ("libname mine '/data/perm';\noptions user= mine;", "mine"),
+        ):
+            src = f"{setup}\ndata x; set y; run;\n"
+            self.assertEqual(self._names(src), [(f"{lib}.x", "write"), (f"{lib}.y", "read")], setup)
+
+    def test_libname_all_clear_ends_the_user_library(self):
+        # "if you specify _ALL_, clears all librefs that are currently
+        # defined. Sasuser, Sashelp, and Work remain assigned" (SAS 9.4
+        # Companion for UNIX Environments, LIBNAME Statement: UNIX). Before,
+        # one-level names stayed in the User library after it.
+        for setup in (
+            "libname user '/data/perm';",
+            "options user='/data/perm';",
+            "libname mine '/data/perm';\noptions user=mine;",
+        ):
+            src = f"{setup}\nlibname _all_ clear;\ndata x; set y; run;\n"
+            self.assertEqual(self._names(src), [("work.x", "write"), ("work.y", "read")], setup)
+
     def _plan(self, src: str):
         from chunker import SasCorpus, resolve_corpus_datasets
         from data_hydration.config import HydrationConfig
@@ -241,7 +265,11 @@ class TestUserLibraryNames(unittest.TestCase):
         return plan_from_inventory(rows, config=HydrationConfig(catalog="main"))
 
     def test_the_permanent_dataset_is_planned(self):
-        for assign in ("libname user '/data/perm';", "options user='/data/perm';"):
+        for assign in (
+            "libname user '/data/perm';",
+            "options user='/data/perm';",
+            "options user = '/data/perm';",
+        ):
             plan = self._plan(f"{assign}\ndata x; set y; run;\n")
             self.assertEqual(
                 [(i.source.locator, i.source.object_name, i.blockers) for i in plan.items],

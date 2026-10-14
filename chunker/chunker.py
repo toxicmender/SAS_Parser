@@ -18,7 +18,13 @@ from typing import TextIO
 import app_config
 
 from .keywords import RUN_GROUP_PROCS
-from .metadata import _merge_meta, _metadata_for, _title, resolve_references
+from .metadata import (
+    _merge_meta,
+    _metadata_for,
+    _title,
+    resolve_references,
+    user_option_values,
+)
 from .models import (
     SasBatchResult,
     SasChunk,
@@ -85,8 +91,7 @@ def _record_user_library(
     for chunk in chunks:
         meta = chunk.metadata
         assigns_user = "user" in meta.defines_librefs or (
-            chunk.kind == SasChunkKind.OPTIONS
-            and any(t == "user" or t.startswith("user=") for t in meta.options)
+            chunk.kind == SasChunkKind.OPTIONS and bool(user_option_values(meta.options))
         )
         if not assigns_user:
             continue

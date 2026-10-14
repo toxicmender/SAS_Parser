@@ -692,8 +692,10 @@ is a promoted macro.
 Dataset names are canonicalised (`_canon_ds`): one-level names become
 `work.<name>` — or, after `libname user '<dir>';`, `options user='<dir>';`
 (recorded as a path, statement `user`, binding the User libref) or
-`options user=<libref>;`, `<libref>.<name>` (`resolve_user_library`, until
-`libname user clear` or `options user=work`; a `USER_LIBRARY_ASSIGNED`
+`options user=<libref>;` (blanks around the `=` allowed), `<libref>.<name>`
+(`resolve_user_library`, until `libname user clear`, `libname _all_ clear`,
+which clears every libref but Sasuser, Sashelp and Work, or
+`options user=work`; a `USER_LIBRARY_ASSIGNED`
 diagnostic notes it, since one assigned at invocation is not seen); a name
 still holding a `&` is left alone, since its libref is not knowable yet.
 Consumers link to the **nearest preceding producer** in corpus order — the

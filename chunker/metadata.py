@@ -2046,8 +2046,21 @@ def resolve_filerefs(chunks: list[SasChunk]) -> None:
         )
 
 
-# `libname user clear;` (or `_all_ clear`) ends the User library.
+# `libname user clear;` or `libname _all_ clear;` ends the User library: "if
+# you specify _ALL_, clears all librefs that are currently defined. Sasuser,
+# Sashelp, and Work remain assigned" (SAS 9.4 Companion for UNIX Environments,
+# LIBNAME Statement: UNIX).
 _USER_CLEAR_RE = re.compile(r"\blibname\s+(?:user|_all_)\s+clear\b", re.IGNORECASE)
+# A USER= value among an OPTIONS statement's words, blanks around `=` allowed.
+_USER_OPTION_RE = re.compile(r"\buser\s*=\s*(\S+)")
+
+
+def user_option_values(options: list[str]) -> list[str]:
+    """The values an OPTIONS chunk gives the USER= system option, in order,
+    read from its words (``SasChunkMetadata.options``): ``user='/data/perm'``
+    or ``user = mine``. A quoted directory keeps its opening quote alone, as
+    the words are read with strings blanked."""
+    return [m.group(1) for m in _USER_OPTION_RE.finditer(" ".join(options))]
 
 
 def resolve_user_library(chunks: list[SasChunk]) -> None:
@@ -2065,7 +2078,8 @@ def resolve_user_library(chunks: list[SasChunk]) -> None:
 
     Walks *chunks* in source order and moves each one-level name — spelled
     without a libref, ``work.`` only by canonicalisation — to that library,
-    until ``libname user clear`` or ``options user=work`` ends it. A name
+    until ``libname user clear``, ``libname _all_ clear`` or ``options
+    user=work`` ends it. A name
     written ``work.x`` stays in WORK, as SAS keeps it there. A ``%MACRO``
     body's names wait for a call: the call site gets its own. One assigned at
     invocation (``-user``) or in a config file is not seen. Idempotent: a
@@ -2088,18 +2102,22 @@ def resolve_user_library(chunks: list[SasChunk]) -> None:
                     logger.debug(f"resolve_user_library: {chunk.chunk_id} one-level names in {lib}")
                 chunks[idx] = chunk.model_copy(update={"metadata": updated})
         if "user" in meta.defines_librefs:
-            user = None if _USER_CLEAR_RE.search(_sanitise(chunk.text)) else "user"
+            user = "user"
         elif chunk.kind is SasChunkKind.OPTIONS:
-            for token in meta.options:
-                if token.startswith("user="):
-                    # A quoted value is a directory, which USER= makes the
-                    # User library's (a path ref, statement `user`); any
-                    # other is a libref it equates to User.
-                    value = token[5:]
-                    if value == "work":
-                        user = None
-                    else:
-                        user = "user" if value[:1] in ("'", '"') else value
+            for value in user_option_values(meta.options):
+                # A quoted value is a directory, which USER= makes the User
+                # library's (a path ref, statement `user`); any other is a
+                # libref it equates to User.
+                if value == "work":
+                    user = None
+                else:
+                    user = "user" if value[:1] in ("'", '"') else value
+        if (
+            user is not None
+            and "clear" in chunk.text.lower()
+            and _USER_CLEAR_RE.search(_sanitise(chunk.text))
+        ):
+            user = None
 
 
 def _one_level(ref: SasDatasetRef) -> bool:

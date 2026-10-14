@@ -779,8 +779,10 @@ into the following substantive chunk's component, same-file only — the
 global-context batch, when that chunk is a promoted macro.
 
 Dataset names are canonicalised (`_canon_ds`): one-level names become
-`work.<name>`, or the User library's after `libname user` or `options user=`
-(`resolve_user_library`; a `USER_LIBRARY_ASSIGNED` diagnostic notes it). Consumers link to the **nearest preceding
+`work.<name>`, or the User library's after `libname user` or `options user=`,
+until `libname user clear`, `libname _all_ clear` or `options user=work`
+(`resolve_user_library`; a `USER_LIBRARY_ASSIGNED` diagnostic notes it).
+Consumers link to the **nearest preceding
 producer** in corpus order — the state a sequential SAS session would
 actually read — so unrelated jobs reusing `work.tmp` stay separate.
 Macro-variable consumers follow the same rule: a chunk reading `&name`
