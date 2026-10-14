@@ -333,6 +333,16 @@ class TestMacroInvocation(unittest.TestCase):
             self.assertEqual((len(br.batches), len(br.singletons)), (1, 0), header)
             self.assertIn(f"dataset_flow({name}): chunk-0002 → chunk-0003", br.batches[0].reason, header)
 
+    def test_a_library_a_macro_call_copies_supplies_its_readers(self):
+        """A whole-library COPY through a call writes `stage.:`, which a later
+        `set stage.a;` reads, as it does when the COPY is written out. Before,
+        the call's pattern was not indexed and the reader stood alone."""
+        for copy in ("%macro cp(tgt);\n  proc copy in=src out=&tgt; run;\n%mend;\n%cp(stage);\n",
+                     "proc copy in=src out=stage; run;\n"):
+            _, br = _chunk_and_batch(copy + "data x; set stage.a; run;\n")
+            self.assertEqual(len(br.singletons), 0, copy)
+            self.assertIn("(stage.a)", br.batches[-1].reason, copy)
+
     def test_the_defaults_of_a_split_definition_come_from_its_header(self):
         """A definition cut into slices is indexed by its last slice, which
         holds no %MACRO header; the defaults are read from the region."""

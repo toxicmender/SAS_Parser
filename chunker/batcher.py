@@ -1054,13 +1054,17 @@ class _EdgeDiscovery:
             # Register this call site as the producer of what it creates, so
             # later chunks get linked via the normal dataset_flow pass. insort
             # (not append) keeps produces_ds sorted, the invariant the
-            # nearest-preceding bisect lookups rely on.
+            # nearest-preceding bisect lookups rely on. A pattern written (a
+            # whole-library COPY's `tgt.:`) is indexed by its prefix too, as
+            # _build_indices indexes one written outright.
             for ref in resolved:
                 if ref.role is not DatasetRole.WRITE:
                     continue
                 ds = ref.name
                 if ds not in self.produces_ds:
                     insort(self.ds_names, ds)
+                if ds.endswith(":"):
+                    self.pattern_outputs[ds[:-1]] = self.produces_ds[ds]
                 if cidx not in self.produces_ds[ds]:
                     insort(self.produces_ds[ds], cidx)
                     if logger.isEnabledFor(logging.DEBUG):
