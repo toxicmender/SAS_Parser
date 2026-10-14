@@ -1391,6 +1391,10 @@ class _MacroScope:
         """
         if chunk.kind is not SasChunkKind.MACRO_CALL:
             return []
+        # None of its macros defined earlier, such as an autocall macro the
+        # corpus never defines: nothing to bind, so the text is not read.
+        if not any(name in self._macros for name in chunk.metadata.invokes_macros):
+            return []
         found = []
         for span in call_spans(_sanitise(chunk.text)):
             if (macro := self._macros.get(span.name)) is not None:
