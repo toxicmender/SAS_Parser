@@ -37,6 +37,16 @@ Where a path appears in *SAS* is `chunker/paths.py`'s grammar, imported here.
 Where one appears in *generated* code is `rewrite.py`'s, since it is target
 syntax rather than source syntax.
 
+Generated Spark SQL names its permanent tables through session variables
+(`CREATE OR REPLACE TABLE IDENTIFIER(session.DEMO_TABLE) AS ...`; see the
+SparkSQL instructions). `post` parses those statements with their IDENTIFIER
+clauses masked (`target_language.mask_identifier_clauses`) and gives the
+clauses back as written, and it regenerates only a statement that names a
+mapped table: every other statement, the `DECLARE OR REPLACE VARIABLE`s
+included, comes through byte-identical. The name a variable holds is set where
+it is declared, which `post` does not rewrite; `pre` reaches it, since the
+model declares the variables from the names `pre` already mapped.
+
 Under `pre` and `both` the run also reports SAS paths that survived into the
 output unmapped — a location the notebook names that will not exist on the
 target.

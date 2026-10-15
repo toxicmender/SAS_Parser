@@ -13,8 +13,10 @@ from target_language import (
     SPARKSQL,
     TargetLanguage,
     UnknownTargetLanguage,
+    mask_identifier_clauses,
     normalize_language,
     resolve_target_language,
+    restore_identifier_clauses,
 )
 
 
@@ -100,3 +102,57 @@ def test_sql_uses_required_sqlglot_with_databricks_dialect(monkeypatch):
     assert "ParseError" in (SPARKSQL.check_syntax("BROKEN") or "")
     assert SPARKSQL.checker_name == "sqlglot"
     assert {dialect for _, dialect in calls} == {"databricks"}
+
+
+# ── the IDENTIFIER clause ────────────────────────────────────────────────────
+# Databricks takes IDENTIFIER(<constant string>) wherever a name goes: the
+# subject of CREATE, ALTER and DROP, the target of INSERT, MERGE, UPDATE, DELETE
+# and COPY INTO, and anything a query names ("IDENTIFIER clause", Databricks
+# SQL / Runtime 13.3 and above). sqlglot reads only some of those, so the
+# Spark SQL check masks the clause before it parses.
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "CREATE OR REPLACE TABLE IDENTIFIER(session.DEMO_TABLE) AS "
+        "SELECT * FROM IDENTIFIER(session.RAW_DEMO);",
+        "INSERT INTO IDENTIFIER(session.T) SELECT * FROM IDENTIFIER(system.session.S);",
+        "COPY INTO IDENTIFIER(session.T) FROM '/Volumes/c/s/v/in/' FILEFORMAT = CSV;",
+        "DROP TABLE IF EXISTS IDENTIFIER(session.T);",
+        "UPDATE IDENTIFIER(session.T) SET a = 1 WHERE b = 2;",
+        "DELETE FROM IDENTIFIER(session.T) WHERE a = 1;",
+        "MERGE INTO IDENTIFIER(session.T) AS t USING IDENTIFIER(session.S) AS s "
+        "ON t.k = s.k WHEN MATCHED THEN UPDATE SET *;",
+        "ALTER TABLE IDENTIFIER('default.' || session.T) ADD COLUMN c2 INT;",
+        "SELECT IDENTIFIER(session.AGG)(c1) FROM VALUES (1) AS T(c1);",
+        "DECLARE OR REPLACE VARIABLE DEMO_TABLE STRING "
+        "DEFAULT CONCAT(session.MART_PREFIX, '.demo_table');",
+    ],
+)
+def test_spark_sql_takes_the_identifier_clause_wherever_databricks_does(sql):
+    assert SPARKSQL.check_syntax(sql) is None
+
+
+def test_an_unclosed_identifier_clause_is_still_a_syntax_error():
+    assert SPARKSQL.check_syntax("CREATE TABLE IDENTIFIER(session.T AS SELECT 1;") is not None
+
+
+def test_masking_leaves_strings_and_comments_alone_and_restores_exactly():
+    sql = (
+        "SELECT 'IDENTIFIER(x' AS s, IDENTIFIER(session.C) -- IDENTIFIER(\n"
+        "FROM IDENTIFIER(session.P || ')') /* IDENTIFIER(y) */ t;"
+    )
+    masked, originals = mask_identifier_clauses(sql)
+    assert list(originals.values()) == [
+        "IDENTIFIER(session.C)",
+        "IDENTIFIER(session.P || ')')",
+    ]
+    assert "'IDENTIFIER(x'" in masked and "/* IDENTIFIER(y) */" in masked
+    assert restore_identifier_clauses(masked, originals) == sql
+
+
+def test_only_the_identifier_keyword_is_masked():
+    masked, originals = mask_identifier_clauses("SELECT my_identifier(a), identifier (b)")
+    assert masked.startswith("SELECT my_identifier(a), __sasp_identifier_0__")
+    assert originals == {"__sasp_identifier_0__": "identifier (b)"}
