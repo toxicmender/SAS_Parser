@@ -309,7 +309,7 @@ def _kinds_for_item(item: SasBatch) -> set[str]:
 
 
 def _names(location: PathLocation) -> Callable[[SasChunkMetadata], bool]:
-    """Whether a chunk names a place of kind *location*."""
+    """Whether a chunk names a place of kind *location*, known or not."""
     return lambda meta: any(r.location is location for r in meta.external_refs)
 
 
@@ -326,10 +326,13 @@ _META_FLAGS: tuple[tuple[str, Callable[[SasChunkMetadata], object]], ...] = (
     ("includes", attrgetter("includes")),
     # An item that names a filesystem location or reaches a remote service has
     # a translation problem no construct key describes — the path itself has to
-    # become something on the target — so it gets its own scope token, raised
-    # by any reference to that kind of place.
+    # become something on the target — so it gets its own scope token. A
+    # wildcard or a place nobody can name yet has that problem too, so these
+    # two hold for one; the two after them single those out.
     ("physical_paths", _names(PathLocation.FILESYSTEM)),
     ("remote_paths", _names(PathLocation.REMOTE)),
+    ("wildcard_paths", attrgetter("wildcard_paths")),
+    ("unresolved_paths", attrgetter("unresolved_paths")),
     ("defines_macros", attrgetter("defines_macros")),
     ("invokes_macros", attrgetter("invokes_macros")),
     ("produces_macrovars", attrgetter("produces_macrovars")),

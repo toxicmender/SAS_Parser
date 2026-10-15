@@ -497,7 +497,10 @@ on that axis:
 - **`[meta: symput_hazard, unclosed_block]`** — the item's metadata must raise
   one of the listed predicate flags. The vocabulary (owned by the pipeline):
   `symput_hazard`, `abort`, `computed_goto`, `component_object`,
-  `unclosed_block`, `includes`, `defines_macros`, `invokes_macros`,
+  `unclosed_block`, `includes`, `physical_paths` and `remote_paths` (the item
+  names a filesystem place or a remote service, known or not),
+  `wildcard_paths` and `unresolved_paths` (it names a wildcard, or a place not
+  known before the job runs), `defines_macros`, `invokes_macros`,
   `produces_macrovars`, `automatic_vars`.
 
 So `## [when: proc:sql] [kind: PROC_STEP] [meta: symput_hazard] [lang: sparksql]

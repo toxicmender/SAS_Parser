@@ -12,11 +12,20 @@ from __future__ import annotations
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from langchain_core.messages import AIMessage
 
-from chunker.models import SasBatch, SasChunk, SasChunkKind, SasChunkMetadata
+from chunker.models import (
+    PathLocation,
+    SasBatch,
+    SasChunk,
+    SasChunkKind,
+    SasChunkMetadata,
+    SasPathRef,
+)
 from llm_client import LLMClientConfig
 from pipeline import SasLLMPipeline
 from pipeline.setup import MemorySetup, PromptingSetup
@@ -364,6 +373,34 @@ def test_meta_flags_for_item_maps_metadata_predicates():
     flags = _meta_flags_for_item(batch)
     assert {"symput_hazard", "component_object", "unclosed_block"} <= flags
     assert "abort" not in flags
+
+
+def _path(raw: str, location: PathLocation = PathLocation.FILESYSTEM, **fields) -> SasPathRef:
+    return SasPathRef(statement="infile", location=location, path=raw.lower(), raw=raw, **fields)
+
+
+@pytest.mark.parametrize(
+    "ref, expected",
+    [
+        (_path("/data/in.csv"), {"physical_paths"}),
+        # A wildcard or a place nobody can name yet still has to become
+        # something on the target, so the location's token holds for it too.
+        (_path("/data/in/*.csv"), {"physical_paths", "wildcard_paths"}),
+        (_path("&root/in.csv", has_macro_ref=True), {"physical_paths", "unresolved_paths"}),
+        (_path("~/in.csv"), {"physical_paths", "unresolved_paths"}),
+        (_path("https://host/x.json", PathLocation.REMOTE, device="url"), {"remote_paths"}),
+        (
+            _path("&base/x.json", PathLocation.REMOTE, device="url", has_macro_ref=True),
+            {"remote_paths", "unresolved_paths"},
+        ),
+        # A fileref nothing assigns names no filesystem place, yet.
+        (_path("in", PathLocation.FILEREF, binds="in"), {"unresolved_paths"}),
+    ],
+)
+def test_meta_flags_name_the_places_an_item_reaches(ref, expected):
+    flags = _meta_flags_for_item(_batch(_meta_chunk("c1", external_refs=[ref])))
+    paths = {"physical_paths", "remote_paths", "wildcard_paths", "unresolved_paths"}
+    assert flags & paths == expected
 
 
 def test_kind_and_meta_gate_instruction_injection_end_to_end():
