@@ -403,6 +403,39 @@ def test_meta_flags_name_the_places_an_item_reaches(ref, expected):
     assert flags & paths == expected
 
 
+@pytest.mark.parametrize(
+    "meta, expected",
+    [
+        ({"input_datasets": ["mart.raw_sales"]}, True),
+        ({"output_datasets": ["user.summary"]}, True),
+        # A LIBNAME's chunk: the library is where its prefix is declared.
+        ({"defines_librefs": ["mart"]}, True),
+        # A libref nothing resolved is a library all the same.
+        ({"input_datasets": ["&lib..x"]}, True),
+        ({"input_datasets": ["work.a"], "output_datasets": ["work.b"]}, False),
+        ({}, False),
+    ],
+)
+def test_permanent_tables_flags_a_table_outside_work(meta, expected):
+    flags = _meta_flags_for_item(_batch(_meta_chunk("c1", **meta)))
+    assert ("permanent_tables" in flags) is expected
+
+
+def test_permanent_tables_flags_a_database_table():
+    from chunker.models import DbTableAccess, DbTableVia
+    from chunker.passthrough import db_table_ref
+
+    table = db_table_ref(
+        "edw_export.current_nonip",
+        access=DbTableAccess.READ,
+        via=DbTableVia.CONNECTION_TO,
+        connection="oracle",
+        engine="oracle",
+    )
+    flags = _meta_flags_for_item(_batch(_meta_chunk("c1", db_tables=[table])))
+    assert "permanent_tables" in flags
+
+
 def test_kind_and_meta_gate_instruction_injection_end_to_end():
     rules = (
         "## [kind: PROC_STEP] PROC rule\nOnly for PROC steps.\n"
