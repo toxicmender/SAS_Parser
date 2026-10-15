@@ -467,32 +467,35 @@ def _quoted_dataset(path: str, reader: str | None) -> tuple[HydrationSource, tup
     return source, tuple(blockers)
 
 
-def _index_note(
-    source: HydrationSource, path_refs: Iterable["SasPathRef"]
-) -> tuple[str, ...]:
+def _index_stems(path_refs: Iterable["SasPathRef"]) -> frozenset[str]:
+    """The stems of the SAS indexes (``.sas7bndx``) *path_refs* name, for
+    :func:`_index_note`: collected once, so each item's note is one lookup."""
+    return frozenset(
+        _stem(ref.path).lower() for ref in path_refs if ref.path.endswith(_SAS_INDEX_SUFFIX)
+    )
+
+
+def _index_note(source: HydrationSource, index_stems: frozenset[str]) -> tuple[str, ...]:
     """A note when a SAS index sits beside this dataset.
 
-    A ``.sas7bndx`` file names an index on the dataset of the same stem. Only
-    its *presence* is knowable here: the indexed column names live inside a
-    binary whose layout is undocumented, and reading it is the reader's job at
-    write time — see :func:`data_hydration.sources.sas_files.index_columns`.
+    A ``.sas7bndx`` file names an index on the dataset of the same stem
+    (*index_stems*, from :func:`_index_stems`). Only its *presence* is
+    knowable here: the indexed column names live inside a binary whose layout
+    is undocumented, and reading it is the reader's job at write time — see
+    :func:`data_hydration.sources.sas_files.index_columns`.
 
     So this returns prose, not column names. Putting a placeholder in
     :attr:`~data_hydration.models.HydrationItem.cluster_by` instead would reach
     the sink and be emitted as ``CLUSTER BY (`<indexed>`)``, which is not valid
     SQL and not a column.
     """
-    if source.kind is not SourceKind.SAS_DATASET:
+    if source.kind is not SourceKind.SAS_DATASET or source.object_name.lower() not in index_stems:
         return ()
-    stem = source.object_name.lower()
-    for ref in path_refs:
-        if ref.path.endswith(_SAS_INDEX_SUFFIX) and _stem(ref.path).lower() == stem:
-            return (
-                "a SAS index sits beside this dataset; its columns are a "
-                "candidate CLUSTER BY, read at load time and applied only "
-                "when data_hydration.apply_index_clustering is set",
-            )
-    return ()
+    return (
+        "a SAS index sits beside this dataset; its columns are a "
+        "candidate CLUSTER BY, read at load time and applied only "
+        "when data_hydration.apply_index_clustering is set",
+    )
 
 
 #: Stands in for a target name that could not be rendered. Never written to —
@@ -1420,6 +1423,7 @@ def build_corpus_plan(
 
     items: list[HydrationItem] = []
     seen_tables: set[str] = set()
+    index_stems = _index_stems(path_ref_list)
     for source, extra in sources:
         target, name_blockers = _target_for(source, config, run_date)
         wildcard = _wildcard_blocker(source)
@@ -1449,7 +1453,7 @@ def build_corpus_plan(
             num_partitions=config.num_partitions,
             probe=probe,
         )
-        notes = _index_note(source, path_ref_list)
+        notes = _index_note(source, index_stems)
         # A relative place: the file's own, or its library directory's.
         spelled = relative.get(_full_path(source)) or relative.get(source.locator)
         if spelled is not None:
