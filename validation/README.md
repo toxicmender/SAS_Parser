@@ -317,7 +317,9 @@ CREATE OR REPLACE TABLE IDENTIFIER(session.DEMO_TABLE) AS SELECT ...;
   - a hard-coded name in OPTIMIZE or VACUUM, which sqlglot reads only as
     commands.
 - **Ignored:** temporary views and CTEs, `read_files`, `system` and
-  `information_schema`, and ``delta.`/path` `` file reads.
+  `information_schema`, and ``delta.`/path` `` file reads. So is the text an
+  `EXECUTE IMMEDIATE` runs: it is a string, so a name hard-coded inside it is
+  not caught.
 
 The score is the share of permanent-table references that pass. `details`
 lists what fails, which is what the retry note quotes to the model. An answer

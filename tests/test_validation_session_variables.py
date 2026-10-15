@@ -9,14 +9,18 @@ one place. ``session_variables`` is the check that generated code does.
 
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 
+from target_language import SPARKSQL
 from validation import (
     EvaluationRun,
     Evaluator,
     SessionVariablesMetric,
     default_metrics,
 )
+from validation.metrics import _fenced_blocks
 from validation.table_names import check_table_names
 
 _FENCE = chr(96) * 3
@@ -316,3 +320,43 @@ def test_check_table_names_reads_blocks_in_order():
         ]
     )
     assert (found.checked, len(found.problems), found.unparsed) == (1, 1, 0)
+
+
+# ── the instructions practise the rule ──────────────────────────────────────
+
+_SPARKSQL_INSTRUCTIONS = (
+    pathlib.Path(__file__).resolve().parents[1] / "prompt_builder/instructions/sparksql"
+)
+
+
+def _instruction_sql() -> list[tuple[str, str]]:
+    """``(file#n, body)`` for every Spark SQL block the bundled instructions
+    show: what the model copies its naming from."""
+    found: list[tuple[str, str]] = []
+    for path in sorted(_SPARKSQL_INSTRUCTIONS.glob("*.md")):
+        blocks = _fenced_blocks(path.read_text(encoding="utf-8"))
+        found += [
+            (f"{path.stem}#{n}", body)
+            for n, (info, body) in enumerate(blocks)
+            if SPARKSQL.owns_fence(info)
+        ]
+    return found
+
+
+@pytest.mark.parametrize(
+    "sql", [pytest.param(body, id=label) for label, body in _instruction_sql()]
+)
+def test_every_instruction_sql_block_passes_what_it_teaches(sql):
+    assert SPARKSQL.check_syntax(sql) is None
+    found = check_table_names([sql])
+    assert (found.problems, found.unparsed) == ([], 0)
+
+
+def test_the_instruction_examples_name_permanent_tables():
+    # Not vacuous: the rule's own example and the worked example each name
+    # permanent tables, through variables.
+    checked = {
+        label: check_table_names([body]).checked for label, body in _instruction_sql()
+    }
+    assert checked["table_names#0"] == 2
+    assert max(n for label, n in checked.items() if label.startswith("examples#")) == 3
