@@ -19,6 +19,7 @@ The Delta round trip itself runs against a real session in
 
 from __future__ import annotations
 
+import logging
 import pathlib
 import sys
 from datetime import datetime
@@ -1041,6 +1042,102 @@ def test_a_library_declared_twice_is_planned_once():
 def test_an_spde_library_is_not_split_into_members():
     [item] = _plan(job="libname spd spde '/data/spde';\ndata a; set spd.big; run;\n").items
     assert item.source.kind is SourceKind.SPDE
+
+
+# ── rarer paths through the planner ──────────────────────────────────────────
+
+
+def _items(job: str) -> list[tuple[str, str, tuple[str, ...]]]:
+    return [(i.source.locator, i.source.object_name, i.blockers) for i in _plan(job=job).items]
+
+
+def test_a_data_set_read_by_a_double_quoted_path_through_a_macro_variable():
+    # SAS resolves &dir in double quotes, so the place is the variable's.
+    [(locator, member, blockers)] = _items('data a; set "&dir/master"; run;\n')
+    assert (locator, member) == ("&dir", "master")
+    assert "unresolved macro reference" in blockers[0]
+
+
+def test_a_data_set_read_by_the_path_of_another_kind_of_file_is_blocked():
+    [(locator, member, blockers)] = _items("data a; set '/data/in/x.csv'; run;\n")
+    assert (locator, member) == ("/data/in", "x.csv")
+    assert "names no SAS data file (.sas7bdat)" in blockers[0]
+
+
+def test_an_unassigned_fileref_s_file_is_the_current_directory_s():
+    # With no fileref of the name, SAS on UNIX reads qtr.dat from its current
+    # directory: the last cd's, or one no cd in the corpus sets.
+    for setup, read in (
+        ("", "qtr.dat from its current directory, which no cd in the corpus sets"),
+        ("x cd /data;\n", "/data/qtr.dat;"),
+    ):
+        [(_, _, blockers)] = _items(setup + "data a; infile qtr; input x; run;\n")
+        assert f"SAS on UNIX reads {read}" in blockers[0]
+
+
+def test_an_unassigned_library_names_each_dataset_it_reads_once():
+    [(_, _, blockers)] = _items("data a; set src.t; run;\ndata b; set src.t src.u; run;\n")
+    assert "the job reads src.t, src.u —" in blockers[0]
+
+
+def test_a_concatenation_reads_members_from_its_directories_alone():
+    # WORK holds no data a job loads, and a file of another engine no members;
+    # a library spelled through a macro variable may hold any, so the
+    # concatenation's library item stays.
+    assert _items("libname all (work '/y');\ndata a; set all.m; run;\n") == [("/y", "m", ())]
+    assert _items("libname all ('/data/a' '/data/b.xlsx');\ndata a; set all.m; run;\n") == [
+        ("/data/a", "m", ()),
+        ("/data", "b.xlsx", ()),
+    ]
+    [(locator, member, blockers)] = _items("libname all (&lib '/y');\ndata a; set all.m; run;\n")
+    assert (locator, member) == ("/y", "")
+    assert "is a library directory" in blockers[0]
+
+
+def test_a_relative_read_after_a_cd_the_plan_cannot_follow_is_blocked():
+    [(locator, member, blockers)] = _items("x cd &dir;\ndata a; infile 'f.csv'; input x; run;\n")
+    assert (locator, member) == ("", "f.csv")
+    assert "'f.csv' is a relative path" in blockers[0]
+
+
+def test_chunk_records_read_a_relative_path_from_the_cd_before_it():
+    results = _results(job="x cd /data/in;\ndata a; infile 'f.csv'; input x; run;\n")
+    from_chunks = _chunk_plan(results)
+    assert [(i.source.locator, i.source.object_name) for i in from_chunks.items] == [
+        ("/data/in", "f.csv")
+    ]
+    assert from_chunks.items == plan_from_inventory(inventory_rows(results), config=_config()).items
+
+
+def test_a_using_libname_placed_inside_its_chunk_serves_the_reads_after_it():
+    # Rows that place it after its chunk's first reference, as rows another
+    # tool wrote may, still bind it for the view's own read.
+    rows = _rows(job="%macro m;\n  libname raw '/data/raw';\n  data a; set raw.x; run;\n" + VIEW + "%mend;\n")
+    view = next(r for r in rows if r.statement == "using_libname")
+    order = [r for r in rows if r is not view]
+    order.insert(order.index(next(r for r in order if r.name == "src.t")), view)
+    rows = [r.model_copy(update={"ref_order": i}) for i, r in enumerate(order)]
+    plan = plan_from_inventory(rows, config=_config())
+    assert sorted((i.source.locator, i.source.object_name, i.blockers) for i in plan.items) == [
+        ("/data/raw", "x", ()),
+        ("/data/view", "t", ()),
+    ]
+
+
+def test_a_dataset_row_with_no_libref_names_no_library():
+    # Rows another tool wrote may hold one; it is no read of a library.
+    rows = [
+        r.model_copy(update={"name": "x"}) if r.name == "raw.x" else r
+        for r in _rows(job="libname raw '/data/raw';\ndata a; set raw.x; run;\n")
+    ]
+    plan = plan_from_inventory(rows, config=_config())
+    assert [(i.source.locator, i.source.object_name) for i in plan.items] == [("/data/raw", "")]
+
+
+def test_a_debug_run_names_the_unassigned_libraries(caplog):
+    with caplog.at_level(logging.DEBUG, logger="data_hydration.planner"):
+        _plan(job="data a; set src.t; run;\n")
+    assert "build_corpus_plan: unassigned libraries ['src']" in caplog.text
 
 
 # ── the table ────────────────────────────────────────────────────────────────

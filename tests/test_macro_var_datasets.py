@@ -41,6 +41,7 @@ from chunker.macro_vars import (
     let_values,
     macro_signature,
     resolve_refs,
+    scope_declarations,
     strip_quotes,
 )
 from chunker.metadata import _canon_ds
@@ -223,6 +224,11 @@ class TestReadOnly(unittest.TestCase):
         result = _chunk("%global / readonly lib=prod;\n%global/readonly ds=a.b;\n")
         declared = {v for c in result.chunks for v in c.metadata.declared_macro_vars}
         self.assertEqual(declared, {"lib", "ds"})
+
+    def test_a_word_that_names_no_variable_declares_nothing(self):
+        self.assertEqual(
+            scope_declarations("%global a 9z b;"), [("global", "a"), ("global", "b")]
+        )
 
 
 class TestMacroComments(unittest.TestCase):
@@ -651,6 +657,16 @@ class TestScope(unittest.TestCase):
         )
         step = _kind(_chunk(src), SasChunkKind.DATA_STEP)[-1]
         self.assertEqual(step.metadata.output_datasets, ["lib.t_five"])
+
+    def test_a_macro_called_after_an_external_one_still_sets_its_globals(self):
+        # %ext is defined outside the corpus and binds nothing; %m, later in
+        # the same statement, still runs.
+        src = (
+            "%let lib = prod;\n%macro m(x); %global lib; %let lib = test; %mend;\n"
+            "%ext(a) foo %m(b);\ndata y; set &lib..t; run;\n"
+        )
+        step = _kind(_chunk(src), SasChunkKind.DATA_STEP)[-1]
+        self.assertEqual(step.metadata.input_datasets, ["test.t"])
 
     def test_a_body_that_rewrites_its_parameter_still_reads_the_calls(self):
         """`%let ds = %upcase(&ds);` keeps the argument the call passed: the

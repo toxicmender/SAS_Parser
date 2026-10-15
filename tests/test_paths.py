@@ -275,6 +275,24 @@ class TestStatementForms:
         refs = extract_paths("proc export outfile='/out/a.csv'; run;")
         assert [r.statement for r in refs] == ["proc_export"]
 
+    def test_an_empty_quoted_value_in_a_list_names_nothing(self):
+        # The rest of the list is kept, each value in its place.
+        assert [r.raw for r in extract_paths("%include '' '/a.sas';")] == ["/a.sas"]
+        refs = extract_paths("libname x ('' '/a');")
+        assert [(r.raw, r.concat_index) for r in refs] == [("/a", 1)]
+
+    def test_each_value_s_own_quotes_decide_its_macro_references(self):
+        # SAS resolves `&` in double quotes and unquoted text, never in single
+        # quotes: each value of a list by its own quote, a cd's by its command's.
+        refs = extract_paths("%include '/a.sas' \"&root/b.sas\" '&lit/c.sas';")
+        assert [(r.raw, r.has_macro_ref) for r in refs] == [
+            ("/a.sas", False),
+            ("&root/b.sas", True),
+            ("&lit/c.sas", False),
+        ]
+        assert [r.has_macro_ref for r in extract_paths("x cd &dir;")] == [True]
+        assert [r.has_macro_ref for r in extract_paths("x 'cd &dir';")] == [False]
+
     def test_path_and_file_outside_an_ods_statement_are_no_ods_paths(self):
         # PATH= is an Oracle connect identifier and a CAS action's table too.
         # Before, any `path=` or `file=` was an ODS output: the inventory
@@ -739,6 +757,11 @@ class TestFilerefResolution:
             for c in result.chunks
             for r in c.metadata.external_refs
         ] == [("file", "fileref", "t", "temp"), ("infile", "fileref", "t", "temp")]
+        # The corpus resolves it again, as it does each file: unchanged.
+        from chunker import SasCorpus, resolve_corpus_references
+
+        corpus = SasCorpus(file_results=[result])
+        assert resolve_corpus_references(corpus).model_dump() == corpus.model_dump()
 
     def test_a_fileref_spelled_through_a_macro_variable(self):
         refs = self._refs("%let f = in;\nfilename &f '/data/x.csv';\ndata a; infile in; run;\n")

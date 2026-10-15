@@ -740,6 +740,18 @@ class TestStatementStructure(unittest.TestCase):
         self.assertIn("%str(a b% )", mt)
         self.assertEqual(_sanitise(text, blank_strings=False), text)
 
+    def test_a_gap_after_a_call_that_is_not_only_comments_stays_with_it(self):
+        # The scanner cuts after a call across whitespace and block comments
+        # alone; any other gap, or a comment that never closes, stays with
+        # the call.
+        from chunker.scanner import _call_and_comments, _Unit
+
+        for text, call in (("%a /* c */ y %b;", "%a /* c */ y "), ("%a /* open %b;", "%a /* open ")):
+            with self.subTest(text=text):
+                unit = _Unit(start=0, end=len(text), text=text)
+                pieces = _call_and_comments(unit, 0, 3, text.index("%b"))
+                self.assertEqual([p.text for p in pieces], [call])
+
     def test_a_macro_comment_is_blanked_to_its_first_unquoted_semicolon(self):
         # One in a string is no comment, and one with no semicolon runs on.
         from chunker.scanner import _sanitise, _without_macro_comments
@@ -1125,6 +1137,7 @@ class TestDebugLogging(unittest.TestCase):
             "proc sql;\nconnect to oracle (path=P);\n"
             "create table work.f as select * from connection to oracle (select * from s.t);\n"
             "quit;\n"
+            "libname user '/perm';\ndata g; set h; run;\n"
         ),
     }
 
@@ -1153,6 +1166,7 @@ class TestDebugLogging(unittest.TestCase):
             "index[ds-literal-body]",
             "macro_body_dataset: resolved param",
             "edge-skip[ds]",
+            "resolve_user_library:",
         ):
             self.assertIn(line, text)
 

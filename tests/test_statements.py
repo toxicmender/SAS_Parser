@@ -424,6 +424,8 @@ def test_a_documented_option_alias_names_what_its_option_does(src, refs):
         ("proc cimport library=mylib infile=tf; run;", [("mylib.:", W, "library=")]),
         ("proc cimport lib=x infile=tf; run;", [("x.:", W, "lib=")]),
         ("proc cimport l=x infile=tf; run;", [("x.:", W, "l=")]),
+        # A libref has no dot: a two-level name there names no library.
+        ("proc cimport library=a.b infile=tf; run;", []),
         # CATALOG= (CAT=, C=) holds no data set.
         ("proc cimport catalog=lib.cat infile=tf; run;", []),
         ("proc cimport c=lib.cat infile=tf; run;", []),

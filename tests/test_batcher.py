@@ -353,6 +353,35 @@ class TestMacroInvocation(unittest.TestCase):
             [call_chunk] = [c for c in chunks if c.kind is SasChunkKind.MACRO_CALL]
             self.assertEqual(call_chunk.metadata.input_datasets, [read], call)
 
+    def test_a_slice_whose_region_cannot_be_found_reads_its_own_header(self):
+        """A split definition's slices name their region, which comes before
+        them in their file. Where it does not, the slice stands for itself."""
+        from chunker.batcher import _CallBinder
+
+        chunker = SasSemanticChunker(min_words=1, max_words=9_999)
+        [macro] = chunker.chunk_text("%macro m(out=a); data &out; run; %mend;\n").chunks
+        child = macro.model_copy(update={"parent_id": "chunk-0099"})
+        region = macro.model_copy(update={"chunk_id": "chunk-0099"})
+        self.assertIs(_CallBinder([child], [0])._header_chunk(0), child)
+        # A chunk of that id in another file is not its region.
+        self.assertIs(_CallBinder([region, child], [0, 1])._header_chunk(1), child)
+        self.assertIs(_CallBinder([region, child], [0, 0])._header_chunk(1), region)
+
+    def test_a_batch_s_database_libnames_are_in_one_order(self):
+        """SasBatch.engine_refs deduplicates through a set, so it sorts:
+        engine, then libref."""
+        from chunker.models import SasBatch
+
+        chunks = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(
+            "libname zz oracle path=P schema=s;\nlibname aa teradata server=T;\n"
+            "libname bb oracle path=Q schema=t;\n"
+        ).chunks
+        batch = SasBatch(batch_id="b", chunks=chunks)
+        self.assertEqual(
+            [(r.engine, r.binds) for r in batch.engine_refs],
+            [("oracle", "bb"), ("oracle", "zz"), ("teradata", "aa")],
+        )
+
     def test_batching_returns_the_corpus_as_it_resolved_it(self):
         """complexity --hydration scores the batches and builds the reference
         inventory from one resolution: batch_resolved's corpus is the one

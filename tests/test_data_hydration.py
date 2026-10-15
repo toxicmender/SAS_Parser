@@ -115,6 +115,15 @@ class TestEngineSources:
 
 
 class TestPathSources:
+    def test_a_view_s_library_planned_from_paths_alone_is_blocked(self):
+        # With no datasets to bind it for, a CREATE VIEW's USING LIBNAME is
+        # its library, listed and blocked, as any directory LIBNAME is.
+        plan = _plan(
+            "proc sql; create view v as select * from src.t using libname src '/data/view'; quit;"
+        )
+        assert [(i.source.locator, i.source.object_name) for i in plan.items] == [("/data/view", "")]
+        assert "is a library directory" in plan.items[0].blockers[0]
+
     def test_a_sas_dataset_is_recognised_by_its_suffix(self):
         plan = _plan("infile '/data/marts/sales.sas7bdat';")
         item = plan.items[0]
@@ -754,6 +763,16 @@ class TestDatabaseTables:
             'SELECT * FROM "EDW_EXPORT"."CURRENT_NONIP"',
             'SELECT * FROM "CURRENT_NONIP"',
         }
+
+    def test_the_reader_selects_a_library_item_s_table_by_its_target(self):
+        # A database LIBNAME that no read names is one schema-level item: its
+        # reader selects the table the target names, in the LIBNAME's schema.
+        from data_hydration.sources.oracle import OracleReader
+
+        config = _config()
+        (item,) = _plan("libname arch oracle path=ARCHPRO schema=hist;").items
+        table = item.target_table.rsplit(".", 1)[-1].upper()
+        assert OracleReader(item, config)._sql() == f'SELECT * FROM "HIST"."{table}"'
 
     def test_the_credential_is_keyed_on_the_connection(self, monkeypatch):
         import types
