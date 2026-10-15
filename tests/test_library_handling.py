@@ -9,7 +9,8 @@ Guide: Essentials (Ch. 3 "Words and Names", Ch. 11 "SAS Libraries"):
 - LIBNAME statements populate ``defines_librefs``, and batches report the
   librefs they use but do not assign via ``SasBatch.required_librefs``;
 - a USER library assignment (``options user=...`` / ``libname user ...``)
-  emits the ``USER_LIBRARY_ASSIGNED`` diagnostic;
+  moves the one-level names after it into that library, and emits the
+  ``USER_LIBRARY_ASSIGNED`` diagnostic;
 - implicit _LAST_ flow (PROC with no DATA=, bare ``set;``, literal
   ``_last_``) and the _DATA_ / DATAn naming convention resolve to concrete
   dataset names in the batcher;
@@ -165,6 +166,139 @@ class TestUserLibraryDiagnostic(unittest.TestCase):
         self.assertNotIn("USER_LIBRARY_ASSIGNED", codes)
 
 
+class TestUserLibraryNames(unittest.TestCase):
+    """One-level names after a USER assignment live in that library. Before,
+    they stayed work.-canonicalised: `set y;` read a temporary work.y, and the
+    permanent /data/perm/y it really reads dropped out of the plan."""
+
+    def _names(self, src: str) -> list[tuple[str, str]]:
+        cr, _ = _chunk_and_batch(src)
+        return [
+            (r.name, r.role.value) for c in cr.chunks for r in c.metadata.dataset_refs
+        ]
+
+    def test_libname_user_moves_one_level_names_until_cleared(self):
+        src = (
+            "libname user '/data/perm';\ndata x; set y; run;\n"
+            "data z; set work.y; run;\nlibname user clear;\ndata q; set r; run;\n"
+        )
+        self.assertEqual(
+            self._names(src),
+            [
+                ("user.x", "write"),
+                ("user.y", "read"),
+                # A two-level WORK name stays in WORK.
+                ("user.z", "write"),
+                ("work.y", "read"),
+                ("work.q", "write"),
+                ("work.r", "read"),
+            ],
+        )
+
+    def test_a_name_literal_is_a_one_level_name(self):
+        src = "libname user '/data/perm';\ndata 'My Data'n; set 'src tab'n; run;\n"
+        self.assertEqual(
+            self._names(src),
+            [("user.'my data'n", "write"), ("user.'src tab'n", "read")],
+        )
+
+    def test_options_user_equates_a_libref_to_user(self):
+        src = (
+            "libname mine '/data/perm';\noptions user=mine;\ndata x; set y; run;\n"
+            "options user=work;\ndata q; set r; run;\n"
+        )
+        self.assertEqual(
+            self._names(src),
+            [("mine.x", "write"), ("mine.y", "read"), ("work.q", "write"), ("work.r", "read")],
+        )
+
+    def test_options_user_names_a_directory(self):
+        # "USER='pathname' | libref ... pathname identifies the directory
+        # containing your default permanent SAS library" (SAS 9.4 Companion for
+        # UNIX Environments, USER System Option: UNIX). Before, the quote was
+        # taken for a libref: `set y;` read '.y.
+        for option in ("user='/data/perm'", 'USER="/data/perm"', "nodate user='/data/perm'"):
+            src = f"options {option};\ndata x; set y; run;\n"
+            self.assertEqual(self._names(src), [("user.x", "write"), ("user.y", "read")], option)
+        refs = [
+            (r.statement, str(r.location), r.path, r.binds)
+            for c in SasSemanticChunker(min_words=1, max_words=9_999)
+            .chunk_text("options user='/Data/Perm';\n")
+            .chunks
+            for r in c.metadata.external_refs
+        ]
+        self.assertEqual(refs, [("user", "filesystem", "/data/perm", "user")])
+        # USER= of another statement (FTP's login) is no library.
+        self.assertEqual(self._names("filename f ftp 'x' user='bob';\ndata a; set b; run;\n")[1], ("work.b", "read"))
+
+    def test_blanks_around_the_equals_sign(self):
+        # Before, only `user=` written as one word assigned the library, and
+        # `set y;` read work.y.
+        for setup, lib in (
+            ("options user = '/data/perm';", "user"),
+            ("options obs=max user ='/data/perm' nonotes;", "user"),
+            ("libname mine '/data/perm';\noptions user= mine;", "mine"),
+        ):
+            src = f"{setup}\ndata x; set y; run;\n"
+            self.assertEqual(self._names(src), [(f"{lib}.x", "write"), (f"{lib}.y", "read")], setup)
+
+    def test_libname_all_clear_ends_the_user_library(self):
+        # "if you specify _ALL_, clears all librefs that are currently
+        # defined. Sasuser, Sashelp, and Work remain assigned" (SAS 9.4
+        # Companion for UNIX Environments, LIBNAME Statement: UNIX). Before,
+        # one-level names stayed in the User library after it.
+        for setup in (
+            "libname user '/data/perm';",
+            "options user='/data/perm';",
+            "libname mine '/data/perm';\noptions user=mine;",
+        ):
+            src = f"{setup}\nlibname _all_ clear;\ndata x; set y; run;\n"
+            self.assertEqual(self._names(src), [("work.x", "write"), ("work.y", "read")], setup)
+
+    def test_a_name_spelled_through_a_macro_variable_is_the_one_sas_reads(self):
+        # `set &t;` reads the name &t holds. Before, it counted as a one-level
+        # name, so work.x moved to user.x.
+        for value, read in (("work.x", "work.x"), ("x", "user.x"), ("prod.x", "prod.x")):
+            src = f"%let t = {value};\nlibname user '/data/perm';\ndata y; set &t; run;\n"
+            self.assertEqual(self._names(src)[-1], (read, "read"), value)
+
+    def test_options_user_through_a_macro_variable(self):
+        # Before, `y` became `&ulib.y`, which SAS reads as the one-level
+        # `permy`, and each run of the passes added another `perm`.
+        from chunker import SasCorpus, resolve_corpus_datasets
+
+        src = "%let ulib = perm;\nlibname perm '/p';\noptions user=&ulib;\ndata x; set y; run;\n"
+        self.assertEqual(self._names(src), [("perm.x", "write"), ("perm.y", "read")])
+        # Unknown, the libref stays spelled through it, a dot for each part.
+        src = "options user=&ulib;\ndata x; set y; run;\n"
+        self.assertEqual(self._names(src), [("&ulib..x", "write"), ("&ulib..y", "read")])
+        result = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(src, source_id="j.sas")
+        once = resolve_corpus_datasets(SasCorpus(file_results=[result]))
+        self.assertEqual(resolve_corpus_datasets(once).model_dump(), once.model_dump())
+
+    def _plan(self, src: str):
+        from chunker import SasCorpus, resolve_corpus_datasets
+        from data_hydration.config import HydrationConfig
+        from data_hydration.inventory import inventory_rows, plan_from_inventory
+
+        result = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(src, source_id="j.sas")
+        rows = inventory_rows(resolve_corpus_datasets(SasCorpus(file_results=[result])).file_results)
+        return plan_from_inventory(rows, config=HydrationConfig(catalog="main"))
+
+    def test_the_permanent_dataset_is_planned(self):
+        for assign in (
+            "libname user '/data/perm';",
+            "options user='/data/perm';",
+            "options user = '/data/perm';",
+        ):
+            plan = self._plan(f"{assign}\ndata x; set y; run;\n")
+            self.assertEqual(
+                [(i.source.locator, i.source.object_name, i.blockers) for i in plan.items],
+                [("/data/perm", "y", ())],
+                assign,
+            )
+
+
 # ── 4. Implicit _LAST_ / _DATA_ resolution ─────────────────────────────────
 
 
@@ -195,6 +329,33 @@ class TestImplicitLastResolution(unittest.TestCase):
         _, br = _chunk_and_batch(src)
         self.assertEqual(len(br.batches), 1)
         self.assertIn("work.data1", br.batches[0].output_datasets)
+
+    def test_an_unnamed_data_step_creates_datan_and_becomes_last(self):
+        # `data;` "automatically creates data sets with the names DATA1,
+        # DATA2, and so on": PROC PRINT with no DATA= then reads it, not the
+        # named step before. Before, the unnamed step wrote nothing, and the
+        # PRINT was linked to work.a.
+        src = (
+            "data work.a; x=1; run;\n"
+            "data; set work.a; y=2; run;\n"
+            "proc print; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertIn("work.data1", br.batches[0].output_datasets)
+        self.assertIn("dataset_flow(work.data1)", br.batches[0].reason)
+
+    def test_only_a_data_statement_naming_no_data_set_creates_datan(self):
+        chunker = SasSemanticChunker(min_words=1, max_words=9_999)
+        for src in ("data / debug; x=1; run;\n", "data; x=1; run;\n"):
+            [chunk] = chunker.chunk_text(src).chunks
+            self.assertEqual(
+                [(r.name, r.role.value) for r in chunk.metadata.dataset_refs],
+                [("_data_", "write")],
+            )
+        for src in ("data _null_; x=1; run;\n", "data view=v; describe; run;\n"):
+            [chunk] = chunker.chunk_text(src).chunks
+            self.assertEqual(list(chunk.metadata.dataset_refs), [], src)
 
     def test_datan_counter_increments(self):
         src = (

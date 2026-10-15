@@ -21,12 +21,15 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterable
+from operator import attrgetter
 from typing import TYPE_CHECKING
 
 from chunker.keywords import SAS_FUNCTION_CATEGORIES
 from chunker.models import (
+    PathLocation,
     SasBatch,
     SasChunk,
+    SasChunkMetadata,
     SasDiagnostic,
 )
 import token_budget as tokens
@@ -305,26 +308,35 @@ def _kinds_for_item(item: SasBatch) -> set[str]:
     return {c.kind.value for c in item.chunks}
 
 
+def _names(location: PathLocation) -> Callable[[SasChunkMetadata], bool]:
+    """Whether a chunk names a place of kind *location*, known or not."""
+    return lambda meta: any(r.location is location for r in meta.external_refs)
+
+
 # Metadata predicate flags, keyed by the ``[meta: ...]`` token an instruction
-# scopes on. Each maps to a metadata attribute that is truthy when the flag
+# scopes on. Each maps to a predicate on the metadata, truthy when the flag
 # holds; the pipeline owns this vocabulary so prompt_builder treats the tokens
 # as opaque. Kept in sync with the docstring in user_instructions.py.
-_META_FLAG_ATTRS: tuple[tuple[str, str], ...] = (
-    ("symput_hazard", "symput_scope_hazard"),
-    ("abort", "contains_abort"),
-    ("computed_goto", "contains_computed_goto"),
-    ("component_object", "component_objects"),
-    ("unclosed_block", "has_unclosed_block"),
-    ("includes", "includes"),
+_META_FLAGS: tuple[tuple[str, Callable[[SasChunkMetadata], object]], ...] = (
+    ("symput_hazard", attrgetter("symput_scope_hazard")),
+    ("abort", attrgetter("contains_abort")),
+    ("computed_goto", attrgetter("contains_computed_goto")),
+    ("component_object", attrgetter("component_objects")),
+    ("unclosed_block", attrgetter("has_unclosed_block")),
+    ("includes", attrgetter("includes")),
     # An item that names a filesystem location or reaches a remote service has
     # a translation problem no construct key describes — the path itself has to
-    # become something on the target — so it gets its own scope token.
-    ("physical_paths", "physical_paths"),
-    ("remote_paths", "remote_paths"),
-    ("defines_macros", "defines_macros"),
-    ("invokes_macros", "invokes_macros"),
-    ("produces_macrovars", "produces_macrovars"),
-    ("automatic_vars", "referenced_automatic_vars"),
+    # become something on the target — so it gets its own scope token. A
+    # wildcard or a place nobody can name yet has that problem too, so these
+    # two hold for one; the two after them single those out.
+    ("physical_paths", _names(PathLocation.FILESYSTEM)),
+    ("remote_paths", _names(PathLocation.REMOTE)),
+    ("wildcard_paths", attrgetter("wildcard_paths")),
+    ("unresolved_paths", attrgetter("unresolved_paths")),
+    ("defines_macros", attrgetter("defines_macros")),
+    ("invokes_macros", attrgetter("invokes_macros")),
+    ("produces_macrovars", attrgetter("produces_macrovars")),
+    ("automatic_vars", attrgetter("referenced_automatic_vars")),
 )
 
 
@@ -338,8 +350,8 @@ def _meta_flags_for_item(item: SasBatch) -> set[str]:
     flags: set[str] = set()
     for chunk in item.chunks:
         m = chunk.metadata
-        for token, attr in _META_FLAG_ATTRS:
-            if token not in flags and getattr(m, attr):
+        for token, holds in _META_FLAGS:
+            if token not in flags and holds(m):
                 flags.add(token)
     return flags
 
@@ -455,6 +467,10 @@ def _format_batch_message(
         required_macros=_fmt_list(batch.required_macros),
         defined_macros=_fmt_list(batch.defined_macros),
         required_librefs=_fmt_list(batch.required_librefs),
+        # Oracle (or other database) tables the batch reads or writes, in the
+        # database's own terms and linked to the SAS copy — the one place the
+        # model learns that `work.nonip` *is* `edw_export.current_nonip`.
+        db_tables=_fmt_list([str(t) for t in batch.db_tables]),
         standard_autocall_macros=_fmt_list(batch.standard_autocall_macros),
         required_macrovars=_fmt_list(batch.required_macrovars),
         produced_macrovars=_fmt_list(batch.produced_macrovars),

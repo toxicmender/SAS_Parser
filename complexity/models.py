@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, computed_field
 # The chunker's record of one external location. Re-exported so a consumer
 # reading a complexity report never has to know which package first named it.
 from chunker.models import PathLocation as PathLocation
+from chunker.models import SasDbTableRef as SasDbTableRef
 from chunker.models import SasPathRef as SasPathRef
 
 # Re-exported, not merely used: this module is the import site every caller
@@ -132,11 +133,19 @@ class ChunkComplexity(_ComplexityBase):
     # are small, and a rollup needs them per chunk to be auditable.
     input_datasets: list[str] = Field(default_factory=list)
     output_datasets: list[str] = Field(default_factory=list)
+    # Of those, the ones it updates in place without creating them (MODIFY,
+    # APPEND BASE=, SQL INSERT/UPDATE/DELETE), and the ones it deletes (PROC
+    # DATASETS DELETE, SQL DROP).
+    updated_datasets: list[str] = Field(default_factory=list)
+    dropped_datasets: list[str] = Field(default_factory=list)
     # The external locations this chunk names — the filesystem paths, remote
     # services and mailboxes behind its LIBNAME/FILENAME/INFILE/... statements.
     # Carried up for the same reason as the datasets above: a file's path list
     # has to be auditable against the chunks it was rolled up from.
     external_refs: list[SasPathRef] = Field(default_factory=list)
+    # The database tables this chunk reads or writes — SQL pass-through and
+    # database-engine LIBNAMEs — carried up for the same audit trail.
+    db_tables: list[SasDbTableRef] = Field(default_factory=list)
 
     def __str__(self) -> str:
         return (
@@ -266,18 +275,28 @@ class FileComplexity(_ComplexityBase):
     # with nothing explaining it reads as a bug in one of the two.
     comment_chunk_count: int = 0
     # The file's data interface, split three ways because the three mean
-    # different things to whoever migrates it: `input_datasets` are read but not
-    # written here, so they must exist before this file runs;
-    # `intermediate_datasets` are written and read within it, so they are
-    # internal and nobody outside needs to provide them; `output_datasets` is
-    # everything it writes, which is what downstream files may be waiting on.
+    # different things to whoever migrates it: `input_datasets` are read (or
+    # updated in place) but not created here, so they must exist before this
+    # file runs; `intermediate_datasets` are created and read within it, so they
+    # are internal and nobody outside needs to provide them; `output_datasets`
+    # is everything it writes, which is what downstream files may be waiting on.
     input_datasets: list[str] = Field(default_factory=list)
     output_datasets: list[str] = Field(default_factory=list)
     intermediate_datasets: list[str] = Field(default_factory=list)
+    # Datasets the file updates in place — each also an output above, and an
+    # input unless the file creates it too; the place a migration most easily
+    # turns an append into an overwrite — and the ones it deletes.
+    updated_datasets: list[str] = Field(default_factory=list)
+    dropped_datasets: list[str] = Field(default_factory=list)
     # Everywhere outside the SAS libraries this file reaches. Reported, never
     # scored: like the dataset interface above it says what a migration has to
     # provision, which is not the same question as how hard the code is.
     external_refs: list[SasPathRef] = Field(default_factory=list)
+    # The database tables this file reads or writes, in the database's own
+    # terms (Oracle owner and table), with the SAS copies they land in.
+    # Reported, never scored, for the same reason as ``external_refs``; kept
+    # apart from the dataset lists because they are a different namespace.
+    db_tables: list[SasDbTableRef] = Field(default_factory=list)
     chunks: list[ChunkComplexity] = Field(default_factory=list)
     cross_file: CrossFileProfile | None = None
     # Batch ids inside this file, offered as cut points when it needs breaking

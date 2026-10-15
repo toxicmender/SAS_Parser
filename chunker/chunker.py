@@ -11,12 +11,20 @@ import re
 import sys
 import time
 from collections.abc import Iterable
+from dataclasses import replace
 from pathlib import Path
 from typing import TextIO
 
 import app_config
 
-from .metadata import _merge_meta, _metadata_for, _title, resolve_macro_var_refs
+from .keywords import RUN_GROUP_PROCS
+from .metadata import (
+    _merge_meta,
+    _metadata_for,
+    _title,
+    assigns_user_library,
+    resolve_references,
+)
 from .models import (
     SasBatchResult,
     SasChunk,
@@ -28,27 +36,36 @@ from .models import (
 )
 from .scanner import (
     _BLOCK_OPENERS,
+    _IN_STREAM_RE,
     _MEND_RE,
+    _PROC_NAME_RE,
+    _STEP_END_RE,
+    UnitRole,
     _Deadline,
     _ParseWatchdog,
     _Region,
     _Unit,
     _classify,
     _classify_normed,
-    _is_stmt_comment,
+    _in_stream_units,
     _line_for,
     _line_starts,
+    _macro_quote_end,
     _norm,
     _record_parser_timeout,
+    _split_after_calls,
+    _statement_role,
     _ws_end,
 )
 
 logger = logging.getLogger(__name__)
 
 # The characters _scan_units cares about outside a quoted string: a statement
-# terminator, a quote opener, or a block-comment opener ("/" alone is ordinary
-# statement text and deliberately not an event).
-_SCAN_EVENT_RE = re.compile(r"[;'\"]|/\*")
+# terminator, a quote opener, a block-comment opener ("/" alone is ordinary
+# statement text and deliberately not an event), or %STR / %NRSTR, whose
+# argument may hold semicolons (scanner._MACRO_QUOTE_RE). Every alternative
+# opens with a literal, so the engine skips ahead on the first characters alone.
+_SCAN_EVENT_RE = re.compile(r";|'|\"|/\*|%(?:nr)?str\s*\(", re.IGNORECASE)
 
 
 def _record_user_library(
@@ -60,9 +77,10 @@ def _record_user_library(
     Per the SAS Programmer's Guide: Essentials (pp. 236, 252-253), assigning
     a USER library — via the ``USER=`` system option or a ``libname user``
     statement — redirects one-level dataset names to that (permanent)
-    library instead of the temporary WORK library.  That invalidates the
-    ``work.``-canonicalisation :func:`_canon_ds` applies, so the condition
-    is surfaced as a diagnostic rather than silently mis-resolved.
+    library instead of the temporary WORK library.
+    :func:`~chunker.metadata.resolve_user_library` moves the names it can see
+    after the assignment; the diagnostic says so, since one made at invocation
+    (``-user``) moves names this parse cannot see.
     Idempotent, mirroring :func:`_record_parser_timeout`.
 
     Called on the whole chunk list once :func:`resolve_macro_var_refs` has run,
@@ -71,28 +89,24 @@ def _record_user_library(
     if any(d.code == "USER_LIBRARY_ASSIGNED" for d in diagnostics):
         return
     for chunk in chunks:
-        meta = chunk.metadata
-        assigns_user = "user" in meta.defines_librefs or (
-            chunk.kind == SasChunkKind.OPTIONS
-            and any(t == "user" or t.startswith("user=") for t in meta.options)
-        )
-        if not assigns_user:
+        if not assigns_user_library(chunk):
             continue
-        logger.warning(
+        logger.info(
             f"_record_user_library: USER library assigned near line "
-            f"{chunk.start_line}; one-level dataset names resolve to USER, "
-            f"not WORK — canonicalised names may be inaccurate"
+            f"{chunk.start_line}; one-level dataset names after it resolve to "
+            f"USER, not WORK"
         )
         diagnostics.append(
             SasDiagnostic(
                 code="USER_LIBRARY_ASSIGNED",
                 message=(
                     "A USER library is assigned (USER= system option or "
-                    "LIBNAME USER), so one-level dataset names resolve to "
-                    "the USER library, not WORK; the work.-canonicalised "
-                    "dataset names in this result may be inaccurate."
+                    "LIBNAME USER), so one-level dataset names after it "
+                    "resolve to that library, not WORK, and are recorded "
+                    "there. A USER library assigned at invocation (-user) "
+                    "is not seen."
                 ),
-                severity=SasDiagnosticSeverity.WARNING,
+                severity=SasDiagnosticSeverity.INFO,
                 start_line=chunk.start_line,
                 end_line=chunk.end_line,
             )
@@ -103,6 +117,34 @@ def _record_user_library(
 # ---------------------------------------------------------------------------
 # Public chunker
 # ---------------------------------------------------------------------------
+
+
+#: What a file that is not valid UTF-8 is read as: the session encoding SAS
+#: uses on UNIX unless told otherwise (ENCODING= ``latin1`` for ``en_US``), and
+#: an encoding in which every byte decodes, so no file is ever lost to one.
+_FALLBACK_ENCODING = "latin-1"
+
+
+def read_sas_source(path: str | Path, encoding: str | None = None) -> str:
+    """The text of the SAS file at *path*.
+
+    With *encoding*, decoded strictly in it. Without, as UTF-8 — a byte-order
+    mark dropped, since Windows editors add one — and, when the bytes are not
+    valid UTF-8, as Latin-1. Code written on an AIX or Linux SAS server is
+    Latin-1 more often than not, and a single ``é`` in a comment, or the
+    ``¬=`` SAS reads as *not equal*, made a strict UTF-8 read raise.
+    """
+    data = Path(path).read_bytes()
+    if encoding is not None:
+        return data.decode(encoding)
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        logger.info(
+            f"read_sas_source: '{path}' is not UTF-8 (byte {exc.start}); "
+            f"read as {_FALLBACK_ENCODING}"
+        )
+        return data.decode(_FALLBACK_ENCODING)
 
 
 class SasSemanticChunker:
@@ -127,6 +169,11 @@ class SasSemanticChunker:
         so far (a background watchdog also logs the stuck phase throughout).
         Pass ``None`` to disable both safeguards and parse unbounded.  Defaults
         to 60s, comfortably above any healthy parse.
+    encoding : str | None
+        How ``chunk_file`` decodes a file, strictly. ``None`` (default) reads
+        ``sas_chunker.encoding`` from config.json, and failing that decodes
+        each file as UTF-8 and, when it is not valid UTF-8, as Latin-1 — see
+        :func:`read_sas_source`.
     """
 
     def __init__(
@@ -135,10 +182,14 @@ class SasSemanticChunker:
         min_words: int | None = None,
         max_words: int | None = None,
         timeout: float | None = 60.0,
+        encoding: str | None = None,
     ) -> None:
         self.min_words = app_config.resolve(min_words, "sas_chunker", "min_words", 300)
         self.max_words = app_config.resolve(max_words, "sas_chunker", "max_words", 700)
         self.timeout = timeout
+        self.encoding: str | None = app_config.resolve(
+            encoding, "sas_chunker", "encoding", None
+        )
         logger.debug(
             f"SasSemanticChunker  min_words={min_words}  max_words={max_words}  "
             f"timeout={timeout}"
@@ -155,7 +206,7 @@ class SasSemanticChunker:
         if not fp.exists():
             logger.error(f"chunk_file: file not found '{fp}'")
             raise FileNotFoundError(fp)
-        source = fp.read_text(encoding="utf-8")
+        source = read_sas_source(fp, self.encoding)
         line_count = source.count("\n") + 1
         logger.debug(f"chunk_file: {len(source)} bytes / {line_count} lines  '{fp}'")
         return self.chunk_text(source, source_id=str(fp))
@@ -210,13 +261,14 @@ class SasSemanticChunker:
                     )
                 )
 
-            # A %LET assigns a name the chunks *after* it use, so dataset and
-            # libref references spelled through macro variables can only be
-            # resolved once the whole file has been built. Runs inside the
-            # watchdog because it is still parse work; a partial result from a
-            # deadline exit is resolved as far as it got.
-            watchdog.set_phase("macro-variable resolution")
-            resolve_macro_var_refs(chunks)
+            # A %LET or a database LIBNAME gives meaning to names in the
+            # chunks *after* it, so references spelled through macro variables
+            # and SAS names under a database libref can only be resolved once
+            # the whole file has been built. Runs inside the watchdog because
+            # it is still parse work; a partial result from a deadline exit is
+            # resolved as far as it got.
+            watchdog.set_phase("reference resolution")
+            resolve_references(chunks)
             # After resolution, so `%let u = user; libname &u '/u/perm';`
             # raises the diagnostic too — the whole point of it is that
             # one-level names stop resolving to WORK, and that is just as true
@@ -248,13 +300,18 @@ class SasSemanticChunker:
         index = 0
         quote: str | None = None
         ticks = 0
+        # Parentheses already paired by _macro_quote_end, kept for the parse.
+        paired: dict[int, int] = {}
 
         # The scan jumps between "event" characters — statement terminators,
-        # quote openers, and block-comment openers — via a compiled search
-        # instead of visiting every character in Python; everything between
-        # events is ordinary statement text that needs no inspection. One
-        # iteration of this loop handles one event (or one quote-close /
-        # doubled-quote escape while inside a string).
+        # quote openers, block-comment openers and macro quoting functions —
+        # via a compiled search instead of visiting every character in
+        # Python; everything between events is ordinary statement text that
+        # needs no inspection. One iteration of this loop handles one event
+        # (or one quote-close / doubled-quote escape while inside a string).
+        # A statement opening in-stream data or a SUBMIT block hands the
+        # lines after it to _in_stream_units, and the scan resumes where SAS
+        # statements do.
         while index < len(source):
             # Deadline check, gated behind a tick counter so perf_counter() is
             # sampled ~once per 256 events (this is the hottest loop).
@@ -312,7 +369,7 @@ class SasSemanticChunker:
                         start=stmt_start,
                         end=end,
                         text=source[stmt_start:end],
-                        is_comment=True,
+                        role=UnitRole.COMMENT,
                         terminated=(comment_end != -1),
                         unclosed_comment=(comment_end == -1),
                     )
@@ -340,42 +397,67 @@ class SasSemanticChunker:
                 index = len(source) if comment_end == -1 else comment_end + 2
                 continue
 
+            # ── macro quoting function: its argument's ";" ends nothing ─────
+            if char == "%":
+                close = _macro_quote_end(source, m.end(), paired)
+                # One that never closes quotes nothing: scan on inside it.
+                index = m.end() if close == -1 else close
+                continue
+
             # ── statement terminator (the only remaining event kind: ";") ───
-            end = _ws_end(source, index + 1)
+            # A macro call needs no semicolon, so one unit may hold a call and
+            # the statements after it: _split_after_calls cuts them apart.
+            term = index + 1
+            end = _ws_end(source, term)
             text = source[stmt_start:end]
-            is_comment = _is_stmt_comment(text)
-            units.append(
-                _Unit(
-                    start=stmt_start,
-                    end=end,
-                    text=text,
-                    is_comment=is_comment,
-                )
+            role = _statement_role(text)
+            pieces = _split_after_calls(
+                _Unit(start=stmt_start, end=end, text=text, role=role)
             )
+            # In-stream data and SUBMIT code begin on the line after the
+            # statement that opens them, which keeps the rest of its own line.
+            last = pieces[-1]
+            in_stream = (
+                _IN_STREAM_RE.fullmatch(source, last.start, term)
+                if last.role is UnitRole.CODE
+                else None
+            )
+            if in_stream is not None:
+                newline = source.find("\n", term)
+                end = len(source) if newline == -1 else newline + 1
+                pieces[-1] = replace(last, end=end, text=source[last.start : end])
+            units.extend(pieces)
             if logger.isEnabledFor(logging.DEBUG):
                 text_preview = text[:60].replace("\n", "↵")
+                cut = f"  pieces={len(pieces)}" if len(pieces) > 1 else ""
                 logger.debug(
                     f"_scan_units: stmt  line={_line_for(stmt_start, line_starts)}  "
-                    f"comment={is_comment}  text={text_preview!r}"
+                    f"role={role.value}  text={text_preview!r}{cut}"
                 )
             stmt_start = None
             index = end
+            if in_stream is not None:
+                opaque, index = _in_stream_units(source, end, in_stream)
+                units.extend(opaque)
 
-        # trailing unterminated fragment
+        # trailing unterminated fragment — complete after all when it ends in
+        # a macro call, which needs no semicolon
         if stmt_start is not None and stmt_start < len(source):
             text = source[stmt_start:]
             if text.strip():
-                line = _line_for(stmt_start, line_starts)
-                logger.warning(f"_scan_units: unterminated statement at line {line}")
-                units.append(
+                pieces = _split_after_calls(
                     _Unit(
                         start=stmt_start,
                         end=len(source),
                         text=text,
-                        is_comment=_is_stmt_comment(text),
+                        role=_statement_role(text),
                         terminated=False,
                     )
                 )
+                if not pieces[-1].terminated:
+                    line = _line_for(pieces[-1].start, line_starts)
+                    logger.warning(f"_scan_units: unterminated statement at line {line}")
+                units.extend(pieces)
 
         non_empty = [u for u in units if u.text]
         logger.debug(
@@ -449,12 +531,14 @@ class SasSemanticChunker:
             unit = units[index]
             stripped = unit.text.strip()
 
-            if not stripped:
+            # Empty text, and in-stream data or SUBMIT code outside any step:
+            # nothing to classify.
+            if not stripped or unit.role in (UnitRole.DATALINES, UnitRole.FOREIGN):
                 unknown.append(unit)
                 index += 1
                 continue
 
-            if unit.is_comment:
+            if unit.role is UnitRole.COMMENT:
                 flush_unknown()
                 regions.append(
                     _Region(
@@ -547,10 +631,17 @@ class SasSemanticChunker:
         Collect all _Units belonging to a DATA / PROC / %MACRO block.
 
         A block ends when one of the following is encountered:
-        - An explicit ``RUN;`` or ``QUIT;`` statement     (DATA / PROC)
+        - An explicit ``RUN;``, ``RUN CANCEL;`` or ``QUIT;`` (DATA / PROC)
         - The matching ``%MEND;`` statement                (%MACRO)
         - A new DATA, PROC, or %MACRO header              (implicit close)
         - End of file                                     (unclosed block)
+
+        A PROC in :data:`~chunker.keywords.RUN_GROUP_PROCS` (DATASETS, REG,
+        SQL, …) runs in groups: RUN executes one and the PROC stays active,
+        so only QUIT ends it. Met by the next step or the end of the file
+        instead, it ended at its last RUN — the block is cut back there,
+        closed, and what followed is open code again. PROC DS2 holds DATA
+        programs of its own, so a DATA header does not end it.
 
         Nested ``%MACRO`` definitions are balanced: a macro body may contain
         inner ``%MACRO``/``%MEND`` pairs, so the block is closed only by the
@@ -559,7 +650,8 @@ class SasSemanticChunker:
 
         Critically, FORMAT, LABEL, OPTIONS, LIBNAME, ODS, TITLE, and all
         other statement types are treated as ordinary body statements and
-        collected without closing the block.
+        collected without closing the block, as is every unit that is not
+        code (comments, in-stream data, SUBMIT code).
         """
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"_collect_block: {kind.value}  start_unit={start}")
@@ -569,11 +661,27 @@ class SasSemanticChunker:
         # (MACRO_DEFINITION only): the block closes on the %MEND matching this
         # macro's own header.
         macro_depth = 0
+        step = kind in {SasChunkKind.DATA_STEP, SasChunkKind.PROC_STEP}
+        proc = ""
+        if kind == SasChunkKind.PROC_STEP:
+            m = _PROC_NAME_RE.match(_norm(units[start].text))
+            proc = m.group(1) if m else ""
+        run_groups = proc in RUN_GROUP_PROCS
+        # Run-group PROCs only: units up to and including the last RUN.
+        through_run = 0
+
+        def cut_at_last_run() -> tuple[list[_Unit], int, bool]:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"_collect_block: PROC {proc.upper()} ended at its last RUN  "
+                    f"units={through_run}"
+                )
+            return block[:through_run], start + through_run, False
 
         while index < len(units):
             unit = units[index]
 
-            if unit.is_comment:
+            if unit.role is not UnitRole.CODE:
                 block.append(unit)
                 index += 1
                 continue
@@ -588,8 +696,11 @@ class SasSemanticChunker:
                 cls is not None
                 and cls in _BLOCK_OPENERS
                 and block
-                and kind in {SasChunkKind.DATA_STEP, SasChunkKind.PROC_STEP}
+                and step
+                and not (proc == "ds2" and cls == SasChunkKind.DATA_STEP)
             ):
+                if through_run:
+                    return cut_at_last_run()
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
                         f"_collect_block: implicit close  {kind.value} at unit {index}  next_kind={cls.value}"
@@ -627,16 +738,18 @@ class SasSemanticChunker:
                     )
                 return block, index, False
 
-            if kind in {SasChunkKind.DATA_STEP, SasChunkKind.PROC_STEP} and lowered in {
-                "run",
-                "quit",
-            }:
+            if step and (ended := _STEP_END_RE.fullmatch(lowered)):
+                if run_groups and ended.group(1):
+                    through_run = len(block)
+                    continue
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
                         f"_collect_block: RUN/QUIT → closed {kind.value}  units={len(block)}"
                     )
                 return block, index, False
 
+        if through_run:
+            return cut_at_last_run()
         logger.warning(
             f"_collect_block: EOF without closing {kind.value}  units={len(block)}"
         )
@@ -670,7 +783,7 @@ class SasSemanticChunker:
         logger.info(
             f"_chunks_for_region: oversized {region.kind.value}  words={wc} > max={self.max_words}  lines={sl}-{el}  splitting"
         )
-        parent_meta = _metadata_for(region.text, region.kind)
+        parent_meta = _metadata_for(region)
         parent_meta.has_unclosed_block = region.unclosed
         parent_chunk = self._make_chunk(
             source_id,
@@ -716,7 +829,7 @@ class SasSemanticChunker:
                 )
                 child_meta = _merge_meta(
                     parent_meta,
-                    _metadata_for(cr.text, region.kind),
+                    _metadata_for(cr),
                 )
                 child_meta.has_unclosed_block = region.unclosed
                 child = self._make_chunk(
@@ -749,7 +862,7 @@ class SasSemanticChunker:
             )
             child_meta = _merge_meta(
                 parent_meta,
-                _metadata_for(cr.text, region.kind),
+                _metadata_for(cr),
             )
             child_meta.has_unclosed_block = region.unclosed
             child = self._make_chunk(
@@ -795,7 +908,7 @@ class SasSemanticChunker:
         parent_id: str | None = None,
         metadata: SasChunkMetadata | None = None,
     ) -> SasChunk:
-        meta = metadata or _metadata_for(region.text, region.kind)
+        meta = metadata or _metadata_for(region)
         meta.has_unclosed_block = region.unclosed
         return SasChunk(
             chunk_id=f"chunk-{index + 1:04d}",

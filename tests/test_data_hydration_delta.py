@@ -342,3 +342,123 @@ class TestThroughTheRunner:
         assert not report.ok
         assert report.outcomes[0].status is ItemStatus.FAILED
         assert "FileNotFoundError" in (report.outcomes[0].error or "")
+
+
+class TestTheReferenceInventory:
+    """The inventory table, written and read back through a real Delta session:
+    one run per write, the latest read by default, rows unchanged."""
+
+    @pytest.fixture
+    def inventory(self, delta_spark):
+        delta_spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMA}")
+        table = f"{CATALOG}.{SCHEMA}.sas_refs"
+        yield table
+        delta_spark.sql(f"DROP TABLE IF EXISTS {table}")
+
+    @staticmethod
+    def _rows(source: str, run_id: str):
+        from chunker import SasCorpus, SasSemanticChunker, resolve_corpus_references
+        from data_hydration.inventory import inventory_rows
+
+        result = SasSemanticChunker().chunk_text(source, source_id="job.sas")
+        corpus = resolve_corpus_references(SasCorpus(file_results=[result]))
+        return inventory_rows(corpus.file_results, run_id=run_id)
+
+    def test_rows_survive_the_round_trip(self, delta_spark, inventory):
+        from data_hydration.inventory import read_inventory, write_inventory
+
+        rows = self._rows(
+            "%let root = /SASData;\nlibname raw \"&root/raw\";\n"
+            "libname edw oracle path=EDWPRO schema=fr_dm pass=\"x\";\n"
+            "data a; set raw.customers edw.accounts &lib..x; run;\n",
+            run_id="20260101T000000Z-00000001",
+        )
+        assert write_inventory(rows, inventory, spark=delta_spark) == len(rows)
+        back = read_inventory(inventory, spark=delta_spark)
+        # Timestamps come back in the session's zone; everything else as written.
+        strip = [r.model_copy(update={"recorded_at": None}) for r in rows]
+        assert [r.model_copy(update={"recorded_at": None}) for r in back] == strip
+        detail = delta_spark.sql(f"DESCRIBE DETAIL {inventory}").first()
+        assert detail["format"] == "delta"
+
+    def test_each_write_is_a_run_and_the_latest_is_read(self, delta_spark, inventory):
+        from data_hydration.inventory import read_inventory, write_inventory
+
+        first = self._rows("data a; set lib.one; run;\n", run_id="20260101T000000Z-00000001")
+        second = self._rows("data a; set lib.two; run;\n", run_id="20260102T000000Z-00000002")
+        write_inventory(first, inventory, spark=delta_spark)
+        write_inventory(second, inventory, spark=delta_spark)
+
+        def names(rows):
+            return {r.name for r in rows}
+
+        assert names(read_inventory(inventory, spark=delta_spark)) == {"lib.two", "work.a"}
+        pinned = read_inventory(inventory, spark=delta_spark, run_id=first[0].run_id)
+        assert names(pinned) == {"lib.one", "work.a"}
+        assert delta_spark.table(inventory).count() == len(first) + len(second)
+
+    def test_the_latest_run_is_the_corpus_asked_for(self, delta_spark, inventory):
+        from data_hydration.inventory import read_inventory, write_inventory
+
+        prod = self._rows("data a; set lib.prod; run;\n", run_id="20260101T000000Z-00000001")
+        trial = self._rows("data a; set lib.trial; run;\n", run_id="20260102T000000Z-00000002")
+        write_inventory([r.model_copy(update={"corpus": "prod"}) for r in prod], inventory, spark=delta_spark)
+        write_inventory([r.model_copy(update={"corpus": "trial"}) for r in trial], inventory, spark=delta_spark)
+
+        def names(rows):
+            return {r.name for r in rows}
+
+        # The trial run is newer, but it is not prod's.
+        assert names(read_inventory(inventory, spark=delta_spark, corpus="prod")) == {"lib.prod", "work.a"}
+        assert read_inventory(inventory, spark=delta_spark, corpus="nobody") == []
+
+    def test_a_table_made_before_a_column_was_added_gains_it(self, delta_spark, inventory):
+        # A table created before concat_index, wildcard and unresolved existed,
+        # with a run in it: the next write adds the columns, and the old run
+        # reads null there — no wildcard, no reason.
+        from data_hydration.inventory import _COLUMNS, read_inventory, write_inventory
+
+        added = ("concat_index", "wildcard", "unresolved")
+        old = [(name, sql_type) for name, sql_type, _ in _COLUMNS if name not in added]
+        delta_spark.sql(
+            f"CREATE TABLE {inventory} ("
+            + ", ".join(f"`{name}` {sql_type}" for name, sql_type in old)
+            + ") USING DELTA"
+        )
+        first = self._rows("data a; set lib.one; run;\n", run_id="20260101T000000Z-00000001")
+        values = [
+            tuple(v for (name, _, _), v in zip(_COLUMNS, _row_values(row)) if name not in added)
+            for row in first
+        ]
+        delta_spark.createDataFrame(
+            values, schema=", ".join(f"`{name}` {sql_type}" for name, sql_type in old)
+        ).write.format("delta").mode("append").saveAsTable(inventory)
+
+        second = self._rows(
+            "libname x ('/a' '/b');\ndata a; set x.m; run;\n"
+            "filename f '/in/*.csv';\ndata b; infile '~/b.csv'; input v; run;\n",
+            run_id="20260102T000000Z-00000002",
+        )
+        write_inventory(second, inventory, spark=delta_spark)
+        assert set(added) <= set(delta_spark.table(inventory).columns)
+        back = read_inventory(inventory, spark=delta_spark)
+        assert [(r.name, r.concat_index) for r in back if r.statement == "libname"] == [
+            ("/a", 0),
+            ("/b", 1),
+        ]
+        assert [(r.name, r.wildcard, r.unresolved) for r in back if r.kind == "path"] == [
+            ("/a", False, None),
+            ("/b", False, None),
+            ("/in/*.csv", True, None),
+            ("~/b.csv", False, "server"),
+        ]
+        pinned = read_inventory(inventory, spark=delta_spark, run_id=first[0].run_id)
+        assert {r.name for r in pinned} == {"lib.one", "work.a"}
+        assert all(r.concat_index is None and r.unresolved is None for r in pinned)
+        assert not any(r.wildcard for r in pinned)
+
+
+def _row_values(row):
+    from data_hydration.inventory import _values
+
+    return _values(row)

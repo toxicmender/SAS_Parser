@@ -31,7 +31,7 @@ import logging
 import re
 # collections.abc rather than typing: Iterable is used as an isinstance test
 # below, not only as an annotation.
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -41,7 +41,9 @@ from chunker.models import (
     SasChunk,
     SasChunkResult,
     SasCorpus,
+    UnresolvedReason,
 )
+from chunker.pathnames import server_parts
 
 from .models import (
     ChunkComplexity,
@@ -49,6 +51,7 @@ from .models import (
     CorpusComplexityReport,
     FileComplexity,
     PathLocation,
+    SasDbTableRef,
     SasPathRef,
 )
 from .naming import resolve_name
@@ -192,7 +195,12 @@ def _dataset_lines(file: FileComplexity) -> list[str]:
     them. A file that touches no dataset at all gets no section — an empty one
     would say nothing the absence does not.
     """
-    if not (file.input_datasets or file.output_datasets or file.intermediate_datasets):
+    if not (
+        file.input_datasets
+        or file.output_datasets
+        or file.intermediate_datasets
+        or file.dropped_datasets
+    ):
         return []
     lines = [
         "",
@@ -206,20 +214,50 @@ def _dataset_lines(file: FileComplexity) -> list[str]:
             f"- Intermediates (written and read here): "
             f"{_fmt_list(file.intermediate_datasets)}"
         )
+    if file.updated_datasets:
+        # Each already listed above, since an update both reads and writes;
+        # called out because appending to a table is what a migration most
+        # easily turns into replacing it.
+        lines.append(
+            f"- Updated in place (rows added or changed): "
+            f"{_fmt_list(file.updated_datasets)}"
+        )
+    if file.dropped_datasets:
+        lines.append(f"- Deleted: {_fmt_list(file.dropped_datasets)}")
     return lines
 
 
-#: How each location kind is introduced in the Paths section, and the order the
+#: The group in the Paths section that holds a wildcard, and the one that holds
+#: a place not known before the job runs, whatever its kind: the groups the
+#: chunk metadata's ``wildcard_paths`` and ``unresolved_paths`` make.
+_WILDCARDS = "Wildcards (SAS reads every file one matches: list them before mapping)"
+_UNRESOLVED = "Unresolved (not known before the job runs; each says why)"
+
+#: How each kind of place is introduced in the Paths section, and the order the
 #: groups are printed in. Filesystem first because it is the common case and the
-#: one with an obvious target-side answer; pipe and device last because they need
-#: a decision rather than a mapping.
-_PATH_GROUPS: tuple[tuple[PathLocation, str], ...] = (
+#: one with an obvious target-side answer; then the two whose places cannot be
+#: mapped as written; pipe and device last because they need a decision rather
+#: than a mapping. Each reference is in one group, as in the chunk metadata's
+#: path views.
+_PATH_GROUPS: tuple[tuple[PathLocation | str, str], ...] = (
     (PathLocation.FILESYSTEM, "Filesystem (needs a volume or external location)"),
+    (_WILDCARDS, _WILDCARDS),
+    (_UNRESOLVED, _UNRESOLVED),
     (PathLocation.REMOTE, "Remote services (needs network egress)"),
     (PathLocation.EMAIL, "Email destinations"),
     (PathLocation.PIPE, "Shell pipes (a command, not a location)"),
     (PathLocation.DEVICE, "Other devices"),
+    (PathLocation.FILEREF, "Filerefs a FILENAME assigns to a device (no place of their own)"),
+    (PathLocation.LIBREF, "Libraries a concatenation names by libref (placed by their own LIBNAME)"),
 )
+
+
+def _path_group(ref: SasPathRef) -> PathLocation | str:
+    """The Paths group *ref* is listed in: its location's, unless it is
+    unresolved or a wildcard."""
+    if ref.unresolved is not None:
+        return _UNRESOLVED
+    return _WILDCARDS if ref.wildcard else ref.location
 
 
 def _path_lines(file: FileComplexity) -> list[str]:
@@ -227,7 +265,9 @@ def _path_lines(file: FileComplexity) -> list[str]:
 
     Grouped by kind because the kinds need different answers: a filesystem path
     wants a volume, an FTP reference wants egress and a credential, and a shell
-    pipe wants somebody to decide what replaces it. A flat list would hide that.
+    pipe wants somebody to decide what replaces it. A wildcard wants a listing
+    first, and a place nobody can name yet wants somebody to say where it is.
+    A flat list would hide that.
 
     A file that reaches nothing outside gets no section, the same rule
     :func:`_dataset_lines` follows — an empty heading says nothing the absence
@@ -236,8 +276,8 @@ def _path_lines(file: FileComplexity) -> list[str]:
     if not file.external_refs:
         return []
     lines = ["", "## Paths", ""]
-    for location, heading in _PATH_GROUPS:
-        refs = [r for r in file.external_refs if r.location is location]
+    for group, heading in _PATH_GROUPS:
+        refs = [r for r in file.external_refs if _path_group(r) == group]
         if not refs:
             continue
         lines.append(f"- {heading}:")
@@ -245,13 +285,30 @@ def _path_lines(file: FileComplexity) -> list[str]:
     return lines
 
 
+def _why_unresolved(ref: SasPathRef) -> str:
+    """Why *ref*'s place is not known before the job runs, in words."""
+    if ref.unresolved is UnresolvedReason.MACRO:
+        return "unresolved macro reference"
+    if ref.unresolved is UnresolvedReason.FILEREF:
+        return "a fileref no FILENAME in the corpus assigns"
+    if ref.unresolved is UnresolvedReason.SERVER:
+        return f"completed by the SAS server: {'; '.join(server_parts(ref.effective_path))}"
+    return "relative: SAS reads it from its current directory"
+
+
 def _fmt_path_ref(ref: SasPathRef) -> str:
-    """One reference as a report line: the value as written, then its provenance.
+    """One reference as a report line: the value as written, where it resolves
+    to, then its provenance.
 
     ``raw`` rather than ``path`` because this is for a human to recognise in
     their own source; the normalised form exists for matching, not for reading.
+    A value spelled through macro variables or a fileref is followed by the
+    place SAS reads, ``resolved_path``, case kept.
     """
-    parts = [f"`{ref.raw}`", f"— {ref.statement}"]
+    parts = [f"`{ref.raw}`"]
+    if ref.resolved_path:
+        parts.append(f"→ `{ref.resolved_path}`")
+    parts.append(f"— {ref.statement}")
     if ref.binds:
         parts.append(f"`{ref.binds}`")
     if ref.device:
@@ -261,9 +318,51 @@ def _fmt_path_ref(ref: SasPathRef) -> str:
         # partitioned storage, not a folder of datasets — so it belongs next to
         # the path rather than being left for the reader to infer.
         parts.append(f"engine `{ref.engine}`")
-    if ref.has_macro_ref:
-        # The one thing a reader must not miss: this value is not what SAS
-        # resolves at run time, so it cannot be mapped as written.
+    if ref.unresolved is not None:
+        # The one thing a reader must not miss: this value is not the place SAS
+        # reads at run time, so it cannot be mapped as written.
+        parts.append(f"**({_why_unresolved(ref)})**")
+    return " ".join(parts)
+
+
+def _db_table_lines(file: FileComplexity) -> list[str]:
+    """The database tables this file reads and writes, in the database's terms.
+
+    Its own section rather than more Inputs/Outputs, because these are not SAS
+    datasets: ``edw_export.current_nonip`` is an Oracle owner and table, and a
+    migration answers it by hydrating or federating the table, not by finding a
+    LIBNAME. Reads first — they are what has to exist before the file runs —
+    each with the SAS copy it lands in. No tables, no heading, the rule
+    :func:`_path_lines` follows.
+    """
+    if not file.db_tables:
+        return []
+    lines = ["", "## Database tables", ""]
+    for access, heading in (("read", "Read"), ("write", "Written")):
+        refs = [r for r in file.db_tables if str(r.access) == access]
+        if not refs:
+            continue
+        lines.append(f"- {heading}:")
+        lines += [f"  - {_fmt_db_table(r)}" for r in refs]
+    return lines
+
+
+def _fmt_db_table(ref: SasDbTableRef) -> str:
+    """One database table as a report line: where it lives, then what became of it."""
+    parts = [f"`{ref.qualified}`"]
+    parts.append(f"on `{ref.engine}`" if ref.engine else "on an unknown engine")
+    if ref.dblink:
+        # The table lives in the *linked* database, not the one connected to —
+        # the line a reader provisioning access must not miss.
+        parts.append(f"through database link `{ref.dblink}`")
+    if ref.sas_targets:
+        parts.append("→ " + ", ".join(f"`{t}`" for t in ref.sas_targets))
+    called = f" in `%{ref.macro}`" if ref.macro else ""
+    parts.append(f"({ref.via} `{ref.connection}`{called})")
+    if ref.parameterised:
+        # Not a table yet: each call names one, and its own line says which.
+        parts.append("*(named by the macro's parameters — resolved per call)*")
+    elif ref.has_macro_ref:
         parts.append("**(unresolved macro reference)**")
     return " ".join(parts)
 
@@ -450,6 +549,7 @@ def render_file_report(
     # writes.
     lines += _dataset_lines(file)
     lines += _path_lines(file)
+    lines += _db_table_lines(file)
     # After the paths, because a hydration item is an answer to one of them: the
     # reader has just seen what the file reaches, and this says what becomes of it.
     lines += _hydration_lines(file, hydration)
@@ -504,6 +604,9 @@ def _chunk_section(
     if chunk.external_refs:
         # The same audit trail for the Paths section above.
         lines.append(f"- Paths: {_fmt_list(r.raw for r in chunk.external_refs)}")
+    if chunk.db_tables:
+        # ...and for the Database tables section.
+        lines.append(f"- Database: {_fmt_list(str(r) for r in chunk.db_tables)}")
     if chunk.signals:
         # Labelled and set apart, so the verdict bullets above and the
         # evidence bullets below do not read as one undifferentiated list.
@@ -557,6 +660,55 @@ def _hydration_summary(plan: Any | None) -> list[str]:
     return lines
 
 
+def _include_summary(checks: Sequence[Any] | None, names: Mapping[str, str]) -> list[str]:
+    """Where each script the corpus runs was found — one an ``%INCLUDE`` pulls
+    in, or PROC PYTHON's ``INFILE=`` — or nothing without a check.
+
+    *checks* are :class:`data_hydration.includes.IncludeCheck` records, one per
+    script. A place nobody looked is ``—``; one looked in without finding the
+    script says so, since that is the dependency the corpus is missing.
+    """
+    if not checks:
+        return []
+    statuses = [c.status for c in checks]
+    counts = [f"found {statuses.count('found')}", f"not found **{statuses.count('missing')}**"]
+    if statuses.count("unnamed"):
+        counts.append(f"no file name {statuses.count('unnamed')}")
+    if statuses.count("unchecked"):
+        # Nowhere to look (SharePoint could not be listed, say): not missing.
+        counts.append(f"not looked for {statuses.count('unchecked')}")
+    lines = [
+        "",
+        "## Included scripts",
+        "",
+        "Each script a `%INCLUDE` pulls in or PROC PYTHON runs (`INFILE=`), "
+        "looked for by file name in the scored directory and in the "
+        "application's SharePoint scripts folder.",
+        "",
+        f"- Scripts included: **{len(checks)}** — {', '.join(counts)}",
+        "",
+        "| Script | Included by | Local | SharePoint |",
+        "| --- | --- | --- | --- |",
+    ]
+
+    def cell(found: tuple[str, ...] | None, named: bool) -> str:
+        if found is None or not named:
+            return "—"
+        return ", ".join(f"`{f}`" for f in found) if found else "**not found**"
+
+    for check in checks:
+        named = check.file_name is not None
+        script = f"`{check.file_name}`" if named else f"`{check.spelled}` (no file name)"
+        by = ", ".join(
+            f"{resolve_name(source_id, names)}:{line}" for source_id, line in check.included_by
+        )
+        lines.append(
+            f"| {script} | {by} | {cell(check.local, named)} "
+            f"| {cell(check.sharepoint, named)} |"
+        )
+    return lines
+
+
 def render_overall_report(
     report: CorpusComplexityReport,
     *,
@@ -564,6 +716,7 @@ def render_overall_report(
     file_links: Mapping[str, str] | None = None,
     graph_image: str | None = None,
     hydration: Any | None = None,
+    includes: Sequence[Any] | None = None,
 ) -> str:
     """The corpus report, with an index of the individual reports appended.
 
@@ -575,10 +728,11 @@ def render_overall_report(
     graph, relative to where this Markdown will be written.
 
     *hydration* is an optional ``data_hydration.HydrationPlan``, summarised
-    before the file index. ``None`` renders nothing at all.
+    before the file index. ``None`` renders nothing at all. So is *includes*,
+    the ``%INCLUDE`` check (``data_hydration.includes.include_checks``).
     """
     body = report.to_markdown(top=top, graph_image=graph_image)
-    summary = _hydration_summary(hydration)
+    summary = _hydration_summary(hydration) + _include_summary(includes, report.names)
     if summary:
         body = body.rstrip() + "\n" + "\n".join(summary) + "\n"
     if not file_links:
@@ -686,6 +840,7 @@ def write_reports(
     overall_name: str = OVERALL_REPORT_NAME,
     graph_image: bool = True,
     hydration: Any | None = None,
+    includes: Sequence[Any] | None = None,
 ) -> WrittenReports:
     """Write the overall report and one report per source file under *out_dir*.
 
@@ -699,7 +854,8 @@ def write_reports(
 
     *hydration* is an optional ``data_hydration.HydrationPlan``: summarised in
     the overall report and broken down per file. Omitting it (the default)
-    leaves every report exactly as it was before hydration existed.
+    leaves every report exactly as it was before hydration existed. *includes*,
+    the ``%INCLUDE`` check, is summarised in the overall report the same way.
     """
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=True)
@@ -755,6 +911,7 @@ def write_reports(
                 drawn.relative_to(directory).as_posix() if drawn else None
             ),
             hydration=hydration,
+            includes=includes,
         ),
         encoding="utf-8",
     )

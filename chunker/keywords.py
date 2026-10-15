@@ -123,12 +123,39 @@ _ADDITIONAL_MACRO_FUNCTION_WORDS = frozenset(
     }
 )
 
+# Macro statements that are neither macro calls nor control flow: they act at
+# once, like %LET, so the scanner reads each as a GLOBAL_STATEMENT (SAS Macro
+# Language: Reference, "Macro Statements"; %SYSLPUT and %SYSRPUT are
+# SAS/CONNECT's). Several are absent from Appendix 1, so this set also widens
+# the macro-call exclusion: `%syslput x = 1;` invokes no macro named syslput.
+_MACRO_STATEMENT_WORDS = frozenset(
+    {
+        "copy",
+        "display",
+        "input",
+        "keydef",
+        "symdel",
+        "syscall",
+        "syslput",
+        "sysmacdelete",
+        "sysmstoreclear",
+        "sysrput",
+        "window",
+    }
+)
+
+# Every word the macro language owns: the full exclusion set for macro-call
+# detection, as a set (the scanner) and as a regex alternation (below).
+_MACRO_LANGUAGE_WORDS = (
+    _RESERVED_WORDS | _ADDITIONAL_MACRO_FUNCTION_WORDS | _MACRO_STATEMENT_WORDS
+)
+
 # Longest words first so the alternation doesn't short-circuit on a shorter
 # word that is a prefix of a longer one.
 _RESERVED_WORDS_PATTERN = "|".join(
     re.escape(w)
     for w in sorted(
-        _RESERVED_WORDS | _ADDITIONAL_MACRO_FUNCTION_WORDS,
+        _MACRO_LANGUAGE_WORDS,
         key=len,
         reverse=True,
     )
@@ -426,11 +453,30 @@ SAS_HOST_COMMAND_TOKENS: frozenset[str] = frozenset(
     {"x", "systask", "sysexec", "waitfor"}
 )
 
+# Global statements recognised by their keyword alone (SAS Global Statements:
+# Reference; SAS Viya's CAS and CASLIB; SAS/GRAPH's GOPTIONS, AXIS, SYMBOL,
+# LEGEND and PATTERN; and the SAS/CONNECT statements that start, feed and end
+# a remote session).
+_MISC_GLOBAL_STATEMENTS = frozenset(
+    {
+        "endsas", "dm", "sasfile", "lock", "missing", "page", "skip", "catname",
+        "resetline", "sysecho", "cas", "caslib",
+        "goptions", "axis", "symbol", "legend", "pattern",
+        "signon", "signoff", "rsubmit", "endrsubmit", "rdisplay", "rget",
+        "listtask", "killtask",
+    }
+)
+
+# Global statements written with an occurrence number: title2, axis1, symbol3.
+_NUMBERED_GLOBAL_STATEMENTS = frozenset(
+    {"title", "footnote", "axis", "symbol", "legend", "pattern"}
+)
+
 # Every token `SasChunkMetadata.global_statement_keyword` can hold. Public for
 # the same reason as the DATA-step vocabulary above: it is what an instruction
 # scopes on (`[when: global_statement:x]`), and a rule naming anything outside
-# it can never fire. `title`/`footnote` are recorded without their optional
-# occurrence digit, so `title2` is `title`.
+# it can never fire. A numbered statement is recorded without its occurrence
+# number, so `title2` is `title`; a macro statement without its `%`.
 SAS_GLOBAL_STATEMENT_TOKENS: frozenset[str] = (
     frozenset(
         {
@@ -439,7 +485,123 @@ SAS_GLOBAL_STATEMENT_TOKENS: frozenset[str] = (
         }
     )
     | SAS_HOST_COMMAND_TOKENS
+    | _MISC_GLOBAL_STATEMENTS
+    | _MACRO_STATEMENT_WORDS
 )
+
+# PROCs that run in groups — SAS calls them interactive procedures. RUN
+# executes the statements submitted so far and the PROC stays active for more,
+# until QUIT or the next step: `proc datasets; delete a; run; delete b; quit;`
+# is one step. PROC SQL and FEDSQL run each statement as it comes, so RUN does
+# nothing there; PROC DS2 runs the program before it.
+#
+# The documented lists: Base SAS's CATALOG, CHART, DATASETS, DOCUMENT and
+# PLOT, and SAS/GRAPH's GAREABAR, GBARLINE, GCHART, GKPI, GMAP, GPLOT, GRADAR,
+# GREPLAY, GSLIDE and GTILE (Usage Note 58486; SAS/GRAPH 9.4 Reference, each
+# with "Supports: RUN-group processing" — G3D and GCONTOUR do not); the
+# interactive ANOVA, ARIMA, CATMOD, FACTEX, GLM, MODEL, OPTEX, PLAN and REG
+# (Usage Note 37105).
+RUN_GROUP_PROCS: frozenset[str] = frozenset(
+    {
+        "sql", "fedsql", "ds2", "datasets", "catalog", "document", "iml",
+        "optmodel", "cas", "casutil", "chart",
+        "plot", "reg", "glm", "anova", "catmod", "arima", "model",
+        "factex", "optex", "plan",
+        "gplot", "gchart", "gmap", "greplay", "gslide", "gradar", "gbarline",
+        "gareabar", "gkpi", "gtile", "pmenu", "trantab",
+    }
+)
+
+# What a PROC's options name, for chunker.statements. Either a dataset the step
+# reads, writes or updates in place ("read", "write", "update"), every member
+# of a library it writes ("library": PROC CIMPORT's LIBRARY=), or a value that
+# only looks like a dataset:
+#   - a "libref" (PROC COPY's IN= and OUT=);
+#   - a "fileref" (PROC HTTP's OUT=);
+#   - a "catalog" (PROC CIMPORT's CATALOG=);
+#   - a "package" — the lib.member.package PROC FCMP's OUTLIB= names, which
+#     writes lib.member.
+# PROC_OPTION_DEFAULTS holds in every PROC. PROC_OPTION_ROLES adds a PROC's own
+# options, and overrides what a default option names there. An option neither
+# table lists names no dataset: FORMAT's LIBRARY= is a catalog, PRINTTO's LOG=
+# a file. Lowercase throughout.
+PROC_OPTION_DEFAULTS: dict[str, str] = {
+    "data": "read",
+    "out": "write",
+    "outdata": "write",
+    # Statistics and modelling: estimates, statistics, fitted models and trees
+    # out; a fitted model, estimates, test data or class levels in.
+    "outest": "write",
+    "outmodel": "write",
+    "outstat": "write",
+    "outtree": "write",
+    "outseed": "write",
+    "testout": "write",
+    "inmodel": "read",
+    "inest": "read",
+    "testdata": "read",
+    "classdata": "read",
+}
+
+# A documented alias is listed beside its option: SAS's procedure guide names
+# them (BASE= "Alias OUT=", COMPARE= "Alias COMP=, C=", UNIQUEOUT= "Alias
+# UNIOUT="), and an alias left out reads as the default role or as nothing.
+PROC_OPTION_ROLES: dict[str, dict[str, str]] = {
+    # BASE= has DATA='s rows added to it: read and rewritten in place. OUT= is
+    # BASE='s alias here, not a new dataset.
+    "append": {"base": "update", "out": "update", "new": "read"},
+    "compare": {
+        "base": "read",
+        "compare": "read",
+        "comp": "read",
+        "c": "read",
+        "outstats": "write",
+    },
+    "sort": {"dupout": "write", "uniqueout": "write", "uniout": "write"},
+    "format": {"cntlin": "read", "cntlout": "write"},
+    "contents": {"out2": "write"},
+    "corr": {"outp": "write", "outs": "write", "outk": "write", "outh": "write"},
+    # FASTCLUS reads its initial seeds from SEED= and writes the cluster means
+    # to MEAN=. Everywhere else SEED= is a random-number seed.
+    "fastclus": {"seed": "read", "mean": "write", "instat": "read"},
+    "score": {"score": "read"},
+    "phreg": {"covariates": "read"},
+    "copy": {
+        "in": "libref",
+        "inlib": "libref",
+        "indd": "libref",
+        "out": "libref",
+        "outlib": "libref",
+        "outdd": "libref",
+    },
+    # LIBRARY= and its aliases name the library its member statements act in.
+    "datasets": {"library": "libref", "lib": "libref", "ddname": "libref", "dd": "libref"},
+    "upload": {"inlib": "libref", "outlib": "libref"},
+    "download": {"inlib": "libref", "outlib": "libref"},
+    "http": {
+        "in": "fileref",
+        "out": "fileref",
+        "headerin": "fileref",
+        "headerout": "fileref",
+    },
+    "json": {"out": "fileref"},
+    "fcmp": {"outlib": "package"},
+    # PROC CIMPORT's destination is what it *creates* from the transport file
+    # INFILE= names: DATA= (DS=, D=) one data set, LIBRARY= (LIB=, L=) the
+    # members of a library, CATALOG= (CAT=, C=) a catalog, which holds none.
+    "cimport": {
+        "data": "write",
+        "ds": "write",
+        "d": "write",
+        "library": "library",
+        "lib": "library",
+        "l": "library",
+        "catalog": "catalog",
+        "cat": "catalog",
+        "c": "catalog",
+        "infile": "fileref",
+    },
+}
 
 # A function call is ``name(`` where the name is not glued to a preceding ``%``,
 # ``&``, or ``.``; a CALL routine is ``CALL name`` at a word boundary. Both

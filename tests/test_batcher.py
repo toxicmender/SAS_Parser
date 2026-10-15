@@ -269,6 +269,182 @@ class TestMacroInvocation(unittest.TestCase):
         self.assertIn("clean", batch.defined_macros)
         self.assertEqual(len(batch.chunks), 2)
 
+    def test_a_name_built_around_one_parameter_resolves_at_the_call(self):
+        """&lib..customers with lib=prod reads prod.customers, not prod."""
+        src = (
+            "data prod.customers; x = 1; run;\n"
+            "%macro m(lib);\n  data work.out; set &lib..customers; run;\n%mend;\n"
+            "%m(prod);\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual((len(br.batches), len(br.singletons)), (1, 0))
+        self.assertIn(
+            "macro_body_dataset(prod.customers): chunk-0001 → chunk-0003",
+            br.batches[0].reason,
+        )
+
+    def test_a_call_that_leaves_a_keyword_parameter_out_uses_its_default(self):
+        """A keyword parameter the call names no value for holds its default
+        (SAS 9.4 Macro Language: Reference, %MACRO Statement). Before, the
+        call read and wrote nothing through it, so `%load();` created no
+        work.loaded and the PROC PRINT reading it stood alone."""
+        src = (
+            "%macro load(out=work.loaded, src=raw.feed);\n"
+            "  data &out; set &src; run;\n%mend;\n"
+            "%load();\nproc print data=work.loaded; run;\n"
+            "%load(out=work.x, src=);\n"
+            "%macro two(ds, lib=prod);\n  data &ds; set &lib..t; run;\n%mend;\n"
+            "%two(a);\n"
+        )
+        cr, br = _chunk_and_batch(src)
+        calls = {
+            c.text.strip(): (c.metadata.input_datasets, c.metadata.output_datasets)
+            for b in br.batches
+            for c in b.chunks
+            if c.kind is SasChunkKind.MACRO_CALL
+        } | {
+            c.text.strip(): (c.metadata.input_datasets, c.metadata.output_datasets)
+            for c in br.singletons
+            if c.kind is SasChunkKind.MACRO_CALL
+        }
+        self.assertEqual(
+            calls,
+            {
+                "%load();": (["raw.feed"], ["work.loaded"]),
+                # `src=` names an empty value, which is no default.
+                "%load(out=work.x, src=);": ([], ["work.x"]),
+                "%two(a);": (["prod.t"], ["work.a"]),
+            },
+        )
+        [batch] = [b for b in br.batches if "work.loaded" in b.output_datasets]
+        self.assertIn("dataset_flow(work.loaded)", batch.reason)
+
+    def test_a_default_is_read_as_an_argument_would_be(self):
+        """A default is cleaned as a call's argument is: lowercased, quotes
+        and a trailing dot stripped. Before, `OUT=Work.Final` wrote
+        `Work.Final`, which no lowercase reader matched, and
+        `out='work.f2'` a quoted-path dataset."""
+        for header, name in (("OUT=Work.Final", "work.final"), ("out='work.f2'", "work.f2")):
+            src = (
+                f"%MACRO LOAD({header});\n  data &out; set sashelp.class; run;\n%MEND;\n"
+                f"%LOAD();\ndata y; set {name}; run;\n"
+            )
+            _, br = _chunk_and_batch(src)
+            self.assertEqual((len(br.batches), len(br.singletons)), (1, 0), header)
+            self.assertIn(f"dataset_flow({name}): chunk-0002 → chunk-0003", br.batches[0].reason, header)
+
+    def test_a_call_s_datasets_are_resolved_like_any_others(self):
+        """A call's datasets are bound before names are resolved, so the
+        passes that resolve them see these too: the User library takes a
+        one-level argument, and a macro variable in one resolves. Before,
+        `%load(customers)` read work.customers after `libname user`, and
+        `%load(&lib..t)` read `&lib..t`."""
+        from chunker import SasCorpus, resolve_corpus_datasets
+
+        macro = "%macro load(ds);\n  data out; set &ds; run;\n%mend;\n"
+        for setup, call, read in (
+            ("libname user '/data/perm';\n", "%load(customers);\n", "user.customers"),
+            ("%let lib = prod;\n", "%load(&lib..t);\n", "prod.t"),
+        ):
+            result = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(
+                setup + macro + call, source_id="t.sas"
+            )
+            [chunks] = [r.chunks for r in resolve_corpus_datasets(SasCorpus(file_results=[result])).file_results]
+            [call_chunk] = [c for c in chunks if c.kind is SasChunkKind.MACRO_CALL]
+            self.assertEqual(call_chunk.metadata.input_datasets, [read], call)
+
+    def test_a_slice_whose_region_cannot_be_found_reads_its_own_header(self):
+        """A split definition's slices name their region, which comes before
+        them in their file. Where it does not, the slice stands for itself."""
+        from chunker.batcher import _CallBinder
+
+        chunker = SasSemanticChunker(min_words=1, max_words=9_999)
+        [macro] = chunker.chunk_text("%macro m(out=a); data &out; run; %mend;\n").chunks
+        child = macro.model_copy(update={"parent_id": "chunk-0099"})
+        region = macro.model_copy(update={"chunk_id": "chunk-0099"})
+        self.assertIs(_CallBinder([child], [0])._header_chunk(0), child)
+        # A chunk of that id in another file is not its region.
+        self.assertIs(_CallBinder([region, child], [0, 1])._header_chunk(1), child)
+        self.assertIs(_CallBinder([region, child], [0, 0])._header_chunk(1), region)
+
+    def test_a_batch_s_database_libnames_are_in_one_order(self):
+        """SasBatch.engine_refs deduplicates through a set, so it sorts:
+        engine, then libref."""
+        from chunker.models import SasBatch
+
+        chunks = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(
+            "libname zz oracle path=P schema=s;\nlibname aa teradata server=T;\n"
+            "libname bb oracle path=Q schema=t;\n"
+        ).chunks
+        batch = SasBatch(batch_id="b", chunks=chunks)
+        self.assertEqual(
+            [(r.engine, r.binds) for r in batch.engine_refs],
+            [("oracle", "bb"), ("oracle", "zz"), ("teradata", "aa")],
+        )
+
+    def test_batching_returns_the_corpus_as_it_resolved_it(self):
+        """complexity --hydration scores the batches and builds the reference
+        inventory from one resolution: batch_resolved's corpus is the one
+        resolve_corpus_datasets builds, and its batches are batch()'s."""
+        from chunker import SasCorpus, resolve_corpus_datasets
+        from chunker.batcher import MultiFileBatcher
+
+        chunker = SasSemanticChunker(min_words=1, max_words=9_999)
+        corpus = SasCorpus(
+            file_results=[
+                chunker.chunk_text(
+                    "libname user '/u';\n%macro load(ds);\n  data out; set &ds; run;\n%mend;\n",
+                    source_id="a.sas",
+                ),
+                chunker.chunk_text("%load(c);\nproc print; run;\n", source_id="b.sas"),
+            ]
+        )
+        batches, resolved = MultiFileBatcher().batch_resolved(corpus)
+        self.assertEqual(resolved.model_dump(), resolve_corpus_datasets(corpus).model_dump())
+        self.assertEqual(batches.model_dump(), MultiFileBatcher().batch(corpus).model_dump())
+        empty = SasCorpus(file_results=[])
+        self.assertIs(MultiFileBatcher().batch_resolved(empty)[1], empty)
+
+    def test_binding_the_calls_again_changes_nothing(self):
+        from chunker import SasCorpus, resolve_corpus_datasets
+
+        src = "libname user '/u';\n%macro load(ds);\n  data out; set &ds; run;\n%mend;\n%load(c);\n"
+        result = SasSemanticChunker(min_words=1, max_words=9_999).chunk_text(src, source_id="t.sas")
+        once = resolve_corpus_datasets(SasCorpus(file_results=[result]))
+        twice = resolve_corpus_datasets(once)
+        self.assertEqual(once.model_dump(), twice.model_dump())
+
+    def test_a_library_a_macro_call_copies_supplies_its_readers(self):
+        """A whole-library COPY through a call writes `stage.:`, which a later
+        `set stage.a;` reads, as it does when the COPY is written out. Before,
+        the call's pattern was not indexed and the reader stood alone."""
+        for copy in ("%macro cp(tgt);\n  proc copy in=src out=&tgt; run;\n%mend;\n%cp(stage);\n",
+                     "proc copy in=src out=stage; run;\n"):
+            _, br = _chunk_and_batch(copy + "data x; set stage.a; run;\n")
+            self.assertEqual(len(br.singletons), 0, copy)
+            self.assertIn("(stage.a)", br.batches[-1].reason, copy)
+
+    def test_the_defaults_of_a_split_definition_come_from_its_header(self):
+        """A definition cut into slices is indexed by its last slice, which
+        holds no %MACRO header; the defaults are read from the region."""
+        body = "".join(f"  data work.t{i}; set work.s{i}; x = {i}; y = x * 2; run;\n" for i in range(12))
+        src = (
+            "%macro load(out=work.loaded, src=raw.feed);\n" + body
+            + "  data &out; set &src; run;\n%mend;\n%load();\n"
+        )
+        result = SasSemanticChunker(min_words=1, max_words=40).chunk_text(src, source_id="t.sas")
+        self.assertGreater(sum(c.parent_id is not None for c in result.chunks), 1)
+        br = SasChunkBatcher().batch(result)
+        [call] = [
+            c
+            for c in (*(c for b in br.batches for c in b.chunks), *br.singletons)
+            if c.kind is SasChunkKind.MACRO_CALL
+        ]
+        self.assertEqual(
+            (call.metadata.input_datasets, call.metadata.output_datasets),
+            (["raw.feed"], ["work.loaded"]),
+        )
+
     def test_macro_def_two_callsites_globals_batch(self):
         """One macro definition + two independent call sites: the definition
         is consumed by two separate components, so it is promoted to the
@@ -671,21 +847,16 @@ class TestComplexPrograms(unittest.TestCase):
         Two macro definitions + two call sites + a downstream PROC.
 
         Static analysis result (with parameterised macro-body resolution):
-          batch-1: %macro load + %load(work, '/a.csv')
-                   — &lib..raw is a *compound* reference (parameter 'lib'
-                     concatenated with literal suffix '.raw'); this is
-                     intentionally left unresolved rather than guessing,
-                     so %load does not link to anything downstream.
-          batch-2: %macro clean + %clean(work.raw) + proc print data=work.raw
-                   — &ds. inside %clean is a *single* parameter reference,
-                     fully resolved to 'work.raw' at the call site, which
-                     correctly links the call to the downstream PROC PRINT.
+          - &lib..raw in %load is a name built around one parameter: the call
+            %load(work, '/a.csv') fills it in, so the call writes work.raw.
+          - &ds. in %clean is the parameter itself, so %clean(work.raw) reads
+            and rewrites work.raw, after %load wrote it.
+          - proc print data=work.raw reads what %clean left.
 
-        This demonstrates the mixed literal/parameterised resolution
-        strategy: simple single-variable parameter references resolve
-        correctly across files/call-sites, while compound concatenated
-        references (var + literal suffix, e.g. &lib..raw) are left
-        unresolved rather than silently producing a wrong dataset name.
+        So the whole program is one batch: each call site links to the next
+        through work.raw, and each definition to its call. A name built from
+        several parameters (&lib..&tbl) is still left alone, since no single
+        argument names it.
         """
         src = (
             "%macro load(lib, file);\n"
@@ -700,18 +871,13 @@ class TestComplexPrograms(unittest.TestCase):
             "proc print data=work.raw; run;\n"
         )
         _, br = _chunk_and_batch(src)
-        self.assertEqual(len(br.batches), 2)
+        self.assertEqual(len(br.batches), 1)
         self.assertEqual(len(br.singletons), 0)
-        all_def_macros = {mac for b in br.batches for mac in b.defined_macros}
-        self.assertIn("load", all_def_macros)
-        self.assertIn("clean", all_def_macros)
-        total = sum(len(b.chunks) for b in br.batches) + len(br.singletons)
-        self.assertEqual(total, 5)
-        # The %clean batch must now include the downstream PROC PRINT,
-        # since &ds. resolves to 'work.raw' at the call site.
-        clean_batch = next(b for b in br.batches if "clean" in b.defined_macros)
-        self.assertEqual(len(clean_batch.chunks), 3)
-        self.assertIn("work.raw", clean_batch.reason)
+        [batch] = br.batches
+        self.assertEqual(set(batch.defined_macros), {"load", "clean"})
+        self.assertEqual(len(batch.chunks), 5)
+        # %load's call writes work.raw (lib=work), which %clean's call reads.
+        self.assertIn("macro_body_dataset(work.raw)", batch.reason)
 
     def test_proc_sql_subquery_chain(self):
         """PROC SQL that references a table built by a prior DATA step."""
@@ -771,6 +937,262 @@ class TestOrderAwareDatasetFlow(unittest.TestCase):
         self.assertEqual(len(br.singletons), 2)
 
 
+class TestPatternDatasetFlow(unittest.TestCase):
+    """Dataset lists (``set lib.sales_:;``) and whole-library writes (a COPY
+    with no SELECT writes ``tgt.:``) under the nearest-producer rule."""
+
+    def test_prefix_input_links_each_matching_producer(self):
+        src = (
+            "data mylib.sales_east; set raw.e; run;\n"
+            "data mylib.sales_west; set raw.w; run;\n"
+            "data mylib.other; set raw.o; run;\n"
+            "data work.all_sales; set mylib.sales_:; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertEqual(
+            [c.chunk_id for c in br.batches[0].chunks],
+            ["chunk-0001", "chunk-0002", "chunk-0004"],
+        )
+        self.assertIn("dataset_flow(mylib.sales_east)", br.batches[0].reason)
+        self.assertIn("dataset_flow(mylib.sales_west)", br.batches[0].reason)
+        self.assertEqual(_singleton_ids(br), ["chunk-0003"])
+
+    def test_prefix_input_takes_only_preceding_producers(self):
+        src = (
+            "data work.all_sales; set mylib.sales_:; run;\n"
+            "data mylib.sales_east; set raw.e; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 0)
+
+    def test_whole_library_input_links_nothing(self):
+        """CONTENTS of _ALL_ reads every member; tying it to every producer in
+        the library would fuse unrelated jobs, so it stays alone."""
+        src = (
+            "data mylib.a; set raw.e; run;\n"
+            "proc contents data=mylib._all_; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 0)
+        self.assertEqual(len(br.singletons), 2)
+
+    def test_whole_library_copy_produces_its_members(self):
+        src = (
+            "proc copy in=src out=tgt; run;\n"
+            "data work.x; set tgt.cust; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertIn("dataset_flow(tgt.cust)", br.batches[0].reason)
+
+    def test_whole_library_copy_covers_a_prefix_input(self):
+        src = (
+            "proc copy in=src out=tgt; run;\n"
+            "data work.x; set tgt.cust_:; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertIn("dataset_flow(tgt.:)", br.batches[0].reason)
+
+    def test_prefix_input_after_a_copy_skips_the_overwritten_producer(self):
+        """The COPY replaced tgt.cust_a, so the list reads the COPY's copy."""
+        src = (
+            "data tgt.cust_a; set raw.c; run;\n"
+            "proc copy in=src out=tgt; run;\n"
+            "data work.x; set tgt.cust_:; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertEqual(
+            [c.chunk_id for c in br.batches[0].chunks], ["chunk-0002", "chunk-0003"]
+        )
+
+    def test_later_copy_replaces_an_earlier_exact_producer(self):
+        """The COPY overwrote tgt.cust after the DATA step wrote it, so the
+        reader depends on the COPY, the nearest producer."""
+        src = (
+            "data tgt.cust; set raw.c; run;\n"
+            "proc copy in=src out=tgt; run;\n"
+            "data work.x; set tgt.cust; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertEqual(
+            [c.chunk_id for c in br.batches[0].chunks], ["chunk-0002", "chunk-0003"]
+        )
+
+    def test_an_exact_producer_after_a_copy_is_the_nearer(self):
+        """The DATA step rewrote tgt.cust after the COPY: the reader depends on
+        it, and the COPY stays out."""
+        src = (
+            "proc copy in=src out=tgt; run;\n"
+            "data tgt.cust; set raw.c; run;\n"
+            "data work.x; set tgt.cust; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertEqual(
+            [c.chunk_id for c in br.batches[0].chunks], ["chunk-0002", "chunk-0003"]
+        )
+
+    def test_prefix_input_ignores_other_libraries_and_later_copies(self):
+        src = (
+            "data zz.sales_e; set raw.e; run;\n"
+            "proc copy in=a out=other; run;\n"
+            "data _null_; set zz.sales_:; run;\n"
+            "proc copy in=src out=zz; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertEqual(
+            [c.chunk_id for c in br.batches[0].chunks], ["chunk-0001", "chunk-0003"]
+        )
+        self.assertEqual(_singleton_ids(br), ["chunk-0002", "chunk-0004"])
+
+    def test_last_skips_a_pattern_output(self):
+        """_LAST_ is the last data set created; a whole-library COPY creates
+        no one data set, so PROC PRINT with no DATA= reads work.a."""
+        src = (
+            "data work.a; set raw.e; run;\n"
+            "proc copy in=src out=tgt; run;\n"
+            "proc print; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertEqual(
+            [c.chunk_id for c in br.batches[0].chunks], ["chunk-0001", "chunk-0003"]
+        )
+        self.assertIn("dataset_flow(work.a)", br.batches[0].reason)
+
+    def test_last_is_what_a_macro_call_created_last(self):
+        """`%make(b);` creates work.b, so a PROC PRINT with no DATA= after it
+        reads work.b. Before, the call's datasets were added after _LAST_ was
+        resolved, so it read work.a."""
+        src = (
+            "data a; x = 1; run;\n"
+            "%macro make(out);\n  data &out; set a; run;\n%mend;\n"
+            "%make(b);\n"
+            "proc print; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        reasons = " ".join(b.reason for b in br.batches)
+        self.assertIn("dataset_flow(work.b): chunk-0003 → chunk-0004", reasons)
+        self.assertNotIn("dataset_flow(work.a)", reasons)
+
+    def test_macro_argument_pattern_resolves_through_the_body(self):
+        src = (
+            "%macro rd(ds); data work.y; set &ds; run; %mend;\n"
+            "data mylib.sales_east; set raw.e; run;\n"
+            "%rd(mylib.sales_:);\n"
+        )
+        _, br = _chunk_and_batch(src)
+        reasons = " ".join(b.reason for b in br.batches)
+        self.assertIn("macro_body_dataset(mylib.sales_east)", reasons)
+
+    def test_drop_is_not_a_producer(self):
+        src = (
+            "data work.a; set raw.e; run;\n"
+            "proc datasets lib=work nolist; delete a; quit;\n"
+            "proc print data=work.a; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        self.assertEqual(
+            [c.chunk_id for c in br.batches[0].chunks], ["chunk-0001", "chunk-0003"]
+        )
+
+
+class TestUpdateInPlace(unittest.TestCase):
+    """A step that updates a table in place (APPEND BASE=, SQL INSERT,
+    MODIFY) needs the table and supplies it to nobody: readers and other
+    updaters link to the step that created it."""
+
+    def test_appenders_without_the_creator_stay_apart(self):
+        """Two jobs appending to one audit table are not one batch."""
+        src = (
+            "data work.r1; set edw.a; run;\n"
+            "proc append base=audit.log data=work.r1; run;\n"
+            "data work.r2; set edw.b; run;\n"
+            "proc append base=audit.log data=work.r2; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(
+            [[c.chunk_id for c in b.chunks] for b in br.batches],
+            [["chunk-0001", "chunk-0002"], ["chunk-0003", "chunk-0004"]],
+        )
+
+    def test_appenders_link_to_the_creator_not_to_each_other(self):
+        src = (
+            "data audit.log; length job $8; stop; run;\n"
+            "proc append base=audit.log data=edw.a; run;\n"
+            "proc sql; insert into audit.log select * from edw.b; quit;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 1)
+        reason = br.batches[0].reason
+        self.assertIn("dataset_flow(audit.log): chunk-0001 → chunk-0002", reason)
+        self.assertIn("dataset_flow(audit.log): chunk-0001 → chunk-0003", reason)
+        self.assertNotIn("chunk-0002 → chunk-0003", reason)
+
+    def test_a_reader_after_an_append_links_to_the_creator(self):
+        src = (
+            "data mart.h; set raw.x; run;\n"
+            "data work.n; set raw.y; run;\n"
+            "proc append base=mart.h data=work.n; run;\n"
+            "proc print data=mart.h; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        reason = br.batches[0].reason
+        self.assertIn("dataset_flow(mart.h): chunk-0001 → chunk-0004", reason)
+        self.assertNotIn("chunk-0003 → chunk-0004", reason)
+
+    def test_an_updated_table_is_an_input_its_batch_needs(self):
+        src = (
+            "data work.n; set raw.y; run;\n"
+            "proc append base=mart.h data=work.n; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        batch = br.batches[0]
+        self.assertEqual(batch.input_datasets, ["raw.y", "mart.h"])
+        self.assertIn("mart.h", batch.output_datasets)
+
+    def test_a_modify_step_does_not_create_its_master(self):
+        src = (
+            "data lib.a; modify lib.a; x = 1; run;\n"
+            "proc print data=lib.a; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        self.assertEqual(len(br.batches), 0)
+        self.assertEqual(len(br.singletons), 2)
+
+    def test_an_in_place_sort_replaces_its_table(self):
+        """PROC SORT with no OUT= writes a sorted copy over the table: a
+        creation, so a later BY step depends on the sort."""
+        src = (
+            "data work.o; set raw.o; run;\n"
+            "proc sort data=work.o; by id; run;\n"
+            "data work.m; merge work.o work.c; by id; run;\n"
+        )
+        _, br = _chunk_and_batch(src)
+        reason = br.batches[0].reason
+        self.assertIn("dataset_flow(work.o): chunk-0001 → chunk-0002", reason)
+        self.assertIn("dataset_flow(work.o): chunk-0002 → chunk-0003", reason)
+
+    def test_macro_calls_that_append_link_to_the_creator(self):
+        src = (
+            "%macro app(base); proc append base=&base data=edw.n; run; %mend;\n"
+            "data mart.h; set raw.x; run;\n"
+            "%app(mart.h);\n"
+            "%app(mart.h);\n"
+        )
+        _, br = _chunk_and_batch(src)
+        reason = " ".join(b.reason for b in br.batches)
+        self.assertIn("macro_body_dataset(mart.h): chunk-0002 → chunk-0003", reason)
+        self.assertIn("macro_body_dataset(mart.h): chunk-0002 → chunk-0004", reason)
+        self.assertNotIn("chunk-0003 → chunk-0004", reason)
+
+
 # ── 11. Global-context batch (tiered weak-edge resolution) ────────────────
 
 
@@ -821,6 +1243,26 @@ class TestGlobalContextBatch(unittest.TestCase):
         self.assertEqual(len(br.batches), 1)
         self.assertFalse(br.batches[0].is_global_context)
         self.assertEqual(br.batches[0].batch_id, "batch-001")
+
+    def test_a_context_statement_before_a_global_macro_joins_its_batch(self):
+        """OPTIONS (or a %LET) just before a macro two pipelines call is
+        absorbed into the global-context batch, which absorption may re-root;
+        the batch is still emitted first, and the pipelines stay apart."""
+        for context in ("options nocenter;\n", "%let x = 1;\n", "filename src '/code';\n"):
+            src = (
+                f"{context}%macro load(ds); data out; set &ds; run; %mend;\n"
+                "%load(raw.a);\ndata x; set y; run;\n%load(raw.c);\n"
+            )
+            with self.subTest(context=context):
+                _, br = _chunk_and_batch(src)
+                globals_batch = br.batches[0]
+                self.assertTrue(globals_batch.is_global_context)
+                self.assertEqual(
+                    [c.chunk_id for c in globals_batch.chunks], ["chunk-0001", "chunk-0002"]
+                )
+                self.assertEqual(
+                    _ordered_chunk_ids(br), [f"chunk-{i:04d}" for i in range(1, 6)]
+                )
 
 
 # ── 12. Call-argument parsing with nested parens ──────────────────────────
@@ -953,6 +1395,13 @@ class TestDatabricksMapping(unittest.TestCase):
         batch = br.batches[0]
         self.assertEqual(batch.output_datasets, ["dev.staging.clean"])
 
+    def test_a_mapped_name_brings_no_catalog_into_the_librefs(self):
+        """A three-level name is Databricks's: its catalog is no SAS libref."""
+        _, br = _chunk_and_batch(self.SRC, databricks_mapping=self.MAPPING)
+        meta = br.batches[0].chunks[0].metadata
+        self.assertEqual(meta.referenced_datasets, ["dev.staging.clean", "prod.sales.raw"])
+        self.assertEqual(meta.referenced_librefs, [])
+
     def test_input_chunk_result_not_mutated(self):
         cr, _ = _chunk_and_batch(self.SRC, databricks_mapping=self.MAPPING)
         all_names = [
@@ -995,6 +1444,15 @@ class TestDatabricksMapping(unittest.TestCase):
         joined = self._all_texts(br)
         self.assertIn("%global src;", joined)  # declaration untouched
         self.assertIn("%let src = prod.sales.orders;", joined)
+
+    def test_readonly_declaration_value_rewritten(self):
+        # `%global / readonly src=...;` assigns as %LET does (SAS 9.4 Macro
+        # Language: Reference, %GLOBAL), so its value is mapped too.
+        src = "%global / readonly src = mylib.orders;\ndata work.a; set &src; run;\n"
+        _, br = _chunk_and_batch(src, databricks_mapping=self.MAPPING)
+        joined = self._all_texts(br)
+        self.assertIn("%global / readonly src = prod.sales.orders;", joined)
+        self.assertNotIn("mylib.orders", joined)
 
     def test_quoted_let_value_rewritten_preserving_quotes(self):
         src = "%let src = 'mylib.orders';\ndata work.a; set mylib.orders; run;\n"

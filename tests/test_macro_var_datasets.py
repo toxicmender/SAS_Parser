@@ -36,13 +36,17 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from chunker import SasChunkBatcher, SasCorpus, SasSemanticChunker
 from chunker.batcher import MultiFileBatcher
 from chunker.macro_vars import (
+    call_spans,
     is_dataset_shaped,
     let_values,
+    macro_signature,
     resolve_refs,
+    scope_declarations,
     strip_quotes,
 )
 from chunker.metadata import _canon_ds
 from chunker.models import SasChunkKind
+from chunker.scanner import _sanitise
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -97,15 +101,17 @@ class TestLetValues(unittest.TestCase):
     def test_quoted_value_unquoted(self):
         self.assertEqual(let_values("%let ds = 'lib.member';"), {"ds": "lib.member"})
 
-    def test_non_name_values_dropped(self):
+    def test_non_name_values_are_recorded_as_unknown(self):
         # Any string at all can be a %LET value; only one that could be a name,
-        # or part of one, is kept.
+        # or part of one, is kept. The rest map to "" — unknown from here on —
+        # rather than vanishing, so an earlier name-shaped value of the same
+        # variable cannot keep answering for it.
         src = (
             "%let where = age > 30 and sex = 'M';\n"
             "%let path = /sasdata3/dataetl/in.csv;\n"
             "%let lib = prod;\n"
         )
-        self.assertEqual(let_values(src), {"lib": "prod"})
+        self.assertEqual(let_values(src), {"where": "", "path": "", "lib": "prod"})
 
     def test_numeric_value_kept_as_a_name_fragment(self):
         # Not a name on its own, but half of one: &&ds&i, &lib..sales&yr.
@@ -125,6 +131,149 @@ class TestLetValues(unittest.TestCase):
     def test_unterminated_let_still_assigns(self):
         # An oversized split can cut a chunk before the semicolon.
         self.assertEqual(let_values("%let ds = work.orders"), {"ds": "work.orders"})
+
+    def test_symdel_leaves_its_names_unknown_where_it_stands(self):
+        # %SYMDEL "deletes the specified variable or variables from the macro
+        # global symbol table": unknown after it, until a %LET assigns again.
+        self.assertEqual(
+            let_values("%let a = x; %let b = y; %symdel a b / nowarn; %let b = z;"),
+            {"a": "", "b": "z"},
+        )
+        self.assertEqual(let_values("%symdel &list;"), {})
+
+    def test_a_readonly_declaration_assigns(self):
+        # "%GLOBAL / READONLY macro-variable=value" creates a new read-only
+        # variable and assigns it, as %LOCAL's form does; omitting the value
+        # "produces a null value" (SAS 9.4 Macro Language: Reference). Before,
+        # the value went unread. The list form assigns nothing.
+        self.assertEqual(
+            let_values(
+                "%global / readonly lib=Prod;\n%global/readonly ds = 'lib.t';\n"
+                "%local / READONLY i=;\n%global lib2 ds2;\n"
+            ),
+            {"lib": "prod", "ds": "lib.t", "i": ""},
+        )
+
+
+class TestSymdel(unittest.TestCase):
+    """A deleted variable stops resolving: before, `&lib` still answered prod
+    after `%symdel lib;`, and the step was recorded as reading prod.t."""
+
+    def _reads(self, source: str) -> list[str]:
+        from chunker import resolve_corpus_datasets
+
+        result = _chunk(source)
+        corpus = resolve_corpus_datasets(SasCorpus(file_results=[result]))
+        return [
+            r.name
+            for c in corpus.file_results[0].chunks
+            for r in c.metadata.dataset_refs
+            if r.role.value == "read"
+        ]
+
+    def test_a_symdel_statement(self):
+        self.assertEqual(
+            self._reads("%let lib = prod;\n%symdel lib;\ndata x; set &lib..t; run;\n"),
+            ["&lib..t"],
+        )
+
+    def test_a_let_after_the_symdel_assigns_again(self):
+        src = "%let lib = prod;\n%symdel lib;\n%let lib = dev;\ndata x; set &lib..t; run;\n"
+        self.assertEqual(self._reads(src), ["dev.t"])
+
+    def test_call_symdel_deletes_when_the_step_has_run(self):
+        src = (
+            "%let lib = prod;\ndata _null_; call symdel('lib'); run;\n"
+            "data x; set &lib..t; run;\n"
+        )
+        self.assertEqual(self._reads(src), ["&lib..t"])
+
+    def test_a_macro_that_deletes_a_global(self):
+        src = (
+            "%let lib = prod;\n%macro drop; %symdel lib; %mend;\n%drop;\n"
+            "data x; set &lib..t; run;\n"
+        )
+        self.assertEqual(self._reads(src), ["&lib..t"])
+
+
+class TestReadOnly(unittest.TestCase):
+    """A read-only variable holds what its declaration assigns. Before,
+    `%global / readonly lib=prod;` set nothing the chunker read, and
+    `&lib..t` stayed unresolved."""
+
+    _reads = TestSymdel._reads
+
+    def test_a_readonly_global(self):
+        src = "%global / readonly lib=prod;\ndata x; set &lib..t; run;\n"
+        self.assertEqual(self._reads(src), ["prod.t"])
+
+    def test_a_macro_that_creates_a_readonly_global(self):
+        src = (
+            "%macro setup; %global / readonly lib=prod; %mend;\n%setup;\n"
+            "data x; set &lib..t; run;\n"
+        )
+        self.assertEqual(self._reads(src), ["prod.t"])
+
+    def test_a_readonly_local_ends_with_its_macro(self):
+        src = "%macro m; %local / readonly lib=prod; %mend;\n%m;\ndata x; set &lib..t; run;\n"
+        self.assertEqual(self._reads(src), ["&lib..t"])
+
+    def test_the_declaration_names_its_variable(self):
+        # Before, the list was read as names: `readonly` was declared, `lib`
+        # was not, and `%global/readonly` with no blank declared nothing.
+        result = _chunk("%global / readonly lib=prod;\n%global/readonly ds=a.b;\n")
+        declared = {v for c in result.chunks for v in c.metadata.declared_macro_vars}
+        self.assertEqual(declared, {"lib", "ds"})
+
+    def test_a_word_that_names_no_variable_declares_nothing(self):
+        self.assertEqual(
+            scope_declarations("%global a 9z b;"), [("global", "a"), ("global", "b")]
+        )
+
+
+class TestMacroComments(unittest.TestCase):
+    """"Only macro comment statements and PL/1-style comments in the form /*
+    commentary */ in macro definitions or open code can be used to hide macro
+    statements from processing by the macro facility" (SAS 9.4 Macro
+    Language: Reference, %* Macro Comment Macro Statement). Before, a call ran
+    the %LET and %GLOBAL in its macro's %* comments, and a %LET in a %*
+    comment inside a step set the path a later reference read."""
+
+    _reads = TestSymdel._reads
+
+    @staticmethod
+    def _call(body: str) -> str:
+        return (
+            f"%let lib = prod;\n%macro m;\n  {body}\n  %put done;\n%mend;\n%m;\n"
+            "data y; set &lib..t; run;\n"
+        )
+
+    def test_a_let_in_a_macro_comment_never_runs(self):
+        # The comment ends at its first semicolon not in quotation marks.
+        for body in ("%* %let lib = test;", "%* a ';' %let lib = test;"):
+            with self.subTest(body=body):
+                self.assertEqual(self._reads(self._call(body)), ["prod.t"])
+
+    def test_a_global_in_a_macro_comment_declares_nothing(self):
+        # So the %LET after it sets a local that ends with the call.
+        src = (
+            "%macro m;\n  %* %global lib;\n  %let lib = test;\n%mend;\n%m;\n"
+            "data y; set &lib..t; run;\n"
+        )
+        self.assertEqual(self._reads(src), ["&lib..t"])
+
+    def test_a_let_in_an_asterisk_comment_runs(self):
+        # "The macro statements that are embedded in commentary are executed
+        # regardless of the asterisk or COMMENT".
+        self.assertEqual(self._reads(self._call("* %let lib = test;;")), ["test.t"])
+
+    def test_a_path_in_a_macro_comment_is_never_assigned(self):
+        src = (
+            "data _null_;\n  %let root = /a;\n  %* %let root = /b;\n"
+            '  infile "&root/x.txt";\n  input;\nrun;\n%include "&root/y.sas";\n'
+        )
+        paths = [r.path for c in _chunk(src).chunks for r in c.metadata.external_refs]
+        self.assertEqual(paths, ["/a/x.txt", "/a/y.sas"])
 
 
 class TestStripQuotes(unittest.TestCase):
@@ -188,6 +337,69 @@ class TestResolveRefs(unittest.TestCase):
     def test_empty_table_and_plain_text_short_circuit(self):
         self.assertEqual(resolve_refs("&ds", {}), "&ds")
         self.assertEqual(resolve_refs("work.orders", {"ds": "x"}), "work.orders")
+
+
+class TestCallSpans(unittest.TestCase):
+    """Macro calls back to back, as one semicolon-split chunk holds them."""
+
+    def _calls(self, text: str) -> list[str]:
+        return [text[span.start : span.end] for span in call_spans(_sanitise(text))]
+
+    def test_calls_without_semicolons(self):
+        self.assertEqual(
+            self._calls("%pull(tbl=a)\n%Pull (tbl=b) %setup\ndata x; set y; run;"),
+            ["%pull(tbl=a)", "%Pull (tbl=b)", "%setup"],
+        )
+        self.assertEqual(
+            [span.name for span in call_spans("%pull(tbl=a)\n%Pull (tbl=b)")],
+            ["pull", "pull"],
+        )
+
+    def test_semicolons_between_calls(self):
+        self.assertEqual(self._calls("%a(1);\n%b;\n"), ["%a(1)", "%b"])
+
+    def test_a_quoted_paren_or_a_nested_call_does_not_end_one(self):
+        self.assertEqual(
+            self._calls("%a(x=')', y=%lowcase(B))\n%b(1)"),
+            ["%a(x=')', y=%lowcase(B))", "%b(1)"],
+        )
+
+    def test_an_unclosed_list_runs_to_the_end(self):
+        self.assertEqual(self._calls("%a(x=1\n%b(2)"), ["%a(x=1\n%b(2)"])
+        self.assertEqual([span.closed for span in call_spans("%a(x=1\n%b(2)")], [False])
+        self.assertEqual([span.closed for span in call_spans("%a(1) %b")], [True, True])
+
+    def test_text_that_opens_with_no_call(self):
+        self.assertEqual(self._calls("data x; %a(1)"), [])
+
+
+class TestMacroSignature(unittest.TestCase):
+    def test_positional_and_keyword_parameters(self):
+        self.assertEqual(
+            macro_signature("%macro load(src, out=work.x, n=);"),
+            [("src", None), ("out", "work.x"), ("n", "")],
+        )
+
+    def test_a_default_holding_commas_or_parentheses_is_one_parameter(self):
+        self.assertEqual(
+            macro_signature("%macro m(list=%str(a,b), fmt=put(x, 8.), q='a,b', n=2);"),
+            [("list", "%str(a,b)"), ("fmt", "put(x, 8.)"), ("q", "'a,b'"), ("n", "2")],
+        )
+
+    def test_no_parameter_list(self):
+        self.assertEqual(macro_signature("%macro m / parmbuff;"), [])
+        self.assertEqual(macro_signature("%macro m;"), [])
+        self.assertEqual(macro_signature("data a; run;"), [])
+
+    def test_a_list_that_never_closes_runs_to_the_end(self):
+        self.assertEqual(macro_signature("%macro m(a, b=1"), [("a", None), ("b", "1")])
+
+    def test_comments_in_the_parameter_list_are_no_parameters(self):
+        (chunk,) = _chunk(
+            "%macro load(lib=, /* the library */ tbl= /* its table */);\n"
+            "  data &lib..&tbl; run;\n%mend;\n"
+        ).chunks
+        self.assertEqual(chunk.metadata.macro_param_names, ["lib", "tbl"])
 
 
 class TestIsDatasetShaped(unittest.TestCase):
@@ -426,6 +638,72 @@ class TestScope(unittest.TestCase):
         step = _kind(_chunk(src), SasChunkKind.DATA_STEP)[0]
         self.assertEqual(step.metadata.output_datasets, ["&target"])
 
+    def test_a_global_a_called_macro_overwrites_at_run_time_is_unknown(self):
+        """CALL SYMPUTX or PROC SQL INTO in the body replaces the global when
+        the call runs: the earlier %LET no longer names the table."""
+        for body in (
+            "data _null_; set cfg; call symputx('cut', x); run;",
+            "proc sql noprint; select max(x) into :cut from cfg; quit;",
+        ):
+            with self.subTest(body=body):
+                src = f"%let cut = five;\n%macro recut;\n  {body}\n%mend;\n%recut;\ndata lib.t_&cut; run;\n"
+                step = _kind(_chunk(src), SasChunkKind.DATA_STEP)[-1]
+                self.assertEqual(step.metadata.output_datasets, ["lib.t_&cut"])
+        # Into a %LOCAL of the same name, the global is untouched.
+        src = (
+            "%let cut = five;\n%macro recut;\n  %local cut;\n"
+            "  proc sql noprint; select max(x) into :cut from cfg; quit;\n%mend;\n"
+            "%recut;\ndata lib.t_&cut; run;\n"
+        )
+        step = _kind(_chunk(src), SasChunkKind.DATA_STEP)[-1]
+        self.assertEqual(step.metadata.output_datasets, ["lib.t_five"])
+
+    def test_a_macro_called_after_an_external_one_still_sets_its_globals(self):
+        # %ext is defined outside the corpus and binds nothing; %m, later in
+        # the same statement, still runs.
+        src = (
+            "%let lib = prod;\n%macro m(x); %global lib; %let lib = test; %mend;\n"
+            "%ext(a) foo %m(b);\ndata y; set &lib..t; run;\n"
+        )
+        step = _kind(_chunk(src), SasChunkKind.DATA_STEP)[-1]
+        self.assertEqual(step.metadata.input_datasets, ["test.t"])
+
+    def test_a_body_that_rewrites_its_parameter_still_reads_the_calls(self):
+        """`%let ds = %upcase(&ds);` keeps the argument the call passed: the
+        body's &ds is still that parameter, for names and paths alike."""
+        src = (
+            "%let ds = work.global_one;\n%let dir = /global;\n"
+            "%macro m(ds, dir);\n  %let ds = %upcase(&ds);\n  %let dir = %trim(&dir);\n"
+            '  data work.out; set &ds; run;\n  %include "&dir/x.sas";\n%mend;\n'
+        )
+        macro = _kind(_chunk(src), SasChunkKind.MACRO_DEFINITION)[0]
+        self.assertEqual(macro.metadata.body_param_inputs, [{"param": "ds", "pos": 0}])
+        self.assertEqual(
+            [(f.path, f.resolved) for f in macro.metadata.include_files], [("&dir/x.sas", False)]
+        )
+
+    def test_a_macro_invoked_inside_a_step_leaves_its_globals(self):
+        """Its defaults alone bind it; its %GLOBAL values hold after the step,
+        for names and for paths."""
+        src = (
+            "%macro setlib;\n  %global lib root;\n  %let lib = prod;\n  %let root = /sas/prod;\n%mend;\n"
+            "data _null_; %setlib; run;\n"
+            "data work.x; set &lib..t; run;\n"
+            '%include "&root/setup.sas";\n'
+        )
+        result = _chunk(src)
+        self.assertEqual(_kind(result, SasChunkKind.DATA_STEP)[-1].metadata.input_datasets, ["prod.t"])
+        (include,) = [f for c in result.chunks for f in c.metadata.include_files]
+        self.assertEqual((include.path, include.resolved), ("/sas/prod/setup.sas", True))
+
+    def test_a_symput_with_a_computed_name_assigns_nothing(self):
+        src = (
+            "%let v = old;\n"
+            "data _null_; call symputx(cats('v', 1), 'new'); call symputx('w'); run;\n"
+            "data lib.&v; run;\n"
+        )
+        self.assertEqual(_kind(_chunk(src), SasChunkKind.DATA_STEP)[-1].metadata.output_datasets, ["lib.old"])
+
     def test_a_reference_before_its_let_is_not_resolved(self):
         src = "data &later; run;\n%let later = work.after;\n"
         step = _kind(_chunk(src), SasChunkKind.DATA_STEP)[0]
@@ -546,13 +824,15 @@ class TestMetadataPlumbing(unittest.TestCase):
         )
 
     def test_unresolved_refs_view_spans_every_dataset_field(self):
-        from chunker.models import SasChunkMetadata
+        from chunker.models import DatasetRole, SasChunkMetadata, SasDatasetRef
 
         meta = SasChunkMetadata(
-            referenced_datasets=["&a", "work.plain"],
-            input_datasets=["&b"],
-            output_datasets=["work.plain"],
-            body_literal_inputs=["&c"],
+            dataset_refs=(
+                SasDatasetRef(name="&a", role=DatasetRole.MENTION, via="%let"),
+                SasDatasetRef(name="&b", role=DatasetRole.READ),
+                SasDatasetRef(name="work.plain", role=DatasetRole.WRITE),
+                SasDatasetRef(name="&c", role=DatasetRole.READ, in_macro_body=True),
+            ),
         )
         self.assertEqual(meta.unresolved_dataset_refs, ["&a", "&b", "&c"])
 

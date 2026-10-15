@@ -122,7 +122,8 @@ def connect(item: "HydrationItem", config: "HydrationConfig") -> Any:
     The DSN comes from the SAS ``path=`` option when it had one, else the
     configured default. The password never comes from either — it resolves
     through the credential chain, keyed on the libref so one corpus can reach
-    several databases with different accounts.
+    several databases with different accounts; a table read through SQL
+    pass-through has no libref, and is keyed on its connection alias instead.
     """
     try:
         import oracledb
@@ -135,7 +136,7 @@ def connect(item: "HydrationItem", config: "HydrationConfig") -> Any:
     options = item.source.option_map
     dsn = options.get("path") or config.oracle_dsn
     user = options.get("user") or config.oracle_user
-    libref = item.source.libref or "oracle"
+    libref = item.source.libref or item.source.connection or "oracle"
     password = resolve_secret(f"oracle_password_{libref}", scope=config.secret_scope)
 
     if not dsn:
@@ -165,11 +166,17 @@ class OracleReader:
     def _sql(self) -> str:
         """The ``SELECT`` for this item, with its partition spliced in."""
         source = self._item.source
-        schema = source.object_name
-        table = self._item.target_table.rsplit(".", 1)[-1]
-        # The target table name has been through naming.sanitise_part, so it is
-        # the source object that must supply the real name.
-        table = source.option_map.get("table", table)
+        if source.connection is not None:
+            # A table the corpus named — through pass-through or as a member of
+            # a database LIBNAME — is owner.table, or a bare table that the
+            # account's default schema resolves; the source carries both halves.
+            schema, _, table = source.object_name.rpartition(".")
+        else:
+            schema = source.object_name
+            table = self._item.target_table.rsplit(".", 1)[-1]
+            # The target table name has been through naming.sanitise_part, so
+            # it is the source object that must supply the real name.
+            table = source.option_map.get("table", table)
         qualified = f'"{schema.upper()}"."{table.upper()}"' if schema else f'"{table.upper()}"'
 
         partition = self._item.partition

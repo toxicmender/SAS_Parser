@@ -1,0 +1,402 @@
+"""
+test_data_hydration_includes.py — where the scripts a corpus %INCLUDEs are.
+
+An %INCLUDE names a script by its path on the SAS server, which means nothing
+here; the script is looked for by file name, in the local corpus and in the
+application's SharePoint scripts folder. Pinned:
+
+* **The file name an %INCLUDE opens**, however it is spelled: a path, a member
+  of a fileref's directory, a macro variable.
+* **Where it was found**, ignoring case and at any depth, with "nowhere looked"
+  kept apart from "looked and not found".
+* **The CLIs**: ``python -m data_hydration --check-includes`` reports and
+  stores it; a FILENAME only %INCLUDE reads is code, never a load.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+import pytest
+
+from chunker import SasCorpus, SasSemanticChunker, resolve_corpus_datasets
+from data_hydration.config import HydrationConfig
+from data_hydration.includes import (
+    found_in,
+    include_checks,
+    include_file_name,
+    is_include,
+    local_index,
+    match_includes,
+    sharepoint_index,
+)
+from data_hydration.inventory import InventoryRow, inventory_rows, plan_from_inventory
+
+
+def _rows(**files: str) -> list[InventoryRow]:
+    chunker = SasSemanticChunker()
+    corpus = SasCorpus(
+        file_results=[chunker.chunk_text(t, source_id=f"{n}.sas") for n, t in files.items()]
+    )
+    return inventory_rows(resolve_corpus_datasets(corpus).file_results)
+
+
+def _includes(src: str) -> list[InventoryRow]:
+    return [r for r in _rows(job=src) if is_include(r)]
+
+
+# ── the file name ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("src", "name"),
+    [
+        ("%include '/sas/prod/macros/Util.sas';", "Util.sas"),
+        ("%include 'C:\\SAS\\Macros\\load.sas';", "load.sas"),
+        ('%let root = /SAS;\n%include "&root/lib/x.sas";', "x.sas"),
+        # Unresolved but for the directory: the file name is still known.
+        ('%include "&nowhere/lib/y.sas";', "y.sas"),
+        # A member of a fileref's directory, bound or not: SAS adds .sas.
+        ("filename src '/code';\n%include src(util);", "util.sas"),
+        ("%include src(util);", "util.sas"),
+        ("%include src('setup.txt');", "setup.txt"),
+        # As SAS on UNIX names it: unquoted with no extension, lowercased;
+        # with one, or quoted, as written (Specifying Pathnames).
+        ("filename src '/code';\n%include src(UTIL);", "util.sas"),
+        ("%include src(Util);", "util.sas"),
+        ("%include src(Util.sas);", "Util.sas"),
+        ('%include src("Util");', "Util"),
+        ("%let f = src(util);\n%include &f;", "util.sas"),
+        # No file name to look for.
+        ("%include &f;", None),
+        ('%include "/lib/&name..sas";', None),
+        # A name no fileref is assigned to: the file SAS on UNIX reads from
+        # its current directory, lowercased, with .sas.
+        ("%include setup;", "setup.sas"),
+        ("%include QTR;", "qtr.sas"),
+    ],
+)
+def test_the_file_name_an_include_opens(src, name):
+    [row] = _includes(src + "\n")
+    assert include_file_name(row) == name
+
+
+def test_a_bound_whole_file_fileref_opens_its_file():
+    [row] = _includes("filename setup '/code/setup.sas';\n%include setup;\n")
+    assert include_file_name(row) == "setup.sas"
+
+
+# ── the places ───────────────────────────────────────────────────────────────
+
+
+def test_the_local_index_lists_every_file_by_lowercased_name(tmp_path):
+    (tmp_path / "macros").mkdir()
+    (tmp_path / "macros" / "Util.SAS").write_text("")
+    (tmp_path / "util.sas").write_text("")
+    (tmp_path / "job.sas").write_text("")
+    assert local_index(tmp_path) == {
+        "util.sas": ("macros/Util.SAS", "util.sas"),
+        "job.sas": ("job.sas",),
+    }
+
+
+class _Library:
+    """A document library's folders, as SharePointClient.list_directory
+    sees them."""
+
+    def __init__(self, tree: dict[str, list[str]]):
+        self.tree = tree
+        self.listed: list[str] = []
+
+    def list_directory(self, path=""):
+        self.listed.append(path)
+        return [
+            {"name": name.rstrip("/"), "is_folder": name.endswith("/")}
+            for name in self.tree.get(path, [])
+        ]
+
+
+def test_the_sharepoint_index_walks_every_folder():
+    library = _Library(
+        {
+            "App/scripts_original": ["job.sas", "macros/", "Readme.md"],
+            "App/scripts_original/macros": ["Util.sas", "deep/"],
+            "App/scripts_original/macros/deep": ["util.sas"],
+        }
+    )
+    index = sharepoint_index("/App/scripts_original/", client=library)
+    assert index["util.sas"] == (
+        "App/scripts_original/macros/Util.sas",
+        "App/scripts_original/macros/deep/util.sas",
+    )
+    assert set(index) == {"job.sas", "readme.md", "util.sas"}
+
+
+def test_an_entry_with_no_name_is_no_file():
+    library = _Library({"a": ["x.sas"]})
+    listed = library.list_directory
+    library.list_directory = lambda path="": [*listed(path), {"is_folder": False}, {"name": ""}]
+    assert sharepoint_index("a", client=library) == {"x.sas": ("a/x.sas",)}
+
+
+def test_a_sharepoint_walk_stops_at_its_folder_limit(monkeypatch, caplog):
+    import data_hydration.includes as includes
+
+    monkeypatch.setattr(includes, "MAX_SHAREPOINT_FOLDERS", 2)
+    library = _Library({"a": ["b/", "x.sas"], "a/b": ["c/", "y.sas"], "a/b/c": ["z.sas"]})
+    assert set(sharepoint_index("a", client=library)) == {"x.sas", "y.sas"}
+    assert "stopped after 2 folder(s)" in caplog.text
+
+
+# ── matching ─────────────────────────────────────────────────────────────────
+
+
+SRC = (
+    "%include '/sas/prod/Util.sas';\n"
+    "%include '/sas/prod/common.sas';\n"
+    "%include '/elsewhere/missing.sas';\n"
+    "%include &f;\n"
+    "libname raw '/data/raw';\n"
+)
+
+
+def test_each_include_records_where_its_script_was_found():
+    local = {"util.sas": ("macros/Util.sas",)}
+    sharepoint = {"common.sas": ("App/scripts_original/common.sas",), "util.sas": ("App/u/util.sas",)}
+    rows = match_includes(_rows(job=SRC), local=local, sharepoint=sharepoint)
+    found = {r.raw: (r.found_local, r.found_sharepoint) for r in rows if is_include(r)}
+    assert found == {
+        "/sas/prod/Util.sas": (("macros/Util.sas",), ("App/u/util.sas",)),
+        "/sas/prod/common.sas": ((), ("App/scripts_original/common.sas",)),
+        "/elsewhere/missing.sas": ((), ()),
+        # Searched, but there was no name to search for.
+        "&f": ((), ()),
+    }
+    # Every other row is as it was.
+    [libname] = [r for r in rows if r.statement == "libname"]
+    assert (libname.found_local, libname.found_sharepoint) == (None, None)
+
+
+def test_a_place_nobody_looked_in_stays_none():
+    rows = match_includes(_rows(job=SRC), local={"util.sas": ("u.sas",)})
+    assert {r.found_sharepoint for r in rows} == {None}
+
+
+def test_the_checks_name_each_script_once_with_everyone_who_includes_it():
+    rows = match_includes(
+        _rows(a=SRC, b="%include '/other/place/Util.sas';\n%include '/x/UTIL.sas';\n"),
+        local={"util.sas": ("macros/Util.sas",)},
+    )
+    checks = {c.file_name or c.spelled: c for c in include_checks(rows)}
+    # UTIL.sas is another file on UNIX, and no copy of it was found.
+    assert list(checks) == ["Util.sas", "common.sas", "missing.sas", "&f", "UTIL.sas"]
+    util = checks["Util.sas"]
+    assert util.included_by == (("a.sas", 1), ("b.sas", 1))
+    assert (util.status, util.local, util.sharepoint) == ("found", ("macros/Util.sas",), None)
+    assert checks["UTIL.sas"].status == "missing"
+    assert checks["missing.sas"].status == "missing"
+    assert checks["&f"].status == "unnamed"
+    # Unchecked: nobody looked.
+    assert {c.status for c in include_checks(_rows(job=SRC))} == {"unchecked"}
+
+
+def test_a_wildcard_include_finds_every_script_it_matches():
+    # `%include '/code/macros/*.sas';` reads every match (SAS 9.4 Companion for
+    # UNIX Environments, Using Wildcards in Pathnames): * is one or more
+    # characters, never a leading period. Before, "*.sas" was looked for by
+    # that name and reported missing.
+    index = {
+        "a.sas": ("m/a.sas",),
+        "util1.sas": ("m/util1.sas",),
+        "util22.sas": ("m/util22.sas",),
+        ".hidden.sas": ("m/.hidden.sas",),
+        "notes.txt": ("m/notes.txt",),
+        "b.sas": ("other/b.sas",),
+    }
+    assert found_in(index, "*.sas") == ("m/a.sas", "other/b.sas", "m/util1.sas", "m/util22.sas")
+    assert found_in(index, "util?.sas") == ("m/util1.sas",)
+    assert found_in(index, "[ab].sas") == ("m/a.sas", "other/b.sas")
+    assert found_in(index, "Util1.SAS") == ("m/util1.sas",)
+    assert found_in(index, "u*1.sas") == ("m/util1.sas",)
+    rows = match_includes(_rows(job="%include '/code/macros/util*.sas';\n"), local=index)
+    [check] = include_checks(rows)
+    assert (check.file_name, check.status, check.local) == (
+        "util*.sas",
+        "found",
+        ("m/util1.sas", "m/util22.sas"),
+    )
+
+
+def test_a_python_script_proc_python_runs_is_looked_for_too():
+    # PROC PYTHON's INFILE= names the Python file the step runs (SAS 9.4
+    # Procedures Guide, PROC PYTHON Statement): a script the job depends on,
+    # as an %INCLUDE's is. Before, it was never looked for.
+    rows = match_includes(
+        _rows(
+            job=(
+                "proc python infile='/sas/py/Prep.py'; run;\n"
+                "filename py '/sas/py/score.py';\nproc python infile=py; run;\n"
+                "proc python infile=gone; run;\n"
+            )
+        ),
+        local={"prep.py": ("py/Prep.py",)},
+    )
+    checks = include_checks(rows)
+    assert [(c.file_name or c.spelled, c.status, c.included_by) for c in checks] == [
+        ("Prep.py", "found", (("job.sas", 1),)),
+        ("score.py", "missing", (("job.sas", 3),)),
+        # A fileref no FILENAME binds: its file name is the FILENAME's.
+        ("gone", "unnamed", (("job.sas", 4),)),
+    ]
+
+
+def test_a_local_copy_is_found_by_its_exact_name_and_sharepoint_ignores_case():
+    # File names on UNIX are case sensitive: "a file named PROGRAM is not the
+    # same as a file named program" (SAS 9.4 Companion for UNIX Environments).
+    # SharePoint ignores case in its own names. Before, both ignored it.
+    index = {"util.sas": ("m/util.sas", "n/UTIL.sas"), "util1.sas": ("m/Util1.sas", "n/util1.sas")}
+    assert found_in(index, "UTIL.sas", exact=True) == ("n/UTIL.sas",)
+    assert found_in(index, "Util.sas", exact=True) == ()
+    assert found_in(index, "Util.sas") == ("m/util.sas", "n/UTIL.sas")
+    assert found_in(index, "Util*.sas", exact=True) == ("m/Util1.sas",)
+    assert found_in(index, "util*.sas", exact=True) == ("n/util1.sas",)
+    rows = match_includes(
+        _rows(job="%include '/sas/prod/Util.sas';\n"),
+        local={"util.sas": ("macros/util.sas",)},
+        sharepoint={"util.sas": ("App/util.sas",)},
+    )
+    [row] = [r for r in rows if is_include(r)]
+    assert (row.found_local, row.found_sharepoint) == ((), ("App/util.sas",))
+
+
+def test_one_statement_including_two_copies_of_a_script_is_one_site():
+    [check] = include_checks(_rows(job="%include '/a/util.sas' '/b/util.sas';\n"))
+    assert (check.file_name, check.included_by) == ("util.sas", (("job.sas", 1),))
+
+
+def test_the_matches_survive_the_table_round_trip():
+    from data_hydration.inventory import _values
+
+    [row] = [
+        r
+        for r in match_includes(_rows(job=SRC), local={"util.sas": ("m/Util.sas",)})
+        if r.raw.endswith("Util.sas")
+    ]
+    stored = row.model_dump()
+    stored["found_local"] = ["m/Util.sas"]
+    assert InventoryRow.model_validate(stored) == row
+    values = dict(zip(InventoryRow.model_fields, _values(row)))
+    assert (values["found_local"], values["found_sharepoint"]) == (["m/Util.sas"], None)
+
+
+# ── the plan ─────────────────────────────────────────────────────────────────
+
+
+def test_a_fileref_only_include_reads_names_code_not_data():
+    rows = _rows(
+        setup="filename src '/code/macros';\nfilename feed '/data/feed';\n",
+        job="%include src(util);\ndata a; infile feed(day1.csv); input x; run;\n",
+    )
+    plan = plan_from_inventory(rows, config=HydrationConfig(catalog="main"))
+    # The macro directory is SAS to convert; the feed directory holds data.
+    assert [i.source.locator for i in plan.items] == ["/data/feed"]
+
+
+def test_a_python_script_is_code_not_data():
+    # The script PROC PYTHON runs is code to convert, by path or through a
+    # FILENAME nothing else reads. Before, that FILENAME was planned as data.
+    rows = _rows(
+        job=(
+            "proc python infile='/sas/py/prep.py'; run;\n"
+            "filename py '/sas/py/score.py';\nproc python infile=py; run;\n"
+        )
+    )
+    assert plan_from_inventory(rows, config=HydrationConfig(catalog="main")).items == []
+
+
+def test_a_fileref_also_read_by_infile_holds_data():
+    rows = _rows(job="filename both '/data/mixed';\n%include both(a);\ndata x; infile both(b.csv); run;\n")
+    plan = plan_from_inventory(rows, config=HydrationConfig(catalog="main"))
+    assert [i.source.locator for i in plan.items] == ["/data/mixed"]
+
+
+# ── the CLI ──────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def corpus_dir(tmp_path):
+    (tmp_path / "macros").mkdir()
+    (tmp_path / "macros" / "util.sas").write_text("%macro util; %mend;\n")
+    (tmp_path / "job.sas").write_text(
+        "%include '/sas/prod/util.sas';\n%include '/sas/prod/common.sas';\n"
+    )
+    return tmp_path
+
+
+def _main(*argv: str) -> int:
+    from data_hydration.__main__ import main
+
+    return main(list(argv))
+
+
+def test_the_cli_reports_where_each_include_was_found(corpus_dir, capsys):
+    assert _main(str(corpus_dir), "--dry-run", "--check-includes") == 0
+    out = capsys.readouterr().out
+    assert "Included scripts — 2, 1 not found" in out
+    assert "util.sas  ->  local: macros/util.sas" in out
+    assert "common.sas  ->  ** missing" in out
+
+
+def test_the_cli_looks_in_sharepoint_and_stores_the_answer(corpus_dir, monkeypatch, capsys):
+    import data_hydration.includes as includes
+    import data_hydration.inventory as inventory
+
+    listed: list[str] = []
+
+    def fake_index(folder, **_):
+        listed.append(folder)
+        return {"common.sas": (f"{folder}/common.sas",)}
+
+    from app_config.sharepoint import SharePointConfig
+
+    stored: dict[str, list[InventoryRow]] = {}
+    monkeypatch.setattr(includes, "sharepoint_index", fake_index)
+    monkeypatch.setattr(
+        SharePointConfig, "from_env", classmethod(lambda cls: SharePointConfig(file_server_base_path="Apps"))
+    )
+    monkeypatch.setattr(
+        inventory, "write_inventory", lambda rows, table, **_: stored.setdefault(table, rows)
+    )
+    argv = [str(corpus_dir), "--dry-run", "--sharepoint-app", "MyApp", "--inventory-table", "m.s.t"]
+    assert _main(*argv) == 0
+    assert listed == ["Apps/MyApp/scripts_original"]
+    out = capsys.readouterr().out
+    assert "common.sas  ->  SharePoint: Apps/MyApp/scripts_original/common.sas" in out
+    [common] = [r for r in stored["m.s.t"] if r.raw.endswith("common.sas")]
+    assert (common.found_local, common.found_sharepoint) == (
+        (),
+        ("Apps/MyApp/scripts_original/common.sas",),
+    )
+
+
+def test_a_sharepoint_folder_that_cannot_be_listed_fails_the_run_not_the_check(
+    corpus_dir, monkeypatch, capsys
+):
+    import data_hydration.includes as includes
+
+    def refuse(*_, **__):
+        raise RuntimeError("Graph says no")
+
+    monkeypatch.setattr(includes, "sharepoint_index", refuse)
+    assert _main(str(corpus_dir), "--dry-run", "--sharepoint-app", "MyApp") == 1
+    captured = capsys.readouterr()
+    assert "util.sas  ->  local: macros/util.sas" in captured.out
+    assert "could not list SharePoint folder" in captured.err
+
+
+def test_without_the_flag_nothing_is_looked_for(corpus_dir, capsys):
+    assert _main(str(corpus_dir), "--dry-run") == 0
+    assert "Included scripts" not in capsys.readouterr().out

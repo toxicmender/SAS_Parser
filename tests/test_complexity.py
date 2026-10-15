@@ -1261,6 +1261,108 @@ class TestCrossFile(unittest.TestCase):
         self.assertEqual(lib.depended_on_by, ["job.sas"])
 
 
+class TestUpdatesAcrossFiles(unittest.TestCase):
+    """Only a file that creates a table supplies it. A file that updates one
+    in place needs it from the creator and supplies it to nobody."""
+
+    # create.sas makes audit.log; two jobs append to it; a report reads it.
+    FILES = dict(
+        create="data audit.log; length job $8; stop; run;\n",
+        job1="data work.r1; set edw.a; run;\n"
+        "proc append base=audit.log data=work.r1; run;\n",
+        job2="proc sql; insert into audit.log select * from edw.b; quit;\n",
+        report="proc print data=audit.log; run;\n",
+    )
+
+    def setUp(self):
+        self.report = ComplexityAnalyzer().analyze_corpus(_corpus(**self.FILES))
+
+    def _profile(self, source_id: str):
+        profile = _file(self.report, source_id).cross_file
+        assert profile is not None
+        return profile
+
+    def test_an_appending_file_imports_the_table_from_its_creator(self):
+        job1 = self._profile("job1.sas")
+        self.assertEqual(job1.depends_on, ["create.sas"])
+        self.assertIn("audit.log written by create.sas", job1.imports)
+
+    def test_appending_files_do_not_depend_on_each_other(self):
+        self.assertEqual(self._profile("job1.sas").depended_on_by, [])
+        self.assertEqual(self._profile("job2.sas").depended_on_by, [])
+        graph = self.report.graph
+        assert graph is not None
+        self.assertEqual(graph.cycles, [])
+
+    def test_a_reader_depends_on_the_creator_alone(self):
+        self.assertEqual(self._profile("report.sas").depends_on, ["create.sas"])
+        self.assertEqual(
+            self._profile("create.sas").depended_on_by,
+            ["job1.sas", "job2.sas", "report.sas"],
+        )
+
+    def test_the_datasets_section_agrees(self):
+        job1 = _file(self.report, "job1.sas")
+        self.assertIn("audit.log", job1.input_datasets)
+        self.assertIn("audit.log", job1.output_datasets)
+        self.assertNotIn("audit.log", job1.intermediate_datasets)
+        self.assertEqual(job1.updated_datasets, ["audit.log"])
+
+
+class TestDatasetListsAcrossFiles(unittest.TestCase):
+    """A dataset list links files as chunker.batcher links chunks: `lib.pre:`
+    covers every dataset whose name starts so, and a whole-library COPY
+    creates every member of its output library."""
+
+    FILES = dict(
+        copy="proc copy in=src out=tgt; run;\n",
+        member="data work.x; set tgt.members; run;\n",
+        months="data stage.sales_jan; set raw.j; run;\n"
+        "data stage.sales_feb; set raw.f; run;\n",
+        year="data work.all; set stage.sales_:; run;\n",
+    )
+
+    def setUp(self):
+        self.report = ComplexityAnalyzer().analyze_corpus(_corpus(**self.FILES))
+
+    def _profile(self, source_id: str):
+        profile = _file(self.report, source_id).cross_file
+        assert profile is not None
+        return profile
+
+    def test_a_member_of_a_copied_library_comes_from_the_copy(self):
+        member = self._profile("member.sas")
+        self.assertEqual(member.depends_on, ["copy.sas"])
+        self.assertIn("tgt.members written by copy.sas", member.imports)
+        self.assertEqual(self._profile("copy.sas").depended_on_by, ["member.sas"])
+
+    def test_a_prefix_list_reads_every_dataset_it_covers(self):
+        self.assertEqual(self._profile("year.sas").depends_on, ["months.sas"])
+        self.assertEqual(
+            self._profile("months.sas").exports,
+            ["stage.sales_jan read by year.sas", "stage.sales_feb read by year.sas"],
+        )
+
+    def test_a_whole_library_read_reads_no_list_either(self):
+        # CONTENTS of stage._all_ reads no dataset, so the COPY that writes
+        # stage.: exports nothing to it, as it imports nothing from the COPY.
+        report = ComplexityAnalyzer().analyze_corpus(
+            _corpus(
+                make="proc copy in=src out=stage; run;\n",
+                look="proc contents data=stage._all_; run;\n",
+            )
+        )
+        for source_id in ("make.sas", "look.sas"):
+            profile = _file(report, source_id).cross_file
+            assert profile is not None
+            self.assertEqual((profile.imports, profile.exports), ([], []), source_id)
+
+    def test_a_whole_library_read_names_no_dataset(self):
+        # COPY reads src.: — every member of src, none of them a dataset any
+        # file is expected to write.
+        self.assertNotIn("dataset_unresolved", _cross_names(_file(self.report, "copy.sas")))
+
+
 class TestFileComplexity(unittest.TestCase):
     """The file rollup, and how it renders."""
 
@@ -1995,8 +2097,16 @@ class TestFileReport(unittest.TestCase):
         self.assertIn("## Drivers", text)
 
     def test_a_floored_size_says_which_kind_floored_it(self):
-        self.assertEqual(self.file.floored_by, "MACRO_DEFINITION")
-        self.assertIn("floored", self._render())
+        # A macro too small to band above SMALL is floored by its definition.
+        # (load.sas no longer is: its %load; reads raw.a through the lib=
+        # default, and that I/O bands it at the floor on its own.)
+        report, texts = _batched(tiny="%macro tiny;\n  %put hello;\n%mend tiny;\n%tiny;\n")
+        file = _file(report, "tiny.sas")
+        self.assertEqual(file.floored_by, "MACRO_DEFINITION")
+        self.assertIn(
+            "floored",
+            render_file_report(file, texts=texts, target_display=report.target_display),
+        )
 
 
 class TestOverallReport(unittest.TestCase):
@@ -2411,6 +2521,67 @@ class TestDatasets(unittest.TestCase):
     def test_a_file_touching_no_dataset_gets_no_section(self):
         text = render_file_report(_file(_analyze("%let x = 1;\n"), "t.sas"))
         self.assertNotIn("## Datasets", text)
+
+    # Appends to mart.hist, inserts into mart.log, and deletes three tables.
+    MAINTENANCE = (
+        "data work.stg; set edw.raw; run;\n"
+        "proc append base=mart.hist data=work.stg; run;\n"
+        "proc sql; insert into mart.log select * from work.stg;"
+        " drop table work.old; quit;\n"
+        "proc datasets lib=work nolist; delete tmp1 tmp2; quit;\n"
+    )
+
+    def test_updates_and_deletes_are_named_per_chunk(self):
+        chunks = sorted(
+            _file(_analyze(self.MAINTENANCE), "t.sas").chunks,
+            key=lambda c: c.start_line,
+        )
+        self.assertEqual(chunks[0].updated_datasets, [])
+        self.assertEqual(chunks[1].updated_datasets, ["mart.hist"])
+        self.assertEqual(chunks[2].updated_datasets, ["mart.log"])
+        self.assertEqual(chunks[2].dropped_datasets, ["work.old"])
+        self.assertEqual(chunks[3].dropped_datasets, ["work.tmp1", "work.tmp2"])
+        # An updated table is read and written; a deleted one is neither.
+        self.assertIn("mart.hist", chunks[1].input_datasets)
+        self.assertIn("mart.hist", chunks[1].output_datasets)
+        self.assertNotIn("work.old", chunks[2].output_datasets)
+
+    def test_a_table_only_updated_here_is_an_input(self):
+        """Something else creates mart.hist; appending to it needs it first."""
+        file = _file(_analyze(self.MAINTENANCE), "t.sas")
+        self.assertEqual(file.input_datasets, ["edw.raw", "mart.hist", "mart.log"])
+        self.assertNotIn("mart.hist", file.intermediate_datasets)
+        self.assertIn("mart.hist", file.output_datasets)
+
+    def test_a_table_created_then_inserted_into_is_not_an_update(self):
+        file = _file(
+            _analyze(
+                "proc sql; create table work.x as select * from edw.raw;"
+                " insert into work.x values (1); quit;\n"
+            ),
+            "t.sas",
+        )
+        self.assertEqual(file.updated_datasets, [])
+        self.assertEqual(file.output_datasets, ["work.x"])
+
+    def test_the_report_calls_out_updates_and_deletes(self):
+        file = _file(_analyze(self.MAINTENANCE), "t.sas")
+        self.assertEqual(file.updated_datasets, ["mart.hist", "mart.log"])
+        self.assertEqual(file.dropped_datasets, ["work.old", "work.tmp1", "work.tmp2"])
+        text = render_file_report(file)
+        self.assertIn(
+            "- Updated in place (rows added or changed): mart.hist, mart.log", text
+        )
+        self.assertIn("- Deleted: work.old, work.tmp1, work.tmp2", text)
+
+    def test_a_file_that_only_deletes_still_gets_a_section(self):
+        file = _file(
+            _analyze("proc datasets lib=work nolist; delete tmp1; quit;\n"), "t.sas"
+        )
+        text = render_file_report(file)
+        self.assertIn("## Datasets", text)
+        self.assertIn("- Deleted: work.tmp1", text)
+        self.assertNotIn("Updated in place", text)
 
     def test_the_rollup_agrees_with_cross_file_coupling(self):
         """An imported dataset must not also be claimed as locally produced."""
@@ -3019,6 +3190,160 @@ class TestPathsSection(unittest.TestCase):
             "**(unresolved macro reference)**", render_file_report(scored, texts={})
         )
 
+    def test_a_fileref_no_filename_assigns_is_unresolved(self):
+        scored = _file(_analyze("data work.r; infile rawin; input x; run;\n"), "t.sas")
+        text = render_file_report(scored, texts={})
+        self.assertIn("- Unresolved (not known before the job runs; each says why):", text)
+        # With the file SAS on UNIX reads when no fileref of that name exists.
+        self.assertIn(
+            "`rawin` → `rawin.dat` — infile `rawin` "
+            "**(a fileref no FILENAME in the corpus assigns)**",
+            text,
+        )
+
+    def test_a_fileref_a_filename_assigns_is_reported_where_it_points(self):
+        scored = _file(
+            _analyze(
+                "filename rawin '/data/in/raw.txt';\n"
+                "data work.r; infile rawin; input x; run;\n"
+            ),
+            "t.sas",
+        )
+        text = render_file_report(scored, texts={})
+        self.assertNotIn("Unresolved", text)
+        self.assertIn("`rawin` → `/data/in/raw.txt` — infile `rawin`", text)
+
+    def test_a_path_spelled_through_a_macro_variable_shows_where_it_resolves(self):
+        scored = _file(
+            _analyze('%let root = /SASData;\nlibname raw "&root/in";\n'), "t.sas"
+        )
+        text = render_file_report(scored, texts={})
+        self.assertIn("`&root/in` → `/SASData/in` — libname `raw`", text)
+        self.assertNotIn("unresolved macro reference", text)
+
+    def test_a_wildcard_and_each_unknown_place_get_their_own_group(self):
+        scored = _file(
+            _analyze(
+                "filename wild '/data/in/wild*.dat';\n"
+                "data work.a; infile wild; input x; run;\n"
+                "data work.b; infile '~/b.csv'; input x; run;\n"
+                "data work.c; infile 'in/c.csv'; input x; run;\n"
+                "data work.d; infile '/data/in/d.csv'; input x; run;\n"
+            ),
+            "t.sas",
+        )
+        text = render_file_report(scored, texts={})
+        filesystem = text.index("- Filesystem (needs a volume or external location):")
+        wildcards = text.index(
+            "- Wildcards (SAS reads every file one matches: list them before mapping):"
+        )
+        unresolved = text.index("- Unresolved (not known before the job runs; each says why):")
+        self.assertLess(filesystem, wildcards)
+        self.assertLess(wildcards, unresolved)
+        # Each reference in one group, as the chunk metadata has them.
+        self.assertEqual(text.count("`/data/in/d.csv`"), 1)
+        self.assertLess(filesystem, text.index("`/data/in/d.csv` — infile"))
+        self.assertLess(wildcards, text.index("`wild` → `/data/in/wild*.dat` — infile `wild`"))
+        self.assertIn(
+            "`~/b.csv` — infile **(completed by the SAS server: ~ is the home "
+            "directory of the user SAS runs as)**",
+            text,
+        )
+        self.assertIn(
+            "`in/c.csv` — infile **(relative: SAS reads it from its current directory)**",
+            text,
+        )
+
+    def test_a_concatenation_reports_each_directory_and_each_libref(self):
+        # A library named by its libref is no place: its own group says so.
+        scored = _file(_analyze("libname all (v9 '/data/x');\n"), "t.sas")
+        text = render_file_report(scored, texts={})
+        self.assertIn("`/data/x` — libname `all`", text)
+        self.assertIn("- Libraries a concatenation names by libref", text)
+        self.assertIn("`v9` — libname `all`", text)
+
+
+class TestDatabaseTablesSection(unittest.TestCase):
+    """Database tables beside the Paths section, in the database's own terms.
+
+    Not more Inputs: ``edw_export.current_nonip`` is an Oracle owner and table,
+    which used to land under Inputs as if it were a SAS dataset — and, with the
+    pass-through grammar, would otherwise vanish from the report altogether.
+    """
+
+    SOURCE = (
+        "libname edw oracle path=EDWPRO schema=fr_dm;\n"
+        "proc sql;\n"
+        "connect to oracle (user=&ora_user password=&ora_pass path=&ora_path);\n"
+        "create table nonip as select * from connection to oracle\n"
+        "(select cov_month from edw_export.current_nonip where table_cd='MED');\n"
+        "execute (truncate table stage.tmp) by oracle;\n"
+        "disconnect from oracle;\n"
+        "quit;\n"
+        "data work.accts; set edw.accounts; run;\n"
+    )
+
+    def setUp(self):
+        self.file = _file(_analyze(self.SOURCE), "t.sas")
+        self.text = render_file_report(self.file, texts={})
+
+    def test_reads_and_writes_are_grouped_with_their_sas_copy(self):
+        self.assertIn("## Database tables", self.text)
+        self.assertIn(
+            "`edw_export.current_nonip` on `oracle` → `work.nonip` "
+            "(connection_to `oracle`)",
+            self.text,
+        )
+        self.assertIn(
+            "`fr_dm.accounts` on `oracle` → `work.accts` (libname `edw`)", self.text
+        )
+        read, written = self.text.index("- Read:"), self.text.index("- Written:")
+        self.assertLess(read, written)
+        self.assertGreater(self.text.index("`stage.tmp` on `oracle`"), written)
+
+    def test_the_oracle_owner_is_no_longer_a_dataset_input(self):
+        self.assertNotIn("edw_export.current_nonip", self.file.input_datasets)
+        self.assertNotIn("work.connection", self.file.input_datasets)
+
+    def test_the_rollup_reconciles_against_its_chunks(self):
+        from_chunks = {t for c in self.file.chunks for t in c.db_tables}
+        self.assertEqual(set(self.file.db_tables), from_chunks)
+        self.assertIn("- Database:", self.text)
+
+    def test_a_file_touching_no_database_gets_no_section(self):
+        plain = _file(_analyze("data work.a;\n  set work.b;\nrun;\n"), "t.sas")
+        self.assertNotIn("## Database tables", render_file_report(plain, texts={}))
+
+    def test_a_dblink_and_an_unresolved_name_are_flagged(self):
+        scored = _file(
+            _analyze(
+                "proc sql;\ncreate table a as select * from connection to oracle\n"
+                "(select * from s.t@prodlink, &sch..u);\nquit;\n"
+            ),
+            "t.sas",
+        )
+        text = render_file_report(scored, texts={})
+        self.assertIn("through database link `prodlink`", text)
+        self.assertIn("**(unresolved macro reference)**", text)
+
+    def test_a_macro_template_and_its_call_are_told_apart(self):
+        scored = _file(
+            _analyze(
+                "%macro pull(schema=edw_export, tbl=, out=);\n"
+                "proc sql;\ncreate table &out as select * from connection to oracle\n"
+                "  (select * from &schema..&tbl);\nquit;\n%mend;\n"
+                "%pull(tbl=current_nonip, out=nonip);\n"
+            ),
+            "t.sas",
+        )
+        text = render_file_report(scored, texts={})
+        self.assertIn("*(named by the macro's parameters — resolved per call)*", text)
+        self.assertIn(
+            "`edw_export.current_nonip` on `oracle` → `work.nonip` "
+            "(connection_to `oracle` in `%pull`)",
+            text,
+        )
+
 
 class TestChooseTarget(unittest.TestCase):
     """Which target an item is translated into, from the shipped profiles.
@@ -3134,6 +3459,105 @@ class TestChooseTarget(unittest.TestCase):
         # MANUAL outranks HARD: the reason with the least chance of translating
         # is the one the prompt and the notebook header show first.
         self.assertEqual(choice.reasons[0].name, "MACRO_DEFINITION")
+
+
+class TestIncludeCheckCLI(unittest.TestCase):
+    """`--check-includes` — each %INCLUDEd script looked for by file name."""
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        (self.tmp / "macros").mkdir()
+        (self.tmp / "macros" / "util.sas").write_text("%macro util; %mend;\n")
+        (self.tmp / "job.sas").write_text(
+            "%include '/sas/prod/util.sas';\n%include '/sas/prod/gone.sas';\n"
+            "data work.a; set raw.a; run;\n",
+            encoding="utf-8",
+        )
+
+    def _report(self, *args) -> str:
+        from complexity.__main__ import main
+
+        out = self.tmp / "report.md"
+        self.assertEqual(main([str(self.tmp), "--out", str(out), *args]), 0)
+        return out.read_text(encoding="utf-8")
+
+    def test_the_overall_report_says_where_each_script_was_found(self):
+        report = self._report("--check-includes")
+        section = report[report.index("## Included scripts"):]
+        self.assertIn("- Scripts included: **2** — found 1, not found **1**", section)
+        self.assertIn("| `util.sas` | job.sas:1 | `macros/util.sas` | — |", section)
+        self.assertIn("| `gone.sas` | job.sas:2 | **not found** | — |", section)
+
+    def test_app_names_the_sharepoint_folder_to_look_in(self):
+        import data_hydration.includes as includes
+
+        looked: list[str] = []
+
+        def fake_index(folder, **_):
+            looked.append(folder)
+            return {"gone.sas": (f"{folder}/gone.sas",)}
+
+        original = includes.sharepoint_index
+        includes.sharepoint_index = fake_index
+        self.addCleanup(setattr, includes, "sharepoint_index", original)
+        report = self._report("--check-includes", "--app", "MyApp")
+        self.assertEqual(len(looked), 1)
+        self.assertTrue(looked[0].endswith("MyApp/scripts_original"))
+        self.assertIn(f"| `gone.sas` | job.sas:2 | **not found** | `{looked[0]}/gone.sas` |", report)
+
+    def test_a_sharepoint_folder_that_cannot_be_listed_keeps_the_report(self):
+        import data_hydration.includes as includes
+
+        def unreachable(folder, **_):
+            raise ConnectionError("SharePoint is down")
+
+        original = includes.sharepoint_index
+        includes.sharepoint_index = unreachable
+        self.addCleanup(setattr, includes, "sharepoint_index", original)
+        with self.assertLogs("complexity", level="ERROR") as logs:
+            report = self._report("--check-includes", "--app", "MyApp")
+        self.assertIn("could not list SharePoint folder", "\n".join(logs.output))
+        # The local search stands; SharePoint's column says nothing was there.
+        self.assertIn("| `util.sas` | job.sas:1 | `macros/util.sas` | — |", report)
+
+    def test_without_the_flag_the_report_is_unchanged(self):
+        self.assertNotIn("Included scripts", self._report())
+
+    def test_a_script_nobody_looked_for_is_not_counted_missing(self):
+        from complexity.report import _include_summary
+        from data_hydration.includes import IncludeCheck
+
+        unchecked = IncludeCheck("util.sas", "/x/util.sas", (("job.sas", 1),), None, None)
+        unnamed = IncludeCheck(None, "&f", (("job.sas", 2),), (), ())
+        lines = _include_summary([unchecked, unnamed], {})
+        self.assertIn(
+            "- Scripts included: **2** — found 0, not found **0**, no file name 1, "
+            "not looked for 1",
+            lines,
+        )
+
+    def test_the_corpus_is_resolved_once_for_both_sections(self):
+        # Once for the batches and both sections: the inventory is built from
+        # the corpus as batching resolved it. Before, it was resolved again.
+        import chunker.batcher as batcher
+
+        calls: list[int] = []
+        original = batcher._resolve_corpus_chunks
+
+        def counted(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        batcher._resolve_corpus_chunks = counted
+        self.addCleanup(setattr, batcher, "_resolve_corpus_chunks", original)
+        self._report("--check-includes", "--hydration")
+        self.assertEqual(len(calls), 1)
+
+    def test_app_alone_still_needs_sharepoint(self):
+        from complexity.__main__ import main
+
+        self.assertEqual(main([str(self.tmp), "--app", "MyApp"]), 1)
 
 
 if __name__ == "__main__":

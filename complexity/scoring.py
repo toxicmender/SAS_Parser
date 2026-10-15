@@ -21,7 +21,15 @@ import re
 from typing import Iterable
 
 import app_config
-from chunker.models import SasChunk, SasChunkMetadata, SasPathRef, _path_ref_sort_key
+from chunker.models import (
+    DatasetRole,
+    SasChunk,
+    SasChunkMetadata,
+    SasDbTableRef,
+    SasPathRef,
+    _db_table_sort_key,
+    _path_ref_sort_key,
+)
 from chunker.scanner import _sanitise
 
 from .models import ChunkComplexity, ComplexitySignal, ComplexityTier, TranslationParity
@@ -80,24 +88,53 @@ def _chunk_outputs(meta: SasChunkMetadata) -> list[str]:
     return _dedupe([*meta.output_datasets, *meta.body_literal_outputs])
 
 
+def _chunk_updates(meta: SasChunkMetadata) -> list[str]:
+    """Datasets a chunk updates in place (MODIFY, APPEND BASE=, SQL INSERT/
+    UPDATE/DELETE) without creating them, its macro body's literal ones
+    included. A table the chunk creates and then inserts into is not one: it
+    has nothing to update until the chunk makes it."""
+    refs = [r for r in meta.dataset_refs if r.param is None]
+    created = {r.name.lower() for r in refs if r.role is DatasetRole.WRITE}
+    return _dedupe(
+        r.name
+        for r in refs
+        if r.role is DatasetRole.UPDATE and r.name.lower() not in created
+    )
+
+
+def _chunk_drops(meta: SasChunkMetadata) -> list[str]:
+    """Datasets a chunk deletes, its macro body's literal ones included."""
+    return _dedupe(
+        r.name for r in meta.dataset_refs if r.role is DatasetRole.DROP and r.param is None
+    )
+
+
 def _file_datasets(
     scored: list[ChunkComplexity],
 ) -> tuple[list[str], list[str], list[str]]:
     """One file's ``(inputs, outputs, intermediates)`` rolled up from its chunks.
 
-    A dataset this file writes and then reads back is an **intermediate**, not
-    an input: nothing outside the file has to provide it. That is the same rule
+    A dataset this file creates and reads is an **intermediate**, not an input:
+    nothing outside the file has to provide it. A table the file only updates in
+    place is an input — another file, or the warehouse, creates it — and an
+    output too, since the file writes to it. That is the rule
     :mod:`complexity.crossfile` applies when deciding whether a read is a
     cross-file import, so the datasets section and the coupling section of a
     report can never contradict each other.
+
+    A chunk creates what it writes and does not update: ``updated_datasets``
+    holds only the tables it updates without creating them.
     """
     reads = _dedupe(d for c in scored for d in c.input_datasets)
     writes = _dedupe(d for c in scored for d in c.output_datasets)
-    written = {d.lower() for d in writes}
+    created: set[str] = set()
+    for c in scored:
+        updated = {d.lower() for d in c.updated_datasets}
+        created.update(d.lower() for d in c.output_datasets if d.lower() not in updated)
     return (
-        [d for d in reads if d.lower() not in written],
+        [d for d in reads if d.lower() not in created],
         writes,
-        [d for d in reads if d.lower() in written],
+        [d for d in reads if d.lower() in created],
     )
 
 
@@ -112,6 +149,18 @@ def _file_paths(scored: list[ChunkComplexity]) -> list[SasPathRef]:
     """
     return sorted(
         {ref for c in scored for ref in c.external_refs}, key=_path_ref_sort_key
+    )
+
+
+def _file_db_tables(scored: list[ChunkComplexity]) -> list[SasDbTableRef]:
+    """One file's database tables, rolled up from its chunks.
+
+    Deduplicated and ordered by :func:`~chunker.models._db_table_sort_key` —
+    the order :attr:`~chunker.models.SasBatch.db_tables` uses — on the same
+    grounds as :func:`_file_paths`.
+    """
+    return sorted(
+        {ref for c in scored for ref in c.db_tables}, key=_db_table_sort_key
     )
 
 

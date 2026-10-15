@@ -101,6 +101,12 @@ class HydrationConfig:
         ``continue`` (default) records a failed item and carries on;
         ``stop`` ends the run at the first failure.
         ``data_hydration.on_error``.
+    inventory_table : str | None
+        The Delta table (``catalog.schema.table``) the reference inventory is
+        written to and read from — every path and dataset the corpus names,
+        resolved or not (see :mod:`data_hydration.inventory`).
+        ``DATA_HYDRATION_INVENTORY_TABLE`` / ``data_hydration.inventory_table``.
+        ``None`` keeps the inventory in memory only.
     oracle_dsn, oracle_user : str | None
         Connection defaults used when a ``LIBNAME`` does not carry its own.
         ``DATA_HYDRATION_ORACLE_DSN`` / ``DATA_HYDRATION_ORACLE_USER``.
@@ -125,6 +131,7 @@ class HydrationConfig:
     staging_dir: str | None = None
     apply_index_clustering: bool = False
     on_error: str = DEFAULT_ON_ERROR
+    inventory_table: str | None = None
 
     oracle_dsn: str | None = None
     oracle_user: str | None = None
@@ -200,6 +207,10 @@ class HydrationConfig:
                 )
             ),
             on_error=_resolve_on_error(),
+            inventory_table=(
+                os.environ.get("DATA_HYDRATION_INVENTORY_TABLE")
+                or get_value("data_hydration", "inventory_table")
+            ),
             oracle_dsn=(
                 os.environ.get("DATA_HYDRATION_ORACLE_DSN")
                 or get_value("data_hydration", "oracle_dsn")

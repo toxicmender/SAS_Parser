@@ -38,8 +38,8 @@ set one of their own), each restricting the section further:
   raise one of the listed predicate flags (the vocabulary the pipeline emits:
   ``symput_hazard``, ``abort``, ``computed_goto``, ``component_object``,
   ``unclosed_block``, ``includes``, ``physical_paths``, ``remote_paths``,
-  ``defines_macros``, ``invokes_macros``, ``produces_macrovars``,
-  ``automatic_vars``).
+  ``wildcard_paths``, ``unresolved_paths``, ``defines_macros``,
+  ``invokes_macros``, ``produces_macrovars``, ``automatic_vars``).
 
 So ``## [when: proc:sql] [kind: PROC_STEP] [lang: sparksql] SQL rules`` fires
 only for a SparkSQL run whose item is a PROC step using PROC SQL. All three

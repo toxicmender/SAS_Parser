@@ -112,7 +112,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--pattern",
         default="*.sas",
-        help="Glob for SAS files within sas_dir (default: *.sas).",
+        help="Glob for SAS files within sas_dir, case ignored (default: *.sas, "
+        "which also finds LOAD.SAS).",
+    )
+    parser.add_argument(
+        "--encoding",
+        help=(
+            "Encoding of the SAS files, e.g. latin1 or cp1252 (default: UTF-8, "
+            "falling back to Latin-1 for a file that is not valid UTF-8)."
+        ),
     )
     parser.add_argument(
         "--target",
@@ -215,6 +223,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "database driver installed.",
     )
     parser.add_argument(
+        "--check-includes",
+        action="store_true",
+        help="Look for every %%INCLUDEd script, and every Python script PROC "
+        "PYTHON runs, by file name: in the scored directory, and in the "
+        "application's SharePoint scripts folder (with --sharepoint, or --app "
+        "on a local run). Reported in the overall report's Included scripts "
+        "section.",
+    )
+    parser.add_argument(
         "--llm-eval",
         action="store_true",
         help="Ask a model to evaluate each file against its static verdict — "
@@ -310,7 +327,9 @@ def _argument_error(args: argparse.Namespace) -> str | None:
         )
     if not args.sharepoint:
         for flag, value in (
-            ("--app", args.app),
+            # On a local run, --app only names the SharePoint folder
+            # --check-includes looks in.
+            ("--app", args.app and not args.check_includes),
             ("--item-id", args.item_id),
             ("--sharepoint-out", args.sharepoint_out),
             ("--no-upload", args.no_upload),
@@ -375,13 +394,14 @@ def _load_local_sources(args: argparse.Namespace) -> _Sources | None:
     ``None`` when the directory holds no matching file, which is a failed run
     rather than an empty report.
     """
-    sas_files = sorted(args.sas_dir.rglob(args.pattern))
+    # Case ignored: on AIX and Linux `*.sas` alone would skip LOAD.SAS.
+    sas_files = sorted(args.sas_dir.rglob(args.pattern, case_sensitive=False))
     if not sas_files:
         logger.error(f"no files matching {args.pattern!r} under {args.sas_dir}")
         return None
     logger.info(f"scoring {len(sas_files)} SAS file(s) under {args.sas_dir}")
 
-    chunker = SasSemanticChunker()
+    chunker = SasSemanticChunker(encoding=getattr(args, "encoding", None))
     results: list[Any] = []
     failures: list[str] = []
     for path in sas_files:
@@ -434,10 +454,12 @@ def _load_sharepoint_sources(
 
 def _analyse(
     args: argparse.Namespace, sources: _Sources, *, target: str | None
-) -> tuple[CorpusComplexityReport, ChunkTextIndex, ComplexityAnalyzer]:
-    """Batch and score *sources*. The middle of the run, identical in both modes."""
+) -> tuple[CorpusComplexityReport, ChunkTextIndex, ComplexityAnalyzer, SasCorpus]:
+    """Batch and score *sources*. The middle of the run, identical in both
+    modes. Also returns the corpus as batching resolved it, which the
+    reference inventory is built from (:func:`_corpus_inventory`)."""
     corpus = SasCorpus(file_results=sources.file_results)
-    batch_result = MultiFileBatcher().batch(corpus)
+    batch_result, resolved = MultiFileBatcher().batch_resolved(corpus)
 
     analyzer = ComplexityAnalyzer(
         target,
@@ -461,11 +483,31 @@ def _analyse(
     # not the corpus: MultiFileBatcher re-ids every chunk per file (f1-, f2-,
     # ...), so a lookup built from the raw corpus would miss every one.
     texts = chunk_texts(batch_result.all_ordered_items)
-    return report, texts, analyzer
+    return report, texts, analyzer, resolved
 
 
-def _hydration_plan(args: argparse.Namespace, sources: _Sources):  # type: ignore[no-untyped-def]
-    """The hydration plan for *sources*, or ``None`` without ``--hydration``.
+def _corpus_inventory(
+    args: argparse.Namespace, sources: _Sources, resolved: SasCorpus
+) -> list[Any] | None:
+    """The reference inventory of *sources*, when ``--hydration`` or
+    ``--check-includes`` reads it; else ``None``.
+
+    Built once for both, from *resolved*: the corpus as the batcher resolved
+    it (:func:`_analyse`) — a database LIBNAME or %LET in a setup file reaches
+    the reads after it, and each macro call names the datasets its macro reads
+    — flattened into rows (:mod:`data_hydration.inventory`), as ``python -m
+    data_hydration`` builds it.
+    """
+    if not (args.hydration or args.check_includes):
+        return None
+    from data_hydration.inventory import inventory_rows
+
+    return inventory_rows(resolved.file_results, corpus=sources.label)
+
+
+def _hydration_plan(args: argparse.Namespace, rows: list[Any] | None):  # type: ignore[no-untyped-def]
+    """The hydration plan for the inventory *rows*, or ``None`` without
+    ``--hydration``.
 
     Built from the metadata the chunker already produced, with ``probe=None`` —
     so this stays what the rest of ``complexity`` is: an offline read of the
@@ -476,25 +518,60 @@ def _hydration_plan(args: argparse.Namespace, sources: _Sources):  # type: ignor
     template) is reported and the rest of the report is still written: hydration
     is an addition to the report, never a reason to lose it.
     """
-    if not args.hydration:
+    if not args.hydration or rows is None:
         return None
+    from data_hydration.inventory import plan_from_inventory
     from data_hydration.naming import TableNameError
-    from data_hydration.planner import build_corpus_plan
 
-    by_source = {
-        result.source_id: (
-            [r for c in result.chunks for r in c.metadata.engine_refs],
-            [r for c in result.chunks for r in c.metadata.external_refs],
-        )
-        for result in sources.file_results
-    }
     try:
-        return build_corpus_plan(by_source, probe=None)
+        return plan_from_inventory(rows, probe=None)
     except TableNameError as exc:
         logger.error(
             f"--hydration: {exc}; the complexity report is written without it"
         )
         return None
+
+
+def _include_checks(
+    args: argparse.Namespace,
+    rows: list[Any] | None,
+    *,
+    application: str | None,
+    client: Any | None = None,
+) -> list[Any] | None:
+    """Where each ``%INCLUDE``d script was found, or ``None`` without
+    ``--check-includes``.
+
+    Looked for by file name (:mod:`data_hydration.includes`): in the scored
+    directory on a local run, and in *application*'s SharePoint scripts folder
+    when there is an application — the request row's with ``--sharepoint``, or
+    ``--app`` on a local run. A folder SharePoint cannot list is logged and
+    left unsearched: the check is an addition to the report, never a reason
+    to lose it.
+    """
+    if not args.check_includes or rows is None:
+        return None
+    from data_hydration.includes import (
+        include_checks,
+        local_index,
+        match_includes,
+        sharepoint_index,
+    )
+
+    local = local_index(args.sas_dir) if args.sas_dir is not None else None
+    sharepoint = None
+    if application:
+        from conversion.paths import original_scripts
+
+        folder = original_scripts(application)
+        try:
+            sharepoint = sharepoint_index(folder, client=client)
+        except Exception as exc:
+            logger.error(
+                f"--check-includes: could not list SharePoint folder {folder!r} "
+                f"({type(exc).__name__}: {exc}); scripts not looked for there"
+            )
+    return include_checks(match_includes(rows, local=local, sharepoint=sharepoint))
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +588,7 @@ def _deliver(
     model: str | None = None,
     run_llm_eval: bool | None = None,
     hydration: object | None = None,
+    includes: list[Any] | None = None,
 ) -> tuple[int, list[Path]]:
     """Write the reports, and return ``(exit status, written paths)``.
 
@@ -518,7 +596,8 @@ def _deliver(
     because the SharePoint flow stages into a temporary directory. The written
     paths come back so the caller can upload them; locally they are ignored.
 
-    *hydration* is the plan from :func:`_hydration_plan`, or ``None``.
+    *hydration* is the plan from :func:`_hydration_plan`, or ``None``; and
+    *includes* the check from :func:`_include_checks`.
     """
     include_source = not args.no_source_text
     written_paths: list[Path] = []
@@ -534,6 +613,7 @@ def _deliver(
             max_source_lines=args.max_chunk_lines,
             graph_image=not args.no_graph_image,
             hydration=hydration,
+            includes=includes,
         )
         written_paths = list(written.paths)
         print(f"wrote overall complexity report: {written.overall}")
@@ -554,7 +634,9 @@ def _deliver(
             if pdf_ok:
                 written_paths.append(written.overall.with_suffix(".pdf"))
     else:
-        markdown = render_overall_report(report, top=args.top, hydration=hydration)
+        markdown = render_overall_report(
+            report, top=args.top, hydration=hydration, includes=includes
+        )
         if args.out is not None:
             _write(args.out, markdown)
             print(f"wrote complexity report: {args.out}")
@@ -601,13 +683,15 @@ def _run_local(args: argparse.Namespace) -> int:
     sources = _load_local_sources(args)
     if sources is None:
         return 1
-    report, texts, _ = _analyse(args, sources, target=args.target)
+    report, texts, _, resolved = _analyse(args, sources, target=args.target)
+    rows = _corpus_inventory(args, sources, resolved)
     status, _ = _deliver(
         args,
         report,
         texts,
         out_dir=args.out_dir,
-        hydration=_hydration_plan(args, sources),
+        hydration=_hydration_plan(args, rows),
+        includes=_include_checks(args, rows, application=args.app),
     )
     return status
 
@@ -716,7 +800,8 @@ def _run_request(args: argparse.Namespace, row: Any, *, client: Any) -> int:
     sources = _load_sharepoint_sources(row.application, client=client)
     if sources is None:
         return 1
-    report, texts, analyzer = _analyse(args, sources, target=target)
+    report, texts, analyzer, resolved = _analyse(args, sources, target=target)
+    inventory = _corpus_inventory(args, sources, resolved)
 
     # The label records what produced the estimate: the model when the LLM
     # pass ran, else the rules profile that did — which still means something
@@ -732,7 +817,10 @@ def _run_request(args: argparse.Namespace, row: Any, *, client: Any) -> int:
             out_dir=staging,
             model=model,
             run_llm_eval=run_llm_eval,
-            hydration=_hydration_plan(args, sources),
+            hydration=_hydration_plan(args, inventory),
+            includes=_include_checks(
+                args, inventory, application=row.application, client=client
+            ),
         )
         summary = sp.render_run_summary(
             row,

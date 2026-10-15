@@ -641,9 +641,10 @@ def _discover_sas_files(sas_dir: Path, pattern: str) -> list[str]:
 
     File order establishes the default execution sequence MultiFileBatcher uses
     to resolve cross-file producer/consumer tie-breaks, so a stable sort keeps
-    batching reproducible across runs.
+    batching reproducible across runs. The pattern ignores case: on AIX and
+    Linux `*.sas` alone would skip LOAD.SAS.
     """
-    return [str(p) for p in sorted(sas_dir.rglob(pattern))]
+    return [str(p) for p in sorted(sas_dir.rglob(pattern, case_sensitive=False))]
 
 
 def _run_local(args: argparse.Namespace) -> int:

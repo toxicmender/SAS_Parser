@@ -197,11 +197,13 @@ def test_unknown_mode_degrades_to_the_default(_isolated, caplog):
 
 def _batch_result(dataset: str):
     from chunker.models import (
+        DatasetRole,
         SasBatch,
         SasBatchResult,
         SasChunk,
         SasChunkKind,
         SasChunkMetadata,
+        SasDatasetRef,
     )
 
     chunk = SasChunk(
@@ -214,7 +216,9 @@ def _batch_result(dataset: str):
         end_line=1,
         start_char=0,
         end_char=10,
-        metadata=SasChunkMetadata(input_datasets=[dataset]),
+        metadata=SasChunkMetadata(
+            dataset_refs=(SasDatasetRef(name=dataset, role=DatasetRole.READ),)
+        ),
     )
     batch = SasBatch(batch_id="b-001", chunks=[chunk], source_files=["etl.sas"])
     return SasBatchResult(batches=[batch], singletons=[])
@@ -738,6 +742,30 @@ def test_pre_rewrites_infile_file_and_include():
     assert "'/mnt/bronze/c.csv'" in out
     assert "'/mnt/silver/r.txt'" in out
     assert len(stats.rewritten) == 3
+
+
+def test_pre_rewrites_a_filename_and_leaves_what_names_it_alone():
+    # The fileref's path moves; `%include src(util);` and `infile src;` name
+    # that FILENAME, not a path of their own.
+    src = "filename src '/code';\n%include src(util);\ndata x; infile src; run;\n"
+    out, stats = pre.rewrite_source_text(src, _paths(**{"/code": "/repo/code"}))
+
+    assert out == src.replace("'/code'", "'/repo/code'")
+    assert stats.rewritten == {"/code": "/repo/code"}
+
+
+def test_pre_rewrites_every_directory_of_a_concatenation():
+    # Each quoted place moves where it stands; a library named by its libref
+    # is no path, and the list's commas and parentheses stay as written.
+    src = (
+        "libname all ('/data/in/a', v9, '/data/in/b');\n"
+        "filename f (\"/data/in/q1.sas\" '/data/in/q2.sas');\n"
+        "data x; infile '(\"/data/in/c.csv\" \"/data/in/d.csv\")'; run;\n"
+    )
+    out, stats = pre.rewrite_source_text(src, _paths(**{"/data/in": "/mnt/bronze"}))
+
+    assert out == src.replace("/data/in/", "/mnt/bronze/")
+    assert len(stats.rewritten) == 6
 
 
 def test_pre_applies_the_longest_matching_key_first():

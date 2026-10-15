@@ -37,7 +37,7 @@ from chunker.keywords import (
     SAS_GLOBAL_STATEMENT_TOKENS,
 )
 from chunker.models import SasChunkKind
-from pipeline.prompting import _META_FLAG_ATTRS
+from pipeline.prompting import _META_FLAGS
 from prompt_builder.user_instructions import (
     SCOPE_ALWAYS,
     SCOPE_TOPIC,
@@ -190,7 +190,7 @@ def test_every_kind_directive_names_a_real_chunk_kind(bundled):
 
 
 def test_every_meta_directive_names_a_real_flag(bundled):
-    valid = {token for token, _ in _META_FLAG_ATTRS}
+    valid = {token for token, _ in _META_FLAGS}
     bad = [
         f"{meta} in '{c.section_path}'"
         for c in bundled.chunks
