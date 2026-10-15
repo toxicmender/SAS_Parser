@@ -334,6 +334,60 @@ def test_a_view_s_using_libname_is_in_force_for_no_file_after():
             ] == [item]
 
 
+REBIND_IN_A_MACRO = (
+    "%macro m;\n  libname raw '/data/2025';\n  data a; set raw.x; run;\n"
+    "  libname raw '/data/2026';\n  data b; set raw.y; run;\n%mend;\n%m;\n"
+)
+
+
+def test_a_libname_inside_a_chunk_binds_the_reads_after_it():
+    # A %MACRO body is one chunk. Before, a chunk's rows were numbered by
+    # kind, its LIBNAMEs first, so both reads took the last one: /data/2026/x
+    # was planned, and /data/2025 left a blocked library.
+    rows = _rows(job=REBIND_IN_A_MACRO)
+    assert [(r.statement, r.name) for r in rows if r.chunk_id == "chunk-0001"] == [
+        ("libname", "/data/2025"),
+        ("data", "work.a"),
+        ("set", "raw.x"),
+        ("libname", "/data/2026"),
+        ("data", "work.b"),
+        ("set", "raw.y"),
+    ]
+    plan = plan_from_inventory(rows, config=_config())
+    assert [(i.source.locator, i.source.object_name, i.blockers) for i in plan.items] == [
+        ("/data/2025", "x", ()),
+        ("/data/2026", "y", ()),
+    ]
+
+
+def test_a_concatenation_inside_a_chunk_stands_where_its_libname_does():
+    # Its member v9 is spelled before `libname all` too, in v9's own LIBNAME:
+    # placed there, all would search a v9 not yet assigned.
+    rows = _rows(
+        job="%macro m;\n  libname v9 '/x';\n  libname all (v9 '/y');\n  data a; set all.m; run;\n%mend;\n"
+    )
+    assert [(r.libref, r.name, r.concat_index) for r in rows if r.kind is RefKind.PATH] == [
+        ("v9", "/x", None),
+        ("all", "v9", 0),
+        ("all", "/y", 1),
+    ]
+    [item] = plan_from_inventory(rows, config=_config()).items
+    assert (item.source.locator, item.source.object_name, item.blockers) == ("/x", "m", ())
+
+
+def test_a_view_s_using_libname_still_serves_its_own_reads_in_a_longer_chunk():
+    # It is written after the view's FROM, yet serves it; placed by text, it
+    # would come after the read it binds.
+    rows = _rows(
+        job="%macro m;\n  libname raw '/data/raw';\n  data a; set raw.x; run;\n" + VIEW + "%mend;\n%m;\n"
+    )
+    plan = plan_from_inventory(rows, config=_config())
+    assert sorted((i.source.locator, i.source.object_name, i.blockers) for i in plan.items) == [
+        ("/data/raw", "x", ()),
+        ("/data/view", "t", ()),
+    ]
+
+
 def test_only_keeps_one_librefs_references():
     rows = _rows(
         job=(

@@ -107,7 +107,10 @@ class InventoryRow(BaseModel, frozen=True):
     file_order, ref_order
         Where the reference stands: the file's place in the corpus, and the
         reference's place in the file. The planner gives a table read by
-        several files to the first, so the order is part of the data.
+        several files to the first, so the order is part of the data. In a
+        chunk that holds a LIBNAME, USER=, environment variable or cd, its
+        references follow its text, as a %MACRO body's steps do; in any
+        other, its LIBNAMEs come first, then its paths, tables and datasets.
     source_id, chunk_id, start_line, end_line
         Which file, chunk and lines named it.
     kind
@@ -350,11 +353,14 @@ def inventory_rows(
                 "end_line": chunk.end_line,
             }
             seen: set[tuple[Any, ...]] = set()
+            refs: list[dict[str, Any]] = []
             for fields in _chunk_refs(chunk.metadata):
                 key = tuple(sorted((k, str(v)) for k, v in fields.items()))
                 if key in seen:
                     continue
                 seen.add(key)
+                refs.append(fields)
+            for fields in _in_source_order(chunk.text, refs):
                 rows.append(InventoryRow(**where, ref_order=ref_order, **fields))
                 ref_order += 1
     logger.info(
@@ -362,6 +368,54 @@ def inventory_rows(
         f"{len({r.source_id for r in rows})} file(s), run {run_id}"
     )
     return rows
+
+
+#: Statements whose place in a chunk decides what the reads after them see: a
+#: LIBNAME, USER= or an environment variable binds a libref, and a cd sets the
+#: directory relative paths are read from.
+_BINDING_STATEMENTS = frozenset({"libname", "user", "setenv", "cd"})
+
+
+def _in_source_order(text: str, refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One chunk's *refs*, in the order they stand in its *text*, when a
+    binding statement among them makes that matter.
+
+    A chunk can hold several steps, as a ``%MACRO`` body or a PROC SQL does,
+    and a LIBNAME between two of them binds the reads after it alone:
+    ``libname raw '/data/2025'; ... set raw.x; ... libname raw '/data/2026';
+    ... set raw.y;``. The references record no offsets, so each is placed at
+    the first occurrence of its spelling, comments aside. One not found (a
+    database LIBNAME's, rebuilt from its options, or a place whose password
+    is redacted) goes before the rest, as it did. So does a CREATE VIEW's
+    USING LIBNAME, which serves the reads written before it in its statement.
+    """
+    if len(refs) < 2 or not any(
+        ref["kind"] is RefKind.PATH and ref["statement"] in _BINDING_STATEMENTS for ref in refs
+    ):
+        return refs
+    # Lazy, as includes.py's: the rows' builder needs the chunker's comment
+    # blanking, the planner reading them never does.
+    from chunker.scanner import _sanitise
+
+    code = _sanitise(text, blank_strings=False).lower()
+
+    def place(ref: dict[str, Any]) -> int:
+        spelled = str(ref.get("raw") or "").lower()
+        if (
+            ref["kind"] not in (RefKind.PATH, RefKind.DATASET)
+            or ref["statement"] == "using_libname"
+            or not spelled
+        ):
+            return -1
+        pattern = rf"(?<![\w.&/]){re.escape(spelled)}(?![\w/])"
+        if ref["statement"] == "libname" and ref.get("libref"):
+            # The LIBNAME statement that names it, so a concatenation's
+            # members (`libname all (v9 '/y');`) stand where it does.
+            pattern = rf"\blibname\s+{re.escape(ref['libref'])}\b[^;]*?{pattern}"
+        found = re.search(pattern, code)
+        return -1 if found is None else found.start()
+
+    return [ref for _, _, ref in sorted((place(ref), i, ref) for i, ref in enumerate(refs))]
 
 
 def _chunk_refs(meta: Any) -> Iterable[dict[str, Any]]:

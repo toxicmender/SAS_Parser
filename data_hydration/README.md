@@ -116,7 +116,8 @@ macro's `set &ds;` makes.
   modify new;`), which serves the statements after it.
 - **The LIBNAME in force** is the latest one before the read, in corpus order
   and within a file: `libname raw '/data/2025'; set raw.x; libname raw
-  '/data/2026'; set raw.y;` reads `/data/2025/x` and `/data/2026/y`. A read
+  '/data/2026'; set raw.y;` reads `/data/2025/x` and `/data/2026/y`, in open
+  code or in one `%MACRO` body or PROC SQL alike. A read
   before any LIBNAME binds its libref is not planned. A CREATE VIEW's `using
   libname raw '/other'` serves the view's own query alone: the view's
   `raw.t` is planned from `/other`, and the next step's `raw.x` from the

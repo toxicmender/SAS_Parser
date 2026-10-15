@@ -1007,6 +1007,21 @@ def _library_members(
             hidden = libraries.scoped(views)
             made_now: set[str] = set()  # renamed or copied by this step so far
             for ref in refs:
+                # One inside the chunk binds the reads after it: a %MACRO body
+                # or a PROC SQL holds several steps.
+                here = _position(ref)
+                while (
+                    here is not None
+                    and libnames
+                    and (position := _position(libnames[0])) is not None
+                    and position < here
+                ):
+                    later = libnames.pop(0)
+                    if later.statement != "using_libname":
+                        libraries.bind(later)
+                    else:
+                        for libref, was in libraries.scoped([later]).items():
+                            hidden.setdefault(libref, was)
                 if str(ref.role) == "write" and ref.via in _IMMEDIATE_WRITES:
                     made_now.add(ref.name)
                 if str(ref.role) not in ("read", "update") or ref.param is not None:
