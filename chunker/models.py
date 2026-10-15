@@ -10,6 +10,8 @@ from typing import Any, Self
 
 from pydantic import BaseModel, Field, computed_field, model_validator
 
+from .pathnames import has_wildcard, is_relative, server_parts
+
 logger = logging.getLogger(__name__)
 
 
@@ -85,6 +87,35 @@ class PathLocation(StrEnum):
     LIBREF = "libref"
 
 
+class UnresolvedReason(StrEnum):
+    """Why the place a :class:`SasPathRef` names is not known before the job
+    runs — see :attr:`SasPathRef.unresolved`. One reason per reference, the
+    first of these that holds."""
+
+    #: A ``&`` reference no macro variable in the corpus gives a value
+    #: (``"&root/in.csv"``): what it holds is only knowable by running SAS.
+    MACRO = "macro"
+    #: A fileref no FILENAME or environment variable in the corpus assigns
+    #: (``infile in;``): its FILENAME is elsewhere — an autoexec, a
+    #: configuration file — and says where it is.
+    FILEREF = "fileref"
+    #: A path the SAS server completes when it reads it: ``~/``, ``~name/``,
+    #: ``!SASROOT`` or ``$VARIABLE`` (:func:`chunker.pathnames.server_parts`).
+    SERVER = "server"
+    #: A relative path (``'in/x.csv'``), which SAS reads from its current
+    #: directory. The chunker records a cd (statement ``cd``) but does not
+    #: follow one; the hydration planner reads a relative path from the
+    #: directory the last cd before it set, and blocks one no cd places.
+    RELATIVE = "relative"
+
+
+#: The statements that write the place they name. SAS matches a wildcard only
+#: where it reads: "Wildcards are supported for input only. You cannot use
+#: wildcards in the FILE statement" (SAS 9.4 Companion for UNIX Environments,
+#: Using Wildcards in Pathnames).
+_WRITE_STATEMENTS = frozenset({"file", "proc_export", "proc_cport", "ods", "printto"})
+
+
 class SasPathRef(BaseModel, frozen=True):
     """One external reference a statement names, with its provenance.
 
@@ -157,6 +188,12 @@ class SasPathRef(BaseModel, frozen=True):
         ``infile '("/a.csv" "/b.csv")';`` reads its files one after another.
         A reference made through a concatenated fileref keeps the index of the
         place it was given. ``None`` for a place named alone.
+    wildcard, unresolved
+        Read off the fields above, and serialised with them: whether the
+        place is a pattern of files rather than one, and why it is not known
+        before the job runs, if it is not (:class:`UnresolvedReason`). They
+        are how :class:`SasChunkMetadata` keeps wildcard and unresolved paths
+        apart from the concrete ones.
     """
 
     statement: str
@@ -177,11 +214,51 @@ class SasPathRef(BaseModel, frozen=True):
         otherwise :attr:`raw`."""
         return self.resolved_path or self.raw
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def wildcard(self) -> bool:
+        """The place is a UNIX wildcard that a statement reads or binds:
+        ``filename in '/data/in/*.csv';`` names every file the pattern
+        matches, one after another — a set of files only a listing of the
+        server's directory can name (:func:`chunker.pathnames.has_wildcard`).
+        A statement that writes takes the name as written: SAS matches
+        wildcards for input only."""
+        return (
+            self.location is PathLocation.FILESYSTEM
+            and self.statement not in _WRITE_STATEMENTS
+            and has_wildcard(self.effective_path)
+        )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def unresolved(self) -> UnresolvedReason | None:
+        """Why the place is not known before the job runs, or ``None`` when
+        it is — once the corpus's macro variables and FILENAMEs are applied.
+        The first of the :class:`UnresolvedReason` that holds: a macro
+        variable nothing gives a value, then a fileref nothing assigns (one a
+        FILENAME assigns to a device, ``filename t temp;``, is assigned), then,
+        for a filesystem place, a part the SAS server completes and a path
+        relative to the current directory."""
+        if self.has_macro_ref:
+            return UnresolvedReason.MACRO
+        if self.location is PathLocation.FILEREF:
+            return None if self.device else UnresolvedReason.FILEREF
+        if self.location is not PathLocation.FILESYSTEM:
+            return None
+        if server_parts(self.effective_path):
+            return UnresolvedReason.SERVER
+        if is_relative(self.effective_path):
+            return UnresolvedReason.RELATIVE
+        return None
+
     def __str__(self) -> str:
         bound = f" {self.binds}" if self.binds else ""
         via = f" via {self.engine}" if self.engine else ""
         resolved = f" → {self.resolved_path}" if self.resolved_path else ""
-        return f"{self.statement}{bound}{via} [{self.location}] {self.raw}{resolved}"
+        flags = " (wildcard)" if self.wildcard else ""
+        if (why := self.unresolved) is not None:
+            flags += f" (unresolved: {why})"
+        return f"{self.statement}{bound}{via} [{self.location}] {self.raw}{resolved}{flags}"
 
 
 class SasIncludeFile(BaseModel, frozen=True):
@@ -208,8 +285,13 @@ class SasIncludeFile(BaseModel, frozen=True):
         a FILENAME URL or FTP device; ``FILEREF`` while no FILENAME binds the
         fileref.
     resolved
-        :attr:`path` is the file SAS reads: no ``&`` reference is left
-        unassigned and no fileref unbound.
+        :attr:`path` is the place SAS reads: no ``&`` reference is left
+        unassigned, no fileref unbound, and nothing is left for the SAS server
+        to complete or for its current directory to place — see
+        :attr:`SasPathRef.unresolved`.
+    wildcard
+        :attr:`path` is a wildcard: ``%include '/code/macros/*.sas';``
+        includes every script it matches.
     """
 
     path: str
@@ -217,6 +299,7 @@ class SasIncludeFile(BaseModel, frozen=True):
     fileref: str | None = None
     location: PathLocation = PathLocation.FILESYSTEM
     resolved: bool = True
+    wildcard: bool = False
 
     @classmethod
     def of(cls, ref: SasPathRef) -> "SasIncludeFile":
@@ -226,13 +309,22 @@ class SasIncludeFile(BaseModel, frozen=True):
             raw=ref.raw,
             fileref=ref.binds,
             location=ref.location,
-            resolved=not ref.has_macro_ref and ref.location is not PathLocation.FILEREF,
+            # A fileref a FILENAME assigns to a device (`temp`) is no file path.
+            resolved=ref.unresolved is None and ref.location is not PathLocation.FILEREF,
+            wildcard=ref.wildcard,
         )
 
     def __str__(self) -> str:
         via = f" (via {self.fileref})" if self.fileref else ""
+        wildcard = " [wildcard]" if self.wildcard else ""
         unresolved = "" if self.resolved else " [unresolved]"
-        return f"{self.path}{via}{unresolved}"
+        return f"{self.path}{via}{wildcard}{unresolved}"
+
+
+def _known(ref: SasPathRef, location: PathLocation) -> bool:
+    """Whether *ref* names one known place of kind *location*: not a
+    wildcard, and nothing about it unresolved."""
+    return ref.location is location and ref.unresolved is None and not ref.wildcard
 
 
 def _path_ref_sort_key(
@@ -1030,25 +1122,56 @@ class SasChunkMetadata(BaseModel):
         """
         return [d for d in self._views()["referenced_datasets"] if "&" in d]
 
+    # The path views below are disjoint: a reference is in one of them at most.
+    # Unlike unresolved_dataset_refs, whose names stay in the dataset lists
+    # because the batcher links steps through them, a wildcard or an
+    # unresolved place leaves the location views: those list the places a
+    # target maps as written, and a pattern or an unknown place cannot be.
+
     @computed_field  # type: ignore[prop-decorator]
     @property
     def physical_paths(self) -> list[SasPathRef]:
-        """Refs pointing at a filesystem location — the ones a target has to
-        map to a volume or external location."""
-        return [r for r in self.external_refs if r.location is PathLocation.FILESYSTEM]
+        """Refs to one known place on a filesystem — the ones a target has to
+        map to a volume or external location. A wildcard is in
+        :attr:`wildcard_paths` instead, and a place the corpus leaves open in
+        :attr:`unresolved_paths`."""
+        return [r for r in self.external_refs if _known(r, PathLocation.FILESYSTEM)]
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def wildcard_paths(self) -> list[SasPathRef]:
+        """Refs to a wildcard a statement reads (``filename in
+        '/data/in/*.csv';``): SAS reads every file it matches, so which files
+        those are only a listing of the SAS server's directory can say, and
+        the hydration plan blocks the read until somebody lists them. One
+        whose place is also unresolved (``"&dir/*.csv"``) is in
+        :attr:`unresolved_paths`."""
+        return [r for r in self.external_refs if r.wildcard and r.unresolved is None]
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def unresolved_paths(self) -> list[SasPathRef]:
+        """Refs whose place is not known before the job runs, of every kind,
+        each saying why (:attr:`SasPathRef.unresolved`): a macro variable
+        nothing in the corpus gives a value, a fileref nothing assigns, a
+        path the SAS server completes (``~``, ``!SASROOT``, ``$VAR``), or one
+        relative to its current directory. Recorded rather than dropped: a
+        place nobody can name yet is exactly what a migration needs told
+        about."""
+        return [r for r in self.external_refs if r.unresolved is not None]
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def remote_paths(self) -> list[SasPathRef]:
-        """Refs reaching a remote service (FTP, URL, ...) — network egress, not
-        storage."""
-        return [r for r in self.external_refs if r.location is PathLocation.REMOTE]
+        """Refs reaching a known remote service (FTP, URL, ...) — network
+        egress, not storage."""
+        return [r for r in self.external_refs if _known(r, PathLocation.REMOTE)]
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def email_refs(self) -> list[SasPathRef]:
-        """Refs addressing a mailbox."""
-        return [r for r in self.external_refs if r.location is PathLocation.EMAIL]
+        """Refs addressing a known mailbox."""
+        return [r for r in self.external_refs if _known(r, PathLocation.EMAIL)]
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -1352,13 +1475,28 @@ class SasBatch(BaseModel):
 
     @property
     def physical_paths(self) -> list[SasPathRef]:
-        """:attr:`external_refs` narrowed to filesystem locations."""
-        return [r for r in self.external_refs if r.location is PathLocation.FILESYSTEM]
+        """:attr:`external_refs` narrowed to known filesystem places, as
+        :attr:`SasChunkMetadata.physical_paths` has them."""
+        return [r for r in self.external_refs if _known(r, PathLocation.FILESYSTEM)]
+
+    @property
+    def wildcard_paths(self) -> list[SasPathRef]:
+        """:attr:`external_refs` narrowed to wildcards, as
+        :attr:`SasChunkMetadata.wildcard_paths` has them."""
+        return [r for r in self.external_refs if r.wildcard and r.unresolved is None]
+
+    @property
+    def unresolved_paths(self) -> list[SasPathRef]:
+        """:attr:`external_refs` narrowed to places not known before the job
+        runs, as :attr:`SasChunkMetadata.unresolved_paths` has them. Non-empty
+        means part of what this batch reads or writes cannot be named until
+        somebody says where it is."""
+        return [r for r in self.external_refs if r.unresolved is not None]
 
     @property
     def remote_paths(self) -> list[SasPathRef]:
-        """:attr:`external_refs` narrowed to remote services."""
-        return [r for r in self.external_refs if r.location is PathLocation.REMOTE]
+        """:attr:`external_refs` narrowed to known remote services."""
+        return [r for r in self.external_refs if _known(r, PathLocation.REMOTE)]
 
     @property
     def unresolved_dataset_refs(self) -> list[str]:

@@ -28,6 +28,7 @@ from .models import (
     SasEngineRef,
     SasIncludeFile,
     SasPathRef,
+    UnresolvedReason,
 )
 from .paths import (
     ENGINE_LIBNAMES,
@@ -66,6 +67,7 @@ __all__ = [
     "SasPathRef",
     "SasIncludeFile",
     "PathLocation",
+    "UnresolvedReason",
     "PATH_STATEMENTS",
     "classify_location",
     "extract_paths",

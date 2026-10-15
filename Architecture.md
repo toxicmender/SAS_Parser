@@ -112,6 +112,11 @@ chunker/
                         which every dataset operand in statements.py and the
                         LIBNAME/FILENAME librefs in paths.py are scanned with.
                         Pure data + functions; no package imports, no models.
+  pathnames.py          What a pathname says about itself on UNIX: a wildcard
+                        (has_wildcard), a part the SAS server completes
+                        (server_parts: ~, !SASROOT, $VAR), full or relative.
+                        SasPathRef.wildcard and .unresolved are read with it.
+                        Pure functions; no package imports.
   sql.py                The one SQL grammar: SqlStatement(text, dialect), a
                         token walk reading a statement's tables by clause and
                         verb. Dialect.NATIVE reads a database's own SQL for
@@ -753,7 +758,16 @@ second table of the same variables' values kept as written (invariant 18):
 `/SAS/Prod/setup.sas`. A `SasPathRef` keeps `raw` as written and records the
 place in `resolved_path`. `include_files` lists each SAS file the chunk's
 `%INCLUDE` statements read as a `SasIncludeFile`: path (resolved, case kept),
-raw, fileref, location, and whether it resolved.
+raw, fileref, location, whether it resolved, and whether it is a wildcard.
+
+Each `SasPathRef` also says whether its place is a wildcard SAS reads every
+match of (`wildcard`) and why it is not known before the job runs, if it is
+not (`unresolved`: a macro variable nothing assigns, a fileref no FILENAME
+assigns, a path the SAS server completes, or a relative one), both read off the
+record with `chunker/pathnames.py` and serialised with it. The path views keep
+them apart and are disjoint: `physical_paths`, `remote_paths` and `email_refs`
+list known places only, `wildcard_paths` the wildcards, `unresolved_paths` the
+places not known. `SasBatch` follows the same split.
 
 ## Batching model
 
@@ -1189,6 +1203,12 @@ any of these silently changes behavior.
      partitioned SPD Engine storage while `libname x '/p'` is an ordinary
      directory — indistinguishable for as long as that group stayed
      non-capturing, which it was until hydration needed to tell them apart.
+     What a path says about itself — a wildcard, a part the SAS server
+     completes, relative or full — is `chunker/pathnames.py`'s, which
+     `SasPathRef` reads. The hydration planner keeps a
+     copy of those rules, as `data_hydration` imports no chunker module while
+     it plans, and `tests/test_pathnames.py` holds the copy to the same
+     answers.
    - **One macro-reference grammar.** `chunker/macro_vars.py` owns what a name
      spelled through a macro variable looks like (`DS_REF_TOKEN`) and how it
      expands (`let_values` / `resolve_refs`). Every dataset operand in

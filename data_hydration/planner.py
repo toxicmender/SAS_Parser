@@ -339,6 +339,11 @@ def _member_of(path: str) -> str:
     return name[: -len(_SAS_DATA_SUFFIX)] if name.lower().endswith(_SAS_DATA_SUFFIX) else name
 
 
+# _absolute, _relative, _server_parts and _WILDCARD_RE are the rules
+# chunker.pathnames gives a SasPathRef's wildcard and unresolved, copied:
+# planning imports no chunker module. tests/test_pathnames.py keeps them one.
+
+
 def _absolute(path: str) -> bool:
     """Whether *path* is a full path: from the root (``/data``), or, on a
     Windows server, a drive (``D:\\data``) or a share (``\\\\host\\share``)."""

@@ -15,6 +15,7 @@ from chunker import (
     SasCorpus,
     SasIncludeFile,
     SasSemanticChunker,
+    UnresolvedReason,
     resolve_corpus_references,
 )
 from chunker.metadata import resolve_references
@@ -77,6 +78,7 @@ def test_the_field_is_serialised_with_the_metadata():
             "fileref": None,
             "location": "filesystem",
             "resolved": True,
+            "wildcard": False,
         }
     ]
 
@@ -209,12 +211,16 @@ def test_a_chunks_filenames_take_effect_in_order():
 
 
 def test_a_single_quoted_path_is_the_file_named():
-    # Between single quotes SAS reads & as a character, so no %LET applies.
+    # Between single quotes SAS reads & as a character, so no %LET applies:
+    # the file is the relative path as written, read from SAS's current
+    # directory — known only once a cd says which.
     src = "%let root = /A;\n%include '&root/x.sas';\n%inc \"&root/y.sas\";\n"
     assert [(f.path, f.resolved) for f in _files(src)] == [
-        ("&root/x.sas", True),
+        ("&root/x.sas", False),
         ("/A/y.sas", True),
     ]
+    [x, _] = [r for c in _chunks(src) for r in c.metadata.external_refs]
+    assert (x.has_macro_ref, x.unresolved) == (False, UnresolvedReason.RELATIVE)
 
 
 def test_a_partly_resolved_path_shows_what_resolved():

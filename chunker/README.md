@@ -103,6 +103,7 @@ For running the work items end-to-end through an LLM, see the
 |------|------|
 | `models.py` | Pydantic models: `SasChunk` (+`Kind`), `SasChunkMetadata` and its `SasDatasetRef` records (+`DatasetRole`), `SasChunkResult`, `SasCorpus`, `SasBatch`, `SasBatchResult`, `SasDiagnostic` (+`Severity`), `SasPathRef` (+`PathLocation`), `SasIncludeFile`, `SasEngineRef`, `SasDbTableRef` (+`DbTableAccess`, `DbTableVia`). |
 | `paths.py` | Where a physical path appears in SAS syntax — `PATH_STATEMENTS`, `classify_location`, `extract_paths`. The **single owner** of that grammar: `xref.pre` imports it to rewrite the same statements. |
+| `pathnames.py` | What a pathname says about itself, as SAS on UNIX reads it: `has_wildcard`, `server_parts` (`~`, `!SASROOT`, `$VAR`), `is_absolute`, `is_relative`. What `SasPathRef.wildcard` and `.unresolved` are read with. Pure; no package imports. |
 | `keywords.py` | SAS keyword catalogues transcribed from the SAS docs (reserved macro words, autocall macros, function / CALL-routine dictionaries, and `SAS_FUNCTION_CATEGORIES`) + the patterns compiled from them. Pure data; no package imports, no logging. |
 | `scanner.py` | Lexical layer: `_Unit` / `_Region` parse primitives and their `UnitRole` (code, comment, in-stream data, SUBMIT code), the statement classifier (`_classify`), where a macro call ends its statement (`_split_after_calls`), macro quoting (`_macro_quote_end`), in-stream blocks (`_in_stream_units`), text normalisation / sanitisation, line-offset helpers, and the `_Deadline` / `_ParseWatchdog` stuck-parser machinery. |
 | `macro_vars.py` | Macro-variable values and reference expansion: `let_values` (the `%LET` symbol table), `resolve_refs` (`&name` / `&name.` / `&&name&i`), `call_spans` (where back-to-back macro calls begin and end), `macro_signature` (a `%MACRO`'s parameters, read with balanced parentheses), and `DS_REF_TOKEN` — the single definition of a dataset token that may embed `&refs`. Pure; no package imports. |
@@ -221,7 +222,13 @@ fields** derived at access time, not stored:
   macro's own `macro_param_names` (call-site-resolved, so never a corpus-level
   dependency).
 - `physical_paths` / `remote_paths` / `email_refs` — the `external_refs` entries
-  whose `location` is `FILESYSTEM` / `REMOTE` / `EMAIL`.
+  whose `location` is `FILESYSTEM` / `REMOTE` / `EMAIL` and whose place is
+  known: one place, nothing unresolved.
+- `wildcard_paths` — the entries that are a wildcard a statement reads
+  (`'/data/in/*.csv'`), whose files only a listing of the SAS server can name.
+- `unresolved_paths` — the entries whose place is not known before the job
+  runs, of every kind, each saying why (`SasPathRef.unresolved`). The five path
+  views are disjoint (see *Wildcards and unresolved places*).
 - `include_files` — the SAS files the chunk's `%INCLUDE` statements read, as
   `SasIncludeFile` records (see *External references*).
 - the dataset lists, views of `dataset_refs` (below), and
@@ -466,6 +473,36 @@ over its chunk's text.
   column) leaves the reference as written. So does a parameter of the macro
   whose body holds the statement: the call site supplies it.
 
+**Wildcards and unresolved places.** Each `SasPathRef` says whether its place
+is a wildcard and why it is not known, if it is not — both read off the record
+(`pathnames.py`) and serialised with it:
+
+- `wildcard` — a `*`, `?` or `[ ]` set in a place a statement reads or binds:
+  SAS on UNIX reads every file the pattern matches ("You can use the *, ?, and
+  [ ] wildcards to specify pathnames in the FILENAME (only if the fileref is to
+  be used for input), INFILE, and %INCLUDE statements", SAS 9.4 Companion for
+  UNIX Environments, Using Wildcards in Pathnames). A statement that writes
+  (FILE, PROC EXPORT, PROC CPORT, ODS, PROC PRINTTO) takes the name as written:
+  wildcards are for input only.
+- `unresolved` — an `UnresolvedReason`, the first that holds: `macro` (a `&`
+  reference no macro variable in the corpus gives a value), `fileref` (a
+  fileref no FILENAME or environment variable in the corpus assigns; one a
+  FILENAME assigns to a device, `filename t temp;`, is assigned), `server` (a
+  path the SAS server completes: `~/`, `~name/`, `!SASROOT`, `$VARIABLE`), or
+  `relative` (read from SAS's current directory). The chunker records a `cd`
+  but does not follow one; the hydration planner reads a relative path from
+  the directory the last `cd` before it set, and blocks one no `cd` places.
+
+The metadata keeps them apart: `physical_paths`, `remote_paths` and
+`email_refs` list only known places, `wildcard_paths` the wildcards and
+`unresolved_paths` the places not known, so each reference is in one of those
+views at most. A fileref a FILENAME assigns to a device, or a library a
+concatenation names by its libref, names no place of its own and is in none.
+Unlike `unresolved_dataset_refs`, whose names stay in the dataset lists because
+the batcher links steps through them, an unresolved place leaves the location
+views: those list what a target maps as written, and a pattern or an unknown
+place cannot be. `SasBatch` rolls the same views up.
+
 **`include_files`** lists each SAS file a chunk's `%INCLUDE` statements pull in,
 one `SasIncludeFile` per file in source order:
 
@@ -475,7 +512,8 @@ one `SasIncludeFile` per file in source order:
 | `raw` | the file as the statement spells it (`&root/setup.sas`, `src(util)`) |
 | `fileref` | the fileref it is named through, if any |
 | `location` | `FILESYSTEM` as a rule, `REMOTE` for a URL or FTP FILENAME, `FILEREF` while no FILENAME binds it |
-| `resolved` | `path` is the real file: no `&` reference left and no unbound fileref |
+| `resolved` | `path` is the real file: no `&` reference left, no unbound fileref, nothing for the SAS server to complete or its current directory to place |
+| `wildcard` | `path` is a wildcard: `%include '/code/macros/*.sas';` includes every script it matches |
 
 It is a view of `external_refs`, serialised with the metadata.
 
