@@ -579,14 +579,19 @@ project's conventions before relying on it.
 
 > ⚠️ **The shipped slice targets Databricks**, not open-source Spark. It uses
 > `QUALIFY`, SQL scripting (`FOR`/`WHILE`/`SIGNAL`), `EXECUTE IMMEDIATE`,
-> `UNPIVOT` and three-level `catalog.schema.table` names, none of which
-> open-source Spark has — a non-Databricks deployment needs those rules
-> rewritten. The directory is named `sparksql/` because that is the target key
+> `UNPIVOT`, session variables read through `IDENTIFIER(...)`, and three-level
+> `catalog.schema.table` names, which open-source Spark lacks or has only in
+> recent releases — a non-Databricks deployment needs those rules rewritten. The directory is named `sparksql/` because that is the target key
 > `databrickssql` folds to (see `target_language`); the two are one target
 > today, so the slice must commit to one of them.
 
-The shipped slice holds only guidance that is true of the *languages* —
-nothing about how your shop wants its SQL to look. House rules (parameterising
+The shipped slice holds guidance that is true of the *languages*, with one
+convention on top: Spark SQL names every permanent table through session
+variables (`sparksql/table_names.md`, scoped `[meta: permanent_tables]`) —
+a prefix per SAS library and a variable per table, so a table's catalog and
+schema are set in one place — and the `session_variables` validation metric
+checks generated code for it. Beyond that, nothing about how your shop wants
+its SQL to look. House rules (parameterising
 hardcoded filters, leaving physical layout alone, emitting reconciliation
 queries) are illustrated in
 [`docs/instruction-examples/site-policy.md`](../docs/instruction-examples/site-policy.md),
