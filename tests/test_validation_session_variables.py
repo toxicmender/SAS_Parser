@@ -234,6 +234,17 @@ def test_details_list_five_problems_then_count_the_rest():
     assert result.details.endswith("; and 2 more")
 
 
+def test_details_name_a_repeated_problem_once():
+    # One table hard-coded six times still leaves room for the other one.
+    sql = "\n".join(["SELECT * FROM mart.orders;"] * 6 + ["SELECT * FROM mart.audit;"])
+    result = _score(sql)
+    assert result.score == 0.0
+    assert result.details.startswith("0/7 permanent table reference(s)")
+    assert result.details.count("`mart.orders`") == 1
+    assert "IDENTIFIER(session.<VAR>) (6 places)" in result.details
+    assert "`mart.audit`" in result.details
+
+
 def test_an_unparsed_block_is_reported_and_left_to_target_syntax():
     result = _score("SELECT * FROM (((", "SELECT * FROM mart.orders;")
     assert result.passed is False

@@ -419,10 +419,16 @@ class SessionVariablesMetric(ValidationMetric):
             f"{passing}/{checked} permanent table reference(s) go through "
             f"declared session variables"
         )
-        if problems:
-            details += "; " + "; ".join(problems[:5])
-            if len(problems) > 5:
-                details += f"; and {len(problems) - 5} more"
+        # Each problem once, with how often it recurs: a table hard-coded in
+        # five places must not crowd every other table out of the retry note.
+        listed = [
+            problem if count == 1 else f"{problem} ({count} places)"
+            for problem, count in Counter(problems).items()
+        ]
+        if listed:
+            details += "; " + "; ".join(listed[:5])
+            if len(listed) > 5:
+                details += f"; and {len(listed) - 5} more"
         return self._result(passing / checked, details + unread)
 
 
