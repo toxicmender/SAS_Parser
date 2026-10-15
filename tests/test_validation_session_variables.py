@@ -103,6 +103,20 @@ def test_a_declaration_in_an_earlier_block_of_the_answer_counts():
     assert result.score == 1.0
 
 
+def test_a_stored_view_built_through_execute_immediate_passes():
+    result = _score(
+        "DECLARE OR REPLACE VARIABLE MART_PREFIX STRING DEFAULT 'catalog_name.mart';\n"
+        "DECLARE OR REPLACE VARIABLE A STRING DEFAULT CONCAT(session.MART_PREFIX, '.a');\n"
+        "DECLARE OR REPLACE VARIABLE B STRING DEFAULT CONCAT(session.MART_PREFIX, '.b');\n"
+        "DECLARE OR REPLACE VARIABLE STMT STRING;\n"
+        "SET VAR STMT = CONCAT('CREATE OR REPLACE VIEW ', session.A, "
+        "' AS SELECT * FROM ', session.B);\n"
+        "EXECUTE IMMEDIATE STMT;\n"
+        "OPTIMIZE IDENTIFIER(session.B) FULL;"
+    )
+    assert (result.score, result.details.split(" ")[0]) == (1.0, "1/1")
+
+
 def test_a_qualified_declaration_is_read():
     # sqlglot reads `DECLARE ... session.x` only as a command.
     result = _score(
@@ -123,6 +137,7 @@ def test_a_qualified_declaration_is_read():
         "SELECT * FROM read_files('/Volumes/c/s/v/in/', format => 'csv');",
         "SELECT * FROM system.information_schema.tables;",
         "SELECT * FROM delta.`/Volumes/c/s/v/t`;",
+        "VACUUM delta.`/Volumes/c/s/v/t`;",
         # A schema or a catalog is no table.
         "CREATE SCHEMA IF NOT EXISTS cat.mart;\nUSE CATALOG main;",
     ],
@@ -176,6 +191,24 @@ def test_what_is_no_permanent_table_is_skipped(sql):
             "SELECT * FROM IDENTIFIER(session.ORDERS);",
             "`ORDERS` is never given a value",
         ),
+        (
+            "DECLARE OR REPLACE VARIABLE ORDERS STRING "
+            "DEFAULT CONCAT(session.MART_PREFIX, '.orders');\n"
+            "SELECT * FROM IDENTIFIER(session.ORDERS);",
+            "`ORDERS` is built from `session.MART_PREFIX`, which is not declared",
+        ),
+        # Databricks keeps a stored view's text, which may not read a session
+        # variable ("the body of a persisted view").
+        (
+            "DECLARE OR REPLACE VARIABLE MART_PREFIX STRING DEFAULT 'catalog_name.mart';\n"
+            "DECLARE OR REPLACE VARIABLE A STRING DEFAULT CONCAT(session.MART_PREFIX, '.a');\n"
+            "DECLARE OR REPLACE VARIABLE B STRING DEFAULT CONCAT(session.MART_PREFIX, '.b');\n"
+            "CREATE OR REPLACE VIEW IDENTIFIER(session.A) AS SELECT * FROM IDENTIFIER(session.B);",
+            "a stored view's query reads IDENTIFIER(session.B)",
+        ),
+        # OPTIMIZE and VACUUM, which sqlglot reads only as commands.
+        ("OPTIMIZE main.mart.orders FULL;", "hard-coded table name `main.mart.orders`"),
+        ("VACUUM TABLE mart.orders RETAIN 168 HOURS;", "hard-coded table name `mart.orders`"),
     ],
 )
 def test_a_name_that_skips_the_variables_fails_and_is_named(sql, problem):

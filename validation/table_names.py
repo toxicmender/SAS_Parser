@@ -23,7 +23,14 @@ order, and judges each table reference the convention covers:
 - a literal qualified name (``main.sales.orders``, ``mart.orders``) fails;
 - an unqualified literal written as a permanent table fails — the target of
   CREATE TABLE (or a view that is not temporary), INSERT, MERGE, UPDATE,
-  DELETE, COPY INTO, DROP TABLE, TRUNCATE or ALTER.
+  DELETE, COPY INTO, DROP TABLE, TRUNCATE or ALTER;
+- a stored view whose query reads a session variable fails: Databricks
+  keeps a stored view's text, and "Temporary variables cannot be referenced
+  within ... the body of a persisted view" ("DECLARE VARIABLE"), so such a
+  view is created with EXECUTE IMMEDIATE and its names resolved.
+
+OPTIMIZE and VACUUM, which sqlglot reads only as commands, are judged by the
+table they name.
 
 What is not a permanent table is left alone: temporary views (a WORK dataset)
 and the CTEs and views a query reads by a bare name, table functions
@@ -67,6 +74,11 @@ _DECLARE_DEFAULT_RE = re.compile(r"(?:\bDEFAULT\b|=)\s*(?P<default>.+?)\s*;?\s*\
 # catalog names no table, and neither does a function.
 _NOT_TABLES = frozenset({"SCHEMA", "DATABASE", "CATALOG", "FUNCTION"})
 
+# The Delta maintenance commands sqlglot reads only as commands, and the table
+# each names first: `OPTIMIZE main.mart.t FULL`, `VACUUM t RETAIN 168 HOURS`.
+_TABLE_COMMANDS = frozenset({"OPTIMIZE", "VACUUM"})
+_COMMAND_TABLE_RE = re.compile(r"\s*(?:TABLE\s+)?(?P<name>[\w.`]+)", re.IGNORECASE)
+
 
 @dataclass
 class TableNameCheck:
@@ -109,6 +121,15 @@ def _variables(expression: object) -> list[str]:
         return []
     found = [_variable(c) for c in expression.find_all(exp.Column)]
     return [name for name in found if name]
+
+
+def _command_text(statement: exp.Command) -> str:
+    """What follows a command's keyword, as written: sqlglot keeps it as a
+    string literal."""
+    from sqlglot import exp
+
+    rest = statement.expression
+    return str(rest.this) if isinstance(rest, exp.Literal) else str(rest or "")
 
 
 def _declared_name(node: object) -> str:
@@ -185,7 +206,10 @@ class _Answer:
                 )
             return
         if isinstance(statement, exp.Command) and statement.name.upper() == "DECLARE":
-            self._declare_command(str(statement.expression or ""))
+            self._declare_command(_command_text(statement))
+            return
+        if isinstance(statement, exp.Command) and statement.name.upper() in _TABLE_COMMANDS:
+            self._command_table(_command_text(statement))
             return
         if isinstance(statement, exp.Set):
             for item in statement.expressions:
@@ -196,11 +220,25 @@ class _Answer:
         if isinstance(statement, exp.Use) or _kind(statement) in _NOT_TABLES:
             return  # USE CATALOG / SCHEMA, CREATE SCHEMA, ...: no table
         target = _target_table(statement)
+        stored_view: set[int] = set()
         if _temporary_view(statement) and isinstance(target, exp.Table):
             # A WORK dataset: no permanent write, though its query still reads.
             self.temp_views.add(target.name.lower())
             target = None
+        elif isinstance(statement, exp.Create) and _kind(statement) == "VIEW":
+            body = statement.expression
+            if isinstance(body, exp.Expr):
+                stored_view = {id(table) for table in body.find_all(exp.Table)}
         for table in statement.find_all(exp.Table):
+            if id(table) in stored_view and table.name in self.identifiers:
+                self.result.checked += 1
+                self._problem(
+                    f"a stored view's query reads {self.identifiers[table.name]}: "
+                    f"Databricks keeps a stored view's text, which may not read "
+                    f"a session variable — build the CREATE VIEW from the "
+                    f"variables and run it with EXECUTE IMMEDIATE"
+                )
+                continue
             self._table(table, writes=table is target)
 
     def _declare_command(self, text: str) -> None:
@@ -216,6 +254,23 @@ class _Answer:
             except Exception:  # sqlglot raises several unrelated types
                 default = None
         self.declare(map(_declared_name, re.split(r"\s*,\s*", names["names"])), default)
+
+    def _command_table(self, text: str) -> None:
+        """The table an OPTIMIZE or VACUUM *text* names, judged as a table."""
+        from sqlglot import exp
+
+        match = _COMMAND_TABLE_RE.match(text)
+        if match is None or "`" in match["name"] or text.lstrip()[:1] in "'\"":
+            return  # a path — delta.`/path`, '/path' — is a file, not a table
+        parts = [p for p in match["name"].split(".") if p]
+        if not parts:
+            return
+        table = exp.Table(this=exp.to_identifier(parts[-1]))
+        if len(parts) > 1:
+            table.set("db", exp.to_identifier(parts[-2]))
+        if len(parts) > 2:
+            table.set("catalog", exp.to_identifier(parts[-3]))
+        self._table(table, writes=True)
 
     def _table(self, table: exp.Table, *, writes: bool) -> None:
         from sqlglot import exp
@@ -270,14 +325,21 @@ class _Answer:
             )
             return
         if len(variables) == 1 and _variable(expression) == variables[0]:
-            value = self.values[variables[0]]
+            name = variables[0]
+            value = self.values[name]
+            prefixes = [v for v in _variables(value) if v != name]
             if value is None:
-                self._problem(f"`{variables[0]}` is never given a value")
-            elif not [v for v in _variables(value) if v != variables[0]]:
+                self._problem(f"`{name}` is never given a value")
+            elif not prefixes:
                 self._problem(
-                    f"`{variables[0]}` holds a literal name: build it from its "
+                    f"`{name}` holds a literal name: build it from its "
                     f"library's prefix, CONCAT(session.<LIBREF>_PREFIX, "
                     f"'.<table>')"
+                )
+            elif undeclared := [v for v in prefixes if v not in self.values]:
+                self._problem(
+                    f"`{name}` is built from `session.{undeclared[0]}`, which "
+                    f"is not declared in this answer"
                 )
 
     def _problem(self, line: str) -> None:

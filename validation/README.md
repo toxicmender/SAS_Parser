@@ -310,7 +310,12 @@ CREATE OR REPLACE TABLE IDENTIFIER(session.DEMO_TABLE) AS SELECT ...;
   - `IDENTIFIER('a.b.c')`;
   - a variable used before it is declared, or never given a value;
   - a permanent write (CREATE TABLE, INSERT, MERGE, UPDATE, DELETE, COPY INTO,
-    DROP TABLE, …) to an unqualified literal name.
+    DROP TABLE, …) to an unqualified literal name;
+  - a stored view whose query reads a session variable. Databricks keeps a
+    stored view's text, which may not read one, so such a view is created
+    through `EXECUTE IMMEDIATE`;
+  - a hard-coded name in OPTIMIZE or VACUUM, which sqlglot reads only as
+    commands.
 - **Ignored:** temporary views and CTEs, `read_files`, `system` and
   `information_schema`, and ``delta.`/path` `` file reads.
 
