@@ -371,3 +371,126 @@ def test_the_instruction_examples_name_permanent_tables():
     }
     assert checked["table_names#0"] == 2
     assert max(n for label, n in checked.items() if label.startswith("examples#")) == 3
+
+
+# ── end to end ───────────────────────────────────────────────────────────────
+
+_CASE = pathlib.Path(__file__).resolve().parents[1] / "validation/cases/permanent_library.json"
+
+_HARD_CODED = """\
+CREATE OR REPLACE TABLE main.mart.orders_clean AS
+SELECT o.*, amount - cost AS margin FROM main.stage.orders o WHERE amount > 0;
+
+CREATE OR REPLACE TEMP VIEW region_margin AS
+SELECT region, SUM(margin) AS total_margin FROM main.mart.orders_clean GROUP BY region;
+
+INSERT INTO main.mart.margin_history SELECT * FROM region_margin;
+"""
+
+_THROUGH_VARIABLES = """\
+DECLARE OR REPLACE VARIABLE STAGE_PREFIX STRING DEFAULT 'catalog_name.stage';
+DECLARE OR REPLACE VARIABLE MART_PREFIX STRING DEFAULT 'catalog_name.mart';
+DECLARE OR REPLACE VARIABLE ORDERS STRING DEFAULT CONCAT(session.STAGE_PREFIX, '.orders');
+DECLARE OR REPLACE VARIABLE ORDERS_CLEAN STRING DEFAULT CONCAT(session.MART_PREFIX, '.orders_clean');
+DECLARE OR REPLACE VARIABLE MARGIN_HISTORY STRING DEFAULT CONCAT(session.MART_PREFIX, '.margin_history');
+
+CREATE OR REPLACE TABLE IDENTIFIER(session.ORDERS_CLEAN) AS
+SELECT o.*, amount - cost AS margin FROM IDENTIFIER(session.ORDERS) o WHERE amount > 0;
+
+CREATE OR REPLACE TEMP VIEW region_margin AS
+SELECT region, SUM(margin) AS total_margin
+FROM IDENTIFIER(session.ORDERS_CLEAN) GROUP BY region;
+
+INSERT INTO IDENTIFIER(session.MARGIN_HISTORY) SELECT * FROM region_margin;
+"""
+
+_RULE = "Table names through session variables"
+
+
+class _Scripted:
+    """Chat-model stub: gives its answers in order and records each prompt."""
+
+    def __init__(self, *answers: str) -> None:
+        self.answers = answers
+        self.prompts: list[list] = []
+
+    def invoke(self, messages, config=None):
+        from langchain_core.messages import AIMessage
+
+        self.prompts.append(list(messages))
+        return AIMessage(self.answers[len(self.prompts) - 1])
+
+
+def _spark_sql_pipeline(llm: _Scripted, *, retries: int = 0):
+    from llm_client import LLMClientConfig
+    from pipeline import SasLLMPipeline
+    from pipeline.setup import PromptingSetup, ValidationSetup
+    from prompt_builder.user_instructions import UserInstructionSet
+    from validation import LiveValidator
+
+    return SasLLMPipeline(
+        llm_config=LLMClientConfig(model="unused-because-llm-injected"),
+        output_language="Spark SQL",
+        prompting=PromptingSetup(
+            structured_output=False,
+            user_instructions=UserInstructionSet.from_dir(
+                str(_SPARKSQL_INSTRUCTIONS.parent)
+            ),
+        ),
+        validation=ValidationSetup(
+            validator=LiveValidator(output_language="Spark SQL"), retries=retries
+        ),
+        llm=llm,
+    )
+
+
+def _text(prompt: list) -> str:
+    return "\n".join(str(message.content) for message in prompt)
+
+
+def test_a_hard_coded_answer_is_retried_with_the_tables_named():
+    from langchain_core.messages import SystemMessage
+
+    from validation.dataset import load_cases
+
+    case = load_cases(_CASE)[0]
+    llm = _Scripted(_response(_HARD_CODED), _response(_THROUGH_VARIABLES))
+    results = _spark_sql_pipeline(llm, retries=1).run_text(
+        case.sas_source, source_id=f"{case.case_id}.sas"
+    )
+
+    # The item names permanent tables, so it was shown the rule and the
+    # worked example.
+    assert _RULE in _text(llm.prompts[0])
+    assert "Permanent library tables through session variables" in _text(llm.prompts[0])
+    # The first answer failed, and the retry was told which tables to fix.
+    assert len(llm.prompts) == 2
+    notes = [
+        str(m.content)
+        for m in llm.prompts[1]
+        if isinstance(m, SystemMessage) and "**session_variables**" in str(m.content)
+    ]
+    assert len(notes) == 1
+    for table in ("main.stage.orders", "main.mart.orders_clean", "main.mart.margin_history"):
+        assert f"hard-coded table name `{table}`" in notes[0]
+    # The answer kept is the one that names every table through a variable.
+    (result,) = results
+    verdict = {m["metric"]: m for m in result["validation"]["metrics"]}
+    assert result["validation"]["passed"] is True
+    assert verdict["session_variables"]["details"].startswith(
+        "4/4 permanent table reference(s) go through declared session variables"
+    )
+    assert verdict["target_syntax"]["score"] == 1.0
+    assert verdict["dataset_fidelity"]["score"] == 1.0
+
+
+def test_a_work_only_item_is_not_shown_the_rule():
+    llm = _Scripted(
+        _response("CREATE OR REPLACE TEMP VIEW b AS SELECT * FROM a WHERE x > 0;")
+    )
+    (result,) = _spark_sql_pipeline(llm).run_text(
+        "data work.b;\n  set work.a;\n  where x > 0;\nrun;\n", source_id="work_only.sas"
+    )
+    assert _RULE not in _text(llm.prompts[0])
+    verdict = {m["metric"]: m for m in result["validation"]["metrics"]}
+    assert verdict["session_variables"]["skipped"] is True
