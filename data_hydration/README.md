@@ -266,8 +266,11 @@ a leading period, `?` one, `[ ]` one of a set.
 An `%INCLUDE` also says what a FILENAME is: `filename src '/code/macros';` read
 only through `%include src(util);` names SAS source, so the plan leaves it out,
 as it leaves out an `%INCLUDE` of a quoted path. So does PROC PYTHON: a
-FILENAME only its `INFILE=` reads names a Python script. A fileref INFILE or
-FILE reads too holds data, and stays.
+FILENAME only its `INFILE=` reads names a Python script. And a FILENAME the job
+only writes through — `file rpt;`, PROC EXPORT's `outfile=exp`, PROC CPORT's
+`file=t` — names its output, as `file '/out/r.txt';` does; one it writes and
+then includes is code it generates. A fileref an INFILE or PROC IMPORT reads
+too holds data, and stays.
 
 ## Package layout
 

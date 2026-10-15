@@ -559,7 +559,7 @@ def _sources_for(
     *,
     db_tables: Sequence["SasDbTableRef"] = (),
     named: frozenset[tuple[str, tuple[tuple[str, str], ...]]] = frozenset(),
-    code_filerefs: frozenset[str] = frozenset(),
+    unloaded_filerefs: frozenset[str] = frozenset(),
     transport_filerefs: frozenset[str] = frozenset(),
     env_used: frozenset[tuple[str, str]] = frozenset(),
 ) -> list[tuple[HydrationSource, tuple[str, ...]]]:
@@ -569,8 +569,8 @@ def _sources_for(
     *named* holds the database LIBNAMEs — ``(libref, options)`` — whose tables
     the corpus names: those are planned table by table, so the LIBNAME's own
     schema-level item, which stands in when no table is known, is left out.
-    *code_filerefs* are the filerefs only ``%INCLUDE`` reads
-    (:func:`_code_filerefs`): their FILENAMEs name SAS source, not data.
+    *unloaded_filerefs* are the filerefs the corpus only runs code or writes
+    through (:func:`_unloaded_filerefs`): their FILENAMEs name no data to load.
     *transport_filerefs* are the ones only PROC CIMPORT reads: their FILENAMEs
     name a transport file, planned blocked as one named by INFILE= is.
     *env_used* are the environment variables a read goes through,
@@ -582,7 +582,7 @@ def _sources_for(
         if (ref.binds, ref.options) not in named
     ]
     for path_ref in path_refs:
-        if path_ref.statement == "filename" and path_ref.binds in code_filerefs:
+        if path_ref.statement == "filename" and path_ref.binds in unloaded_filerefs:
             continue
         if (
             path_ref.statement == "setenv"
@@ -661,19 +661,24 @@ def build_plan(
     )
 
 
-def _code_filerefs(
+def _unloaded_filerefs(
     by_source: Mapping[str, tuple[Sequence["SasEngineRef"], Sequence["SasPathRef"]]],
 ) -> frozenset[str]:
-    """The filerefs the corpus only runs code through: ``%INCLUDE`` and PROC
-    PYTHON's ``INFILE=``.
+    """The filerefs the corpus only runs code or writes through: ``%INCLUDE``
+    and PROC PYTHON's ``INFILE=``, and FILE, PROC EXPORT's ``OUTFILE=`` and
+    PROC CPORT's ``FILE=``.
 
     ``filename src '/code/macros'; %include src(util);`` names a directory of
     SAS source, and ``filename py '/py/prep.py'; proc python infile=py;`` a
     Python script: more code to convert, not data to load, as either by a
-    quoted path is not. A fileref an INFILE or FILE statement also uses
-    holds data, and stays.
+    quoted path is not. ``filename rpt '/out/r.txt'; file rpt;`` names what
+    the job writes, as ``file '/out/r.txt';`` does, and a file it writes and
+    then includes is code it generates. A fileref an INFILE or PROC IMPORT
+    also reads holds data, and stays.
     """
-    return _filerefs_only(by_source, "include", "proc_python")
+    return _filerefs_only(
+        by_source, "include", "proc_python", "file", "proc_export", "proc_cport"
+    )
 
 
 def _filerefs_only(
@@ -1326,7 +1331,7 @@ def build_corpus_plan(
     if members.unassigned and logger.isEnabledFor(logging.DEBUG):
         logger.debug(f"build_corpus_plan: unassigned libraries {sorted(members.unassigned)}")
     expanded: set[_Library] = set()
-    code_filerefs = _code_filerefs(by_source)
+    unloaded_filerefs = _unloaded_filerefs(by_source)
     transport_filerefs = _filerefs_only(by_source, "proc_cimport")
     env_used = _env_in_use(by_source, members)
 
@@ -1341,7 +1346,7 @@ def build_corpus_plan(
             source_id or None,
             db_tables=db_tables.get(source_id, ()),
             named=named,
-            code_filerefs=code_filerefs,
+            unloaded_filerefs=unloaded_filerefs,
             transport_filerefs=transport_filerefs,
             env_used=env_used,
         ):

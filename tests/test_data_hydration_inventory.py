@@ -752,6 +752,34 @@ def test_the_file_proc_import_reads_by_its_file_alias_is_planned():
     ]
 
 
+def test_a_fileref_the_job_only_writes_through_is_no_source():
+    # `file rpt;`, PROC EXPORT's `outfile=exp` and PROC CPORT's `file=t`
+    # write the file their FILENAME names, as `file '/out/r.txt';` does, and
+    # a file written and then included is code the job generates. Before,
+    # each FILENAME was planned as data to load.
+    plan = _plan(
+        job=(
+            "filename rpt '/out/report.txt';\ndata _null_; file rpt; put 'x'; run;\n"
+            "filename exp '/out/x.csv';\nproc export data=a outfile=exp dbms=csv; run;\n"
+            "filename t '/out/t.cpt';\nproc cport data=a file=t; run;\n"
+            "filename gen '/tmp/gen.sas';\ndata _null_; file gen; put 'x'; run;\n%include gen;\n"
+        )
+    )
+    assert plan.items == []
+
+
+def test_a_fileref_the_job_writes_and_reads_holds_data():
+    plan = _plan(
+        job=(
+            "filename tmp '/data/tmp.txt';\ndata _null_; file tmp; put 'a'; run;\n"
+            "data b; infile tmp; input x; run;\n"
+        )
+    )
+    assert [(i.source.locator, i.source.object_name) for i in plan.items] == [
+        ("/data", "tmp.txt")
+    ]
+
+
 def test_a_read_through_a_keyword_default_is_planned():
     # `%load();` reads raw.feed through `src=`'s default (SAS 9.4 Macro
     # Language: Reference, %MACRO Statement). Before, the call read nothing,
