@@ -201,7 +201,12 @@ macro's `set &ds;` makes.
 rows: each path (`LIBNAME`, `FILENAME`, `INFILE`, `%INCLUDE`, ...), each SAS
 dataset a step reads or writes, each database table and each database LIBNAME.
 `resolved` says which still hold an unresolved `&macro`; `raw` is the SAS
-spelling, `value` the place or name SAS reads, `name` the comparison key.
+spelling, `value` the place or name SAS reads, `name` the comparison key. A
+path row keeps apart, as the chunk metadata does, a wildcard (`wildcard`:
+SAS reads every file it matches, so the plan blocks it) and a place not known
+before the job runs (`unresolved`: `macro`, `fileref`, `server` for one the SAS
+server completes, or `relative`), and is `resolved` only when it is neither
+unresolved nor left at a fileref.
 
 - **`inventory_rows(file_results, corpus=...)`** builds the rows from the
   chunker's results, resolved with `chunker.resolve_corpus_datasets` (top-level
@@ -211,8 +216,8 @@ spelling, `value` the place or name SAS reads, `name` the comparison key.
   `run_id` is `<UTC stamp>-<8 hex>`, so the latest run sorts last and the table
   keeps the history. The table and its schema are created when missing, never
   its catalog, and a table created before a column was added (`concat_index`,
-  a path's place in a concatenation) gains it on the next write, null in the
-  earlier runs. **`read_inventory(table, corpus=...)`** reads the corpus's
+  a path's place in a concatenation; `wildcard` and `unresolved`) gains it on
+  the next write, null in the earlier runs. **`read_inventory(table, corpus=...)`** reads the corpus's
   latest run back, or a given `run_id`.
 - **`plan_from_inventory(rows)`** plans from the rows alone. The CLI and
   `complexity --hydration` plan this way, so the inventory is the planner's

@@ -106,6 +106,41 @@ def test_every_reference_is_a_row_resolved_or_not():
     assert (read.role, read.statement, read.libref, read.member) == ("read", "set", "raw", "customers")
 
 
+def test_a_path_row_says_whether_it_is_a_wildcard_and_why_it_is_unresolved():
+    rows = _rows(
+        job=(
+            "filename wild '/data/in/wild*.dat';\n"
+            "data a; infile wild; input x; run;\n"
+            "data b; infile '~/b.csv'; input x; run;\n"
+            "data c; infile 'in/c.csv'; input x; run;\n"
+            'data d; infile "&nowhere/d.csv"; input x; run;\n'
+            "data e; infile rawin; input x; run;\n"
+            "data f; infile '/data/in/f.csv'; input x; run;\n"
+            "data _null_; file '/out/report*.txt'; put 'x'; run;\n"
+        )
+    )
+    paths = [(r.statement, r.raw, r.resolved, r.wildcard, r.unresolved) for r in rows if r.kind is RefKind.PATH]
+    assert paths == [
+        ("filename", "/data/in/wild*.dat", True, True, None),
+        ("infile", "wild", True, True, None),
+        ("infile", "~/b.csv", False, False, "server"),
+        ("infile", "in/c.csv", False, False, "relative"),
+        ("infile", "&nowhere/d.csv", False, False, "macro"),
+        ("infile", "rawin", False, False, "fileref"),
+        ("infile", "/data/in/f.csv", True, False, None),
+        # A write takes the name as written: SAS matches wildcards on input only.
+        ("file", "/out/report*.txt", True, False, None),
+    ]
+    # Every other kind of row has neither.
+    assert {(r.wildcard, r.unresolved) for r in rows if r.kind is not RefKind.PATH} == {(False, None)}
+
+
+def test_a_run_from_before_the_wildcard_column_reads_no_wildcard():
+    [row] = [r for r in _rows(job="filename f '/data/*.csv';\n") if r.kind is RefKind.PATH]
+    stored = row.model_dump() | {"wildcard": None, "unresolved": None}
+    assert InventoryRow.model_validate(stored).wildcard is False
+
+
 def test_rows_keep_the_corpus_order():
     rows = _rows(a="libname a '/a';\ndata x; set a.t; run;\n", b="data y; set x; run;\n")
     assert [(r.source_id, r.file_order, r.ref_order) for r in rows] == [

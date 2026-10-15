@@ -7,7 +7,9 @@ The chunker records four kinds of reference on each chunk —
 :class:`~chunker.models.SasEngineRef` (a database LIBNAME). The inventory flattens
 them into one :class:`InventoryRow` each, **resolved or not**: a path still
 spelled ``&root/in`` is a row with ``resolved = false``, which is exactly what a
-migration needs told about.
+migration needs told about. A path row also says why its place is not known
+(``unresolved``: ``macro``, ``fileref``, ``server`` or ``relative``) and whether it
+is a wildcard (``wildcard``), as the chunk metadata keeps those paths apart.
 
 The rows live in a Delta table (:func:`write_inventory`), one *run* per write,
 so the history of a corpus's references is kept and the latest run is one
@@ -139,7 +141,8 @@ class InventoryRow(BaseModel, frozen=True):
         :attr:`name`.
     resolved
         The reference names a definite place or object: no unresolved ``&``
-        remains, and a path is not left at a fileref no FILENAME binds.
+        remains, and a path is neither :attr:`unresolved` nor left at a
+        fileref (one a FILENAME assigns to a device, ``temp``, names no place).
     has_macro_ref
         An unresolved ``&`` remains — in the name, or in a connection option.
     libref
@@ -170,6 +173,14 @@ class InventoryRow(BaseModel, frozen=True):
         A path's place in a concatenation (``libname x ('/a' '/b');``), from
         0 — see :attr:`~chunker.models.SasPathRef.concat_index`. The rows of
         one concatenation follow each other in ``ref_order``.
+    wildcard
+        A path that is a wildcard SAS reads every match of
+        (``/data/in/*.csv``) — see :attr:`~chunker.models.SasPathRef.wildcard`.
+    unresolved
+        Why a path's place is not known before the job runs: ``macro``,
+        ``fileref``, ``server`` or ``relative`` — see
+        :class:`~chunker.models.UnresolvedReason`. ``None`` when it is known,
+        and on every other kind of row.
     """
 
     run_id: str
@@ -207,6 +218,8 @@ class InventoryRow(BaseModel, frozen=True):
     found_local: tuple[str, ...] | None = None
     found_sharepoint: tuple[str, ...] | None = None
     concat_index: int | None = None
+    wildcard: bool = False
+    unresolved: str | None = None
 
     @field_validator("options", mode="before")
     @classmethod
@@ -224,6 +237,12 @@ class InventoryRow(BaseModel, frozen=True):
     @classmethod
     def _no_targets(cls, value: Any) -> Any:
         return () if value is None else value
+
+    @field_validator("wildcard", mode="before")
+    @classmethod
+    def _no_wildcard(cls, value: Any) -> Any:
+        """A run written before the column existed reads null in it."""
+        return False if value is None else value
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +456,7 @@ def _chunk_refs(meta: Any) -> Iterable[dict[str, Any]]:
         }
     for ref in meta.external_refs:
         location = str(ref.location)
+        unresolved = ref.unresolved
         yield {
             "kind": RefKind.PATH,
             "statement": ref.statement,
@@ -444,13 +464,15 @@ def _chunk_refs(meta: Any) -> Iterable[dict[str, Any]]:
             "name": _without_password(ref.path),
             "raw": _without_password(ref.raw),
             "value": _without_password(ref.effective_path),
-            "resolved": not ref.has_macro_ref and location != "fileref",
+            "resolved": unresolved is None and location != "fileref",
             "has_macro_ref": ref.has_macro_ref,
             "libref": ref.binds,
             "location": location,
             "engine": ref.engine,
             "device": ref.device,
             "concat_index": ref.concat_index,
+            "wildcard": ref.wildcard,
+            "unresolved": None if unresolved is None else str(unresolved),
         }
     for ref in meta.db_tables:
         yield {
@@ -730,6 +752,8 @@ _COLUMNS: tuple[tuple[str, str, str], ...] = (
     # Columns added after the table's first release go last: an existing table
     # gains them on the next write (write_inventory), null in earlier runs.
     ("concat_index", "INT", "place of a path in a concatenation, from 0"),
+    ("wildcard", "BOOLEAN", "a path SAS reads every file matching"),
+    ("unresolved", "STRING", "why a path is not known: macro, fileref, server or relative"),
 )
 
 # Unity Catalog identifiers: one to three parts of letters, digits and _.

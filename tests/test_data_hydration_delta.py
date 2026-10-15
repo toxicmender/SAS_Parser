@@ -413,11 +413,13 @@ class TestTheReferenceInventory:
         assert read_inventory(inventory, spark=delta_spark, corpus="nobody") == []
 
     def test_a_table_made_before_a_column_was_added_gains_it(self, delta_spark, inventory):
-        # A table created before concat_index existed, with a run in it: the
-        # next write adds the column, and the old run reads null there.
+        # A table created before concat_index, wildcard and unresolved existed,
+        # with a run in it: the next write adds the columns, and the old run
+        # reads null there — no wildcard, no reason.
         from data_hydration.inventory import _COLUMNS, read_inventory, write_inventory
 
-        old = [(name, sql_type) for name, sql_type, _ in _COLUMNS if name != "concat_index"]
+        added = ("concat_index", "wildcard", "unresolved")
+        old = [(name, sql_type) for name, sql_type, _ in _COLUMNS if name not in added]
         delta_spark.sql(
             f"CREATE TABLE {inventory} ("
             + ", ".join(f"`{name}` {sql_type}" for name, sql_type in old)
@@ -425,7 +427,7 @@ class TestTheReferenceInventory:
         )
         first = self._rows("data a; set lib.one; run;\n", run_id="20260101T000000Z-00000001")
         values = [
-            tuple(v for (name, _, _), v in zip(_COLUMNS, _row_values(row)) if name != "concat_index")
+            tuple(v for (name, _, _), v in zip(_COLUMNS, _row_values(row)) if name not in added)
             for row in first
         ]
         delta_spark.createDataFrame(
@@ -433,18 +435,27 @@ class TestTheReferenceInventory:
         ).write.format("delta").mode("append").saveAsTable(inventory)
 
         second = self._rows(
-            "libname x ('/a' '/b');\ndata a; set x.m; run;\n", run_id="20260102T000000Z-00000002"
+            "libname x ('/a' '/b');\ndata a; set x.m; run;\n"
+            "filename f '/in/*.csv';\ndata b; infile '~/b.csv'; input v; run;\n",
+            run_id="20260102T000000Z-00000002",
         )
         write_inventory(second, inventory, spark=delta_spark)
-        assert "concat_index" in delta_spark.table(inventory).columns
+        assert set(added) <= set(delta_spark.table(inventory).columns)
         back = read_inventory(inventory, spark=delta_spark)
         assert [(r.name, r.concat_index) for r in back if r.statement == "libname"] == [
             ("/a", 0),
             ("/b", 1),
         ]
+        assert [(r.name, r.wildcard, r.unresolved) for r in back if r.kind == "path"] == [
+            ("/a", False, None),
+            ("/b", False, None),
+            ("/in/*.csv", True, None),
+            ("~/b.csv", False, "server"),
+        ]
         pinned = read_inventory(inventory, spark=delta_spark, run_id=first[0].run_id)
         assert {r.name for r in pinned} == {"lib.one", "work.a"}
-        assert all(r.concat_index is None for r in pinned)
+        assert all(r.concat_index is None and r.unresolved is None for r in pinned)
+        assert not any(r.wildcard for r in pinned)
 
 
 def _row_values(row):
