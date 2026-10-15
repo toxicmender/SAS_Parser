@@ -519,7 +519,7 @@ def _string_end(text: str, pos: int, quote: str) -> int:
         return close + 1
 
 
-def _macro_quote_end(text: str, start: int, known: dict[int, int] | None = None) -> int:
+def _macro_quote_end(text: str, start: int, known: dict[int, int]) -> int:
     """Index just past the parenthesis closing the macro quoting function
     whose argument begins at *start*; -1 when it never closes.
 
@@ -535,9 +535,7 @@ def _macro_quote_end(text: str, start: int, known: dict[int, int] | None = None)
     never closes — whose walk runs to the end of the text — is walked once,
     not once per quoting function inside it.
     """
-    if known is None:
-        known = {}
-    elif (hit := known.get(start - 1)) is not None:
+    if (hit := known.get(start - 1)) is not None:
         return hit
     opens = [start - 1]
     pos = start

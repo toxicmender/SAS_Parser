@@ -1062,7 +1062,7 @@ def _resolved_meta(
     meta: SasChunkMetadata,
     table: Mapping[str, str],
     own_values: dict[str, str],
-    texts: Mapping[str, str] | None = None,
+    texts: Mapping[str, str],
 ) -> SasChunkMetadata | None:
     """*meta* with every dataset/libref name resolved against *table*, and
     every path against *texts*, or ``None`` when nothing in it changed.
@@ -1070,7 +1070,7 @@ def _resolved_meta(
     *own_values* are this chunk's own ``%LET`` assignments, already expanded by
     the caller against the table in force where each one stands. *texts* holds
     the same variables' values as written, for paths (see
-    :meth:`_MacroScope.enter_texts`); without it paths keep their references.
+    :meth:`_MacroScope.enter_texts`); empty, paths keep their references.
 
     A dataset reference's resolved name is canonicalised again (``batch_med``
     → ``work.batch_med``) so it lands where the batcher's producer/consumer
@@ -1104,9 +1104,7 @@ def _resolved_meta(
     updates["defines_librefs"] = sorted(
         set(_resolve_names(meta.defines_librefs, table, canonical=False))
     )
-    paths = _resolve_binds(meta.external_refs, table)
-    if texts is not None:
-        paths = _resolve_paths(paths, texts)
+    paths = _resolve_paths(_resolve_binds(meta.external_refs, table), texts)
     updates["external_refs"] = paths
     updates["includes"] = _include_paths(paths)
     updates["engine_refs"] = _resolve_binds(meta.engine_refs, table)

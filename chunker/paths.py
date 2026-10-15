@@ -326,7 +326,7 @@ class PathSpec:
                 ref = self._quoted_ref(match, *member.span("path"), index)
                 if ref is not None:
                     refs.append(ref)
-            elif self.statement == "libname":
+            else:  # only a LIBNAME's list admits a libref (see the specs)
                 refs.append(
                     SasPathRef(
                         statement=self._statement_at(match),

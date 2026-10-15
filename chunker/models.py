@@ -650,10 +650,9 @@ def _dataset_views(refs: tuple[SasDatasetRef, ...]) -> dict[str, tuple[Any, ...]
     WRITE alone also fills ``created_datasets`` (``body_literal_created`` in a
     body). ``referenced_datasets`` is every name, sorted, whatever its role, and
     ``referenced_librefs`` the librefs those names hold (without the
-    chunk's ``defines_librefs``, which the property adds).
+    chunk's ``defines_librefs``, which the property adds). *refs* holds one
+    at least: :meth:`SasChunkMetadata._views` answers an empty tuple itself.
     """
-    if not refs:
-        return _NO_VIEWS  # most chunks name no dataset; never mutated
     found: dict[str, dict[Any, None]] = {}
     for ref in refs:
         role = ref.role
@@ -820,7 +819,7 @@ class SasChunkMetadata(BaseModel):
         tuple: the batcher reads the views of every chunk many times over.
         Kept outside the fields, so equality and dumps never see it."""
         if not self.dataset_refs:
-            return _NO_VIEWS
+            return _NO_VIEWS  # most chunks name no dataset; never mutated
         cached = self.__dict__.get("_dataset_views_cache")
         if cached is not None and cached[0] is self.dataset_refs:
             return cached[1]

@@ -925,8 +925,8 @@ def _library_members(
     by_source: Mapping[str, tuple[Sequence["SasEngineRef"], Sequence["SasPathRef"]]],
     datasets: Mapping[str, Sequence[Sequence["SasDatasetRef"]]],
     *,
-    directories: "_WorkingDirectories | None" = None,
-    relative: dict[str, tuple[str, str]] | None = None,
+    directories: "_WorkingDirectories",
+    relative: dict[str, tuple[str, str]],
 ) -> _Members:
     """The datasets to load from each directory library.
 
@@ -1039,10 +1039,9 @@ def _library_members(
                     # Named by its path, through no libref: its own item, a
                     # relative path read from the current directory.
                     path = _quoted_spelling(ref)
-                    cwd = directories.at(source_id, _position(ref)) if directories else None
+                    cwd = directories.at(source_id, _position(ref))
                     if cwd is not None and _relative(path):
-                        if relative is not None:
-                            relative.setdefault(_under(cwd, path), (path, cwd))
+                        relative.setdefault(_under(cwd, path), (path, cwd))
                         path = _under(cwd, path)
                     key = (_directory(path), _member_of(path).lower())
                     if not made and key not in seen:
@@ -1137,9 +1136,9 @@ class _Libraries:
 
     def bind(self, ref: "SasPathRef") -> None:
         """Put the LIBNAME, or environment variable, *ref* in force. A later
-        library of a concatenation joins the ones before it."""
-        if not ref.binds:
-            return
+        library of a concatenation joins the ones before it. Every *ref*
+        binds a libref: :func:`_library_members` takes no other."""
+        assert ref.binds is not None
         if ref.statement == "setenv":
             self.env[ref.binds] = ((ref.binds, ref.effective_path),)
             return
