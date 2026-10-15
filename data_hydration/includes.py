@@ -88,21 +88,20 @@ def include_file_name(row: InventoryRow) -> str | None:
     return name
 
 
-# A UNIX wildcard in a file name: *, ? or a [ ] set.
-_WILDCARD_RE = re.compile(r"[*?]|\[[^\]]*\]")
-
-
 def found_in(index: FileIndex, name: str, *, exact: bool = False) -> tuple[str, ...]:
     """The scripts of *index* named *name*: one name, or for a wildcard
-    (``%include '/code/macros/*.sas';``) every name it matches, in name order.
-    As SAS on UNIX reads one, ``*`` is one or more characters and never
-    matches a leading period, ``?`` is one, ``[ ]`` one of a set (SAS 9.4
-    Companion for UNIX Environments, Using Wildcards in Pathnames).
+    (``%include '/code/macros/*.sas';``, :func:`chunker.pathnames.has_wildcard`)
+    every name it matches, in name order. As SAS on UNIX reads one, ``*`` is
+    one or more characters and never matches a leading period, ``?`` is one,
+    ``[ ]`` one of a set (SAS 9.4 Companion for UNIX Environments, Using
+    Wildcards in Pathnames).
 
     Case is ignored unless *exact*, which keeps only the scripts whose own
     name has the case *name* is written in, as a UNIX file name must."""
+    from chunker.pathnames import has_wildcard
+
     key = name.lower()
-    if not _WILDCARD_RE.search(key):
+    if not has_wildcard(key):
         found = tuple(index.get(key, ()))
         return tuple(p for p in found if _file_name(p) == name) if exact else found
     pattern = re.compile(fnmatch.translate(key.replace("*", "?*")))

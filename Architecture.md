@@ -1206,7 +1206,7 @@ any of these silently changes behavior.
      non-capturing, which it was until hydration needed to tell them apart.
      What a path says about itself — a wildcard, a part the SAS server
      completes, relative or full — is `chunker/pathnames.py`'s, which
-     `SasPathRef` reads. The hydration planner keeps a
+     `SasPathRef` and the include matcher read. The hydration planner keeps a
      copy of those rules, as `data_hydration` imports no chunker module while
      it plans, and `tests/test_pathnames.py` holds the copy to the same
      answers.
