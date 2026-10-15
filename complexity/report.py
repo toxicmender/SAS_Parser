@@ -41,7 +41,9 @@ from chunker.models import (
     SasChunk,
     SasChunkResult,
     SasCorpus,
+    UnresolvedReason,
 )
+from chunker.pathnames import server_parts
 
 from .models import (
     ChunkComplexity,
@@ -225,19 +227,37 @@ def _dataset_lines(file: FileComplexity) -> list[str]:
     return lines
 
 
-#: How each location kind is introduced in the Paths section, and the order the
+#: The group in the Paths section that holds a wildcard, and the one that holds
+#: a place not known before the job runs, whatever its kind: the groups the
+#: chunk metadata's ``wildcard_paths`` and ``unresolved_paths`` make.
+_WILDCARDS = "Wildcards (SAS reads every file one matches: list them before mapping)"
+_UNRESOLVED = "Unresolved (not known before the job runs; each says why)"
+
+#: How each kind of place is introduced in the Paths section, and the order the
 #: groups are printed in. Filesystem first because it is the common case and the
-#: one with an obvious target-side answer; pipe and device last because they need
-#: a decision rather than a mapping.
-_PATH_GROUPS: tuple[tuple[PathLocation, str], ...] = (
+#: one with an obvious target-side answer; then the two whose places cannot be
+#: mapped as written; pipe and device last because they need a decision rather
+#: than a mapping. Each reference is in one group, as in the chunk metadata's
+#: path views.
+_PATH_GROUPS: tuple[tuple[PathLocation | str, str], ...] = (
     (PathLocation.FILESYSTEM, "Filesystem (needs a volume or external location)"),
+    (_WILDCARDS, _WILDCARDS),
+    (_UNRESOLVED, _UNRESOLVED),
     (PathLocation.REMOTE, "Remote services (needs network egress)"),
     (PathLocation.EMAIL, "Email destinations"),
     (PathLocation.PIPE, "Shell pipes (a command, not a location)"),
     (PathLocation.DEVICE, "Other devices"),
-    (PathLocation.FILEREF, "Filerefs no FILENAME in the corpus assigns"),
+    (PathLocation.FILEREF, "Filerefs a FILENAME assigns to a device (no place of their own)"),
     (PathLocation.LIBREF, "Libraries a concatenation names by libref (placed by their own LIBNAME)"),
 )
+
+
+def _path_group(ref: SasPathRef) -> PathLocation | str:
+    """The Paths group *ref* is listed in: its location's, unless it is
+    unresolved or a wildcard."""
+    if ref.unresolved is not None:
+        return _UNRESOLVED
+    return _WILDCARDS if ref.wildcard else ref.location
 
 
 def _path_lines(file: FileComplexity) -> list[str]:
@@ -245,7 +265,9 @@ def _path_lines(file: FileComplexity) -> list[str]:
 
     Grouped by kind because the kinds need different answers: a filesystem path
     wants a volume, an FTP reference wants egress and a credential, and a shell
-    pipe wants somebody to decide what replaces it. A flat list would hide that.
+    pipe wants somebody to decide what replaces it. A wildcard wants a listing
+    first, and a place nobody can name yet wants somebody to say where it is.
+    A flat list would hide that.
 
     A file that reaches nothing outside gets no section, the same rule
     :func:`_dataset_lines` follows — an empty heading says nothing the absence
@@ -254,13 +276,24 @@ def _path_lines(file: FileComplexity) -> list[str]:
     if not file.external_refs:
         return []
     lines = ["", "## Paths", ""]
-    for location, heading in _PATH_GROUPS:
-        refs = [r for r in file.external_refs if r.location is location]
+    for group, heading in _PATH_GROUPS:
+        refs = [r for r in file.external_refs if _path_group(r) == group]
         if not refs:
             continue
         lines.append(f"- {heading}:")
         lines += [f"  - {_fmt_path_ref(r)}" for r in refs]
     return lines
+
+
+def _why_unresolved(ref: SasPathRef) -> str:
+    """Why *ref*'s place is not known before the job runs, in words."""
+    if ref.unresolved is UnresolvedReason.MACRO:
+        return "unresolved macro reference"
+    if ref.unresolved is UnresolvedReason.FILEREF:
+        return "a fileref no FILENAME in the corpus assigns"
+    if ref.unresolved is UnresolvedReason.SERVER:
+        return f"completed by the SAS server: {'; '.join(server_parts(ref.effective_path))}"
+    return "relative: SAS reads it from its current directory"
 
 
 def _fmt_path_ref(ref: SasPathRef) -> str:
@@ -285,10 +318,10 @@ def _fmt_path_ref(ref: SasPathRef) -> str:
         # partitioned storage, not a folder of datasets — so it belongs next to
         # the path rather than being left for the reader to infer.
         parts.append(f"engine `{ref.engine}`")
-    if ref.has_macro_ref:
-        # The one thing a reader must not miss: this value is not what SAS
-        # resolves at run time, so it cannot be mapped as written.
-        parts.append("**(unresolved macro reference)**")
+    if ref.unresolved is not None:
+        # The one thing a reader must not miss: this value is not the place SAS
+        # reads at run time, so it cannot be mapped as written.
+        parts.append(f"**({_why_unresolved(ref)})**")
     return " ".join(parts)
 
 

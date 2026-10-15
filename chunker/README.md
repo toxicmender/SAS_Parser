@@ -501,9 +501,9 @@ concatenation names by its libref, names no place of its own and is in none.
 Unlike `unresolved_dataset_refs`, whose names stay in the dataset lists because
 the batcher links steps through them, an unresolved place leaves the location
 views: those list what a target maps as written, and a pattern or an unknown
-place cannot be. `SasBatch` rolls the same views up, and the pipeline's
-`[meta: wildcard_paths]` / `[meta: unresolved_paths]` tokens scope instructions
-on them.
+place cannot be. `SasBatch` rolls the same views up, the complexity report lists
+each kind in a group of its own, and the pipeline's `[meta: wildcard_paths]` /
+`[meta: unresolved_paths]` tokens scope instructions on them.
 
 **`include_files`** lists each SAS file a chunk's `%INCLUDE` statements pull in,
 one `SasIncludeFile` per file in source order:

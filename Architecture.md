@@ -767,8 +767,8 @@ assigns, a path the SAS server completes, or a relative one), both read off the
 record with `chunker/pathnames.py` and serialised with it. The path views keep
 them apart and are disjoint: `physical_paths`, `remote_paths` and `email_refs`
 list known places only, `wildcard_paths` the wildcards, `unresolved_paths` the
-places not known. `SasBatch` and the pipeline's `[meta:]` tokens follow the
-same split.
+places not known. `SasBatch`, the complexity report and the pipeline's
+`[meta:]` tokens follow the same split.
 
 ## Batching model
 

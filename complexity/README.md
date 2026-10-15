@@ -798,6 +798,13 @@ and `sasautos=` statements, recognised by `chunker/paths.py`:
 - Filesystem (needs a volume or external location):
   - `/sasdata3/dataetl` — libname `dataetl`
   - `/data/in/customers.csv` — infile
+- Wildcards (SAS reads every file one matches: list them before mapping):
+  - `/data/in/wild*.dat` — filename `wild`
+- Unresolved (not known before the job runs; each says why):
+  - `&root/in` — libname `raw` **(unresolved macro reference)**
+  - `rawin` → `rawin.dat` — infile `rawin` **(a fileref no FILENAME in the corpus assigns)**
+  - `~/in/x.csv` — infile **(completed by the SAS server: ~ is the home directory of the user SAS runs as)**
+  - `in/x.csv` — infile **(relative: SAS reads it from its current directory)**
 - Remote services (needs network egress):
   - `rates.dat` — filename `feed` via ftp
 - Email destinations:
@@ -806,17 +813,24 @@ and `sasautos=` statements, recognised by `chunker/paths.py`:
 
 Grouped by kind because the kinds need different answers: a filesystem path
 wants a volume or external location, an FTP reference wants egress and a
-credential, and a shell pipe wants somebody to decide what replaces it. A value
-spelled through macro variables the corpus assigns is followed by the place SAS
-reads (`` `&root/in` → `/SASData/in` — libname `raw` ``); one carrying a `&macro`
-reference nothing assigns is flagged as unresolved — it is not what SAS
-resolves at run time, so it cannot be mapped as written. A fileref used by
-`INFILE`, `FILE` or `%INCLUDE` is reported where its `FILENAME` points; one that
-no `FILENAME` in the corpus assigns (an autoexec or the job's JCL does) gets
-its own last group, *Filerefs no FILENAME in the corpus assigns*; a bare word
-there points at the file SAS on UNIX reads when no fileref of that name exists
-(`` `qtr` → `qtr.sas` — include `qtr` ``: lowercased, with `.sas` for
-`%INCLUDE` or `.dat` for `INFILE` and `FILE`, in its current directory).
+credential, and a shell pipe wants somebody to decide what replaces it. A
+wildcard wants a listing of the SAS server's directory first, and a place
+nobody can name yet wants somebody to say where it is, so both get groups of
+their own, the ones the chunk metadata's `wildcard_paths` and
+`unresolved_paths` make: each reference is in one group. A value spelled
+through macro variables the corpus assigns is followed by the place SAS reads
+(`` `&root/in` → `/SASData/in` — libname `raw` ``) and is known; one still
+carrying a `&macro` reference nothing assigns is unresolved — it is not what
+SAS resolves at run time, so it cannot be mapped as written. So is a path the
+SAS server completes (`~`, `!SASROOT`, `$VAR`) and a relative one, which SAS
+reads from its current directory (the hydration plan places it after a `cd`).
+A fileref used by `INFILE`, `FILE` or `%INCLUDE` is reported where its
+`FILENAME` points; one that no `FILENAME` in the corpus assigns (an autoexec or
+the job's JCL does) is unresolved too, and a bare word there points at the file
+SAS on UNIX reads when no fileref of that name exists (`` `qtr` → `qtr.sas` —
+include `qtr` ``: lowercased, with `.sas` for `%INCLUDE` or `.dat` for `INFILE`
+and `FILE`, in its current directory). A fileref a `FILENAME` assigns to a
+device (`filename t temp;`) names no place of its own and has its own group.
 
 Reported, never scored. Like the dataset interface, it says what a migration has
 to provision, which is a different question from how hard the code is. A file

@@ -3190,12 +3190,16 @@ class TestPathsSection(unittest.TestCase):
             "**(unresolved macro reference)**", render_file_report(scored, texts={})
         )
 
-    def test_a_fileref_no_filename_assigns_gets_its_own_group(self):
+    def test_a_fileref_no_filename_assigns_is_unresolved(self):
         scored = _file(_analyze("data work.r; infile rawin; input x; run;\n"), "t.sas")
         text = render_file_report(scored, texts={})
-        self.assertIn("- Filerefs no FILENAME in the corpus assigns:", text)
+        self.assertIn("- Unresolved (not known before the job runs; each says why):", text)
         # With the file SAS on UNIX reads when no fileref of that name exists.
-        self.assertIn("`rawin` → `rawin.dat` — infile `rawin`", text)
+        self.assertIn(
+            "`rawin` → `rawin.dat` — infile `rawin` "
+            "**(a fileref no FILENAME in the corpus assigns)**",
+            text,
+        )
 
     def test_a_fileref_a_filename_assigns_is_reported_where_it_points(self):
         scored = _file(
@@ -3206,7 +3210,7 @@ class TestPathsSection(unittest.TestCase):
             "t.sas",
         )
         text = render_file_report(scored, texts={})
-        self.assertNotIn("Filerefs no FILENAME", text)
+        self.assertNotIn("Unresolved", text)
         self.assertIn("`rawin` → `/data/in/raw.txt` — infile `rawin`", text)
 
     def test_a_path_spelled_through_a_macro_variable_shows_where_it_resolves(self):
@@ -3216,6 +3220,39 @@ class TestPathsSection(unittest.TestCase):
         text = render_file_report(scored, texts={})
         self.assertIn("`&root/in` → `/SASData/in` — libname `raw`", text)
         self.assertNotIn("unresolved macro reference", text)
+
+    def test_a_wildcard_and_each_unknown_place_get_their_own_group(self):
+        scored = _file(
+            _analyze(
+                "filename wild '/data/in/wild*.dat';\n"
+                "data work.a; infile wild; input x; run;\n"
+                "data work.b; infile '~/b.csv'; input x; run;\n"
+                "data work.c; infile 'in/c.csv'; input x; run;\n"
+                "data work.d; infile '/data/in/d.csv'; input x; run;\n"
+            ),
+            "t.sas",
+        )
+        text = render_file_report(scored, texts={})
+        filesystem = text.index("- Filesystem (needs a volume or external location):")
+        wildcards = text.index(
+            "- Wildcards (SAS reads every file one matches: list them before mapping):"
+        )
+        unresolved = text.index("- Unresolved (not known before the job runs; each says why):")
+        self.assertLess(filesystem, wildcards)
+        self.assertLess(wildcards, unresolved)
+        # Each reference in one group, as the chunk metadata has them.
+        self.assertEqual(text.count("`/data/in/d.csv`"), 1)
+        self.assertLess(filesystem, text.index("`/data/in/d.csv` — infile"))
+        self.assertLess(wildcards, text.index("`wild` → `/data/in/wild*.dat` — infile `wild`"))
+        self.assertIn(
+            "`~/b.csv` — infile **(completed by the SAS server: ~ is the home "
+            "directory of the user SAS runs as)**",
+            text,
+        )
+        self.assertIn(
+            "`in/c.csv` — infile **(relative: SAS reads it from its current directory)**",
+            text,
+        )
 
     def test_a_concatenation_reports_each_directory_and_each_libref(self):
         # A library named by its libref is no place: its own group says so.
