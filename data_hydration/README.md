@@ -121,7 +121,10 @@ macro's `set &ds;` makes.
   libname raw '/other'` serves the view's own query alone: the view's
   `raw.t` is planned from `/other`, and the next step's `raw.x` from the
   session's `raw`. A libref only a view assigns is not assigned in the
-  session.
+  session. Where a statement stands comes from the inventory's rows: a plan
+  built from chunk metadata directly has no positions, so a file's LIBNAMEs
+  bind before all its reads, and a view's USING LIBNAME binds for its whole
+  file, behind them, and for no file after.
 - **The library item stays** where no member is named, blocked as before;
   where a list (`raw.sales_:`) is read from it, since which members that covers
   only a listing knows; and while any read names its library through a macro

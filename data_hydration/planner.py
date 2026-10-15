@@ -947,7 +947,8 @@ def _library_members(
     '/data/2026'; set raw.y;`` reads ``/data/2025/x`` and ``/data/2026/y``.
     Records that say where they stand in their file (an ``order``, as the
     inventory's do) are bound in place; without one, a file's LIBNAMEs are
-    taken before its reads. A parameter's template in a ``%MACRO`` body reads nothing until a call names
+    taken before its reads, and a view's USING LIBNAME is in force for the
+    whole file, behind them. A parameter's template in a ``%MACRO`` body reads nothing until a call names
     it, and each call's reading is its own reference
     (``chunker.resolve_corpus_datasets``).
 
@@ -980,6 +981,15 @@ def _library_members(
             key=lambda ref: (_position(ref) is not None, _position(ref) or 0),
         )
         made_here: set[str] = set()  # by this file's earlier steps
+        # A view's own LIBNAMEs (a CREATE VIEW's USING list) are in force for
+        # its chunk alone. With no position, one cannot be told to its chunk:
+        # it is in force for the whole file, behind the file's other LIBNAMEs,
+        # and for no file after.
+        unplaced = [
+            ref for ref in libnames if ref.statement == "using_libname" and _position(ref) is None
+        ]
+        file_views = libraries.scoped(unplaced)
+        put = {libref: libraries.bound.get(libref) for libref in file_views}
         for refs in datasets.get(source_id, ()):
             # Every LIBNAME that stands before this chunk binds its libref now.
             start = min((p for r in refs if (p := _position(r)) is not None), default=None)
@@ -992,7 +1002,7 @@ def _library_members(
                 ref = libnames.pop(0)
                 if ref.statement != "using_libname":
                     libraries.bind(ref)
-                elif _position(ref) is not None:  # unplaced, it has no chunk
+                elif _position(ref) is not None:  # unplaced, it is in file_views
                     views.append(ref)
             hidden = libraries.scoped(views)
             made_now: set[str] = set()  # renamed or copied by this step so far
@@ -1069,6 +1079,11 @@ def _library_members(
         for ref in libnames:  # after the file's last read: in force for the next
             if ref.statement != "using_libname":
                 libraries.bind(ref)
+        # What the unplaced views hid comes back, save where a LIBNAME of the
+        # file has replaced them since.
+        libraries.restore(
+            {lib: was for lib, was in file_views.items() if libraries.bound.get(lib) == put[lib]}
+        )
     return found
 
 

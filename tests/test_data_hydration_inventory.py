@@ -300,6 +300,40 @@ def test_the_plan_from_the_inventory_is_the_plan_from_the_chunks():
     assert "oracle:ARCHPRO/hist (arch)" in [str(i.source) for i in from_rows.items]
 
 
+VIEW = (
+    "proc sql;\n  create view work.v as select * from src.t\n"
+    "  using libname src '/data/view';\nquit;\n"
+)
+
+
+def test_a_view_s_using_libname_binds_with_no_position():
+    # Records with no position cannot be told to their chunk, so the view's
+    # LIBNAME is in force for its file. Before, it was dropped, and the
+    # view's read got a "never assigned" blocker the rows did not.
+    results = _results(job=VIEW + "data a; set work.v; run;\n")
+    from_chunks = _chunk_plan(results)
+    assert [(i.source.locator, i.source.object_name, i.blockers) for i in from_chunks.items] == [
+        ("/data/view", "t", ())
+    ]
+    assert from_chunks.items == plan_from_inventory(inventory_rows(results), config=_config()).items
+
+
+def test_a_view_s_using_libname_is_in_force_for_no_file_after():
+    # The next file's read of src.u has no LIBNAME, whichever route plans
+    # it; a LIBNAME of the file's own, though, carries on.
+    for setup, item in (
+        ("", ("", "", True)),
+        ("libname src '/data/main';\n", ("/data/main", "u", False)),
+    ):
+        results = _results(a=setup + VIEW, b="data b; set src.u; run;\n")
+        for plan in (_chunk_plan(results), plan_from_inventory(inventory_rows(results), config=_config())):
+            assert [
+                (i.source.locator, i.source.object_name, bool(i.blockers))
+                for i in plan.items
+                if i.source.object_name == "u" or any("src.u" in b for b in i.blockers)
+            ] == [item]
+
+
 def test_only_keeps_one_librefs_references():
     rows = _rows(
         job=(
