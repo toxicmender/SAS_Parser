@@ -353,6 +353,29 @@ class TestMacroInvocation(unittest.TestCase):
             [call_chunk] = [c for c in chunks if c.kind is SasChunkKind.MACRO_CALL]
             self.assertEqual(call_chunk.metadata.input_datasets, [read], call)
 
+    def test_batching_returns_the_corpus_as_it_resolved_it(self):
+        """complexity --hydration scores the batches and builds the reference
+        inventory from one resolution: batch_resolved's corpus is the one
+        resolve_corpus_datasets builds, and its batches are batch()'s."""
+        from chunker import SasCorpus, resolve_corpus_datasets
+        from chunker.batcher import MultiFileBatcher
+
+        chunker = SasSemanticChunker(min_words=1, max_words=9_999)
+        corpus = SasCorpus(
+            file_results=[
+                chunker.chunk_text(
+                    "libname user '/u';\n%macro load(ds);\n  data out; set &ds; run;\n%mend;\n",
+                    source_id="a.sas",
+                ),
+                chunker.chunk_text("%load(c);\nproc print; run;\n", source_id="b.sas"),
+            ]
+        )
+        batches, resolved = MultiFileBatcher().batch_resolved(corpus)
+        self.assertEqual(resolved.model_dump(), resolve_corpus_datasets(corpus).model_dump())
+        self.assertEqual(batches.model_dump(), MultiFileBatcher().batch(corpus).model_dump())
+        empty = SasCorpus(file_results=[])
+        self.assertIs(MultiFileBatcher().batch_resolved(empty)[1], empty)
+
     def test_binding_the_calls_again_changes_nothing(self):
         from chunker import SasCorpus, resolve_corpus_datasets
 

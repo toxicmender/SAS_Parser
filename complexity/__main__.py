@@ -77,12 +77,7 @@ from typing import Any
 
 import app_config
 from app_config.logging_setup import configure_logging
-from chunker import (
-    MultiFileBatcher,
-    SasCorpus,
-    SasSemanticChunker,
-    resolve_corpus_datasets,
-)
+from chunker import MultiFileBatcher, SasCorpus, SasSemanticChunker
 
 from .analyzer import ComplexityAnalyzer
 from .models import CorpusComplexityReport
@@ -459,10 +454,12 @@ def _load_sharepoint_sources(
 
 def _analyse(
     args: argparse.Namespace, sources: _Sources, *, target: str | None
-) -> tuple[CorpusComplexityReport, ChunkTextIndex, ComplexityAnalyzer]:
-    """Batch and score *sources*. The middle of the run, identical in both modes."""
+) -> tuple[CorpusComplexityReport, ChunkTextIndex, ComplexityAnalyzer, SasCorpus]:
+    """Batch and score *sources*. The middle of the run, identical in both
+    modes. Also returns the corpus as batching resolved it, which the
+    reference inventory is built from (:func:`_corpus_inventory`)."""
     corpus = SasCorpus(file_results=sources.file_results)
-    batch_result = MultiFileBatcher().batch(corpus)
+    batch_result, resolved = MultiFileBatcher().batch_resolved(corpus)
 
     analyzer = ComplexityAnalyzer(
         target,
@@ -486,25 +483,26 @@ def _analyse(
     # not the corpus: MultiFileBatcher re-ids every chunk per file (f1-, f2-,
     # ...), so a lookup built from the raw corpus would miss every one.
     texts = chunk_texts(batch_result.all_ordered_items)
-    return report, texts, analyzer
+    return report, texts, analyzer, resolved
 
 
-def _corpus_inventory(args: argparse.Namespace, sources: _Sources) -> list[Any] | None:
+def _corpus_inventory(
+    args: argparse.Namespace, sources: _Sources, resolved: SasCorpus
+) -> list[Any] | None:
     """The reference inventory of *sources*, when ``--hydration`` or
     ``--check-includes`` reads it; else ``None``.
 
-    Built once for both: the corpus resolved as the batcher resolves it — a
-    database LIBNAME or %LET in a setup file reaches the reads after it, and
-    each macro call names the datasets its macro reads — then flattened into
-    rows (:mod:`data_hydration.inventory`), as ``python -m data_hydration``
-    builds it.
+    Built once for both, from *resolved*: the corpus as the batcher resolved
+    it (:func:`_analyse`) — a database LIBNAME or %LET in a setup file reaches
+    the reads after it, and each macro call names the datasets its macro reads
+    — flattened into rows (:mod:`data_hydration.inventory`), as ``python -m
+    data_hydration`` builds it.
     """
     if not (args.hydration or args.check_includes):
         return None
     from data_hydration.inventory import inventory_rows
 
-    corpus = resolve_corpus_datasets(SasCorpus(file_results=sources.file_results))
-    return inventory_rows(corpus.file_results, corpus=sources.label)
+    return inventory_rows(resolved.file_results, corpus=sources.label)
 
 
 def _hydration_plan(args: argparse.Namespace, rows: list[Any] | None):  # type: ignore[no-untyped-def]
@@ -685,8 +683,8 @@ def _run_local(args: argparse.Namespace) -> int:
     sources = _load_local_sources(args)
     if sources is None:
         return 1
-    report, texts, _ = _analyse(args, sources, target=args.target)
-    rows = _corpus_inventory(args, sources)
+    report, texts, _, resolved = _analyse(args, sources, target=args.target)
+    rows = _corpus_inventory(args, sources, resolved)
     status, _ = _deliver(
         args,
         report,
@@ -802,8 +800,8 @@ def _run_request(args: argparse.Namespace, row: Any, *, client: Any) -> int:
     sources = _load_sharepoint_sources(row.application, client=client)
     if sources is None:
         return 1
-    report, texts, analyzer = _analyse(args, sources, target=target)
-    inventory = _corpus_inventory(args, sources)
+    report, texts, analyzer, resolved = _analyse(args, sources, target=target)
+    inventory = _corpus_inventory(args, sources, resolved)
 
     # The label records what produced the estimate: the model when the LLM
     # pass ran, else the rules profile that did — which still means something

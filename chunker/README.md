@@ -662,8 +662,11 @@ that wants every dataset a job touches without batching: the passes
 `MultiFileBatcher` runs before it groups anything — each macro call given the
 datasets its macro's body reads and writes through its parameters
 (`via="macro_call"`), then the references resolved and `_LAST_` made concrete.
-It is how `data_hydration` and `complexity --hydration` see a LIBNAME in
-`setup.sas` reach the reads in `job.sas`, and `%load(raw.c)` read `raw.c`.
+It is how `data_hydration` sees a LIBNAME in `setup.sas` reach the reads in
+`job.sas`, and `%load(raw.c)` read `raw.c`. A caller that batches as well
+calls `MultiFileBatcher.batch_resolved(corpus)`, which returns the batches and
+that same corpus, resolved once: `complexity --hydration` builds its reference
+inventory so.
 
 Options ride on each record, so a consumer never joins by alias. The one-line
 `str()` form — what reaches the LLM prompt — leaves them out, because that is

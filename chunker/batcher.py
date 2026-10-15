@@ -1157,7 +1157,15 @@ def resolve_corpus_datasets(corpus: SasCorpus) -> SasCorpus:
     flat_chunks = list(flat_chunks)
     n = len(flat_chunks)
     _resolve_corpus_chunks(flat_chunks, _UF(n), _file_of_map(file_offsets, n))
-    bounds = [*file_offsets, n]
+    return _corpus_of(corpus, flat_chunks, file_offsets)
+
+
+def _corpus_of(
+    corpus: SasCorpus, flat_chunks: list[SasChunk], file_offsets: list[int]
+) -> SasCorpus:
+    """*corpus* with its files' chunks taken from *flat_chunks*, which
+    :func:`_build_flat_index` flattened it into at *file_offsets*."""
+    bounds = [*file_offsets, len(flat_chunks)]
     return corpus.model_copy(
         update={
             "file_results": [
@@ -2088,6 +2096,14 @@ class MultiFileBatcher:
         Returns a :class:`SasBatchResult` containing all batches
         (including cross-file ones) and standalone singletons.
         """
+        return self.batch_resolved(corpus)[0]
+
+    def batch_resolved(self, corpus: SasCorpus) -> tuple[SasBatchResult, SasCorpus]:
+        """:meth:`batch`, and *corpus* with every chunk's datasets as they were
+        resolved to batch it — what :func:`resolve_corpus_datasets` returns —
+        for a caller that wants both and should not resolve twice: ``complexity
+        --hydration`` scores the batches and builds the reference inventory
+        from the corpus."""
         source_ids = corpus.source_ids
         logger.info(
             f"MultiFileBatcher.batch: start  files={len(corpus.file_results)}  source_ids={source_ids}  total_chunks={sum(len(r.chunks) for r in corpus.file_results)}"
@@ -2096,7 +2112,7 @@ class MultiFileBatcher:
 
         if not corpus.file_results or not corpus.all_chunks:
             logger.warning("MultiFileBatcher.batch: corpus is empty")
-            return SasBatchResult(source_ids=source_ids)
+            return SasBatchResult(source_ids=source_ids), corpus
 
         # ── flatten corpus ──────────────────────────────────────────────────
         flat_chunks, file_offsets = _build_flat_index(corpus.file_results)
@@ -2148,4 +2164,6 @@ class MultiFileBatcher:
         if self.databricks_mapping:
             result = replace_dataset_names(result, self.databricks_mapping)
 
-        return result
+        # The passes after resolution group chunks and never rewrite one, so
+        # the flat list is the corpus as resolved.
+        return result, _corpus_of(corpus, flat_chunks, file_offsets)

@@ -3501,17 +3501,19 @@ class TestIncludeCheckCLI(unittest.TestCase):
         )
 
     def test_the_corpus_is_resolved_once_for_both_sections(self):
-        import complexity.__main__ as cli
+        # Once for the batches and both sections: the inventory is built from
+        # the corpus as batching resolved it. Before, it was resolved again.
+        import chunker.batcher as batcher
 
         calls: list[int] = []
-        original = cli.resolve_corpus_datasets
+        original = batcher._resolve_corpus_chunks
 
-        def counted(corpus):
+        def counted(*args, **kwargs):
             calls.append(1)
-            return original(corpus)
+            return original(*args, **kwargs)
 
-        cli.resolve_corpus_datasets = counted
-        self.addCleanup(setattr, cli, "resolve_corpus_datasets", original)
+        batcher._resolve_corpus_chunks = counted
+        self.addCleanup(setattr, batcher, "_resolve_corpus_chunks", original)
         self._report("--check-includes", "--hydration")
         self.assertEqual(len(calls), 1)
 
