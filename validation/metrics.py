@@ -27,12 +27,14 @@ import app_config
 from chunker.models import SasBatch, SasChunk
 from target_language import (
     PROSE_FENCE_INFOS,
+    SPARKSQL,
     TargetLanguage,
     normalize_language,
     resolve_target_language,
 )
 
 from .models import EvaluationRun, MetricResult
+from .table_names import check_table_names
 
 logger = logging.getLogger(__name__)
 
@@ -126,12 +128,16 @@ def _item_datasets(item: SasBatch | SasChunk) -> list[str]:
 
 def _mentions(name: str, response: str) -> bool:
     """True when *name* (``lib.member``) or its bare member name appears in
-    *response* as a standalone identifier."""
+    *response* as a standalone identifier — or as the quoted suffix a Spark
+    SQL session variable builds the table from, ``CONCAT(session.MART_PREFIX,
+    '.member')``, whatever the variable is called."""
     low = response.lower()
     if name.lower() in low:
         return True
-    bare = name.split(".")[-1].lower()
-    return re.search(rf"(?<![\w.]){re.escape(bare)}(?![\w.])", low) is not None
+    bare = re.escape(name.split(".")[-1].lower())
+    return (
+        re.search(rf"(?<![\w.]){bare}(?![\w.])|['\"]\.{bare}['\"]", low) is not None
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +368,64 @@ class LanguageComplianceMetric(ValidationMetric):
         return self._result(on_target / total, details)
 
 
+class SessionVariablesMetric(ValidationMetric):
+    """Spark SQL names each permanent table through a session variable.
+
+    The Spark SQL instructions ask for every table outside WORK to be named
+    through Databricks SQL session variables, so its catalog and schema are
+    set in one place: a ``<LIBREF>_PREFIX`` per SAS library, a variable per
+    table built from it with ``CONCAT``, and ``IDENTIFIER(session.<VAR>)``
+    wherever the table is read or written. Each response's ``## Translation``
+    SQL is read in order by :func:`validation.table_names.check_table_names`.
+
+    Scores ``passing / checked`` table references over the run. ``details``
+    names what fails — a hard-coded ``catalog.schema.table``, a variable used
+    before it is declared, a table variable holding a literal name — and is
+    what the corrective note before a retry quotes to the model
+    (``SasLLMPipeline._validation_feedback_message``). Skipped when no answer
+    names a permanent table (WORK only), and for any target but Spark SQL,
+    which :func:`default_metrics` never builds it for.
+    """
+
+    name = "session_variables"
+    default_threshold = 1.0
+
+    def __init__(
+        self,
+        threshold: float | None = None,
+        *,
+        output_language: str | TargetLanguage | None = None,
+    ) -> None:
+        super().__init__(threshold)
+        self.target = _as_target(output_language)
+
+    def evaluate(self, run: EvaluationRun) -> MetricResult:
+        if self.target.key != SPARKSQL.key:
+            return self._result(
+                1.0, f"not a Spark SQL run ({self.target.display_name})", skipped=True
+            )
+        checked = unparsed = 0
+        problems: list[str] = []
+        for response in run.responses:
+            found = check_table_names(_target_blocks(response, self.target))
+            checked += found.checked
+            unparsed += found.unparsed
+            problems += found.problems
+        unread = f"; {unparsed} block(s) not parsed (see target_syntax)" if unparsed else ""
+        if not checked:
+            return self._result(1.0, f"no permanent table named{unread}", skipped=True)
+        passing = checked - len(problems)
+        details = (
+            f"{passing}/{checked} permanent table reference(s) go through "
+            f"declared session variables"
+        )
+        if problems:
+            details += "; " + "; ".join(problems[:5])
+            if len(problems) > 5:
+                details += f"; and {len(problems) - 5} more"
+        return self._result(passing / checked, details + unread)
+
+
 class RequiredTermsMetric(ValidationMetric):
     """Caller-declared substrings that must appear somewhere in the output.
 
@@ -415,15 +479,22 @@ def default_metrics(
     own :attr:`~pipeline.engine.SasLLMPipeline.target_language` so scoring and
     prompting cannot disagree about what the run was asked to emit.
 
+    A Spark SQL suite adds :class:`SessionVariablesMetric`: its permanent
+    tables are named through session variables, which no other target has.
+
     The LLM-judged metrics are *not* included — they need a judge model and
     are opted into explicitly (see :func:`judged_metrics`).
     """
     target = _as_target(output_language)
+    target_specific: list[ValidationMetric] = (
+        [SessionVariablesMetric(output_language=target)] if target.key == SPARKSQL.key else []
+    )
     return [
         ResponseCoverageMetric(),
         DatasetFidelityMetric(),
         LanguageComplianceMetric(output_language=target),
         TargetSyntaxMetric(output_language=target),
+        *target_specific,
         RequiredTermsMetric(),
         ReferenceSimilarityMetric(),
     ]

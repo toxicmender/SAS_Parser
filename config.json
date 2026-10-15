@@ -77,12 +77,13 @@
     "dir": "prompt_builder/instructions",
     "max_tokens": 9800
   },
-  "_validation_comment": "Per-metric pass thresholds; null uses the metric class default. language_compliance scores whether emitted code blocks use the selected target, and target_syntax verifies them with Python AST for PySpark or sqlglot under the Databricks dialect for Spark SQL. Every metric is higher-is-better. The LLM-judged thresholds are inert unless that suite is enabled.",
+  "_validation_comment": "Per-metric pass thresholds; null uses the metric class default. language_compliance scores whether emitted code blocks use the selected target, and target_syntax verifies them with Python AST for PySpark or sqlglot under the Databricks dialect for Spark SQL. session_variables (Spark SQL runs only) scores whether every permanent table is named through a declared session variable, IDENTIFIER(session.<VAR>), rather than a literal catalog.schema.table. Every metric is higher-is-better. The LLM-judged thresholds are inert unless that suite is enabled.",
   "validation": {
     "response_coverage_threshold": null,
     "dataset_fidelity_threshold": null,
       "target_syntax_threshold": null,
     "language_compliance_threshold": null,
+    "session_variables_threshold": null,
     "required_terms_threshold": null,
     "reference_similarity_threshold": null,
     "llm_judge_threshold": null,
