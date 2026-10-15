@@ -315,9 +315,16 @@ def _names(location: PathLocation) -> Callable[[SasChunkMetadata], bool]:
 
 def _names_permanent_table(meta: SasChunkMetadata) -> bool:
     """Whether a chunk names a table outside WORK: a dataset in another
-    library, a library it assigns, or a database table."""
-    return any(libref != "work" for libref in meta.referenced_librefs) or bool(
-        meta.db_tables
+    library, a library it assigns, a database table, or a dataset a name
+    mapping already gave its Databricks name (``catalog.schema.table``, which
+    ``referenced_librefs`` leaves out because a catalog is no libref)."""
+    return (
+        any(libref != "work" for libref in meta.referenced_librefs)
+        or bool(meta.db_tables)
+        or any(
+            name.count(".") >= 2 and "&" not in name and not name.startswith("'")
+            for name in meta.referenced_datasets
+        )
     )
 
 

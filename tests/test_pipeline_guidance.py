@@ -412,13 +412,33 @@ def test_meta_flags_name_the_places_an_item_reaches(ref, expected):
         ({"defines_librefs": ["mart"]}, True),
         # A libref nothing resolved is a library all the same.
         ({"input_datasets": ["&lib..x"]}, True),
+        # A name mapping's Databricks name has no libref left to read.
+        ({"input_datasets": ["main.mart.raw_sales"]}, True),
         ({"input_datasets": ["work.a"], "output_datasets": ["work.b"]}, False),
+        # Two dots spelled through a macro variable are still a WORK name.
+        ({"output_datasets": ["work.&prefix._out"]}, False),
         ({}, False),
     ],
 )
 def test_permanent_tables_flags_a_table_outside_work(meta, expected):
     flags = _meta_flags_for_item(_batch(_meta_chunk("c1", **meta)))
     assert ("permanent_tables" in flags) is expected
+
+
+def test_permanent_tables_survives_a_databricks_name_mapping():
+    """``replace_dataset_names`` turns ``mart.raw_sales`` into a three-level
+    name that ``referenced_librefs`` no longer lists; the item still names a
+    permanent table and still needs the session-variable rule."""
+    from chunker.batcher import replace_dataset_names
+    from chunker.models import SasBatchResult
+
+    chunk = _meta_chunk("c1", input_datasets=["mart.raw_sales"])
+    mapped = replace_dataset_names(
+        SasBatchResult(singletons=[chunk]), {"mart": "main.mart_prod"}
+    ).singletons[0]
+    assert mapped.metadata.input_datasets == ["main.mart_prod.raw_sales"]
+    assert mapped.metadata.referenced_librefs == []
+    assert "permanent_tables" in _meta_flags_for_item(_batch(mapped))
 
 
 def test_permanent_tables_flags_a_database_table():

@@ -501,9 +501,9 @@ on that axis:
   names a filesystem place or a remote service, known or not),
   `wildcard_paths` and `unresolved_paths` (it names a wildcard, or a place not
   known before the job runs), `permanent_tables` (it names a table outside
-  WORK: a dataset in another library, a library it assigns, or a database
-  table), `defines_macros`, `invokes_macros`, `produces_macrovars`,
-  `automatic_vars`.
+  WORK: a dataset in another library, a library it assigns, a database table,
+  or a dataset a name mapping already renamed to `catalog.schema.table`),
+  `defines_macros`, `invokes_macros`, `produces_macrovars`, `automatic_vars`.
 
 So `## [when: proc:sql] [kind: PROC_STEP] [meta: symput_hazard] [lang: sparksql]
 Rule` fires only for a SparkSQL run whose item is a PROC step that uses PROC SQL
