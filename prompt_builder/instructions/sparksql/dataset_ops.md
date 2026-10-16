@@ -10,9 +10,20 @@ CREATE OR REPLACE TEMP VIEW txns_ord AS
 SELECT * FROM txns ORDER BY cust_id, txn_dt DESC;
 ```
 
-`work.*` gives a `TEMP VIEW`, a permanent libref a
-`CREATE OR REPLACE VIEW <catalog>.mylib.txns_ord` — a view either way, since
-PROC SORT adds no columns and computes nothing.
+`work.*` gives a `TEMP VIEW`, a permanent libref a stored view — a view either
+way, since PROC SORT adds no columns and computes nothing. A stored view keeps
+its query's text, which may not read a session variable, so build it from the
+table variables and run it:
+
+```sql
+DECLARE OR REPLACE VARIABLE MYLIB_PREFIX STRING DEFAULT 'catalog_name.mylib';
+DECLARE OR REPLACE VARIABLE TXNS STRING DEFAULT CONCAT(session.MYLIB_PREFIX, '.txns');
+DECLARE OR REPLACE VARIABLE TXNS_ORD STRING DEFAULT CONCAT(session.MYLIB_PREFIX, '.txns_ord');
+DECLARE OR REPLACE VARIABLE STMT STRING;
+SET VAR STMT = CONCAT('CREATE OR REPLACE VIEW ', session.TXNS_ORD,
+  ' AS SELECT * FROM ', session.TXNS, ' ORDER BY cust_id, txn_dt DESC');
+EXECUTE IMMEDIATE STMT;
+```
 
 - `BY DESCENDING v` flips *that* column only: `by a descending b` is
   `ORDER BY a, b DESC`, never `ORDER BY a DESC, b DESC`.
@@ -30,8 +41,9 @@ PROC SORT adds no columns and computes nothing.
 - ⚠️ **In-place sort (no `OUT=`)**: input and output are the same dataset. Never
   emit `CREATE OR REPLACE VIEW x AS SELECT * FROM x ORDER BY ...` — a view
   cannot select from itself. Name the ordered view differently and repoint the
-  consumers, or use `CREATE OR REPLACE TABLE x AS SELECT ...` where the SAS
-  genuinely replaced a stored dataset, and say which under Risks.
+  consumers, or use `CREATE OR REPLACE TABLE IDENTIFIER(session.X) AS
+  SELECT ...` where the SAS genuinely replaced a stored dataset, and say which
+  under Risks.
 
 Ordering semantics to preserve:
 

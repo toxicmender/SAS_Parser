@@ -71,18 +71,19 @@
     "max_story_points": null,
     "use_cross_file": null
   },
-  "_user_instructions_comment": "Operator translation rules injected per item. 'dir' is a directory of *.md files whose first path component names the target language ('sparksql/', or '_common/' for language-agnostic); it takes precedence over the single-file 'path'. README*.md and _-prefixed files are documentation and are never ingested. 'dir' ships pointing at the bundled starter set, which is scoped [lang: sparksql] and therefore inert under any other output_language; set it to null to inject no operator rules, or to your own directory to use project conventions instead. WARNING: that set targets DATABRICKS SQL - it uses QUALIFY, SQL scripting, EXECUTE IMMEDIATE, UNPIVOT and three-level catalog.schema.table names, which open-source Spark does not have. Point 'dir' elsewhere if you run a non-Databricks Spark. A relative value is resolved against the repo root when it does not exist relative to the working directory, so the default survives being run from elsewhere.'max_tokens' caps operator rules and examples inside prompt_builder.max_instruction_tokens so they cannot starve the reference corpus; null means uncapped, which is fine for a handful of rules but not for a large set - uncapped rules simply consume the whole budget. It is set to 70% of max_instruction_tokens, which leaves ~1050 words for reference chunks; move the two together if you change either.",
+  "_user_instructions_comment": "Operator translation rules injected per item. 'dir' is a directory of *.md files whose first path component names the target language ('sparksql/', or '_common/' for language-agnostic); it takes precedence over the single-file 'path'. README*.md and _-prefixed files are documentation and are never ingested. 'dir' ships pointing at the bundled starter set, which is scoped [lang: sparksql] and therefore inert under any other output_language; set it to null to inject no operator rules, or to your own directory to use project conventions instead. WARNING: that set targets DATABRICKS SQL - it uses QUALIFY, SQL scripting, EXECUTE IMMEDIATE, UNPIVOT, session variables read through IDENTIFIER(...) and three-level catalog.schema.table names, which open-source Spark lacks or has only in recent releases. Point 'dir' elsewhere if you run a non-Databricks Spark. A relative value is resolved against the repo root when it does not exist relative to the working directory, so the default survives being run from elsewhere.'max_tokens' caps operator rules and examples inside prompt_builder.max_instruction_tokens so they cannot starve the reference corpus; null means uncapped, which is fine for a handful of rules but not for a large set - uncapped rules simply consume the whole budget. It is set to 70% of max_instruction_tokens, which leaves ~1050 words for reference chunks; move the two together if you change either.",
   "user_instructions": {
     "path": null,
     "dir": "prompt_builder/instructions",
     "max_tokens": 9800
   },
-  "_validation_comment": "Per-metric pass thresholds; null uses the metric class default. language_compliance scores whether emitted code blocks use the selected target, and target_syntax verifies them with Python AST for PySpark or sqlglot under the Databricks dialect for Spark SQL. Every metric is higher-is-better. The LLM-judged thresholds are inert unless that suite is enabled.",
+  "_validation_comment": "Per-metric pass thresholds; null uses the metric class default. language_compliance scores whether emitted code blocks use the selected target, and target_syntax verifies them with Python AST for PySpark or sqlglot under the Databricks dialect for Spark SQL. session_variables (Spark SQL runs only) scores whether every permanent table is named through a declared session variable, IDENTIFIER(session.<VAR>), rather than a literal catalog.schema.table. Every metric is higher-is-better. The LLM-judged thresholds are inert unless that suite is enabled.",
   "validation": {
     "response_coverage_threshold": null,
     "dataset_fidelity_threshold": null,
       "target_syntax_threshold": null,
     "language_compliance_threshold": null,
+    "session_variables_threshold": null,
     "required_terms_threshold": null,
     "reference_similarity_threshold": null,
     "llm_judge_threshold": null,

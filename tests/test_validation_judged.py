@@ -562,12 +562,15 @@ def test_analysis_summarization_skips_without_item_metadata():
 
 
 def test_default_metrics_stays_deterministic_and_judge_free():
+    # The configured default target is Spark SQL, whose suite also checks
+    # that permanent tables are named through session variables.
     names = [m.name for m in default_metrics()]
     assert names == [
         "response_coverage",
         "dataset_fidelity",
         "language_compliance",
         "target_syntax",
+        "session_variables",
         "required_terms",
         "reference_similarity",
     ]

@@ -40,6 +40,7 @@ from chunker.models import SasChunkKind
 from pipeline.prompting import _META_FLAGS
 from prompt_builder.user_instructions import (
     SCOPE_ALWAYS,
+    SCOPE_EXAMPLE,
     SCOPE_TOPIC,
     UserInstructionSet,
     kinds_of,
@@ -279,6 +280,42 @@ def test_sparksql_slice_is_scoped_to_sparksql(bundled):
         if c.doc_id.startswith("sparksql_") and "sparksql" not in langs_of(c)
     ]
     assert unscoped == [], f"sparksql sections not scoped to SparkSQL: {unscoped}"
+
+
+def test_session_variable_rule_reaches_only_spark_sql_permanent_tables(bundled):
+    """The detailed table-naming rule and its worked example cost nothing to
+    an item that names no table outside WORK, and never reach PySpark."""
+    rule = [c for c in bundled.chunks if c.doc_id == "sparksql_table_names"]
+    example = [
+        c
+        for c in bundled.chunks
+        if c.doc_id == "sparksql_examples" and "session variables" in c.section_path
+    ]
+    assert (len(rule), len(example)) == (1, 1)
+    assert scope_of(rule[0]) == SCOPE_ALWAYS
+    assert scope_of(example[0]) == SCOPE_EXAMPLE
+    for chunk in (*rule, *example):
+        assert metas_of(chunk) == ["permanent_tables"]
+        assert langs_of(chunk) == ["sparksql"]
+
+
+def test_always_on_spark_sql_names_tables_through_session_variables(bundled):
+    """The one-line rule every Spark SQL item sees. The output-format guidance
+    once told the model to write ``<catalog>.mylib.accounts`` literally."""
+    output_format = [
+        c
+        for c in bundled.chunks
+        if c.doc_id == "sparksql_overview" and c.section_path == "Output format"
+    ]
+    assert len(output_format) == 1
+    assert "IDENTIFIER(session." in output_format[0].text
+    # A `/Volumes/<catalog>/...` path is a file, and files keep literal paths.
+    literal = [
+        c.section_path
+        for c in bundled.chunks
+        if c.doc_id.startswith("sparksql_") and "<catalog>." in c.text
+    ]
+    assert literal == [], f"sparksql sections naming a literal table: {literal}"
 
 
 def test_pyspark_slice_is_scoped_to_pyspark(bundled):

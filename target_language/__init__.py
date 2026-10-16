@@ -23,8 +23,10 @@ __all__ = [
     "SPARKSQL",
     "TargetLanguage",
     "UnknownTargetLanguage",
+    "mask_identifier_clauses",
     "normalize_language",
     "resolve_target_language",
+    "restore_identifier_clauses",
 ]
 
 DEFAULT_OUTPUT_LANGUAGE = "Spark SQL"
@@ -50,12 +52,132 @@ def _check_python(source: str) -> str | None:
     return None
 
 
+# The IDENTIFIER clause: an object name computed from a constant string — a
+# session variable, a parameter marker or a literal — anywhere Databricks SQL
+# takes a name ("IDENTIFIER clause", Databricks SQL / Runtime 13.3 and above).
+_IDENTIFIER_RE = re.compile(r"IDENTIFIER\s*\(", re.IGNORECASE)
+_PLACEHOLDER = "__sasp_identifier_{}__"
+
+
+def _skip_quoted(sql: str, start: int) -> int:
+    """The index after the string literal or backquoted name opening at
+    *start*: a backslash escapes the next character in a literal, and a
+    doubled backquote stands for one inside a name."""
+    quote = sql[start]
+    i = start + 1
+    while i < len(sql):
+        char = sql[i]
+        if char == "\\" and quote != "`":
+            i += 2
+        elif char == quote and quote == "`" and sql.startswith("``", i):
+            i += 2
+        elif char == quote:
+            return i + 1
+        else:
+            i += 1
+    return len(sql)
+
+
+def _skip_comment(sql: str, start: int) -> int:
+    """The index after the comment opening at *start*: ``--`` to the end of
+    its line, or a bracketed comment, which nests."""
+    if sql.startswith("--", start):
+        end = sql.find("\n", start)
+        return len(sql) if end < 0 else end + 1
+    depth = 0
+    i = start
+    while i < len(sql):
+        if sql.startswith("/*", i):
+            depth += 1
+            i += 2
+        elif sql.startswith("*/", i):
+            depth -= 1
+            i += 2
+            if depth == 0:
+                return i
+        else:
+            i += 1
+    return len(sql)
+
+
+def _closing_paren(sql: str, start: int) -> int:
+    """The index of the parenthesis closing the one at *start*, strings and
+    comments aside, or ``-1`` when it is never closed."""
+    depth = 0
+    i = start
+    while i < len(sql):
+        char = sql[i]
+        if char in "'\"`":
+            i = _skip_quoted(sql, i)
+            continue
+        if sql.startswith(("--", "/*"), i):
+            i = _skip_comment(sql, i)
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def mask_identifier_clauses(sql: str) -> tuple[str, dict[str, str]]:
+    """*sql* with each IDENTIFIER clause replaced by a plain placeholder name,
+    and the clause each placeholder stands for.
+
+    sqlglot reads ``SELECT * FROM IDENTIFIER(session.t)`` but not
+    ``CREATE TABLE IDENTIFIER(session.t) AS ...``, ``INSERT INTO``, ``COPY
+    INTO`` or ``DROP TABLE`` with one, which Databricks accepts — so a parse
+    of generated Spark SQL masks them first. A placeholder is an ordinary
+    identifier, so the statement around it parses as it would with a literal
+    name, and :func:`restore_identifier_clauses` puts the clauses back. A
+    clause inside a string or a comment is left alone, as is one never
+    closed, which the parse then reports.
+    """
+    out: list[str] = []
+    originals: dict[str, str] = {}
+    i = 0
+    while i < len(sql):
+        char = sql[i]
+        if char in "'\"`":
+            end = _skip_quoted(sql, i)
+        elif sql.startswith(("--", "/*"), i):
+            end = _skip_comment(sql, i)
+        elif (
+            char in "iI"
+            and (i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] in "_$"))
+            and (match := _IDENTIFIER_RE.match(sql, i)) is not None
+            and (close := _closing_paren(sql, match.end() - 1)) >= 0
+        ):
+            name = _PLACEHOLDER.format(len(originals))
+            originals[name] = sql[i : close + 1]
+            out.append(name)
+            i = close + 1
+            continue
+        else:
+            end = i + 1
+        out.append(sql[i:end])
+        i = end
+    return "".join(out), originals
+
+
+def restore_identifier_clauses(sql: str, originals: dict[str, str]) -> str:
+    """*sql*, masked by :func:`mask_identifier_clauses`, with its clauses back."""
+    for name, clause in originals.items():
+        sql = sql.replace(name, clause)
+    return sql
+
+
 def _check_sql(source: str, dialect: str) -> str | None:
-    """Parse a statement list with the required sqlglot dependency."""
+    """Parse a statement list with the required sqlglot dependency, its
+    IDENTIFIER clauses masked (:func:`mask_identifier_clauses`)."""
     import sqlglot
 
+    masked, _ = mask_identifier_clauses(source)
     try:
-        sqlglot.parse(source, dialect=dialect)
+        sqlglot.parse(masked, dialect=dialect)
     except Exception as exc:
         return f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
     return None

@@ -46,7 +46,7 @@ import logging
 import re
 
 import app_config
-from target_language import SPARKSQL
+from target_language import SPARKSQL, mask_identifier_clauses, restore_identifier_clauses
 
 from .mapping import map_path, ordered_keys
 
@@ -152,6 +152,28 @@ def _lookup(name: str, mapping: dict[str, str]) -> str | None:
     return None
 
 
+def _statement_spans(sql: str, read: str) -> list[tuple[int, int]]:
+    """Where each statement of *sql* stands, ``(start, end)``, its separating
+    semicolon excluded: split at every semicolon token, as sqlglot's own
+    parser splits a script, so a span parses to exactly the statement
+    ``sqlglot.parse`` would have read there."""
+    from sqlglot.dialects.dialect import Dialect
+
+    spans: list[tuple[int, int]] = []
+    start = end = -1
+    for token in Dialect.get_or_raise(read).tokenize(sql):
+        if token.token_type.name == "SEMICOLON":
+            if start >= 0:
+                spans.append((start, end + 1))
+            start = -1
+        else:
+            start = token.start if start < 0 else start
+            end = token.end
+    if start >= 0:
+        spans.append((start, end + 1))
+    return spans
+
+
 def rewrite_sql(
     sql: str, mapping: dict[str, str], *, on_failure: str | None = None
 ) -> str:
@@ -159,7 +181,13 @@ def rewrite_sql(
     *sql* with every mapped table reference rewritten to its target.
 
     Returns *sql* unchanged when it does not parse, when ``sqlglot`` is not
-    installed, or when nothing matched.
+    installed, or when nothing matched. Only a statement that names a mapped
+    table is regenerated; every other statement, and the comments and spacing
+    between them, comes through byte-identical — a
+    ``DECLARE OR REPLACE VARIABLE`` keeps its spelling. An IDENTIFIER clause
+    (``CREATE TABLE IDENTIFIER(session.t) AS ...``) is masked for the parse
+    and comes back as written: the name it computes is a session variable's
+    value, set where the variable is declared, so nothing here maps it.
     """
     if not mapping or not sql.strip():
         return sql
@@ -175,16 +203,17 @@ def rewrite_sql(
         return sql
 
     read = SPARKSQL.sqlglot_dialect or "databricks"
+    masked, identifiers = mask_identifier_clauses(sql)
     try:
-        statements = sqlglot.parse(sql, read=read)
+        spans = _statement_spans(masked, read)
+        statements = [sqlglot.parse_one(masked[a:b], read=read) for a, b in spans]
     except Exception as exc:  # sqlglot raises several unrelated types
         _unparseable("Spark SQL", exc, on_failure)
         return sql
 
-    changed = False
-    for statement in statements:
-        if statement is None:
-            continue
+    edits: list[tuple[int, int, str]] = []
+    for (start, end), statement in zip(spans, statements):
+        changed = False
         for table in statement.find_all(exp.Table):
             qualified = ".".join(
                 part.name for part in (table.args.get("db"), table.this) if part
@@ -199,15 +228,12 @@ def rewrite_sql(
                 "catalog", exp.to_identifier(parts[-3]) if len(parts) > 2 else None
             )
             changed = True
-    if not changed:
+        if changed:
+            edits.append((start, end, statement.sql(dialect=read)))
+    if not edits:
         return sql
-    rewritten = ";\n".join(
-        statement.sql(dialect=read) for statement in statements if statement is not None
-    )
-    if sql.rstrip().endswith(";"):
-        rewritten += ";"
     logger.info(f"rewrite_sql: rewrote table references under dialect {read!r}")
-    return rewritten
+    return restore_identifier_clauses(_apply_edits(masked, edits), identifiers)
 
 
 def _string_literal(node: ast.AST) -> tuple[ast.Constant, str] | None:

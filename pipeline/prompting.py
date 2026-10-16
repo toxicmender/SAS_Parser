@@ -313,6 +313,21 @@ def _names(location: PathLocation) -> Callable[[SasChunkMetadata], bool]:
     return lambda meta: any(r.location is location for r in meta.external_refs)
 
 
+def _names_permanent_table(meta: SasChunkMetadata) -> bool:
+    """Whether a chunk names a table outside WORK: a dataset in another
+    library, a library it assigns, a database table, or a dataset a name
+    mapping already gave its Databricks name (``catalog.schema.table``, which
+    ``referenced_librefs`` leaves out because a catalog is no libref)."""
+    return (
+        any(libref != "work" for libref in meta.referenced_librefs)
+        or bool(meta.db_tables)
+        or any(
+            name.count(".") >= 2 and "&" not in name and not name.startswith("'")
+            for name in meta.referenced_datasets
+        )
+    )
+
+
 # Metadata predicate flags, keyed by the ``[meta: ...]`` token an instruction
 # scopes on. Each maps to a predicate on the metadata, truthy when the flag
 # holds; the pipeline owns this vocabulary so prompt_builder treats the tokens
@@ -333,6 +348,9 @@ _META_FLAGS: tuple[tuple[str, Callable[[SasChunkMetadata], object]], ...] = (
     ("remote_paths", _names(PathLocation.REMOTE)),
     ("wildcard_paths", attrgetter("wildcard_paths")),
     ("unresolved_paths", attrgetter("unresolved_paths")),
+    # A permanent table is named through session variables on Spark SQL, a
+    # rule a WORK-only item has no use for.
+    ("permanent_tables", _names_permanent_table),
     ("defines_macros", attrgetter("defines_macros")),
     ("invokes_macros", attrgetter("invokes_macros")),
     ("produces_macrovars", attrgetter("produces_macrovars")),

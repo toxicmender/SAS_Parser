@@ -260,6 +260,40 @@ def test_sql_leaves_unmapped_tables_alone():
     assert out == "SELECT * FROM hr.staff"
 
 
+def test_sql_with_session_variables_keeps_them_as_written(caplog):
+    # The generated Spark SQL names its permanent tables through session
+    # variables: the IDENTIFIER clauses parse (masked) and come back
+    # untouched, and only the statement naming a mapped table is regenerated
+    # — the DECLAREs keep their spelling, and the comment survives.
+    import logging
+
+    sql = (
+        "-- mart library\n"
+        "DECLARE OR REPLACE VARIABLE MART_PREFIX STRING DEFAULT 'catalog_name.mart';\n"
+        "DECLARE OR REPLACE VARIABLE DEMO_TABLE STRING "
+        "DEFAULT CONCAT(session.MART_PREFIX, '.demo_table');\n"
+        "CREATE OR REPLACE TABLE IDENTIFIER(session.DEMO_TABLE) AS\n"
+        "SELECT * FROM sales.orders;\n"
+    )
+    with caplog.at_level(logging.WARNING, logger="xref.rewrite"):
+        out = rewrite.rewrite_sql(sql, _MAPPING)
+    assert caplog.records == []
+    assert out == sql[: sql.index("CREATE")] + (
+        "CREATE OR REPLACE TABLE IDENTIFIER(session.DEMO_TABLE) AS "
+        "SELECT * FROM cat.sales.orders;\n"
+    )
+
+
+def test_sql_session_variables_alone_change_nothing():
+    sql = "INSERT INTO IDENTIFIER(session.T) SELECT * FROM IDENTIFIER(session.S);"
+    assert rewrite.rewrite_sql(sql, _MAPPING) == sql
+
+
+def test_sql_an_empty_statement_between_semicolons_is_kept():
+    sql = "SELECT * FROM sales.orders;; SELECT 1;"
+    assert rewrite.rewrite_sql(sql, _MAPPING) == "SELECT * FROM cat.sales.orders;; SELECT 1;"
+
+
 def test_unparseable_sql_is_returned_untouched(caplog):
     import logging
 
