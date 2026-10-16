@@ -9,6 +9,7 @@ one place. ``session_variables`` is the check that generated code does.
 
 from __future__ import annotations
 
+import logging
 import pathlib
 
 import pytest
@@ -331,6 +332,82 @@ def test_check_table_names_reads_blocks_in_order():
         ]
     )
     assert (found.checked, len(found.problems), found.unparsed) == (1, 1, 0)
+
+
+# ── edges of the reading ─────────────────────────────────────────────────────
+
+_PREFIX = "DECLARE OR REPLACE VARIABLE MART_PREFIX STRING DEFAULT 'catalog_name.mart';\n"
+
+
+@pytest.mark.parametrize(
+    "clause",
+    [
+        "IDENTIFIER(CONCAT(session.MART_PREFIX, '.orders'))",
+        "IDENTIFIER(session.MART_PREFIX || '.orders')",
+    ],
+)
+def test_a_name_built_inline_from_a_declared_prefix_passes(clause):
+    found = check_table_names([_PREFIX + f"SELECT * FROM {clause};"])
+    assert (found.checked, found.problems) == (1, [])
+
+
+@pytest.mark.parametrize(
+    "sql, problem",
+    [
+        # A column, not a session variable: the name is spelled out.
+        (
+            "SELECT * FROM IDENTIFIER(mart.orders);",
+            "IDENTIFIER(mart.orders) hard-codes the name",
+        ),
+        (
+            _PREFIX + "SELECT * FROM IDENTIFIER(session.MART_PREFIX ||);",
+            "IDENTIFIER(session.MART_PREFIX ||) could not be read",
+        ),
+        # `DECLARE ... session.X` is a command to sqlglot, read by hand.
+        (
+            "DECLARE OR REPLACE VARIABLE session.ORDERS STRING;\n"
+            "SELECT * FROM IDENTIFIER(session.ORDERS);",
+            "`ORDERS` is never given a value",
+        ),
+        (
+            "DECLARE OR REPLACE VARIABLE session.ORDERS STRING DEFAULT CONCAT(session.P, ;\n"
+            "SELECT * FROM IDENTIFIER(session.ORDERS);",
+            "`ORDERS`'s DEFAULT could not be read",
+        ),
+        # Neither a Spark setting nor a SET VAR on nothing declares a variable.
+        (
+            "SET spark.sql.shuffle.partitions = 8;\nSELECT * FROM IDENTIFIER(session.ORDERS);",
+            "`session.ORDERS` is not declared",
+        ),
+        (
+            "SET VAR ORDERS = 'c.mart.orders';\nSELECT * FROM IDENTIFIER(session.ORDERS);",
+            "`session.ORDERS` is not declared",
+        ),
+    ],
+)
+def test_what_the_check_cannot_accept_is_named(sql, problem):
+    found = check_table_names([sql])
+    assert found.checked == 1
+    assert len(found.problems) == 1 and found.problems[0].startswith(problem)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "DECLARE (x INT);",  # no name the check can read
+        "OPTIMIZE .;",
+        ";",
+        "-- a comment and nothing else",
+    ],
+)
+def test_what_names_no_table_is_left_alone(sql):
+    assert check_table_names([sql]) == check_table_names([])
+
+
+def test_problems_are_logged_at_debug(caplog):
+    caplog.set_level(logging.DEBUG, logger="validation.table_names")
+    check_table_names(["SELECT * FROM mart.orders;"])
+    assert "check_table_names: ['hard-coded table name `mart.orders`" in caplog.text
 
 
 # ── the instructions practise the rule ──────────────────────────────────────

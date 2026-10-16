@@ -79,6 +79,10 @@ _NOT_TABLES = frozenset({"SCHEMA", "DATABASE", "CATALOG", "FUNCTION"})
 _TABLE_COMMANDS = frozenset({"OPTIMIZE", "VACUUM"})
 _COMMAND_TABLE_RE = re.compile(r"\s*(?:TABLE\s+)?(?P<name>[\w.`]+)", re.IGNORECASE)
 
+# The value of a variable whose DECLARE default sqlglot could not read: it has
+# one, so it is not "never given a value", but nothing here can judge it.
+_UNREADABLE = object()
+
 
 @dataclass
 class TableNameCheck:
@@ -247,12 +251,12 @@ class _Answer:
         names = _DECLARE_NAMES_RE.match(text)
         if names is None:
             return
-        default = None
+        default: object | None = None
         if found := _DECLARE_DEFAULT_RE.search(text, names.end()):
             try:
                 default = sqlglot.parse_one(found["default"], read=_DIALECT)
             except Exception:  # sqlglot raises several unrelated types
-                default = None
+                default = _UNREADABLE
         self.declare(map(_declared_name, re.split(r"\s*,\s*", names["names"])), default)
 
     def _command_table(self, text: str) -> None:
@@ -330,6 +334,11 @@ class _Answer:
             prefixes = [v for v in _variables(value) if v != name]
             if value is None:
                 self._problem(f"`{name}` is never given a value")
+            elif value is _UNREADABLE:
+                self._problem(
+                    f"`{name}`'s DEFAULT could not be read: build it as "
+                    f"CONCAT(session.<LIBREF>_PREFIX, '.<table>')"
+                )
             elif not prefixes:
                 self._problem(
                     f"`{name}` holds a literal name: build it from its "
