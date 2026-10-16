@@ -156,3 +156,32 @@ def test_only_the_identifier_keyword_is_masked():
     masked, originals = mask_identifier_clauses("SELECT my_identifier(a), identifier (b)")
     assert masked.startswith("SELECT my_identifier(a), __sasp_identifier_0__")
     assert originals == {"__sasp_identifier_0__": "identifier (b)"}
+
+
+@pytest.mark.parametrize(
+    "sql, clauses",
+    [
+        # A backslash escapes the quote after it; the literal runs on.
+        (r"SELECT 'it\'s IDENTIFIER(x)' FROM IDENTIFIER(session.T)", ["IDENTIFIER(session.T)"]),
+        # A doubled backquote is one backquote inside a name.
+        ("SELECT `a``IDENTIFIER(x)` FROM IDENTIFIER(session.T)", ["IDENTIFIER(session.T)"]),
+        # Bracketed comments nest.
+        (
+            "/* a /* b */ IDENTIFIER(x) */ SELECT * FROM IDENTIFIER(session.T)",
+            ["IDENTIFIER(session.T)"],
+        ),
+        # Inside a clause: a call, and a parenthesis in a literal or a comment.
+        (
+            "SELECT * FROM IDENTIFIER(CONCAT(session.P, ')') /* ) */ -- )\n) t",
+            ["IDENTIFIER(CONCAT(session.P, ')') /* ) */ -- )\n)"],
+        ),
+        # What never closes runs to the end, and masks nothing after it.
+        ("SELECT 'IDENTIFIER(session.T)", []),
+        ("SELECT 1 /* IDENTIFIER(session.T)", []),
+        ("SELECT * FROM IDENTIFIER('a.b", []),
+    ],
+)
+def test_masking_reads_quotes_comments_and_parentheses_as_sql_does(sql, clauses):
+    masked, originals = mask_identifier_clauses(sql)
+    assert list(originals.values()) == clauses
+    assert restore_identifier_clauses(masked, originals) == sql

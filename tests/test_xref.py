@@ -289,6 +289,11 @@ def test_sql_session_variables_alone_change_nothing():
     assert rewrite.rewrite_sql(sql, _MAPPING) == sql
 
 
+def test_sql_an_empty_statement_between_semicolons_is_kept():
+    sql = "SELECT * FROM sales.orders;; SELECT 1;"
+    assert rewrite.rewrite_sql(sql, _MAPPING) == "SELECT * FROM cat.sales.orders;; SELECT 1;"
+
+
 def test_unparseable_sql_is_returned_untouched(caplog):
     import logging
 
