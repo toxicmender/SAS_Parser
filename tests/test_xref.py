@@ -856,6 +856,37 @@ def test_sql_a_new_prefix_after_a_statement_ending_in_a_comment_starts_its_own()
     assert SPARKSQL.check_syntax(out[0]) is None
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # A table whose name is a mapped library's: a library row is no table's
+        # new name, written out or held whole in a variable.
+        "SELECT * FROM stage.raw;",
+        "DECLARE OR REPLACE VARIABLE MART_RAW STRING DEFAULT 'catalog_name.mart.raw';",
+    ],
+)
+def test_sql_a_library_row_never_renames_a_table(sql):
+    assert rewrite.rewrite_sql_cells([sql], {"raw": "prod.raw_v2"}) == ([sql], [])
+
+
+def test_pyspark_a_library_row_never_renames_a_table():
+    code = "df = spark.table('raw')"
+    assert rewrite.rewrite_python(code, {"raw": "prod.raw_v2"}) == code
+
+
+def test_sql_a_library_row_for_a_prefix_s_library_is_reported(caplog):
+    import logging
+
+    sql = (
+        "DECLARE OR REPLACE VARIABLE RAW_PREFIX STRING DEFAULT 'catalog_name.raw';\n"
+        "DECLARE OR REPLACE VARIABLE CUSTOMERS STRING DEFAULT CONCAT(session.RAW_PREFIX, '.customers');\n"
+        "DECLARE OR REPLACE VARIABLE ORDERS STRING DEFAULT CONCAT(session.RAW_PREFIX, '.orders');"
+    )
+    with caplog.at_level(logging.WARNING, logger="xref.rewrite"):
+        assert rewrite.rewrite_sql_cells([sql], {"raw": "prod.raw_v2"}) == ([sql], [])
+    assert caplog.text.count("maps library 'raw' to 'prod.raw_v2'") == 1
+
+
 def test_post_cells_without_sql_rewrite_each_cell_on_its_own():
     mappings = sourcing.XrefMappings(exact={"sales.orders": "cat.sales.orders"})
     out, remapped = xref_apply.apply_post_cells(

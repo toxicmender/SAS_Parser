@@ -155,15 +155,18 @@ def _match(name: str, mapping: dict[str, str]) -> tuple[str, str] | None:
 
     Both the qualified name (``schema.table``) and the bare table name are
     tried, in that order: a mapping is written against the SAS-side
-    ``schema.table``, but generated code may name the table alone.
+    ``schema.table``, but generated code may name the table alone. A key
+    without a dot matches only when its target names a table
+    (``catalog.schema.table``); one whose target is ``catalog.schema`` is a
+    library row (:class:`~xref.sourcing.XrefMappings` ``by_libref``), no
+    table's new name.
     """
     lowered = name.strip().lower()
-    hit = mapping.get(lowered)
-    if hit is not None:
-        return lowered, hit
     _, dot, bare = lowered.rpartition(".")
-    if dot and bare and (hit := mapping.get(bare)) is not None:
-        return bare, hit
+    for key in (lowered, bare) if dot and bare else (lowered,):
+        hit = mapping.get(key)
+        if hit is not None and ("." in key or hit.count(".") == 2):
+            return key, hit
     return None
 
 
@@ -373,6 +376,7 @@ class _VariableRewrite:
         self.prefixes: list[_Prefix] = []
         self.declared: set[str] = set()
         self.remapped: set[str] = set()
+        self.libraries_reported: set[str] = set()
         # New prefixes declared by this rewrite: (catalog, schema, cell, offset, name).
         self.added: list[tuple[str, str, int, int, str]] = []
 
@@ -519,6 +523,7 @@ class _VariableRewrite:
     ) -> _Dependent:
         hit = _match(f"{prefix.schema}.{member}", self.mapping)
         if hit is None:
+            self._library_row(prefix)
             return _Dependent(index, column, suffix, member, None, None)
         key, target = hit
         parts = target.split(".")
@@ -531,6 +536,22 @@ class _VariableRewrite:
             return _Dependent(index, column, suffix, member, None, None)
         return _Dependent(
             index, column, suffix, member, key, (parts[0], parts[1], parts[2]), dict(prefix_of)
+        )
+
+    def _library_row(self, prefix: _Prefix) -> None:
+        """Report, once, a library row (``libref -> catalog.schema``) for
+        *prefix*'s library: post applies table rows only, so the tables built
+        from the prefix stay where they are."""
+        library = prefix.schema.lower()
+        target = self.mapping.get(library)
+        if target is None or target.count(".") == 2 or library in self.libraries_reported:
+            return
+        self.libraries_reported.add(library)
+        logger.warning(
+            f"rewrite_sql: XREF maps library {prefix.schema!r} to {target!r}, but "
+            f"the post rewrite applies table rows only, so the tables "
+            f"{prefix.name} builds are left where they are; XREF pre mode applies "
+            f"library rows"
         )
 
     def _whole_name(self, index: int, literal: exp.Expr | None, text: str, holder: str) -> None:

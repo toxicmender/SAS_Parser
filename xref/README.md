@@ -64,7 +64,10 @@ holding `'catalog_name.mart'` is looked up as `mart.orders`, and then:
 - a variable holding a literal `'catalog.schema.table'` gets the target.
 
 A mapped name built any other way — inside an IDENTIFIER clause, or from more
-than a prefix and a member — is logged and left as written. Under `both`,
+than a prefix and a member — is logged and left as written. Library rows
+(`by_libref`, `libref -> catalog.schema`) are applied by `pre` only: `post`
+logs one that names a prefix's library and leaves its tables where they are,
+and never takes a library row for a table's new name. Under `both`,
 names held in variables are reported among those only `post` reached, since a
 target split across a prefix and a member never appears whole.
 
