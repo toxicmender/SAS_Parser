@@ -425,6 +425,25 @@ def test_permanent_tables_flags_a_table_outside_work(meta, expected):
     assert ("permanent_tables" in flags) is expected
 
 
+@pytest.mark.parametrize(
+    "source, expected",
+    [
+        # A %LET value written like a dataset is only a mention: no table.
+        ("%let outfile = summary.xlsx;\n", False),
+        ("%let host = server.domain.com;\n", False),
+        # The step that uses one reads the table under its resolved name.
+        ("%let ds = mart.orders;\ndata work.x;\n  set &ds;\nrun;\n", True),
+        ("data mart.b;\n  set work.a;\nrun;\n", True),
+    ],
+)
+def test_permanent_tables_counts_datasets_an_item_reads_or_writes(source, expected):
+    from chunker import SasSemanticChunker
+
+    chunks = SasSemanticChunker().chunk_text(source).chunks
+    flags = _meta_flags_for_item(_batch(*chunks))
+    assert ("permanent_tables" in flags) is expected
+
+
 def test_permanent_tables_survives_a_databricks_name_mapping():
     """``replace_dataset_names`` turns ``mart.raw_sales`` into a three-level
     name that ``referenced_librefs`` no longer lists; the item still names a

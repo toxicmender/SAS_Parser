@@ -313,18 +313,34 @@ def _names(location: PathLocation) -> Callable[[SasChunkMetadata], bool]:
     return lambda meta: any(r.location is location for r in meta.external_refs)
 
 
+def _permanent_name(name: str) -> bool:
+    """Whether a dataset name lies outside WORK: another library's (a libref
+    still spelled ``&lib`` counts), or a ``catalog.schema.table`` a name
+    mapping gave it."""
+    if name.startswith("'") or "." not in name:
+        return False  # a quoted path, or a one-level WORK name
+    if name.count(".") >= 2 and "&" not in name:
+        return True
+    return name.split(".", 1)[0].lower() != "work"
+
+
 def _names_permanent_table(meta: SasChunkMetadata) -> bool:
-    """Whether a chunk names a table outside WORK: a dataset in another
-    library, a library it assigns, a database table, or a dataset a name
-    mapping already gave its Databricks name (``catalog.schema.table``, which
-    ``referenced_librefs`` leaves out because a catalog is no libref)."""
+    """Whether a chunk names a table outside WORK: a dataset it reads, writes
+    or drops in another library, a library it assigns, or a database table.
+    Only datasets with a role count: a ``%LET`` value written like one
+    (``%let outfile = summary.xlsx;``) names no table, and the step that
+    uses a real one reads it under its resolved name."""
+    names = (
+        *meta.input_datasets,
+        *meta.output_datasets,
+        *meta.dropped_datasets,
+        *meta.body_literal_inputs,
+        *meta.body_literal_outputs,
+    )
     return (
-        any(libref != "work" for libref in meta.referenced_librefs)
-        or bool(meta.db_tables)
-        or any(
-            name.count(".") >= 2 and "&" not in name and not name.startswith("'")
-            for name in meta.referenced_datasets
-        )
+        bool(meta.db_tables)
+        or any(libref.lower() != "work" for libref in meta.defines_librefs)
+        or any(_permanent_name(name) for name in names)
     )
 
 
