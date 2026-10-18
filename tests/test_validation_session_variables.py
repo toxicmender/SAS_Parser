@@ -396,9 +396,15 @@ _VARS = "DECLARE OR REPLACE VARIABLE LIB_PREFIX STRING DEFAULT 'catalog_name.lib
             "RETURN SELECT * FROM IDENTIFIER(session.B);",
             ["a SQL function's body reads IDENTIFIER(session.B)"],
         ),
+        # ... so a name they hard-code is built with EXECUTE IMMEDIATE, not
+        # IDENTIFIER, which the next attempt would fail on.
         (
             "CREATE OR REPLACE FUNCTION f() RETURNS TABLE (a INT) RETURN SELECT * FROM main.mart.t;",
-            ["hard-coded table name `main.mart.t`"],
+            ["hard-coded table name `main.mart.t`: build the statement"],
+        ),
+        (
+            _VARS + "CREATE OR REPLACE VIEW IDENTIFIER(session.V) AS SELECT * FROM main.mart.src;",
+            ["hard-coded table name `main.mart.src`: build the statement"],
         ),
         # The tables a variable's value reads.
         (
@@ -490,6 +496,8 @@ def test_every_statement_the_rule_names_is_judged(sql, problems):
         "SELECT * FROM IDENTIFIER(session.OUT_VIEW);\n"
         "ALTER VIEW IDENTIFIER(session.OUT_VIEW) AS SELECT 2 AS a;\n"
         "DROP VIEW IF EXISTS IDENTIFIER(session.OUT_VIEW);",
+        # Spark's global temporary views.
+        "SELECT * FROM global_temp.v;",
     ],
 )
 def test_what_the_rule_allows_passes(sql):

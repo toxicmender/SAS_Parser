@@ -327,11 +327,12 @@ CREATE OR REPLACE TABLE IDENTIFIER(session.DEMO_TABLE) AS SELECT ...;
   - a stored view's query (`CREATE VIEW` or `ALTER VIEW ... AS`) or a
     persisted SQL function's body that reads a session variable. Databricks
     keeps that text, which may not read one, so it too is created through
-    `EXECUTE IMMEDIATE`.
+    `EXECUTE IMMEDIATE` — the fix given for a name such a body hard-codes,
+    too.
 - **Ignored:** temporary views, named literally or through a variable
   (`CREATE TEMP VIEW IDENTIFIER(session.V)`, until `V` changes), and CTEs, a
   temporary view's or function's body, `read_files`, `system` and
-  `information_schema`, and
+  `information_schema`, Spark's `global_temp` views, and
   ``delta.`/path` `` file reads. So is the text an `EXECUTE IMMEDIATE` runs:
   it is a string, so a name hard-coded inside it is not caught.
 

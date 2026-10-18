@@ -40,7 +40,8 @@ What is not a permanent table is left alone: temporary views (a WORK dataset,
 named literally or through a variable) and the CTEs and views a query reads by
 a bare name, table functions
 (``read_files``), Databricks' own ``system`` catalog and
-``information_schema``, and a file read in place (``delta.`/Volumes/...```).
+``information_schema``, Spark's ``global_temp`` views, and a file read in place
+(``delta.`/Volumes/...```).
 
 Logger name: ``validation.table_names``.
 """
@@ -353,7 +354,10 @@ class _Answer:
             if id(table) in stored_view and table.name in self.identifiers:
                 self._persisted_read(table, "a stored view's query", "CREATE VIEW")
                 continue
-            where = takes_none.get(id(table))
+            # A stored query's names are resolved with EXECUTE IMMEDIATE too.
+            where = takes_none.get(id(table)) or (
+                "a stored view's query" if id(table) in stored_view else None
+            )
             self._table(
                 table,
                 writes=id(table) in writes or where == "the new name of RENAME TO",
@@ -390,7 +394,7 @@ class _Answer:
             if persisted and table.name in self.identifiers:
                 self._persisted_read(table, "a SQL function's body", "CREATE FUNCTION")
             else:
-                self._table(table, writes=False)
+                self._table(table, writes=False, where="a SQL function's body" if persisted else None)
 
     def _declare_command(self, text: str) -> None:
         """A DECLARE whose default sqlglot cannot parse: its variables exist,
@@ -441,9 +445,10 @@ class _Answer:
         where: str | None = None,
     ) -> None:
         """Judge one table reference. *where* names a place that takes no
-        IDENTIFIER clause (``OPTIMIZE``, a ``CLONE`` source); *temp_view_ok*
-        is False where a write to a temporary view's name is still a
-        permanent table (``CREATE TABLE``)."""
+        IDENTIFIER clause over a session variable (``OPTIMIZE``, a ``CLONE``
+        source, a stored query), so its fix is EXECUTE IMMEDIATE;
+        *temp_view_ok* is False where a write to a temporary view's name is
+        still a permanent table (``CREATE TABLE``)."""
         from sqlglot import exp
 
         if not isinstance(table.this, exp.Identifier):
@@ -462,6 +467,8 @@ class _Answer:
         if db or catalog:
             if catalog.lower() == "system" or db.lower() == "information_schema":
                 return
+            if not catalog and db.lower() == "global_temp":
+                return  # Spark's global temporary views
             if db.lower() in _PATH_FORMATS and ("/" in name or ":" in name):
                 return  # a file read in place: a path, not a table
             self.result.checked += 1
