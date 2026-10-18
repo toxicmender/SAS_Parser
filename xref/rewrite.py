@@ -204,13 +204,15 @@ class _Cell:
     tokens: list[Token] | None = None
 
 
-@dataclass
+@dataclass(eq=False)
 class _Dependent:
     """A table name built from a prefix, ``CONCAT(session.P, '.member')``.
 
     ``column`` and ``suffix`` are the ``session.P`` reference and the
     ``'.member'`` literal; both are ``None`` for a name built inside an
-    IDENTIFIER clause, which the rewrite cannot reach.
+    IDENTIFIER clause, which the rewrite cannot reach. ``active`` is each
+    variable's prefix where the name is read, so a group is re-pointed only
+    to a prefix that still holds what it held when it was chosen.
     """
 
     cell: int
@@ -219,9 +221,10 @@ class _Dependent:
     member: str
     key: str | None
     target: tuple[str, str, str] | None
+    active: dict[str, _Prefix] = field(default_factory=dict)
 
 
-@dataclass
+@dataclass(eq=False)
 class _Prefix:
     """A session variable given ``'catalog.schema'``: the prefix the names of
     a library's tables are built from."""
@@ -235,6 +238,13 @@ class _Prefix:
     # Something other than CONCAT(session.P, '.member') reads the variable,
     # so its value must stay where it is.
     pinned: bool = False
+    # Where every table built from it moves, when its own literal moves there.
+    moves_to: tuple[str, str] | None = None
+
+    @property
+    def home(self) -> tuple[str, str]:
+        """The ``(catalog, schema)`` the prefix holds once the rewrite is done."""
+        return self.moves_to or (self.catalog, self.schema)
 
 
 def _string_value(node: object) -> str | None:
@@ -340,9 +350,9 @@ class _VariableRewrite:
     * every table built from it mapped to one ``catalog.schema``, and nothing
       else reading it: the prefix's own literal changes;
     * otherwise each mapped group gets a prefix of its own — an existing one
-      holding that ``catalog.schema`` where one is declared first, or a new
-      ``<SCHEMA>_PREFIX`` declared right after the original — and the group's
-      tables are re-pointed to it;
+      that holds that ``catalog.schema`` wherever the group reads it, once the
+      rewrite is done, or a new ``<SCHEMA>_PREFIX`` declared right after the
+      original — and the group's tables are re-pointed to it;
     * a mapping that renames the table rewrites its ``'.member'`` literal.
 
     Anything else that reads a prefix — a query, a command's text, an
@@ -389,6 +399,10 @@ class _VariableRewrite:
                 elif not assignments:
                     self._pin(statement, prefix_of)
                 self._inline(index, cell, statement, values, prefix_of)
+        # Every prefix's final value is settled before any group is re-pointed,
+        # so a group never follows a prefix that is about to move away.
+        for prefix in self.prefixes:
+            self._plan(prefix)
         for prefix in self.prefixes:
             self._settle(prefix)
         return sorted(self.remapped)
@@ -407,7 +421,7 @@ class _VariableRewrite:
         built = _built_from_prefix(value, prefix_of)
         if built is not None:
             prefix, column, suffix, member = built
-            prefix.dependents.append(self._dependent(index, column, suffix, prefix, member))
+            prefix.dependents.append(self._dependent(index, column, suffix, prefix, member, prefix_of))
             return
         self._pin(value, prefix_of)
         literal = value if _string_value(value) is not None else None
@@ -455,7 +469,7 @@ class _VariableRewrite:
             built = _built_from_prefix(inner, prefix_of) if names_table else None
             if built is not None:
                 prefix, _, _, member = built
-                prefix.dependents.append(self._dependent(index, None, None, prefix, member))
+                prefix.dependents.append(self._dependent(index, None, None, prefix, member, prefix_of))
                 continue
             self._pin(inner, prefix_of)
             if names_table and (text := _evaluate(inner, values)) is not None and text.count(".") == 2:
@@ -496,6 +510,7 @@ class _VariableRewrite:
         suffix: exp.Literal | None,
         prefix: _Prefix,
         member: str,
+        prefix_of: dict[str, _Prefix],
     ) -> _Dependent:
         hit = _match(f"{prefix.schema}.{member}", self.mapping)
         if hit is None:
@@ -509,7 +524,9 @@ class _VariableRewrite:
                 f"is left as written"
             )
             return _Dependent(index, column, suffix, member, None, None)
-        return _Dependent(index, column, suffix, member, key, (parts[0], parts[1], parts[2]))
+        return _Dependent(
+            index, column, suffix, member, key, (parts[0], parts[1], parts[2]), dict(prefix_of)
+        )
 
     def _whole_name(self, index: int, literal: exp.Expr | None, text: str, holder: str) -> None:
         """A table name held whole: rewrite its literal, or report it."""
@@ -532,24 +549,33 @@ class _VariableRewrite:
 
     # ── rewriting ───────────────────────────────────────────────────────────
 
+    def _plan(self, prefix: _Prefix) -> None:
+        """Whether every table built from *prefix* moves to one
+        ``catalog.schema`` and nothing else reads it, so that its own literal
+        moves there (``moves_to``)."""
+        mapped = [d for d in prefix.dependents if d.target is not None]
+        homes = {(d.target[0], d.target[1]) for d in mapped if d.target}
+        if (
+            mapped
+            and not prefix.pinned
+            and len(homes) == 1
+            and all(d.target is not None for d in prefix.dependents)
+            and all(d.column is not None or (d.target and d.target[2] == d.member) for d in mapped)
+        ):
+            prefix.moves_to = homes.pop()
+
     def _settle(self, prefix: _Prefix) -> None:
         mapped = [d for d in prefix.dependents if d.target is not None]
         if not mapped:
             return
-        homes = sorted({(d.target[0], d.target[1]) for d in mapped if d.target})
-        moves_whole = (
-            not prefix.pinned
-            and len(homes) == 1
-            and all(d.target is not None for d in prefix.dependents)
-            and all(d.column is not None or (d.target and d.target[2] == d.member) for d in mapped)
-        )
-        if moves_whole:
-            moved = homes[0] != (prefix.catalog, prefix.schema)
+        if prefix.moves_to is not None:
+            moved = prefix.moves_to != (prefix.catalog, prefix.schema)
             if moved:
-                self._edit_literal(prefix.cell, prefix.literal, ".".join(homes[0]))
+                self._edit_literal(prefix.cell, prefix.literal, ".".join(prefix.moves_to))
             for dependent in mapped:
                 self._rename_member(dependent, moved=moved)
             return
+        homes = sorted({(d.target[0], d.target[1]) for d in mapped if d.target})
         for home in homes:
             group = [d for d in mapped if d.target and (d.target[0], d.target[1]) == home]
             editable = [d for d in group if d.column is not None]
@@ -585,14 +611,14 @@ class _VariableRewrite:
             self.remapped.add(dependent.key)
 
     def _prefix_for(self, home: tuple[str, str], prefix: _Prefix, group: list[_Dependent]) -> str:
-        """The prefix variable *group* is re-pointed to: one already holding
-        *home* and declared before the group, or a new one."""
+        """The prefix variable *group* is re-pointed to: one that holds *home*
+        once the rewrite is done and is the variable's prefix wherever the
+        group reads it, or a new one."""
         first = min(
             (d.cell, d.column.this.meta.get("start", 0) if d.column else 0) for d in group
         )
         for other in self.prefixes:
-            position = (other.cell, other.literal.meta.get("start", 0))
-            if (other.catalog, other.schema) == home and position < first:
+            if other.home == home and all(d.active.get(other.name) is other for d in group):
                 return other.name
         for catalog, schema, cell, offset, name in self.added:
             if (catalog, schema) == home and (cell, offset) < first:

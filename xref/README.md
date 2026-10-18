@@ -56,9 +56,10 @@ holding `'catalog_name.mart'` is looked up as `mart.orders`, and then:
   else reads the prefix (a query, a command's text such as `EXECUTE
   IMMEDIATE`, an IDENTIFIER clause that names anything else): the prefix's own
   literal changes;
-- otherwise each mapped group gets a prefix of its own — one already holding
-  that `catalog.schema`, or a new `<SCHEMA>_PREFIX` declared right after the
-  original — and its tables are re-pointed to it;
+- otherwise each mapped group gets a prefix of its own — one that holds that
+  `catalog.schema` wherever the group reads it, once the rewrite is done, or a
+  new `<SCHEMA>_PREFIX` declared right after the original — and its tables are
+  re-pointed to it;
 - a mapping that renames the table rewrites the `'.orders'` literal;
 - a variable holding a literal `'catalog.schema.table'` gets the target.
 

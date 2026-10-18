@@ -737,6 +737,56 @@ def test_sql_a_prefix_read_another_way_keeps_its_value(reader):
     assert remapped == ["mart.orders"]
 
 
+_TWO_LIBRARIES = (
+    "DECLARE OR REPLACE VARIABLE A_PREFIX STRING DEFAULT 'c.a';\n"
+    "DECLARE OR REPLACE VARIABLE A_X STRING DEFAULT CONCAT(session.A_PREFIX, '.x');\n"
+    "DECLARE OR REPLACE VARIABLE B_PREFIX STRING DEFAULT 'c.b';\n"
+    "DECLARE OR REPLACE VARIABLE B_T1 STRING DEFAULT CONCAT(session.B_PREFIX, '.t1');\n"
+    "DECLARE OR REPLACE VARIABLE B_T2 STRING DEFAULT CONCAT(session.B_PREFIX, '.t2');"
+)
+
+
+@pytest.mark.parametrize(
+    "mapping, expected",
+    [
+        # A_PREFIX held c.a, but it moves to d.a: b.t1, bound for c.a, gets a
+        # prefix of its own rather than following A_PREFIX away.
+        (
+            {"a.x": "d.a.x", "b.t1": "c.a.t1"},
+            _TWO_LIBRARIES.replace("'c.a'", "'d.a'")
+            .replace(
+                "'c.b';\n",
+                "'c.b';\nDECLARE OR REPLACE VARIABLE C_A_PREFIX STRING DEFAULT 'c.a';\n",
+            )
+            .replace("CONCAT(session.B_PREFIX, '.t1')", "CONCAT(session.C_A_PREFIX, '.t1')"),
+        ),
+        # A_PREFIX moves to d.a, where b.t1 is bound: b.t1 reads it there.
+        (
+            {"a.x": "d.a.x", "b.t1": "d.a.t1"},
+            _TWO_LIBRARIES.replace("'c.a'", "'d.a'").replace(
+                "CONCAT(session.B_PREFIX, '.t1')", "CONCAT(session.A_PREFIX, '.t1')"
+            ),
+        ),
+    ],
+)
+def test_sql_a_group_is_re_pointed_to_what_a_prefix_will_hold(mapping, expected):
+    out, remapped = rewrite.rewrite_sql_cells([_TWO_LIBRARIES], mapping)
+    assert (out, remapped) == ([expected], ["a.x", "b.t1"])
+    assert rewrite.rewrite_sql_cells(out, mapping) == (out, [])
+
+
+def test_sql_a_prefix_set_to_another_value_before_the_group_is_not_reused():
+    # SALES_PREFIX first holds the target, but no longer does where ORDERS
+    # is declared.
+    sql = (
+        "DECLARE OR REPLACE VARIABLE SALES_PREFIX STRING DEFAULT 'prod.sales';\n"
+        "SET VAR SALES_PREFIX = 'other.place';\n" + _DECLARES
+    )
+    out, _ = rewrite.rewrite_sql_cells([sql], {"mart.orders": "prod.sales.orders"})
+    assert "VARIABLE PROD_SALES_PREFIX STRING DEFAULT 'prod.sales';" in out[0]
+    assert "CONCAT(session.PROD_SALES_PREFIX, '.orders')" in out[0]
+
+
 def test_post_cells_without_sql_rewrite_each_cell_on_its_own():
     mappings = sourcing.XrefMappings(exact={"sales.orders": "cat.sales.orders"})
     out, remapped = xref_apply.apply_post_cells(
