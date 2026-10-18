@@ -170,6 +170,12 @@ def _match(name: str, mapping: dict[str, str]) -> tuple[str, str] | None:
     return None
 
 
+def _names_a_table(text: str) -> bool:
+    """Whether *text* reads as one ``catalog.schema.table`` name, rather than
+    a statement built around one (``'DROP TABLE IF EXISTS c.s.t'``)."""
+    return text.count(".") == 2 and not any(ch.isspace() for ch in text)
+
+
 def _folded(*parts: str) -> tuple[str, ...]:
     """Name *parts* as Databricks compares them: case-insensitively."""
     return tuple(part.lower() for part in parts)
@@ -444,7 +450,7 @@ class _VariableRewrite:
             prefix = _Prefix(index, name, literal, catalog, schema)  # type: ignore[arg-type]
             self.prefixes.append(prefix)
             prefix_of[name] = prefix
-        elif text is not None and text.count(".") == 2:
+        elif text is not None and _names_a_table(text):
             self._whole_name(index, literal if not shared else None, text, name)
 
     def _inline(
@@ -486,7 +492,7 @@ class _VariableRewrite:
                 prefix.dependents.append(self._dependent(index, None, None, prefix, member, prefix_of))
                 continue
             self._pin(inner, prefix_of)
-            if names_table and (text := _evaluate(inner, values)) is not None and text.count(".") == 2:
+            if names_table and (text := _evaluate(inner, values)) is not None and _names_a_table(text):
                 self._whole_name(index, None, text, clause)
 
     @staticmethod

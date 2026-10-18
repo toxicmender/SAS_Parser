@@ -907,6 +907,21 @@ def test_sql_a_target_differing_only_in_case_changes_nothing(sql, mapping):
     assert rewrite.rewrite_sql_cells([sql], mapping) == ([sql], [])
 
 
+def test_sql_a_statement_built_from_a_table_variable_is_no_table_name(caplog):
+    import logging
+
+    sql = _ORDERS_ONLY + (
+        "DECLARE OR REPLACE VARIABLE STMT STRING;\n"
+        "SET VAR STMT = CONCAT('DROP TABLE IF EXISTS ', session.ORDERS);\n"
+        "EXECUTE IMMEDIATE STMT;"
+    )
+    with caplog.at_level(logging.WARNING, logger="xref.rewrite"):
+        out, remapped = rewrite.rewrite_sql_cells([sql], {"mart.orders": "prod.sales.orders"})
+    assert out == [sql.replace("'catalog_name.mart'", "'prod.sales'")]
+    assert remapped == ["mart.orders"]
+    assert "left as written" not in caplog.text
+
+
 def test_post_cells_without_sql_rewrite_each_cell_on_its_own():
     mappings = sourcing.XrefMappings(exact={"sales.orders": "cat.sales.orders"})
     out, remapped = xref_apply.apply_post_cells(
