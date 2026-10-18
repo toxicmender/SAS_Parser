@@ -4029,7 +4029,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "saspy", marker = "extra == 'hydration'", specifier = ">=5.100" },
     { name = "saspy", marker = "extra == 'saspy'", specifier = ">=5.100" },
-    { name = "sqlglot", specifier = ">=25" },
+    { name = "sqlglot", specifier = ">=30" },
     { name = "tiktoken", specifier = ">=0.7" },
 ]
 provides-extras = ["spark", "vault", "azure", "databricks", "databricks-ai", "sharepoint", "dev", "graph", "oracle", "sftp", "adls", "sasdata", "saspy", "hydration"]
