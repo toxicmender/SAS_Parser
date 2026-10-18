@@ -631,15 +631,12 @@ class _VariableRewrite:
         name = self._new_name(home)
         cell = self.cells[prefix.cell]
         assert cell is not None
-        offset = self._statement_end(cell, prefix.literal)
+        offset, ended = self._statement_end(cell, prefix.literal)
         declare = (
             f"DECLARE OR REPLACE VARIABLE {name} STRING DEFAULT "
             f"{_literal('.'.join(home), self.read)};"
         )
-        if offset is None:
-            offset, text = len(cell.masked), f";\n{declare}"
-        else:
-            text = f"\n{declare}"
+        text = f"\n{declare}" if ended else f";\n{declare}"
         cell.edits.append((offset, offset, text))
         self.added.append((*home, prefix.cell, offset, name))
         self.declared.add(name)
@@ -655,9 +652,10 @@ class _VariableRewrite:
             n += 1
         return f"{catalog}_{schema}_PREFIX_{n}"
 
-    def _statement_end(self, cell: _Cell, literal: exp.Expr) -> int | None:
-        """Just past the semicolon ending the statement that holds *literal*,
-        or ``None`` when the cell ends first."""
+    def _statement_end(self, cell: _Cell, literal: exp.Expr) -> tuple[int, bool]:
+        """Where a statement can follow the one that holds *literal*: just
+        past its semicolon (``True``), or, when the cell ends without one,
+        just past its last token (``False``), ahead of a comment trailing it."""
         from sqlglot.dialects.dialect import Dialect
 
         if cell.tokens is None:
@@ -665,8 +663,8 @@ class _VariableRewrite:
         after = literal.meta.get("end", 0)
         for token in cell.tokens:
             if token.token_type.name == "SEMICOLON" and token.start > after:
-                return token.end + 1
-        return None
+                return token.end + 1, True
+        return cell.tokens[-1].end + 1, False
 
     def _edit_literal(self, index: int, literal: exp.Expr, text: str) -> None:
         span = _span(literal)

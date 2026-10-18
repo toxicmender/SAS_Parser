@@ -20,6 +20,7 @@ import pytest
 
 import app_config
 from app_config.sharepoint import SharePointConfig, SharePointError
+from target_language import SPARKSQL
 from xref import apply as xref_apply, pre, rewrite, sourcing
 
 @pytest.fixture(autouse=True)
@@ -837,6 +838,22 @@ def test_sql_edits_are_applied_once_and_never_overlap(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="xref.rewrite"):
         assert rewrite.rewrite_sql(sql, _MAPPING) == sql
     assert "overlap" in caplog.text
+
+
+def test_sql_a_new_prefix_after_a_statement_ending_in_a_comment_starts_its_own():
+    # No semicolon and a trailing comment: the new DECLARE goes after the
+    # statement's last token, not into the comment.
+    cells = [
+        "DECLARE OR REPLACE VARIABLE MART_PREFIX STRING DEFAULT 'catalog_name.mart' -- the mart",
+        "DECLARE OR REPLACE VARIABLE ORDERS STRING DEFAULT CONCAT(session.MART_PREFIX, '.orders');\n"
+        "DECLARE OR REPLACE VARIABLE ITEMS STRING DEFAULT CONCAT(session.MART_PREFIX, '.items');",
+    ]
+    out, _ = rewrite.rewrite_sql_cells(cells, {"mart.orders": "prod.sales.orders"})
+    assert out[0] == (
+        "DECLARE OR REPLACE VARIABLE MART_PREFIX STRING DEFAULT 'catalog_name.mart';\n"
+        "DECLARE OR REPLACE VARIABLE SALES_PREFIX STRING DEFAULT 'prod.sales'; -- the mart"
+    )
+    assert SPARKSQL.check_syntax(out[0]) is None
 
 
 def test_post_cells_without_sql_rewrite_each_cell_on_its_own():
