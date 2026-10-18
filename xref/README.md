@@ -41,11 +41,13 @@ Generated Spark SQL names its permanent tables through session variables
 (`CREATE OR REPLACE TABLE IDENTIFIER(session.DEMO_TABLE) AS ...`; see the
 SparkSQL instructions). `post` parses those statements with their IDENTIFIER
 clauses masked (`target_language.mask_identifier_clauses`) and gives the
-clauses back as written, and it regenerates only a statement that names a
-mapped table: every other statement, the `DECLARE OR REPLACE VARIABLE`s
-included, comes through byte-identical. The name a variable holds is set where
-it is declared, which `post` does not rewrite; `pre` reaches it, since the
-model declares the variables from the names `pre` already mapped.
+clauses back as written. It regenerates nothing: sqlglot records where every
+name stands, so `post` replaces each mapped name in place and every other
+byte — the `DECLARE OR REPLACE VARIABLE`s, comments, a `WHILE ... DO` block
+sqlglot cannot write back — comes through as written. The name a variable
+holds is set where it is declared, which `post` does not rewrite; `pre`
+reaches it, since the model declares the variables from the names `pre`
+already mapped.
 
 Under `pre` and `both` the run also reports SAS paths that survived into the
 output unmapped — a location the notebook names that will not exist on the

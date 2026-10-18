@@ -263,8 +263,8 @@ def test_sql_leaves_unmapped_tables_alone():
 def test_sql_with_session_variables_keeps_them_as_written(caplog):
     # The generated Spark SQL names its permanent tables through session
     # variables: the IDENTIFIER clauses parse (masked) and come back
-    # untouched, and only the statement naming a mapped table is regenerated
-    # — the DECLAREs keep their spelling, and the comment survives.
+    # untouched, and only the mapped name changes — the DECLAREs keep their
+    # spelling, and the comment and the line break survive.
     import logging
 
     sql = (
@@ -278,10 +278,33 @@ def test_sql_with_session_variables_keeps_them_as_written(caplog):
     with caplog.at_level(logging.WARNING, logger="xref.rewrite"):
         out = rewrite.rewrite_sql(sql, _MAPPING)
     assert caplog.records == []
-    assert out == sql[: sql.index("CREATE")] + (
-        "CREATE OR REPLACE TABLE IDENTIFIER(session.DEMO_TABLE) AS "
-        "SELECT * FROM cat.sales.orders;\n"
-    )
+    assert out == sql.replace("FROM sales.orders", "FROM cat.sales.orders")
+
+
+@pytest.mark.parametrize(
+    "sql, expected",
+    [
+        # sqlglot upper-cased a placeholder in function position when it
+        # regenerated the statement, and the clause never came back.
+        (
+            "SELECT IDENTIFIER(session.AGG)(amount) FROM sales.orders;",
+            "SELECT IDENTIFIER(session.AGG)(amount) FROM cat.sales.orders;",
+        ),
+        # sqlglot reads a WHILE block but writes it back as nothing: the loop
+        # head and its INSERT were deleted.
+        (
+            "WHILE x < 3 DO INSERT INTO sales.orders SELECT 1; SET VAR x = x + 1; END WHILE;",
+            "WHILE x < 3 DO INSERT INTO cat.sales.orders SELECT 1; SET VAR x = x + 1; END WHILE;",
+        ),
+        # Backquotes, an alias, keyword case, spacing and comments: all as written.
+        (
+            "select  *  from `sales`.`orders`  o -- the orders\nwhere o.amt > 0",
+            "select  *  from cat.sales.orders  o -- the orders\nwhere o.amt > 0",
+        ),
+    ],
+)
+def test_sql_only_the_mapped_name_changes(sql, expected):
+    assert rewrite.rewrite_sql(sql, _MAPPING) == expected
 
 
 def test_sql_session_variables_alone_change_nothing():

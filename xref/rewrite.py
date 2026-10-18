@@ -4,7 +4,9 @@ Two languages, two parsers, one rule.
 
 Spark SQL
     ``sqlglot.parse`` under the configured dialect, walk every ``exp.Table``,
-    rewrite the ones whose ``db.name`` matches a mapping key, regenerate.
+    and replace each name whose ``db.name`` matches a mapping key where it
+    stands in the source — sqlglot records every identifier's offsets, so
+    nothing is regenerated.
 
 PySpark
     The ``ast`` module over the string literals that name tables:
@@ -44,11 +46,15 @@ from __future__ import annotations
 import ast
 import logging
 import re
+from typing import TYPE_CHECKING
 
 import app_config
 from target_language import SPARKSQL, mask_identifier_clauses, restore_identifier_clauses
 
 from .mapping import map_path, ordered_keys
+
+if TYPE_CHECKING:  # sqlglot is imported where a parse needs it
+    from sqlglot import exp
 
 logger = logging.getLogger(__name__)
 
@@ -152,26 +158,23 @@ def _lookup(name: str, mapping: dict[str, str]) -> str | None:
     return None
 
 
-def _statement_spans(sql: str, read: str) -> list[tuple[int, int]]:
-    """Where each statement of *sql* stands, ``(start, end)``, its separating
-    semicolon excluded: split at every semicolon token, as sqlglot's own
-    parser splits a script, so a span parses to exactly the statement
-    ``sqlglot.parse`` would have read there."""
-    from sqlglot.dialects.dialect import Dialect
+def _name_span(table: exp.Table) -> tuple[int, int] | None:
+    """Where *table*'s name stands in the text it was parsed from, from its
+    first name part to its last (end exclusive), or ``None`` when a part has
+    no recorded position. sqlglot keeps each identifier's offsets, quotes
+    included, in its ``meta``."""
+    from sqlglot import exp
 
-    spans: list[tuple[int, int]] = []
-    start = end = -1
-    for token in Dialect.get_or_raise(read).tokenize(sql):
-        if token.token_type.name == "SEMICOLON":
-            if start >= 0:
-                spans.append((start, end + 1))
-            start = -1
-        else:
-            start = token.start if start < 0 else start
-            end = token.end
-    if start >= 0:
-        spans.append((start, end + 1))
-    return spans
+    parts = [
+        part
+        for part in (table.args.get("catalog"), table.args.get("db"), table.this)
+        if part is not None
+    ]
+    if not parts or not all(
+        isinstance(part, exp.Identifier) and "start" in part.meta for part in parts
+    ):
+        return None
+    return parts[0].meta["start"], parts[-1].meta["end"] + 1
 
 
 def rewrite_sql(
@@ -181,13 +184,14 @@ def rewrite_sql(
     *sql* with every mapped table reference rewritten to its target.
 
     Returns *sql* unchanged when it does not parse, when ``sqlglot`` is not
-    installed, or when nothing matched. Only a statement that names a mapped
-    table is regenerated; every other statement, and the comments and spacing
-    between them, comes through byte-identical — a
-    ``DECLARE OR REPLACE VARIABLE`` keeps its spelling. An IDENTIFIER clause
-    (``CREATE TABLE IDENTIFIER(session.t) AS ...``) is masked for the parse
-    and comes back as written: the name it computes is a session variable's
-    value, set where the variable is declared, so nothing here maps it.
+    installed, or when nothing matched. Each mapped name is replaced where it
+    stands in the source, so nothing is regenerated: every other byte comes
+    through as written — the spelling of a ``DECLARE OR REPLACE VARIABLE``,
+    comments, a placeholder in function position, and the SQL scripting
+    blocks sqlglot reads but cannot write back (``WHILE ... DO``). An
+    IDENTIFIER clause (``CREATE TABLE IDENTIFIER(session.t) AS ...``) is
+    masked for the parse and comes back as written: the name it computes is a
+    session variable's value, set where the variable is declared.
     """
     if not mapping or not sql.strip():
         return sql
@@ -205,31 +209,29 @@ def rewrite_sql(
     read = SPARKSQL.sqlglot_dialect or "databricks"
     masked, identifiers = mask_identifier_clauses(sql, read)
     try:
-        spans = _statement_spans(masked, read)
-        statements = [sqlglot.parse_one(masked[a:b], read=read) for a, b in spans]
+        statements = sqlglot.parse(masked, read=read)
     except Exception as exc:  # sqlglot raises several unrelated types
         _unparseable("Spark SQL", exc, on_failure)
         return sql
 
     edits: list[tuple[int, int, str]] = []
-    for (start, end), statement in zip(spans, statements):
-        changed = False
-        for table in statement.find_all(exp.Table):
+    for statement in statements:
+        for table in statement.find_all(exp.Table) if statement else ():
             qualified = ".".join(
                 part.name for part in (table.args.get("db"), table.this) if part
             )
             target = _lookup(qualified, mapping)
             if target is None:
                 continue
-            parts = target.split(".")
-            table.set("this", exp.to_identifier(parts[-1]))
-            table.set("db", exp.to_identifier(parts[-2]) if len(parts) > 1 else None)
-            table.set(
-                "catalog", exp.to_identifier(parts[-3]) if len(parts) > 2 else None
-            )
-            changed = True
-        if changed:
-            edits.append((start, end, statement.sql(dialect=read)))
+            span = _name_span(table)
+            if span is None:
+                _unparseable(
+                    "Spark SQL",
+                    ValueError(f"no source position for table {qualified!r}"),
+                    on_failure,
+                )
+                return sql
+            edits.append((*span, exp.to_table(target, dialect=read).sql(dialect=read)))
     if not edits:
         return sql
     logger.info(f"rewrite_sql: rewrote table references under dialect {read!r}")
