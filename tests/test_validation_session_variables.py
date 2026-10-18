@@ -498,6 +498,11 @@ def test_every_statement_the_rule_names_is_judged(sql, problems):
         "DROP VIEW IF EXISTS IDENTIFIER(session.OUT_VIEW);",
         # Spark's global temporary views.
         "SELECT * FROM global_temp.v;",
+        # A WORK view named through more than one variable, and a Spark
+        # setting: no permanent table either.
+        "DECLARE OR REPLACE VARIABLE REGION STRING DEFAULT 'east';\n"
+        "CREATE OR REPLACE TEMP VIEW IDENTIFIER(session.REGION || '_out') AS SELECT 1 AS a;",
+        "SET ansi_mode = true;",
     ],
 )
 def test_what_the_rule_allows_passes(sql):

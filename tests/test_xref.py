@@ -720,6 +720,9 @@ _ORDERS_ONLY = (
         # A value a query compares with, and a clause in function position.
         "SELECT table_name FROM system.information_schema.tables WHERE table_schema = session.MART_PREFIX;",
         "SELECT IDENTIFIER(session.MART_PREFIX || '.f')(1);",
+        # A clause in a statement sqlglot falls back to a command for only
+        # after masking, so its text carries the clause's placeholder.
+        "CREATE TABLE IDENTIFIER(session.MART_PREFIX || '.orders_copy') DEEP CLONE src;",
     ],
 )
 def test_sql_a_prefix_read_another_way_keeps_its_value(reader):
@@ -736,6 +739,16 @@ def test_sql_a_prefix_read_another_way_keeps_its_value(reader):
         ).replace("CONCAT(session.MART_PREFIX, '.orders')", "CONCAT(session.PROD_MART_PREFIX, '.orders')")
     ]
     assert remapped == ["mart.orders"]
+
+
+def test_raw_text_that_does_not_tokenize_still_keeps_the_prefixes_it_names():
+    from sqlglot import exp
+
+    prefix = rewrite._Prefix(0, "MART_PREFIX", exp.Literal.string("c.mart"), "c", "mart")
+    run = rewrite._VariableRewrite([], {}, "databricks")
+    unclosed = "IMMEDIATE CONCAT('OPTIMIZE ', session.MART_PREFIX, '.t"
+    run._pin_text(unclosed, rewrite._Cell("", {}, []), {"MART_PREFIX": prefix})
+    assert prefix.pinned
 
 
 _TWO_LIBRARIES = (
