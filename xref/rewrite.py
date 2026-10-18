@@ -684,8 +684,14 @@ class _VariableRewrite:
             f"DECLARE OR REPLACE VARIABLE {name} STRING DEFAULT "
             f"{_literal('.'.join(home), self.read)};"
         )
-        text = f"\n{declare}" if ended else f";\n{declare}"
-        cell.edits.append((offset, offset, text))
+        if not ended:
+            # The cell ends without a semicolon: end the statement (one edit,
+            # however many prefixes follow it), keeping any comment after it
+            # with it, and start the new DECLARE on a line of its own.
+            cell.edits.append((offset, offset, ";"))
+            if cell.masked[offset:].strip():
+                offset = len(cell.masked)
+        cell.edits.append((offset, offset, f"\n{declare}"))
         self.added.append((*home, prefix.cell, offset, name))
         self.declared.add(name)
         return name
@@ -945,11 +951,12 @@ def _offsetter(source: str):
 
 
 def _without_overlaps(edits: list[tuple[int, int, str]]) -> list[tuple[int, int, str]] | None:
-    """*edits* with each repeated one kept once, or ``None`` when two of them
-    change overlapping text, which applying both would corrupt. Insertions at
-    one offset do not overlap; they are applied in a fixed order."""
-    unique = sorted(set(edits))
-    for (_, end, _), (start, _, _) in zip(unique, unique[1:]):
+    """*edits* with each repeated one kept once, in the order made, or
+    ``None`` when two of them change overlapping text, which applying both
+    would corrupt. Insertions at one offset do not overlap."""
+    unique = list(dict.fromkeys(edits))
+    spans = sorted((start, end) for start, end, _ in unique)
+    for (_, end), (start, _) in zip(spans, spans[1:]):
         if start < end:
             return None
     return unique
@@ -959,13 +966,15 @@ def _apply_edits(source: str, edits: list[tuple[int, int, str]]) -> str:
     """*source* with each ``(start, end, replacement)`` span substituted.
 
     Applied back-to-front so an earlier span's offsets are still valid when it
-    is reached. Everything outside the listed spans — comments, formatting,
-    quoting — comes through byte-identical, which is what makes this module's
-    hard rule (leave unparseable input alone) worth anything: a rewrite that
+    is reached; insertions at one offset land in the order they were made.
+    Everything outside the listed spans — comments, formatting, quoting —
+    comes through byte-identical, which is what makes this module's hard rule
+    (leave unparseable input alone) worth anything: a rewrite that
     reformatted would be indistinguishable from a corruption.
     """
     out = source
-    for start, end, replacement in sorted(edits, reverse=True):
+    ordered = sorted(enumerate(edits), key=lambda item: (item[1][0], item[1][1], item[0]))
+    for _, (start, end, replacement) in reversed(ordered):
         out = out[:start] + replacement + out[end:]
     return out
 
