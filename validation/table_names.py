@@ -20,7 +20,10 @@ order, and judges each table reference the convention covers:
   is declared earlier in the answer, and when it is one variable, that
   variable's value is built from another (its library's prefix) rather than
   being a literal name;
-- a literal qualified name (``main.sales.orders``, ``mart.orders``) fails;
+- a literal qualified name (``main.sales.orders``, ``mart.orders``) fails,
+  in the query a variable's value reads (``SET VAR n = (SELECT ...)``) too;
+- ``SET x = ...`` without ``VAR`` gives a session variable no value — Spark
+  rejects it — and fails;
 - an unqualified literal written as a permanent table fails — the target of
   CREATE TABLE (or a view that is not temporary), INSERT, MERGE, UPDATE,
   DELETE, COPY INTO, DROP TABLE, TRUNCATE or ALTER;
@@ -235,10 +238,9 @@ class _Answer:
                 names = item.this if isinstance(item.this, list) else [item.this]
                 # sqlglot keeps `default=False` for a DECLARE with none.
                 default = item.args.get("default")
-                self.declare(
-                    map(_declared_name, names),
-                    default if isinstance(default, exp.Expr) else None,
-                )
+                value = default if isinstance(default, exp.Expr) else None
+                self._reads(value)
+                self.declare(map(_declared_name, names), value)
             return
         if isinstance(statement, exp.Command):
             self._command(statement.name.upper(), _command_text(statement))
@@ -246,8 +248,19 @@ class _Answer:
         if isinstance(statement, exp.Set):
             for item in statement.expressions:
                 eq = item.this
-                if isinstance(eq, exp.EQ) and (name := _variable(eq.this)):
+                if not (isinstance(eq, exp.EQ) and (name := _variable(eq.this))):
+                    continue
+                if item.args.get("kind") == "VARIABLE":
+                    self._reads(eq.expression)
                     self.set(name, eq.expression)
+                elif name in self.values:
+                    # Spark refuses `SET x = ...` on a session variable
+                    # (UNSUPPORTED_FEATURE.SET_VARIABLE_USING_SET): no value.
+                    self.result.checked += 1
+                    self._problem(
+                        f"`SET {name} = ...` without VAR does not assign the session "
+                        f"variable, which Spark rejects: write SET VAR {name} = ..."
+                    )
             return
         if _kind(statement) == "FUNCTION":
             self._function(statement)
@@ -287,6 +300,15 @@ class _Answer:
                 temp_view_ok=not creates_table,
                 where=where,
             )
+
+    def _reads(self, value: object) -> None:
+        """Judge the tables a variable's value reads (``SET VAR n = (SELECT
+        ... FROM t)``), before the variable takes it."""
+        from sqlglot import exp
+
+        if isinstance(value, exp.Expr):
+            for table in value.find_all(exp.Table):
+                self._table(table, writes=False)
 
     def _persisted_read(self, table: exp.Table, body: str, statement: str) -> None:
         self.result.checked += 1

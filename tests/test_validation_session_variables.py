@@ -400,6 +400,28 @@ _VARS = "DECLARE OR REPLACE VARIABLE LIB_PREFIX STRING DEFAULT 'catalog_name.lib
             "CREATE OR REPLACE FUNCTION f() RETURNS TABLE (a INT) RETURN SELECT * FROM main.mart.t;",
             ["hard-coded table name `main.mart.t`"],
         ),
+        # The tables a variable's value reads.
+        (
+            "DECLARE OR REPLACE VARIABLE MAX_DT DATE;\n"
+            "SET VAR MAX_DT = (SELECT MAX(dt) FROM main.mart.t);",
+            ["hard-coded table name `main.mart.t`"],
+        ),
+        (
+            "DECLARE OR REPLACE VARIABLE N INT DEFAULT (SELECT COUNT(*) FROM main.mart.t);",
+            ["hard-coded table name `main.mart.t`"],
+        ),
+        (
+            "DECLARE OR REPLACE VARIABLE N INT;\n"
+            "SET VAR N = (SELECT COUNT(*) FROM IDENTIFIER(session.T));",
+            ["`session.T` is not declared"],
+        ),
+        # SET without VAR on a variable is rejected by Spark, so it gives none.
+        (
+            _VARS + "DECLARE OR REPLACE VARIABLE T STRING;\n"
+            "SET T = CONCAT(session.LIB_PREFIX, '.t');\n"
+            "SELECT * FROM IDENTIFIER(session.T);",
+            ["`SET T = ...` without VAR", "`T` is never given a value"],
+        ),
     ],
 )
 def test_every_statement_the_rule_names_is_judged(sql, problems):
@@ -429,6 +451,9 @@ def test_every_statement_the_rule_names_is_judged(sql, problems):
         "DECLARE OR REPLACE VARIABLE STMT STRING;\n"
         "SET VAR STMT = CONCAT('OPTIMIZE ', session.OLD, ' FULL');\n"
         "EXECUTE IMMEDIATE STMT;",
+        # A variable read from a table through its own variable.
+        _VARS + "DECLARE OR REPLACE VARIABLE N INT;\n"
+        "SET VAR N = (SELECT COUNT(*) FROM IDENTIFIER(session.OLD));",
     ],
 )
 def test_what_the_rule_allows_passes(sql):

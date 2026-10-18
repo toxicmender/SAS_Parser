@@ -312,7 +312,11 @@ CREATE OR REPLACE TABLE IDENTIFIER(session.DEMO_TABLE) AS SELECT ...;
     `CREATE TABLE ... DEEP CLONE`, `MSCK REPAIR TABLE`, and others naming a
     `TABLE`;
   - `IDENTIFIER('a.b.c')`;
-  - a variable used before it is declared, or never given a value;
+  - a variable used before it is declared, or never given a value. A
+    `SET x = ...` without `VAR` gives none (Spark rejects it on a variable)
+    and is reported itself;
+  - any of these in the query a variable's value reads
+    (`SET VAR n = (SELECT ... FROM t)`, a `DECLARE ... DEFAULT (SELECT ...)`);
   - a permanent write (CREATE TABLE, INSERT, MERGE, UPDATE, DELETE, COPY INTO,
     DROP TABLE, …) to an unqualified literal name — a `CREATE TABLE` too when
     a temporary view already has that name;
