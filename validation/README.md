@@ -304,22 +304,29 @@ CREATE OR REPLACE TABLE IDENTIFIER(session.DEMO_TABLE) AS SELECT ...;
 
 - **Passes:** an `IDENTIFIER(...)` whose variables are declared earlier in the
   same answer. When the clause is a single variable, that variable must be
-  built from another variable, its library's prefix.
+  built from another variable, its library's prefix. A qualified
+  `DECLARE ... session.x` (or `VAR session.x`) declares `x`.
 - **Fails:**
-  - a literal `catalog.schema.table` or `lib.table`;
+  - a literal `catalog.schema.table` or `lib.table`, including in statements
+    sqlglot reads only as commands: `OPTIMIZE`, `VACUUM`,
+    `CREATE TABLE ... DEEP CLONE`, `MSCK REPAIR TABLE`, and others naming a
+    `TABLE`;
   - `IDENTIFIER('a.b.c')`;
   - a variable used before it is declared, or never given a value;
   - a permanent write (CREATE TABLE, INSERT, MERGE, UPDATE, DELETE, COPY INTO,
-    DROP TABLE, …) to an unqualified literal name;
-  - a stored view whose query reads a session variable. Databricks keeps a
-    stored view's text, which may not read one, so such a view is created
-    through `EXECUTE IMMEDIATE`;
-  - a hard-coded name in OPTIMIZE or VACUUM, which sqlglot reads only as
-    commands.
-- **Ignored:** temporary views and CTEs, `read_files`, `system` and
-  `information_schema`, and ``delta.`/path` `` file reads. So is the text an
-  `EXECUTE IMMEDIATE` runs: it is a string, so a name hard-coded inside it is
-  not caught.
+    DROP TABLE, …) to an unqualified literal name — a `CREATE TABLE` too when
+    a temporary view already has that name;
+  - an `IDENTIFIER(...)` where Databricks takes none: `OPTIMIZE`, `VACUUM`,
+    the new name of `RENAME TO`, a `CLONE` source. Those statements are built
+    from the variables and run through `EXECUTE IMMEDIATE`;
+  - a stored view's query (`CREATE VIEW` or `ALTER VIEW ... AS`) or a
+    persisted SQL function's body that reads a session variable. Databricks
+    keeps that text, which may not read one, so it too is created through
+    `EXECUTE IMMEDIATE`.
+- **Ignored:** temporary views and CTEs, a temporary view's or function's
+  body, `read_files`, `system` and `information_schema`, and
+  ``delta.`/path` `` file reads. So is the text an `EXECUTE IMMEDIATE` runs:
+  it is a string, so a name hard-coded inside it is not caught.
 
 The score is the share of permanent-table references that pass. `details`
 lists what fails, which is what the retry note quotes to the model. An answer

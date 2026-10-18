@@ -340,6 +340,99 @@ def test_check_table_names_reads_blocks_in_order():
     assert (found.checked, len(found.problems), found.unparsed) == (1, 1, 0)
 
 
+# ── statements the rule names ───────────────────────────────────────────────
+
+_VARS = "DECLARE OR REPLACE VARIABLE LIB_PREFIX STRING DEFAULT 'catalog_name.lib';\n" + "".join(
+    f"DECLARE OR REPLACE VARIABLE {v} STRING DEFAULT CONCAT(session.LIB_PREFIX, '.{v.lower()}');\n"
+    for v in ("OLD", "NEW", "V", "B")
+)
+
+
+@pytest.mark.parametrize(
+    "sql, problems",
+    [
+        # Statements sqlglot reads only as commands still name tables.
+        (
+            "CREATE TABLE main.mart.y DEEP CLONE main.stage.x;",
+            [
+                "hard-coded table name `main.mart.y`: declare it as a session variable",
+                "hard-coded table name `main.stage.x`: build the statement",
+            ],
+        ),
+        ("MSCK REPAIR TABLE main.mart.t;", ["hard-coded table name `main.mart.t`"]),
+        ("OPTIMIZE `main`.`mart`.`orders` FULL;", ["hard-coded table name `main.mart.orders`: build"]),
+        # The places the rule says take no IDENTIFIER clause.
+        (_VARS + "OPTIMIZE IDENTIFIER(session.OLD) FULL;", ["OPTIMIZE takes no IDENTIFIER"]),
+        (_VARS + "VACUUM IDENTIFIER(session.OLD);", ["VACUUM takes no IDENTIFIER"]),
+        (
+            _VARS + "ALTER TABLE IDENTIFIER(session.OLD) RENAME TO IDENTIFIER(session.NEW);",
+            ["the new name of RENAME TO takes no IDENTIFIER"],
+        ),
+        (
+            _VARS + "ALTER TABLE IDENTIFIER(session.OLD) RENAME TO new_t;",
+            ["`new_t` is written as a permanent table by a literal name: build the statement"],
+        ),
+        (
+            _VARS + "CREATE TABLE IDENTIFIER(session.NEW) SHALLOW CLONE IDENTIFIER(session.OLD);",
+            ["a CLONE source takes no IDENTIFIER"],
+        ),
+        (
+            _VARS + "CREATE TABLE IDENTIFIER(session.NEW) DEEP CLONE IDENTIFIER(session.OLD);",
+            ["a CLONE source takes no IDENTIFIER"],
+        ),
+        # A permanent table named like a WORK dataset is still permanent.
+        (
+            "CREATE OR REPLACE TEMP VIEW orders AS SELECT 1 AS a;\n"
+            "CREATE OR REPLACE TABLE orders AS SELECT * FROM orders;",
+            ["`orders` is written as a permanent table by a literal name"],
+        ),
+        # Bodies Databricks persists may not read a session variable.
+        (
+            _VARS + "ALTER VIEW IDENTIFIER(session.V) AS SELECT * FROM IDENTIFIER(session.B);",
+            ["a stored view's query reads IDENTIFIER(session.B)"],
+        ),
+        (
+            _VARS + "CREATE OR REPLACE FUNCTION f() RETURNS TABLE (a INT) "
+            "RETURN SELECT * FROM IDENTIFIER(session.B);",
+            ["a SQL function's body reads IDENTIFIER(session.B)"],
+        ),
+        (
+            "CREATE OR REPLACE FUNCTION f() RETURNS TABLE (a INT) RETURN SELECT * FROM main.mart.t;",
+            ["hard-coded table name `main.mart.t`"],
+        ),
+    ],
+)
+def test_every_statement_the_rule_names_is_judged(sql, problems):
+    found = check_table_names([sql])
+    assert len(found.problems) == len(problems)
+    for problem, expected in zip(found.problems, problems):
+        assert problem.startswith(expected)
+    assert found.checked >= len(problems)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # A temporary view's or function's body may read a session variable.
+        _VARS + "CREATE OR REPLACE TEMP VIEW t AS SELECT * FROM IDENTIFIER(session.B);\n"
+        "ALTER VIEW t AS SELECT * FROM IDENTIFIER(session.V);",
+        _VARS + "CREATE TEMPORARY FUNCTION f() RETURNS TABLE (a INT) "
+        "RETURN SELECT * FROM IDENTIFIER(session.B);",
+        # Dropping a WORK dataset is no permanent write.
+        "CREATE OR REPLACE TEMP VIEW orders AS SELECT 1 AS a;\nDROP TABLE IF EXISTS orders;",
+        # A path read in place is a file.
+        "VACUUM delta.`/Volumes/c/s/v/t`;",
+        # The forms the rule asks for.
+        _VARS + "ALTER TABLE IDENTIFIER(session.OLD) CLUSTER BY (a);\n"
+        "DECLARE OR REPLACE VARIABLE STMT STRING;\n"
+        "SET VAR STMT = CONCAT('OPTIMIZE ', session.OLD, ' FULL');\n"
+        "EXECUTE IMMEDIATE STMT;",
+    ],
+)
+def test_what_the_rule_allows_passes(sql):
+    assert check_table_names([sql]).problems == []
+
+
 # ── edges of the reading ─────────────────────────────────────────────────────
 
 _PREFIX = "DECLARE OR REPLACE VARIABLE MART_PREFIX STRING DEFAULT 'catalog_name.mart';\n"
