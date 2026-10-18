@@ -46,15 +46,24 @@ from __future__ import annotations
 import ast
 import logging
 import re
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import app_config
-from target_language import SPARKSQL, mask_identifier_clauses, restore_identifier_clauses
+from target_language import (
+    SPARKSQL,
+    mask_identifier_clauses,
+    restore_identifier_clauses,
+    session_variable,
+    unqualify_declared_names,
+)
 
 from .mapping import map_path, ordered_keys
 
 if TYPE_CHECKING:  # sqlglot is imported where a parse needs it
     from sqlglot import exp
+    from sqlglot.tokenizer_core import Token
 
 logger = logging.getLogger(__name__)
 
@@ -141,8 +150,8 @@ def _unparseable(what: str, exc: Exception, mode: str | None) -> None:
     logger.warning(f"rewrite: {message}")
 
 
-def _lookup(name: str, mapping: dict[str, str]) -> str | None:
-    """The target for a table name, matched case-insensitively.
+def _match(name: str, mapping: dict[str, str]) -> tuple[str, str] | None:
+    """The mapping key a table name matches, and its target, case-insensitively.
 
     Both the qualified name (``schema.table``) and the bare table name are
     tried, in that order: a mapping is written against the SAS-side
@@ -151,11 +160,17 @@ def _lookup(name: str, mapping: dict[str, str]) -> str | None:
     lowered = name.strip().lower()
     hit = mapping.get(lowered)
     if hit is not None:
-        return hit
+        return lowered, hit
     _, dot, bare = lowered.rpartition(".")
-    if dot and bare:
-        return mapping.get(bare)
+    if dot and bare and (hit := mapping.get(bare)) is not None:
+        return bare, hit
     return None
+
+
+def _lookup(name: str, mapping: dict[str, str]) -> str | None:
+    """The target for a table name (see :func:`_match`)."""
+    hit = _match(name, mapping)
+    return hit[1] if hit else None
 
 
 def _name_span(table: exp.Table) -> tuple[int, int] | None:
@@ -177,46 +192,433 @@ def _name_span(table: exp.Table) -> tuple[int, int] | None:
     return parts[0].meta["start"], parts[-1].meta["end"] + 1
 
 
-def rewrite_sql(
-    sql: str, mapping: dict[str, str], *, on_failure: str | None = None
-) -> str:
-    """
-    *sql* with every mapped table reference rewritten to its target.
+@dataclass
+class _Cell:
+    """One SQL cell as the rewrite reads it: masked, parsed, and the edits
+    gathered for it."""
 
-    Returns *sql* unchanged when it does not parse, when ``sqlglot`` is not
-    installed, or when nothing matched. Each mapped name is replaced where it
-    stands in the source, so nothing is regenerated: every other byte comes
-    through as written — the spelling of a ``DECLARE OR REPLACE VARIABLE``,
-    comments, a placeholder in function position, and the SQL scripting
-    blocks sqlglot reads but cannot write back (``WHILE ... DO``). An
-    IDENTIFIER clause (``CREATE TABLE IDENTIFIER(session.t) AS ...``) is
-    masked for the parse and comes back as written: the name it computes is a
-    session variable's value, set where the variable is declared.
+    masked: str
+    identifiers: dict[str, str]
+    statements: list[exp.Expr]
+    edits: list[tuple[int, int, str]] = field(default_factory=list)
+    tokens: list[Token] | None = None
+
+
+@dataclass
+class _Dependent:
+    """A table name built from a prefix, ``CONCAT(session.P, '.member')``.
+
+    ``column`` and ``suffix`` are the ``session.P`` reference and the
+    ``'.member'`` literal; both are ``None`` for a name built inside an
+    IDENTIFIER clause, which the rewrite cannot reach.
     """
-    if not mapping or not sql.strip():
-        return sql
-    try:
+
+    cell: int
+    column: exp.Column | None
+    suffix: exp.Literal | None
+    member: str
+    key: str | None
+    target: tuple[str, str, str] | None
+
+
+@dataclass
+class _Prefix:
+    """A session variable given ``'catalog.schema'``: the prefix the names of
+    a library's tables are built from."""
+
+    cell: int
+    name: str
+    literal: exp.Literal
+    catalog: str
+    schema: str
+    dependents: list[_Dependent] = field(default_factory=list)
+    # Something other than CONCAT(session.P, '.member') reads the variable,
+    # so its value must stay where it is.
+    pinned: bool = False
+
+
+def _string_value(node: object) -> str | None:
+    """The text a string literal holds, or ``None``."""
+    from sqlglot import exp
+
+    if isinstance(node, exp.Literal) and node.is_string:
+        return node.this
+    return None
+
+
+def _evaluate(node: object, values: dict[str, str | None]) -> str | None:
+    """The string *node* builds from literals, session variables, ``CONCAT``
+    and ``||``, or ``None`` when any part of it is unknown."""
+    from sqlglot import exp
+
+    if (text := _string_value(node)) is not None:
+        return text
+    if isinstance(node, exp.Paren):
+        return _evaluate(node.this, values)
+    if isinstance(node, exp.Column):
+        return values.get(session_variable(node) or "")
+    if isinstance(node, exp.DPipe):
+        parts = [node.this, node.expression]
+    elif isinstance(node, exp.Concat):
+        parts = node.expressions
+    else:
+        return None
+    texts = [_evaluate(part, values) for part in parts]
+    return None if any(text is None for text in texts) else "".join(texts)  # type: ignore[arg-type]
+
+
+def _assignments(statement: exp.Expr) -> list[tuple[str, exp.Expr | None, bool]]:
+    """``(variable, value, shared)`` for each value *statement* gives a
+    session variable: a ``DECLARE``'s default, or a ``SET VAR``. ``shared``
+    marks a ``DECLARE a, b ... DEFAULT x``, whose one literal is two values."""
+    from sqlglot import exp
+
+    found: list[tuple[str, exp.Expr | None, bool]] = []
+    if isinstance(statement, exp.Declare):
+        for item in statement.expressions:
+            names = item.this if isinstance(item.this, list) else [item.this]
+            default = item.args.get("default")
+            value = default if isinstance(default, exp.Expr) else None
+            for name in names:
+                found.append((str(getattr(name, "name", name)).upper(), value, len(names) > 1))
+    elif (
+        isinstance(statement, exp.Set)
+        and statement.expressions
+        and statement.expressions[0].args.get("kind") == "VARIABLE"
+    ):
+        for item in statement.expressions:
+            eq = item.this
+            if isinstance(eq, exp.EQ) and (name := session_variable(eq.this)):
+                found.append((name, eq.expression, False))
+    return found
+
+
+def _built_from_prefix(
+    value: object, prefix_of: dict[str, _Prefix]
+) -> tuple[_Prefix, exp.Column, exp.Literal, str] | None:
+    """``(prefix, column, suffix, member)`` when *value* is
+    ``CONCAT(session.P, '.member')`` or ``session.P || '.member'`` and ``P``
+    holds a prefix."""
+    from sqlglot import exp
+
+    if isinstance(value, exp.Concat) and len(value.expressions) == 2:
+        column, suffix = value.expressions
+    elif isinstance(value, exp.DPipe):
+        column, suffix = value.this, value.expression
+    else:
+        return None
+    member = _string_value(suffix)
+    if not isinstance(column, exp.Column) or not isinstance(suffix, exp.Literal) or member is None:
+        return None
+    prefix = prefix_of.get(session_variable(column) or "")
+    if prefix is None or not member.startswith(".") or "." in member[1:] or len(member) < 2:
+        return None
+    return prefix, column, suffix, member[1:]
+
+
+def _literal(text: str, read: str) -> str:
+    from sqlglot import exp
+
+    return exp.Literal.string(text).sql(dialect=read)
+
+
+def _span(node: exp.Expr) -> tuple[int, int] | None:
+    """Where a parsed identifier or literal stands in the source, end
+    exclusive, or ``None`` when sqlglot recorded no position."""
+    meta = node.meta
+    return (meta["start"], meta["end"] + 1) if "start" in meta else None
+
+
+class _VariableRewrite:
+    """The edits that move table names held in session variables to their
+    mapped targets, across one item's SQL cells in the order they run.
+
+    Each variable's value is evaluated as the item runs. A table variable
+    built as ``CONCAT(session.P, '.member')`` from a prefix ``P`` holding
+    ``'catalog.schema'`` is looked up as ``schema.member``. Then, per prefix:
+
+    * every table built from it mapped to one ``catalog.schema``, and nothing
+      else reading it: the prefix's own literal changes;
+    * otherwise each mapped group gets a prefix of its own — an existing one
+      holding that ``catalog.schema`` where one is declared first, or a new
+      ``<SCHEMA>_PREFIX`` declared right after the original — and the group's
+      tables are re-pointed to it;
+    * a mapping that renames the table rewrites its ``'.member'`` literal.
+
+    A table variable holding a literal ``'catalog.schema.table'`` gets the
+    target literal. A mapped name built any other way — inside an IDENTIFIER
+    clause, or from more than a prefix and a member — is reported, not
+    rewritten.
+    """
+
+    def __init__(self, cells: list[_Cell | None], mapping: dict[str, str], read: str) -> None:
+        self.cells = cells
+        self.mapping = mapping
+        self.read = read
+        self.prefixes: list[_Prefix] = []
+        self.declared: set[str] = set()
+        self.remapped: set[str] = set()
+        # New prefixes declared by this rewrite: (catalog, schema, cell, offset, name).
+        self.added: list[tuple[str, str, int, int, str]] = []
+
+    def run(self) -> list[str]:
+        values: dict[str, str | None] = {}
+        prefix_of: dict[str, _Prefix] = {}
+        for index, cell in enumerate(self.cells):
+            if cell is None:
+                continue
+            for statement in cell.statements:
+                for name, value, shared in _assignments(statement):
+                    self.declared.add(name)
+                    prefix_of.pop(name, None)
+                    text = _evaluate(value, values)
+                    self._assign(index, name, value, text, shared, prefix_of)
+                    values[name] = text
+                self._inline(index, cell, statement, values, prefix_of)
+        for prefix in self.prefixes:
+            self._settle(prefix)
+        return sorted(self.remapped)
+
+    # ── reading ─────────────────────────────────────────────────────────────
+
+    def _assign(
+        self,
+        index: int,
+        name: str,
+        value: exp.Expr | None,
+        text: str | None,
+        shared: bool,
+        prefix_of: dict[str, _Prefix],
+    ) -> None:
+        from sqlglot import exp
+
+        built = _built_from_prefix(value, prefix_of)
+        if built is not None:
+            prefix, column, suffix, member = built
+            prefix.dependents.append(self._dependent(index, column, suffix, prefix, member))
+            return
+        if isinstance(value, exp.Expr):
+            for column in value.find_all(exp.Column):
+                if (prefix := prefix_of.get(session_variable(column) or "")) is not None:
+                    prefix.pinned = True
+        literal = value if _string_value(value) is not None else None
+        if literal is not None and text is not None and text.count(".") == 1 and not shared:
+            catalog, schema = text.split(".")
+            prefix = _Prefix(index, name, literal, catalog, schema)  # type: ignore[arg-type]
+            self.prefixes.append(prefix)
+            prefix_of[name] = prefix
+        elif text is not None and text.count(".") == 2:
+            self._whole_name(index, literal if not shared else None, text, name)
+
+    def _inline(
+        self,
+        index: int,
+        cell: _Cell,
+        statement: exp.Expr,
+        values: dict[str, str | None],
+        prefix_of: dict[str, _Prefix],
+    ) -> None:
+        """Names built inside the statement's IDENTIFIER clauses."""
         import sqlglot
         from sqlglot import exp
-    except ImportError:
-        logger.warning(
-            "rewrite_sql: sqlglot is not installed, so the post-conversion "
-            "XREF rewrite cannot run; install the 'sql' extra "
-            "('pip install \"sas-parser[sql]\"'). The code is unchanged"
-        )
-        return sql
 
-    read = SPARKSQL.sqlglot_dialect or "databricks"
+        for table in statement.find_all(exp.Table):
+            clause = cell.identifiers.get(table.name)
+            if clause is None:
+                continue
+            try:
+                inner = sqlglot.parse_one(clause[clause.index("(") + 1 : clause.rindex(")")], read=self.read)
+            except Exception:  # sqlglot raises several unrelated types
+                continue
+            if session_variable(inner) is not None:
+                continue  # IDENTIFIER(session.T): T's own value is rewritten
+            built = _built_from_prefix(inner, prefix_of)
+            if built is not None:
+                prefix, _, _, member = built
+                prefix.dependents.append(self._dependent(index, None, None, prefix, member))
+            elif (text := _evaluate(inner, values)) is not None and text.count(".") == 2:
+                self._whole_name(index, None, text, clause)
+
+    def _dependent(
+        self,
+        index: int,
+        column: exp.Column | None,
+        suffix: exp.Literal | None,
+        prefix: _Prefix,
+        member: str,
+    ) -> _Dependent:
+        hit = _match(f"{prefix.schema}.{member}", self.mapping)
+        if hit is None:
+            return _Dependent(index, column, suffix, member, None, None)
+        key, target = hit
+        parts = target.split(".")
+        if len(parts) != 3:
+            logger.warning(
+                f"rewrite_sql: {key!r} maps to {target!r}, which is not "
+                f"catalog.schema.table; the session variable that builds it "
+                f"is left as written"
+            )
+            return _Dependent(index, column, suffix, member, None, None)
+        return _Dependent(index, column, suffix, member, key, (parts[0], parts[1], parts[2]))
+
+    def _whole_name(self, index: int, literal: exp.Expr | None, text: str, holder: str) -> None:
+        """A table name held whole: rewrite its literal, or report it."""
+        hit = _match(text.split(".", 1)[1], self.mapping)
+        if hit is None:
+            return
+        key, target = hit
+        if target.lower() == text.lower():
+            return
+        cell = self.cells[index]
+        span = _span(literal) if literal is not None else None
+        if cell is None or span is None:
+            logger.warning(
+                f"rewrite_sql: {text!r} maps to {target!r}, but {holder} builds "
+                f"it in a way the post rewrite does not change; left as written"
+            )
+            return
+        cell.edits.append((*span, _literal(target, self.read)))
+        self.remapped.add(key)
+
+    # ── rewriting ───────────────────────────────────────────────────────────
+
+    def _settle(self, prefix: _Prefix) -> None:
+        mapped = [d for d in prefix.dependents if d.target is not None]
+        if not mapped:
+            return
+        homes = sorted({(d.target[0], d.target[1]) for d in mapped if d.target})
+        moves_whole = (
+            not prefix.pinned
+            and len(homes) == 1
+            and all(d.target is not None for d in prefix.dependents)
+            and all(d.column is not None or (d.target and d.target[2] == d.member) for d in mapped)
+        )
+        if moves_whole:
+            moved = homes[0] != (prefix.catalog, prefix.schema)
+            if moved:
+                self._edit_literal(prefix.cell, prefix.literal, ".".join(homes[0]))
+            for dependent in mapped:
+                self._rename_member(dependent, moved=moved)
+            return
+        for home in homes:
+            group = [d for d in mapped if d.target and (d.target[0], d.target[1]) == home]
+            editable = [d for d in group if d.column is not None]
+            for dependent in group:
+                if dependent.column is None:
+                    logger.warning(
+                        f"rewrite_sql: {dependent.key!r} maps to "
+                        f"{'.'.join(dependent.target or ())!r}, but its name is built "
+                        f"inside an IDENTIFIER clause, which the post rewrite does not "
+                        f"change; left as written"
+                    )
+            if not editable:
+                continue
+            moved = home != (prefix.catalog, prefix.schema)
+            if moved:
+                name = self._prefix_for(home, prefix, editable)
+                for dependent in editable:
+                    column = dependent.column
+                    span = _span(column.this) if column is not None else None
+                    if span is not None:
+                        self._edit(dependent.cell, span, name)
+            for dependent in editable:
+                self._rename_member(dependent, moved=moved)
+
+    def _rename_member(self, dependent: _Dependent, *, moved: bool) -> None:
+        """Rewrite the ``'.member'`` a mapping renames, and count the name as
+        remapped when it moved or was renamed."""
+        if dependent.target is None or dependent.key is None:
+            return
+        renamed = dependent.target[2] != dependent.member and dependent.suffix is not None
+        if renamed and dependent.suffix is not None:
+            self._edit_literal(dependent.cell, dependent.suffix, f".{dependent.target[2]}")
+        if moved or renamed:
+            self.remapped.add(dependent.key)
+
+    def _prefix_for(self, home: tuple[str, str], prefix: _Prefix, group: list[_Dependent]) -> str:
+        """The prefix variable *group* is re-pointed to: one already holding
+        *home* and declared before the group, or a new one."""
+        first = min(
+            (d.cell, d.column.this.meta.get("start", 0) if d.column else 0) for d in group
+        )
+        for other in self.prefixes:
+            position = (other.cell, other.literal.meta.get("start", 0))
+            if (other.catalog, other.schema) == home and position < first:
+                return other.name
+        for catalog, schema, cell, offset, name in self.added:
+            if (catalog, schema) == home and (cell, offset) < first:
+                return name
+        name = self._new_name(home)
+        cell = self.cells[prefix.cell]
+        assert cell is not None
+        offset = self._statement_end(cell, prefix.literal)
+        declare = (
+            f"DECLARE OR REPLACE VARIABLE {name} STRING DEFAULT "
+            f"{_literal('.'.join(home), self.read)};"
+        )
+        if offset is None:
+            offset, text = len(cell.masked), f";\n{declare}"
+        else:
+            text = f"\n{declare}"
+        cell.edits.append((offset, offset, text))
+        self.added.append((*home, prefix.cell, offset, name))
+        self.declared.add(name)
+        return name
+
+    def _new_name(self, home: tuple[str, str]) -> str:
+        catalog, schema = (re.sub(r"\W+", "_", part).upper() for part in home)
+        for name in (f"{schema}_PREFIX", f"{catalog}_{schema}_PREFIX"):
+            if name not in self.declared:
+                return name
+        n = 2
+        while f"{catalog}_{schema}_PREFIX_{n}" in self.declared:
+            n += 1
+        return f"{catalog}_{schema}_PREFIX_{n}"
+
+    def _statement_end(self, cell: _Cell, literal: exp.Expr) -> int | None:
+        """Just past the semicolon ending the statement that holds *literal*,
+        or ``None`` when the cell ends first."""
+        from sqlglot.dialects.dialect import Dialect
+
+        if cell.tokens is None:
+            cell.tokens = Dialect.get_or_raise(self.read).tokenize(cell.masked)
+        after = literal.meta.get("end", 0)
+        for token in cell.tokens:
+            if token.token_type.name == "SEMICOLON" and token.start > after:
+                return token.end + 1
+        return None
+
+    def _edit_literal(self, index: int, literal: exp.Expr, text: str) -> None:
+        span = _span(literal)
+        if span is not None:
+            self._edit(index, span, _literal(text, self.read))
+
+    def _edit(self, index: int, span: tuple[int, int], text: str) -> None:
+        cell = self.cells[index]
+        if cell is not None:
+            cell.edits.append((*span, text))
+
+
+def _parse_cell(sql: str, read: str, on_failure: str | None) -> _Cell | None:
+    """*sql* masked and parsed, or ``None`` (reported) when it does not parse."""
+    import sqlglot
+
     masked, identifiers = mask_identifier_clauses(sql, read)
     try:
-        statements = sqlglot.parse(masked, read=read)
+        statements = sqlglot.parse(unqualify_declared_names(masked, read), read=read)
     except Exception as exc:  # sqlglot raises several unrelated types
         _unparseable("Spark SQL", exc, on_failure)
-        return sql
+        return None
+    return _Cell(masked, identifiers, [s for s in statements if s is not None])
 
-    edits: list[tuple[int, int, str]] = []
-    for statement in statements:
-        for table in statement.find_all(exp.Table) if statement else ():
+
+def _name_edits(cell: _Cell, mapping: dict[str, str], read: str, on_failure: str | None) -> bool:
+    """Gather the edits for every mapped table name *cell* writes out. False
+    (reported) when one has no recorded position, so the cell stays as is."""
+    from sqlglot import exp
+
+    for statement in cell.statements:
+        for table in statement.find_all(exp.Table):
             qualified = ".".join(
                 part.name for part in (table.args.get("db"), table.this) if part
             )
@@ -230,12 +632,78 @@ def rewrite_sql(
                     ValueError(f"no source position for table {qualified!r}"),
                     on_failure,
                 )
-                return sql
-            edits.append((*span, exp.to_table(target, dialect=read).sql(dialect=read)))
-    if not edits:
-        return sql
-    logger.info(f"rewrite_sql: rewrote table references under dialect {read!r}")
-    return restore_identifier_clauses(_apply_edits(masked, edits), identifiers)
+                return False
+            cell.edits.append((*span, exp.to_table(target, dialect=read).sql(dialect=read)))
+    return True
+
+
+def rewrite_sql_cells(
+    cells: Sequence[str], mapping: dict[str, str], *, on_failure: str | None = None
+) -> tuple[list[str], list[str]]:
+    """
+    One item's SQL *cells*, in the order they run, with every mapped table
+    name rewritten to its target — and the mapping keys of the names that
+    session variables held.
+
+    Two kinds of name are rewritten:
+
+    * **Names written out** (``FROM sales.orders``): each is replaced where
+      it stands in the source, so nothing is regenerated and every other
+      byte comes through as written — the spelling of a ``DECLARE``,
+      comments, a placeholder in function position, and the SQL scripting
+      blocks sqlglot reads but cannot write back (``WHILE ... DO``).
+    * **Names held in session variables**, the way the Spark SQL
+      instructions name permanent tables
+      (``DECLARE ... ORDERS STRING DEFAULT CONCAT(session.MART_PREFIX,
+      '.orders')`` then ``IDENTIFIER(session.ORDERS)``): see
+      :class:`_VariableRewrite`. The cells are read together because a
+      prefix declared in one can build the names of the next.
+
+    A cell that does not parse, or that has a mapped name without a recorded
+    position, is left exactly as written (``xref.on_parse_failure`` decides
+    whether that is a warning or an error); so are all cells when ``sqlglot``
+    is not installed.
+    """
+    out = list(cells)
+    if not mapping or not any(cell.strip() for cell in cells):
+        return out, []
+    try:
+        import sqlglot  # noqa: F401  (the import is the availability check)
+    except ImportError:
+        logger.warning(
+            "rewrite_sql: sqlglot is not installed, so the post-conversion "
+            "XREF rewrite cannot run; install the 'sql' extra "
+            "('pip install \"sas-parser[sql]\"'). The code is unchanged"
+        )
+        return out, []
+
+    read = default_dialect()
+    parsed = [_parse_cell(cell, read, on_failure) if cell.strip() else None for cell in cells]
+    for index, cell in enumerate(parsed):
+        if cell is not None and not _name_edits(cell, mapping, read, on_failure):
+            parsed[index] = None
+    remapped = _VariableRewrite(parsed, mapping, read).run()
+    for index, cell in enumerate(parsed):
+        if cell is not None and cell.edits:
+            out[index] = restore_identifier_clauses(
+                _apply_edits(cell.masked, cell.edits), cell.identifiers
+            )
+    if out != list(cells):
+        logger.info(f"rewrite_sql: rewrote table references under dialect {read!r}")
+    return out, remapped
+
+
+def rewrite_sql(
+    sql: str, mapping: dict[str, str], *, on_failure: str | None = None
+) -> str:
+    """
+    *sql* with every mapped table reference rewritten to its target: one cell
+    of :func:`rewrite_sql_cells`, which says what is rewritten and how.
+
+    Returns *sql* unchanged when it does not parse, when ``sqlglot`` is not
+    installed, or when nothing matched.
+    """
+    return rewrite_sql_cells([sql], mapping, on_failure=on_failure)[0][0]
 
 
 def _string_literal(node: ast.AST) -> tuple[ast.Constant, str] | None:

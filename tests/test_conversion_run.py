@@ -440,6 +440,41 @@ def test_post_rewrites_the_document_cells_the_notebook_is_built_from():
     assert cells[2]["source"] == "reads /data/in as before"
 
 
+def test_post_reads_a_session_variable_across_the_item_s_cells(caplog):
+    import logging
+
+    from xref.sourcing import XrefMappings
+
+    # The prefix is declared in the first cell and builds the table's name in
+    # the second: rewritten one cell at a time, neither would change.
+    document = {
+        "analysis": "",
+        "cells": [
+            {
+                "kind": "code",
+                "language": "sql",
+                "source": "DECLARE OR REPLACE VARIABLE MART_PREFIX STRING DEFAULT 'catalog_name.mart';",
+            },
+            {
+                "kind": "code",
+                "language": "sql",
+                "source": "DECLARE OR REPLACE VARIABLE ORDERS STRING "
+                "DEFAULT CONCAT(session.MART_PREFIX, '.orders');\n"
+                "SELECT * FROM IDENTIFIER(session.ORDERS);",
+            },
+        ],
+    }
+    mappings = XrefMappings(exact={"mart.orders": "prod.sales.orders"})
+    with caplog.at_level(logging.WARNING, logger="xref.apply"):
+        outputs, _ = _xref_run(_transport(), mappings, "both", document=document)
+
+    cells = outputs[0]["document"]["cells"]
+    assert cells[0]["source"].endswith("DEFAULT 'prod.sales';")
+    assert "CONCAT(session.MART_PREFIX, '.orders')" in cells[1]["source"]
+    # Under "both", a name only the post pass reached is reported.
+    assert "only reached by the post pass (mart.orders)" in caplog.text
+
+
 def test_a_cell_language_alias_resolves_like_any_other_target_name():
     # 'py' and 'databrickssql' are target_language aliases. The post pass reads
     # a cell tag through the same resolver the run uses, so a legitimate

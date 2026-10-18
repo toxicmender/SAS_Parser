@@ -44,10 +44,26 @@ clauses masked (`target_language.mask_identifier_clauses`) and gives the
 clauses back as written. It regenerates nothing: sqlglot records where every
 name stands, so `post` replaces each mapped name in place and every other
 byte — the `DECLARE OR REPLACE VARIABLE`s, comments, a `WHILE ... DO` block
-sqlglot cannot write back — comes through as written. The name a variable
-holds is set where it is declared, which `post` does not rewrite; `pre`
-reaches it, since the model declares the variables from the names `pre`
-already mapped.
+sqlglot cannot write back — comes through as written.
+
+The names the variables hold move too (`rewrite_sql_cells`). An item's SQL
+cells are read together, in order, since a prefix declared in one cell builds
+the names of the next. `post` evaluates each variable as the item would. A
+table variable built as `CONCAT(session.MART_PREFIX, '.orders')` from a prefix
+holding `'catalog_name.mart'` is looked up as `mart.orders`, and then:
+
+- every table built from the prefix maps to one `catalog.schema`, and nothing
+  else reads the prefix: the prefix's own literal changes;
+- otherwise each mapped group gets a prefix of its own — one already holding
+  that `catalog.schema`, or a new `<SCHEMA>_PREFIX` declared right after the
+  original — and its tables are re-pointed to it;
+- a mapping that renames the table rewrites the `'.orders'` literal;
+- a variable holding a literal `'catalog.schema.table'` gets the target.
+
+A mapped name built any other way — inside an IDENTIFIER clause, or from more
+than a prefix and a member — is logged and left as written. Under `both`,
+names held in variables are reported among those only `post` reached, since a
+target split across a prefix and a member never appears whole.
 
 Under `pre` and `both` the run also reports SAS paths that survived into the
 output unmapped — a location the notebook names that will not exist on the
