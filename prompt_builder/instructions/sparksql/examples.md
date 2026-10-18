@@ -136,22 +136,28 @@ run;
 
 Databricks SQL:
 ```sql
+DECLARE OR REPLACE VARIABLE MYLIB_PREFIX STRING DEFAULT 'catalog_name.mylib';
+DECLARE OR REPLACE VARIABLE ACCOUNTS STRING DEFAULT CONCAT(session.MYLIB_PREFIX, '.accounts');
+DECLARE OR REPLACE VARIABLE STMT STRING;
+
 -- work.* output: the ordered view names what the next step consumes.
 CREATE OR REPLACE TEMP VIEW txns_ord AS
 SELECT * FROM txns ORDER BY cust_id, txn_dt DESC;
 
 -- In-place sort of a permanent dataset: layout intent, not a view. The rows
 -- are unchanged, so declare the layout instead of rewriting them.
-ALTER TABLE main.mylib.accounts CLUSTER BY (acct_id);
-OPTIMIZE FULL main.mylib.accounts;
+ALTER TABLE IDENTIFIER(session.ACCOUNTS) CLUSTER BY (acct_id);
+SET VAR STMT = CONCAT('OPTIMIZE ', session.ACCOUNTS, ' FULL');
+EXECUTE IMMEDIATE STMT;
 ```
 Notes: `descending txn_dt` flips that column only. ⚠️ The view's `ORDER BY`
 orders the view, not whatever selects from it — a consumer that depends on the
 order must restate it. The second step has no `OUT=`, so input and output are
-the same permanent table: `CREATE OR REPLACE VIEW accounts AS SELECT * FROM
-accounts` would be self-referential, and `CLUSTER BY` is what "stored in
-`acct_id` order" means here. ⚠️ Clustering colocates rows for skipping; it does
-not make reads come back sorted.
+the same permanent table: a view over it would be self-referential, and
+`CLUSTER BY` is what "stored in `acct_id` order" means here. `OPTIMIZE` takes
+no `IDENTIFIER`, so it runs from the table's variable; its `FULL` needs Runtime
+16.0 or above. ⚠️ Clustering colocates rows for skipping; it does not make
+reads come back sorted.
 
 ## [example: proc:sort] PROC SORT NODUPKEY
 SAS:
@@ -202,3 +208,47 @@ Notes: the macro is a code generator, so the translation is what it
 ⚠️ If the argument list is not known at translation time, the expansion cannot
 be resolved; say so and either parameterise a single view on `region` or state
 the assumed list.
+
+## [example] [meta: permanent_tables] Permanent library tables through session variables
+SAS:
+```sas
+libname raw  '/sasdata/raw';
+libname mart '/sasdata/mart';
+
+data mart.customers;
+  set raw.customers;
+  where balance > 0;
+run;
+
+proc sql;
+  create table work.by_region as
+  select region, count(*) as n_customers
+  from mart.customers
+  group by region;
+quit;
+```
+
+Spark SQL:
+```sql
+-- One prefix per library: the libref is the schema; catalog_name is assumed.
+DECLARE OR REPLACE VARIABLE RAW_PREFIX STRING DEFAULT 'catalog_name.raw';
+DECLARE OR REPLACE VARIABLE MART_PREFIX STRING DEFAULT 'catalog_name.mart';
+-- Both libraries hold a `customers`, so each variable carries its libref.
+DECLARE OR REPLACE VARIABLE RAW_CUSTOMERS STRING DEFAULT CONCAT(session.RAW_PREFIX, '.customers');
+DECLARE OR REPLACE VARIABLE MART_CUSTOMERS STRING DEFAULT CONCAT(session.MART_PREFIX, '.customers');
+
+CREATE OR REPLACE TABLE IDENTIFIER(session.MART_CUSTOMERS) AS
+SELECT * FROM IDENTIFIER(session.RAW_CUSTOMERS)
+WHERE balance > 0;
+
+-- work.by_region stays a temporary view; it reads the table by its variable.
+CREATE OR REPLACE TEMP VIEW by_region AS
+SELECT region, COUNT(*) AS n_customers
+FROM IDENTIFIER(session.MART_CUSTOMERS)
+GROUP BY region;
+```
+Notes: the `LIBNAME` path does not survive — where a table lives is set by its
+library's prefix alone, so moving `mart` to another catalog is a one-line
+change. Mapping states the assumed catalog. ⚠️ No statement names
+`catalog_name.mart.customers` literally; even a one-off read goes through the
+variable.

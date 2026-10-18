@@ -4,10 +4,10 @@ translation rather than being dropped:
 
 - A variable label -> a **column** `COMMENT`, inline in the DDL
   (`amt DOUBLE COMMENT 'Transaction amount'`) or via
-  `ALTER TABLE t ALTER COLUMN amt COMMENT '...'`.
+  `ALTER TABLE IDENTIFIER(session.T) ALTER COLUMN amt COMMENT '...'`.
 - A dataset label (`data work.x (label='...')`, or `PROC DATASETS ... MODIFY`)
-  -> a **table** `COMMENT`, inline (`CREATE TABLE t (...) COMMENT '...'`) or
-  `COMMENT ON TABLE t IS '...'`.
+  -> a **table** `COMMENT`, inline (`CREATE TABLE IDENTIFIER(session.T) (...)
+  COMMENT '...'`) or `COMMENT ON TABLE IDENTIFIER(session.T) IS '...'`.
 
 A label only reaches a table, so a step whose output is a `TEMP VIEW` has
 nowhere to put one — carry it as a `--` comment in the SQL instead, and say so.

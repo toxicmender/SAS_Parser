@@ -507,10 +507,17 @@ validation/
   metrics.py            Deterministic metrics + default_metrics(language):
                         response_coverage, dataset_fidelity,
                         language_compliance, target_syntax, required_terms,
-                        reference_similarity. The two language-aware ones
-                        score against the run's target. target_syntax parses
+                        reference_similarity — and, for Spark SQL only,
+                        session_variables, which fails an item that names a
+                        permanent table other than through a declared
+                        session variable. The language-aware ones score
+                        against the run's target. target_syntax parses
                         the selected target language. Thresholds resolve via app_config
                         (validation.<name>_threshold).
+  table_names.py        check_table_names(): the session_variables check,
+                        reading an answer's Spark SQL in order (DECLARE /
+                        SET VAR, IDENTIFIER clauses, commands sqlglot keeps
+                        as raw text).
   judge.py              LLMJudgeMetric — opt-in LLM-as-judge (any
                         LangChain-style model / llm_client.LLMClient);
                         never part of default_metrics().

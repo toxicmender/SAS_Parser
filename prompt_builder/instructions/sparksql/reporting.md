@@ -34,6 +34,6 @@ translate the query almost verbatim and check only the edges:
   already being repeated or wrapped — keep whatever the source did.
 - FedSQL has its own type names (`DOUBLE`, `BIGINT`, `VARCHAR(n)`) which map
   directly; SAS-format-based conversions do not appear.
-- Dataset references still need the two-level to three-level name change.
+- Dataset references still go through their session variables, as in PROC SQL.
 - ⚠️ FedSQL runs with its own missing-value and division semantics; the
   `NULL`-versus-missing and ANSI divide-by-zero guidance still applies.

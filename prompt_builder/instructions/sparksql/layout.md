@@ -6,11 +6,11 @@ as liquid clustering.
 
 | SAS | Databricks SQL |
 |---|---|
-| `PROC SORT DATA=lib.t; BY a b;` (in place, permanent libref) | `ALTER TABLE cat.lib.t CLUSTER BY (a, b);` |
-| `PROC SORT DATA=lib.s OUT=lib.t; BY a b;` | `CREATE OR REPLACE TABLE cat.lib.t CLUSTER BY (a, b) AS SELECT * FROM cat.lib.s;` |
-| `MODIFY t; INDEX CREATE a;` / `CREATE INDEX i ON t(a);` | `ALTER TABLE cat.lib.t CLUSTER BY (a);` |
-| `MODIFY t (SORTEDBY=a b);` | `ALTER TABLE cat.lib.t CLUSTER BY (a, b);` |
-| `INDEX DELETE a;` / `SORTEDBY=_NULL_` | `ALTER TABLE cat.lib.t CLUSTER BY NONE;` |
+| `PROC SORT DATA=lib.t; BY a b;` (in place, permanent libref) | `ALTER TABLE IDENTIFIER(session.T) CLUSTER BY (a, b);` |
+| `PROC SORT DATA=lib.s OUT=lib.t; BY a b;` | `CREATE OR REPLACE TABLE IDENTIFIER(session.T) CLUSTER BY (a, b) AS SELECT * FROM IDENTIFIER(session.S);` |
+| `MODIFY t; INDEX CREATE a;` / `CREATE INDEX i ON t(a);` | `ALTER TABLE IDENTIFIER(session.T) CLUSTER BY (a);` |
+| `MODIFY t (SORTEDBY=a b);` | `ALTER TABLE IDENTIFIER(session.T) CLUSTER BY (a, b);` |
+| `INDEX DELETE a;` / `SORTEDBY=_NULL_` | `ALTER TABLE IDENTIFIER(session.T) CLUSTER BY NONE;` |
 
 ⚠️ **Never emit `OPTIMIZE ... ZORDER BY`, `PARTITIONED BY`, or a bucketing
 clause for this.** Clustering replaces all three, is incompatible with them on
@@ -21,18 +21,32 @@ A translation reaching for `ZORDER BY (a)` should have written `CLUSTER BY (a)`.
 and before `AS` — never inside the `SELECT`:
 
 ```sql
-CREATE TABLE cat.lib.t (acct_id BIGINT, open_dt DATE) CLUSTER BY (acct_id);
-CREATE TABLE cat.lib.t CLUSTER BY (acct_id) AS SELECT * FROM cat.lib.s;
-ALTER TABLE cat.lib.t CLUSTER BY (acct_id, open_dt);   -- existing, unpartitioned
+DECLARE OR REPLACE VARIABLE LIB_PREFIX STRING DEFAULT 'catalog_name.lib';
+DECLARE OR REPLACE VARIABLE S STRING DEFAULT CONCAT(session.LIB_PREFIX, '.s');
+DECLARE OR REPLACE VARIABLE T STRING DEFAULT CONCAT(session.LIB_PREFIX, '.t');
+
+CREATE TABLE IDENTIFIER(session.T) (acct_id BIGINT, open_dt DATE) CLUSTER BY (acct_id);
+CREATE TABLE IDENTIFIER(session.T) CLUSTER BY (acct_id) AS SELECT * FROM IDENTIFIER(session.S);
+ALTER TABLE IDENTIFIER(session.T) CLUSTER BY (acct_id, open_dt);   -- existing, unpartitioned
 ```
 
 **OPTIMIZE is maintenance, not translation.** Predictive optimization runs
 `OPTIMIZE`, `ANALYZE` and `VACUUM` on Unity Catalog managed tables by itself.
-Emit `OPTIMIZE <table> FULL;` **once**, right after first enabling clustering or
+Emit `OPTIMIZE <table> FULL` **once**, right after first enabling clustering or
 changing keys — declaring keys does not rewrite rows already written, and plain
-`OPTIMIZE` is incremental so it will not re-cluster them. ⚠️ Emit no scheduled
-or repeated `OPTIMIZE`/`VACUUM`: that is a maintenance job smuggled into an ETL
-script. Say under Risks that upkeep is a table setting and leave it there.
+`OPTIMIZE` is incremental so it will not re-cluster them. `FULL` needs Runtime
+16.0 or above; say so under Risks. `OPTIMIZE` takes no `IDENTIFIER`, so build
+it from the table's variable and run it:
+
+```sql
+DECLARE OR REPLACE VARIABLE STMT STRING;
+SET VAR STMT = CONCAT('OPTIMIZE ', session.T, ' FULL');
+EXECUTE IMMEDIATE STMT;
+```
+
+⚠️ Emit no scheduled or repeated `OPTIMIZE`/`VACUUM`: that is a maintenance job
+smuggled into an ETL script. Say under Risks that upkeep is a table setting and
+leave it there.
 
 ⚠️ **`CLUSTER BY` is not row order.** It colocates related rows so scans skip
 files; `SELECT * FROM t` still returns rows in no guaranteed order, so it can

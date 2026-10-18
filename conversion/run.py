@@ -462,12 +462,14 @@ def _apply_xref_post(
     built from — so a rewrite reaches the deliverable. Rewriting only the
     Markdown ``response`` would leave the uploaded notebook untouched.
 
-    Dispatch is **per cell**, on the cell's own ``language``, not on the run's
-    target: a PySpark run routinely contains a ``sql`` cell, and handing that to
-    the Python parser would no-op under :mod:`xref.rewrite`'s hard rule — a
-    silent miss rather than a visible failure.
+    Each cell is parsed as its own ``language``, not as the run's target: a
+    PySpark run routinely contains a ``sql`` cell, and handing that to the
+    Python parser would no-op under :mod:`xref.rewrite`'s hard rule — a silent
+    miss rather than a visible failure. An item's SQL cells are rewritten
+    together (:func:`xref.apply.apply_post_cells`), since a session variable
+    declared in one cell names the tables of the next.
     """
-    from xref.apply import apply_both, apply_post
+    from xref.apply import apply_post, apply_post_cells, only_post_names, warn_only_post
 
     changed = 0
     for out in outputs:
@@ -484,24 +486,28 @@ def _apply_xref_post(
                 changed += 1
             continue
 
-        cells = document.get("cells") or []
-        item_changed = False
-        for cell in cells:
-            if cell.get("kind") != "code":
-                continue
+        code: list[tuple[dict, str, str]] = []
+        for cell in document.get("cells") or []:
             source = str(cell.get("source", ""))
-            if not source.strip():
+            if cell.get("kind") != "code" or not source.strip():
                 continue
             language = _cell_language(cell, output_language)
-            if language is None:
-                continue
-            if report_only_post:
-                outcome = apply_both(source, language, mappings)
-                rewritten = outcome.code
-            else:
-                rewritten = apply_post(source, language, mappings)
-            if rewritten != source:
-                cell["source"] = rewritten
+            if language is not None:
+                code.append((cell, source, language))
+        if not code:
+            continue
+        sources = [source for _, source, _ in code]
+        rewritten, remapped = apply_post_cells(
+            [(source, language) for _, source, language in code], mappings
+        )
+        if report_only_post:
+            warn_only_post(
+                only_post_names("\n".join(sources), "\n".join(rewritten), mappings, remapped)
+            )
+        item_changed = False
+        for (cell, source, _), new in zip(code, rewritten):
+            if new != source:
+                cell["source"] = new
                 item_changed = True
         if item_changed:
             changed += 1

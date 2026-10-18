@@ -37,6 +37,40 @@ Where a path appears in *SAS* is `chunker/paths.py`'s grammar, imported here.
 Where one appears in *generated* code is `rewrite.py`'s, since it is target
 syntax rather than source syntax.
 
+Generated Spark SQL names its permanent tables through session variables
+(`CREATE OR REPLACE TABLE IDENTIFIER(session.DEMO_TABLE) AS ...`; see the
+SparkSQL instructions). `post` parses those statements with their IDENTIFIER
+clauses masked (`target_language.mask_identifier_clauses`) and gives the
+clauses back as written. It regenerates nothing: sqlglot records where every
+name stands, so `post` replaces each mapped name in place and every other
+byte — the `DECLARE OR REPLACE VARIABLE`s, comments, a `WHILE ... DO` block
+sqlglot cannot write back — comes through as written.
+
+The names the variables hold move too (`rewrite_sql_cells`). An item's SQL
+cells are read together, in order, since a prefix declared in one cell builds
+the names of the next. `post` evaluates each variable as the item would. A
+table variable built as `CONCAT(session.MART_PREFIX, '.orders')` from a prefix
+holding `'catalog_name.mart'` is looked up as `mart.orders`, and then:
+
+- every table built from the prefix maps to one `catalog.schema`, and nothing
+  else reads the prefix (a query, a command's text such as `EXECUTE
+  IMMEDIATE`, an IDENTIFIER clause that names anything else): the prefix's own
+  literal changes;
+- otherwise each mapped group gets a prefix of its own — one that holds that
+  `catalog.schema` wherever the group reads it, once the rewrite is done, or a
+  new `<SCHEMA>_PREFIX` declared right after the original — and its tables are
+  re-pointed to it;
+- a mapping that renames the table rewrites the `'.orders'` literal;
+- a variable holding a literal `'catalog.schema.table'` gets the target.
+
+A mapped name built any other way — inside an IDENTIFIER clause, or from more
+than a prefix and a member — is logged and left as written. Library rows
+(`by_libref`, `libref -> catalog.schema`) are applied by `pre` only: `post`
+logs one that names a prefix's library and leaves its tables where they are,
+and never takes a library row for a table's new name. Under `both`,
+names held in variables are reported among those only `post` reached, since a
+target split across a prefix and a member never appears whole.
+
 Under `pre` and `both` the run also reports SAS paths that survived into the
 output unmapped — a location the notebook names that will not exist on the
 target.

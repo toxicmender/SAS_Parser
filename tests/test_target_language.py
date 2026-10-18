@@ -13,8 +13,10 @@ from target_language import (
     SPARKSQL,
     TargetLanguage,
     UnknownTargetLanguage,
+    mask_identifier_clauses,
     normalize_language,
     resolve_target_language,
+    restore_identifier_clauses,
 )
 
 
@@ -100,3 +102,164 @@ def test_sql_uses_required_sqlglot_with_databricks_dialect(monkeypatch):
     assert "ParseError" in (SPARKSQL.check_syntax("BROKEN") or "")
     assert SPARKSQL.checker_name == "sqlglot"
     assert {dialect for _, dialect in calls} == {"databricks"}
+
+
+# ── the IDENTIFIER clause ────────────────────────────────────────────────────
+# Databricks takes IDENTIFIER(<constant string>) wherever a name goes: the
+# subject of CREATE, ALTER and DROP, the target of INSERT, MERGE, UPDATE, DELETE
+# and COPY INTO, and anything a query names ("IDENTIFIER clause", Databricks
+# SQL / Runtime 13.3 and above). sqlglot reads only some of those, so the
+# Spark SQL check masks the clause before it parses.
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "CREATE OR REPLACE TABLE IDENTIFIER(session.DEMO_TABLE) AS "
+        "SELECT * FROM IDENTIFIER(session.RAW_DEMO);",
+        "INSERT INTO IDENTIFIER(session.T) SELECT * FROM IDENTIFIER(system.session.S);",
+        "COPY INTO IDENTIFIER(session.T) FROM '/Volumes/c/s/v/in/' FILEFORMAT = CSV;",
+        "DROP TABLE IF EXISTS IDENTIFIER(session.T);",
+        "UPDATE IDENTIFIER(session.T) SET a = 1 WHERE b = 2;",
+        "DELETE FROM IDENTIFIER(session.T) WHERE a = 1;",
+        "MERGE INTO IDENTIFIER(session.T) AS t USING IDENTIFIER(session.S) AS s "
+        "ON t.k = s.k WHEN MATCHED THEN UPDATE SET *;",
+        "ALTER TABLE IDENTIFIER('default.' || session.T) ADD COLUMN c2 INT;",
+        "SELECT IDENTIFIER(session.AGG)(c1) FROM VALUES (1) AS T(c1);",
+        "DECLARE OR REPLACE VARIABLE DEMO_TABLE STRING "
+        "DEFAULT CONCAT(session.MART_PREFIX, '.demo_table');",
+    ],
+)
+def test_spark_sql_takes_the_identifier_clause_wherever_databricks_does(sql):
+    assert SPARKSQL.check_syntax(sql) is None
+
+
+def test_an_unclosed_identifier_clause_is_still_a_syntax_error():
+    assert SPARKSQL.check_syntax("CREATE TABLE IDENTIFIER(session.T AS SELECT 1;") is not None
+
+
+def test_masking_leaves_strings_and_comments_alone_and_restores_exactly():
+    sql = (
+        "SELECT 'IDENTIFIER(x' AS s, IDENTIFIER(session.C) -- IDENTIFIER(\n"
+        "FROM IDENTIFIER(session.P || ')') /* IDENTIFIER(y) */ t;"
+    )
+    masked, originals = mask_identifier_clauses(sql)
+    assert list(originals.values()) == [
+        "IDENTIFIER(session.C)",
+        "IDENTIFIER(session.P || ')')",
+    ]
+    assert "'IDENTIFIER(x'" in masked and "/* IDENTIFIER(y) */" in masked
+    assert restore_identifier_clauses(masked, originals) == sql
+
+
+def test_only_the_identifier_keyword_is_masked():
+    masked, originals = mask_identifier_clauses("SELECT my_identifier(a), identifier (b)")
+    assert masked.startswith("SELECT my_identifier(a), __sasp_identifier_0__")
+    assert originals == {"__sasp_identifier_0__": "identifier (b)"}
+
+
+@pytest.mark.parametrize(
+    "sql, clauses",
+    [
+        # A backslash escapes the quote after it; the literal runs on.
+        (r"SELECT 'it\'s IDENTIFIER(x)' FROM IDENTIFIER(session.T)", ["IDENTIFIER(session.T)"]),
+        # A doubled backquote is one backquote inside a name.
+        ("SELECT `a``IDENTIFIER(x)` FROM IDENTIFIER(session.T)", ["IDENTIFIER(session.T)"]),
+        # Bracketed comments nest.
+        (
+            "/* a /* b */ IDENTIFIER(x) */ SELECT * FROM IDENTIFIER(session.T)",
+            ["IDENTIFIER(session.T)"],
+        ),
+        # Inside a clause: a call, and a parenthesis in a literal or a comment.
+        (
+            "SELECT * FROM IDENTIFIER(CONCAT(session.P, ')') /* ) */ -- )\n) t",
+            ["IDENTIFIER(CONCAT(session.P, ')') /* ) */ -- )\n)"],
+        ),
+        # What never closes runs to the end, and masks nothing after it.
+        ("SELECT 'IDENTIFIER(session.T)", []),
+        ("SELECT 1 /* IDENTIFIER(session.T)", []),
+        ("SELECT * FROM IDENTIFIER('a.b", []),
+    ],
+)
+def test_masking_reads_quotes_comments_and_parentheses_as_sql_does(sql, clauses):
+    masked, originals = mask_identifier_clauses(sql)
+    assert list(originals.values()) == clauses
+    assert restore_identifier_clauses(masked, originals) == sql
+
+
+def test_a_raw_string_ending_in_a_backslash_ends_where_sql_ends_it():
+    # r'...' has no escapes, so its last backslash does not swallow the quote.
+    sql = (
+        "CREATE OR REPLACE TEMP VIEW paths AS SELECT r'C:\\temp\\' AS p;\n"
+        "CREATE OR REPLACE TABLE IDENTIFIER(session.T) AS SELECT 1 AS a;"
+    )
+    assert list(mask_identifier_clauses(sql)[1].values()) == ["IDENTIFIER(session.T)"]
+    assert SPARKSQL.check_syntax(sql) is None
+
+
+def test_a_qualified_identifier_function_is_no_clause():
+    assert mask_identifier_clauses("SELECT t.identifier(x) FROM t") == (
+        "SELECT t.identifier(x) FROM t",
+        {},
+    )
+
+
+@pytest.mark.parametrize(
+    "sql, clause",
+    [
+        ("SELECT * FROM IDENTIFIER(session.T WHERE a = 1);", "IDENTIFIER(session.T WHERE a = 1)"),
+        (
+            "CREATE OR REPLACE TABLE IDENTIFIER(session.T AS SELECT * FROM IDENTIFIER(session.S));",
+            "IDENTIFIER(session.T AS SELECT * FROM IDENTIFIER(session.S))",
+        ),
+        ("SELECT * FROM IDENTIFIER(session.P ||);", "IDENTIFIER(session.P ||)"),
+        ("SELECT * FROM IDENTIFIER();", "IDENTIFIER()"),
+    ],
+)
+def test_an_error_inside_a_clause_is_still_a_syntax_error(sql, clause):
+    # Masking takes the clause out of the statement; its expression is parsed
+    # on its own, so the mask hides nothing.
+    error = SPARKSQL.check_syntax(sql)
+    assert error is not None and error.endswith(f"(in {clause})")
+
+
+@pytest.mark.parametrize(
+    "sql, expected",
+    [
+        (
+            "DECLARE OR REPLACE VARIABLE session.Q STRING DEFAULT 'x';",
+            "DECLARE OR REPLACE VARIABLE         Q STRING DEFAULT 'x';",
+        ),
+        # VAR is VARIABLE's synonym; a list of names; system.session.
+        (
+            "DECLARE VAR system.session.Q, session.R STRING = 'x';",
+            "DECLARE VAR                Q,         R STRING = 'x';",
+        ),
+        # Only a declared name: a later read, a string and SET VAR keep theirs.
+        (
+            "DECLARE session.Q STRING; SELECT session.Q, 'DECLARE session.x'; SET VAR session.Q = 'a';",
+            "DECLARE         Q STRING; SELECT session.Q, 'DECLARE session.x'; SET VAR session.Q = 'a';",
+        ),
+        ("DECLARE OR REPLACE VARIABLE PLAIN STRING;", "DECLARE OR REPLACE VARIABLE PLAIN STRING;"),
+    ],
+)
+def test_a_declared_name_loses_its_qualifier_and_keeps_its_offsets(sql, expected):
+    from target_language import unqualify_declared_names
+
+    assert unqualify_declared_names(sql) == expected
+    assert len(expected) == len(sql)
+
+
+def test_an_unclosed_literal_unqualifies_nothing():
+    from target_language import unqualify_declared_names
+
+    sql = "DECLARE session.Q STRING DEFAULT 'never closed"
+    assert unqualify_declared_names(sql) == sql
+
+
+def test_restoring_tolerates_a_placeholder_whose_case_changed():
+    masked, originals = mask_identifier_clauses("SELECT IDENTIFIER(session.AGG)(c1) FROM t")
+    regenerated = masked.replace("__sasp_identifier_0__", "__SASP_IDENTIFIER_0__")
+    assert restore_identifier_clauses(regenerated, originals) == (
+        "SELECT IDENTIFIER(session.AGG)(c1) FROM t"
+    )
