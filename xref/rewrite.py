@@ -203,7 +203,7 @@ def rewrite_sql(
         return sql
 
     read = SPARKSQL.sqlglot_dialect or "databricks"
-    masked, identifiers = mask_identifier_clauses(sql)
+    masked, identifiers = mask_identifier_clauses(sql, read)
     try:
         spans = _statement_spans(masked, read)
         statements = [sqlglot.parse_one(masked[a:b], read=read) for a, b in spans]

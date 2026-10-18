@@ -117,7 +117,7 @@ def test_a_stored_view_built_through_execute_immediate_passes():
         "SET VAR STMT = CONCAT('CREATE OR REPLACE VIEW ', session.A, "
         "' AS SELECT * FROM ', session.B);\n"
         "EXECUTE IMMEDIATE STMT;\n"
-        "OPTIMIZE IDENTIFIER(session.B) FULL;"
+        "SELECT COUNT(*) FROM IDENTIFIER(session.B);"
     )
     assert (result.score, result.details.split(" ")[0]) == (1.0, "1/1")
 

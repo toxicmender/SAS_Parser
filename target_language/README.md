@@ -24,3 +24,9 @@ variables. sqlglot reads the clause in a query but not as the target of
 CREATE TABLE, INSERT INTO, COPY INTO or DROP TABLE, so each clause is replaced
 by a placeholder name for the parse; `restore_identifier_clauses` puts them
 back for a caller that rewrites the SQL (`xref.rewrite`).
+
+Clauses are found on sqlglot's own Databricks tokens, so a clause spelled
+inside a string, a raw string, a comment or a backquoted name is never masked,
+and an unclosed one is left for the parse to report. The check then parses
+each clause's own expression as well, so an error inside a clause —
+`IDENTIFIER(session.T WHERE a = 1)` — is still reported.

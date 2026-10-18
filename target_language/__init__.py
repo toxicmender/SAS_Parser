@@ -12,6 +12,10 @@ import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # sqlglot is imported where a parse needs it
+    from sqlglot.tokens import Token
 
 logger = logging.getLogger(__name__)
 
@@ -55,75 +59,41 @@ def _check_python(source: str) -> str | None:
 # The IDENTIFIER clause: an object name computed from a constant string — a
 # session variable, a parameter marker or a literal — anywhere Databricks SQL
 # takes a name ("IDENTIFIER clause", Databricks SQL / Runtime 13.3 and above).
-_IDENTIFIER_RE = re.compile(r"IDENTIFIER\s*\(", re.IGNORECASE)
 _PLACEHOLDER = "__sasp_identifier_{}__"
 
 
-def _skip_quoted(sql: str, start: int) -> int:
-    """The index after the string literal or backquoted name opening at
-    *start*: a backslash escapes the next character in a literal, and a
-    doubled backquote stands for one inside a name."""
-    quote = sql[start]
-    i = start + 1
-    while i < len(sql):
-        char = sql[i]
-        if char == "\\" and quote != "`":
-            i += 2
-        elif char == quote and quote == "`" and sql.startswith("``", i):
-            i += 2
-        elif char == quote:
-            return i + 1
-        else:
-            i += 1
-    return len(sql)
+def _clause_end(tokens: list[Token], i: int) -> int | None:
+    """The index of the token closing the IDENTIFIER clause that opens at
+    token *i*, or ``None`` when none opens there or it never closes.
 
-
-def _skip_comment(sql: str, start: int) -> int:
-    """The index after the comment opening at *start*: ``--`` to the end of
-    its line, or a bracketed comment, which nests."""
-    if sql.startswith("--", start):
-        end = sql.find("\n", start)
-        return len(sql) if end < 0 else end + 1
+    A clause opens at an unquoted ``IDENTIFIER`` followed by ``(``, and not
+    after a dot: a backquoted name, a string or a comment spelling it is a
+    different token, or none at all.
+    """
+    token = tokens[i]
+    if (
+        token.token_type.name != "VAR"
+        or token.text.upper() != "IDENTIFIER"
+        or i + 1 >= len(tokens)
+        or tokens[i + 1].token_type.name != "L_PAREN"
+        or (i > 0 and tokens[i - 1].token_type.name == "DOT")
+    ):
+        return None
     depth = 0
-    i = start
-    while i < len(sql):
-        if sql.startswith("/*", i):
+    for j in range(i + 1, len(tokens)):
+        kind = tokens[j].token_type.name
+        if kind == "L_PAREN":
             depth += 1
-            i += 2
-        elif sql.startswith("*/", i):
-            depth -= 1
-            i += 2
-            if depth == 0:
-                return i
-        else:
-            i += 1
-    return len(sql)
-
-
-def _closing_paren(sql: str, start: int) -> int:
-    """The index of the parenthesis closing the one at *start*, strings and
-    comments aside, or ``-1`` when it is never closed."""
-    depth = 0
-    i = start
-    while i < len(sql):
-        char = sql[i]
-        if char in "'\"`":
-            i = _skip_quoted(sql, i)
-            continue
-        if sql.startswith(("--", "/*"), i):
-            i = _skip_comment(sql, i)
-            continue
-        if char == "(":
-            depth += 1
-        elif char == ")":
+        elif kind == "R_PAREN":
             depth -= 1
             if depth == 0:
-                return i
-        i += 1
-    return -1
+                return j
+    return None
 
 
-def mask_identifier_clauses(sql: str) -> tuple[str, dict[str, str]]:
+def mask_identifier_clauses(
+    sql: str, dialect: str = "databricks"
+) -> tuple[str, dict[str, str]]:
     """*sql* with each IDENTIFIER clause replaced by a plain placeholder name,
     and the clause each placeholder stands for.
 
@@ -132,54 +102,73 @@ def mask_identifier_clauses(sql: str) -> tuple[str, dict[str, str]]:
     INTO`` or ``DROP TABLE`` with one, which Databricks accepts — so a parse
     of generated Spark SQL masks them first. A placeholder is an ordinary
     identifier, so the statement around it parses as it would with a literal
-    name, and :func:`restore_identifier_clauses` puts the clauses back. A
-    clause inside a string or a comment is left alone, as is one never
-    closed, which the parse then reports.
+    name, and :func:`restore_identifier_clauses` puts the clauses back.
+
+    Clauses are found on *dialect*'s own tokens, so a string, a raw string, a
+    comment or a backquoted name that only spells ``IDENTIFIER(`` is never
+    one. A clause never closed masks nothing, and neither does a literal or a
+    comment never closed, which the tokenizer refuses: the parse reports them.
+    Nor does a clause in a statement sqlglot keeps as raw text after its
+    keyword (``OPTIMIZE``, ``EXECUTE``, ``SHOW``): it parses as a command
+    either way, and whoever reads that text masks it there.
     """
+    try:
+        from sqlglot.dialects.dialect import Dialect
+
+        tokens = Dialect.get_or_raise(dialect).tokenize(sql)
+    except Exception:  # sqlglot's TokenError: an unclosed literal or comment
+        return sql, {}
     out: list[str] = []
     originals: dict[str, str] = {}
-    i = 0
-    while i < len(sql):
-        char = sql[i]
-        if char in "'\"`":
-            end = _skip_quoted(sql, i)
-        elif sql.startswith(("--", "/*"), i):
-            end = _skip_comment(sql, i)
-        elif (
-            char in "iI"
-            and (i == 0 or not (sql[i - 1].isalnum() or sql[i - 1] in "_$"))
-            and (match := _IDENTIFIER_RE.match(sql, i)) is not None
-            and (close := _closing_paren(sql, match.end() - 1)) >= 0
-        ):
-            name = _PLACEHOLDER.format(len(originals))
-            originals[name] = sql[i : close + 1]
-            out.append(name)
-            i = close + 1
+    copied = i = 0
+    while i < len(tokens):
+        close = _clause_end(tokens, i)
+        if close is None:
+            i += 1
             continue
-        else:
-            end = i + 1
-        out.append(sql[i:end])
-        i = end
+        name = _PLACEHOLDER.format(len(originals))
+        start, end = tokens[i].start, tokens[close].end + 1
+        originals[name] = sql[start:end]
+        out += (sql[copied:start], name)
+        copied, i = end, close + 1
+    out.append(sql[copied:])
     return "".join(out), originals
 
 
 def restore_identifier_clauses(sql: str, originals: dict[str, str]) -> str:
-    """*sql*, masked by :func:`mask_identifier_clauses`, with its clauses back."""
-    for name, clause in originals.items():
-        sql = sql.replace(name, clause)
-    return sql
+    """*sql*, masked by :func:`mask_identifier_clauses`, with its clauses back.
+
+    Matched case-insensitively, so a generator that normalises names — sqlglot
+    upper-cases a function name — still leaves no placeholder behind.
+    """
+    if not originals:
+        return sql
+    by_name = {name.lower(): clause for name, clause in originals.items()}
+    pattern = re.compile("|".join(map(re.escape, originals)), re.IGNORECASE)
+    return pattern.sub(lambda match: by_name[match.group(0).lower()], sql)
+
+
+def _syntax_error(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
 
 
 def _check_sql(source: str, dialect: str) -> str | None:
     """Parse a statement list with the required sqlglot dependency, its
-    IDENTIFIER clauses masked (:func:`mask_identifier_clauses`)."""
+    IDENTIFIER clauses masked (:func:`mask_identifier_clauses`) and each
+    clause's own expression parsed by itself, so masking hides no error."""
     import sqlglot
 
-    masked, _ = mask_identifier_clauses(source)
+    masked, clauses = mask_identifier_clauses(source, dialect)
     try:
         sqlglot.parse(masked, dialect=dialect)
     except Exception as exc:
-        return f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
+        return _syntax_error(exc)
+    for clause in clauses.values():
+        inner = clause[clause.index("(") + 1 : clause.rindex(")")]
+        try:
+            sqlglot.parse_one(inner, dialect=dialect)
+        except Exception as exc:
+            return f"{_syntax_error(exc)} (in {clause})"
     return None
 
 

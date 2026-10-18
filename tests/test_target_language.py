@@ -185,3 +185,47 @@ def test_masking_reads_quotes_comments_and_parentheses_as_sql_does(sql, clauses)
     masked, originals = mask_identifier_clauses(sql)
     assert list(originals.values()) == clauses
     assert restore_identifier_clauses(masked, originals) == sql
+
+
+def test_a_raw_string_ending_in_a_backslash_ends_where_sql_ends_it():
+    # r'...' has no escapes, so its last backslash does not swallow the quote.
+    sql = (
+        "CREATE OR REPLACE TEMP VIEW paths AS SELECT r'C:\\temp\\' AS p;\n"
+        "CREATE OR REPLACE TABLE IDENTIFIER(session.T) AS SELECT 1 AS a;"
+    )
+    assert list(mask_identifier_clauses(sql)[1].values()) == ["IDENTIFIER(session.T)"]
+    assert SPARKSQL.check_syntax(sql) is None
+
+
+def test_a_qualified_identifier_function_is_no_clause():
+    assert mask_identifier_clauses("SELECT t.identifier(x) FROM t") == (
+        "SELECT t.identifier(x) FROM t",
+        {},
+    )
+
+
+@pytest.mark.parametrize(
+    "sql, clause",
+    [
+        ("SELECT * FROM IDENTIFIER(session.T WHERE a = 1);", "IDENTIFIER(session.T WHERE a = 1)"),
+        (
+            "CREATE OR REPLACE TABLE IDENTIFIER(session.T AS SELECT * FROM IDENTIFIER(session.S));",
+            "IDENTIFIER(session.T AS SELECT * FROM IDENTIFIER(session.S))",
+        ),
+        ("SELECT * FROM IDENTIFIER(session.P ||);", "IDENTIFIER(session.P ||)"),
+        ("SELECT * FROM IDENTIFIER();", "IDENTIFIER()"),
+    ],
+)
+def test_an_error_inside_a_clause_is_still_a_syntax_error(sql, clause):
+    # Masking takes the clause out of the statement; its expression is parsed
+    # on its own, so the mask hides nothing.
+    error = SPARKSQL.check_syntax(sql)
+    assert error is not None and error.endswith(f"(in {clause})")
+
+
+def test_restoring_tolerates_a_placeholder_whose_case_changed():
+    masked, originals = mask_identifier_clauses("SELECT IDENTIFIER(session.AGG)(c1) FROM t")
+    regenerated = masked.replace("__sasp_identifier_0__", "__SASP_IDENTIFIER_0__")
+    assert restore_identifier_clauses(regenerated, originals) == (
+        "SELECT IDENTIFIER(session.AGG)(c1) FROM t"
+    )

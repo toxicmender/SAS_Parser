@@ -363,7 +363,7 @@ def check_table_names(blocks: Iterable[str]) -> TableNameCheck:
 
     answer = _Answer()
     for block in blocks:
-        masked, identifiers = mask_identifier_clauses(block)
+        masked, identifiers = mask_identifier_clauses(block, _DIALECT)
         try:
             statements = sqlglot.parse(masked, read=_DIALECT)
         except Exception:  # sqlglot raises several unrelated types
