@@ -53,7 +53,9 @@ table variable built as `CONCAT(session.MART_PREFIX, '.orders')` from a prefix
 holding `'catalog_name.mart'` is looked up as `mart.orders`, and then:
 
 - every table built from the prefix maps to one `catalog.schema`, and nothing
-  else reads the prefix: the prefix's own literal changes;
+  else reads the prefix (a query, a command's text such as `EXECUTE
+  IMMEDIATE`, an IDENTIFIER clause that names anything else): the prefix's own
+  literal changes;
 - otherwise each mapped group gets a prefix of its own — one already holding
   that `catalog.schema`, or a new `<SCHEMA>_PREFIX` declared right after the
   original — and its tables are re-pointed to it;

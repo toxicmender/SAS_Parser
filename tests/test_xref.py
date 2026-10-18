@@ -699,6 +699,44 @@ def test_sql_a_new_prefix_name_keeps_counting():
     assert "CONCAT(session.PROD_SALES_PREFIX_3, '.orders')" in out[0]
 
 
+_ORDERS_ONLY = (
+    "DECLARE OR REPLACE VARIABLE MART_PREFIX STRING DEFAULT 'catalog_name.mart';\n"
+    "DECLARE OR REPLACE VARIABLE ORDERS STRING DEFAULT CONCAT(session.MART_PREFIX, '.orders');\n"
+)
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [
+        # A clause that builds a name from the prefix and more than a member.
+        "SELECT * FROM IDENTIFIER(session.MART_PREFIX || '.' || session.DS);",
+        # The prefix itself as a name, in a statement sqlglot parses and in one
+        # it keeps as a command.
+        "USE SCHEMA IDENTIFIER(session.MART_PREFIX);",
+        "SHOW TABLES IN IDENTIFIER(session.MART_PREFIX);",
+        # Statement text built from the prefix.
+        "EXECUTE IMMEDIATE CONCAT('OPTIMIZE ', session.MART_PREFIX, '.other_t');",
+        # A value a query compares with, and a clause in function position.
+        "SELECT table_name FROM system.information_schema.tables WHERE table_schema = session.MART_PREFIX;",
+        "SELECT IDENTIFIER(session.MART_PREFIX || '.f')(1);",
+    ],
+)
+def test_sql_a_prefix_read_another_way_keeps_its_value(reader):
+    # ORDERS is the prefix's only table variable and it moves, but something
+    # else reads the prefix: moving it would move that too, so ORDERS gets a
+    # prefix of its own instead.
+    sql = _ORDERS_ONLY + reader
+    out, remapped = rewrite.rewrite_sql_cells([sql], {"mart.orders": "prod.mart.orders"})
+    assert out == [
+        sql.replace(
+            "'catalog_name.mart';\n",
+            "'catalog_name.mart';\n"
+            "DECLARE OR REPLACE VARIABLE PROD_MART_PREFIX STRING DEFAULT 'prod.mart';\n",
+        ).replace("CONCAT(session.MART_PREFIX, '.orders')", "CONCAT(session.PROD_MART_PREFIX, '.orders')")
+    ]
+    assert remapped == ["mart.orders"]
+
+
 def test_post_cells_without_sql_rewrite_each_cell_on_its_own():
     mappings = sourcing.XrefMappings(exact={"sales.orders": "cat.sales.orders"})
     out, remapped = xref_apply.apply_post_cells(

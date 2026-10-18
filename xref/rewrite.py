@@ -345,6 +345,11 @@ class _VariableRewrite:
       tables are re-pointed to it;
     * a mapping that renames the table rewrites its ``'.member'`` literal.
 
+    Anything else that reads a prefix — a query, a command's text, an
+    IDENTIFIER clause that builds some other name or names the prefix itself —
+    keeps the prefix where it is, so moving its tables never moves what that
+    reads.
+
     A table variable holding a literal ``'catalog.schema.table'`` gets the
     target literal. A mapped name built any other way — inside an IDENTIFIER
     clause, or from more than a prefix and a member — is reported, not
@@ -362,18 +367,27 @@ class _VariableRewrite:
         self.added: list[tuple[str, str, int, int, str]] = []
 
     def run(self) -> list[str]:
+        from sqlglot import exp
+
         values: dict[str, str | None] = {}
         prefix_of: dict[str, _Prefix] = {}
         for index, cell in enumerate(self.cells):
             if cell is None:
                 continue
             for statement in cell.statements:
-                for name, value, shared in _assignments(statement):
+                assignments = _assignments(statement)
+                for name, value, shared in assignments:
                     self.declared.add(name)
                     prefix_of.pop(name, None)
                     text = _evaluate(value, values)
                     self._assign(index, name, value, text, shared, prefix_of)
                     values[name] = text
+                if isinstance(statement, exp.Command):
+                    rest = statement.expression
+                    command = str(rest.this) if isinstance(rest, exp.Literal) else str(rest or "")
+                    self._pin_text(command, cell, prefix_of)
+                elif not assignments:
+                    self._pin(statement, prefix_of)
                 self._inline(index, cell, statement, values, prefix_of)
         for prefix in self.prefixes:
             self._settle(prefix)
@@ -390,17 +404,12 @@ class _VariableRewrite:
         shared: bool,
         prefix_of: dict[str, _Prefix],
     ) -> None:
-        from sqlglot import exp
-
         built = _built_from_prefix(value, prefix_of)
         if built is not None:
             prefix, column, suffix, member = built
             prefix.dependents.append(self._dependent(index, column, suffix, prefix, member))
             return
-        if isinstance(value, exp.Expr):
-            for column in value.find_all(exp.Column):
-                if (prefix := prefix_of.get(session_variable(column) or "")) is not None:
-                    prefix.pinned = True
+        self._pin(value, prefix_of)
         literal = value if _string_value(value) is not None else None
         catalog, _, schema = (text or "").partition(".")
         if literal is not None and catalog and schema and "." not in schema and not shared:
@@ -418,26 +427,67 @@ class _VariableRewrite:
         values: dict[str, str | None],
         prefix_of: dict[str, _Prefix],
     ) -> None:
-        """Names built inside the statement's IDENTIFIER clauses."""
+        """The statement's IDENTIFIER clauses, wherever they stand: a table
+        name built in one from a prefix is a table variable that has no
+        variable; any other read of a prefix keeps the prefix in place."""
         import sqlglot
         from sqlglot import exp
 
-        for table in statement.find_all(exp.Table):
-            clause = cell.identifiers.get(table.name)
-            if clause is None:
+        seen: set[str] = set()
+        for node in statement.walk():
+            if not isinstance(node, (exp.Table, exp.Column, exp.Anonymous)):
                 continue
+            clause = cell.identifiers.get(node.name)
+            if clause is None or node.name in seen:
+                continue
+            seen.add(node.name)
             try:
                 inner = sqlglot.parse_one(clause[clause.index("(") + 1 : clause.rindex(")")], read=self.read)
             except Exception:  # sqlglot raises several unrelated types
+                self._pin_text(clause, cell, prefix_of)
                 continue
             if session_variable(inner) is not None:
-                continue  # IDENTIFIER(session.T): T's own value is rewritten
-            built = _built_from_prefix(inner, prefix_of)
+                # IDENTIFIER(session.T): T's own value is rewritten, and a
+                # prefix named whole stays where it is.
+                self._pin(inner, prefix_of)
+                continue
+            names_table = isinstance(node, exp.Table)
+            built = _built_from_prefix(inner, prefix_of) if names_table else None
             if built is not None:
                 prefix, _, _, member = built
                 prefix.dependents.append(self._dependent(index, None, None, prefix, member))
-            elif (text := _evaluate(inner, values)) is not None and text.count(".") == 2:
+                continue
+            self._pin(inner, prefix_of)
+            if names_table and (text := _evaluate(inner, values)) is not None and text.count(".") == 2:
                 self._whole_name(index, None, text, clause)
+
+    @staticmethod
+    def _pin(expression: object, prefix_of: dict[str, _Prefix]) -> None:
+        """Keep in place every prefix *expression* reads."""
+        from sqlglot import exp
+
+        if not isinstance(expression, exp.Expr):
+            return
+        for column in expression.find_all(exp.Column):
+            if (prefix := prefix_of.get(session_variable(column) or "")) is not None:
+                prefix.pinned = True
+
+    def _pin_text(self, text: str, cell: _Cell, prefix_of: dict[str, _Prefix]) -> None:
+        """Keep in place every prefix raw SQL *text* names: what follows a
+        command's keyword, which sqlglot keeps as one string (``EXECUTE
+        IMMEDIATE``, ``SHOW``), or a clause it cannot read."""
+        from sqlglot.dialects.dialect import Dialect
+
+        try:
+            tokens = Dialect.get_or_raise(self.read).tokenize(text)
+            words = [t.text for t in tokens if "STRING" not in t.token_type.name]
+        except Exception:  # an unclosed literal or comment: read it as words
+            words = re.findall(r"\w+", text)
+        for word in words:
+            if (prefix := prefix_of.get(word.upper())) is not None:
+                prefix.pinned = True
+            elif (clause := cell.identifiers.get(word.lower())) is not None:
+                self._pin_text(clause, cell, prefix_of)
 
     def _dependent(
         self,
