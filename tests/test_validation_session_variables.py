@@ -428,6 +428,23 @@ _VARS = "DECLARE OR REPLACE VARIABLE LIB_PREFIX STRING DEFAULT 'catalog_name.lib
             "WHILE i < 3 DO\n  INSERT INTO perm_t SELECT 1;\n  SET VAR i = i + 1;\nEND WHILE;",
             ["`perm_t` is written as a permanent table by a literal name"],
         ),
+        # A permanent view named like a WORK dataset is still a stored view.
+        (
+            _VARS + "CREATE OR REPLACE TEMP VIEW v AS SELECT 1 AS a;\n"
+            "CREATE OR REPLACE VIEW v AS SELECT * FROM IDENTIFIER(session.B);",
+            [
+                "`v` is written as a permanent table by a literal name",
+                "a stored view's query reads IDENTIFIER(session.B)",
+            ],
+        ),
+        # A WORK view's variable given a permanent table's name later.
+        (
+            "DECLARE OR REPLACE VARIABLE OUT_VIEW STRING DEFAULT 'region_out';\n"
+            "CREATE OR REPLACE TEMP VIEW IDENTIFIER(session.OUT_VIEW) AS SELECT 1 AS a;\n"
+            "SET VAR OUT_VIEW = 'region_final';\n"
+            "INSERT INTO IDENTIFIER(session.OUT_VIEW) SELECT * FROM region_out;",
+            ["`OUT_VIEW` holds a literal name"],
+        ),
     ],
 )
 def test_every_statement_the_rule_names_is_judged(sql, problems):
@@ -466,6 +483,13 @@ def test_every_statement_the_rule_names_is_judged(sql, problems):
         "  SET VAR i = i + 1;\nEND WHILE;",
         _VARS + "MERGE INTO IDENTIFIER(session.OLD) AS t USING IDENTIFIER(session.NEW) AS s "
         "ON t.k = s.k WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *;",
+        # A WORK dataset named through a variable, as macros.md resolves
+        # `work.&prefix._out`: a temporary view, not a permanent table.
+        "DECLARE OR REPLACE VARIABLE OUT_VIEW STRING DEFAULT 'region_out';\n"
+        "CREATE OR REPLACE TEMP VIEW IDENTIFIER(session.OUT_VIEW) AS SELECT 1 AS a;\n"
+        "SELECT * FROM IDENTIFIER(session.OUT_VIEW);\n"
+        "ALTER VIEW IDENTIFIER(session.OUT_VIEW) AS SELECT 2 AS a;\n"
+        "DROP VIEW IF EXISTS IDENTIFIER(session.OUT_VIEW);",
     ],
 )
 def test_what_the_rule_allows_passes(sql):

@@ -36,8 +36,9 @@ order, and judges each table reference the convention covers:
 OPTIMIZE and VACUUM, which sqlglot reads only as commands, are judged by the
 table they name.
 
-What is not a permanent table is left alone: temporary views (a WORK dataset)
-and the CTEs and views a query reads by a bare name, table functions
+What is not a permanent table is left alone: temporary views (a WORK dataset,
+named literally or through a variable) and the CTEs and views a query reads by
+a bare name, table functions
 (``read_files``), Databricks' own ``system`` catalog and
 ``information_schema``, and a file read in place (``delta.`/Volumes/...```).
 
@@ -146,6 +147,18 @@ def _variables(expression: object) -> list[str]:
     return [name for name in found if name]
 
 
+def _clause_variable(clause: str) -> str | None:
+    """The session variable an IDENTIFIER clause reads whole
+    (``IDENTIFIER(session.T)``), or ``None``."""
+    import sqlglot
+
+    try:
+        expression = sqlglot.parse_one(clause[clause.index("(") + 1 : clause.rindex(")")], read=_DIALECT)
+    except Exception:  # sqlglot raises several unrelated types
+        return None
+    return _variable(expression)
+
+
 def _command_text(statement: exp.Command) -> str:
     """What follows a command's keyword, as written: sqlglot keeps it as a
     string literal."""
@@ -219,6 +232,8 @@ class _Answer:
         # Declared variable -> the expression it holds (None until it has one).
         self.values: dict[str, object | None] = {}
         self.temp_views: set[str] = set()
+        # The variables a temporary view is named through, until they change.
+        self.temp_view_variables: set[str] = set()
         # The IDENTIFIER clauses of the block being read, by placeholder.
         self.identifiers: dict[str, str] = {}
         self.result = TableNameCheck()
@@ -226,10 +241,28 @@ class _Answer:
     def declare(self, names: Iterable[str], default: object | None) -> None:
         for name in names:
             self.values[name] = default
+            self.temp_view_variables.discard(name)
 
     def set(self, name: str, value: object) -> None:
-        if name in self.values:  # `SET x = ...` on no variable is Spark config
+        if name in self.values:  # SET VAR on no variable gives it no value
             self.values[name] = value
+            self.temp_view_variables.discard(name)
+
+    def _temp_view(self, target: exp.Table) -> None:
+        """Remember the WORK dataset a temporary view makes: by its name, or
+        by the variable an IDENTIFIER clause names it through."""
+        clause = self.identifiers.get(target.name)
+        if clause is None:
+            self.temp_views.add(target.name.lower())
+        elif (variable := _clause_variable(clause)) is not None:
+            self.temp_view_variables.add(variable)
+
+    def _work_view(self, table: exp.Table) -> bool:
+        """Whether *table* names a temporary view made earlier: a WORK dataset."""
+        clause = self.identifiers.get(table.name)
+        if clause is None:
+            return table.name.lower() in self.temp_views
+        return _clause_variable(clause) in self.temp_view_variables
 
     def statement(self, statement: exp.Expr) -> None:
         from sqlglot import exp
@@ -272,13 +305,15 @@ class _Answer:
         # What the statement writes, and each statement a scripting block
         # nests (`WHILE ... DO INSERT INTO t ...; END WHILE`).
         writes: set[int] = set()
+        work: set[int] = set()
         for node in statement.walk():
             written = _target_table(node)
             if not isinstance(written, exp.Table):
                 continue
             if _temporary_view(node):
                 # A WORK dataset: no permanent write, though its query still reads.
-                self.temp_views.add(written.name.lower())
+                self._temp_view(written)
+                work.add(id(written))
             else:
                 writes.add(id(written))
         stored_view: set[int] = set()
@@ -287,7 +322,13 @@ class _Answer:
             and _kind(statement) == "VIEW"
             and not _temporary_view(statement)
         ):
-            if not (isinstance(target, exp.Table) and target.name.lower() in self.temp_views):
+            # ALTER VIEW on a WORK dataset's view stores nothing; a CREATE VIEW
+            # that is not temporary stores its query whatever it is named.
+            if not (
+                isinstance(statement, exp.Alter)
+                and isinstance(target, exp.Table)
+                and self._work_view(target)
+            ):
                 stored_view = {
                     id(table) for body in _view_bodies(statement) for table in body.find_all(exp.Table)
                 }
@@ -300,9 +341,15 @@ class _Answer:
         clone = statement.args.get("clone") if isinstance(statement, exp.Create) else None
         if isinstance(clone, exp.Clone) and isinstance(clone.this, exp.Table):
             takes_none[id(clone.this)] = "a CLONE source"
-        # A permanent table named like a WORK dataset is still a permanent table.
-        creates_table = isinstance(statement, exp.Create) and _kind(statement) == "TABLE"
+        # A permanent table or view named like a WORK dataset is still permanent.
+        creates_permanent = (
+            isinstance(statement, exp.Create)
+            and _kind(statement) in ("TABLE", "VIEW")
+            and not _temporary(statement)
+        )
         for table in statement.find_all(exp.Table):
+            if id(table) in work:
+                continue
             if id(table) in stored_view and table.name in self.identifiers:
                 self._persisted_read(table, "a stored view's query", "CREATE VIEW")
                 continue
@@ -310,7 +357,7 @@ class _Answer:
             self._table(
                 table,
                 writes=id(table) in writes or where == "the new name of RENAME TO",
-                temp_view_ok=not creates_table,
+                temp_view_ok=not creates_permanent,
                 where=where,
             )
 
@@ -404,6 +451,8 @@ class _Answer:
         name, db, catalog = table.name, table.db, table.catalog
         fix = _USE_IDENTIFIER if where is None else _USE_EXECUTE
         if name in self.identifiers:
+            if temp_view_ok and self._work_view(table):
+                return  # a WORK dataset, named through its variable
             self.result.checked += 1
             if where is not None:
                 self._problem(f"{where} takes no IDENTIFIER: {_USE_EXECUTE}")

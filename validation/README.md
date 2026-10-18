@@ -319,8 +319,8 @@ CREATE OR REPLACE TABLE IDENTIFIER(session.DEMO_TABLE) AS SELECT ...;
     (`SET VAR n = (SELECT ... FROM t)`, a `DECLARE ... DEFAULT (SELECT ...)`);
   - a permanent write (CREATE TABLE, INSERT, MERGE, UPDATE, DELETE, COPY INTO,
     DROP TABLE, …) to an unqualified literal name, inside a `WHILE ... DO`
-    block too — a `CREATE TABLE` too when a temporary view already has that
-    name;
+    block too — a `CREATE TABLE` or a permanent `CREATE VIEW` too when a
+    temporary view already has that name;
   - an `IDENTIFIER(...)` where Databricks takes none: `OPTIMIZE`, `VACUUM`,
     the new name of `RENAME TO`, a `CLONE` source. Those statements are built
     from the variables and run through `EXECUTE IMMEDIATE`;
@@ -328,8 +328,10 @@ CREATE OR REPLACE TABLE IDENTIFIER(session.DEMO_TABLE) AS SELECT ...;
     persisted SQL function's body that reads a session variable. Databricks
     keeps that text, which may not read one, so it too is created through
     `EXECUTE IMMEDIATE`.
-- **Ignored:** temporary views and CTEs, a temporary view's or function's
-  body, `read_files`, `system` and `information_schema`, and
+- **Ignored:** temporary views, named literally or through a variable
+  (`CREATE TEMP VIEW IDENTIFIER(session.V)`, until `V` changes), and CTEs, a
+  temporary view's or function's body, `read_files`, `system` and
+  `information_schema`, and
   ``delta.`/path` `` file reads. So is the text an `EXECUTE IMMEDIATE` runs:
   it is a string, so a name hard-coded inside it is not caught.
 
