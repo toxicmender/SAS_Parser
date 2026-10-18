@@ -887,6 +887,26 @@ def test_sql_a_library_row_for_a_prefix_s_library_is_reported(caplog):
     assert caplog.text.count("maps library 'raw' to 'prod.raw_v2'") == 1
 
 
+@pytest.mark.parametrize(
+    "sql, mapping",
+    [
+        # Databricks reads names case-insensitively: a target that differs
+        # only in case is where the table already is.
+        (_ORDERS_ONLY.replace("'.orders'", "'.ORDERS'"), {"mart.orders": "catalog_name.mart.orders"}),
+        (
+            _ORDERS_ONLY.replace("'catalog_name.mart'", "'CATALOG_NAME.MART'"),
+            {"mart.orders": "catalog_name.mart.orders"},
+        ),
+        (
+            _ORDERS_ONLY + "DECLARE OR REPLACE VARIABLE ITEMS STRING DEFAULT CONCAT(session.MART_PREFIX, '.items');",
+            {"mart.orders": "Catalog_Name.Mart.Orders"},
+        ),
+    ],
+)
+def test_sql_a_target_differing_only_in_case_changes_nothing(sql, mapping):
+    assert rewrite.rewrite_sql_cells([sql], mapping) == ([sql], [])
+
+
 def test_post_cells_without_sql_rewrite_each_cell_on_its_own():
     mappings = sourcing.XrefMappings(exact={"sales.orders": "cat.sales.orders"})
     out, remapped = xref_apply.apply_post_cells(

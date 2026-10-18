@@ -170,6 +170,11 @@ def _match(name: str, mapping: dict[str, str]) -> tuple[str, str] | None:
     return None
 
 
+def _folded(*parts: str) -> tuple[str, ...]:
+    """Name *parts* as Databricks compares them: case-insensitively."""
+    return tuple(part.lower() for part in parts)
+
+
 def _lookup(name: str, mapping: dict[str, str]) -> str | None:
     """The target for a table name (see :func:`_match`)."""
     hit = _match(name, mapping)
@@ -580,30 +585,43 @@ class _VariableRewrite:
         ``catalog.schema`` and nothing else reads it, so that its own literal
         moves there (``moves_to``)."""
         mapped = [d for d in prefix.dependents if d.target is not None]
-        homes = {(d.target[0], d.target[1]) for d in mapped if d.target}
+        homes = self._homes(mapped)
         if (
             mapped
             and not prefix.pinned
             and len(homes) == 1
             and all(d.target is not None for d in prefix.dependents)
-            and all(d.column is not None or (d.target and d.target[2] == d.member) for d in mapped)
+            and all(
+                d.column is not None or (d.target and _folded(d.target[2]) == _folded(d.member))
+                for d in mapped
+            )
         ):
-            prefix.moves_to = homes.pop()
+            prefix.moves_to = next(iter(homes.values()))
+
+    @staticmethod
+    def _homes(mapped: list[_Dependent]) -> dict[tuple[str, ...], tuple[str, str]]:
+        """The ``(catalog, schema)`` targets of *mapped*, one per name as
+        Databricks compares names, each spelled as its first mapping does."""
+        homes: dict[tuple[str, ...], tuple[str, str]] = {}
+        for d in mapped:
+            if d.target:
+                homes.setdefault(_folded(d.target[0], d.target[1]), (d.target[0], d.target[1]))
+        return homes
 
     def _settle(self, prefix: _Prefix) -> None:
         mapped = [d for d in prefix.dependents if d.target is not None]
         if not mapped:
             return
+        own = _folded(prefix.catalog, prefix.schema)
         if prefix.moves_to is not None:
-            moved = prefix.moves_to != (prefix.catalog, prefix.schema)
+            moved = _folded(*prefix.moves_to) != own
             if moved:
                 self._edit_literal(prefix.cell, prefix.literal, ".".join(prefix.moves_to))
             for dependent in mapped:
                 self._rename_member(dependent, moved=moved)
             return
-        homes = sorted({(d.target[0], d.target[1]) for d in mapped if d.target})
-        for home in homes:
-            group = [d for d in mapped if d.target and (d.target[0], d.target[1]) == home]
+        for key, home in sorted(self._homes(mapped).items()):
+            group = [d for d in mapped if d.target and _folded(d.target[0], d.target[1]) == key]
             editable = [d for d in group if d.column is not None]
             for dependent in group:
                 if dependent.column is None:
@@ -615,7 +633,7 @@ class _VariableRewrite:
                     )
             if not editable:
                 continue
-            moved = home != (prefix.catalog, prefix.schema)
+            moved = key != own
             if moved:
                 name = self._prefix_for(home, prefix, editable)
                 for dependent in editable:
@@ -630,7 +648,9 @@ class _VariableRewrite:
         """Rewrite the ``'.member'`` a mapping renames, and count the name as
         remapped when it moved or was renamed."""
         assert dependent.target is not None and dependent.key is not None  # a mapped one
-        renamed = dependent.target[2] != dependent.member and dependent.suffix is not None
+        renamed = (
+            _folded(dependent.target[2]) != _folded(dependent.member) and dependent.suffix is not None
+        )
         if renamed and dependent.suffix is not None:
             self._edit_literal(dependent.cell, dependent.suffix, f".{dependent.target[2]}")
         if moved or renamed:
@@ -643,11 +663,12 @@ class _VariableRewrite:
         first = min(
             (d.cell, d.column.this.meta.get("start", 0) if d.column else 0) for d in group
         )
+        wanted = _folded(*home)
         for other in self.prefixes:
-            if other.home == home and all(d.active.get(other.name) is other for d in group):
+            if _folded(*other.home) == wanted and all(d.active.get(other.name) is other for d in group):
                 return other.name
         for catalog, schema, cell, offset, name in self.added:
-            if (catalog, schema) == home and (cell, offset) < first:
+            if _folded(catalog, schema) == wanted and (cell, offset) < first:
                 return name
         name = self._new_name(home)
         cell = self.cells[prefix.cell]
