@@ -34,11 +34,19 @@ ALTER TABLE IDENTIFIER(session.T) CLUSTER BY (acct_id, open_dt);   -- existing, 
 `OPTIMIZE`, `ANALYZE` and `VACUUM` on Unity Catalog managed tables by itself.
 Emit `OPTIMIZE <table> FULL` **once**, right after first enabling clustering or
 changing keys — declaring keys does not rewrite rows already written, and plain
-`OPTIMIZE` is incremental so it will not re-cluster them. `OPTIMIZE` takes no
-`IDENTIFIER`, so run it from the table variable:
-`SET VAR STMT = CONCAT('OPTIMIZE ', session.T, ' FULL'); EXECUTE IMMEDIATE STMT;`. ⚠️ Emit no scheduled
-or repeated `OPTIMIZE`/`VACUUM`: that is a maintenance job smuggled into an ETL
-script. Say under Risks that upkeep is a table setting and leave it there.
+`OPTIMIZE` is incremental so it will not re-cluster them. `FULL` needs Runtime
+16.0 or above; say so under Risks. `OPTIMIZE` takes no `IDENTIFIER`, so build
+it from the table's variable and run it:
+
+```sql
+DECLARE OR REPLACE VARIABLE STMT STRING;
+SET VAR STMT = CONCAT('OPTIMIZE ', session.T, ' FULL');
+EXECUTE IMMEDIATE STMT;
+```
+
+⚠️ Emit no scheduled or repeated `OPTIMIZE`/`VACUUM`: that is a maintenance job
+smuggled into an ETL script. Say under Risks that upkeep is a table setting and
+leave it there.
 
 ⚠️ **`CLUSTER BY` is not row order.** It colocates related rows so scans skip
 files; `SELECT * FROM t` still returns rows in no guaranteed order, so it can

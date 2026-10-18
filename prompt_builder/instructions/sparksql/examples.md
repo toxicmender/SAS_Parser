@@ -155,8 +155,9 @@ orders the view, not whatever selects from it — a consumer that depends on the
 order must restate it. The second step has no `OUT=`, so input and output are
 the same permanent table: a view over it would be self-referential, and
 `CLUSTER BY` is what "stored in `acct_id` order" means here. `OPTIMIZE` takes
-no `IDENTIFIER`, so it runs from the table's variable. ⚠️ Clustering colocates
-rows for skipping; it does not make reads come back sorted.
+no `IDENTIFIER`, so it runs from the table's variable; its `FULL` needs Runtime
+16.0 or above. ⚠️ Clustering colocates rows for skipping; it does not make
+reads come back sorted.
 
 ## [example: proc:sort] PROC SORT NODUPKEY
 SAS:
