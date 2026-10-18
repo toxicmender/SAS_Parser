@@ -250,6 +250,13 @@ def test_a_declared_name_loses_its_qualifier_and_keeps_its_offsets(sql, expected
     assert len(expected) == len(sql)
 
 
+def test_an_unclosed_literal_unqualifies_nothing():
+    from target_language import unqualify_declared_names
+
+    sql = "DECLARE session.Q STRING DEFAULT 'never closed"
+    assert unqualify_declared_names(sql) == sql
+
+
 def test_restoring_tolerates_a_placeholder_whose_case_changed():
     masked, originals = mask_identifier_clauses("SELECT IDENTIFIER(session.AGG)(c1) FROM t")
     regenerated = masked.replace("__sasp_identifier_0__", "__SASP_IDENTIFIER_0__")

@@ -402,8 +402,8 @@ class _VariableRewrite:
                 if (prefix := prefix_of.get(session_variable(column) or "")) is not None:
                     prefix.pinned = True
         literal = value if _string_value(value) is not None else None
-        if literal is not None and text is not None and text.count(".") == 1 and not shared:
-            catalog, schema = text.split(".")
+        catalog, _, schema = (text or "").partition(".")
+        if literal is not None and catalog and schema and "." not in schema and not shared:
             prefix = _Prefix(index, name, literal, catalog, schema)  # type: ignore[arg-type]
             self.prefixes.append(prefix)
             prefix_of[name] = prefix
@@ -527,8 +527,7 @@ class _VariableRewrite:
     def _rename_member(self, dependent: _Dependent, *, moved: bool) -> None:
         """Rewrite the ``'.member'`` a mapping renames, and count the name as
         remapped when it moved or was renamed."""
-        if dependent.target is None or dependent.key is None:
-            return
+        assert dependent.target is not None and dependent.key is not None  # a mapped one
         renamed = dependent.target[2] != dependent.member and dependent.suffix is not None
         if renamed and dependent.suffix is not None:
             self._edit_literal(dependent.cell, dependent.suffix, f".{dependent.target[2]}")

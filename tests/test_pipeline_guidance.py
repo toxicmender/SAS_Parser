@@ -417,6 +417,8 @@ def test_meta_flags_name_the_places_an_item_reaches(ref, expected):
         ({"input_datasets": ["work.a"], "output_datasets": ["work.b"]}, False),
         # Two dots spelled through a macro variable are still a WORK name.
         ({"output_datasets": ["work.&prefix._out"]}, False),
+        # A quoted path and a one-level name are not another library's table.
+        ({"input_datasets": ["'/data/raw/x.sas7bdat'", "onelevel"]}, False),
         ({}, False),
     ],
 )

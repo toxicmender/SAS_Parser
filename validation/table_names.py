@@ -348,11 +348,7 @@ class _Answer:
         """A table a command's text names, judged as a table."""
         from sqlglot import exp
 
-        try:
-            table = exp.to_table(spelled, dialect=_DIALECT)
-        except Exception:  # sqlglot raises several unrelated types
-            return
-        self._table(table, writes=writes, where=where)
+        self._table(exp.to_table(spelled, dialect=_DIALECT), writes=writes, where=where)
 
     def _table(
         self,

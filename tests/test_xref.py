@@ -353,6 +353,30 @@ _BOTH_TO_SALES = {"mart.orders": "prod.sales.orders", "mart.items": "prod.sales.
             [(_DECLARES + _USE).replace("'.orders'", "'.orders_v2'")],
             ["mart.orders"],
         ),
+        # Every table stays in the prefix's schema: the prefix is kept, a
+        # renamed member changes, and a table mapped to itself is not counted.
+        (
+            [_DECLARES + _USE],
+            {"mart.orders": "catalog_name.mart.orders_v2", "mart.items": "catalog_name.mart.items"},
+            [(_DECLARES + _USE).replace("'.orders'", "'.orders_v2'")],
+            ["mart.orders"],
+        ),
+        # A table mapped to itself beside one that moves: only the mover is
+        # re-pointed.
+        (
+            [_DECLARES + _USE],
+            {"mart.orders": "catalog_name.mart.orders", "mart.items": "prod.sales.items"},
+            [
+                (_DECLARES + _USE)
+                .replace(
+                    "'catalog_name.mart';\n",
+                    "'catalog_name.mart';\n"
+                    "DECLARE OR REPLACE VARIABLE SALES_PREFIX STRING DEFAULT 'prod.sales';\n",
+                )
+                .replace("CONCAT(session.MART_PREFIX, '.items')", "CONCAT(session.SALES_PREFIX, '.items')")
+            ],
+            ["mart.items"],
+        ),
         # A variable holding a whole literal name gets the target literal.
         (
             ["DECLARE OR REPLACE VARIABLE T STRING DEFAULT 'catalog_name.mart.orders';"],
@@ -502,6 +526,191 @@ def test_post_cells_reads_an_item_s_sql_cells_together():
     assert out[1] == "df = spark.table('sales.orders')"  # not mapped: left alone
     assert out[2] == cells[2][0]
     assert remapped == ["mart.orders"]
+
+
+_PREFIX_ONLY = "DECLARE OR REPLACE VARIABLE MART_PREFIX STRING DEFAULT 'catalog_name.mart';\n"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # Built in brackets, or from more than a prefix and a member.
+        _PREFIX_ONLY
+        + "DECLARE OR REPLACE VARIABLE ORDERS STRING DEFAULT (session.MART_PREFIX || '.orders');",
+        _PREFIX_ONLY + "DECLARE OR REPLACE VARIABLE SUFFIX STRING DEFAULT '.orders';\n"
+        "DECLARE OR REPLACE VARIABLE ORDERS STRING DEFAULT CONCAT(session.MART_PREFIX, session.SUFFIX);",
+        # Built inside a clause from more than a prefix and a member.
+        _PREFIX_ONLY + "SELECT * FROM IDENTIFIER(session.MART_PREFIX || '.' || 'orders');",
+    ],
+)
+def test_sql_a_mapped_name_built_another_way_is_reported(sql, caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="xref.rewrite"):
+        out = rewrite.rewrite_sql_cells([sql], {"mart.orders": "prod.sales.orders"})
+    assert out == ([sql], [])
+    assert "does not change; left as written" in caplog.text
+
+
+def test_sql_a_target_that_is_not_three_parts_leaves_the_variable_alone(caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="xref.rewrite"):
+        out = rewrite.rewrite_sql_cells([_DECLARES], {"mart.orders": "sales.orders"})
+    assert out == ([_DECLARES], [])
+    assert "is not catalog.schema.table" in caplog.text
+
+
+def test_sql_a_group_named_only_inside_a_clause_is_reported(caplog):
+    import logging
+
+    sql = (
+        _PREFIX_ONLY
+        + "DECLARE OR REPLACE VARIABLE ITEMS STRING DEFAULT CONCAT(session.MART_PREFIX, '.items');\n"
+        "SELECT * FROM IDENTIFIER(CONCAT(session.MART_PREFIX, '.orders'));"
+    )
+    with caplog.at_level(logging.WARNING, logger="xref.rewrite"):
+        out = rewrite.rewrite_sql_cells([sql], {"mart.orders": "prod.sales.orders"})
+    assert out == ([sql], [])
+    assert "built inside an IDENTIFIER clause" in caplog.text
+
+
+def test_sql_the_bare_table_name_matches_when_the_qualified_one_does_not():
+    out, remapped = rewrite.rewrite_sql_cells(
+        [_DECLARES + "SELECT * FROM stage.orders;"], {"orders": "prod.sales.orders"}
+    )
+    assert "CONCAT(session.SALES_PREFIX, '.orders')" in out[0]
+    assert out[0].endswith("SELECT * FROM prod.sales.orders;")
+    assert remapped == ["orders"]
+
+
+def test_sql_an_identity_mapping_changes_nothing():
+    sql = "DECLARE OR REPLACE VARIABLE T STRING DEFAULT 'catalog_name.mart.orders';"
+    assert rewrite.rewrite_sql_cells([sql], {"mart.orders": "catalog_name.mart.orders"}) == (
+        [sql],
+        [],
+    )
+
+
+def test_sql_two_libraries_moving_to_one_schema_share_the_new_prefix():
+    sql = (
+        _PREFIX_ONLY
+        + "DECLARE OR REPLACE VARIABLE STAGE_PREFIX STRING DEFAULT 'catalog_name.stage';\n"
+        "DECLARE OR REPLACE VARIABLE ORDERS STRING DEFAULT CONCAT(session.MART_PREFIX, '.orders');\n"
+        "DECLARE OR REPLACE VARIABLE ITEMS STRING DEFAULT CONCAT(session.MART_PREFIX, '.items');\n"
+        "DECLARE OR REPLACE VARIABLE RAW STRING DEFAULT CONCAT(session.STAGE_PREFIX, '.raw');\n"
+        "DECLARE OR REPLACE VARIABLE KEEP STRING DEFAULT CONCAT(session.STAGE_PREFIX, '.keep');\n"
+    )
+    out, remapped = rewrite.rewrite_sql_cells(
+        [sql], {"mart.orders": "prod.sales.orders", "stage.raw": "prod.sales.raw"}
+    )
+    assert out[0].count("VARIABLE SALES_PREFIX STRING DEFAULT 'prod.sales'") == 1
+    assert "CONCAT(session.SALES_PREFIX, '.orders')" in out[0]
+    assert "CONCAT(session.SALES_PREFIX, '.raw')" in out[0]
+    assert remapped == ["mart.orders", "stage.raw"]
+
+
+def test_sql_a_prefix_without_a_closing_semicolon_gets_one():
+    cells = [
+        "DECLARE OR REPLACE VARIABLE MART_PREFIX STRING DEFAULT 'catalog_name.mart'",
+        "DECLARE OR REPLACE VARIABLE ORDERS STRING DEFAULT CONCAT(session.MART_PREFIX, '.orders');\n"
+        "DECLARE OR REPLACE VARIABLE ITEMS STRING DEFAULT CONCAT(session.MART_PREFIX, '.items');",
+    ]
+    out, _ = rewrite.rewrite_sql_cells(cells, {"mart.orders": "prod.sales.orders"})
+    assert out[0] == (
+        cells[0] + ";\nDECLARE OR REPLACE VARIABLE SALES_PREFIX STRING DEFAULT 'prod.sales';"
+    )
+
+
+def test_sql_a_new_prefix_name_counts_up_past_taken_names():
+    taken = (
+        "DECLARE OR REPLACE VARIABLE SALES_PREFIX STRING DEFAULT 'a.b';\n"
+        "DECLARE OR REPLACE VARIABLE PROD_SALES_PREFIX STRING DEFAULT 'c.d';\n"
+    )
+    out, _ = rewrite.rewrite_sql_cells([taken + _DECLARES], {"mart.orders": "prod.sales.orders"})
+    assert "VARIABLE PROD_SALES_PREFIX_2 STRING DEFAULT 'prod.sales';" in out[0]
+    assert "CONCAT(session.PROD_SALES_PREFIX_2, '.orders')" in out[0]
+
+
+def test_sql_a_clause_whose_expression_does_not_parse_is_passed_over():
+    sql = _DECLARES + "SELECT * FROM IDENTIFIER(session.MART_PREFIX ||);\nSELECT * FROM sales.orders;"
+    out = rewrite.rewrite_sql(sql, _MAPPING)
+    assert out == sql.replace("FROM sales.orders", "FROM cat.sales.orders")
+
+
+def test_sql_a_mapped_name_without_a_position_leaves_the_cell_as_written(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setattr(rewrite, "_name_span", lambda table: None)
+    with caplog.at_level(logging.WARNING, logger="xref.rewrite"):
+        assert rewrite.rewrite_sql("SELECT * FROM sales.orders", _MAPPING) == (
+            "SELECT * FROM sales.orders"
+        )
+    assert "no source position" in caplog.text
+
+
+def test_name_span_needs_a_recorded_position():
+    from sqlglot import exp
+
+    assert rewrite._name_span(exp.Table(this=exp.to_identifier("orders"))) is None
+
+
+def test_sql_cells_are_left_as_written_without_sqlglot(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setitem(sys.modules, "sqlglot", None)
+    with caplog.at_level(logging.WARNING, logger="xref.rewrite"):
+        assert rewrite.rewrite_sql_cells(["SELECT * FROM sales.orders"], _MAPPING) == (
+            ["SELECT * FROM sales.orders"],
+            [],
+        )
+    assert "sqlglot is not installed" in caplog.text
+
+
+def test_sql_a_prefix_declared_after_the_group_is_not_reused():
+    # SALES_PREFIX holds the target but comes too late for ORDERS to read it.
+    sql = _DECLARES + "DECLARE OR REPLACE VARIABLE SALES_PREFIX STRING DEFAULT 'prod.sales';\n"
+    out, _ = rewrite.rewrite_sql_cells([sql], {"mart.orders": "prod.sales.orders"})
+    assert "VARIABLE PROD_SALES_PREFIX STRING DEFAULT 'prod.sales';" in out[0]
+    assert "CONCAT(session.PROD_SALES_PREFIX, '.orders')" in out[0]
+
+
+def test_sql_one_library_split_across_two_schemas_gets_two_prefixes():
+    sql = _DECLARES + (
+        "DECLARE OR REPLACE VARIABLE KEEP STRING DEFAULT CONCAT(session.MART_PREFIX, '.keep');\n"
+    )
+    out, remapped = rewrite.rewrite_sql_cells(
+        [sql], {"mart.orders": "prod.sales.orders", "mart.items": "prod.stock.items"}
+    )
+    assert "VARIABLE SALES_PREFIX STRING DEFAULT 'prod.sales';" in out[0]
+    assert "VARIABLE STOCK_PREFIX STRING DEFAULT 'prod.stock';" in out[0]
+    assert "CONCAT(session.SALES_PREFIX, '.orders')" in out[0]
+    assert "CONCAT(session.STOCK_PREFIX, '.items')" in out[0]
+    assert "CONCAT(session.MART_PREFIX, '.keep')" in out[0]
+    assert remapped == ["mart.items", "mart.orders"]
+
+
+def test_sql_a_new_prefix_name_keeps_counting():
+    taken = "".join(
+        f"DECLARE OR REPLACE VARIABLE {name} STRING DEFAULT 'x.y';\n"
+        for name in ("SALES_PREFIX", "PROD_SALES_PREFIX", "PROD_SALES_PREFIX_2")
+    )
+    out, _ = rewrite.rewrite_sql_cells([taken + _DECLARES], {"mart.orders": "prod.sales.orders"})
+    assert "CONCAT(session.PROD_SALES_PREFIX_3, '.orders')" in out[0]
+
+
+def test_post_cells_without_sql_rewrite_each_cell_on_its_own():
+    mappings = sourcing.XrefMappings(exact={"sales.orders": "cat.sales.orders"})
+    out, remapped = xref_apply.apply_post_cells(
+        [("df = spark.table('sales.orders')", "python")], mappings
+    )
+    assert (out, remapped) == (["df = spark.table('cat.sales.orders')"], [])
+
+
+def test_post_with_nothing_to_rewrite_returns_the_code():
+    mappings = sourcing.XrefMappings(exact={"mart.orders": "prod.sales.orders"})
+    assert xref_apply.apply_both("   ", "Spark SQL", mappings).code == "   "
+    assert xref_apply.apply_post_cells([("SELECT 1", "sql")], None) == (["SELECT 1"], [])  # type: ignore[arg-type]
 
 
 def test_sql_session_variables_alone_change_nothing():

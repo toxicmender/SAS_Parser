@@ -420,6 +420,8 @@ def test_every_statement_the_rule_names_is_judged(sql, problems):
         "RETURN SELECT * FROM IDENTIFIER(session.B);",
         # Dropping a WORK dataset is no permanent write.
         "CREATE OR REPLACE TEMP VIEW orders AS SELECT 1 AS a;\nDROP TABLE IF EXISTS orders;",
+        # A function's name is no table, and dropping one reads none.
+        "DROP FUNCTION IF EXISTS main.mart.f;",
         # A path read in place is a file.
         "VACUUM delta.`/Volumes/c/s/v/t`;",
         # The forms the rule asks for.
