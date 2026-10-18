@@ -122,14 +122,20 @@ def test_a_stored_view_built_through_execute_immediate_passes():
     assert (result.score, result.details.split(" ")[0]) == (1.0, "1/1")
 
 
-def test_a_qualified_declaration_is_read():
-    # sqlglot reads `DECLARE ... session.x` only as a command.
+@pytest.mark.parametrize(
+    "keyword",
+    # VAR is VARIABLE's synonym in Spark's grammar (`variable: VARIABLE | VAR`).
+    ["", "VARIABLE ", "VAR "],
+)
+def test_a_qualified_declaration_is_read(keyword):
+    # sqlglot reads `DECLARE ... session.x` only as a command; the check reads
+    # it as the plain DECLARE it is once the qualifier is blanked out.
     result = _score(
-        "DECLARE OR REPLACE session.MART_PREFIX STRING DEFAULT 'catalog_name.mart';\n"
-        "DECLARE OR REPLACE VARIABLE T STRING DEFAULT CONCAT(session.MART_PREFIX, '.t');\n"
+        f"DECLARE OR REPLACE {keyword}session.MART_PREFIX STRING DEFAULT 'catalog_name.mart';\n"
+        f"DECLARE OR REPLACE {keyword}session.T STRING DEFAULT CONCAT(session.MART_PREFIX, '.t');\n"
         "SELECT * FROM IDENTIFIER(session.T);"
     )
-    assert result.score == 1.0
+    assert (result.score, result.details.split(" ")[0]) == (1.0, "1/1")
 
 
 @pytest.mark.parametrize(

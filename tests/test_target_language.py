@@ -223,6 +223,33 @@ def test_an_error_inside_a_clause_is_still_a_syntax_error(sql, clause):
     assert error is not None and error.endswith(f"(in {clause})")
 
 
+@pytest.mark.parametrize(
+    "sql, expected",
+    [
+        (
+            "DECLARE OR REPLACE VARIABLE session.Q STRING DEFAULT 'x';",
+            "DECLARE OR REPLACE VARIABLE         Q STRING DEFAULT 'x';",
+        ),
+        # VAR is VARIABLE's synonym; a list of names; system.session.
+        (
+            "DECLARE VAR system.session.Q, session.R STRING = 'x';",
+            "DECLARE VAR                Q,         R STRING = 'x';",
+        ),
+        # Only a declared name: a later read, a string and SET VAR keep theirs.
+        (
+            "DECLARE session.Q STRING; SELECT session.Q, 'DECLARE session.x'; SET VAR session.Q = 'a';",
+            "DECLARE         Q STRING; SELECT session.Q, 'DECLARE session.x'; SET VAR session.Q = 'a';",
+        ),
+        ("DECLARE OR REPLACE VARIABLE PLAIN STRING;", "DECLARE OR REPLACE VARIABLE PLAIN STRING;"),
+    ],
+)
+def test_a_declared_name_loses_its_qualifier_and_keeps_its_offsets(sql, expected):
+    from target_language import unqualify_declared_names
+
+    assert unqualify_declared_names(sql) == expected
+    assert len(expected) == len(sql)
+
+
 def test_restoring_tolerates_a_placeholder_whose_case_changed():
     masked, originals = mask_identifier_clauses("SELECT IDENTIFIER(session.AGG)(c1) FROM t")
     regenerated = masked.replace("__sasp_identifier_0__", "__SASP_IDENTIFIER_0__")

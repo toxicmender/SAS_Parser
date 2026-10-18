@@ -48,7 +48,12 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from target_language import SPARKSQL, mask_identifier_clauses
+from target_language import (
+    SPARKSQL,
+    mask_identifier_clauses,
+    session_variable,
+    unqualify_declared_names,
+)
 
 if TYPE_CHECKING:  # sqlglot is imported where a parse needs it
     from sqlglot import exp
@@ -62,13 +67,13 @@ _PATH_FORMATS = frozenset(
     {"delta", "parquet", "csv", "json", "orc", "avro", "text", "binaryfile"}
 )
 
-# A DECLARE sqlglot reads only as a command — a qualified name, `DECLARE OR
-# REPLACE session.x ...`: its names, and its default after DEFAULT or `=`.
+# A DECLARE sqlglot still reads only as a command once its names are
+# unqualified (target_language.unqualify_declared_names) is one whose default
+# it cannot parse: its names, after the optional keywords.
 _DECLARE_NAMES_RE = re.compile(
-    r"\s*(?:OR\s+REPLACE\s+)?(?:VARIABLE\s+)?(?P<names>[\w.]+(?:\s*,\s*[\w.]+)*)",
+    r"\s*(?:OR\s+REPLACE\s+)?(?:VAR(?:IABLE)?\s+)?(?P<names>[\w.]+(?:\s*,\s*[\w.]+)*)",
     re.IGNORECASE,
 )
-_DECLARE_DEFAULT_RE = re.compile(r"(?:\bDEFAULT\b|=)\s*(?P<default>.+?)\s*;?\s*\Z", re.I | re.S)
 
 # What a statement creates, alters or drops when it is no table: a schema or a
 # catalog names no table, and neither does a function.
@@ -104,17 +109,7 @@ class TableNameCheck:
     unparsed: int = 0
 
 
-def _variable(column: object) -> str | None:
-    """The session variable *column* reads — ``session.x``,
-    ``system.session.x`` or a bare ``x`` — upper-cased, or ``None``."""
-    from sqlglot import exp
-
-    if not isinstance(column, exp.Column):
-        return None
-    qualifier = (column.text("db").lower(), column.table.lower())
-    if qualifier in (("", ""), ("", "session"), ("system", "session")):
-        return column.name.upper()
-    return None
+_variable = session_variable
 
 
 def _variables(expression: object) -> list[str]:
@@ -246,18 +241,12 @@ class _Answer:
             self._table(table, writes=table is target)
 
     def _declare_command(self, text: str) -> None:
-        import sqlglot
-
+        """A DECLARE whose default sqlglot cannot parse: its variables exist,
+        holding a value this check cannot judge."""
         names = _DECLARE_NAMES_RE.match(text)
-        if names is None:
-            return
-        default: object | None = None
-        if found := _DECLARE_DEFAULT_RE.search(text, names.end()):
-            try:
-                default = sqlglot.parse_one(found["default"], read=_DIALECT)
-            except Exception:  # sqlglot raises several unrelated types
-                default = _UNREADABLE
-        self.declare(map(_declared_name, re.split(r"\s*,\s*", names["names"])), default)
+        if names is not None:
+            names_declared = re.split(r"\s*,\s*", names["names"])
+            self.declare(map(_declared_name, names_declared), _UNREADABLE)
 
     def _command_table(self, text: str) -> None:
         """The table an OPTIMIZE or VACUUM *text* names, judged as a table."""
@@ -365,7 +354,9 @@ def check_table_names(blocks: Iterable[str]) -> TableNameCheck:
     for block in blocks:
         masked, identifiers = mask_identifier_clauses(block, _DIALECT)
         try:
-            statements = sqlglot.parse(masked, read=_DIALECT)
+            statements = sqlglot.parse(
+                unqualify_declared_names(masked, _DIALECT), read=_DIALECT
+            )
         except Exception:  # sqlglot raises several unrelated types
             answer.result.unparsed += 1
             continue

@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # sqlglot is imported where a parse needs it
-    from sqlglot.tokens import Token
+    from sqlglot.tokenizer_core import Token
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,8 @@ __all__ = [
     "normalize_language",
     "resolve_target_language",
     "restore_identifier_clauses",
+    "session_variable",
+    "unqualify_declared_names",
 ]
 
 DEFAULT_OUTPUT_LANGUAGE = "Spark SQL"
@@ -146,6 +148,82 @@ def restore_identifier_clauses(sql: str, originals: dict[str, str]) -> str:
     by_name = {name.lower(): clause for name, clause in originals.items()}
     pattern = re.compile("|".join(map(re.escape, originals)), re.IGNORECASE)
     return pattern.sub(lambda match: by_name[match.group(0).lower()], sql)
+
+
+def session_variable(node: object) -> str | None:
+    """The session variable a sqlglot column node reads — ``session.x``,
+    ``system.session.x`` or a bare ``x`` — upper-cased, or ``None``."""
+    from sqlglot import exp
+
+    if not isinstance(node, exp.Column):
+        return None
+    qualifier = (node.text("db").lower(), node.table.lower())
+    if qualifier in (("", ""), ("", "session"), ("system", "session")):
+        return node.name.upper()
+    return None
+
+
+def _qualifier_end(tokens: list[Token], j: int) -> int | None:
+    """The index of the dot ending a ``session.`` or ``system.session.``
+    qualifier that starts at token *j* and is followed by a name, else
+    ``None``."""
+    k = j
+    if (
+        k + 2 < len(tokens)
+        and tokens[k].text.lower() == "system"
+        and tokens[k + 1].token_type.name == "DOT"
+    ):
+        k += 2
+    if (
+        k + 2 < len(tokens)
+        and tokens[k].text.lower() == "session"
+        and tokens[k + 1].token_type.name == "DOT"
+    ):
+        return k + 1
+    return None
+
+
+def unqualify_declared_names(sql: str, dialect: str = "databricks") -> str:
+    """*sql* with the ``session.`` / ``system.session.`` qualifier of every
+    name a ``DECLARE`` declares blanked out by spaces, the length unchanged.
+
+    sqlglot reads ``DECLARE OR REPLACE VARIABLE session.x STRING DEFAULT
+    ...`` only as an opaque command, though the qualified name is valid
+    Databricks SQL; without the qualifier the statement parses as an ordinary
+    ``DECLARE``, default and all. Blanking rather than deleting keeps every
+    offset, so a caller can parse the result and still edit the original.
+    """
+    try:
+        from sqlglot.dialects.dialect import Dialect
+
+        tokens = Dialect.get_or_raise(dialect).tokenize(sql)
+    except Exception:  # sqlglot's TokenError: an unclosed literal or comment
+        return sql
+    blanks: list[tuple[int, int]] = []
+    for i, token in enumerate(tokens):
+        if token.token_type.name != "DECLARE":
+            continue
+        j = i + 1
+        if j + 1 < len(tokens) and [t.token_type.name for t in tokens[j : j + 2]] == [
+            "OR",
+            "REPLACE",
+        ]:
+            j += 2
+        if j + 1 < len(tokens) and tokens[j].text.upper() in ("VAR", "VARIABLE"):
+            j += 1
+        while j < len(tokens):  # the names, separated by commas
+            end = _qualifier_end(tokens, j)
+            if end is not None:
+                blanks.append((tokens[j].start, tokens[end].end + 1))
+                j = end + 1
+            if j + 1 < len(tokens) and tokens[j + 1].token_type.name == "COMMA":
+                j += 2
+                continue
+            break
+    out = sql
+    for start, end in blanks:
+        out = out[:start] + re.sub(r"[^\n]", " ", out[start:end]) + out[end:]
+    return out
 
 
 def _syntax_error(exc: Exception) -> str:
