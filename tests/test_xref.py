@@ -787,6 +787,58 @@ def test_sql_a_prefix_set_to_another_value_before_the_group_is_not_reused():
     assert "CONCAT(session.PROD_SALES_PREFIX, '.orders')" in out[0]
 
 
+_SHARED_DEFAULT = (
+    "DECLARE OR REPLACE VARIABLE MART_PREFIX STRING DEFAULT 'c.mart';\n"
+    "DECLARE OR REPLACE VARIABLE T1, T2 STRING DEFAULT CONCAT(session.MART_PREFIX, '.t');\n"
+    "DECLARE OR REPLACE VARIABLE U STRING DEFAULT CONCAT(session.MART_PREFIX, '.u');"
+)
+
+
+@pytest.mark.parametrize(
+    "mapping, expected",
+    [
+        # Two variables share one default: it is renamed once.
+        ({"mart.t": "c.mart.orders"}, _SHARED_DEFAULT.replace("'.t'", "'.orders'")),
+        # ... and re-pointed once.
+        (
+            {"mart.t": "d.other.t"},
+            _SHARED_DEFAULT.replace(
+                "'c.mart';\n",
+                "'c.mart';\nDECLARE OR REPLACE VARIABLE OTHER_PREFIX STRING DEFAULT 'd.other';\n",
+            ).replace("CONCAT(session.MART_PREFIX, '.t')", "CONCAT(session.OTHER_PREFIX, '.t')"),
+        ),
+    ],
+)
+def test_sql_a_default_shared_by_two_variables_is_edited_once(mapping, expected):
+    out, remapped = rewrite.rewrite_sql_cells([_SHARED_DEFAULT], mapping)
+    assert (out, remapped) == ([expected], ["mart.t"])
+    assert rewrite.rewrite_sql_cells(out, mapping) == (out, [])
+
+
+def test_sql_edits_are_applied_once_and_never_overlap(monkeypatch, caplog):
+    import logging
+
+    sql = "SELECT * FROM sales.orders"
+    real = rewrite._name_edits
+
+    def doubled(cell, mapping, read, on_failure):
+        real(cell, mapping, read, on_failure)
+        cell.edits += cell.edits  # the same edit twice is applied once
+        return True
+
+    monkeypatch.setattr(rewrite, "_name_edits", doubled)
+    assert rewrite.rewrite_sql(sql, _MAPPING) == "SELECT * FROM cat.sales.orders"
+
+    def overlapping(cell, mapping, read, on_failure):
+        cell.edits += [(14, 19, "a"), (17, 26, "b")]
+        return True
+
+    monkeypatch.setattr(rewrite, "_name_edits", overlapping)
+    with caplog.at_level(logging.WARNING, logger="xref.rewrite"):
+        assert rewrite.rewrite_sql(sql, _MAPPING) == sql
+    assert "overlap" in caplog.text
+
+
 def test_post_cells_without_sql_rewrite_each_cell_on_its_own():
     mappings = sourcing.XrefMappings(exact={"sales.orders": "cat.sales.orders"})
     out, remapped = xref_apply.apply_post_cells(

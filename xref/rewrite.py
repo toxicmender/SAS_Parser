@@ -381,6 +381,7 @@ class _VariableRewrite:
 
         values: dict[str, str | None] = {}
         prefix_of: dict[str, _Prefix] = {}
+        shared_read: set[int] = set()
         for index, cell in enumerate(self.cells):
             if cell is None:
                 continue
@@ -390,7 +391,11 @@ class _VariableRewrite:
                     self.declared.add(name)
                     prefix_of.pop(name, None)
                     text = _evaluate(value, values)
-                    self._assign(index, name, value, text, shared, prefix_of)
+                    # `DECLARE a, b ... DEFAULT x`: one value, read (and edited) once.
+                    if not shared or id(value) not in shared_read:
+                        self._assign(index, name, value, text, shared, prefix_of)
+                    if shared:
+                        shared_read.add(id(value))
                     values[name] = text
                 if isinstance(statement, exp.Command):
                     rest = statement.expression
@@ -759,10 +764,13 @@ def rewrite_sql_cells(
             parsed[index] = None
     remapped = _VariableRewrite(parsed, mapping, read).run()
     for index, cell in enumerate(parsed):
-        if cell is not None and cell.edits:
-            out[index] = restore_identifier_clauses(
-                _apply_edits(cell.masked, cell.edits), cell.identifiers
-            )
+        if cell is None or not cell.edits:
+            continue
+        edits = _without_overlaps(cell.edits)
+        if edits is None:
+            _unparseable("Spark SQL", ValueError("two rewrites of the same text overlap"), on_failure)
+            continue
+        out[index] = restore_identifier_clauses(_apply_edits(cell.masked, edits), cell.identifiers)
     if out != list(cells):
         logger.info(f"rewrite_sql: rewrote table references under dialect {read!r}")
     return out, remapped
@@ -888,6 +896,17 @@ def _offsetter(source: str):
         return starts[lineno - 1] + len(line.encode("utf-8")[:col].decode("utf-8"))
 
     return offset
+
+
+def _without_overlaps(edits: list[tuple[int, int, str]]) -> list[tuple[int, int, str]] | None:
+    """*edits* with each repeated one kept once, or ``None`` when two of them
+    change overlapping text, which applying both would corrupt. Insertions at
+    one offset do not overlap; they are applied in a fixed order."""
+    unique = sorted(set(edits))
+    for (_, end, _), (start, _, _) in zip(unique, unique[1:]):
+        if start < end:
+            return None
+    return unique
 
 
 def _apply_edits(source: str, edits: list[tuple[int, int, str]]) -> str:
