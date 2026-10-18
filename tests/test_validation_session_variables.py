@@ -422,6 +422,12 @@ _VARS = "DECLARE OR REPLACE VARIABLE LIB_PREFIX STRING DEFAULT 'catalog_name.lib
             "SELECT * FROM IDENTIFIER(session.T);",
             ["`SET T = ...` without VAR", "`T` is never given a value"],
         ),
+        # A write inside a scripting block.
+        (
+            "DECLARE OR REPLACE VARIABLE i INT DEFAULT 0;\n"
+            "WHILE i < 3 DO\n  INSERT INTO perm_t SELECT 1;\n  SET VAR i = i + 1;\nEND WHILE;",
+            ["`perm_t` is written as a permanent table by a literal name"],
+        ),
     ],
 )
 def test_every_statement_the_rule_names_is_judged(sql, problems):
@@ -454,6 +460,12 @@ def test_every_statement_the_rule_names_is_judged(sql, problems):
         # A variable read from a table through its own variable.
         _VARS + "DECLARE OR REPLACE VARIABLE N INT;\n"
         "SET VAR N = (SELECT COUNT(*) FROM IDENTIFIER(session.OLD));",
+        # A WORK dataset made inside a scripting block, and a MERGE's actions.
+        "DECLARE OR REPLACE VARIABLE i INT DEFAULT 0;\n"
+        "WHILE i < 3 DO\n  CREATE OR REPLACE TEMP VIEW step AS SELECT i AS n;\n"
+        "  SET VAR i = i + 1;\nEND WHILE;",
+        _VARS + "MERGE INTO IDENTIFIER(session.OLD) AS t USING IDENTIFIER(session.NEW) AS s "
+        "ON t.k = s.k WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *;",
     ],
 )
 def test_what_the_rule_allows_passes(sql):

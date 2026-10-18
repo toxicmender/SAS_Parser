@@ -318,8 +318,9 @@ CREATE OR REPLACE TABLE IDENTIFIER(session.DEMO_TABLE) AS SELECT ...;
   - any of these in the query a variable's value reads
     (`SET VAR n = (SELECT ... FROM t)`, a `DECLARE ... DEFAULT (SELECT ...)`);
   - a permanent write (CREATE TABLE, INSERT, MERGE, UPDATE, DELETE, COPY INTO,
-    DROP TABLE, …) to an unqualified literal name — a `CREATE TABLE` too when
-    a temporary view already has that name;
+    DROP TABLE, …) to an unqualified literal name, inside a `WHILE ... DO`
+    block too — a `CREATE TABLE` too when a temporary view already has that
+    name;
   - an `IDENTIFIER(...)` where Databricks takes none: `OPTIMIZE`, `VACUUM`,
     the new name of `RENAME TO`, a `CLONE` source. Those statements are built
     from the variables and run through `EXECUTE IMMEDIATE`;

@@ -26,7 +26,8 @@ order, and judges each table reference the convention covers:
   rejects it — and fails;
 - an unqualified literal written as a permanent table fails — the target of
   CREATE TABLE (or a view that is not temporary), INSERT, MERGE, UPDATE,
-  DELETE, COPY INTO, DROP TABLE, TRUNCATE or ALTER;
+  DELETE, COPY INTO, DROP TABLE, TRUNCATE or ALTER, at the top level or in a
+  scripting block (``WHILE ... DO``);
 - a stored view whose query reads a session variable fails: Databricks
   keeps a stored view's text, and "Temporary variables cannot be referenced
   within ... the body of a persisted view" ("DECLARE VARIABLE"), so such a
@@ -268,12 +269,24 @@ class _Answer:
         if isinstance(statement, exp.Use) or _kind(statement) in _NOT_TABLES:
             return  # USE CATALOG / SCHEMA, CREATE SCHEMA, ...: no table
         target = _target_table(statement)
+        # What the statement writes, and each statement a scripting block
+        # nests (`WHILE ... DO INSERT INTO t ...; END WHILE`).
+        writes: set[int] = set()
+        for node in statement.walk():
+            written = _target_table(node)
+            if not isinstance(written, exp.Table):
+                continue
+            if _temporary_view(node):
+                # A WORK dataset: no permanent write, though its query still reads.
+                self.temp_views.add(written.name.lower())
+            else:
+                writes.add(id(written))
         stored_view: set[int] = set()
-        if _temporary_view(statement) and isinstance(target, exp.Table):
-            # A WORK dataset: no permanent write, though its query still reads.
-            self.temp_views.add(target.name.lower())
-            target = None
-        elif isinstance(statement, (exp.Create, exp.Alter)) and _kind(statement) == "VIEW":
+        if (
+            isinstance(statement, (exp.Create, exp.Alter))
+            and _kind(statement) == "VIEW"
+            and not _temporary_view(statement)
+        ):
             if not (isinstance(target, exp.Table) and target.name.lower() in self.temp_views):
                 stored_view = {
                     id(table) for body in _view_bodies(statement) for table in body.find_all(exp.Table)
@@ -296,7 +309,7 @@ class _Answer:
             where = takes_none.get(id(table))
             self._table(
                 table,
-                writes=table is target or where == "the new name of RENAME TO",
+                writes=id(table) in writes or where == "the new name of RENAME TO",
                 temp_view_ok=not creates_table,
                 where=where,
             )
