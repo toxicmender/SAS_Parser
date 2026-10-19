@@ -67,8 +67,10 @@ produces, never sources.
   first file that reads it; appending one copy per reader would load its rows
   five times.
 - **A LIBNAME whose tables are named is planned per table.** Its schema-level
-  item — the stand-in when no table is known — is dropped; a LIBNAME nothing
-  names keeps it.
+  item — the stand-in when no table is known — is dropped. A LIBNAME nothing
+  names a table through keeps it, blocked, as a library directory with no
+  member named is: it names no table to load, and run as planned it would
+  select one named after the schema (`"HIST"."HIST"`).
 - **Blocked, not guessed:** a connection whose engine is unknown (its `CONNECT`
   made by a macro call), a `@dblink` (the table lives in the *linked* database),
   and an unresolved `&macro` in the table name, alongside the usual option
