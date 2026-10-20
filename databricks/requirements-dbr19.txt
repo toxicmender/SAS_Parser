@@ -61,7 +61,7 @@ langchain-protocol==0.0.18
 langgraph==1.2.10
 langgraph-checkpoint==4.1.1
 langgraph-prebuilt==1.1.0
-langgraph-sdk==0.4.2
+langgraph-sdk==0.4.4
 langsmith==0.10.12
 llvmlite==0.48.0
 markdown-it-py==4.2.0
