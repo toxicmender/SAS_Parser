@@ -42,18 +42,48 @@ _CREATE_RACE_MARKERS: Tuple[str, ...] = (
     "TABLE_OR_VIEW_ALREADY_EXISTS",
     "DELTA_TABLE_ALREADY_EXISTS",
     "TableAlreadyExistsException",
+    # The loser of a race to create a managed table whose location the
+    # winner has just initialised.
+    "DELTA_CREATE_TABLE_WITH_NON_EMPTY_LOCATION",
 )
+
+
+def exception_text(exc: BaseException) -> str:
+    """Everything that identifies *exc*: its message, its Spark error
+    condition, and its repr.
+
+    The condition matters on its own: when the Delta error-class JSON does
+    not match the Spark build, ``str(exc)`` comes back *empty* (the message
+    template lookup fails) while ``getCondition()`` still names the error.
+    """
+    parts = [str(exc), type(exc).__name__]
+    for getter in ("getCondition", "getErrorClass"):
+        method = getattr(exc, getter, None)
+        if callable(method):
+            try:
+                value = method()
+            except Exception:  # pragma: no cover - JVM side unavailable
+                value = None
+            if value:
+                parts.append(str(value))
+    java = getattr(exc, "java_exception", None)
+    if java is not None:
+        try:
+            parts.append(str(java.getClass().getName()))
+        except Exception:  # pragma: no cover
+            pass
+    return " ".join(parts)
 
 
 def is_retryable_conflict(exc: BaseException) -> bool:
     """Whether *exc* is a Delta concurrency conflict worth retrying."""
-    text = str(exc)
+    text = exception_text(exc)
     return any(marker in text for marker in _CONFLICT_MARKERS)
 
 
 def is_retryable_ddl(exc: BaseException) -> bool:
     """A conflict, or a lost create race, during idempotent DDL."""
-    text = str(exc)
+    text = exception_text(exc)
     return is_retryable_conflict(exc) or any(m in text for m in _CREATE_RACE_MARKERS)
 
 

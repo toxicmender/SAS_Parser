@@ -325,9 +325,6 @@ class TestDeltaContract(KVStoreContract):
         assert (val.item_id, val.score, val.passed) == ("batch-001", 0.75, True)
         kv = self._spark.table(schema.KV.name(base)).first()
         assert (kv.namespace, kv.scope_id) == ("policy", "task-9")
-        store.set("kv::project_goal", "x")
-        goal = self._spark.table(schema.KV.name(base)).filter("kv_key = 'kv::project_goal'").first()
-        assert (goal.namespace, goal.scope_id) == ("kv", "project_goal")
         # The façade still sees one key space.
         assert store.keys("kv::") == [
             "kv::policy::task-9",
@@ -337,6 +334,9 @@ class TestDeltaContract(KVStoreContract):
         assert len(store.keys()) == 5
         assert store.thread_ids() == ["t1"]
         assert store.stats()["total_keys"] == 5
+        store.set("kv::project_goal", "x")
+        goal = self._spark.table(schema.KV.name(base)).filter("kv_key = 'kv::project_goal'").first()
+        assert (goal.namespace, goal.scope_id) == ("kv", "project_goal")
 
     def test_append_inserts_messages_and_still_merges_the_chat_row(self):
         base = self._base()

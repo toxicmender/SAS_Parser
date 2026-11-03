@@ -46,6 +46,18 @@ def test_lost_create_races_are_retryable_ddl():
     assert not _delta.is_retryable_ddl(RuntimeError("PERMISSION_DENIED"))
 
 
+def test_an_error_with_an_empty_message_is_classified_by_its_condition():
+    class EmptyMessage(Exception):
+        def __str__(self) -> str:
+            return ""
+
+        def getCondition(self) -> str:
+            return "DELTA_CREATE_TABLE_WITH_NON_EMPTY_LOCATION"
+
+    assert _delta.is_retryable_ddl(EmptyMessage())
+    assert not _delta.is_retryable_conflict(EmptyMessage())
+
+
 def test_with_retry_retries_conflicts_then_gives_up(monkeypatch):
     monkeypatch.setattr(_delta.time, "sleep", lambda s: None)
     calls = {"n": 0}
