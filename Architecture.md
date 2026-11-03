@@ -251,8 +251,13 @@ memory/
                         turns older than a recency tail fold monotonically
                         into a KV-stored summary (prompted, never persisted).
                         Store is duck-typed; imports only memory.turns.
+  schema.py             Delta table family DDL (typed tables, clustering,
+                        full-text search indexes), search()/isearch() SQL.
+  chunk_history.py      ChunkHistory: append-only original-vs-converted
+                        chunk record, every attempt kept.
   store.py              KVStore façade over two backends
-                        (_InMemoryBackend dict / _DeltaBackend Spark+Delta),
+                        (_InMemoryBackend dict / _DeltaBackend routing to
+                        the typed Delta tables of memory.schema),
                         KVChatMessageHistory (BaseChatMessageHistory, with
                         optional after-write retention and the chat:: index
                         that gives Thread -> Chat -> Message), ThreadMemoryManager
@@ -1044,8 +1049,17 @@ last seen key (`records_after` — keys are time-ordered), invalidating on
 clear/prune/retention/restore, so an n-item run reads O(n) message rows
 instead of O(n²).
 `_InMemoryBackend` (default) is a plain dict and requires neither pyspark
-nor a JVM; `_DeltaBackend` requires both and uses MERGE INTO / DELETE FROM
-against a Delta table.
+nor a JVM; `_DeltaBackend` requires both and routes each key, by namespace,
+into a family of typed Delta tables derived from one base name
+(`memory.schema`: `B_messages` — append-only INSERTs —, `B_chats`,
+`B_run_items`, `B_validations`, `B_kv`), each liquid-clustered on its lookup
+keys, with row tracking, and — on Databricks DBR 19 with
+`memory.full_text_search` — predictive optimization and full-text search
+indexes that `isearch()` pushdown uses. `MemoryHub.chunk_history`
+(`memory.chunk_history`) adds the append-only `B_chunk_sources` /
+`B_item_attempts` / `B_chunk_conversions` tables (and the
+`B_chunk_history` view): every LLM attempt, accepted or rejected, with each
+member chunk's original SAS text and converted code.
 
 ## Load-bearing invariants
 

@@ -153,6 +153,36 @@ def test_prompt_artifact_captures_the_final_validation_retry():
     assert "missing translated statement" in final_prompt
 
 
+def test_chunk_history_keeps_the_rejected_attempt_beside_the_final_one():
+    llm = _RecordingChatModel()
+    hub = MemoryHub()
+    pipeline = _pipeline(llm, memory=hub, validator=_FailThenPassValidator(), retries=1)
+
+    (output,) = pipeline.run_text(SAS, source_id="retry.sas")
+
+    rows = hub.chunk_history.for_item(output["thread_id"], output["item_id"])
+    assert [(r["attempt"], r["is_final"]) for r in rows] == [(1, False), (2, True)]
+    assert all(r["original_text"] == SAS for r in rows)
+    assert [r["response"] for r in rows] == ["## Analysis\nresp 1", "## Analysis\nresp 2"]
+    assert [r["validation_passed"] for r in rows] == [False, True]
+    assert rows[-1]["chat_id"] == pipeline.chat_id
+    # The thread itself keeps only the accepted turn.
+    thread = hub.get_thread(output["thread_id"]).messages
+    assert [m.content for m in thread][-1] == "## Analysis\nresp 2"
+
+
+def test_a_failing_chunk_history_cannot_fail_a_run(monkeypatch):
+    hub = MemoryHub()
+    pipeline = _pipeline(memory=hub)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("history store down")
+
+    monkeypatch.setattr(hub.chunk_history, "record_attempt", boom)
+    (output,) = pipeline.run_text(SAS, source_id="x.sas")
+    assert output["response"]
+
+
 # ---------------------------------------------------------------------------
 # Long-term memory: the task policy
 # ---------------------------------------------------------------------------
