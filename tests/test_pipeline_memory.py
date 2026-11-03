@@ -165,6 +165,8 @@ def test_chunk_history_keeps_the_rejected_attempt_beside_the_final_one():
     assert all(r["original_text"] == SAS for r in rows)
     assert [r["response"] for r in rows] == ["## Analysis\nresp 1", "## Analysis\nresp 2"]
     assert [r["validation_passed"] for r in rows] == [False, True]
+    assert rows[0]["feedback"] is None
+    assert "Automated validation of your previous answer FAILED" in rows[1]["feedback"]
     assert rows[-1]["chat_id"] == pipeline.chat_id
     # The thread itself keeps only the accepted turn.
     thread = hub.get_thread(output["thread_id"]).messages

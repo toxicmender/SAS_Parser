@@ -32,6 +32,7 @@ import logging
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Literal, Optional, Sequence
 
 from . import schema
@@ -55,8 +56,8 @@ HISTORY_COLUMNS: tuple[str, ...] = (
     "attempt_id", "thread_id", "chat_id", "item_id", "attempt", "is_final",
     "chunk_id", "chunk_key", "member_index", "source_id", "kind", "title",
     "start_line", "end_line", "text_sha256", "original_text", "converted_text",
-    "response", "document", "target_language", "model", "validation_score",
-    "validation_passed", "created_at",
+    "response", "document", "feedback", "target_language", "model",
+    "validation_score", "validation_passed", "created_at", "archived_at",
 )
 
 _FENCE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
@@ -71,7 +72,7 @@ def _sha256(*parts: Optional[str]) -> str:
 
 def _metadata_json(metadata: Any) -> Optional[str]:
     dump = getattr(metadata, "model_dump_json", None)
-    return dump() if callable(dump) else None
+    return str(dump()) if callable(dump) else None
 
 
 def chunk_key(source_id: Optional[str], text: str) -> str:
@@ -117,17 +118,32 @@ def converted_text_for(
     return response or None
 
 
-def _current(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Rows of the latest accepted attempt per (thread_id, item_id)."""
+@dataclass(frozen=True)
+class ArchiveResult:
+    """What one :meth:`ChunkHistory.archive` call moved out of the active
+    tables (``attempt_ids`` lists the archived attempts)."""
+
+    attempts: int = 0
+    conversions: int = 0
+    attempt_ids: tuple[str, ...] = ()
+
+
+def _current_ids(attempts: Iterable[Dict[str, Any]]) -> set[str]:
+    """Attempt ids of the latest accepted attempt per (thread_id, item_id)."""
     latest: Dict[tuple[Any, Any], tuple[float, int, str]] = {}
-    for r in rows:
-        if not r["is_final"]:
+    for a in attempts:
+        if not a["is_final"]:
             continue
-        rank = (r["created_at"] or 0.0, r["attempt"] or 0, r["attempt_id"])
-        key = (r["thread_id"], r["item_id"])
+        rank = (a["created_at"] or 0.0, a["attempt"] or 0, a["attempt_id"])
+        key = (a["thread_id"], a["item_id"])
         if key not in latest or rank > latest[key]:
             latest[key] = rank
-    keep = {rank[2] for rank in latest.values()}
+    return {rank[2] for rank in latest.values()}
+
+
+def _current(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Rows of the latest accepted attempt per (thread_id, item_id)."""
+    keep = _current_ids(rows)
     return [r for r in rows if r["attempt_id"] in keep]
 
 
@@ -181,16 +197,30 @@ class ChunkHistory:
         self._sources: Dict[str, Dict[str, Any]] = {}
         self._attempts: List[Dict[str, Any]] = []
         self._conversions: List[Dict[str, Any]] = []
+        self._attempts_archive: List[Dict[str, Any]] = []
+        self._conversions_archive: List[Dict[str, Any]] = []
+        # Rows recorded with buffer=True, written together by flush().
+        self._pending_sources: List[Dict[str, Any]] = []
+        self._pending_attempts: List[Dict[str, Any]] = []
+        self._pending_conversions: List[Dict[str, Any]] = []
+        # chunk_keys this instance has already stored: their insert-only
+        # MERGE is skipped, so a retry or a re-run writes two INSERTs only.
+        self._known_sources: set[str] = set()
         self._spark = spark
         if base is None:
             return
         if spark is None:
             raise ValueError(f"Delta chunk history (base={base!r}) requires a SparkSession")
-        self._names = {s.suffix: s.name(base) for s in schema.HISTORY_TABLES}
+        tables = schema.HISTORY_TABLES + schema.ARCHIVE_TABLES
+        self._names = {s.suffix: s.name(base) for s in tables}
         self._quoted = {k: schema.quoted_table_name(v) for k, v in self._names.items()}
         self._view = schema.quoted_table_name(schema.chunk_history_view_name(base))
-        schema.ensure_tables(spark, base, schema.HISTORY_TABLES)
+        self._archive_view = schema.quoted_table_name(
+            schema.chunk_history_view_name(base, archived=True)
+        )
+        schema.ensure_tables(spark, base, tables)
         spark.sql(schema.chunk_history_view_ddl(base))
+        spark.sql(schema.chunk_history_view_ddl(base, archived=True))
         if full_text_search:
             self.provision = schema.enable_databricks_features(
                 spark, base, schema.HISTORY_TABLES
@@ -225,11 +255,21 @@ class ChunkHistory:
         validation_passed: Optional[bool] = None,
         target_language: Optional[str] = None,
         model: Optional[str] = None,
+        feedback: Optional[str] = None,
+        buffer: bool = False,
     ) -> str:
         """Record one attempt at *item* (a :class:`chunker.models.SasBatch`).
 
         Writes the attempt row, one conversion row per member chunk, and any
-        member chunk's original text not stored yet. Returns the attempt id.
+        member chunk's original text not stored yet. *feedback* is the
+        corrective note prompted with this attempt — the previous attempt's
+        failed verdict — so a retry's history says why it happened.
+
+        With ``buffer=True`` the rows are held until the next unbuffered
+        call or :meth:`flush`, so an item's rejected attempts and its final
+        one land in one write (three Delta commits per item rather than per
+        attempt). Buffered rows are not readable until flushed. Returns the
+        attempt id.
         """
         now = time.time()
         attempt_id = uuid.uuid4().hex
@@ -291,19 +331,202 @@ class ChunkHistory:
             "validation_score": validation_score,
             "validation_passed": validation_passed,
             "created_at": now,
+            "feedback": feedback or None,
         }
-        if self.is_delta:
-            self._write_delta(sources, attempt_row, conversions)
-        else:
-            for row in sources:
-                self._sources.setdefault(row["chunk_key"], row)
-            self._attempts.append(attempt_row)
-            self._conversions.extend(conversions)
+        self._pending_sources.extend(sources)
+        self._pending_attempts.append(attempt_row)
+        self._pending_conversions.extend(conversions)
+        if not buffer:
+            self.flush()
         logger.debug(
             f"record_attempt: thread={thread_id} item={item_id} attempt={attempt} "
             f"final={is_final} chunks={len(chunks)}"
         )
         return attempt_id
+
+    def flush(self) -> int:
+        """Write every buffered attempt; returns how many were written.
+
+        The buffer is emptied even when the write fails, so a broken store
+        cannot make the next item re-send this one's rows.
+        """
+        if not self._pending_attempts:
+            return 0
+        sources = list({r["chunk_key"]: r for r in self._pending_sources}.values())
+        attempts, conversions = self._pending_attempts, self._pending_conversions
+        self._pending_sources, self._pending_attempts, self._pending_conversions = [], [], []
+        if self.is_delta:
+            self._write_delta(sources, attempts, conversions)
+        else:
+            for row in sources:
+                self._sources.setdefault(row["chunk_key"], row)
+            self._attempts.extend(attempts)
+            self._conversions.extend(conversions)
+        return len(attempts)
+
+    @property
+    def pending(self) -> int:
+        """Attempts recorded with ``buffer=True`` and not yet flushed."""
+        return len(self._pending_attempts)
+
+    # ---- archival ----------------------------------------------------------
+
+    def archive(
+        self,
+        *,
+        before_ts: Optional[float] = None,
+        thread_id: Optional[str] = None,
+        superseded_only: bool = False,
+        keep_current: bool = True,
+    ) -> ArchiveResult:
+        """Move stale attempts out of the active tables into the archive.
+
+        Selection is per whole attempt (its ``item_attempts`` row and every
+        ``chunk_conversions`` row of it):
+
+        * ``before_ts`` — recorded strictly before this Unix time;
+        * ``superseded_only`` — only attempts that no longer stand: rejected
+          attempts, and accepted ones a later accepted attempt replaced;
+        * ``thread_id`` — limit to one thread;
+        * ``keep_current`` (default) — the current accepted attempt of each
+          (thread, item) is never archived, however old.
+
+        At least one of ``before_ts`` / ``superseded_only`` is required, so a
+        bare call cannot empty the active tables. Rows are copied to the
+        archive *before* they are deleted from the active tables, and both
+        steps are idempotent: an interrupted run leaves at most a duplicate
+        (reads show the active copy) and a rerun completes it. Original
+        chunks are never archived — both views join the same
+        ``chunk_sources`` row. Archived rows stay readable through
+        ``include_archived=True``.
+        """
+        if before_ts is None and not superseded_only:
+            raise ValueError("archive needs before_ts and/or superseded_only=True")
+        now = time.time()
+        if not self.is_delta:
+            current = _current_ids(self._attempts)
+            selected = {
+                a["attempt_id"]
+                for a in self._attempts
+                if (thread_id is None or a["thread_id"] == thread_id)
+                and (before_ts is None or (a["created_at"] or 0.0) < before_ts)
+                and not (superseded_only and a["attempt_id"] in current)
+                and not (keep_current and a["attempt_id"] in current)
+            }
+            moved_attempts = [a for a in self._attempts if a["attempt_id"] in selected]
+            moved_convs = [c for c in self._conversions if c["attempt_id"] in selected]
+            self._attempts_archive.extend({**a, "archived_at": now} for a in moved_attempts)
+            self._conversions_archive.extend({**c, "archived_at": now} for c in moved_convs)
+            self._attempts = [a for a in self._attempts if a["attempt_id"] not in selected]
+            self._conversions = [
+                c for c in self._conversions if c["attempt_id"] not in selected
+            ]
+            result = ArchiveResult(
+                attempts=len(moved_attempts),
+                conversions=len(moved_convs),
+                attempt_ids=tuple(sorted(selected)),
+            )
+        else:
+            result = self._archive_delta(
+                before_ts=before_ts,
+                thread_id=thread_id,
+                superseded_only=superseded_only,
+                keep_current=keep_current,
+                now=now,
+            )
+        logger.info(
+            f"archive: moved {result.attempts} attempt(s) / {result.conversions} "
+            f"conversion row(s) to the archive  thread={thread_id or '*'}  "
+            f"before_ts={before_ts}  superseded_only={superseded_only}"
+        )
+        return result
+
+    def _archive_delta(
+        self,
+        *,
+        before_ts: Optional[float],
+        thread_id: Optional[str],
+        superseded_only: bool,
+        keep_current: bool,
+        now: float,
+    ) -> ArchiveResult:
+        from pyspark.sql import Window
+        from pyspark.sql import functions as F
+
+        spark = self._spark_or_raise()
+        attempts = spark.table(self._quoted["item_attempts"])
+        if thread_id is not None:
+            attempts = attempts.filter(F.col("thread_id") == thread_id)
+        # "Current" = latest accepted attempt per (thread, item). Computed over
+        # the whole item, not the thread_id/before_ts slice, so an old answer
+        # that still stands is recognised as current.
+        latest = Window.partitionBy("thread_id", "item_id").orderBy(
+            F.col("created_at").desc(), F.col("attempt").desc(), F.col("attempt_id").desc()
+        )
+        current_ids = (
+            spark.table(self._quoted["item_attempts"])
+            .filter(F.col("is_final"))
+            .withColumn("_rn", F.row_number().over(latest))
+            .filter(F.col("_rn") == 1)
+            .select("attempt_id")
+        )
+        selected = attempts
+        if before_ts is not None:
+            selected = selected.filter(F.col("created_at") < F.lit(float(before_ts)))
+        if superseded_only or keep_current:
+            selected = selected.join(current_ids, on="attempt_id", how="left_anti")
+        # Collected: every later statement must act on the same fixed set,
+        # whatever is written meanwhile (a new attempt changes "current").
+        ids = sorted(r.attempt_id for r in selected.select("attempt_id").collect())
+        if not ids:
+            return ArchiveResult()
+
+        def ids_view(action: Any) -> None:
+            self._with_view(spark.createDataFrame([(i,) for i in ids], "attempt_id STRING"), action)
+
+        conv_count = (
+            spark.table(self._quoted["chunk_conversions"])
+            .filter(F.col("attempt_id").isin(ids))
+            .count()
+        )
+        stamp = repr(float(now))
+        for suffix, keys in (
+            ("item_attempts", ("attempt_id",)),
+            ("chunk_conversions", ("attempt_id", "member_index")),
+        ):
+            source = self._quoted[suffix]
+            archive = self._quoted[f"{suffix}_archive"]
+            spec = schema.ITEM_ATTEMPTS if suffix == "item_attempts" else schema.CHUNK_CONVERSIONS
+            cols = ", ".join(f"r.`{c}`" for c in spec.column_names)
+            on = " AND ".join(f"t.`{k}` = s.`{k}`" for k in keys)
+            ids_view(
+                lambda view, source=source, archive=archive, cols=cols, on=on, suffix=suffix: self._retry(
+                    f"{suffix} archive copy",
+                    lambda: spark.sql(f"""
+                        MERGE INTO {archive} AS t
+                        USING (
+                            SELECT {cols}, CAST({stamp} AS DOUBLE) AS archived_at
+                            FROM {source} AS r JOIN {view} AS i ON r.attempt_id = i.attempt_id
+                        ) AS s
+                        ON {on}
+                        WHEN NOT MATCHED THEN INSERT *
+                    """),
+                )
+            )
+        # Delete only after both copies landed; conversions first so a
+        # half-finished delete never leaves an attempt without its rows.
+        for suffix in ("chunk_conversions", "item_attempts"):
+            source = self._quoted[suffix]
+            ids_view(
+                lambda view, source=source, suffix=suffix: self._retry(
+                    f"{suffix} archive delete",
+                    lambda: spark.sql(
+                        f"MERGE INTO {source} AS t USING {view} AS s "
+                        f"ON t.attempt_id = s.attempt_id WHEN MATCHED THEN DELETE"
+                    ),
+                )
+            )
+        return ArchiveResult(attempts=len(ids), conversions=conv_count, attempt_ids=tuple(ids))
 
     # ---- reads -------------------------------------------------------------
 
@@ -316,6 +539,7 @@ class ChunkHistory:
         item_id: Optional[str] = None,
         final_only: bool = False,
         current_only: bool = False,
+        include_archived: bool = False,
     ) -> List[Dict[str, Any]]:
         """History rows (original + converted chunk), oldest first.
 
@@ -325,6 +549,8 @@ class ChunkHistory:
         verdict failed, and its earlier answer keeps ``is_final``.
         ``current_only`` therefore keeps just the most recent accepted attempt
         of each (thread, item) — the answer that stands now.
+        ``include_archived`` also reads attempts :meth:`archive` moved out
+        (their ``archived_at`` is set; active rows carry ``None``).
         """
         filters = {
             "chunk_id": chunk_id,
@@ -335,6 +561,7 @@ class ChunkHistory:
         rows = self._query(
             {k: v for k, v in filters.items() if v is not None},
             final_only or current_only,
+            include_archived,
         )
         return _current(rows) if current_only else rows
 
@@ -345,6 +572,7 @@ class ChunkHistory:
         *,
         final_only: bool = False,
         current_only: bool = False,
+        include_archived: bool = False,
     ) -> List[Dict[str, Any]]:
         """Every attempt's rows for one work item, oldest attempt first."""
         return self.history(
@@ -352,6 +580,7 @@ class ChunkHistory:
             item_id=item_id,
             final_only=final_only,
             current_only=current_only,
+            include_archived=include_archived,
         )
 
     def search(
@@ -362,6 +591,7 @@ class ChunkHistory:
         case_sensitive: bool = False,
         mode: schema.SearchMode = "substring",
         final_only: bool = False,
+        include_archived: bool = False,
         limit: int = 50,
     ) -> List[Dict[str, Any]]:
         """History rows whose *field* contains *pattern*.
@@ -371,7 +601,8 @@ class ChunkHistory:
         Semantics follow Databricks ``search``/``isearch``: ``mode="word"``
         requires every word of the pattern, in any order. On Databricks the
         predicate is ``isearch``/``search`` itself, so the full-text search
-        index on that column skips files that cannot match.
+        index on that column skips files that cannot match. Archived rows
+        (``include_archived=True``) have no index and are scanned.
         """
         if field not in _FIELDS:
             raise ValueError(f"field must be one of {sorted(_FIELDS)}, got {field!r}")
@@ -385,11 +616,11 @@ class ChunkHistory:
         if not self.is_delta:
             rows = [
                 r
-                for r in self._query({}, final_only)
+                for r in self._query({}, final_only, include_archived)
                 if _matches([r[column]], pattern, case_sensitive=case_sensitive, mode=mode)
             ]
             return rows[:limit]
-        df = self._view_df(final_only)
+        df = self._view_df(final_only, include_archived)
         df = df.filter(self._search_predicate(column, pattern, case_sensitive, mode))
         return self._collect(df.orderBy("created_at", "attempt", "member_index").limit(limit))
 
@@ -416,6 +647,8 @@ class ChunkHistory:
                 "chunk_sources": len(self._sources),
                 "item_attempts": len(self._attempts),
                 "chunk_conversions": len(self._conversions),
+                "item_attempts_archive": len(self._attempts_archive),
+                "chunk_conversions_archive": len(self._conversions_archive),
             }
         spark = self._spark_or_raise()
         return {
@@ -429,9 +662,11 @@ class ChunkHistory:
 
     # ---- in-memory query ---------------------------------------------------
 
-    def _joined(self) -> Iterable[Dict[str, Any]]:
-        attempts = {a["attempt_id"]: a for a in self._attempts}
-        for conv in self._conversions:
+    def _joined(self, archived: bool = False) -> Iterable[Dict[str, Any]]:
+        attempt_rows = self._attempts_archive if archived else self._attempts
+        conversion_rows = self._conversions_archive if archived else self._conversions
+        attempts = {a["attempt_id"]: a for a in attempt_rows}
+        for conv in conversion_rows:
             att = attempts.get(conv["attempt_id"])
             src = self._sources.get(conv["chunk_key"])
             if att is None or src is None:
@@ -450,6 +685,7 @@ class ChunkHistory:
                     "original_text": src["original_text"],
                     "response": att["response"],
                     "document": att["document"],
+                    "feedback": att.get("feedback"),
                     "target_language": att["target_language"],
                     "model": att["model"],
                     "validation_score": att["validation_score"],
@@ -457,17 +693,30 @@ class ChunkHistory:
                 }
             )
 
-    def _query(self, filters: Dict[str, Any], final_only: bool) -> List[Dict[str, Any]]:
+    def _query(
+        self, filters: Dict[str, Any], final_only: bool, include_archived: bool = False
+    ) -> List[Dict[str, Any]]:
         if self.is_delta:
             from pyspark.sql import functions as F
 
-            df = self._view_df(final_only)
+            df = self._view_df(final_only, include_archived)
             for column, value in filters.items():
                 df = df.filter(F.col(column) == value)
             return self._collect(df.orderBy("created_at", "attempt", "member_index"))
+        joined: Iterable[Dict[str, Any]] = list(self._joined())
+        if include_archived:
+            seen = {(r["attempt_id"], r["member_index"]) for r in joined}
+            joined = [
+                *joined,
+                *(
+                    r
+                    for r in self._joined(archived=True)
+                    if (r["attempt_id"], r["member_index"]) not in seen
+                ),
+            ]
         rows = [
             r
-            for r in self._joined()
+            for r in joined
             if (not final_only or r["is_final"])
             and all(r[k] == v for k, v in filters.items())
         ]
@@ -492,10 +741,20 @@ class ChunkHistory:
             raise RuntimeError("chunk history has no SparkSession")
         return self._spark
 
-    def _view_df(self, final_only: bool) -> "DataFrame":
+    def _view_df(self, final_only: bool, include_archived: bool = False) -> "DataFrame":
         from pyspark.sql import functions as F
 
-        df = self._spark_or_raise().table(self._view)
+        spark = self._spark_or_raise()
+        df = spark.table(self._view)
+        if include_archived:
+            # An archive run interrupted between its copy and its delete
+            # leaves an attempt in both; the active copy wins.
+            archived = spark.table(self._archive_view).join(
+                df.select("attempt_id", "member_index"),
+                on=["attempt_id", "member_index"],
+                how="left_anti",
+            )
+            df = df.unionByName(archived)
         if final_only:
             df = df.filter(F.col("is_final"))
         return df
@@ -558,32 +817,35 @@ class ChunkHistory:
                 )
                 time.sleep(delay)
 
+    def _staged(self, spec: schema.TableSpec, rows: List[Dict[str, Any]]) -> "DataFrame":
+        ddl = ", ".join(f"`{n}` {t}" for n, t in spec.columns)
+        return self._spark_or_raise().createDataFrame(
+            [tuple(r.get(n) for n in spec.column_names) for r in rows], ddl
+        )
+
+    def _with_view(self, df: "DataFrame", action: Any) -> None:
+        spark = self._spark_or_raise()
+        view = f"_chunk_hist_{uuid.uuid4().hex}"
+        df.createOrReplaceTempView(view)
+        try:
+            action(view)
+        finally:
+            spark.catalog.dropTempView(view)
+
     def _write_delta(
         self,
         sources: List[Dict[str, Any]],
-        attempt_row: Dict[str, Any],
+        attempts: List[Dict[str, Any]],
         conversions: List[Dict[str, Any]],
     ) -> None:
         spark = self._spark_or_raise()
-
-        def staged(spec: schema.TableSpec, rows: List[Dict[str, Any]]) -> "DataFrame":
-            ddl = ", ".join(f"`{n}` {t}" for n, t in spec.columns)
-            return spark.createDataFrame(
-                [tuple(r[n] for n in spec.column_names) for r in rows], ddl
-            )
-
-        def with_view(df: "DataFrame", action: Any) -> None:
-            view = f"_chunk_hist_{uuid.uuid4().hex}"
-            df.createOrReplaceTempView(view)
-            try:
-                action(view)
-            finally:
-                spark.catalog.dropTempView(view)
+        staged = self._staged
+        with_view = self._with_view
 
         # Written sources -> attempt -> conversions: the view inner-joins all
         # three, so a partially written attempt is simply not visible.
-        if sources:
-            unique = list({r["chunk_key"]: r for r in sources}.values())
+        unique = [r for r in sources if r["chunk_key"] not in self._known_sources]
+        if unique:
             target = self._quoted["chunk_sources"]
             with_view(
                 staged(schema.CHUNK_SOURCES, unique),
@@ -595,8 +857,9 @@ class ChunkHistory:
                     ),
                 ),
             )
+            self._known_sources.update(r["chunk_key"] for r in unique)
         for suffix, spec, rows in (
-            ("item_attempts", schema.ITEM_ATTEMPTS, [attempt_row]),
+            ("item_attempts", schema.ITEM_ATTEMPTS, attempts),
             ("chunk_conversions", schema.CHUNK_CONVERSIONS, conversions),
         ):
             if not rows:

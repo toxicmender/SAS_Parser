@@ -199,13 +199,15 @@ class TestDeltaContract(KVStoreContract):
             delta_spark.sql(f"DROP TABLE IF EXISTS {table}")
 
     def make_store(self) -> KVStore:
-        return KVStore(spark=self._spark, table=self._base())
+        return KVStore(spark=self._spark, table=self._base(), full_text_search=False)
 
     # ---- Table family setup -----------------------------------------------
 
     def _base(self) -> str:
         base = f"default.kv_contract_{uuid.uuid4().hex[:10]}"
-        self._tables.extend(spec.name(base) for spec in schema.KV_TABLES)
+        self._tables.extend(
+            spec.name(base) for spec in (*schema.KV_TABLES, schema.RESTORE_JOURNAL)
+        )
         return base
 
     def _properties(self, table: str) -> dict[str, str]:
@@ -221,7 +223,7 @@ class TestDeltaContract(KVStoreContract):
         fresh table never needs the ALTER (which a delta-spark built against
         an older Spark minor cannot execute)."""
         base = self._base()
-        store = KVStore(spark=self._spark, table=base)
+        store = KVStore(spark=self._spark, table=base, full_text_search=False)
         for spec in schema.KV_TABLES:
             props = self._properties(spec.name(base))
             assert props.get("delta.enableRowTracking") == "true"
@@ -230,7 +232,7 @@ class TestDeltaContract(KVStoreContract):
 
     def test_cdf_is_re_enabled_when_a_table_lacks_it(self):
         base = self._base()
-        KVStore(spark=self._spark, table=base)
+        KVStore(spark=self._spark, table=base, full_text_search=False)
         messages = schema.MESSAGES.name(base)
         try:
             self._spark.sql(
@@ -242,17 +244,17 @@ class TestDeltaContract(KVStoreContract):
                 f"this pyspark/delta-spark pair cannot write table properties "
                 f"({type(exc).__name__}); the upgrade path is unavailable here"
             )
-        store = KVStore(spark=self._spark, table=base)
+        store = KVStore(spark=self._spark, table=base, full_text_search=False)
         assert store._backend._cdf_enabled("messages") is True
 
     def test_keys_are_routed_into_typed_tables(self):
         base = self._base()
-        store = KVStore(spark=self._spark, table=base)
+        store = KVStore(spark=self._spark, table=base, full_text_search=False)
         store.set_many(
             [
                 {"key": "msg::t1::0000000000000001-ab", "value": {
                     "message": {"type": "human", "data": {"content": "hello"}}, "ts": 1.0}},
-                {"key": "chat::t1::c1", "value": {"chat_id": "c1", "message_count": 2}},
+                {"key": "chat::t1::c1", "value": {"chat_id": "c1", "label": "L", "started_at": 5.0}},
                 {"key": "kv::run::t1::item::batch-001", "value": {
                     "status": "ok", "index": 1, "total": 3, "attempts": 2}},
                 {"key": "kv::validation::t1::item::batch-001", "value": {
@@ -263,7 +265,7 @@ class TestDeltaContract(KVStoreContract):
         msg = self._spark.table(schema.MESSAGES.name(base)).first()
         assert (msg.thread_id, msg.msg_tick, msg.role, msg.content) == ("t1", 1, "human", "hello")
         chat = self._spark.table(schema.CHATS.name(base)).first()
-        assert (chat.thread_id, chat.chat_id, chat.message_count) == ("t1", "c1", 2)
+        assert (chat.thread_id, chat.chat_id, chat.label, chat.started_at) == ("t1", "c1", "L", 5.0)
         run = self._spark.table(schema.RUN_ITEMS.name(base)).first()
         assert (run.thread_id, run.item_id, run.status, run.idx, run.attempts) == (
             "t1", "batch-001", "ok", 1, 2,
@@ -284,7 +286,7 @@ class TestDeltaContract(KVStoreContract):
 
     def test_append_inserts_messages_and_still_merges_the_chat_row(self):
         base = self._base()
-        store = KVStore(spark=self._spark, table=base)
+        store = KVStore(spark=self._spark, table=base, full_text_search=False)
         store.set("chat::t1::c1", {"chat_id": "c1", "message_count": 1})
         store.append_many(
             [
@@ -304,7 +306,7 @@ class TestDeltaContract(KVStoreContract):
 
     def test_search_is_filtered_in_sql_with_identical_results(self):
         base = self._base()
-        store = KVStore(spark=self._spark, table=base)
+        store = KVStore(spark=self._spark, table=base, full_text_search=False)
         store.set("kv::a", "PROC SORT it", tags=["x"])
         store.set("kv::b", "unrelated", tags=["Sorting"])
         store.set("kv::c", "nothing")
@@ -315,7 +317,7 @@ class TestDeltaContract(KVStoreContract):
         base = self._base()
         audit = f"{base}_audit"
         self._tables.append(audit)
-        store = KVStore(spark=self._spark, table=base, audit_table=audit)
+        store = KVStore(spark=self._spark, table=base, audit_table=audit, full_text_search=False)
         first = store.sync_cdf("worker-1")
         assert first.baseline is True
         store.append_many(
@@ -339,6 +341,119 @@ class TestDeltaContract(KVStoreContract):
         )
         assert checkpoints == 2
 
+    # ---- chats derived from messages ---------------------------------------
+
+    def test_chat_stats_are_aggregated_from_the_messages(self):
+        from langchain_core.messages import HumanMessage
+
+        from memory.store import KVChatMessageHistory
+
+        base = self._base()
+        store = KVStore(spark=self._spark, table=base, full_text_search=False)
+        a = KVChatMessageHistory("t1", store)
+        a.set_chat("chat-a", label="first")
+        a.add_messages([HumanMessage("one"), HumanMessage("two")])
+        a.set_chat("chat-b")
+        a.add_messages([HumanMessage("three")])
+        a.set_chat("chat-a")
+        a.add_messages([HumanMessage("four")])  # interleaved back into chat-a
+
+        chats = {c["chat_id"]: c for c in a.chats()}
+        assert chats["chat-a"]["message_count"] == 3
+        assert chats["chat-a"]["label"] == "first"
+        assert chats["chat-b"]["message_count"] == 1
+        assert [m.content for m in a.messages_in_chat("chat-a")] == ["one", "two", "four"]
+        # The static row was written once per chat; appends are message-only.
+        ops = [
+            r.operation
+            for r in self._spark.sql(f"DESCRIBE HISTORY {schema.CHATS.name(base)}").collect()
+        ]
+        assert ops.count("MERGE") == 2
+
+    # ---- restore is all-or-nothing ----------------------------------------
+
+    def test_a_failed_restore_rolls_every_table_back(self, monkeypatch):
+        base = self._base()
+        store = KVStore(spark=self._spark, table=base, full_text_search=False)
+        store.set_many(
+            [
+                {"key": "msg::t::0000000000000001-aa", "value": {"ts": 1.0}},
+                {"key": "chat::t::c", "value": {"chat_id": "c"}},
+                {"key": "kv::run::t::item::b", "value": {"status": "ok"}},
+                {"key": "kv::goal", "value": "keep me"},
+            ]
+        )
+        before = store.snapshot()
+        backend = store._backend
+        real_stage = backend._stage
+
+        def failing_stage(spec, rows, now):
+            if spec.suffix == "run_items":  # third table: two already overwritten
+                raise RuntimeError("simulated failure mid-restore")
+            return real_stage(spec, rows, now)
+
+        monkeypatch.setattr(backend, "_stage", failing_stage)
+        with pytest.raises(RuntimeError, match="mid-restore"):
+            store.restore({"kv::other": {"value": 1}})
+        monkeypatch.setattr(backend, "_stage", real_stage)
+
+        assert store.snapshot() == before
+        assert backend.unfinished_restores() == {}
+        states = [
+            r.state
+            for r in self._spark.table(schema.RESTORE_JOURNAL.name(base)).collect()
+        ]
+        assert "rolled_back" in states
+
+    def test_an_interrupted_restore_is_reported_and_recoverable(self, caplog):
+        from memory.operations import DeltaMemoryMaintenance, VacuumPolicy
+
+        base = self._base()
+        store = KVStore(spark=self._spark, table=base, full_text_search=False)
+        store.set("kv::goal", "original")
+        backend = store._backend
+        # What a crash leaves: 'started' journaled, one table overwritten.
+        versions = {s.suffix: backend._latest_version(s.suffix) for s in schema.KV_TABLES}
+        backend._journal(
+            [("crashed", backend._names[k], v, "started", 1.0) for k, v in versions.items()]
+        )
+        self._spark.sql(f"DELETE FROM {schema.KV.name(base)}")
+        assert store.get("kv::goal") is None
+
+        KVStore(spark=self._spark, table=base, full_text_search=False)
+        assert any("interrupted" in r.message for r in caplog.records)
+        ops = DeltaMemoryMaintenance(self._spark, base, policy=VacuumPolicy(7 * 24))
+        assert ops.recover_restore() == ["crashed"]
+        assert store.get("kv::goal") == "original"
+        assert backend.unfinished_restores() == {}
+
+    # ---- additive schema migration ----------------------------------------
+
+    def test_a_missing_nullable_column_is_added_and_a_retyped_one_rejected(self):
+        base = self._base()
+        KVStore(spark=self._spark, table=base, full_text_search=False)
+        kv = schema.KV.name(base)
+        # An older table: drop the newest nullable column by recreating it.
+        self._spark.sql(f"DROP TABLE {kv}")
+        self._spark.sql(
+            f"CREATE TABLE {kv} (kv_key STRING NOT NULL, value STRING NOT NULL, "
+            "tags STRING, created_at DOUBLE, updated_at DOUBLE, source STRING, "
+            "namespace STRING) USING DELTA"
+        )
+        store = KVStore(spark=self._spark, table=base, full_text_search=False)
+        assert "scope_id" in self._spark.table(kv).columns
+        store.set("kv::policy::t", 1)
+        assert self._spark.table(kv).first().scope_id == "t"
+
+        self._spark.sql(f"DROP TABLE {kv}")
+        self._spark.sql(
+            f"CREATE TABLE {kv} (kv_key STRING NOT NULL, value STRING NOT NULL, "
+            "tags STRING, created_at STRING, updated_at DOUBLE, source STRING, "
+            "namespace STRING, scope_id STRING) USING DELTA"
+        )
+        with pytest.raises(RuntimeError, match="incompatible memory schema"):
+            KVStore(spark=self._spark, table=base, full_text_search=False)
+
     def test_legacy_single_table_store_migrates_once(self):
         from memory.operations import DeltaMemoryMaintenance, VacuumPolicy
 
@@ -359,7 +474,7 @@ class TestDeltaContract(KVStoreContract):
         ops = DeltaMemoryMaintenance(self._spark, base, policy=VacuumPolicy(7 * 24))
         copied = ops.migrate_legacy(legacy)
         assert copied == {"messages": 1, "run_items": 1, "kv": 1}
-        store = KVStore(spark=self._spark, table=base)
+        store = KVStore(spark=self._spark, table=base, full_text_search=False)
         records = dict(store.all_records())
         assert records["kv::goal"]["created_at"] == 14.0
         assert records["kv::run::t::item::b1"]["value"] == {"status": "ok"}

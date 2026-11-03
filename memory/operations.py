@@ -126,8 +126,10 @@ class DeltaMemoryMaintenance:
             for index in spec.search_indexes:
                 name = spec.index_name(self.table_name, index.column)
                 try:
-                    rows = self._spark.sql(f"DESCRIBE INDEX {name}").collect()
-                    out[name] = [r.asDict() for r in rows]
+                    result, _ = schema.run_index_sql(
+                        self._spark, spec, self.table_name, index.column, "DESCRIBE INDEX {name}"
+                    )
+                    out[name] = [r.asDict() for r in result.collect()]
                 except Exception as exc:
                     out[name] = None
                     logger.debug(f"search_index_status: {name}: {exc}")
@@ -141,11 +143,54 @@ class DeltaMemoryMaintenance:
         """
         for spec in schema.ALL_TABLES:
             for index in spec.search_indexes:
-                self._spark.sql(
-                    f"DROP INDEX IF EXISTS {spec.index_name(self.table_name, index.column)}"
+                schema.run_index_sql(
+                    self._spark, spec, self.table_name, index.column, "DROP INDEX IF EXISTS {name}"
                 )
         return schema.enable_databricks_features(
             self._spark, self.table_name, tuple(self._existing())
+        )
+
+    # ---- restore recovery ------------------------------------------------
+
+    def recover_restore(self) -> list[str]:
+        """Roll back every interrupted ``KVStore.restore`` run.
+
+        A restore that crashed mid-way leaves some memory tables overwritten
+        and others not; each table is put back to the version journaled
+        before that run began. Returns the recovered restore ids. Rerun the
+        restore afterwards if its snapshot is still wanted.
+        """
+        from .store import _DeltaBackend
+
+        backend = _DeltaBackend(self._spark, self.table_name, full_text_search=False)
+        recovered = []
+        for restore_id, versions in backend.unfinished_restores().items():
+            backend.rollback_restore(restore_id, versions)
+            recovered.append(restore_id)
+            logger.info(f"recover_restore: rolled back {restore_id} -> {versions}")
+        return recovered
+
+    # ---- chunk history archival ------------------------------------------
+
+    def archive_chunk_history(
+        self,
+        *,
+        before_ts: float | None = None,
+        thread_id: str | None = None,
+        superseded_only: bool = False,
+        keep_current: bool = True,
+    ) -> Any:
+        """Move stale chunk-history attempts to the archive tables — see
+        :meth:`memory.chunk_history.ChunkHistory.archive`. Run :meth:`vacuum`
+        afterwards (or let predictive optimization) to reclaim the files the
+        deletes leave behind."""
+        from .chunk_history import ChunkHistory
+
+        return ChunkHistory(self._spark, self.table_name, full_text_search=False).archive(
+            before_ts=before_ts,
+            thread_id=thread_id,
+            superseded_only=superseded_only,
+            keep_current=keep_current,
         )
 
     # ---- migration ---------------------------------------------------------
@@ -164,7 +209,7 @@ class DeltaMemoryMaintenance:
         # The legacy table is usually the base name itself: its derived
         # tables carry suffixes, so the two never collide.
         legacy = _quoted_table_name(legacy_table)
-        backend = _DeltaBackend(self._spark, self.table_name)
+        backend = _DeltaBackend(self._spark, self.table_name, full_text_search=False)
         if backend.count() and not force:
             raise RuntimeError(
                 f"memory tables under {self.table_name!r} already hold rows; "

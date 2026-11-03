@@ -1059,7 +1059,10 @@ indexes that `isearch()` pushdown uses. `MemoryHub.chunk_history`
 (`memory.chunk_history`) adds the append-only `B_chunk_sources` /
 `B_item_attempts` / `B_chunk_conversions` tables (and the
 `B_chunk_history` view): every LLM attempt, accepted or rejected, with each
-member chunk's original SAS text and converted code.
+member chunk's original SAS text and converted code, plus the
+corrective feedback behind each retry; `ChunkHistory.archive()` moves stale
+attempts to `_archive` tables. `restore()` is journaled
+(`B_restore_journal`) and rolled back across every table on failure.
 
 ## Load-bearing invariants
 

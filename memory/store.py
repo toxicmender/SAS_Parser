@@ -252,7 +252,8 @@ def _derive_message(key: str, value_json: str) -> Tuple[Any, ...]:
             role = (data.get("role") if isinstance(data, dict) else None) or message.get("type")
         else:
             role = payload.get("role")
-    return thread, tick, _as_str(role), message_text(payload)
+    chat = payload.get("chat_id") if isinstance(payload, dict) else None
+    return thread, tick, _as_str(role), message_text(payload), _as_str(chat)
 
 
 def _derive_chat(key: str, value_json: str) -> Tuple[Any, ...]:
@@ -263,9 +264,7 @@ def _derive_chat(key: str, value_json: str) -> Tuple[Any, ...]:
         thread,
         chat,
         _as_str(v.get("label")),
-        _as_str(v.get("first_key")),
-        _as_str(v.get("last_key")),
-        _as_int(v.get("message_count")),
+        _as_float(v.get("started_at")),
     )
 
 
@@ -501,7 +500,7 @@ class _DeltaBackend:
         *,
         audit_table: str | None = None,
         max_write_retries: int = 3,
-        full_text_search: bool = False,
+        full_text_search: bool = True,
     ) -> None:
         if not _PYSPARK_AVAILABLE:
             raise RuntimeError("pyspark is not installed. Run: pip install pyspark")
@@ -530,6 +529,7 @@ class _DeltaBackend:
         schema.ensure_tables(self._spark, self._base, schema.KV_TABLES)
         self._validate_schema()
         self._warn_on_legacy_table()
+        self._warn_on_unfinished_restore()
         if full_text_search:
             self.provision = schema.enable_databricks_features(
                 self._spark, self._base, schema.KV_TABLES
@@ -773,21 +773,108 @@ class _DeltaBackend:
             )
 
     def replace_all(self, rows: List[_RawRecord], now: float) -> None:
-        """Replace every table's contents with *rows*.
+        """Replace every table's contents with *rows*, all or nothing.
 
-        One ``INSERT OVERWRITE`` per table: each table is atomic (a reader
-        never observes it emptied), the family as a whole is not.
+        Delta has no multi-table transaction, so the restore is journaled:
+        each table's current version is logged (``B_restore_journal``,
+        state ``started``) before anything is overwritten, then every table
+        gets one ``INSERT OVERWRITE``. If any overwrite fails, the tables
+        already overwritten are put back with ``RESTORE TABLE … TO VERSION
+        AS OF`` their logged version and the run is logged ``rolled_back``
+        before the error propagates. A process that dies mid-restore leaves a
+        ``started`` entry; the next open logs it and
+        ``DeltaMemoryMaintenance.recover_restore()`` rolls it back.
         """
         groups = dict((spec.suffix, group) for spec, group in self._grouped(rows))
-        for spec in schema.KV_TABLES:
-            target = self._quoted[spec.suffix]
-            cols = ", ".join(f"`{c}`" for c in spec.column_names)
-            self._with_view(
-                self._stage(spec, groups.get(spec.suffix, []), now),
-                "replace",
-                lambda view, target=target, cols=cols: self._spark.sql(
-                    f"INSERT OVERWRITE {target} ({cols}) SELECT {cols} FROM {view}"
-                ),
+        restore_id = uuid.uuid4().hex
+        versions = {spec.suffix: self._latest_version(spec.suffix) for spec in schema.KV_TABLES}
+        self._journal(
+            [
+                (restore_id, self._names[suffix], version, "started", now)
+                for suffix, version in versions.items()
+            ]
+        )
+        done: List[str] = []
+        try:
+            for spec in schema.KV_TABLES:
+                target = self._quoted[spec.suffix]
+                cols = ", ".join(f"`{c}`" for c in spec.column_names)
+                self._with_view(
+                    self._stage(spec, groups.get(spec.suffix, []), now),
+                    "replace",
+                    lambda view, target=target, cols=cols: self._spark.sql(
+                        f"INSERT OVERWRITE {target} ({cols}) SELECT {cols} FROM {view}"
+                    ),
+                )
+                done.append(spec.suffix)
+        except Exception:
+            logger.error(
+                "Delta memory restore %s failed after %d of %d table(s); rolling back",
+                restore_id,
+                len(done),
+                len(schema.KV_TABLES),
+            )
+            self.rollback_restore(restore_id, {s: versions[s] for s in done})
+            raise
+        self._journal([(restore_id, None, None, "completed", _now())])
+
+    def _journal(self, rows: List[Tuple[Any, ...]]) -> None:
+        self._ensure_journal()
+        cols = ", ".join(f"`{c}`" for c in schema.RESTORE_JOURNAL.column_names)
+        self._with_view(
+            self._spark.createDataFrame(rows, _spark_schema(schema.RESTORE_JOURNAL)),
+            "journal",
+            lambda view: self._spark.sql(
+                f"INSERT INTO {self._journal_table} ({cols}) SELECT {cols} FROM {view}"
+            ),
+        )
+
+    def _ensure_journal(self) -> None:
+        if getattr(self, "_journal_ready", False):
+            return
+        schema.ensure_tables(self._spark, self._base, (schema.RESTORE_JOURNAL,))
+        self._journal_ready = True
+
+    @property
+    def _journal_table(self) -> str:
+        return _quoted_table_name(schema.RESTORE_JOURNAL.name(self._base))
+
+    def rollback_restore(self, restore_id: str, versions: Dict[str, int]) -> None:
+        """Put each table in *versions* (suffix → version) back, and log it."""
+        for suffix, version in versions.items():
+            self._spark.sql(
+                f"RESTORE TABLE {self._quoted[suffix]} TO VERSION AS OF {int(version)}"
+            )
+        self._journal([(restore_id, None, None, "rolled_back", _now())])
+
+    def unfinished_restores(self) -> Dict[str, Dict[str, int]]:
+        """``restore_id`` → {table suffix: pre-restore version} for every
+        restore that started but neither completed nor rolled back."""
+        if not self._spark.catalog.tableExists(schema.RESTORE_JOURNAL.name(self._base)):
+            return {}
+        rows = self._spark.table(self._journal_table).collect()
+        closed = {r.restore_id for r in rows if r.state in ("completed", "rolled_back")}
+        by_name = {name: suffix for suffix, name in self._names.items()}
+        open_runs: Dict[str, Dict[str, int]] = {}
+        for r in rows:
+            if r.state == "started" and r.restore_id not in closed and r.table_name in by_name:
+                open_runs.setdefault(r.restore_id, {})[by_name[r.table_name]] = int(r.pre_version)
+        return open_runs
+
+    def _warn_on_unfinished_restore(self) -> None:
+        try:
+            unfinished = self.unfinished_restores()
+        except Exception as exc:  # pragma: no cover - catalog dependent
+            logger.debug(f"unfinished_restores: {exc}")
+            return
+        if unfinished:
+            logger.error(
+                "Delta memory %s: %d restore(s) were interrupted (%s); the "
+                "tables may be partly overwritten. Roll back with "
+                "DeltaMemoryMaintenance.recover_restore().",
+                self._base,
+                len(unfinished),
+                ", ".join(sorted(unfinished)),
             )
 
     def _delete_keys(self, spec: "schema.TableSpec", keys: List[str]) -> None:
@@ -932,6 +1019,43 @@ class _DeltaBackend:
 
     def count(self) -> int:
         return sum(self._df(spec).count() for spec in schema.KV_TABLES)
+
+    def _thread_messages(self, thread_id: str) -> "DataFrame":
+        # Exact thread on the clustered column, plus the key prefix (a thread
+        # id cannot be told apart from a longer one by thread_id alone when
+        # ids contain '::').
+        return (
+            self._spark.table(self._quoted["messages"])
+            .filter(F.col("thread_id") == thread_id)
+            .filter(F.col("kv_key").startswith(f"msg::{thread_id}::"))
+        )
+
+    def chat_stats(self, thread_id: str) -> Dict[str, Dict[str, Any]]:
+        """One aggregate over the thread's messages, grouped by ``chat_id``."""
+        rows = (
+            self._thread_messages(thread_id)
+            .filter(F.col("chat_id").isNotNull())
+            .groupBy("chat_id")
+            .agg(
+                F.min("kv_key").alias("first_key"),
+                F.max("kv_key").alias("last_key"),
+                F.count(F.lit(1)).alias("message_count"),
+            )
+            .collect()
+        )
+        return {
+            r.chat_id: {
+                "first_key": r.first_key,
+                "last_key": r.last_key,
+                "message_count": int(r.message_count),
+            }
+            for r in rows
+        }
+
+    def chat_records(self, thread_id: str, chat_id: str) -> List[_RawRecord]:
+        return self._collect_records(
+            self._thread_messages(thread_id).filter(F.col("chat_id") == chat_id)
+        )
 
     # ---- CDF ---------------------------------------------------------------
 
@@ -1170,7 +1294,7 @@ class KVStore:
         *,
         audit_table: Optional[str] = None,
         max_write_retries: int = 3,
-        full_text_search: bool = False,
+        full_text_search: bool = True,
     ) -> None:
         self._table = table
         if audit_table is not None and table is None:
@@ -1263,6 +1387,21 @@ class KVStore:
     def thread_ids(self) -> List[str]:
         """Distinct thread ids that have at least one stored message."""
         return self._backend.thread_ids()
+
+    def chat_stats(self, thread_id: str) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Per-chat first/last key and message count of *thread_id*,
+        aggregated by the backend, or ``None`` when it has no pushdown (the
+        caller then aggregates the decoded records itself)."""
+        stats = getattr(self._backend, "chat_stats", None)
+        return stats(thread_id) if stats is not None else None
+
+    def chat_records(self, thread_id: str, chat_id: str) -> Optional[List[Tuple[str, Dict]]]:
+        """*thread_id*'s messages in *chat_id*, filtered by the backend, or
+        ``None`` when it has no pushdown."""
+        records = getattr(self._backend, "chat_records", None)
+        if records is None:
+            return None
+        return [self._decode_record(r) for r in records(thread_id, chat_id)]
 
     def has_prefix(self, prefix: str) -> bool:
         """True if at least one key starts with *prefix*.
@@ -1443,24 +1582,27 @@ class KVChatMessageHistory(BaseChatMessageHistory):
     Key layout
     ----------
     msg::{session_id}::{epoch_micros:016d}-{rand4}
-        → {"message": <langchain message_to_dict>, "ts": ...}
+        → {"message": <langchain message_to_dict>, "ts": ..., "chat_id": ...}
     chat::{session_id}::{chat_id}
-        → {"chat_id", "label", "started_at", "first_key", "last_key",
-           "message_count", ...}   (only when a chat is active — see below)
+        → {"chat_id", "thread_id", "label", "started_at"}
+           (static; only when a chat is active — see below)
 
     Chats
     -----
     A **chat** is one span of a thread: the messages written by one
     consumer, e.g. one ``SasLLMPipeline`` instance (Task → Thread → Chat →
     Message). Set one with :meth:`set_chat` and every later
-    :meth:`add_messages` extends its record in the *same* store write.
+    :meth:`add_messages` stamps its ``chat_id`` into each message value.
+    The chat's first/last key and message count are derived from those
+    stamps on read (:meth:`chats`), so they can never drift from the
+    messages; the static ``chat::`` row is written once per chat.
 
     The chat id is deliberately **not** part of the message key. Thread ids
     are recovered from message keys by splitting off the last ``::`` segment
     (:meth:`ThreadMemoryManager.list_threads`), the fork copy is a key-prefix
     range, and the incremental read frontier is a key comparison — a third
-    segment would break all three, and every legacy row at once. An index
-    record costs one extra upserted row per write instead.
+    segment would break all three, and every legacy row at once. The id
+    rides in the value instead (a derived ``chat_id`` column in Delta).
 
     Values carry the full ``message_to_dict`` payload, so tool calls,
     ``usage_metadata``, ``response_metadata``, names, and ids all
@@ -1628,15 +1770,17 @@ class KVChatMessageHistory(BaseChatMessageHistory):
                         # survive the round-trip.
                         "message": message_to_dict(message),
                         "ts": ts,
+                        # The chat this message belongs to: the chat index
+                        # (first/last key, count) is derived from it on
+                        # read, so it can never disagree with the messages.
+                        **({"chat_id": self._chat_id} if self._chat_id else {}),
                     },
                     "tags": ["message", role, self.session_id],
                 }
             )
         if not entries:
             return
-        chat_entry = self._chat_entry(
-            entries[0]["key"], entries[-1]["key"], len(entries)
-        )
+        chat_entry = self._chat_entry()
         if chat_entry is not None:
             # Same batch as the messages it indexes. In Delta mode the
             # messages are INSERTed before the chat row is MERGEd, so the
@@ -1667,79 +1811,123 @@ class KVChatMessageHistory(BaseChatMessageHistory):
         """The chat later writes are attributed to, or ``None``."""
         return self._chat_id
 
-    def _chat_entry(
-        self, first_key: str, last_key: str, added: int
-    ) -> Optional[Dict[str, Any]]:
-        """The chat index row to write alongside a batch of messages."""
+    def _chat_entry(self) -> Optional[Dict[str, Any]]:
+        """The chat's static row, when it still needs writing — else ``None``.
+
+        A chat row holds only what does not change per message (id, thread,
+        label, start time) and is written once per chat — on its first write,
+        or when a label arrives later. Everything that does (first/last key,
+        message count) is derived from the messages' ``chat_id`` on read, so
+        an ordinary append is a single message write with no index row to
+        keep in step.
+        """
         if self._chat_id is None:
             return None
         if self._chat_state is None:
             stored = self._store.get(self._chat_prefix + self._chat_id)
-            self._chat_state = stored if isinstance(stored, dict) else None
-        now = _now()
-        if self._chat_state is None:
-            self._chat_state = {
-                "chat_id": self._chat_id,
-                "thread_id": self.session_id,
-                "label": self._chat_label,
-                "started_at": now,
-                "first_key": first_key,
-                "last_key": last_key,
-                "message_count": 0,
-            }
+            if isinstance(stored, dict):
+                self._chat_state = stored
+                if not (self._chat_label and not stored.get("label")):
+                    return None
+            else:
+                self._chat_state = {
+                    "chat_id": self._chat_id,
+                    "thread_id": self.session_id,
+                    "label": self._chat_label,
+                    "started_at": _now(),
+                }
+                return self._static_chat_row(self._chat_state)
         state = self._chat_state
         if self._chat_label and not state.get("label"):
             state["label"] = self._chat_label
-        # Widened, never overwritten: another instance appending to the same
-        # chat can land on the same microsecond tick with a random suffix
-        # that sorts *below* the stored one (the _last_us bump is
-        # per-instance — the same race _refresh's frontier handles), and an
-        # assigned last_key could then sort before first_key, leaving the
-        # recorded range empty.
-        state["first_key"] = min(str(state.get("first_key", first_key)), first_key)
-        state["last_key"] = max(str(state.get("last_key", "")), last_key)
-        state["updated_at"] = now
-        state["message_count"] = int(state.get("message_count", 0)) + added
+            return self._static_chat_row(state)
+        return None
+
+    def _static_chat_row(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        static = {k: state.get(k) for k in ("chat_id", "thread_id", "label", "started_at")}
         return {
-            "key": self._chat_prefix + self._chat_id,
-            "value": dict(state),
-            "tags": ["chat", self.session_id, self._chat_id],
+            "key": self._chat_prefix + str(static["chat_id"]),
+            "value": static,
+            "tags": ["chat", self.session_id, str(static["chat_id"])],
             "source": "KVChatMessageHistory",
         }
 
+    def _chat_stats(self) -> Dict[str, Dict[str, Any]]:
+        """Per-chat ``first_key``/``last_key``/``message_count`` of this
+        thread, derived from the messages themselves."""
+        derive = getattr(self._store, "chat_stats", None)
+        derived = derive(self.session_id) if derive is not None else None
+        if derived is not None:
+            return derived
+        stats: Dict[str, Dict[str, Any]] = {}
+        for key, rec in self._store.all_records(prefix=self._msg_prefix):
+            value = rec["value"]
+            chat = value.get("chat_id") if isinstance(value, dict) else None
+            if not chat:
+                continue
+            entry = stats.setdefault(
+                chat, {"first_key": key, "last_key": key, "message_count": 0}
+            )
+            entry["first_key"] = min(entry["first_key"], key)
+            entry["last_key"] = max(entry["last_key"], key)
+            entry["message_count"] += 1
+        return stats
+
     def chats(self) -> List[Dict[str, Any]]:
-        """This thread's chat records, oldest first."""
-        records = [
-            rec["value"]
+        """This thread's chats, oldest first.
+
+        Static rows joined with stats derived from the messages; a chat whose
+        static row never landed still appears (``label``/``started_at``
+        ``None``), because its messages say it exists.
+        """
+        static = {
+            str(rec["value"].get("chat_id")): rec["value"]
             for _, rec in self._store.all_records(prefix=self._chat_prefix)
-            if isinstance(rec["value"], dict)
-        ]
-        records.sort(key=lambda state: state.get("started_at", 0.0))
+            if isinstance(rec["value"], dict) and rec["value"].get("chat_id")
+        }
+        stats = self._chat_stats()
+        records = []
+        for chat_id in set(static) | set(stats):
+            base: Dict[str, Any] = dict(
+                static.get(chat_id) or {"chat_id": chat_id, "thread_id": self.session_id}
+            )
+            base.setdefault("label", None)
+            base.setdefault("started_at", None)
+            base.update(
+                stats.get(chat_id)
+                or {"first_key": None, "last_key": None, "message_count": 0}
+            )
+            records.append(base)
+        records.sort(
+            key=lambda state: (
+                state.get("started_at") if state.get("started_at") is not None else float("inf"),
+                state.get("first_key") or "",
+            )
+        )
         return records
 
     def messages_in_chat(self, chat_id: str) -> List[BaseMessage]:
         """The messages written under *chat_id*, in order.
 
-        Reads the chat's key range directly rather than through the append
-        cache: this is an introspection path, and the range is the record's
-        ``first_key``/``last_key`` — messages another chat interleaved on the
-        same thread inside that range would be included, so a chat is only a
-        clean unit for consumers that do not interleave (one pipeline
-        instance at a time on a thread, which is how the pipeline runs).
+        Selected by each message's own ``chat_id``, so messages another chat
+        interleaved on the same thread are never included.
         """
-        state = self._store.get(self._chat_prefix + chat_id)
-        if not isinstance(state, dict):
+        records = getattr(self._store, "chat_records", None)
+        pushed = records(self.session_id, chat_id) if records is not None else None
+        if pushed is not None:
+            pairs = pushed
+        else:
+            pairs = [
+                (key, rec)
+                for key, rec in self._store.all_records(prefix=self._msg_prefix)
+                if isinstance(rec["value"], dict) and rec["value"].get("chat_id") == chat_id
+            ]
+        if not pairs:
             logger.warning(
-                f"messages_in_chat: thread '{self.session_id}' has no chat "
-                f"'{chat_id}'"
+                f"messages_in_chat: thread '{self.session_id}' has no messages "
+                f"in chat '{chat_id}'"
             )
             return []
-        first, last = state.get("first_key", ""), state.get("last_key", "")
-        pairs = [
-            (key, rec)
-            for key, rec in self._store.all_records(prefix=self._msg_prefix)
-            if first <= key <= last
-        ]
         pairs.sort(key=lambda kv: kv[0][len(self._msg_prefix) :])
         return [self._decode_message(rec["value"]) for _, rec in pairs]
 
@@ -1977,9 +2165,7 @@ class ThreadMemoryManager:
             }
             for key, rec in records
         ]
-        chat_entries = self._forked_chat_entries(
-            src_thread_id, dst_thread_id, [key for key, _ in records]
-        )
+        chat_entries = self._forked_chat_entries(src_thread_id, dst_thread_id, records)
         # The destination was checked empty above: the copies are new rows.
         self._store.append_many([*entries, *chat_entries])
         logger.info(
@@ -1990,44 +2176,34 @@ class ThreadMemoryManager:
         return len(entries)
 
     def _forked_chat_entries(
-        self, src_thread_id: str, dst_thread_id: str, copied_keys: List[str]
+        self, src_thread_id: str, dst_thread_id: str, copied: List[Tuple[str, Dict]]
     ) -> List[Dict[str, Any]]:
-        """Chat index rows for the copied slice of a forked thread.
+        """Static chat rows for the chats the copied slice contains.
 
-        A fork copies a *prefix* of the messages, so chats are clamped to it:
-        one that starts past the fork point is dropped, one that straddles it
-        keeps only the copied part (``last_key`` and ``message_count``
-        recomputed). Without this the branch's index would claim messages
-        that were never copied.
+        The copied messages keep their ``chat_id``, so the branch's derived
+        chat stats are automatically clamped to what was copied; only the
+        static row (label, start time) of each chat with at least one copied
+        message needs carrying over. A chat that starts past the fork point
+        has no copied message and is not carried.
         """
-        if not copied_keys:
-            return []
-        src_prefix = f"msg::{src_thread_id}::"
-        dst_prefix = f"msg::{dst_thread_id}::"
-        last_copied = copied_keys[-1]
+        copied_chats = {
+            rec["value"].get("chat_id")
+            for _, rec in copied
+            if isinstance(rec["value"], dict) and rec["value"].get("chat_id")
+        }
         forked: List[Dict[str, Any]] = []
         for _, rec in self._store.all_records(prefix=f"chat::{src_thread_id}::"):
             state = rec["value"]
-            if not isinstance(state, dict) or not state.get("chat_id"):
-                continue
-            first = str(state.get("first_key", ""))
-            last = min(str(state.get("last_key", "")), last_copied)
-            if not first or first > last:
-                continue
-            count = sum(1 for key in copied_keys if first <= key <= last)
-            if not count:
+            if not isinstance(state, dict) or state.get("chat_id") not in copied_chats:
                 continue
             chat_id = str(state["chat_id"])
             forked.append(
                 {
                     "key": f"chat::{dst_thread_id}::{chat_id}",
                     "value": {
-                        **state,
-                        "thread_id": dst_thread_id,
-                        "first_key": dst_prefix + first[len(src_prefix) :],
-                        "last_key": dst_prefix + last[len(src_prefix) :],
-                        "message_count": count,
-                    },
+                        k: state.get(k) for k in ("chat_id", "label", "started_at")
+                    }
+                    | {"thread_id": dst_thread_id},
                     "tags": ["chat", dst_thread_id, chat_id],
                     "source": rec["source"],
                 }
@@ -2293,7 +2469,7 @@ class MemoryHub:
         cdf_consumer_id: str | None = None,
         cdf_audit_table: str | None = None,
         max_write_retries: int = 3,
-        full_text_search: bool = False,
+        full_text_search: bool = True,
     ) -> None:
         if cdf_consumer_id is not None and cdf_audit_table is None:
             raise ValueError(

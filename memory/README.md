@@ -128,14 +128,20 @@ The chat id is deliberately **not** part of the message key. Thread ids are
 recovered from `msg::{thread}::{tick}` keys by splitting off the last segment
 (`list_threads`), `fork_thread` copies a key-prefix range, and the
 incremental read frontier is a key comparison — a third segment would break
-all three at once, and every legacy row with them. Instead one index record
-per chat (`chat::{thread}::{chat_id}`) is written **in the same batch** as
-the messages it indexes, so the index can never describe a write that did not
-land. `get_thread(..., chat_id=...)` re-stamps the active chat on every call
+all three at once, and every legacy row with them. Instead each message
+value carries its `chat_id` (a derived, clustered-table column in Delta), and
+a chat's `first_key` / `last_key` / `message_count` are **aggregated from the
+messages on read** — they cannot disagree with what landed, and an append is
+one message write. Only a static row per chat (`chat::{thread}::{chat_id}`:
+label, start time) is stored, once, on the chat's first write; a chat whose
+static row was lost still lists, with `label = None`.
+`messages_in_chat` selects by that stamp, so another chat's interleaved
+messages are never included. `get_thread(..., chat_id=...)` re-stamps the active chat on every call
 rather than fixing it at creation, because thread objects are cached per id
 and two consumers sharing a manager would otherwise inherit each other's
-chat. Forking clamps chats to the copied slice: one that starts after the
-fork point is dropped, one that straddles it keeps only the copied part.
+chat. Forking needs no clamping: copied messages keep their `chat_id`, so a
+branch's chats reflect exactly the copied slice; static rows are carried for
+chats with at least one copied message.
 
 ### Thread forking
 
@@ -199,15 +205,18 @@ pattern rather than one generic KV table (`memory/schema.py` holds the DDL):
 
 | Table | Holds | Write pattern | Liquid `CLUSTER BY` | Full-text search index |
 |-------|-------|---------------|---------------------|------------------------|
-| `B_messages` | `msg::` chat messages | blind `INSERT` (keys are collision-free) | `thread_id, msg_tick` | `content`, `value`, `kv_key`, `tags` ngram(5) |
-| `B_chats` | `chat::` chat index rows | `MERGE` | `thread_id` | — |
+| `B_messages` | `msg::` chat messages (each stamped with its `chat_id`) | blind `INSERT` (keys are collision-free), auto-compacted | `thread_id, msg_tick` | `content`, `value`, `kv_key`, `tags` ngram(5) |
+| `B_chats` | `chat::` static chat rows (label, start time); counts derive from messages | `MERGE`, once per chat | `thread_id` | — |
 | `B_run_items` | `kv::run::` per-item run facts | `MERGE` | `thread_id, item_id` | — |
 | `B_validations` | `kv::validation::` verdicts | `MERGE` | `thread_id, item_id` | — |
 | `B_kv` | everything else: policies, thread notes, summaries, plain KV | `MERGE` | `namespace, scope_id` | `value`, `kv_key`, `tags` ngram(5) |
 | `B_chunk_sources` | each distinct **original** SAS chunk, once | insert-only `MERGE` | `source_id, chunk_id` | `original_text` ngram(4) |
-| `B_item_attempts` | every LLM attempt per work item (accepted *and* rejected) | blind `INSERT` | `thread_id, item_id` | `response` ngram(4) |
-| `B_chunk_conversions` | each attempt's **converted** code per member chunk | blind `INSERT` | `chunk_key, thread_id` | `converted_text` ngram(4) |
-| `B_chunk_history` | VIEW: original + converted chunk, response and verdict on one row | — | — | (base-table indexes) |
+| `B_item_attempts` | every LLM attempt per work item (accepted *and* rejected), with the `feedback` that prompted a retry | blind `INSERT`, one per item, auto-compacted | `thread_id, item_id` | `response` ngram(4) |
+| `B_chunk_conversions` | each attempt's **converted** code per member chunk | blind `INSERT`, one per item, auto-compacted | `chunk_key, thread_id` | `converted_text` ngram(4) |
+| `B_chunk_history` | VIEW: original + converted chunk, response, feedback and verdict on one row | — | — | (base-table indexes) |
+| `B_item_attempts_archive`, `B_chunk_conversions_archive` | attempts moved out by `ChunkHistory.archive()` (+ `archived_at`) | `MERGE` copy | `thread_id, item_id` | — |
+| `B_chunk_history_archive` | VIEW: the same shape over the archive tables | — | — | — |
+| `B_restore_journal` | append-only log of `restore()` runs (pre-restore table versions) | `INSERT` | `restore_id` | — |
 
 Every KV-routed table carries the same six raw-record columns the `KVStore`
 façade speaks — `kv_key`, `value` (JSON), `tags` (JSON array), `created_at`,
@@ -220,6 +229,18 @@ search indexes work on; callers keep using keys and the façade unchanged.
 All tables are created with `delta.enableRowTracking = true`. Change Data
 Feed is enabled only on `B_messages` and `B_chats` — the two tables CDF cache
 invalidation reads — so the fact tables do not pay its write cost.
+
+**Schema evolution.** Opening a table adds any nullable column a newer
+version declares (`ALTER TABLE … ADD COLUMNS`); existing rows read `NULL`. A
+retyped column, or a missing `NOT NULL` one, is an error rather than a guess.
+
+**Restore is all-or-nothing.** Delta has no multi-table transaction, so
+`KVStore.restore()` / `MemoryHub.restore()` journals every table's version
+in `B_restore_journal` first, overwrites the tables one by one, and on any
+failure puts the overwritten ones back with `RESTORE TABLE … TO VERSION AS
+OF` before re-raising. A process that dies mid-restore leaves a `started`
+entry: the next open logs it, and `DeltaMemoryMaintenance.recover_restore()`
+rolls it back.
 
 **Breaking change.** The pre-split single table (`kv_key`/`value`/… at the
 base name itself) is no longer read; opening a base whose legacy table still
@@ -234,9 +255,10 @@ ops.migrate_legacy("cat.sch.llm_mem")   # routes every row; idempotent MERGE
 
 ### Full-text search (Databricks DBR 19)
 
-With `memory.full_text_search` (default **on**; `MemoryHub(full_text_search=...)`
-/ `MemorySetup(full_text_search=...)` override it) the Delta backend, on
-Databricks:
+`full_text_search` is **on by default everywhere** — `MemoryHub`,
+`KVStore`, `ChunkHistory`, and `MemorySetup` / config.json
+`memory.full_text_search` (null = on); pass `False` to opt out. In Delta mode
+on Databricks:
 
 1. enables **predictive optimization** on every memory table — it is what
    refreshes a search index (there is no manual `REFRESH INDEX`) and also
@@ -267,6 +289,20 @@ only an n-gram index can serve (a `split` word index cannot prove a substring
 absent). Patterns shorter than the n-gram size still answer correctly but
 cannot use the index.
 
+Index names are `<table>_<column>_fts` in the table's schema. The docs do
+not say whether `CREATE/DESCRIBE/DROP INDEX` accept a catalog.schema-qualified
+name, so the qualified form is tried first and, if the runtime rejects it as
+a name form, the statement is retried with the bare name inside a scoped
+`USE CATALOG`/`USE SCHEMA` (the session's previous catalog and schema are
+restored). `ProvisionReport.index_name_style` says which form worked.
+
+**Verify on DBR 19** with the smoke check (it creates, checks and drops a
+scratch base; exit status 0 = everything works):
+
+```bash
+python scripts/databricks_fts_smoke.py --schema main.scratch
+```
+
 An index never changes a result — only how much data is scanned — and
 refreshes asynchronously. Off Databricks (OSS delta-spark, local Spark) the
 setup statements fail, one warning is logged, and searches fall back to
@@ -278,7 +314,11 @@ setup statements fail, one warning is logged, and searches fall back to
 reference record of how every chunk was translated. `SasLLMPipeline` writes
 one attempt per LLM call: an attempt inline validation rejects is recorded
 with `is_final = false` *before* it is rolled off the thread, the accepted
-one with `is_final = true`. Rows are never updated or deleted, and chat
+one with `is_final = true`; a retry's row carries the corrective `feedback`
+it was prompted with. An item's attempts are buffered and written together
+when its final attempt lands — three Delta commits per item however many
+retries it took (a crash mid-item loses only that item's rejected attempts;
+an LLM failure flushes what was buffered). Rows are never updated, and chat
 retention does not touch them. Because nothing is updated, an item a resume
 re-translates has *two* accepted attempts; `current_only=True` keeps the most
 recent one per (thread, item). The history is not part of
@@ -302,6 +342,33 @@ hist.search("PROC SORT", field="original")          # isearch on Databricks
 hist.search("withColumn", field="converted", case_sensitive=True)
 hist.search("merge by id", field="response", mode="word")
 ```
+
+#### Archival
+
+The active tables (and their search indexes) only need what is still
+looked at. `archive()` moves stale attempts — whole attempts: the
+`item_attempts` row and all its conversion rows — into the `_archive` tables:
+
+```python
+import time
+hist.archive(superseded_only=True)                      # rejected + replaced answers
+hist.archive(before_ts=time.time() - 90 * 86400)        # anything older than 90 days
+hist.archive(before_ts=cutoff, thread_id="thread-1")    # one thread
+hist.history(chunk_id="f1-chunk-0007", include_archived=True)
+```
+
+- At least one of `before_ts` / `superseded_only` is required.
+- `keep_current=True` (default): the answer that stands for each (thread,
+  item) is never archived, however old.
+- Rows are copied to the archive *before* they are deleted from the active
+  tables, both idempotently: an interrupted run leaves at most a duplicate
+  (reads show the active copy) and a rerun completes it.
+- Original chunks stay in `B_chunk_sources` (one row per distinct chunk;
+  both views join it).
+- `include_archived=True` on `history` / `for_item` / `search` reads both;
+  archived rows have `archived_at` set and are scanned, not indexed.
+- From a scheduled job: `DeltaMemoryMaintenance.archive_chunk_history(...)`,
+  then `vacuum()` (or predictive optimization) reclaims the deleted files.
 
 ```sql
 SELECT chunk_id, attempt, is_final, original_text, converted_text, validation_score
