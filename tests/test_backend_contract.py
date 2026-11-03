@@ -280,7 +280,7 @@ class TestDeltaContract(KVStoreContract):
         ]
         assert len(store.keys()) == 5
         assert store.thread_ids() == ["t1"]
-        assert store.count() == 5
+        assert store.stats()["total_keys"] == 5
 
     def test_append_inserts_messages_and_still_merges_the_chat_row(self):
         base = self._base()
