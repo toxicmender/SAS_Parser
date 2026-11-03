@@ -234,13 +234,42 @@ invalidation reads — so the fact tables do not pay its write cost.
 version declares (`ALTER TABLE … ADD COLUMNS`); existing rows read `NULL`. A
 retyped column, or a missing `NOT NULL` one, is an error rather than a guess.
 
-**Restore is all-or-nothing.** Delta has no multi-table transaction, so
-`KVStore.restore()` / `MemoryHub.restore()` journals every table's version
-in `B_restore_journal` first, overwrites the tables one by one, and on any
-failure puts the overwritten ones back with `RESTORE TABLE … TO VERSION AS
-OF` before re-raising. A process that dies mid-restore leaves a `started`
-entry: the next open logs it, and `DeltaMemoryMaintenance.recover_restore()`
-rolls it back.
+**Restore is journaled and undoes only its own work.** Delta has no
+multi-table transaction, so `KVStore.restore()` / `MemoryHub.restore()` logs
+every table's version in `B_restore_journal` (`started`), overwrites the
+tables one by one — journaling each as `overwritten` with the version it
+produced — and finally logs `completed`. On a failure:
+
+- only the tables this run overwrote are put back with `RESTORE TABLE … TO
+  VERSION AS OF` their pre-restore version; tables it never reached are not
+  touched;
+- a table is restored only while it is still at the version the run left it
+  at. If anything committed to it since, `RESTORE` would erase that work, so
+  the table is journaled `rollback_skipped` and logged for an operator
+  instead;
+- if every table was overwritten and only the `completed` row failed to
+  land, the restore *succeeded*: it returns normally, and recovery marks it
+  complete rather than undoing it.
+
+A process that dies mid-restore leaves an open run; the next open logs it,
+and `DeltaMemoryMaintenance.recover_restore()` settles it by the same rules,
+returning `{restore_id: {"completed", "rolled_back", "needs_manual"}}`.
+`vacuum(dry_run=False)` prunes settled journal rows past the retention
+window.
+
+**Message appends are never duplicated.** Messages are written with a blind
+`INSERT` (no MERGE join). If it reports an error, the batch's keys are looked
+up before anything is retried — a Delta commit is atomic, so either all rows
+landed (done) or none did (re-sent, on a retryable conflict only). Chunk
+history INSERTs follow the same rule by `attempt_id`.
+
+**Startup is cheap.** Table DDL, schema validation, the legacy and
+interrupted-restore checks, and the Databricks provisioning run once per
+Spark application per base, not on every `MemoryHub` construction; workers
+creating the tables at the same moment retry the lost race. Provisioning
+(predictive optimization, search indexes) is skipped entirely once a table
+group carries the `sasparser.memory.provisioned` marker for the current
+schema version; `DeltaMemoryMaintenance.provision(force=True)` re-runs it.
 
 **Breaking change.** The pre-split single table (`kv_key`/`value`/… at the
 base name itself) is no longer read; opening a base whose legacy table still
@@ -442,8 +471,19 @@ ops = DeltaMemoryMaintenance(
     policy=VacuumPolicy(retention_hours=30 * 24, max_cdf_outage_hours=7 * 24),
 )
 ops.optimize()
-ops.vacuum()  # dry run
+ops.vacuum()                     # dry run; vacuum(dry_run=False) also prunes the restore journal
+ops.recover_restore()            # settle interrupted restores (see above)
+ops.provision(force=True)        # re-run Databricks setup (indexes, predictive optimization)
+ops.rederive_columns()           # once after an upgrade that changed derived columns
 ```
+
+Upgrading a store written before this version: run `migrate_legacy()` for a
+pre-split single table (it also stamps legacy chats' messages with their
+`chat_id`), and `rederive_columns()` once so `B_kv`'s `namespace` /
+`scope_id` follow the current rule — `("kv", <key>)` for plain KV entries,
+`(<ns>, <id>)` for `policy` / `tmem` / `summary` / `pending`. Legacy chats in
+any other store are stamped lazily, the first time a thread's chats are
+read.
 
 ### Optional Databricks AI Bridge
 

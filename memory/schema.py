@@ -39,7 +39,23 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from . import _delta
+
 logger = logging.getLogger(__name__)
+
+#: Bumped when provisioning (indexes, views, properties) changes, so a table
+#: provisioned by an older version is provisioned again once.
+SCHEMA_VERSION = "3"
+#: Table property set on the first table of a group once Databricks
+#: provisioning fully succeeded for SCHEMA_VERSION.
+PROVISIONED_PROPERTY = "sasparser.memory.provisioned"
+#: Set on B_messages by DeltaMemoryMaintenance.migrate_legacy.
+MIGRATED_PROPERTY = "sasparser.memory.migrated_from"
+
+#: ``kv::<ns>::<scope>…`` namespaces written by this codebase (policy,
+#: thread notes, rolling summaries, pending extractor proposals). Any other
+#: ``kv::<key>`` is a plain KVMemoryStore entry.
+KV_NAMESPACES: tuple[str, ...] = ("policy", "tmem", "summary", "pending")
 
 
 _IDENTIFIER_PART = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -440,6 +456,9 @@ RESTORE_JOURNAL = TableSpec(
         ("pre_version", "BIGINT"),
         ("state", "STRING"),
         ("ts", "DOUBLE"),
+        # Version the overwrite committed ('overwritten' rows): rollback is
+        # only safe while the table is still at exactly this version.
+        ("post_version", "BIGINT"),
     ),
     not_null=("restore_id", "state", "ts"),
     cluster_by=("restore_id",),
@@ -566,6 +585,9 @@ class ProvisionReport:
     #: Which index-name form the runtime accepted ("qualified" / "bare"),
     #: once any index statement succeeded.
     index_name_style: str | None = None
+    #: True when the tables already carried the provisioned marker, so no
+    #: statement was issued.
+    reused: bool = False
 
     @property
     def full_text_search(self) -> bool:
@@ -573,16 +595,30 @@ class ProvisionReport:
         return bool(self.search_indexes) and not self.failures
 
 
+def _ddl(spark: Any, operation: str, statement: str) -> Any:
+    """Run idempotent DDL, retrying a lost create race or a concurrent
+    metadata/protocol change — what workers starting together hit."""
+    return _delta.with_retry(
+        operation, lambda: spark.sql(statement), retry_on=_delta.is_retryable_ddl
+    )
+
+
 def ensure_tables(spark: Any, base: str, specs: tuple[TableSpec, ...]) -> None:
     """``CREATE TABLE IF NOT EXISTS`` every spec, add any nullable column a
-    newer spec declares (additive migration), enable CDF where missing."""
+    newer spec declares (additive migration), enable CDF where missing.
+
+    Callers run this once per process per base (see the provisioning caches
+    in memory.store / memory.chunk_history), not per construction.
+    """
     for spec in specs:
-        spark.sql(spec.ddl(base))
+        _ddl(spark, f"CREATE {spec.suffix}", spec.ddl(base))
         _add_missing_columns(spark, base, spec)
         if spec.cdf and not table_property(spark, spec.name(base), "delta.enableChangeDataFeed"):
-            spark.sql(
+            _ddl(
+                spark,
+                f"CDF {spec.suffix}",
                 f"ALTER TABLE {quoted_table_name(spec.name(base))} SET TBLPROPERTIES "
-                "('delta.enableChangeDataFeed' = 'true')"
+                "('delta.enableChangeDataFeed' = 'true')",
             )
 
 
@@ -605,8 +641,18 @@ def _add_missing_columns(spark: Any, base: str, spec: TableSpec) -> None:
             "it is not a memory table this version can migrate"
         )
     cols = ", ".join(f"`{n}` {t}" for n, t in missing)
-    spark.sql(f"ALTER TABLE {quoted_table_name(table)} ADD COLUMNS ({cols})")
+    _ddl(spark, f"ADD COLUMNS {spec.suffix}", f"ALTER TABLE {quoted_table_name(table)} ADD COLUMNS ({cols})")
     logger.info(f"ensure_tables: added column(s) {[n for n, _ in missing]} to {table}")
+
+
+def table_properties(spark: Any, table: str) -> dict[str, str]:
+    """All table properties of *table* (empty when it cannot be read)."""
+    try:
+        rows = spark.sql(f"SHOW TBLPROPERTIES {quoted_table_name(table)}").collect()
+    except Exception as exc:  # pragma: no cover - depends on the backend
+        logger.debug(f"table_properties: could not read properties of {table}: {exc}")
+        return {}
+    return {str(row["key"]): str(row["value"]) for row in rows}
 
 
 def table_property(spark: Any, table: str, key: str) -> bool:
@@ -616,15 +662,32 @@ def table_property(spark: Any, table: str, key: str) -> bool:
     attempts the ALTER: the failure mode to avoid is silently *skipping* an
     upgrade, not attempting it once too often.
     """
+    return table_properties(spark, table).get(key, "").strip().lower() == "true"
+
+
+def set_table_property(spark: Any, table: str, key: str, value: str) -> bool:
+    """Set one table property; ``False`` (logged) when the runtime refuses."""
     try:
-        rows = spark.sql(f"SHOW TBLPROPERTIES {quoted_table_name(table)}").collect()
-    except Exception as exc:  # pragma: no cover - depends on the backend
-        logger.debug(f"table_property: could not read properties of {table}: {exc}")
+        _ddl(
+            spark,
+            f"SET {key}",
+            f"ALTER TABLE {quoted_table_name(table)} SET TBLPROPERTIES "
+            f"({sql_string_literal(key)} = {sql_string_literal(value)})",
+        )
+        return True
+    except Exception as exc:
+        logger.info(f"set_table_property: {table} {key}: {_short(exc)}")
         return False
-    for row in rows:
-        if row["key"] == key:
-            return str(row["value"]).strip().lower() == "true"
-    return False
+
+
+def is_provisioned(spark: Any, base: str, specs: tuple[TableSpec, ...]) -> bool:
+    """Whether *specs* were fully provisioned for :data:`SCHEMA_VERSION`."""
+    marker = table_properties(spark, specs[0].name(base)).get(PROVISIONED_PROPERTY)
+    return marker == SCHEMA_VERSION
+
+
+def mark_provisioned(spark: Any, base: str, specs: tuple[TableSpec, ...]) -> None:
+    set_table_property(spark, specs[0].name(base), PROVISIONED_PROPERTY, SCHEMA_VERSION)
 
 
 def enable_databricks_features(

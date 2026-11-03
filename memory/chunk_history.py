@@ -35,12 +35,17 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Literal, Optional, Sequence
 
-from . import schema
+from . import _delta, schema
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from pyspark.sql import DataFrame, SparkSession
 
 logger = logging.getLogger(__name__)
+
+# (spark application id, base, full_text_search) -> (provision report, search
+# functions available): tables, views and Databricks provisioning run once
+# per process per base (see memory.store.forget_provisioning).
+_HISTORY_PROVISIONED: Dict[tuple[str, str, bool], tuple[Any, bool]] = {}
 
 HistoryField = Literal["original", "converted", "response"]
 
@@ -218,13 +223,26 @@ class ChunkHistory:
         self._archive_view = schema.quoted_table_name(
             schema.chunk_history_view_name(base, archived=True)
         )
+        key = (*_delta.application_key(spark, base), full_text_search)
+        cached = _HISTORY_PROVISIONED.get(key)
+        if cached is not None:
+            self.provision, self.search_functions = cached
+            return
         schema.ensure_tables(spark, base, tables)
-        spark.sql(schema.chunk_history_view_ddl(base))
-        spark.sql(schema.chunk_history_view_ddl(base, archived=True))
-        if full_text_search:
-            self.provision = schema.enable_databricks_features(
-                spark, base, schema.HISTORY_TABLES
+        for archived in (False, True):
+            # OR REPLACE keeps the view in step with this version's columns;
+            # once per process, retried when workers race on it.
+            _delta.with_retry(
+                "chunk history view",
+                lambda archived=archived: spark.sql(
+                    schema.chunk_history_view_ddl(base, archived=archived)
+                ),
+                retry_on=_delta.is_retryable_ddl,
             )
+        if full_text_search:
+            from .store import provision_databricks
+
+            self.provision = provision_databricks(spark, base, schema.HISTORY_TABLES)
             if self.provision.failures:
                 logger.warning(
                     "chunk history %s: Databricks features unavailable (%d "
@@ -233,7 +251,8 @@ class ChunkHistory:
                     len(self.provision.failures),
                     self.provision.failures[0],
                 )
-            self.search_functions = self._probe_search_functions()
+            self.search_functions = _delta.probe_search_functions(spark)
+        _HISTORY_PROVISIONED[key] = (self.provision, self.search_functions)
 
     @property
     def is_delta(self) -> bool:
@@ -781,7 +800,9 @@ class ChunkHistory:
         words = _WORD.findall(pattern)
         if not words:
             return F.lit(False)
-        flags = "" if case_sensitive else "(?i)"
+        # (?iu): Java's (?i) alone folds ASCII only; UNICODE_CASE makes
+        # 'ÉTAPE' match 'étape', as Python's str.lower does in memory.
+        flags = "" if case_sensitive else "(?iu)"
         predicate = None
         for word in words:
             # Java regex: a whole word, bounded by non-letters.
@@ -790,32 +811,11 @@ class ChunkHistory:
             predicate = clause if predicate is None else predicate & clause
         return predicate
 
-    def _probe_search_functions(self) -> bool:
-        try:
-            self._spark_or_raise().sql(
-                "SELECT isearch('memory', 'mem', mode => 'substring') AS hit"
-            ).collect()
-            return True
-        except Exception:
-            logger.info("chunk history: search()/isearch() unavailable; using LIKE scans")
-            return False
-
     def _retry(self, operation: str, action: Any) -> None:
-        for attempt in range(self._max_write_retries + 1):
-            try:
-                action()
-                return
-            except Exception as exc:
-                text = str(exc).upper()
-                transient = "CONCURRENT" in text or "CONFLICT" in text
-                if not transient or attempt == self._max_write_retries:
-                    raise
-                delay = 0.05 * (2**attempt)
-                logger.warning(
-                    "chunk history %s conflicted; retrying (%s/%s) in %.2fs",
-                    operation, attempt + 1, self._max_write_retries, delay,
-                )
-                time.sleep(delay)
+        """Retry an idempotent write (MERGE / DELETE) on a Delta conflict."""
+        _delta.with_retry(
+            f"chunk history {operation}", action, max_retries=self._max_write_retries
+        )
 
     def _staged(self, spec: schema.TableSpec, rows: List[Dict[str, Any]]) -> "DataFrame":
         ddl = ", ".join(f"`{n}` {t}" for n, t in spec.columns)
@@ -824,13 +824,52 @@ class ChunkHistory:
         )
 
     def _with_view(self, df: "DataFrame", action: Any) -> None:
-        spark = self._spark_or_raise()
-        view = f"_chunk_hist_{uuid.uuid4().hex}"
-        df.createOrReplaceTempView(view)
-        try:
+        with _delta.temp_view(self._spark_or_raise(), df, "chunk_hist") as view:
             action(view)
-        finally:
-            spark.catalog.dropTempView(view)
+
+    def _insert_once(
+        self, suffix: str, spec: schema.TableSpec, rows: List[Dict[str, Any]]
+    ) -> None:
+        """Blind INSERT that is safe to retry: after any failure the rows'
+        ``attempt_id``s are looked up (a Delta commit is atomic), and only
+        the absent attempts are re-sent, only on a retryable conflict — a
+        commit that landed despite a client-side error is never duplicated."""
+        spark = self._spark_or_raise()
+        target = self._quoted[suffix]
+        cols = ", ".join(f"`{c}`" for c in spec.column_names)
+        pending = list(rows)
+        for attempt in range(self._max_write_retries + 1):
+            try:
+                self._with_view(
+                    self._staged(spec, pending),
+                    lambda view: spark.sql(
+                        f"INSERT INTO {target} ({cols}) SELECT {cols} FROM {view}"
+                    ),
+                )
+                return
+            except Exception as exc:
+                from pyspark.sql import functions as F
+
+                ids = sorted({r["attempt_id"] for r in pending})
+                landed = {
+                    r.attempt_id
+                    for r in spark.table(target)
+                    .filter(F.col("attempt_id").isin(ids))
+                    .select("attempt_id")
+                    .distinct()
+                    .collect()
+                }
+                pending = [r for r in pending if r["attempt_id"] not in landed]
+                if not pending:
+                    logger.info(
+                        "chunk history %s INSERT reported %s but its commit landed",
+                        suffix,
+                        type(exc).__name__,
+                    )
+                    return
+                if not _delta.is_retryable_conflict(exc) or attempt == self._max_write_retries:
+                    raise
+                time.sleep(0.05 * (2**attempt))
 
     def _write_delta(
         self,
@@ -864,14 +903,4 @@ class ChunkHistory:
         ):
             if not rows:
                 continue
-            target = self._quoted[suffix]
-            cols = ", ".join(f"`{c}`" for c in spec.column_names)
-            with_view(
-                staged(spec, rows),
-                lambda view, target=target, cols=cols, suffix=suffix: self._retry(
-                    f"{suffix} INSERT",
-                    lambda: spark.sql(
-                        f"INSERT INTO {target} ({cols}) SELECT {cols} FROM {view}"
-                    ),
-                ),
-            )
+            self._insert_once(suffix, spec, rows)

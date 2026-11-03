@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from . import schema
+from . import _delta, schema
 from .schema import quoted_table_name as _quoted_table_name
 
 logger = logging.getLogger(__name__)
@@ -83,17 +83,12 @@ class DeltaMemoryMaintenance:
 
     def status(self) -> dict[str, Any]:
         """Return the current Delta history/details needed by an operator."""
-        tables: dict[str, Any] = {}
-        for spec in self._existing():
-            quoted = _quoted_table_name(spec.name(self.table_name))
-            latest = self._spark.sql(f"DESCRIBE HISTORY {quoted} LIMIT 1").first()
-            detail = self._spark.sql(f"DESCRIBE DETAIL {quoted}").first()
-            tables[spec.name(self.table_name)] = {
-                "latest_version": int(latest.version) if latest is not None else None,
-                "last_operation": getattr(latest, "operation", None),
-                "size_in_bytes": getattr(detail, "sizeInBytes", None),
-                "num_files": getattr(detail, "numFiles", None),
-            }
+        tables: dict[str, Any] = {
+            spec.name(self.table_name): _delta.table_status(
+                self._spark, _quoted_table_name(spec.name(self.table_name))
+            )
+            for spec in self._existing()
+        }
         return {
             "base_table": self.table_name,
             "tables": tables,
@@ -106,8 +101,16 @@ class DeltaMemoryMaintenance:
             self._spark.sql(f"OPTIMIZE {_quoted_table_name(spec.name(self.table_name))}")
 
     def vacuum(self, *, dry_run: bool = True) -> dict[str, list[Any]]:
-        """Vacuum every table within policy; dry-run by default."""
+        """Vacuum every table within policy; dry-run by default.
+
+        A real run also prunes ``B_restore_journal`` rows of settled restores
+        older than the retention window, so the journal cannot grow forever.
+        """
         out: dict[str, list[Any]] = {}
+        if not dry_run:
+            self._backend().prune_restore_journal(
+                time.time() - self.policy.retention_hours * 3600
+            )
         for spec in self._existing():
             name = spec.name(self.table_name)
             command = (
@@ -135,7 +138,7 @@ class DeltaMemoryMaintenance:
                     logger.debug(f"search_index_status: {name}: {exc}")
         return out
 
-    def rebuild_search_indexes(self) -> schema.ProvisionReport:
+    def rebuild_search_indexes(self) -> dict[str, schema.ProvisionReport]:
         """Drop and recreate every full-text search index.
 
         Needed once when the feature leaves Beta: Databricks does not carry
@@ -146,29 +149,63 @@ class DeltaMemoryMaintenance:
                 schema.run_index_sql(
                     self._spark, spec, self.table_name, index.column, "DROP INDEX IF EXISTS {name}"
                 )
-        return schema.enable_databricks_features(
-            self._spark, self.table_name, tuple(self._existing())
-        )
+        return self.provision(force=True)
+
+    def provision(self, *, force: bool = True) -> dict[str, schema.ProvisionReport]:
+        """(Re)run the one-time Databricks setup: predictive optimization,
+        search indexes and the provisioned marker, for the KV and the
+        chunk-history table groups. Clears this process's provisioning cache
+        so the next store re-validates too."""
+        from .store import forget_provisioning, provision_databricks
+
+        forget_provisioning(self.table_name)
+        existing = set(self._existing())
+        return {
+            group: provision_databricks(
+                self._spark,
+                self.table_name,
+                tuple(spec for spec in specs if spec in existing),
+                force=force,
+            )
+            for group, specs in (("kv", schema.KV_TABLES), ("history", schema.HISTORY_TABLES))
+            if specs[0] in existing
+        }
+
+    def _backend(self) -> Any:
+        from .store import _DeltaBackend
+
+        return _DeltaBackend(self._spark, self.table_name, full_text_search=False)
 
     # ---- restore recovery ------------------------------------------------
 
-    def recover_restore(self) -> list[str]:
-        """Roll back every interrupted ``KVStore.restore`` run.
+    def recover_restore(self) -> dict[str, dict[str, Any]]:
+        """Settle every interrupted ``KVStore.restore`` run.
 
-        A restore that crashed mid-way leaves some memory tables overwritten
-        and others not; each table is put back to the version journaled
-        before that run began. Returns the recovered restore ids. Rerun the
-        restore afterwards if its snapshot is still wanted.
+        Per run:
+
+        * every table journaled ``overwritten`` → the restore did finish
+          (only its completion row was lost): marked complete, nothing undone;
+        * otherwise only the tables the run overwrote are rolled back, and
+          only those still at the version the run left them at; a table
+          written to since is listed under ``needs_manual`` instead (RESTORE
+          would erase those later commits). Untouched tables are never
+          restored.
+
+        Returns ``{restore_id: {"completed", "rolled_back", "needs_manual"}}``.
+        Rerun the restore afterwards if its snapshot is still wanted.
         """
-        from .store import _DeltaBackend
+        backend = self._backend()
+        outcomes: dict[str, dict[str, Any]] = {}
+        for restore_id, run in backend.unfinished_restores().items():
+            outcomes[restore_id] = backend.settle_restore(restore_id, run)
+            logger.info(f"recover_restore: {restore_id} -> {outcomes[restore_id]}")
+        return outcomes
 
-        backend = _DeltaBackend(self._spark, self.table_name, full_text_search=False)
-        recovered = []
-        for restore_id, versions in backend.unfinished_restores().items():
-            backend.rollback_restore(restore_id, versions)
-            recovered.append(restore_id)
-            logger.info(f"recover_restore: rolled back {restore_id} -> {versions}")
-        return recovered
+    def rederive_columns(self) -> dict[str, int]:
+        """Recompute the derived columns (thread_id, namespace, scope_id, …)
+        of every KV-routed row from its key and value. Run once after an
+        upgrade that changed a derivation rule; values are untouched."""
+        return self._backend().rederive()
 
     # ---- chunk history archival ------------------------------------------
 
@@ -204,12 +241,10 @@ class DeltaMemoryMaintenance:
         rows unless ``force=True``. The legacy table itself is left untouched.
         Returns the number of rows copied per target table.
         """
-        from .store import _DeltaBackend
-
         # The legacy table is usually the base name itself: its derived
         # tables carry suffixes, so the two never collide.
         legacy = _quoted_table_name(legacy_table)
-        backend = _DeltaBackend(self._spark, self.table_name, full_text_search=False)
+        backend = self._backend()
         if backend.count() and not force:
             raise RuntimeError(
                 f"memory tables under {self.table_name!r} already hold rows; "
@@ -217,6 +252,7 @@ class DeltaMemoryMaintenance:
             )
         copied: dict[str, int] = {}
         batch: list[tuple[Any, ...]] = []
+        chat_threads: set[str] = set()
 
         def flush() -> None:
             if not batch:
@@ -224,6 +260,8 @@ class DeltaMemoryMaintenance:
             for row in batch:
                 suffix = backend._route(row[0]).suffix
                 copied[suffix] = copied.get(suffix, 0) + 1
+                if row[0].startswith("chat::"):
+                    chat_threads.add(row[0][len("chat::") :].rsplit("::", 1)[0])
             backend.upsert(list(batch), _now())
             batch.clear()
 
@@ -251,6 +289,19 @@ class DeltaMemoryMaintenance:
             if len(batch) >= MIGRATION_BATCH_ROWS:
                 flush()
         flush()
+        # Legacy messages have no chat_id stamp: stamp them now, from each
+        # chat's recorded key range, so chats keep their messages.
+        from .store import KVChatMessageHistory, KVStore
+
+        store = KVStore(self._spark, self.table_name, full_text_search=False)
+        for thread_id in sorted(chat_threads):
+            KVChatMessageHistory(thread_id, store).backfill_legacy_chats()
+        schema.set_table_property(
+            self._spark,
+            schema.MESSAGES.name(self.table_name),
+            schema.MIGRATED_PROPERTY,
+            legacy_table,
+        )
         logger.info(f"migrate_legacy: {legacy_table} -> {self.table_name}_*: {copied}")
         return copied
 

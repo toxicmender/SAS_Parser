@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     parser.add_argument("--schema", required=True, help="catalog.schema to create scratch tables in")
     parser.add_argument("--keep", action="store_true", help="do not drop the scratch tables")
     args = parser.parse_args(argv)
@@ -59,6 +59,11 @@ def main(argv: list[str] | None = None) -> int:
         hub = MemoryHub(spark=spark, table=base, full_text_search=True)
         kv_report = hub._store._backend.provision
         hist_report = hub.chunk_history.provision
+        check(
+            schema.is_provisioned(spark, base, schema.KV_TABLES)
+            and schema.is_provisioned(spark, base, schema.HISTORY_TABLES),
+            "provisioned marker set (later processes skip the Databricks setup)",
+        )
         for label, report in (("kv tables", kv_report), ("chunk history", hist_report)):
             check(report is not None and not report.failures,
                   f"{label}: predictive optimization + search indexes "
@@ -97,9 +102,11 @@ def main(argv: list[str] | None = None) -> int:
         check(len(hub.chunk_history.search("dropDuplicates", field="converted")) == 1,
               "chunk_history.search(converted)")
 
-        plan = spark.table(schema.chunk_history_view_name(base)).filter(
-            schema.search_sql(("original_text",), "nodupkey")
-        )._jdf.queryExecution().executedPlan().toString()
+        explain = spark.sql(
+            f"EXPLAIN SELECT * FROM {schema.quoted_table_name(schema.chunk_history_view_name(base))} "
+            f"WHERE {schema.search_sql(('original_text',), 'nodupkey')}"
+        ).first()
+        plan = str(explain[0]) if explain is not None else ""
         check("isearch" in plan.lower() or "search" in plan.lower(),
               "isearch predicate reaches the physical plan")
         print("\nIndexes refresh asynchronously; track REFRESH_INDEX runs in "

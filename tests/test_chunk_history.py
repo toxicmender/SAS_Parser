@@ -288,6 +288,16 @@ class ChunkHistoryContract:
         assert len(h.history(chunk_key=chunk_key("a.sas", SORT))) == 4
         assert len(h.history(chunk_id="c1", thread_id="t2")) == 1
 
+    def test_case_insensitive_search_folds_non_ascii_letters(self):
+        h = self.make()
+        h.record_attempt(
+            _batch("b", _chunk("c1", "* étape de tri; proc sort data=x; run;")),
+            "r", None, thread_id="t", attempt=1, is_final=True,
+        )
+        assert [r["chunk_id"] for r in h.search("ÉTAPE", mode="word")] == ["c1"]
+        assert [r["chunk_id"] for r in h.search("ÉTAPE")] == ["c1"]
+        assert h.search("ÉTAPE", case_sensitive=True) == []
+
     def test_search_original_converted_and_response(self):
         h = self.make()
         h.record_attempt(
@@ -408,8 +418,11 @@ class TestInMemoryChunkHistory(ChunkHistoryContract):
 class TestDeltaChunkHistory(ChunkHistoryContract):
     @pytest.fixture(autouse=True)
     def _bind_spark(self, delta_spark):
+        from memory.store import forget_provisioning
+
         self._spark = delta_spark
         self._bases: list[str] = []
+        forget_provisioning()
         yield
         for base in self._bases:
             for archived in (False, True):
