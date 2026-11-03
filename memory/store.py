@@ -527,9 +527,9 @@ class _DeltaBackend:
     # ---- DDL ---------------------------------------------------------------
 
     def _ensure_tables(self, full_text_search: bool) -> None:
-        self._warn_on_legacy_table()
         schema.ensure_tables(self._spark, self._base, schema.KV_TABLES)
         self._validate_schema()
+        self._warn_on_legacy_table()
         if full_text_search:
             self.provision = schema.enable_databricks_features(
                 self._spark, self._base, schema.KV_TABLES
@@ -553,7 +553,19 @@ class _DeltaBackend:
         if not exists:
             return
         names = {f.name for f in self._spark.table(self._table_name_q()).schema}
-        if {"kv_key", "value"} <= names:
+        if not {"kv_key", "value"} <= names:
+            return
+        if any(
+            self._spark.table(self._quoted[spec.suffix]).limit(1).count()
+            for spec in schema.KV_TABLES
+        ):
+            # Already migrated (or in use): the old table is just history.
+            logger.info(
+                "Delta memory: legacy single table %s is still present but "
+                "unused; drop it once the migration is verified.",
+                self._base,
+            )
+        else:
             logger.error(
                 "Delta memory: %s is a legacy single-table memory store. The "
                 "store now uses %s_* typed tables and does not read it; copy "
@@ -1003,31 +1015,36 @@ class _DeltaBackend:
         events: list[dict[str, Any]] = []
         audit_rows: list[tuple[Any, ...]] = []
         versions: list[int] = []
-        for spec in schema.KV_TABLES:
-            if not spec.cdf:
-                continue
+        cdf_specs = [spec for spec in schema.KV_TABLES if spec.cdf]
+        checkpoint_keys = {
+            spec.suffix: self._audit_event_id(
+                consumer_id, self._names[spec.suffix], -1, "__checkpoint__", "checkpoint"
+            )
+            for spec in cdf_specs
+        }
+        # This runs before every LLM call of a CDF-enabled pipeline: read all
+        # checkpoints in one query rather than one per table.
+        stored = {
+            row.event_id: int(row.commit_version)
+            for row in self._spark.table(audit)
+            .filter(F.col("event_id").isin(list(checkpoint_keys.values())))
+            .select("event_id", "commit_version")
+            .collect()
+        }
+        for spec in cdf_specs:
             name = self._names[spec.suffix]
-            checkpoint_key = self._audit_event_id(
-                consumer_id, name, -1, "__checkpoint__", "checkpoint"
-            )
-            checkpoint_rows = (
-                self._spark.table(audit)
-                .filter(F.col("event_id") == checkpoint_key)
-                .select("commit_version")
-                .limit(1)
-                .collect()
-            )
+            checkpoint_key = checkpoint_keys[spec.suffix]
             latest = self._latest_version(spec.suffix)
             versions.append(latest)
             checkpoint_row = (
                 checkpoint_key, consumer_id, name, None,
                 "checkpoint", latest, None, None, None, now,
             )
-            if not checkpoint_rows:
+            if checkpoint_key not in stored:
                 baseline = True
                 audit_rows.append(checkpoint_row)
                 continue
-            checkpoint = int(checkpoint_rows[0].commit_version)
+            checkpoint = stored[checkpoint_key]
             if checkpoint >= latest:
                 continue
             changes = (

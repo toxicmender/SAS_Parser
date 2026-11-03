@@ -186,6 +186,25 @@ class ChunkHistoryContract:
         finals = h.for_item("t1", "batch-001", final_only=True)
         assert {r["attempt"] for r in finals} == {2}
 
+    def test_current_only_keeps_the_answer_that_stands_after_a_redo(self):
+        h = self.make()
+        item = _batch("batch-001", _chunk("c1", SORT))
+        h.record_attempt(item, "first run", None, thread_id="t1", attempt=1, is_final=True)
+        # A later resume re-translates the item; both answers were accepted.
+        h.record_attempt(item, "redo rejected", None, thread_id="t1", attempt=1, is_final=False)
+        h.record_attempt(item, "redo kept", None, thread_id="t1", attempt=2, is_final=True)
+        h.record_attempt(_batch("batch-002", _chunk("c2", STEP, start=2)), "other", None,
+                         thread_id="t1", attempt=1, is_final=True)
+        assert [r["response"] for r in h.for_item("t1", "batch-001", final_only=True)] == [
+            "first run", "redo kept",
+        ]
+        assert [r["response"] for r in h.for_item("t1", "batch-001", current_only=True)] == [
+            "redo kept",
+        ]
+        assert sorted(r["response"] for r in h.history(thread_id="t1", current_only=True)) == [
+            "other", "redo kept",
+        ]
+
     def test_original_text_is_stored_once_per_distinct_chunk(self):
         h = self.make()
         item = _batch("batch-001", _chunk("c1", SORT))
@@ -268,6 +287,19 @@ class TestDeltaChunkHistory(ChunkHistoryContract):
             thread_id="t", attempt=1, is_final=True,
         )
         assert [r["chunk_id"] for r in h.search("proc sort")] == ["c1"]
+
+    def test_a_raced_duplicate_source_row_does_not_duplicate_history(self):
+        h = self.make()
+        h.record_attempt(
+            _batch("b", _chunk("c1", SORT)), "r", None,
+            thread_id="t", attempt=1, is_final=True,
+        )
+        base = self._bases[-1]
+        sources = schema.CHUNK_SOURCES.name(base)
+        # What two concurrent insert-only MERGEs of the same new chunk leave.
+        self._spark.sql(f"INSERT INTO {sources} SELECT * FROM {sources}")
+        assert self._spark.table(sources).count() == 2
+        assert len(h.for_item("t", "b")) == 1
 
     def test_tables_carry_row_tracking_and_the_view_exists(self):
         h = self.make()

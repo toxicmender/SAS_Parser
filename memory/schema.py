@@ -227,9 +227,14 @@ MESSAGES = TableSpec(
     not_null=_KV_NOT_NULL,
     cluster_by=("thread_id", "msg_tick"),
     cdf=True,
+    # KVStore.search pushes isearch(kv_key, value, tags) down; an index can
+    # only skip files when every target column is indexed, so all three are,
+    # plus the plain-text content for direct SQL lookups (the 4-index cap).
     search_indexes=(
         SearchIndex("content", "ngram", 5),
         SearchIndex("value", "ngram", 5),
+        SearchIndex("kv_key", "ngram", 5),
+        SearchIndex("tags", "ngram", 5),
     ),
     comment="LLM chat messages; value = lossless LangChain message JSON, "
     "content = its plain text. Append-only.",
@@ -289,7 +294,11 @@ KV = TableSpec(
     columns=KV_CORE + (("namespace", "STRING"), ("scope_id", "STRING")),
     not_null=_KV_NOT_NULL,
     cluster_by=("namespace", "scope_id"),
-    search_indexes=(SearchIndex("value", "ngram", 5),),
+    search_indexes=(
+        SearchIndex("value", "ngram", 5),
+        SearchIndex("kv_key", "ngram", 5),
+        SearchIndex("tags", "ngram", 5),
+    ),
     comment="Low-volume memory records: task policies, thread notes, "
     "rolling summaries and plain KV entries.",
 )
@@ -338,7 +347,7 @@ ITEM_ATTEMPTS = TableSpec(
     ),
     not_null=("attempt_id", "thread_id", "item_id", "attempt", "is_final"),
     cluster_by=("thread_id", "item_id"),
-    search_indexes=(SearchIndex("response", "split", 3),),
+    search_indexes=(SearchIndex("response", "ngram", 4),),
     comment="Every LLM attempt for a work item, accepted or rejected. "
     "Append-only.",
 )
@@ -400,7 +409,17 @@ def chunk_history_view_ddl(base: str) -> str:
             a.validation_score, a.validation_passed, c.created_at
         FROM {conv} AS c
         JOIN {att} AS a ON a.attempt_id = c.attempt_id
-        JOIN {src} AS s ON s.chunk_key = c.chunk_key
+        JOIN (
+            -- Two workers recording the same new chunk at once can both win
+            -- their insert-only MERGE; keep the first so a race can never
+            -- duplicate history rows.
+            SELECT * FROM (
+                SELECT *, row_number() OVER (
+                    PARTITION BY chunk_key ORDER BY first_seen_at, chunk_id
+                ) AS _rn
+                FROM {src}
+            ) WHERE _rn = 1
+        ) AS s ON s.chunk_key = c.chunk_key
     """
 
 

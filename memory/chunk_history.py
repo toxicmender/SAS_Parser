@@ -117,6 +117,20 @@ def converted_text_for(
     return response or None
 
 
+def _current(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Rows of the latest accepted attempt per (thread_id, item_id)."""
+    latest: Dict[tuple[Any, Any], tuple[float, int, str]] = {}
+    for r in rows:
+        if not r["is_final"]:
+            continue
+        rank = (r["created_at"] or 0.0, r["attempt"] or 0, r["attempt_id"])
+        key = (r["thread_id"], r["item_id"])
+        if key not in latest or rank > latest[key]:
+            latest[key] = rank
+    keep = {rank[2] for rank in latest.values()}
+    return [r for r in rows if r["attempt_id"] in keep]
+
+
 def _matches(
     texts: Sequence[Optional[str]], pattern: str, *, case_sensitive: bool, mode: str
 ) -> bool:
@@ -301,11 +315,16 @@ class ChunkHistory:
         thread_id: Optional[str] = None,
         item_id: Optional[str] = None,
         final_only: bool = False,
+        current_only: bool = False,
     ) -> List[Dict[str, Any]]:
         """History rows (original + converted chunk), oldest first.
 
-        Every filter given must match; ``final_only`` keeps only accepted
-        attempts.
+        Every filter given must match. ``final_only`` keeps every attempt that
+        was accepted when it ran. An item can be accepted more than once: a
+        resume with validation retries re-translates an item whose stored
+        verdict failed, and its earlier answer keeps ``is_final``.
+        ``current_only`` therefore keeps just the most recent accepted attempt
+        of each (thread, item) — the answer that stands now.
         """
         filters = {
             "chunk_id": chunk_id,
@@ -313,13 +332,27 @@ class ChunkHistory:
             "thread_id": thread_id,
             "item_id": item_id,
         }
-        return self._query({k: v for k, v in filters.items() if v is not None}, final_only)
+        rows = self._query(
+            {k: v for k, v in filters.items() if v is not None},
+            final_only or current_only,
+        )
+        return _current(rows) if current_only else rows
 
     def for_item(
-        self, thread_id: str, item_id: str, *, final_only: bool = False
+        self,
+        thread_id: str,
+        item_id: str,
+        *,
+        final_only: bool = False,
+        current_only: bool = False,
     ) -> List[Dict[str, Any]]:
         """Every attempt's rows for one work item, oldest attempt first."""
-        return self.history(thread_id=thread_id, item_id=item_id, final_only=final_only)
+        return self.history(
+            thread_id=thread_id,
+            item_id=item_id,
+            final_only=final_only,
+            current_only=current_only,
+        )
 
     def search(
         self,

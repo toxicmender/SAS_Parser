@@ -199,13 +199,13 @@ pattern rather than one generic KV table (`memory/schema.py` holds the DDL):
 
 | Table | Holds | Write pattern | Liquid `CLUSTER BY` | Full-text search index |
 |-------|-------|---------------|---------------------|------------------------|
-| `B_messages` | `msg::` chat messages | blind `INSERT` (keys are collision-free) | `thread_id, msg_tick` | `content` ngram(5), `value` ngram(5) |
+| `B_messages` | `msg::` chat messages | blind `INSERT` (keys are collision-free) | `thread_id, msg_tick` | `content`, `value`, `kv_key`, `tags` ngram(5) |
 | `B_chats` | `chat::` chat index rows | `MERGE` | `thread_id` | — |
 | `B_run_items` | `kv::run::` per-item run facts | `MERGE` | `thread_id, item_id` | — |
 | `B_validations` | `kv::validation::` verdicts | `MERGE` | `thread_id, item_id` | — |
-| `B_kv` | everything else: policies, thread notes, summaries, plain KV | `MERGE` | `namespace, scope_id` | `value` ngram(5) |
+| `B_kv` | everything else: policies, thread notes, summaries, plain KV | `MERGE` | `namespace, scope_id` | `value`, `kv_key`, `tags` ngram(5) |
 | `B_chunk_sources` | each distinct **original** SAS chunk, once | insert-only `MERGE` | `source_id, chunk_id` | `original_text` ngram(4) |
-| `B_item_attempts` | every LLM attempt per work item (accepted *and* rejected) | blind `INSERT` | `thread_id, item_id` | `response` split(3) |
+| `B_item_attempts` | every LLM attempt per work item (accepted *and* rejected) | blind `INSERT` | `thread_id, item_id` | `response` ngram(4) |
 | `B_chunk_conversions` | each attempt's **converted** code per member chunk | blind `INSERT` | `chunk_key, thread_id` | `converted_text` ngram(4) |
 | `B_chunk_history` | VIEW: original + converted chunk, response and verdict on one row | — | — | (base-table indexes) |
 
@@ -260,6 +260,13 @@ Requirements and limits, from the Databricks feature (Beta; DBR 18.3+):
   Preview: `DeltaMemoryMaintenance.rebuild_search_indexes()`;
   `search_index_status()` runs `DESCRIBE INDEX` for each.
 
+Why these columns and tokenizers: `kv.search` is `isearch(kv_key, value,
+tags, …)` and an index can only skip a file when *every* target is indexed,
+so all three are; and every pushed-down search is a substring search, which
+only an n-gram index can serve (a `split` word index cannot prove a substring
+absent). Patterns shorter than the n-gram size still answer correctly but
+cannot use the index.
+
 An index never changes a result — only how much data is scanned — and
 refreshes asynchronously. Off Databricks (OSS delta-spark, local Spark) the
 setup statements fail, one warning is logged, and searches fall back to
@@ -272,7 +279,12 @@ reference record of how every chunk was translated. `SasLLMPipeline` writes
 one attempt per LLM call: an attempt inline validation rejects is recorded
 with `is_final = false` *before* it is rolled off the thread, the accepted
 one with `is_final = true`. Rows are never updated or deleted, and chat
-retention does not touch them.
+retention does not touch them. Because nothing is updated, an item a resume
+re-translates has *two* accepted attempts; `current_only=True` keeps the most
+recent one per (thread, item). The history is not part of
+`MemoryHub.snapshot()`/`restore()` and is not copied by `fork_thread` /
+`fork_run` — query a forked item's lineage by `chunk_key`, which is
+thread-independent.
 
 - The **original** chunk text is stored once in `B_chunk_sources`, keyed by
   `chunk_key = sha256(source_id, text)` (re-runs and re-chunking reuse it).
@@ -284,7 +296,8 @@ retention does not touch them.
 ```python
 hist = mem.chunk_history
 hist.for_item("thread-1", "batch-003")             # every attempt, oldest first
-hist.history(chunk_id="f1-chunk-0007", final_only=True)
+hist.history(chunk_id="f1-chunk-0007", final_only=True)   # every accepted attempt
+hist.for_item("thread-1", "batch-003", current_only=True) # the answer that stands now
 hist.search("PROC SORT", field="original")          # isearch on Databricks
 hist.search("withColumn", field="converted", case_sensitive=True)
 hist.search("merge by id", field="response", mode="word")

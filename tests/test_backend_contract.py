@@ -311,6 +311,34 @@ class TestDeltaContract(KVStoreContract):
         assert store._backend.search_functions is False  # OSS: LIKE fallback
         assert {k for k, _ in store.search("sort")} == {"kv::a", "kv::b"}
 
+    def test_cdf_sync_follows_messages_and_chats_with_one_checkpoint_each(self):
+        base = self._base()
+        audit = f"{base}_audit"
+        self._tables.append(audit)
+        store = KVStore(spark=self._spark, table=base, audit_table=audit)
+        first = store.sync_cdf("worker-1")
+        assert first.baseline is True
+        store.append_many(
+            [
+                {"key": "msg::t1::0000000000000001-aa", "value": {"ts": 1.0}},
+                {"key": "chat::t1::c1", "value": {"chat_id": "c1"}},
+            ]
+        )
+        store.set("kv::run::t1::item::b1", {"status": "ok"})  # no CDF table
+        second = store.sync_cdf("worker-1")
+        assert second.baseline is False
+        changed = {(e["table"].rsplit("_", 1)[-1], e["key"]) for e in second.events}
+        assert changed == {
+            ("messages", "msg::t1::0000000000000001-aa"),
+            ("chats", "chat::t1::c1"),
+        }
+        # Nothing new: no events, checkpoints unchanged.
+        assert store.sync_cdf("worker-1").events == ()
+        checkpoints = (
+            self._spark.table(audit).filter("change_type = 'checkpoint'").count()
+        )
+        assert checkpoints == 2
+
     def test_legacy_single_table_store_migrates_once(self):
         from memory.operations import DeltaMemoryMaintenance, VacuumPolicy
 
