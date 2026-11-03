@@ -814,7 +814,17 @@ class _DeltaBackend:
                 len(done),
                 len(schema.KV_TABLES),
             )
-            self.rollback_restore(restore_id, {s: versions[s] for s in done})
+            try:
+                self.rollback_restore(restore_id, {s: versions[s] for s in done})
+            except Exception:
+                # Keep the original error; the journal still reads 'started',
+                # so recover_restore() can finish the rollback later.
+                logger.error(
+                    "Delta memory restore %s: rollback failed; run "
+                    "DeltaMemoryMaintenance.recover_restore()",
+                    restore_id,
+                    exc_info=True,
+                )
             raise
         self._journal([(restore_id, None, None, "completed", _now())])
 
