@@ -188,6 +188,7 @@ def test_repo_config_json_matches_code_defaults():
     assert repo_cfg["memory"] == {
         "delta_table": None,
         "cdf_audit_table": None,
+        "full_text_search": None,  # null = unset -> code default (True)
     }
     # The one section that ships non-null: the bundled target instruction
     # sets are on by default. max_tokens is set with them so

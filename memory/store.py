@@ -1,7 +1,8 @@
 """LangChain chat-history and KV memory. See memory/README.md.
 
-Persists to a Databricks Delta table in production; runs on a plain Python dict
-locally, with no Spark (or JVM) required at all in that mode.
+Persists to a family of typed Databricks Delta tables in production (see
+memory.schema); runs on a plain Python dict locally, with no Spark (or JVM)
+required at all in that mode.
 
 Logger name: ``memory.store``.
 """
@@ -12,7 +13,6 @@ import datetime
 import hashlib
 import json
 import logging
-import re
 import time
 import uuid
 from bisect import bisect_left, bisect_right, insort
@@ -30,6 +30,9 @@ from langchain_core.messages import (
     messages_from_dict,
 )
 
+from . import _delta, schema
+from .chunk_history import ChunkHistory
+
 # PySpark is optional — required only for Delta mode; the in-memory backend
 # (table=None) must import and run without it. The type checker imports these
 # unconditionally so uses below aren't "possibly unbound"; _PYSPARK_AVAILABLE
@@ -38,6 +41,7 @@ if TYPE_CHECKING:
     from pyspark.sql import DataFrame, SparkSession
     from pyspark.sql import functions as F
     from pyspark.sql.types import (
+        BooleanType,
         DoubleType,
         LongType,
         StringType,
@@ -50,6 +54,7 @@ try:
     from pyspark.sql import DataFrame, SparkSession
     from pyspark.sql import functions as F
     from pyspark.sql.types import (
+        BooleanType,
         DoubleType,
         LongType,
         StringType,
@@ -87,27 +92,10 @@ def _jload(s: str) -> Any:
     return json.loads(s)
 
 
-_IDENTIFIER_PART = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
-
-def _quoted_table_name(table: str) -> str:
-    """Return a SQL-safe one- to three-part table identifier.
-
-    Spark SQL parameter markers cannot represent identifiers.  Memory table
-    names are configuration, rather than data, but accepting arbitrary SQL in
-    that configuration would still make every DDL/DML call injectable.  Keep
-    the production contract deliberately narrow: Unity Catalog identifiers
-    are one, two, or three ordinary identifier parts.
-    """
-    if not isinstance(table, str) or not table:
-        raise ValueError("Delta table must be a non-empty identifier")
-    parts = table.split(".")
-    if not 1 <= len(parts) <= 3 or any(not _IDENTIFIER_PART.fullmatch(p) for p in parts):
-        raise ValueError(
-            "Delta table must be a one- to three-part identifier containing "
-            "only letters, numbers, and underscores"
-        )
-    return ".".join(f"`{part}`" for part in parts)
+# The identifier rules live with the table layout; re-exported under the old
+# private name for memory.operations and existing callers.
+_quoted_table_name = schema.quoted_table_name
 
 
 @dataclass(frozen=True)
@@ -124,25 +112,41 @@ class CDFSyncResult:
     checkpoint_version: int | None = None
 
 
-# Schema for the Delta table (built lazily; Delta mode only)
-_KV_SCHEMA = None
+
+# ---------------------------------------------------------------------------
+# Delta staging: Spark schemas and the typed columns derived on write
+# ---------------------------------------------------------------------------
+
+# SQL type in memory.schema -> DataType.simpleString() Spark reports back.
+_SQL_SIMPLE = {
+    "STRING": "string",
+    "DOUBLE": "double",
+    "BIGINT": "bigint",
+    "BOOLEAN": "boolean",
+}
+
+_SPARK_SCHEMAS: Dict[str, Any] = {}
 _AUDIT_SCHEMA = None
 
 
-def _schema():
-    global _KV_SCHEMA
-    if _KV_SCHEMA is None:
-        _KV_SCHEMA = StructType(
+def _spark_schema(spec: "schema.TableSpec"):
+    """The staging StructType for *spec* (built lazily; Delta mode only)."""
+    cached = _SPARK_SCHEMAS.get(spec.suffix)
+    if cached is None:
+        types = {
+            "STRING": StringType,
+            "DOUBLE": DoubleType,
+            "BIGINT": LongType,
+            "BOOLEAN": BooleanType,
+        }
+        cached = StructType(
             [
-                StructField("kv_key", StringType(), nullable=False),
-                StructField("value", StringType(), nullable=False),
-                StructField("tags", StringType(), nullable=True),
-                StructField("created_at", DoubleType(), nullable=True),
-                StructField("updated_at", DoubleType(), nullable=True),
-                StructField("source", StringType(), nullable=True),
+                StructField(name, types[sql_type](), nullable=name not in spec.not_null)
+                for name, sql_type in spec.columns
             ]
         )
-    return _KV_SCHEMA
+        _SPARK_SCHEMAS[spec.suffix] = cached
+    return cached
 
 
 def _audit_schema():
@@ -166,11 +170,221 @@ def _audit_schema():
     return _AUDIT_SCHEMA
 
 
+def _safe_json(value_json: str) -> Any:
+    try:
+        return _jload(value_json)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_float(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return float(value)
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_str(value: Any) -> Optional[str]:
+    return None if value is None else str(value)
+
+
+def _thread_and_tail(key: str, prefix: str) -> Tuple[Optional[str], Optional[str]]:
+    """``prefix{thread}::{tail}`` → (thread, tail), splitting at the last ``::``."""
+    rest = key[len(prefix) :]
+    if "::" not in rest:
+        return None, rest or None
+    thread, tail = rest.rsplit("::", 1)
+    return thread, tail
+
+
+def _thread_item(key: str, prefix: str) -> Tuple[Optional[str], Optional[str]]:
+    """``prefix{thread}::item::{item}`` → (thread, item)."""
+    rest = key[len(prefix) :]
+    if "::item::" not in rest:
+        return None, None
+    thread, item = rest.rsplit("::item::", 1)
+    return thread, item
+
+
+def message_text(payload: Any) -> Optional[str]:
+    """Plain text of a stored message payload (lossless or legacy shape)."""
+    if not isinstance(payload, dict):
+        return None
+    message = payload.get("message")
+    if isinstance(message, dict):
+        data = message.get("data")
+        content = data.get("content") if isinstance(data, dict) else None
+    else:
+        content = payload.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        return "\n".join(parts)
+    return None
+
+
+def _derive_message(key: str, value_json: str) -> Tuple[Any, ...]:
+    thread, tail = _thread_and_tail(key, "msg::")
+    tick = _as_int(tail.split("-", 1)[0]) if tail else None
+    payload = _safe_json(value_json)
+    role = None
+    if isinstance(payload, dict):
+        message = payload.get("message")
+        if isinstance(message, dict):
+            data = message.get("data")
+            role = (data.get("role") if isinstance(data, dict) else None) or message.get("type")
+        else:
+            role = payload.get("role")
+    chat = payload.get("chat_id") if isinstance(payload, dict) else None
+    return thread, tick, _as_str(role), message_text(payload), _as_str(chat)
+
+
+def _derive_chat(key: str, value_json: str) -> Tuple[Any, ...]:
+    thread, chat = _thread_and_tail(key, "chat::")
+    v = _safe_json(value_json)
+    v = v if isinstance(v, dict) else {}
+    return (
+        thread,
+        chat,
+        _as_str(v.get("label")),
+        _as_float(v.get("started_at")),
+    )
+
+
+def _derive_run_item(key: str, value_json: str) -> Tuple[Any, ...]:
+    thread, item = _thread_item(key, "kv::run::")
+    v = _safe_json(value_json)
+    v = v if isinstance(v, dict) else {}
+    return (
+        thread,
+        item,
+        _as_str(v.get("status")),
+        _as_int(v.get("index")),
+        _as_int(v.get("total")),
+        _as_int(v.get("attempts")),
+        _as_float(v.get("elapsed_s")),
+    )
+
+
+def _derive_validation(key: str, value_json: str) -> Tuple[Any, ...]:
+    thread, item = _thread_item(key, "kv::validation::")
+    v = _safe_json(value_json)
+    v = v if isinstance(v, dict) else {}
+    passed = v.get("passed")
+    return (
+        thread,
+        item,
+        _as_float(v.get("score")),
+        passed if isinstance(passed, bool) else None,
+        _as_int(v.get("index")),
+    )
+
+
+def _derive_kv(key: str, value_json: str) -> Tuple[Any, ...]:
+    """``(namespace, scope_id)`` — the B_kv clustering columns.
+
+    * ``kv::<ns>::<scope>…`` for a namespace this codebase writes
+      (:data:`memory.schema.KV_NAMESPACES`) → ``(ns, scope)``: task, thread
+      or candidate id;
+    * any other ``kv::<key>`` is a plain KVMemoryStore entry → ``("kv",
+      <key>)``, the whole user key (which may itself contain ``::``);
+    * a top-level ``<ns>::<scope>…`` key (legacy ``idx::``) → ``(ns, scope)``.
+    """
+    parts = key.split("::")
+    if parts[0] == "kv" and len(parts) > 1:
+        if len(parts) >= 3 and parts[1] in schema.KV_NAMESPACES:
+            return parts[1], parts[2]
+        return "kv", key[len("kv::") :]
+    if len(parts) >= 2:
+        return parts[0], parts[1]
+    return None, key
+
+
+_DERIVE = {
+    schema.MESSAGES.suffix: _derive_message,
+    schema.CHATS.suffix: _derive_chat,
+    schema.RUN_ITEMS.suffix: _derive_run_item,
+    schema.VALIDATIONS.suffix: _derive_validation,
+    schema.KV.suffix: _derive_kv,
+}
+
+_THREAD_PREFIX = {schema.MESSAGES.suffix: "msg::", schema.CHATS.suffix: "chat::"}
+
+
+def _thread_filter_prefix(spec: "schema.TableSpec", prefix: str) -> Optional[str]:
+    """A ``thread_id`` prefix implied by a key prefix, or ``None``.
+
+    The thread id is everything between the namespace and the key's *last*
+    ``::``, so a key prefix ``msg::A::…`` only pins the thread to "starts
+    with A" (thread ``A`` itself, or ``A::x``); a prefix without a ``::``
+    after the namespace pins nothing.
+    """
+    ns = _THREAD_PREFIX.get(spec.suffix)
+    if ns is None or not prefix.startswith(ns):
+        return None
+    rest = prefix[len(ns) :]
+    if "::" not in rest:
+        return None
+    return rest.rsplit("::", 1)[0]
+
+
 # Storage backends. Both speak the same raw record shape, a tuple in
 # Delta-schema column order (value/tags kept JSON-serialised). Upsert rows with
 # created_at=None get each backend's preservation semantics (keep existing on
 # update, default to now on insert).
 _RawRecord = Tuple[str, str, Optional[str], Optional[float], float, Optional[str]]
+
+
+# (spark application id, base, full_text_search) -> (provision report,
+# search functions available). Filled by the first _DeltaBackend for a base;
+# later ones in the same process skip every DDL and startup check.
+_KV_PROVISIONED: Dict[Tuple[str, str, bool], Tuple[Any, bool]] = {}
+
+
+def forget_provisioning(base: Optional[str] = None) -> None:
+    """Drop cached provisioning (all bases, or one), so the next store for it
+    re-runs DDL, schema validation and startup checks. For tests and for
+    DeltaMemoryMaintenance.provision(force=True)."""
+    from . import chunk_history
+
+    for cache in (_KV_PROVISIONED, chunk_history._HISTORY_PROVISIONED):
+        for key in [k for k in cache if base is None or k[1] == base]:
+            del cache[key]
+
+
+def provision_databricks(
+    spark: Any, base: str, specs: Tuple["schema.TableSpec", ...], *, force: bool = False
+) -> "schema.ProvisionReport":
+    """Predictive optimization + search indexes for *specs*, once.
+
+    Skipped (``reused=True``) when the group's first table already carries
+    the provisioned marker for the current schema version; the marker is set
+    only after a run with no failures, so an incomplete setup is retried by
+    the next process.
+    """
+    if not force and schema.is_provisioned(spark, base, specs):
+        return schema.ProvisionReport(reused=True)
+    report = schema.enable_databricks_features(spark, base, specs)
+    if not report.failures:
+        schema.mark_provisioned(spark, base, specs)
+    return report
 
 
 class _InMemoryBackend:
@@ -214,6 +428,16 @@ class _InMemoryBackend:
                 "updated_at": updated_at,
                 "source": source or (existing["source"] if existing else None),
             }
+
+    def append(self, rows: List[_RawRecord], now: float) -> None:
+        """Rows the caller guarantees are new; a dict needs no fast path."""
+        self.upsert(rows, now)
+
+    def thread_ids(self) -> List[str]:
+        lo, hi = self._prefix_range("msg::")
+        return sorted(
+            {k[len("msg::") :].rsplit("::", 1)[0] for k in self._sorted_keys[lo:hi]}
+        )
 
     def replace_all(self, rows: List[_RawRecord], now: float) -> None:
         """Atomically replace the whole store with *rows*."""
@@ -291,11 +515,28 @@ class _InMemoryBackend:
 
 
 class _DeltaBackend:
-    """Spark DataFrame / Databricks Delta table backend (production).
+    """Databricks Delta backend (production) over the typed table family.
 
-    Upserts use ``MERGE INTO``, deletes use ``DELETE FROM``.  Requires
-    pyspark and an active SparkSession; the table is created with Delta
-    format if it does not already exist.
+    One configured *base* name fans out into the tables of
+    :mod:`memory.schema`; every key is routed by namespace (``msg::`` →
+    ``B_messages``, ``chat::`` → ``B_chats``, ``kv::run::`` → ``B_run_items``,
+    ``kv::validation::`` → ``B_validations``, everything else → ``B_kv``).
+    Each routed table stores the same six raw-record columns the
+    :class:`KVStore` façade speaks, plus typed columns derived from the key
+    and value on write (``thread_id``, ``role``, ``content``, ``status``,
+    ``score``, …) — which is what liquid clustering, data skipping, SQL
+    analysis, and the full-text search indexes work on.
+
+    Write paths
+    -----------
+    * :meth:`append` — blind ``INSERT`` for rows known to be new (chat
+      messages: their keys are collision-free). Appends never conflict with
+      each other in Delta and skip MERGE's join entirely.
+    * :meth:`upsert` — one ``MERGE`` per table touched.
+
+    A batch that spans tables is one commit per table, written in a fixed
+    order (messages before chats), so an index row can never describe
+    messages that did not land.
     """
 
     def __init__(
@@ -305,6 +546,7 @@ class _DeltaBackend:
         *,
         audit_table: str | None = None,
         max_write_retries: int = 3,
+        full_text_search: bool = True,
     ) -> None:
         if not _PYSPARK_AVAILABLE:
             raise RuntimeError("pyspark is not installed. Run: pip install pyspark")
@@ -314,191 +556,563 @@ class _DeltaBackend:
             )
         if max_write_retries < 0:
             raise ValueError("max_write_retries must be >= 0")
+        _quoted_table_name(table)  # validate the base before deriving names
         self._spark = spark
+        self._base = table
         self._table_name = table
-        self._table = _quoted_table_name(table)
+        self._names = {spec.suffix: spec.name(table) for spec in schema.KV_TABLES}
+        self._quoted = {s: _quoted_table_name(n) for s, n in self._names.items()}
         self._audit_table_name = audit_table
         self._audit_table = _quoted_table_name(audit_table) if audit_table else None
         self._max_write_retries = max_write_retries
-        self._ensure_table()
+        self.provision: schema.ProvisionReport | None = None
+        self.search_functions = False
+        # DDL, schema validation, startup checks and Databricks provisioning
+        # run once per Spark application per base — not on every MemoryHub /
+        # KVStore construction (see forget_provisioning()).
+        key = (*_delta.application_key(spark, table), full_text_search)
+        cached = _KV_PROVISIONED.get(key)
+        if cached is None:
+            self._ensure_tables(full_text_search)
+            _KV_PROVISIONED[key] = (self.provision, self.search_functions)
+        else:
+            self.provision, self.search_functions = cached
 
-    def _ensure_table(self) -> None:
-        """Create, migrate, and verify the production Delta table contract."""
-        self._spark.sql(f"""
-            CREATE TABLE IF NOT EXISTS {self._table} (
-                kv_key     STRING  NOT NULL,
-                value      STRING  NOT NULL,
-                tags       STRING,
-                created_at DOUBLE,
-                updated_at DOUBLE,
-                source     STRING
-            )
-            USING DELTA
-            TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')
-        """)
-        # CREATE TABLE IF NOT EXISTS leaves an existing table untouched, so
-        # CDF must be enabled explicitly for upgraded deployments. CDF only
-        # captures writes after this point; startup validation makes that
-        # boundary visible instead of silently running without coherence.
-        #
-        # Only when it is actually missing, though. The CREATE above already
-        # sets the property on a table it creates, so on every fresh table this
-        # ALTER re-set a value that was already correct — and it is the one
-        # statement here that a delta-spark built against an older Spark cannot
-        # execute (ClassNotFoundException on an internal catalyst class), which
-        # made the whole Delta backend unusable for a write it never needed to
-        # issue. Reading first costs one metadata query per startup.
-        if not self._cdf_enabled():
-            self._spark.sql(
-                f"ALTER TABLE {self._table} SET TBLPROPERTIES "
-                "('delta.enableChangeDataFeed' = 'true')"
-            )
-        self._migrate_schema()
+    # ---- DDL ---------------------------------------------------------------
+
+    def _ensure_tables(self, full_text_search: bool) -> None:
+        schema.ensure_tables(self._spark, self._base, schema.KV_TABLES)
         self._validate_schema()
+        self._warn_on_legacy_table()
+        self._warn_on_unfinished_restore()
+        if full_text_search:
+            self.provision = provision_databricks(self._spark, self._base, schema.KV_TABLES)
+            self.search_functions = _delta.probe_search_functions(self._spark)
+            if self.provision.failures:
+                logger.warning(
+                    "Delta memory %s: Databricks features unavailable (%d "
+                    "statement(s) failed; first: %s). Searches still return "
+                    "the same rows, without index acceleration.",
+                    self._base,
+                    len(self.provision.failures),
+                    self.provision.failures[0],
+                )
 
-    def _cdf_enabled(self) -> bool:
-        """Whether the table already has Change Data Feed turned on.
-
-        Read through ``SHOW TBLPROPERTIES``, which reports the properties as
-        rows. A table that cannot be interrogated returns ``False`` so the
-        caller still attempts the ALTER: the failure mode to avoid is silently
-        *skipping* the upgrade, not attempting it once too often.
-        """
+    def _warn_on_legacy_table(self) -> None:
+        """Name the migration when the base is still a pre-split table."""
         try:
-            rows = self._spark.sql(
-                f"SHOW TBLPROPERTIES {self._table}"
-            ).collect()
-        except Exception as exc:  # pragma: no cover - depends on the backend
-            logger.debug(
-                f"_cdf_enabled: could not read properties of {self._table_name}: "
-                f"{exc}"
+            exists = self._spark.catalog.tableExists(self._base)
+        except Exception:  # pragma: no cover - catalog dependent
+            return
+        if not exists:
+            return
+        names = {f.name for f in self._spark.table(self._table_name_q()).schema}
+        if not {"kv_key", "value"} <= names:
+            return
+        migrated = schema.MIGRATED_PROPERTY in schema.table_properties(
+            self._spark, self._names["messages"]
+        )
+        # One property read; the single-row probe only covers a runtime that
+        # refused to set the property during migration.
+        if migrated or self._spark.table(self._quoted["messages"]).limit(1).count():
+            # Already migrated (or in use): the old table is just history.
+            logger.info(
+                "Delta memory: legacy single table %s is still present but "
+                "unused; drop it once the migration is verified.",
+                self._base,
             )
-            return False
-        for row in rows:
-            if row["key"] == "delta.enableChangeDataFeed":
-                return str(row["value"]).strip().lower() == "true"
-        return False
+        else:
+            logger.error(
+                "Delta memory: %s is a legacy single-table memory store. The "
+                "store now uses %s_* typed tables and does not read it; copy "
+                "it once with DeltaMemoryMaintenance.migrate_legacy(%r).",
+                self._base,
+                self._base,
+                self._base,
+            )
 
-    def _migrate_schema(self) -> None:
-        """Apply safe additive migrations to legacy memory tables.
-
-        The original schema predates provenance. ``source`` is nullable and
-        can therefore be added safely; missing identity/value columns are a
-        hard error because inventing them could corrupt existing memory.
-        """
-        fields = {field.name: field for field in self._spark.table(self._table).schema}
-        if "source" not in fields:
-            self._spark.sql(f"ALTER TABLE {self._table} ADD COLUMNS (source STRING)")
+    def _table_name_q(self) -> str:
+        return _quoted_table_name(self._base)
 
     def _validate_schema(self) -> None:
-        expected = {
-            "kv_key": "string",
-            "value": "string",
-            "tags": "string",
-            "created_at": "double",
-            "updated_at": "double",
-            "source": "string",
-        }
-        actual = {
-            field.name: field.dataType.simpleString()
-            for field in self._spark.table(self._table).schema
-        }
-        invalid = {
-            name: (expected_type, actual.get(name))
-            for name, expected_type in expected.items()
-            if actual.get(name) != expected_type
-        }
-        if invalid:
-            raise RuntimeError(
-                f"Delta table {self._table_name!r} has an incompatible memory "
-                f"schema: {invalid!r}"
-            )
+        for spec in schema.KV_TABLES:
+            actual = {
+                f.name: f.dataType.simpleString()
+                for f in self._spark.table(self._quoted[spec.suffix]).schema
+            }
+            expected = {
+                name: _SQL_SIMPLE[sql_type] for name, sql_type in spec.columns
+            }
+            invalid = {
+                name: (want, actual.get(name))
+                for name, want in expected.items()
+                if actual.get(name) != want
+            }
+            if invalid:
+                raise RuntimeError(
+                    f"Delta table {self._names[spec.suffix]!r} has an "
+                    f"incompatible memory schema: {invalid!r}"
+                )
 
-    @staticmethod
-    def _is_concurrent_write(exc: Exception) -> bool:
-        text = str(exc).upper()
-        return (
-            "CONCURRENT" in text
-            or "CONFLICT" in text
-            or ("DELTA_" in text and "COMMIT" in text)
+    def _cdf_enabled(self, suffix: str = "messages") -> bool:
+        return schema.table_property(
+            self._spark, self._names[suffix], "delta.enableChangeDataFeed"
         )
 
+    # ---- routing -----------------------------------------------------------
+
+    @staticmethod
+    def _route(key: str) -> "schema.TableSpec":
+        for prefix, spec in schema.KV_ROUTES:
+            if key.startswith(prefix):
+                return spec
+        return schema.KV_FALLBACK
+
+    @staticmethod
+    def _specs_for_prefix(prefix: str) -> List["schema.TableSpec"]:
+        """Tables whose key space can contain a key starting with *prefix*."""
+        out: List[schema.TableSpec] = []
+        for route, spec in schema.KV_ROUTES:
+            if prefix.startswith(route):
+                # A routed namespace owns every key under it.
+                return [spec]
+            if route.startswith(prefix):
+                out.append(spec)
+        # Keys outside every route live in the fallback table.
+        out.append(schema.KV_FALLBACK)
+        return out
+
+    def _df(self, spec: "schema.TableSpec", prefix: str = "") -> "DataFrame":
+        df = self._spark.table(self._quoted[spec.suffix])
+        if prefix:
+            df = df.filter(F.col("kv_key").startswith(prefix))
+            thread = _thread_filter_prefix(spec, prefix)
+            if thread is not None:
+                # Redundant with the key filter, but on a clustered column:
+                # lets Delta skip every file of every other thread.
+                df = df.filter(F.col("thread_id").startswith(thread))
+        return df
+
+    # ---- staging -----------------------------------------------------------
+
+    def _stage(
+        self, spec: "schema.TableSpec", rows: List[_RawRecord], now: float
+    ) -> "DataFrame":
+        # created_at=None (not supplied) defaults to now; the MERGE's
+        # WHEN MATCHED branch never touches created_at, so an existing
+        # row's creation time is preserved on update.
+        derive = _DERIVE[spec.suffix]
+        staged = [
+            (
+                key,
+                value_json,
+                tags_json,
+                created_at if created_at is not None else now,
+                updated_at,
+                source,
+                *derive(key, value_json),
+            )
+            for key, value_json, tags_json, created_at, updated_at, source in rows
+        ]
+        return self._spark.createDataFrame(staged, schema=_spark_schema(spec))
+
+    def _grouped(self, rows: List[_RawRecord]) -> List[Tuple["schema.TableSpec", List[_RawRecord]]]:
+        groups: Dict[str, List[_RawRecord]] = {}
+        for row in rows:
+            groups.setdefault(self._route(row[0]).suffix, []).append(row)
+        # Fixed table order: messages land before the chat rows indexing them.
+        return [
+            (spec, groups[spec.suffix])
+            for spec in schema.KV_TABLES
+            if spec.suffix in groups
+        ]
+
     def _with_write_retry(self, operation: str, action: Any) -> None:
-        """Retry idempotent Delta writes, never a full-store restore."""
+        """Retry an *idempotent* Delta write on a concurrency conflict."""
+        _delta.with_retry(operation, action, max_retries=self._max_write_retries)
+
+    def _with_view(self, df: "DataFrame", stem: str, action: Any) -> None:
+        with _delta.temp_view(self._spark, df, stem) as view:
+            action(view)
+
+    # ---- writes ------------------------------------------------------------
+
+    def upsert(self, rows: List[_RawRecord], now: float) -> None:
+        for spec, group in self._grouped(rows):
+            target = self._quoted[spec.suffix]
+            derived = [c for c in spec.column_names if c not in schema.KV_CORE_NAMES]
+            extra = "".join(f",\n    target.`{c}` = source.`{c}`" for c in derived)
+
+            def merge(view: str, target: str = target, extra: str = extra) -> None:
+                self._with_write_retry(
+                    "MERGE",
+                    lambda: self._spark.sql(f"""
+                        MERGE INTO {target} AS target
+                        USING {view} AS source
+                          ON target.kv_key = source.kv_key
+                        WHEN MATCHED THEN UPDATE SET
+                            target.value      = source.value,
+                            target.tags       = COALESCE(source.tags, target.tags),
+                            target.updated_at = source.updated_at,
+                            target.source     = COALESCE(source.source, target.source){extra}
+                        WHEN NOT MATCHED THEN INSERT *
+                    """),
+                )
+
+            self._with_view(self._stage(spec, group, now), "upsert", merge)
+
+    def append(self, rows: List[_RawRecord], now: float) -> None:
+        """Write rows the caller guarantees are new.
+
+        Message rows go through a blind ``INSERT``; anything else in the batch
+        (a chat index row) still MERGEs, since it may already exist.
+        """
+        for spec, group in self._grouped(rows):
+            if spec.suffix != schema.MESSAGES.suffix:
+                self.upsert(group, now)
+                continue
+            self._insert_messages(spec, group, now)
+
+    def _insert_messages(
+        self, spec: "schema.TableSpec", group: List[_RawRecord], now: float
+    ) -> None:
+        """Blind INSERT, made safe to retry by verifying first.
+
+        A blind INSERT is not idempotent: retrying one whose commit landed
+        (the client saw an error anyway) would duplicate every row. A Delta
+        commit is atomic, so after any failure the batch's keys are looked up:
+        all present means the commit landed and nothing is retried; only the
+        absent rows are re-sent, and only on a retryable conflict.
+        """
+        target = self._quoted[spec.suffix]
+        cols = ", ".join(f"`{c}`" for c in spec.column_names)
+        pending = list(group)
         for attempt in range(self._max_write_retries + 1):
             try:
-                action()
+                self._with_view(
+                    self._stage(spec, pending, now),
+                    "append",
+                    lambda view: self._spark.sql(
+                        f"INSERT INTO {target} ({cols}) SELECT {cols} FROM {view}"
+                    ),
+                )
                 return
             except Exception as exc:
-                if not self._is_concurrent_write(exc) or attempt == self._max_write_retries:
+                present = self._present_message_keys([r[0] for r in pending])
+                pending = [r for r in pending if r[0] not in present]
+                if not pending:
+                    logger.info(
+                        "Delta INSERT reported %s but its commit landed; not retrying",
+                        type(exc).__name__,
+                    )
+                    return
+                if not _delta.is_retryable_conflict(exc) or attempt == self._max_write_retries:
                     raise
                 delay = 0.05 * (2**attempt)
                 logger.warning(
-                    "Delta %s conflicted; retrying (%s/%s) in %.2fs",
-                    operation,
+                    "Delta INSERT conflicted; re-sending %d absent row(s) (%s/%s) in %.2fs",
+                    len(pending),
                     attempt + 1,
                     self._max_write_retries,
                     delay,
                 )
                 time.sleep(delay)
 
-    def _df(self, prefix: str = "") -> "DataFrame":
-        df = self._spark.table(self._table)
-        if prefix:
-            df = df.filter(F.col("kv_key").startswith(prefix))
-        return df
-
-    def _stage(self, rows: List[_RawRecord], now: float) -> "DataFrame":
-        # created_at=None (not supplied) defaults to now; the MERGE's
-        # WHEN MATCHED branch never touches created_at, so an existing
-        # row's creation time is preserved on update.
-        staged_rows = [
-            (key, value_json, tags_json, created_at if created_at is not None else now, updated_at, source)
-            for key, value_json, tags_json, created_at, updated_at, source in rows
-        ]
-        return self._spark.createDataFrame(staged_rows, schema=_schema())
-
-    def upsert(self, rows: List[_RawRecord], now: float) -> None:
-        # Unique per-call view name: a fixed name would let two concurrent
-        # writers on the same SparkSession clobber each other's staged rows
-        # between createOrReplaceTempView and MERGE.
-        view = f"_kv_upsert_{uuid.uuid4().hex}"
-        self._stage(rows, now).createOrReplaceTempView(view)
-        try:
-            def merge() -> None:
-                self._spark.sql(f"""
-                    MERGE INTO {self._table} AS target
-                    USING {view} AS source
-                      ON target.kv_key = source.kv_key
-                    WHEN MATCHED THEN UPDATE SET
-                        target.value      = source.value,
-                        target.tags       = COALESCE(source.tags, target.tags),
-                        target.updated_at = source.updated_at,
-                        target.source     = COALESCE(source.source, target.source)
-                    WHEN NOT MATCHED THEN INSERT *
-                """)
-
-            self._with_write_retry("MERGE", merge)
-        finally:
-            self._spark.catalog.dropTempView(view)
+    def _present_message_keys(self, keys: List[str]) -> set:
+        threads = sorted({t for t in (_thread_and_tail(k, "msg::")[0] for k in keys) if t})
+        df = self._spark.table(self._quoted["messages"])
+        if threads:
+            df = df.filter(F.col("thread_id").isin(threads))  # clustered: skips files
+        return {
+            r.kv_key for r in df.filter(F.col("kv_key").isin(list(keys))).select("kv_key").collect()
+        }
 
     def replace_all(self, rows: List[_RawRecord], now: float) -> None:
-        """Atomically replace the table contents with *rows*.
+        """Replace every table's contents with *rows*, all or nothing.
 
-        ``INSERT OVERWRITE`` is a single Delta commit, so a reader never
-        observes the empty intermediate state a DELETE-then-insert would
-        expose (and a crash cannot leave the table emptied).
+        Delta has no multi-table transaction, so the restore is journaled in
+        ``B_restore_journal``:
+
+        * ``started`` — every table's version before anything is touched;
+        * ``overwritten`` — after each ``INSERT OVERWRITE`` commits, with the
+          version it produced (``post_version``);
+        * ``completed`` — once every table is overwritten.
+
+        On a failure the tables this run overwrote are rolled back with
+        ``RESTORE TABLE … TO VERSION AS OF`` their pre-restore version — but
+        only while a table is still at the run's ``post_version``. A table
+        someone else wrote to since is *not* restored (RESTORE would erase
+        their commits); it is journaled ``rollback_skipped`` and logged for an
+        operator. Tables the run never overwrote are never touched. A process
+        that dies mid-restore leaves an open run, which the next open logs and
+        ``DeltaMemoryMaintenance.recover_restore()`` settles the same way.
         """
-        view = f"_kv_replace_{uuid.uuid4().hex}"
-        self._stage(rows, now).createOrReplaceTempView(view)
+        groups = dict((spec.suffix, group) for spec, group in self._grouped(rows))
+        restore_id = uuid.uuid4().hex
+        pre = {spec.suffix: self._latest_version(spec.suffix) for spec in schema.KV_TABLES}
+        self._journal(
+            [
+                (restore_id, self._names[suffix], version, "started", now, None)
+                for suffix, version in pre.items()
+            ]
+        )
+        post: Dict[str, Optional[int]] = {}
         try:
-            self._spark.sql(f"INSERT OVERWRITE {self._table} SELECT * FROM {view}")
-        finally:
-            self._spark.catalog.dropTempView(view)
+            for spec in schema.KV_TABLES:
+                target = self._quoted[spec.suffix]
+                cols = ", ".join(f"`{c}`" for c in spec.column_names)
+                self._with_view(
+                    self._stage(spec, groups.get(spec.suffix, []), now),
+                    "replace",
+                    lambda view, target=target, cols=cols: self._spark.sql(
+                        f"INSERT OVERWRITE {target} ({cols}) SELECT {cols} FROM {view}"
+                    ),
+                )
+                # Recorded in memory first: even if journaling it fails, this
+                # process knows the table was overwritten and can roll it back.
+                post[spec.suffix] = None
+                post[spec.suffix] = self._latest_version(spec.suffix)
+                self._journal(
+                    [(restore_id, self._names[spec.suffix], pre[spec.suffix],
+                      "overwritten", _now(), post[spec.suffix])]
+                )
+        except Exception:
+            logger.error(
+                "Delta memory restore %s failed after %d of %d table(s); rolling back",
+                restore_id,
+                len(post),
+                len(schema.KV_TABLES),
+            )
+            try:
+                self.rollback_restore(restore_id, pre, post)
+            except Exception:
+                # Keep the original error; the run stays open in the journal,
+                # so recover_restore() can settle it later.
+                logger.error(
+                    "Delta memory restore %s: rollback failed; run "
+                    "DeltaMemoryMaintenance.recover_restore()",
+                    restore_id,
+                    exc_info=True,
+                )
+            raise
+        try:
+            _delta.with_retry(
+                "journal completed",
+                lambda: self._journal([(restore_id, None, None, "completed", _now(), None)]),
+                retry_on=lambda exc: True,
+                max_retries=2,
+            )
+        except Exception:
+            # The data IS restored. Recovery treats a run whose every table
+            # is journaled 'overwritten' as complete, never as one to undo.
+            logger.warning(
+                "Delta memory restore %s succeeded but its completion could not "
+                "be journaled; recovery will mark it complete",
+                restore_id,
+                exc_info=True,
+            )
+
+    def _journal(self, rows: List[Tuple[Any, ...]]) -> None:
+        self._ensure_journal()
+        cols = ", ".join(f"`{c}`" for c in schema.RESTORE_JOURNAL.column_names)
+        self._with_view(
+            self._spark.createDataFrame(rows, _spark_schema(schema.RESTORE_JOURNAL)),
+            "journal",
+            lambda view: self._spark.sql(
+                f"INSERT INTO {self._journal_table} ({cols}) SELECT {cols} FROM {view}"
+            ),
+        )
+
+    def _ensure_journal(self) -> None:
+        if getattr(self, "_journal_ready", False):
+            return
+        schema.ensure_tables(self._spark, self._base, (schema.RESTORE_JOURNAL,))
+        self._journal_ready = True
+
+    @property
+    def _journal_table(self) -> str:
+        return _quoted_table_name(schema.RESTORE_JOURNAL.name(self._base))
+
+    def rollback_restore(
+        self,
+        restore_id: str,
+        pre: Dict[str, int],
+        post: Dict[str, Optional[int]],
+    ) -> Dict[str, List[str]]:
+        """Undo one restore run's overwrites, where that is still safe.
+
+        *pre*: suffix → version before the run. *post*: suffix → version the
+        run's overwrite produced, for the tables it overwrote (``None`` when
+        unknown). Returns ``{"rolled_back": [...], "needs_manual": [...]}``.
+        """
+        rolled: List[str] = []
+        manual: List[str] = []
+        for suffix, post_version in post.items():
+            current = self._latest_version(suffix)
+            if post_version is not None and current == post_version:
+                self._spark.sql(
+                    f"RESTORE TABLE {self._quoted[suffix]} TO VERSION AS OF {int(pre[suffix])}"
+                )
+                rolled.append(suffix)
+            else:
+                manual.append(suffix)
+                logger.error(
+                    "Delta memory restore %s: not rolling back %s — it is at version "
+                    "%s, the restore left it at %s, and RESTORE to %s would erase the "
+                    "commits made since. Decide manually.",
+                    restore_id,
+                    self._names[suffix],
+                    current,
+                    post_version,
+                    pre[suffix],
+                )
+        self._journal(
+            [
+                (restore_id, self._names[s], pre[s], "rollback_skipped", _now(), post[s])
+                for s in manual
+            ]
+            + [(restore_id, None, None, "rolled_back", _now(), None)]
+        )
+        return {"rolled_back": rolled, "needs_manual": manual}
+
+    def unfinished_restores(self) -> Dict[str, Dict[str, Dict[str, Optional[int]]]]:
+        """Open restore runs: ``restore_id`` → ``{"pre": {suffix: version},
+        "post": {suffix: version}}`` (``post`` holds the overwritten tables).
+
+        Reads only the open runs' rows (a left anti-join against closed
+        runs), and nothing at all when the journal was never created.
+        """
+        journal_name = schema.RESTORE_JOURNAL.name(self._base)
+        if not self._spark.catalog.tableExists(journal_name):
+            return {}
+        journal = self._spark.table(self._journal_table)
+        closed = (
+            journal.filter(F.col("state").isin("completed", "rolled_back"))
+            .select("restore_id")
+            .distinct()
+        )
+        rows = (
+            journal.filter(F.col("state").isin("started", "overwritten"))
+            .join(closed, on="restore_id", how="left_anti")
+            .select("restore_id", "table_name", "state", "pre_version", "post_version")
+            .collect()
+        )
+        by_name = {name: suffix for suffix, name in self._names.items()}
+        runs: Dict[str, Dict[str, Dict[str, Optional[int]]]] = {}
+        for r in rows:
+            suffix = by_name.get(r.table_name)
+            if suffix is None:
+                continue
+            run = runs.setdefault(r.restore_id, {"pre": {}, "post": {}})
+            if r.state == "started":
+                run["pre"][suffix] = int(r.pre_version)
+            else:
+                run["post"][suffix] = None if r.post_version is None else int(r.post_version)
+        return runs
+
+    def settle_restore(self, restore_id: str, run: Dict[str, Dict[str, Optional[int]]]) -> Dict[str, Any]:
+        """Close one open run: complete if every table was overwritten,
+        otherwise roll back what it overwrote (see :meth:`rollback_restore`)."""
+        if set(run["post"]) >= {spec.suffix for spec in schema.KV_TABLES}:
+            self._journal([(restore_id, None, None, "completed", _now(), None)])
+            return {"completed": True, "rolled_back": [], "needs_manual": []}
+        pre = {k: int(v) for k, v in run["pre"].items() if v is not None}
+        outcome = self.rollback_restore(restore_id, pre, run["post"])
+        return {"completed": False, **outcome}
+
+    def prune_restore_journal(self, before_ts: float) -> None:
+        """Drop journal rows of *closed* runs older than *before_ts*."""
+        if not self._spark.catalog.tableExists(schema.RESTORE_JOURNAL.name(self._base)):
+            return
+        self._with_write_retry(
+            "journal prune",
+            lambda: self._spark.sql(
+                f"DELETE FROM {self._journal_table} WHERE ts < {float(before_ts)!r} "
+                f"AND restore_id IN (SELECT restore_id FROM {self._journal_table} "
+                "WHERE state IN ('completed', 'rolled_back'))"
+            ),
+        )
+
+    def _warn_on_unfinished_restore(self) -> None:
+        try:
+            unfinished = self.unfinished_restores()
+        except Exception as exc:  # pragma: no cover - catalog dependent
+            logger.debug(f"unfinished_restores: {exc}")
+            return
+        if unfinished:
+            logger.error(
+                "Delta memory %s: %d restore(s) were interrupted (%s); the "
+                "tables may be partly overwritten. Settle them with "
+                "DeltaMemoryMaintenance.recover_restore().",
+                self._base,
+                len(unfinished),
+                ", ".join(sorted(unfinished)),
+            )
+
+    def _delete_keys(self, spec: "schema.TableSpec", keys: List[str]) -> None:
+        """Delete exactly *keys* from one table, staging them as data.
+
+        Deletes go through MERGE rather than ``DELETE FROM ... WHERE``: Spark
+        parameter markers are not substituted inside Delta's DELETE plan, and
+        staging keeps key values as *data*, so a key with quotes or LIKE
+        wildcards is just a string.
+        """
+        target = self._quoted[spec.suffix]
+        self._with_view(
+            self._spark.createDataFrame([(k,) for k in keys], "kv_key STRING"),
+            "delete",
+            lambda view: self._with_write_retry(
+                "DELETE",
+                lambda: self._spark.sql(
+                    f"MERGE INTO {target} tgt USING {view} src "
+                    f"ON tgt.kv_key = src.kv_key WHEN MATCHED THEN DELETE"
+                ),
+            ),
+        )
+
+    def delete_many(self, keys: List[str]) -> int:
+        by_table: Dict[str, List[str]] = {}
+        for key in set(keys):
+            by_table.setdefault(self._route(key).suffix, []).append(key)
+        removed = 0
+        for spec in schema.KV_TABLES:
+            wanted = by_table.get(spec.suffix)
+            if not wanted:
+                continue
+            existing = [
+                row.kv_key
+                for row in self._spark.table(self._quoted[spec.suffix])
+                .filter(F.col("kv_key").isin(wanted))
+                .select("kv_key")
+                .collect()
+            ]
+            if existing:
+                self._delete_keys(spec, existing)
+            removed += len(existing)
+        return removed
+
+    def clear_prefix(self, prefix: str) -> int:
+        removed = 0
+        for spec in self._specs_for_prefix(prefix):
+            keys = [row.kv_key for row in self._df(spec, prefix).select("kv_key").collect()]
+            if keys:
+                self._delete_keys(spec, keys)
+            removed += len(keys)
+        return removed
+
+    def clear(self) -> None:
+        for spec in schema.KV_TABLES:
+            target = self._quoted[spec.suffix]
+            self._with_write_retry(
+                "CLEAR", lambda target=target: self._spark.sql(f"DELETE FROM {target}")
+            )
+
+    # ---- reads -------------------------------------------------------------
 
     def get(self, key: str) -> Optional[str]:
+        spec = self._route(key)
         rows = (
-            self._df()
+            self._df(spec)
             .filter(F.col("kv_key") == key)
             .select("value")
             .limit(1)
@@ -509,93 +1123,153 @@ class _DeltaBackend:
     def records(self, prefix: str = "") -> List[_RawRecord]:
         return self.records_after(prefix, "")
 
-    def records_after(self, prefix: str, after_key: str) -> List[_RawRecord]:
-        df = self._df(prefix)
-        if after_key:
-            df = df.filter(F.col("kv_key") > after_key)
+    def _collect_records(self, df: "DataFrame") -> List[_RawRecord]:
         return [
             (row.kv_key, row.value, row.tags, row.created_at, row.updated_at, row.source)
-            for row in df.collect()
+            for row in df.select(*schema.KV_CORE_NAMES).collect()
         ]
 
+    def records_after(self, prefix: str, after_key: str) -> List[_RawRecord]:
+        out: List[_RawRecord] = []
+        for spec in self._specs_for_prefix(prefix):
+            df = self._df(spec, prefix)
+            if after_key:
+                df = df.filter(F.col("kv_key") > after_key)
+            out.extend(self._collect_records(df))
+        out.sort(key=lambda r: r[0])
+        return out
+
+    def search_candidates(self, prefix: str, query: str) -> List[_RawRecord]:
+        """Rows whose key, value, or tags contain *query*, case-insensitively.
+
+        The superset :meth:`KVStore.search` scores. With ``search_functions``
+        the predicate is ``isearch`` (index-accelerated where a full-text
+        search index covers the column); otherwise ``lower(col)`` contains —
+        identical rows either way.
+        """
+        out: List[_RawRecord] = []
+        q = query.lower()
+        for spec in self._specs_for_prefix(prefix):
+            df = self._df(spec, prefix)
+            if self.search_functions:
+                predicate = F.expr(
+                    schema.search_sql(("kv_key", "value", "tags"), query)
+                )
+            else:
+                predicate = (
+                    F.lower(F.col("kv_key")).contains(q)
+                    | F.lower(F.col("value")).contains(q)
+                    | F.lower(F.coalesce(F.col("tags"), F.lit(""))).contains(q)
+                )
+            out.extend(self._collect_records(df.filter(predicate)))
+        return out
+
     def keys(self, prefix: str = "") -> List[str]:
-        return [row.kv_key for row in self._df(prefix).select("kv_key").collect()]
+        out: List[str] = []
+        for spec in self._specs_for_prefix(prefix):
+            out.extend(row.kv_key for row in self._df(spec, prefix).select("kv_key").collect())
+        return sorted(out)
 
     def has_prefix(self, prefix: str) -> bool:
         # Stops at the first matching row instead of collecting every key.
-        return bool(self._df(prefix).limit(1).count())
+        return any(
+            bool(self._df(spec, prefix).limit(1).count())
+            for spec in self._specs_for_prefix(prefix)
+        )
 
-    def _delete_keys(self, keys: List[str]) -> None:
-        """Delete exactly *keys*, staging them as data rather than as SQL.
-
-        Deletes go through MERGE rather than ``DELETE FROM ... WHERE`` because
-        neither obvious spelling of the WHERE clause works here:
-
-        * Spark's named parameter markers (``spark.sql(sql, args)``) are not
-          substituted inside Delta's ``DeltaDelete`` plan — the parameter stays
-          unbound and analysis fails with ``UNBOUND_SQL_PARAMETER``.
-        * The ``delta.tables.DeltaTable`` Python API, which would take a Column
-          expression, is not reachable from the py4j gateway in this
-          deployment (``io.delta.tables.DeltaTable does not exist in the JVM``)
-          even though Delta SQL itself works.
-
-        Staging the keys in a view is the spelling that works, and it is the
-        same mechanism :meth:`upsert` and :meth:`replace_all` already use: key
-        values travel as *data*, so nothing needs SQL quoting or LIKE
-        escaping, and a key containing quotes or wildcards is just a string.
-        """
-        view = f"_kv_delete_{uuid.uuid4().hex}"
-        self._spark.createDataFrame([(k,) for k in keys], "kv_key STRING") \
-            .createOrReplaceTempView(view)
-        try:
-            self._with_write_retry(
-                "DELETE",
-                lambda: self._spark.sql(
-                    f"MERGE INTO {self._table} tgt USING {view} src "
-                    f"ON tgt.kv_key = src.kv_key WHEN MATCHED THEN DELETE"
-                ),
-            )
-        finally:
-            self._spark.catalog.dropTempView(view)
-
-    def delete_many(self, keys: List[str]) -> int:
-        key_list = list(set(keys))
-        existing = [
-            row.kv_key
-            for row in self._df()
-            .filter(F.col("kv_key").isin(key_list))
-            .select("kv_key")
+    def thread_ids(self) -> List[str]:
+        """Distinct thread ids with at least one message — one clustered
+        column of one table, rather than every message key."""
+        return sorted(
+            row.thread_id
+            for row in self._spark.table(self._quoted["messages"])
+            .select("thread_id")
+            .distinct()
             .collect()
-        ]
-        if existing:
-            self._delete_keys(existing)
-        return len(existing)
-
-    def clear_prefix(self, prefix: str) -> int:
-        # The matching keys are collected first, so the MERGE source is a
-        # fresh DataFrame rather than a view over the table being merged into.
-        # _df()'s startswith is a literal prefix match, so "msg::thread_1::"
-        # cannot also delete "msg::threadX1::…" — no wildcards to escape.
-        keys = self.keys(prefix)
-        if keys:
-            self._delete_keys(keys)
-        return len(keys)
-
-    def clear(self) -> None:
-        self._with_write_retry("CLEAR", lambda: self._spark.sql(f"DELETE FROM {self._table}"))
+            if row.thread_id is not None
+        )
 
     def count(self) -> int:
-        return self._df().count()
+        return sum(self._df(spec).count() for spec in schema.KV_TABLES)
 
-    def _latest_version(self) -> int:
-        row = self._spark.sql(f"DESCRIBE HISTORY {self._table} LIMIT 1").first()
-        return int(row.version) if row is not None else 0
+    def rederive(self, batch_rows: int = 5000) -> Dict[str, int]:
+        """Recompute every row's derived columns from its key and value.
+
+        For rows written before a derivation rule changed (e.g. B_kv's
+        namespace/scope_id). Each batch is a MERGE of the rows' own values
+        and timestamps, so nothing but the derived columns changes.
+        """
+        counts: Dict[str, int] = {}
+        for spec in schema.KV_TABLES:
+            batch: List[_RawRecord] = []
+            seen = 0
+            rows = (
+                self._spark.table(self._quoted[spec.suffix])
+                .select(*schema.KV_CORE_NAMES)
+                .toLocalIterator()
+            )
+            for row in rows:
+                batch.append(
+                    (row.kv_key, row.value, row.tags, row.created_at,
+                     row.updated_at if row.updated_at is not None else _now(), row.source)
+                )
+                if len(batch) >= batch_rows:
+                    self.upsert(batch, _now())
+                    seen += len(batch)
+                    batch = []
+            if batch:
+                self.upsert(batch, _now())
+                seen += len(batch)
+            counts[spec.suffix] = seen
+        return counts
+
+    def _thread_messages(self, thread_id: str) -> "DataFrame":
+        # Exact thread on the clustered column, plus the key prefix (a thread
+        # id cannot be told apart from a longer one by thread_id alone when
+        # ids contain '::').
+        return (
+            self._spark.table(self._quoted["messages"])
+            .filter(F.col("thread_id") == thread_id)
+            .filter(F.col("kv_key").startswith(f"msg::{thread_id}::"))
+        )
+
+    def chat_stats(self, thread_id: str) -> Dict[str, Dict[str, Any]]:
+        """One aggregate over the thread's messages, grouped by ``chat_id``."""
+        rows = (
+            self._thread_messages(thread_id)
+            .filter(F.col("chat_id").isNotNull())
+            .groupBy("chat_id")
+            .agg(
+                F.min("kv_key").alias("first_key"),
+                F.max("kv_key").alias("last_key"),
+                F.count(F.lit(1)).alias("message_count"),
+            )
+            .collect()
+        )
+        return {
+            r.chat_id: {
+                "first_key": r.first_key,
+                "last_key": r.last_key,
+                "message_count": int(r.message_count),
+            }
+            for r in rows
+        }
+
+    def chat_records(self, thread_id: str, chat_id: str) -> List[_RawRecord]:
+        return self._collect_records(
+            self._thread_messages(thread_id).filter(F.col("chat_id") == chat_id)
+        )
+
+    # ---- CDF ---------------------------------------------------------------
+
+    def _latest_version(self, suffix: str) -> int:
+        return _delta.latest_version(self._spark, self._quoted[suffix])
 
     def _ensure_audit_table(self) -> str:
         if self._audit_table is None:
             raise RuntimeError(
                 "CDF synchronization needs audit_table= so checkpoints and "
-                "the durable audit trail are outside the source memory table"
+                "the durable audit trail are outside the source memory tables"
             )
         self._spark.sql(f"""
             CREATE TABLE IF NOT EXISTS {self._audit_table} (
@@ -611,6 +1285,8 @@ class _DeltaBackend:
                 recorded_at      DOUBLE NOT NULL
             )
             USING DELTA
+            CLUSTER BY (consumer_id, source_table)
+            TBLPROPERTIES ('delta.enableRowTracking' = 'true')
         """)
         return self._audit_table
 
@@ -628,12 +1304,12 @@ class _DeltaBackend:
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     def _audit_upsert(self, rows: list[tuple[Any, ...]]) -> None:
-        """Idempotently persist events and the consumer checkpoint together."""
+        """Idempotently persist events and the consumer checkpoints together."""
         audit = self._ensure_audit_table()
-        view = f"_kv_cdf_audit_{uuid.uuid4().hex}"
-        self._spark.createDataFrame(rows, schema=_audit_schema()).createOrReplaceTempView(view)
-        try:
-            self._with_write_retry(
+        self._with_view(
+            self._spark.createDataFrame(rows, schema=_audit_schema()),
+            "cdf_audit",
+            lambda view: self._with_write_retry(
                 "CDF audit MERGE",
                 lambda: self._spark.sql(f"""
                     MERGE INTO {audit} AS target
@@ -645,103 +1321,117 @@ class _DeltaBackend:
                         target.recorded_at = source.recorded_at
                     WHEN NOT MATCHED THEN INSERT *
                 """),
-            )
-        finally:
-            self._spark.catalog.dropTempView(view)
+            ),
+        )
 
     def sync_cdf(self, consumer_id: str) -> CDFSyncResult:
-        """Read committed changes since *consumer_id*'s durable checkpoint.
+        """Read committed changes since *consumer_id*'s durable checkpoints.
 
-        The first invocation deliberately establishes a snapshot boundary
-        rather than pretending historical CDF exists. Later calls read whole
-        committed versions, write their audit rows and updated checkpoint to a
-        separate Delta table, then return the affected keys for local cache
-        invalidation.
+        Only the CDF-enabled tables (messages and chats — the ones local
+        thread caches mirror) are read, each against its own checkpoint. The
+        first invocation establishes a snapshot boundary for every table
+        rather than pretending historical CDF exists; it is reported as a
+        baseline so the caller drops all caches.
         """
         if not isinstance(consumer_id, str) or not consumer_id.strip():
             raise ValueError("CDF consumer_id must be a non-empty string")
         audit = self._ensure_audit_table()
-        checkpoint_key = self._audit_event_id(
-            consumer_id, self._table_name, -1, "__checkpoint__", "checkpoint"
-        )
-        checkpoint_rows = (
-            self._spark.table(audit)
-            .filter(F.col("event_id") == checkpoint_key)
-            .select("commit_version")
-            .limit(1)
-            .collect()
-        )
-        latest = self._latest_version()
         now = _now()
-        if not checkpoint_rows:
-            self._audit_upsert([
-                (
-                    checkpoint_key, consumer_id, self._table_name, None,
-                    "checkpoint", latest, None, None, None, now,
-                )
-            ])
-            return CDFSyncResult(baseline=True, checkpoint_version=latest)
-
-        checkpoint = int(checkpoint_rows[0].commit_version)
-        if checkpoint >= latest:
-            return CDFSyncResult(checkpoint_version=checkpoint)
-        changes = (
-            self._spark.read.format("delta")
-            .option("readChangeFeed", "true")
-            .option("startingVersion", checkpoint + 1)
-            .option("endingVersion", latest)
-            .table(self._table)
-            .collect()
-        )
+        baseline = False
         events: list[dict[str, Any]] = []
         audit_rows: list[tuple[Any, ...]] = []
-        for row in changes:
-            data = row.asDict(recursive=True)
-            key = str(data["kv_key"])
-            change_type = str(data["_change_type"])
-            version = int(data["_commit_version"])
-            event = {
-                "key": key,
-                "change_type": change_type,
-                "commit_version": version,
-                "commit_timestamp": data.get("_commit_timestamp"),
-            }
-            events.append(event)
-            audit_rows.append(
-                (
-                    self._audit_event_id(
-                        consumer_id, self._table_name, version, key, change_type
-                    ),
-                    consumer_id, self._table_name, key, change_type, version,
-                    data.get("_commit_timestamp"), data.get("value"),
-                    data.get("tags"), now,
-                )
+        versions: list[int] = []
+        cdf_specs = [spec for spec in schema.KV_TABLES if spec.cdf]
+        checkpoint_keys = {
+            spec.suffix: self._audit_event_id(
+                consumer_id, self._names[spec.suffix], -1, "__checkpoint__", "checkpoint"
             )
-        audit_rows.append(
-            (
-                checkpoint_key, consumer_id, self._table_name, None,
+            for spec in cdf_specs
+        }
+        # This runs before every LLM call of a CDF-enabled pipeline: read all
+        # checkpoints in one query rather than one per table.
+        stored = {
+            row.event_id: int(row.commit_version)
+            for row in self._spark.table(audit)
+            .filter(F.col("event_id").isin(list(checkpoint_keys.values())))
+            .select("event_id", "commit_version")
+            .collect()
+        }
+        for spec in cdf_specs:
+            name = self._names[spec.suffix]
+            checkpoint_key = checkpoint_keys[spec.suffix]
+            latest = self._latest_version(spec.suffix)
+            versions.append(latest)
+            checkpoint_row = (
+                checkpoint_key, consumer_id, name, None,
                 "checkpoint", latest, None, None, None, now,
             )
-        )
-        self._audit_upsert(audit_rows)
-        return CDFSyncResult(events=tuple(events), checkpoint_version=latest)
+            if checkpoint_key not in stored:
+                baseline = True
+                audit_rows.append(checkpoint_row)
+                continue
+            checkpoint = stored[checkpoint_key]
+            if checkpoint >= latest:
+                continue
+            changes = (
+                self._spark.read.format("delta")
+                .option("readChangeFeed", "true")
+                .option("startingVersion", checkpoint + 1)
+                .option("endingVersion", latest)
+                .table(self._quoted[spec.suffix])
+                .select(
+                    "kv_key", "value", "tags",
+                    "_change_type", "_commit_version", "_commit_timestamp",
+                )
+                .collect()
+            )
+            for row in changes:
+                data = row.asDict(recursive=True)
+                key = str(data["kv_key"])
+                change_type = str(data["_change_type"])
+                version = int(data["_commit_version"])
+                events.append(
+                    {
+                        "key": key,
+                        "table": name,
+                        "change_type": change_type,
+                        "commit_version": version,
+                        "commit_timestamp": data.get("_commit_timestamp"),
+                    }
+                )
+                audit_rows.append(
+                    (
+                        self._audit_event_id(consumer_id, name, version, key, change_type),
+                        consumer_id, name, key, change_type, version,
+                        data.get("_commit_timestamp"), data.get("value"),
+                        data.get("tags"), now,
+                    )
+                )
+            audit_rows.append(checkpoint_row)
+        if audit_rows:
+            self._audit_upsert(audit_rows)
+        checkpoint_version = max(versions) if versions else None
+        if baseline:
+            return CDFSyncResult(baseline=True, checkpoint_version=checkpoint_version)
+        return CDFSyncResult(events=tuple(events), checkpoint_version=checkpoint_version)
 
     def operations(self) -> Dict[str, Any]:
-        """Lightweight table diagnostics used by the maintenance runbook."""
-        latest = self._spark.sql(f"DESCRIBE HISTORY {self._table} LIMIT 1").first()
-        detail = self._spark.sql(f"DESCRIBE DETAIL {self._table}").first()
+        """Lightweight per-table diagnostics used by the maintenance runbook."""
+        tables: Dict[str, Any] = {
+            self._names[spec.suffix]: _delta.table_status(self._spark, self._quoted[spec.suffix])
+            for spec in schema.KV_TABLES
+        }
         return {
-            "table": self._table_name,
-            "latest_version": int(latest.version) if latest is not None else None,
-            "last_operation": getattr(latest, "operation", None),
-            "size_in_bytes": getattr(detail, "sizeInBytes", None),
-            "num_files": getattr(detail, "numFiles", None),
+            "base_table": self._base,
+            "tables": tables,
             "audit_table": self._audit_table_name,
+            "search_functions": self.search_functions,
+            "search_indexes": list(self.provision.search_indexes) if self.provision else [],
         }
 
     @property
     def label(self) -> str:
-        return f"Delta:{self._table_name}"
+        return f"Delta:{self._base}_*"
 
 
 # ===========================================================================
@@ -756,9 +1446,11 @@ class KVStore:
     Two modes
     ---------
     - **Delta mode** (production):
-      Pass ``spark`` and ``table="catalog.schema.table_name"``.
-      The table is created with Delta format if it does not already exist.
-      Upserts use ``MERGE INTO``, deletes use ``DELETE FROM``.
+      Pass ``spark`` and ``table="catalog.schema.base_name"``. The typed
+      tables of :mod:`memory.schema` (``base_name_messages``, ``_chats``,
+      ``_run_items``, ``_validations``, ``_kv``) are created if absent and
+      every key is routed to one of them by namespace. Messages are
+      appended with ``INSERT``, other upserts use ``MERGE INTO``.
 
     - **In-memory mode** (local / CI):
       Pass ``table=None`` (default).  All state lives in a plain Python
@@ -769,8 +1461,8 @@ class KVStore:
 
     Key layout
     ----------
-    Keys follow a namespace::subkey convention so multiple logical stores
-    can share one physical table without collision:
+    Keys follow a namespace::subkey convention; the namespace decides which
+    Delta table a key lives in:
 
         msg::thread-42::00000003   → chat message seq 3 of thread-42
         kv::project_goal           → a KVMemoryStore entry
@@ -782,8 +1474,11 @@ class KVStore:
         Active Spark / Databricks session.  Required only when ``table``
         is given; ignored in in-memory mode.
     table : str | None
-        Fully-qualified Delta table name for persistence, or None for
-        pure in-memory operation.
+        Delta base table name for persistence, or None for pure in-memory
+        operation.
+    full_text_search : bool
+        Delta mode on Databricks: predictive optimization, full-text search
+        indexes, and ``isearch()`` pushdown for :meth:`search`.
     """
 
     def __init__(
@@ -793,16 +1488,18 @@ class KVStore:
         *,
         audit_table: Optional[str] = None,
         max_write_retries: int = 3,
+        full_text_search: bool = True,
     ) -> None:
         self._table = table
         if audit_table is not None and table is None:
             raise ValueError("audit_table requires a Delta table")
-        self._backend = (
+        self._backend: Any = (
             _DeltaBackend(
                 spark,
                 table,
                 audit_table=audit_table,
                 max_write_retries=max_write_retries,
+                full_text_search=full_text_search,
             )
             if table
             else _InMemoryBackend()
@@ -820,7 +1517,7 @@ class KVStore:
         self.set_many([{"key": key, "value": value, "tags": tags, "source": source}])
 
     def set_many(self, entries: List[Dict[str, Any]]) -> None:
-        """Upsert several entries at once — a single MERGE in Delta mode.
+        """Upsert several entries at once — one MERGE per table touched.
 
         Each entry is a dict with keys:
 
@@ -834,7 +1531,23 @@ class KVStore:
         if not entries:
             return
         now = _now()
-        rows: List[_RawRecord] = [
+        self._backend.upsert(self._raw_rows(entries, now), now)
+
+    def append_many(self, entries: List[Dict[str, Any]]) -> None:
+        """Write entries whose keys the caller guarantees are new.
+
+        Same entry shape as :meth:`set_many`. Delta mode writes ``msg::`` rows
+        with a blind ``INSERT`` (no MERGE join, no conflict with concurrent
+        appends); any other key in the batch is still upserted.
+        """
+        if not entries:
+            return
+        now = _now()
+        self._backend.append(self._raw_rows(entries, now), now)
+
+    @staticmethod
+    def _raw_rows(entries: List[Dict[str, Any]], now: float) -> List[_RawRecord]:
+        return [
             (
                 e["key"],
                 _jdump(e["value"]),
@@ -845,7 +1558,6 @@ class KVStore:
             )
             for e in entries
         ]
-        self._backend.upsert(rows, now)
 
     def get(self, key: str, default: Any = None) -> Any:
         raw = self._backend.get(key)
@@ -855,7 +1567,7 @@ class KVStore:
         return self._backend.delete_many([key]) == 1
 
     def delete_many(self, keys: List[str]) -> int:
-        """Delete several keys — a single DELETE … IN in Delta mode.
+        """Delete several keys — one staged MERGE … DELETE per table.
 
         Returns the number of keys that existed and were removed.
         """
@@ -865,6 +1577,25 @@ class KVStore:
 
     def keys(self, prefix: str = "") -> List[str]:
         return self._backend.keys(prefix)
+
+    def thread_ids(self) -> List[str]:
+        """Distinct thread ids that have at least one stored message."""
+        return self._backend.thread_ids()
+
+    def chat_stats(self, thread_id: str) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Per-chat first/last key and message count of *thread_id*,
+        aggregated by the backend, or ``None`` when it has no pushdown (the
+        caller then aggregates the decoded records itself)."""
+        stats = getattr(self._backend, "chat_stats", None)
+        return stats(thread_id) if stats is not None else None
+
+    def chat_records(self, thread_id: str, chat_id: str) -> Optional[List[Tuple[str, Dict]]]:
+        """*thread_id*'s messages in *chat_id*, filtered by the backend, or
+        ``None`` when it has no pushdown."""
+        records = getattr(self._backend, "chat_records", None)
+        if records is None:
+            return None
+        return [self._decode_record(r) for r in records(thread_id, chat_id)]
 
     def has_prefix(self, prefix: str) -> bool:
         """True if at least one key starts with *prefix*.
@@ -933,13 +1664,17 @@ class KVStore:
         """
         Keyword search over keys, JSON-serialised values, and tags.
 
-        On Databricks this can be enhanced with Spark MLlib TF-IDF or
-        a Vector Search index; here we use a simple contains scan over
-        the raw records both backends expose in the same shape.
+        Scoring is a case-insensitive substring count. In Delta mode the
+        candidate rows are filtered in SQL first — ``isearch()`` on
+        Databricks, which full-text search indexes accelerate, or a
+        ``lower(...)`` contains scan elsewhere — so only matching rows ever
+        leave the cluster.
         """
         q = query.lower()
         hits: List[Tuple[str, float]] = []
-        for key, value_json, tags_json, _, _, _ in self._backend.records(prefix):
+        candidates = getattr(self._backend, "search_candidates", None)
+        rows = candidates(prefix, query) if candidates is not None else self._backend.records(prefix)
+        for key, value_json, tags_json, _, _, _ in rows:
             score = 0.0
             if q in key.lower():
                 score += 2.0
@@ -1041,24 +1776,27 @@ class KVChatMessageHistory(BaseChatMessageHistory):
     Key layout
     ----------
     msg::{session_id}::{epoch_micros:016d}-{rand4}
-        → {"message": <langchain message_to_dict>, "ts": ...}
+        → {"message": <langchain message_to_dict>, "ts": ..., "chat_id": ...}
     chat::{session_id}::{chat_id}
-        → {"chat_id", "label", "started_at", "first_key", "last_key",
-           "message_count", ...}   (only when a chat is active — see below)
+        → {"chat_id", "thread_id", "label", "started_at"}
+           (static; only when a chat is active — see below)
 
     Chats
     -----
     A **chat** is one span of a thread: the messages written by one
     consumer, e.g. one ``SasLLMPipeline`` instance (Task → Thread → Chat →
     Message). Set one with :meth:`set_chat` and every later
-    :meth:`add_messages` extends its record in the *same* store write.
+    :meth:`add_messages` stamps its ``chat_id`` into each message value.
+    The chat's first/last key and message count are derived from those
+    stamps on read (:meth:`chats`), so they can never drift from the
+    messages; the static ``chat::`` row is written once per chat.
 
     The chat id is deliberately **not** part of the message key. Thread ids
     are recovered from message keys by splitting off the last ``::`` segment
     (:meth:`ThreadMemoryManager.list_threads`), the fork copy is a key-prefix
     range, and the incremental read frontier is a key comparison — a third
-    segment would break all three, and every legacy row at once. An index
-    record costs one extra upserted row per write instead.
+    segment would break all three, and every legacy row at once. The id
+    rides in the value instead (a derived ``chat_id`` column in Delta).
 
     Values carry the full ``message_to_dict`` payload, so tool calls,
     ``usage_metadata``, ``response_metadata``, names, and ids all
@@ -1130,6 +1868,8 @@ class KVChatMessageHistory(BaseChatMessageHistory):
         # instance deletes messages (clear / prune / retention). A writer
         # bypassing this instance to *delete or backdate* rows is not
         # detected until then.
+        # Legacy chats (pre-stamp range rows) are backfilled once per instance.
+        self._legacy_chats_checked = False
         self._msg_cache: Optional[List[BaseMessage]] = None
         self._cache_keys: set[str] = set()
         self._cache_frontier = ""
@@ -1209,7 +1949,8 @@ class KVChatMessageHistory(BaseChatMessageHistory):
         self.add_messages([message])
 
     def add_messages(self, messages: Sequence[BaseMessage]) -> None:
-        """Persist several messages in ONE store write (one Delta MERGE)."""
+        """Persist several messages in ONE store call (a Delta INSERT for the
+        messages, plus a MERGE for the chat index row when a chat is set)."""
         ts = _now()
         entries = []
         for message in messages:
@@ -1225,20 +1966,25 @@ class KVChatMessageHistory(BaseChatMessageHistory):
                         # survive the round-trip.
                         "message": message_to_dict(message),
                         "ts": ts,
+                        # The chat this message belongs to: the chat index
+                        # (first/last key, count) is derived from it on
+                        # read, so it can never disagree with the messages.
+                        **({"chat_id": self._chat_id} if self._chat_id else {}),
                     },
                     "tags": ["message", role, self.session_id],
                 }
             )
         if not entries:
             return
-        chat_entry = self._chat_entry(
-            entries[0]["key"], entries[-1]["key"], len(entries)
-        )
+        chat_entry = self._chat_entry()
         if chat_entry is not None:
-            # Same batch as the messages it indexes: one Delta MERGE, and the
+            # Same batch as the messages it indexes. In Delta mode the
+            # messages are INSERTed before the chat row is MERGEd, so the
             # index can never describe a write that did not land.
             entries.append(chat_entry)
-        self._store.set_many(entries)
+        # Message keys are freshly minted and collision-free: append, not
+        # upsert.
+        self._store.append_many(entries)
         self._apply_retention()
 
     # ---- Chats -------------------------------------------------------------
@@ -1261,79 +2007,178 @@ class KVChatMessageHistory(BaseChatMessageHistory):
         """The chat later writes are attributed to, or ``None``."""
         return self._chat_id
 
-    def _chat_entry(
-        self, first_key: str, last_key: str, added: int
-    ) -> Optional[Dict[str, Any]]:
-        """The chat index row to write alongside a batch of messages."""
+    def _chat_entry(self) -> Optional[Dict[str, Any]]:
+        """The chat's static row, when it still needs writing — else ``None``.
+
+        A chat row holds only what does not change per message (id, thread,
+        label, start time) and is written once per chat — on its first write,
+        or when a label arrives later. Everything that does (first/last key,
+        message count) is derived from the messages' ``chat_id`` on read, so
+        an ordinary append is a single message write with no index row to
+        keep in step.
+        """
         if self._chat_id is None:
             return None
         if self._chat_state is None:
             stored = self._store.get(self._chat_prefix + self._chat_id)
-            self._chat_state = stored if isinstance(stored, dict) else None
-        now = _now()
-        if self._chat_state is None:
-            self._chat_state = {
-                "chat_id": self._chat_id,
-                "thread_id": self.session_id,
-                "label": self._chat_label,
-                "started_at": now,
-                "first_key": first_key,
-                "last_key": last_key,
-                "message_count": 0,
-            }
+            if isinstance(stored, dict):
+                self._chat_state = stored
+                if not (self._chat_label and not stored.get("label")):
+                    return None
+            else:
+                self._chat_state = {
+                    "chat_id": self._chat_id,
+                    "thread_id": self.session_id,
+                    "label": self._chat_label,
+                    "started_at": _now(),
+                }
+                return self._static_chat_row(self._chat_state)
         state = self._chat_state
         if self._chat_label and not state.get("label"):
             state["label"] = self._chat_label
-        # Widened, never overwritten: another instance appending to the same
-        # chat can land on the same microsecond tick with a random suffix
-        # that sorts *below* the stored one (the _last_us bump is
-        # per-instance — the same race _refresh's frontier handles), and an
-        # assigned last_key could then sort before first_key, leaving the
-        # recorded range empty.
-        state["first_key"] = min(str(state.get("first_key", first_key)), first_key)
-        state["last_key"] = max(str(state.get("last_key", "")), last_key)
-        state["updated_at"] = now
-        state["message_count"] = int(state.get("message_count", 0)) + added
+            return self._static_chat_row(state)
+        return None
+
+    def _static_chat_row(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        static = {k: state.get(k) for k in ("chat_id", "thread_id", "label", "started_at")}
         return {
-            "key": self._chat_prefix + self._chat_id,
-            "value": dict(state),
-            "tags": ["chat", self.session_id, self._chat_id],
+            "key": self._chat_prefix + str(static["chat_id"]),
+            "value": static,
+            "tags": ["chat", self.session_id, str(static["chat_id"])],
             "source": "KVChatMessageHistory",
         }
 
-    def chats(self) -> List[Dict[str, Any]]:
-        """This thread's chat records, oldest first."""
-        records = [
-            rec["value"]
-            for _, rec in self._store.all_records(prefix=self._chat_prefix)
+    def _chat_stats(self) -> Dict[str, Dict[str, Any]]:
+        """Per-chat ``first_key``/``last_key``/``message_count`` of this
+        thread, derived from the messages themselves."""
+        derive = getattr(self._store, "chat_stats", None)
+        derived = derive(self.session_id) if derive is not None else None
+        if derived is not None:
+            return derived
+        stats: Dict[str, Dict[str, Any]] = {}
+        for key, rec in self._store.all_records(prefix=self._msg_prefix):
+            value = rec["value"]
+            chat = value.get("chat_id") if isinstance(value, dict) else None
+            if not chat:
+                continue
+            entry = stats.setdefault(
+                chat, {"first_key": key, "last_key": key, "message_count": 0}
+            )
+            entry["first_key"] = min(entry["first_key"], key)
+            entry["last_key"] = max(entry["last_key"], key)
+            entry["message_count"] += 1
+        return stats
+
+    def backfill_legacy_chats(self) -> int:
+        """Stamp ``chat_id`` into messages of chats written before stamping.
+
+        A chat row that still carries ``first_key``/``last_key`` is from the
+        pre-stamp layout: its messages have no ``chat_id``, so derived stats
+        would lose them. Each unstamped message inside such a range gets the
+        chat's id (one batched write; already-stamped messages are left as
+        they are, so overlapping legacy ranges keep the earlier chat), and the
+        row is rewritten as a static row. Idempotent; runs once per instance
+        before every chat read. Returns the number of messages stamped.
+        """
+        if self._legacy_chats_checked:
+            return 0
+        self._legacy_chats_checked = True
+        legacy = [
+            (key, rec)
+            for key, rec in self._store.all_records(prefix=self._chat_prefix)
             if isinstance(rec["value"], dict)
+            and rec["value"].get("chat_id")
+            and ("first_key" in rec["value"] or "last_key" in rec["value"])
         ]
-        records.sort(key=lambda state: state.get("started_at", 0.0))
+        if not legacy:
+            return 0
+        legacy.sort(key=lambda kv: kv[1]["value"].get("started_at") or 0.0)
+        messages = self._store.all_records(prefix=self._msg_prefix)
+        stamped: Dict[str, Dict[str, Any]] = {}
+        for _, rec in legacy:
+            state = rec["value"]
+            first, last = str(state.get("first_key") or ""), str(state.get("last_key") or "")
+            for key, mrec in messages:
+                value = mrec["value"]
+                if (
+                    first <= key <= last
+                    and key not in stamped
+                    and isinstance(value, dict)
+                    and not value.get("chat_id")
+                ):
+                    stamped[key] = {
+                        "key": key,
+                        "value": {**value, "chat_id": state["chat_id"]},
+                        "created_at": mrec["created_at"],
+                        "updated_at": mrec["updated_at"],
+                    }
+        statics = [self._static_chat_row(rec["value"]) for _, rec in legacy]
+        for row, (_, rec) in zip(statics, legacy):
+            row["source"] = rec["source"]
+        self._store.set_many([*stamped.values(), *statics])
+        logger.info(
+            f"backfill_legacy_chats: thread '{self.session_id}' stamped "
+            f"{len(stamped)} message(s) across {len(legacy)} legacy chat(s)"
+        )
+        return len(stamped)
+
+    def chats(self) -> List[Dict[str, Any]]:
+        """This thread's chats, oldest first.
+
+        Static rows joined with stats derived from the messages; a chat whose
+        static row never landed still appears (``label``/``started_at``
+        ``None``), because its messages say it exists.
+        """
+        self.backfill_legacy_chats()
+        static = {
+            str(rec["value"].get("chat_id")): rec["value"]
+            for _, rec in self._store.all_records(prefix=self._chat_prefix)
+            if isinstance(rec["value"], dict) and rec["value"].get("chat_id")
+        }
+        stats = self._chat_stats()
+        records = []
+        for chat_id in set(static) | set(stats):
+            base: Dict[str, Any] = dict(
+                static.get(chat_id) or {"chat_id": chat_id, "thread_id": self.session_id}
+            )
+            base.setdefault("label", None)
+            base.setdefault("started_at", None)
+            base.update(
+                stats.get(chat_id)
+                or {"first_key": None, "last_key": None, "message_count": 0}
+            )
+            records.append(base)
+        records.sort(
+            key=lambda state: (
+                state.get("started_at") if state.get("started_at") is not None else float("inf"),
+                state.get("first_key") or "",
+            )
+        )
         return records
 
     def messages_in_chat(self, chat_id: str) -> List[BaseMessage]:
         """The messages written under *chat_id*, in order.
 
-        Reads the chat's key range directly rather than through the append
-        cache: this is an introspection path, and the range is the record's
-        ``first_key``/``last_key`` — messages another chat interleaved on the
-        same thread inside that range would be included, so a chat is only a
-        clean unit for consumers that do not interleave (one pipeline
-        instance at a time on a thread, which is how the pipeline runs).
+        Selected by each message's own ``chat_id``, so messages another chat
+        interleaved on the same thread are never included.
         """
-        state = self._store.get(self._chat_prefix + chat_id)
-        if not isinstance(state, dict):
+        self.backfill_legacy_chats()
+        records = getattr(self._store, "chat_records", None)
+        pushed = records(self.session_id, chat_id) if records is not None else None
+        if pushed is not None:
+            pairs = pushed
+        else:
+            pairs = [
+                (key, rec)
+                for key, rec in self._store.all_records(prefix=self._msg_prefix)
+                if isinstance(rec["value"], dict) and rec["value"].get("chat_id") == chat_id
+            ]
+        if not pairs:
             logger.warning(
-                f"messages_in_chat: thread '{self.session_id}' has no chat "
-                f"'{chat_id}'"
+                f"messages_in_chat: thread '{self.session_id}' has no messages "
+                f"in chat '{chat_id}'"
             )
             return []
-        first, last = state.get("first_key", ""), state.get("last_key", "")
-        pairs = [
-            (key, rec)
-            for key, rec in self._store.all_records(prefix=self._msg_prefix)
-            if first <= key <= last
-        ]
         pairs.sort(key=lambda kv: kv[0][len(self._msg_prefix) :])
         return [self._decode_message(rec["value"]) for _, rec in pairs]
 
@@ -1544,9 +2389,14 @@ class ThreadMemoryManager:
         src_prefix = f"msg::{src_thread_id}::"
         dst_prefix = f"msg::{dst_thread_id}::"
         if self._store.has_prefix(dst_prefix):
+            # Also what makes a re-run after a partial fork safe: the rows
+            # already copied make the destination non-empty, so the append
+            # below can never duplicate them.
             raise ValueError(
                 f"destination thread '{dst_thread_id}' is not empty"
             )
+        # Copied messages carry their chat_id; stamp legacy chats first.
+        self.get_thread(src_thread_id).backfill_legacy_chats()
         records = self._store.all_records(prefix=src_prefix)
         records.sort(key=lambda kv: kv[0][len(src_prefix) :])
         if upto_ts is not None:
@@ -1571,10 +2421,9 @@ class ThreadMemoryManager:
             }
             for key, rec in records
         ]
-        chat_entries = self._forked_chat_entries(
-            src_thread_id, dst_thread_id, [key for key, _ in records]
-        )
-        self._store.set_many([*entries, *chat_entries])
+        chat_entries = self._forked_chat_entries(src_thread_id, dst_thread_id, records)
+        # The destination was checked empty above: the copies are new rows.
+        self._store.append_many([*entries, *chat_entries])
         logger.info(
             f"fork_thread: copied {len(entries)} message(s) and "
             f"{len(chat_entries)} chat record(s) "
@@ -1583,44 +2432,34 @@ class ThreadMemoryManager:
         return len(entries)
 
     def _forked_chat_entries(
-        self, src_thread_id: str, dst_thread_id: str, copied_keys: List[str]
+        self, src_thread_id: str, dst_thread_id: str, copied: List[Tuple[str, Dict]]
     ) -> List[Dict[str, Any]]:
-        """Chat index rows for the copied slice of a forked thread.
+        """Static chat rows for the chats the copied slice contains.
 
-        A fork copies a *prefix* of the messages, so chats are clamped to it:
-        one that starts past the fork point is dropped, one that straddles it
-        keeps only the copied part (``last_key`` and ``message_count``
-        recomputed). Without this the branch's index would claim messages
-        that were never copied.
+        The copied messages keep their ``chat_id``, so the branch's derived
+        chat stats are automatically clamped to what was copied; only the
+        static row (label, start time) of each chat with at least one copied
+        message needs carrying over. A chat that starts past the fork point
+        has no copied message and is not carried.
         """
-        if not copied_keys:
-            return []
-        src_prefix = f"msg::{src_thread_id}::"
-        dst_prefix = f"msg::{dst_thread_id}::"
-        last_copied = copied_keys[-1]
+        copied_chats = {
+            rec["value"].get("chat_id")
+            for _, rec in copied
+            if isinstance(rec["value"], dict) and rec["value"].get("chat_id")
+        }
         forked: List[Dict[str, Any]] = []
         for _, rec in self._store.all_records(prefix=f"chat::{src_thread_id}::"):
             state = rec["value"]
-            if not isinstance(state, dict) or not state.get("chat_id"):
-                continue
-            first = str(state.get("first_key", ""))
-            last = min(str(state.get("last_key", "")), last_copied)
-            if not first or first > last:
-                continue
-            count = sum(1 for key in copied_keys if first <= key <= last)
-            if not count:
+            if not isinstance(state, dict) or state.get("chat_id") not in copied_chats:
                 continue
             chat_id = str(state["chat_id"])
             forked.append(
                 {
                     "key": f"chat::{dst_thread_id}::{chat_id}",
                     "value": {
-                        **state,
-                        "thread_id": dst_thread_id,
-                        "first_key": dst_prefix + first[len(src_prefix) :],
-                        "last_key": dst_prefix + last[len(src_prefix) :],
-                        "message_count": count,
-                    },
+                        k: state.get(k) for k in ("chat_id", "label", "started_at")
+                    }
+                    | {"thread_id": dst_thread_id},
                     "tags": ["chat", dst_thread_id, chat_id],
                     "source": rec["source"],
                 }
@@ -1634,11 +2473,7 @@ class ThreadMemoryManager:
         instance happens to have touched — so with a persistent Delta
         backend the list survives a process restart.
         """
-        ids = {
-            key[len("msg::") :].rsplit("::", 1)[0]
-            for key in self._store.keys(prefix="msg::")
-        }
-        return sorted(ids)
+        return self._store.thread_ids()
 
     def delete_thread(self, thread_id: str) -> None:
         self.get_thread(thread_id).clear()
@@ -1840,12 +2675,19 @@ class MemoryHub:
         Active Databricks / local Spark session.  Required only when
         ``table`` is given; in-memory mode never touches Spark.
     table : str | None
-        Fully-qualified Delta table name, e.g. ``"main.ml.langchain_memory"``.
+        Delta base table name, e.g. ``"main.ml.langchain_memory"``; the
+        typed tables ``main.ml.langchain_memory_*`` are derived from it.
         Pass ``None`` (default) for local in-memory operation.
     ranker : Any | None
         Optional ``memory.relevance.HybridRanker`` forwarded to the
         :class:`KVMemoryStore`, upgrading ``mem.kv.search`` from a
         substring scan to hybrid BM25 (+ optional dense) retrieval.
+    full_text_search : bool
+        Delta mode on Databricks (DBR 18.3+, targeted at DBR 19): enable
+        predictive optimization, create the full-text search indexes, and
+        push ``kv.search`` / ``chunk_history.search`` down as ``isearch()``.
+        Off-Databricks the setup failure is logged once and searches fall
+        back to ``LIKE`` scans with identical results.
     retention_max_age_s, retention_max_messages : float | int | None
         Storage-side retention forwarded to every chat thread: after each
         write, messages older than ``retention_max_age_s`` seconds are
@@ -1883,6 +2725,7 @@ class MemoryHub:
         cdf_consumer_id: str | None = None,
         cdf_audit_table: str | None = None,
         max_write_retries: int = 3,
+        full_text_search: bool = True,
     ) -> None:
         if cdf_consumer_id is not None and cdf_audit_table is None:
             raise ValueError(
@@ -1893,6 +2736,15 @@ class MemoryHub:
             spark=spark,
             table=table,
             audit_table=cdf_audit_table,
+            max_write_retries=max_write_retries,
+            full_text_search=full_text_search,
+        )
+        # Original-vs-converted chunk history: same base table family, its
+        # own append-only tables (memory.chunk_history).
+        self.chunk_history = ChunkHistory(
+            spark if table else None,
+            table,
+            full_text_search=full_text_search,
             max_write_retries=max_write_retries,
         )
         self.threads = ThreadMemoryManager(
@@ -1996,4 +2848,5 @@ class MemoryHub:
             "operations": self._store.operations(),
             "threads": self.threads.list_threads(),
             "kv": self.kv.stats(),
+            "chunk_history": self.chunk_history.stats(),
         }

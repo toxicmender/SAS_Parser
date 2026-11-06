@@ -898,3 +898,77 @@ class TestChatIndex(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLegacyChatsKeepTheirMessages(unittest.TestCase):
+    """Chats written before messages carried a chat_id stamp (range rows)."""
+
+    def _legacy_thread(self) -> KVStore:
+        store = KVStore()
+        keys = [f"msg::t1::{i:016d}-aaaa" for i in (1, 2, 3)]
+        store.set_many(
+            [
+                {"key": k, "value": {
+                    "message": {"type": "human", "data": {"content": f"m{i}"}}, "ts": float(i)}}
+                for i, k in enumerate(keys, start=1)
+            ]
+            + [
+                {"key": "chat::t1::old", "value": {
+                    "chat_id": "old", "thread_id": "t1", "label": "legacy",
+                    "started_at": 1.0, "first_key": keys[0], "last_key": keys[1],
+                    "message_count": 2}},
+            ]
+        )
+        return store
+
+    def test_chats_and_messages_in_chat_survive_the_layout_change(self):
+        store = self._legacy_thread()
+        thread = KVChatMessageHistory("t1", store)
+        (chat,) = thread.chats()
+        self.assertEqual((chat["chat_id"], chat["message_count"], chat["label"]), ("old", 2, "legacy"))
+        self.assertEqual([m.content for m in thread.messages_in_chat("old")], ["m1", "m2"])
+        # The range row became a static row; a second instance stamps nothing.
+        self.assertNotIn("first_key", store.get("chat::t1::old"))
+        self.assertEqual(KVChatMessageHistory("t1", store).backfill_legacy_chats(), 0)
+
+    def test_a_fork_carries_a_legacy_chat(self):
+        store = self._legacy_thread()
+        mgr = ThreadMemoryManager(store)
+        mgr.fork_thread("t1", "t2", upto_messages=1)
+        (chat,) = mgr.chats("t2")
+        self.assertEqual((chat["chat_id"], chat["message_count"]), ("old", 1))
+
+
+class TestDerivedColumns(unittest.TestCase):
+    def test_message_parsing_tolerates_null_or_odd_payloads(self):
+        import json
+
+        from memory.store import _derive_message
+
+        for payload in (
+            {"message": {"type": "ai", "data": None}},
+            {"message": "not-a-dict"},
+            {"message": {"type": "ai"}},
+            ["not", "a", "dict"],
+        ):
+            thread, tick, role, content, chat = _derive_message(
+                "msg::t::0000000000000001-aa", json.dumps(payload)
+            )
+            self.assertEqual((thread, tick, content, chat), ("t", 1, None, None))
+            self.assertIn(role, (None, "ai"))
+
+    def test_kv_namespace_and_scope(self):
+        from memory.store import _derive_kv
+
+        cases = {
+            "kv::project_goal": ("kv", "project_goal"),
+            "kv::a::b::c": ("kv", "a::b::c"),
+            "kv::policy::task-1": ("policy", "task-1"),
+            "kv::tmem::thread-9": ("tmem", "thread-9"),
+            "kv::summary::thread-9": ("summary", "thread-9"),
+            "kv::pending::cand-1": ("pending", "cand-1"),
+            "idx::thread-3": ("idx", "thread-3"),
+            "bare": (None, "bare"),
+        }
+        for key, expected in cases.items():
+            self.assertEqual(_derive_kv(key, "null"), expected, key)

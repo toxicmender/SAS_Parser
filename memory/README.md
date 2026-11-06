@@ -30,6 +30,10 @@ the **remember** channel on top of the same duck-typed KV interface.
 - `extractor.py` — `MemoryExtractor`, the write path: classifies a completed
   turn into permanent (a policy proposal, held for approval) or temporary (a
   thread note, applied) memory, behind an offline cue gate.
+- `schema.py` — the Delta table family (DDL, clustering, full-text search
+  indexes) and the `search()`/`isearch()` SQL builders.
+- `chunk_history.py` — `ChunkHistory`, the append-only record of every
+  original SAS chunk and every converted version of it.
 - `turns.py` — dependency-light turn grouping and token-estimate helpers
   shared by `relevance` and `summarize` (so `summarize` never drags in
   bm25s/faiss).
@@ -83,7 +87,8 @@ mem = MemoryHub()
 # Databricks — Delta-backed
 mem = MemoryHub(
     spark=spark,                          # existing Databricks SparkSession
-    table="catalog.schema.langchain_mem", # Delta table (created if absent)
+    table="catalog.schema.langchain_mem", # BASE name of the typed tables
+    full_text_search=True,                # DBR 19: search indexes + PO
 )
 
 thread = mem.get_thread("user-42")
@@ -123,14 +128,20 @@ The chat id is deliberately **not** part of the message key. Thread ids are
 recovered from `msg::{thread}::{tick}` keys by splitting off the last segment
 (`list_threads`), `fork_thread` copies a key-prefix range, and the
 incremental read frontier is a key comparison — a third segment would break
-all three at once, and every legacy row with them. Instead one index record
-per chat (`chat::{thread}::{chat_id}`) is written **in the same batch** as
-the messages it indexes, so the index can never describe a write that did not
-land. `get_thread(..., chat_id=...)` re-stamps the active chat on every call
+all three at once, and every legacy row with them. Instead each message
+value carries its `chat_id` (a derived, clustered-table column in Delta), and
+a chat's `first_key` / `last_key` / `message_count` are **aggregated from the
+messages on read** — they cannot disagree with what landed, and an append is
+one message write. Only a static row per chat (`chat::{thread}::{chat_id}`:
+label, start time) is stored, once, on the chat's first write; a chat whose
+static row was lost still lists, with `label = None`.
+`messages_in_chat` selects by that stamp, so another chat's interleaved
+messages are never included. `get_thread(..., chat_id=...)` re-stamps the active chat on every call
 rather than fixing it at creation, because thread objects are cached per id
 and two consumers sharing a manager would otherwise inherit each other's
-chat. Forking clamps chats to the copied slice: one that starts after the
-fork point is dropped, one that straddles it keeps only the copied part.
+chat. Forking needs no clamping: copied messages keep their `chat_id`, so a
+branch's chats reflect exactly the copied slice; static rows are carried for
+chats with at least one copied message.
 
 ### Thread forking
 
@@ -166,8 +177,9 @@ KVStore                      ← façade over one of two interchangeable backend
 ```
 
 The `KVStore` façade owns all JSON (de)serialisation, tag queries, search,
-and snapshot/restore. A backend only stores, retrieves, and deletes raw rows,
-which both speak in the same Delta-schema column order:
+and snapshot/restore. A backend only stores, retrieves, and deletes raw rows
+(the Delta backend routing each to its typed table), which both speak in the
+same column order:
 
 ```
 (key, value_json, tags_json | None, created_at, updated_at, source)
@@ -185,35 +197,214 @@ layer was removed from LangChain in v1, and `RunnableWithMessageHistory` is
 deprecated in favour of LangGraph persistence, so this module ships neither
 adapter.
 
-### Storage schema (one row per KV entry)
+### Storage schema — a family of typed Delta tables
 
-| Column | Type | Meaning |
-|--------|------|---------|
-| `kv_key` | STRING NOT NULL | namespaced key, e.g. `msg::thread-1::0001783440000000-9f3a` |
-| `value` | STRING NOT NULL | JSON-serialised payload |
-| `tags` | STRING | JSON array of tag strings |
-| `created_at` | DOUBLE | Unix timestamp (float) |
-| `updated_at` | DOUBLE | Unix timestamp (float) |
-| `source` | STRING | optional provenance label |
+`memory.delta_table` (or `MemoryHub(table=...)`) is a **base name** `B`. The
+store creates, in the same catalog and schema, one Delta table per access
+pattern rather than one generic KV table (`memory/schema.py` holds the DDL):
 
-Keys follow a `namespace::subkey` convention so multiple logical stores share
-one physical table without collision (`msg::…` chat messages, `kv::…`
-`KVMemoryStore` entries, `idx::…` legacy sequence counters). Message keys embed
-a zero-padded microsecond timestamp plus a short random suffix, so they are
-collision-free without any read-modify-write sequence counter and sort
-lexicographically in time order (legacy `{seq:08d}` keys sort before them). On
-Databricks the Delta backend uses `MERGE INTO` for upserts (`set_many` batches
-several entries into one MERGE) and `DELETE FROM` for deletes; every value the
-SQL sees goes through Spark parameter markers (`spark.sql(sql, args)`, Spark ≥
-3.4), never string interpolation. `restore()` is a single `INSERT OVERWRITE`
-commit, so a crash mid-restore cannot leave the table emptied.
+| Table | Holds | Write pattern | Liquid `CLUSTER BY` | Full-text search index |
+|-------|-------|---------------|---------------------|------------------------|
+| `B_messages` | `msg::` chat messages (each stamped with its `chat_id`) | blind `INSERT` (keys are collision-free), auto-compacted | `thread_id, msg_tick` | `content`, `value`, `kv_key`, `tags` ngram(5) |
+| `B_chats` | `chat::` static chat rows (label, start time); counts derive from messages | `MERGE`, once per chat | `thread_id` | — |
+| `B_run_items` | `kv::run::` per-item run facts | `MERGE` | `thread_id, item_id` | — |
+| `B_validations` | `kv::validation::` verdicts | `MERGE` | `thread_id, item_id` | — |
+| `B_kv` | everything else: policies, thread notes, summaries, plain KV | `MERGE` | `namespace, scope_id` | `value`, `kv_key`, `tags` ngram(5) |
+| `B_chunk_sources` | each distinct **original** SAS chunk, once | insert-only `MERGE` | `source_id, chunk_id` | `original_text` ngram(4) |
+| `B_item_attempts` | every LLM attempt per work item (accepted *and* rejected), with the `feedback` that prompted a retry | blind `INSERT`, one per item, auto-compacted | `thread_id, item_id` | `response` ngram(4) |
+| `B_chunk_conversions` | each attempt's **converted** code per member chunk | blind `INSERT`, one per item, auto-compacted | `chunk_key, thread_id` | `converted_text` ngram(4) |
+| `B_chunk_history` | VIEW: original + converted chunk, response, feedback and verdict on one row | — | — | (base-table indexes) |
+| `B_item_attempts_archive`, `B_chunk_conversions_archive` | attempts moved out by `ChunkHistory.archive()` (+ `archived_at`) | `MERGE` copy | `thread_id, item_id` | — |
+| `B_chunk_history_archive` | VIEW: the same shape over the archive tables | — | — | — |
+| `B_restore_journal` | append-only log of `restore()` runs (pre-restore table versions) | `INSERT` | `restore_id` | — |
 
-Message values carry the full LangChain `message_to_dict` payload
-(`{"message": …, "ts": …}`), so tool calls, `usage_metadata`,
-`response_metadata`, names, and ids round-trip losslessly;
-`get_session_metadata()` sums the persisted `usage_metadata` into per-thread
-`total_usage` token counts. Rows written by the pre-lossless schema
-(`{"role", "content", "meta", "ts"}`) are still readable.
+Every KV-routed table carries the same six raw-record columns the `KVStore`
+façade speaks — `kv_key`, `value` (JSON), `tags` (JSON array), `created_at`,
+`updated_at`, `source` — followed by typed columns derived from the key and
+value on write (`thread_id`, `msg_tick`, `role`, `content`, `chat_id`,
+`status`, `idx`, `attempts`, `score`, `passed`, `namespace`, `scope_id`, …).
+The derived columns are what clustering, data skipping, SQL analysis and the
+search indexes work on; callers keep using keys and the façade unchanged.
+
+All tables are created with `delta.enableRowTracking = true`. Change Data
+Feed is enabled only on `B_messages` and `B_chats` — the two tables CDF cache
+invalidation reads — so the fact tables do not pay its write cost.
+
+**Schema evolution.** Opening a table adds any nullable column a newer
+version declares (`ALTER TABLE … ADD COLUMNS`); existing rows read `NULL`. A
+retyped column, or a missing `NOT NULL` one, is an error rather than a guess.
+
+**Restore is journaled and undoes only its own work.** Delta has no
+multi-table transaction, so `KVStore.restore()` / `MemoryHub.restore()` logs
+every table's version in `B_restore_journal` (`started`), overwrites the
+tables one by one — journaling each as `overwritten` with the version it
+produced — and finally logs `completed`. On a failure:
+
+- only the tables this run overwrote are put back with `RESTORE TABLE … TO
+  VERSION AS OF` their pre-restore version; tables it never reached are not
+  touched;
+- a table is restored only while it is still at the version the run left it
+  at. If anything committed to it since, `RESTORE` would erase that work, so
+  the table is journaled `rollback_skipped` and logged for an operator
+  instead;
+- if every table was overwritten and only the `completed` row failed to
+  land, the restore *succeeded*: it returns normally, and recovery marks it
+  complete rather than undoing it.
+
+A process that dies mid-restore leaves an open run; the next open logs it,
+and `DeltaMemoryMaintenance.recover_restore()` settles it by the same rules,
+returning `{restore_id: {"completed", "rolled_back", "needs_manual"}}`.
+`vacuum(dry_run=False)` prunes settled journal rows past the retention
+window.
+
+**Message appends are never duplicated.** Messages are written with a blind
+`INSERT` (no MERGE join). If it reports an error, the batch's keys are looked
+up before anything is retried — a Delta commit is atomic, so either all rows
+landed (done) or none did (re-sent, on a retryable conflict only). Chunk
+history INSERTs follow the same rule by `attempt_id`.
+
+**Startup is cheap.** Table DDL, schema validation, the legacy and
+interrupted-restore checks, and the Databricks provisioning run once per
+Spark application per base, not on every `MemoryHub` construction; workers
+creating the tables at the same moment retry the lost race. Provisioning
+(predictive optimization, search indexes) is skipped entirely once a table
+group carries the `sasparser.memory.provisioned` marker for the current
+schema version; `DeltaMemoryMaintenance.provision(force=True)` re-runs it.
+
+**Breaking change.** The pre-split single table (`kv_key`/`value`/… at the
+base name itself) is no longer read; opening a base whose legacy table still
+exists logs an error naming the one-time copy:
+
+```python
+from memory import DeltaMemoryMaintenance, VacuumPolicy
+
+ops = DeltaMemoryMaintenance(spark, "cat.sch.llm_mem", policy=VacuumPolicy(30 * 24))
+ops.migrate_legacy("cat.sch.llm_mem")   # routes every row; idempotent MERGE
+```
+
+### Full-text search (Databricks DBR 19)
+
+`full_text_search` is **on by default everywhere** — `MemoryHub`,
+`KVStore`, `ChunkHistory`, and `MemorySetup` / config.json
+`memory.full_text_search` (null = on); pass `False` to opt out. In Delta mode
+on Databricks:
+
+1. enables **predictive optimization** on every memory table — it is what
+   refreshes a search index (there is no manual `REFRESH INDEX`) and also
+   runs OPTIMIZE/VACUUM;
+2. creates the **full-text search indexes** listed above
+   (`CREATE SEARCH INDEX IF NOT EXISTS <table>_<column>_fts ...`);
+3. pushes `kv.search(...)` and `chunk_history.search(...)` down as
+   `isearch()` / `search()` predicates, so the index skips files that cannot
+   contain a match.
+
+Requirements and limits, from the Databricks feature (Beta; DBR 18.3+):
+
+- the workspace preview *SQL: Full-Text Search Index for Unity Catalog managed
+  tables* is on, and the tables are Unity Catalog **managed** tables;
+- the identity creating them has `MODIFY` on the table and `CREATE TABLE` on
+  the schema;
+- no row filters, column masks, ABAC policies, Delta Sharing or shallow
+  clones on these tables — Databricks silently ignores the index otherwise;
+- indexed columns must not be renamed or retyped;
+- Beta indexes must be dropped and recreated when the feature reaches Public
+  Preview: `DeltaMemoryMaintenance.rebuild_search_indexes()`;
+  `search_index_status()` runs `DESCRIBE INDEX` for each.
+
+Why these columns and tokenizers: `kv.search` is `isearch(kv_key, value,
+tags, …)` and an index can only skip a file when *every* target is indexed,
+so all three are; and every pushed-down search is a substring search, which
+only an n-gram index can serve (a `split` word index cannot prove a substring
+absent). Patterns shorter than the n-gram size still answer correctly but
+cannot use the index.
+
+Index names are `<table>_<column>_fts` in the table's schema. The docs do
+not say whether `CREATE/DESCRIBE/DROP INDEX` accept a catalog.schema-qualified
+name, so the qualified form is tried first and, if the runtime rejects it as
+a name form, the statement is retried with the bare name inside a scoped
+`USE CATALOG`/`USE SCHEMA` (the session's previous catalog and schema are
+restored). `ProvisionReport.index_name_style` says which form worked.
+
+**Verify on DBR 19** with the smoke check (it creates, checks and drops a
+scratch base; exit status 0 = everything works):
+
+```bash
+python scripts/databricks_fts_smoke.py --schema main.scratch
+```
+
+An index never changes a result — only how much data is scanned — and
+refreshes asynchronously. Off Databricks (OSS delta-spark, local Spark) the
+setup statements fail, one warning is logged, and searches fall back to
+`lower(col) LIKE` scans returning the same rows.
+
+### Chunk history — original and converted chunks
+
+`MemoryHub.chunk_history` (`memory.chunk_history.ChunkHistory`) is the
+reference record of how every chunk was translated. `SasLLMPipeline` writes
+one attempt per LLM call: an attempt inline validation rejects is recorded
+with `is_final = false` *before* it is rolled off the thread, the accepted
+one with `is_final = true`; a retry's row carries the corrective `feedback`
+it was prompted with. An item's attempts are buffered and written together
+when its final attempt lands — three Delta commits per item however many
+retries it took (a crash mid-item loses only that item's rejected attempts;
+an LLM failure flushes what was buffered). Rows are never updated, and chat
+retention does not touch them. Because nothing is updated, an item a resume
+re-translates has *two* accepted attempts; `current_only=True` keeps the most
+recent one per (thread, item). The history is not part of
+`MemoryHub.snapshot()`/`restore()` and is not copied by `fork_thread` /
+`fork_run` — query a forked item's lineage by `chunk_key`, which is
+thread-independent.
+
+- The **original** chunk text is stored once in `B_chunk_sources`, keyed by
+  `chunk_key = sha256(source_id, text)` (re-runs and re-chunking reuse it).
+- The **converted** chunk is the item's code cells attributed to that chunk
+  (`TranslationCell.chunk_id`); a single-chunk item needs no attribution.
+  A multi-chunk item whose model attributed nothing to a chunk records
+  `converted_text = NULL` — the attempt's full response is always kept.
+
+```python
+hist = mem.chunk_history
+hist.for_item("thread-1", "batch-003")             # every attempt, oldest first
+hist.history(chunk_id="f1-chunk-0007", final_only=True)   # every accepted attempt
+hist.for_item("thread-1", "batch-003", current_only=True) # the answer that stands now
+hist.search("PROC SORT", field="original")          # isearch on Databricks
+hist.search("withColumn", field="converted", case_sensitive=True)
+hist.search("merge by id", field="response", mode="word")
+```
+
+#### Archival
+
+The active tables (and their search indexes) only need what is still
+looked at. `archive()` moves stale attempts — whole attempts: the
+`item_attempts` row and all its conversion rows — into the `_archive` tables:
+
+```python
+import time
+hist.archive(superseded_only=True)                      # rejected + replaced answers
+hist.archive(before_ts=time.time() - 90 * 86400)        # anything older than 90 days
+hist.archive(before_ts=cutoff, thread_id="thread-1")    # one thread
+hist.history(chunk_id="f1-chunk-0007", include_archived=True)
+```
+
+- At least one of `before_ts` / `superseded_only` is required.
+- `keep_current=True` (default): the answer that stands for each (thread,
+  item) is never archived, however old.
+- Rows are copied to the archive *before* they are deleted from the active
+  tables, both idempotently: an interrupted run leaves at most a duplicate
+  (reads show the active copy) and a rerun completes it.
+- Original chunks stay in `B_chunk_sources` (one row per distinct chunk;
+  both views join it).
+- `include_archived=True` on `history` / `for_item` / `search` reads both;
+  archived rows have `archived_at` set and are scanned, not indexed.
+- From a scheduled job: `DeltaMemoryMaintenance.archive_chunk_history(...)`,
+  then `vacuum()` (or predictive optimization) reclaims the deleted files.
+
+```sql
+SELECT chunk_id, attempt, is_final, original_text, converted_text, validation_score
+FROM cat.sch.llm_mem_chunk_history
+WHERE thread_id = 'thread-1' AND isearch(original_text, 'proc sql')
+ORDER BY created_at, attempt, member_index;
+```
 
 ### Incremental reads
 
@@ -233,8 +424,9 @@ the next invalidation.
 For a shared Delta deployment, configure both a per-process consumer id and
 an **independent** audit table. `MemoryHub.sync_changes()` establishes a
 snapshot boundary on its first call (invalidating all local thread caches),
-then consumes later committed CDF versions and invalidates only cached threads
-whose `msg::` or `chat::` rows changed. The consumer checkpoint lives in the
+then consumes later committed CDF versions of `B_messages` and `B_chats` —
+each against its own checkpoint — and invalidates only cached threads whose
+`msg::` or `chat::` rows changed. The consumer checkpoint lives in the
 audit table, never in the source memory table, so processing it cannot create
 an endless CDF feedback loop.
 
@@ -263,8 +455,11 @@ longer than the longest expected CDF consumer outage.
 ### Delta maintenance
 
 Maintenance is explicit and never runs in the request path. Use
-`DeltaMemoryMaintenance` from a scheduled job to inspect history, compact, or
-vacuum a memory table. `VacuumPolicy` rejects retention below seven days or
+`DeltaMemoryMaintenance` (given the memory **base** name; every command acts
+on all derived tables) from a scheduled job to inspect history, compact, or
+vacuum. On Databricks with `full_text_search` on, predictive optimization
+already runs OPTIMIZE/VACUUM automatically; the explicit commands remain for
+other runtimes. `VacuumPolicy` rejects retention below seven days or
 above four 30-day months, and requires it to exceed the configured worst-case
 CDF consumer outage. `vacuum()` is a dry run by default.
 
@@ -276,8 +471,19 @@ ops = DeltaMemoryMaintenance(
     policy=VacuumPolicy(retention_hours=30 * 24, max_cdf_outage_hours=7 * 24),
 )
 ops.optimize()
-ops.vacuum()  # dry run
+ops.vacuum()                     # dry run; vacuum(dry_run=False) also prunes the restore journal
+ops.recover_restore()            # settle interrupted restores (see above)
+ops.provision(force=True)        # re-run Databricks setup (indexes, predictive optimization)
+ops.rederive_columns()           # once after an upgrade that changed derived columns
 ```
+
+Upgrading a store written before this version: run `migrate_legacy()` for a
+pre-split single table (it also stamps legacy chats' messages with their
+`chat_id`), and `rederive_columns()` once so `B_kv`'s `namespace` /
+`scope_id` follow the current rule — `("kv", <key>)` for plain KV entries,
+`(<ns>, <id>)` for `policy` / `tmem` / `summary` / `pending`. Legacy chats in
+any other store are stamped lazily, the first time a thread's chats are
+read.
 
 ### Optional Databricks AI Bridge
 

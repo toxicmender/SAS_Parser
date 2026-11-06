@@ -302,6 +302,17 @@ def memory_table_value(key: str, default: str | None = None) -> str | None:
         return default
     return value
 
+def memory_full_text_search(default: bool = True) -> bool:
+    """``memory.full_text_search`` from ``config.json`` (default ``True``).
+
+    Turns on predictive optimization and Databricks full-text search indexes
+    for the Delta memory tables (DBR 18.3+; the project targets DBR 19). It
+    only matters in Delta mode, and off-Databricks the setup failure is
+    logged and searches fall back to ``LIKE`` scans.
+    """
+    return bool(get_typed_value("memory", "full_text_search", bool, default))
+
+
 # Supported chat-client construction strategies.
 PROVIDER_CLIENT_AUTO = "auto"
 PROVIDER_CLIENT_OPENAI_COMPATIBLE = "openai_compatible"

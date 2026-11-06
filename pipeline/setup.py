@@ -74,7 +74,10 @@ class MemorySetup:
     ``delta_table`` or config.json ``memory.delta_table`` is set);
     ``cdf_audit_table`` likewise falls back to config.json
     ``memory.cdf_audit_table``; both configured names must be
-    ``Catalog.Schema.Table``. ``task_id`` / ``task_policy`` name or carry the
+    ``Catalog.Schema.Table`` (``delta_table`` is the *base* name the typed
+    memory tables are derived from — see ``memory.schema``);
+    ``full_text_search`` falls back to config.json
+    ``memory.full_text_search``. ``task_id`` / ``task_policy`` name or carry the
     long-term policy; ``thread_memory`` holds short-term notes (implied by a
     ``memory_extractor`` when omitted); ``chat_id`` identifies this
     instance's span of every thread it writes; ``window_k`` /
@@ -93,6 +96,9 @@ class MemorySetup:
     cdf_consumer_id: str | None = None
     cdf_audit_table: str | None = None
     max_delta_write_retries: int = 3
+    # Databricks full-text search indexes + predictive optimization on the
+    # memory tables. None falls back to config.json memory.full_text_search.
+    full_text_search: bool | None = None
     # History policy: which of the stored turns are actually prompted. It
     # belongs here rather than in a group of its own because it is the same
     # subject as the store — what is remembered versus what is re-sent — and
@@ -116,12 +122,18 @@ class MemorySetup:
             self.cdf_audit_table
             or app_config.memory_table_value("cdf_audit_table")
         )
+        full_text_search = (
+            self.full_text_search
+            if self.full_text_search is not None
+            else app_config.memory_full_text_search()
+        )
         hub = self.memory or self._default_hub(
             self.spark,
             delta_table,
             cdf_consumer_id=self.cdf_consumer_id,
             cdf_audit_table=cdf_audit_table,
             max_write_retries=self.max_delta_write_retries,
+            full_text_search=full_text_search,
         )
         chat_id = self.chat_id or uuid.uuid4().hex[:12]
 
@@ -169,6 +181,7 @@ class MemorySetup:
         cdf_consumer_id: str | None = None,
         cdf_audit_table: str | None = None,
         max_write_retries: int = 3,
+        full_text_search: bool = False,
     ) -> MemoryHub:
         if delta_table is None:
             if cdf_consumer_id is not None or cdf_audit_table is not None:
@@ -190,6 +203,7 @@ class MemorySetup:
             cdf_consumer_id=cdf_consumer_id,
             cdf_audit_table=cdf_audit_table,
             max_write_retries=max_write_retries,
+            full_text_search=full_text_search,
         )
 
 

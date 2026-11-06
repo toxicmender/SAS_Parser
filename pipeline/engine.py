@@ -1389,7 +1389,26 @@ class SasLLMPipeline:
                     )
 
             passed = result.passed if result is not None else True
-            if passed or attempt >= max_attempts:
+            is_final = passed or attempt >= max_attempts
+            # Every attempt — rejected ones included, before the rollback
+            # below erases them from the thread — goes to the chunk history.
+            self._record_chunk_attempt(
+                item,
+                str(ai_text),
+                document,
+                thread_id=thread_id,
+                attempt=attempt,
+                is_final=is_final,
+                result=result,
+                item_target=item_target,
+                # The corrective note prompted WITH this attempt (empty on the
+                # first); recorded before `feedback` is replaced below.
+                feedback="\n\n".join(str(m.content) for m in feedback) or None,
+                # Rejected attempts wait for the item's final one: one write
+                # per item instead of one per attempt.
+                buffer=not is_final,
+            )
+            if is_final:
                 if not passed:
                     logger.warning(
                         f"_answer_item: item={item_id} still failing after "
@@ -1411,6 +1430,60 @@ class SasLLMPipeline:
             # Drop this attempt's turn pair so the retry replaces it in place.
             history.truncate_to(len_before)
             feedback = [self._validation_feedback_message(result)]
+
+    def _record_chunk_attempt(
+        self,
+        item: SasBatch,
+        response_text: str,
+        document: dict[str, Any] | None,
+        *,
+        thread_id: str,
+        attempt: int,
+        is_final: bool,
+        result: Any,
+        item_target: TargetLanguage | None,
+        feedback: str | None = None,
+        buffer: bool = False,
+    ) -> None:
+        """Append one attempt (original + converted chunks) to the history.
+
+        Swallows everything, like :meth:`_extract_memories`: the history is a
+        reference record, and writing it must never fail a translation run.
+        """
+        target = item_target or self._target_language
+        try:
+            self._memory.chunk_history.record_attempt(
+                item,
+                response_text,
+                document,
+                thread_id=thread_id,
+                attempt=attempt,
+                is_final=is_final,
+                chat_id=self.chat_id,
+                validation_score=float(result.score) if result is not None else None,
+                validation_passed=bool(result.passed) if result is not None else None,
+                target_language=getattr(target, "key", None),
+                model=str(self.model) if self.model is not None else None,
+                feedback=feedback,
+                buffer=buffer,
+            )
+        except Exception:
+            logger.warning(
+                f"_record_chunk_attempt: history write failed  item={item.batch_id}  "
+                f"thread='{thread_id}'",
+                exc_info=True,
+            )
+
+    def _flush_chunk_history(self, item_id: str, thread_id: str) -> None:
+        """Write buffered chunk-history attempts; never raises."""
+        try:
+            self._memory.chunk_history.flush()
+        except Exception:
+            logger.warning(
+                f"_flush_chunk_history: history write failed  item={item_id}  "
+                f"thread='{thread_id}'",
+                exc_info=True,
+            )
 
     def _extract_memories(
         self, thread_id: str, user_msg: str, response_text: str
@@ -1557,6 +1630,9 @@ class SasLLMPipeline:
                     f"_process: LLM call failed  item={item_id}  thread={thread_id}",
                     exc_info=True,
                 )
+                # Attempts already rejected before the failing call are still
+                # history: write what was buffered for this item.
+                self._flush_chunk_history(item_id, thread_id)
                 self._ledger.record_run_fact(
                     thread_id, item_id, self._ledger.error_fact(idx, total, exc)
                 )
