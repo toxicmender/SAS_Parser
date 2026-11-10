@@ -166,6 +166,25 @@ def _engine_blocker(engine: str | None) -> tuple[str, ...]:
     )
 
 
+def _unread_library_blocker(ref: "SasEngineRef") -> tuple[str, ...]:
+    """A blocker for a database LIBNAME no read here names a table through.
+
+    ``libname arch oracle path=ARCHPRO schema=hist;`` binds a schema, not one
+    table. Its tables are planned one by one where the corpus reads them;
+    with none read, the stand-in item has no table to load, and run as
+    planned it would select a table named after the schema
+    (``"HIST"."HIST"``), which almost never exists. So it is reported, as a
+    library directory with no member named is, rather than run.
+    """
+    schema = ref.option_map.get("schema")
+    library = f"LIBNAME {ref.binds}" + (f" (schema {schema})" if schema else "")
+    return (
+        f"{library} binds a database schema, not one table, and no read here "
+        f"names a table through it — list the tables the job reads from it, or "
+        f"leave it out if it reads none",
+    )
+
+
 def _list_blocker(ref: "SasDbTableRef") -> tuple[str, ...]:
     """A blocker for a read of a list of tables.
 
@@ -577,6 +596,8 @@ def _sources_for(
     *named* holds the database LIBNAMEs — ``(libref, options)`` — whose tables
     the corpus names: those are planned table by table, so the LIBNAME's own
     schema-level item, which stands in when no table is known, is left out.
+    Any other database LIBNAME keeps that item, blocked: it names no table to
+    load (:func:`_unread_library_blocker`).
     *unloaded_filerefs* are the filerefs the corpus only runs code or writes
     through (:func:`_unloaded_filerefs`): their FILENAMEs name no data to load.
     *transport_filerefs* are the ones only PROC CIMPORT reads: their FILENAMEs
@@ -585,7 +606,10 @@ def _sources_for(
     ``(name, place)`` (:func:`_env_in_use`): any other is just a variable.
     """
     sources: list[tuple[HydrationSource, tuple[str, ...]]] = [
-        (_oracle_source(ref, source_id), _engine_blocker(ref.engine))
+        (
+            _oracle_source(ref, source_id),
+            (*_engine_blocker(ref.engine), *_unread_library_blocker(ref)),
+        )
         for ref in engine_refs
         if (ref.binds, ref.options) not in named
     ]

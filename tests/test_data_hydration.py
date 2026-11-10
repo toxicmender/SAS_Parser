@@ -62,6 +62,13 @@ def _plan(source: str, **overrides) -> HydrationPlan:
     )
 
 
+def _runnable(source: str, **overrides) -> HydrationPlan:
+    """The plan for a snippet whose database tables are read, via the real
+    chunker: items a run attempts, where a LIBNAME alone is blocked."""
+    engine_refs, path_refs, tables = _db(source)
+    return build_plan(engine_refs, path_refs, db_tables=tables, config=_config(**overrides))
+
+
 class TestDecoupling:
     def test_importing_data_hydration_imports_neither_chunker_nor_a_driver(self):
         """The contract in the package README, asserted the only way that works.
@@ -109,9 +116,34 @@ class TestEngineSources:
         assert "pass" in item.blockers[0] and "user" in item.blockers[0]
 
     def test_a_clean_connection_has_no_blockers(self):
-        plan = _plan("libname edwprod oracle path=EDWPRO schema=s user=svc;")
-        assert plan.items[0].blockers == ()
+        plan = _runnable(
+            "libname edwprod oracle path=EDWPRO schema=s user=svc;\n"
+            "data work.x; set edwprod.accounts; run;\n"
+        )
+        assert [item.blockers for item in plan.items] == [()]
         assert plan.blocked_count == 0
+
+    def test_a_libname_no_read_names_a_table_through_is_blocked(self):
+        # Its tables are planned where the corpus reads them. With none read,
+        # the stand-in item names no table: run, it would select one named
+        # after the schema ("HIST"."HIST"), so it is reported instead.
+        plan = _plan("libname arch oracle path=ARCHPRO schema=hist user=svc;")
+        (item,) = plan.items
+        assert item.blockers == (
+            "LIBNAME arch (schema hist) binds a database schema, not one table, "
+            "and no read here names a table through it — list the tables the job "
+            "reads from it, or leave it out if it reads none",
+        )
+        assert execute(plan, config=_config()).skipped == 1
+
+    def test_an_unread_libname_without_a_schema_is_named_by_its_libref(self):
+        (item,) = _plan("libname arch oracle path=ARCHPRO;").items
+        assert item.blockers[0].startswith("LIBNAME arch binds a database schema,")
+
+    def test_another_engine_s_unread_libname_says_both_things(self):
+        (item,) = _plan("libname td teradata server=tdprod database=dw;").items
+        assert item.blockers[0].startswith("a teradata database")
+        assert item.blockers[1].startswith("LIBNAME td binds a database schema,")
 
 
 class TestPathSources:
@@ -554,6 +586,15 @@ class TestPartitioning:
         assert "<= 100.0" in parts[-1].predicate
 
 
+#: Two tables read through two LIBNAMEs: two items a run attempts.
+_TWO_TABLES = (
+    "libname a oracle path=P schema=one;\n"
+    "libname b oracle path=P schema=two;\n"
+    "data work.x; set a.t1; run;\n"
+    "data work.y; set b.t2; run;\n"
+)
+
+
 class TestRunner:
     def test_a_dry_run_touches_nothing_and_skips_every_item(self):
         plan = _plan("libname a oracle path=P schema=t;")
@@ -572,11 +613,7 @@ class TestRunner:
         assert report.failed == 0
 
     def test_a_failing_item_is_recorded_and_the_run_continues(self, monkeypatch):
-        source = (
-            "libname a oracle path=P schema=one;\n"
-            "libname b oracle path=P schema=two;\n"
-        )
-        plan = _plan(source)
+        plan = _runnable(_TWO_TABLES)
         assert len(plan.items) == 2
 
         calls: list[str] = []
@@ -593,11 +630,7 @@ class TestRunner:
         assert "host unreachable" in (report.outcomes[0].error or "")
 
     def test_on_error_stop_ends_the_run_at_the_first_failure(self, monkeypatch):
-        source = (
-            "libname a oracle path=P schema=one;\n"
-            "libname b oracle path=P schema=two;\n"
-        )
-        plan = _plan(source)
+        plan = _runnable(_TWO_TABLES)
         calls: list[str] = []
 
         def _boom(item, config):
@@ -610,7 +643,7 @@ class TestRunner:
         assert report.failed == 1
 
     def test_a_written_item_reports_its_row_count(self, monkeypatch):
-        plan = _plan("libname a oracle path=P schema=t;")
+        plan = _runnable("libname a oracle path=P schema=t;\ndata work.x; set a.accounts; run;\n")
         monkeypatch.setattr(
             "data_hydration.sinks.delta.write_item", lambda item, config: 42
         )
@@ -766,13 +799,15 @@ class TestDatabaseTables:
 
     def test_the_reader_selects_a_library_item_s_table_by_its_target(self):
         # A database LIBNAME that no read names is one schema-level item: its
-        # reader selects the table the target names, in the LIBNAME's schema.
+        # reader would select the table the target names, in the LIBNAME's
+        # schema. That table is named after the schema, so the item is blocked.
         from data_hydration.sources.oracle import OracleReader
 
         config = _config()
         (item,) = _plan("libname arch oracle path=ARCHPRO schema=hist;").items
         table = item.target_table.rsplit(".", 1)[-1].upper()
         assert OracleReader(item, config)._sql() == f'SELECT * FROM "HIST"."{table}"'
+        assert item.needs_operator_input
 
     def test_the_credential_is_keyed_on_the_connection(self, monkeypatch):
         import types
