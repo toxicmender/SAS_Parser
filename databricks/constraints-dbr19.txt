@@ -16,7 +16,7 @@ annotated-types==0.7.0
 anyio==4.10.0
 azure-core==1.41.0
 azure-identity==1.25.3
-certifi==2025.11.12
+certifi==2026.10.18
 cffi==2.0.0
 charset-normalizer==3.4.4
 cryptography==46.0.3
