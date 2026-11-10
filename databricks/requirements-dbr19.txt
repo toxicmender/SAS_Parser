@@ -74,7 +74,7 @@ microsoft-kiota-serialization-multipart==1.11.7
 microsoft-kiota-serialization-text==1.11.7
 msgraph-core==1.5.1
 msgraph-sdk==1.60.0
-multidict==6.7.1
+multidict==6.9.1
 numba==0.66.0
 openai==2.50.0
 orjson==3.11.9
