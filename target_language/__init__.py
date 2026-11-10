@@ -12,6 +12,10 @@ import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # sqlglot is imported where a parse needs it
+    from sqlglot.tokenizer_core import Token
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +27,12 @@ __all__ = [
     "SPARKSQL",
     "TargetLanguage",
     "UnknownTargetLanguage",
+    "mask_identifier_clauses",
     "normalize_language",
     "resolve_target_language",
+    "restore_identifier_clauses",
+    "session_variable",
+    "unqualify_declared_names",
 ]
 
 DEFAULT_OUTPUT_LANGUAGE = "Spark SQL"
@@ -50,14 +58,195 @@ def _check_python(source: str) -> str | None:
     return None
 
 
+# The IDENTIFIER clause: an object name computed from a constant string — a
+# session variable, a parameter marker or a literal — anywhere Databricks SQL
+# takes a name ("IDENTIFIER clause", Databricks SQL / Runtime 13.3 and above).
+_PLACEHOLDER = "__sasp_identifier_{}__"
+
+
+def _clause_end(tokens: list[Token], i: int) -> int | None:
+    """The index of the token closing the IDENTIFIER clause that opens at
+    token *i*, or ``None`` when none opens there or it never closes.
+
+    A clause opens at an unquoted ``IDENTIFIER`` followed by ``(``, and not
+    after a dot: a backquoted name, a string or a comment spelling it is a
+    different token, or none at all.
+    """
+    token = tokens[i]
+    if (
+        token.token_type.name != "VAR"
+        or token.text.upper() != "IDENTIFIER"
+        or i + 1 >= len(tokens)
+        or tokens[i + 1].token_type.name != "L_PAREN"
+        or (i > 0 and tokens[i - 1].token_type.name == "DOT")
+    ):
+        return None
+    depth = 0
+    for j in range(i + 1, len(tokens)):
+        kind = tokens[j].token_type.name
+        if kind == "L_PAREN":
+            depth += 1
+        elif kind == "R_PAREN":
+            depth -= 1
+            if depth == 0:
+                return j
+    return None
+
+
+def mask_identifier_clauses(
+    sql: str, dialect: str = "databricks"
+) -> tuple[str, dict[str, str]]:
+    """*sql* with each IDENTIFIER clause replaced by a plain placeholder name,
+    and the clause each placeholder stands for.
+
+    sqlglot reads ``SELECT * FROM IDENTIFIER(session.t)`` but not
+    ``CREATE TABLE IDENTIFIER(session.t) AS ...``, ``INSERT INTO``, ``COPY
+    INTO`` or ``DROP TABLE`` with one, which Databricks accepts — so a parse
+    of generated Spark SQL masks them first. A placeholder is an ordinary
+    identifier, so the statement around it parses as it would with a literal
+    name, and :func:`restore_identifier_clauses` puts the clauses back.
+
+    Clauses are found on *dialect*'s own tokens, so a string, a raw string, a
+    comment or a backquoted name that only spells ``IDENTIFIER(`` is never
+    one. A clause never closed masks nothing, and neither does a literal or a
+    comment never closed, which the tokenizer refuses: the parse reports them.
+    Nor does a clause in a statement sqlglot keeps as raw text after its
+    keyword (``OPTIMIZE``, ``EXECUTE``, ``SHOW``): it parses as a command
+    either way, and whoever reads that text masks it there.
+    """
+    try:
+        from sqlglot.dialects.dialect import Dialect
+
+        tokens = Dialect.get_or_raise(dialect).tokenize(sql)
+    except Exception:  # sqlglot's TokenError: an unclosed literal or comment
+        return sql, {}
+    out: list[str] = []
+    originals: dict[str, str] = {}
+    copied = i = 0
+    while i < len(tokens):
+        close = _clause_end(tokens, i)
+        if close is None:
+            i += 1
+            continue
+        name = _PLACEHOLDER.format(len(originals))
+        start, end = tokens[i].start, tokens[close].end + 1
+        originals[name] = sql[start:end]
+        out += (sql[copied:start], name)
+        copied, i = end, close + 1
+    out.append(sql[copied:])
+    return "".join(out), originals
+
+
+def restore_identifier_clauses(sql: str, originals: dict[str, str]) -> str:
+    """*sql*, masked by :func:`mask_identifier_clauses`, with its clauses back.
+
+    Matched case-insensitively, so a generator that normalises names — sqlglot
+    upper-cases a function name — still leaves no placeholder behind.
+    """
+    if not originals:
+        return sql
+    by_name = {name.lower(): clause for name, clause in originals.items()}
+    pattern = re.compile("|".join(map(re.escape, originals)), re.IGNORECASE)
+    return pattern.sub(lambda match: by_name[match.group(0).lower()], sql)
+
+
+def session_variable(node: object) -> str | None:
+    """The session variable a sqlglot column node reads — ``session.x``,
+    ``system.session.x`` or a bare ``x`` — upper-cased, or ``None``."""
+    from sqlglot import exp
+
+    if not isinstance(node, exp.Column):
+        return None
+    qualifier = (node.text("db").lower(), node.table.lower())
+    if qualifier in (("", ""), ("", "session"), ("system", "session")):
+        return node.name.upper()
+    return None
+
+
+def _qualifier_end(tokens: list[Token], j: int) -> int | None:
+    """The index of the dot ending a ``session.`` or ``system.session.``
+    qualifier that starts at token *j* and is followed by a name, else
+    ``None``."""
+    k = j
+    if (
+        k + 2 < len(tokens)
+        and tokens[k].text.lower() == "system"
+        and tokens[k + 1].token_type.name == "DOT"
+    ):
+        k += 2
+    if (
+        k + 2 < len(tokens)
+        and tokens[k].text.lower() == "session"
+        and tokens[k + 1].token_type.name == "DOT"
+    ):
+        return k + 1
+    return None
+
+
+def unqualify_declared_names(sql: str, dialect: str = "databricks") -> str:
+    """*sql* with the ``session.`` / ``system.session.`` qualifier of every
+    name a ``DECLARE`` declares blanked out by spaces, the length unchanged.
+
+    sqlglot reads ``DECLARE OR REPLACE VARIABLE session.x STRING DEFAULT
+    ...`` only as an opaque command, though the qualified name is valid
+    Databricks SQL; without the qualifier the statement parses as an ordinary
+    ``DECLARE``, default and all. Blanking rather than deleting keeps every
+    offset, so a caller can parse the result and still edit the original.
+    """
+    try:
+        from sqlglot.dialects.dialect import Dialect
+
+        tokens = Dialect.get_or_raise(dialect).tokenize(sql)
+    except Exception:  # sqlglot's TokenError: an unclosed literal or comment
+        return sql
+    blanks: list[tuple[int, int]] = []
+    for i, token in enumerate(tokens):
+        if token.token_type.name != "DECLARE":
+            continue
+        j = i + 1
+        if j + 1 < len(tokens) and [t.token_type.name for t in tokens[j : j + 2]] == [
+            "OR",
+            "REPLACE",
+        ]:
+            j += 2
+        if j + 1 < len(tokens) and tokens[j].text.upper() in ("VAR", "VARIABLE"):
+            j += 1
+        while j < len(tokens):  # the names, separated by commas
+            end = _qualifier_end(tokens, j)
+            if end is not None:
+                blanks.append((tokens[j].start, tokens[end].end + 1))
+                j = end + 1
+            if j + 1 < len(tokens) and tokens[j + 1].token_type.name == "COMMA":
+                j += 2
+                continue
+            break
+    out = sql
+    for start, end in blanks:
+        out = out[:start] + re.sub(r"[^\n]", " ", out[start:end]) + out[end:]
+    return out
+
+
+def _syntax_error(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
+
+
 def _check_sql(source: str, dialect: str) -> str | None:
-    """Parse a statement list with the required sqlglot dependency."""
+    """Parse a statement list with the required sqlglot dependency, its
+    IDENTIFIER clauses masked (:func:`mask_identifier_clauses`) and each
+    clause's own expression parsed by itself, so masking hides no error."""
     import sqlglot
 
+    masked, clauses = mask_identifier_clauses(source, dialect)
     try:
-        sqlglot.parse(source, dialect=dialect)
+        sqlglot.parse(masked, dialect=dialect)
     except Exception as exc:
-        return f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
+        return _syntax_error(exc)
+    for clause in clauses.values():
+        inner = clause[clause.index("(") + 1 : clause.rindex(")")]
+        try:
+            sqlglot.parse_one(inner, dialect=dialect)
+        except Exception as exc:
+            return f"{_syntax_error(exc)} (in {clause})"
     return None
 
 

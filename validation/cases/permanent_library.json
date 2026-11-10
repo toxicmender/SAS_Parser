@@ -1,0 +1,5 @@
+{
+  "case_id": "permanent_library",
+  "description": "Two LIBNAMEs, a DATA step from one library into the other, a PROC SQL summary into WORK, and a PROC APPEND onto a permanent history table. Under Spark SQL, session_variables checks that every permanent table is named through a declared session variable (a prefix per library, a variable per table, IDENTIFIER wherever it is used) while the WORK output stays a temporary view.",
+  "sas_source": "libname stage '/sasdata/stage';\nlibname mart '/sasdata/mart';\n\ndata mart.orders_clean;\n  set stage.orders;\n  where amount > 0;\n  margin = amount - cost;\nrun;\n\nproc sql;\n  create table work.region_margin as\n  select region, sum(margin) as total_margin\n  from mart.orders_clean\n  group by region;\nquit;\n\nproc append base=mart.margin_history data=work.region_margin;\nrun;\n"
+}

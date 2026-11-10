@@ -78,9 +78,12 @@ Where a macro builds SQL *text* rather than parameter values:
   IMMEDIATE`, which also takes `USING` arguments and can write results `INTO`
   variables. Prefer binding values over concatenating them.
 - A macro-variable-built **object name** (`&lib..&ds`, `work.&prefix._out`) ->
-  the `IDENTIFIER()` clause: `SELECT * FROM IDENTIFIER(:tbl)`. A parameter
-  marker cannot stand where a table name goes, and string-concatenating the
-  name into the statement is an injection risk; `IDENTIFIER()` is the construct
-  for exactly this.
+  a session variable set from its parts and read through the `IDENTIFIER()`
+  clause: `SET VAR OUT_TABLE = CONCAT(session.MART_PREFIX, '.', session.DS);`,
+  then `SELECT * FROM IDENTIFIER(session.OUT_TABLE)`. A parameter marker cannot
+  stand where a table name goes, and string-concatenating the name into the
+  statement is an injection risk; `IDENTIFIER()` is the construct for exactly
+  this.
 - ⚠️ Prefer resolving the name at translation time when the macro variable is
-  known — a literal name is reviewable, a dynamic one is not.
+  known — declare the variable of the table it resolves to: a fixed name is
+  reviewable, a dynamic one is not.

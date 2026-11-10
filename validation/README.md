@@ -48,6 +48,9 @@ metrics.py       Deterministic metrics + default_metrics(output_language):
                                         run's target language          (>= 1.0)
                    target_syntax        those blocks parse as the
                                         target (historical name)       (>= 1.0)
+                   session_variables    Spark SQL only: permanent
+                                        tables are named through
+                                        declared session variables     (>= 1.0)
                    required_terms       declared substrings            (>= 1.0)
                    reference_similarity token-F1 vs golden reference   (>= 0.5)
 judge.py         LLMJudgeMetric — grades functional equivalence 1–5 with any
@@ -76,6 +79,9 @@ conversation.py  validate_thread() / validate_transcript() (and their
 live.py          LiveValidator: inline per-item scoring during a run, with
                  the verdict stored in that conversation's memory.
                  validations_for_thread() reads the verdicts back.
+table_names.py   check_table_names(): how one answer's Spark SQL names
+                 its permanent tables — the reader behind
+                 session_variables.
 dataset.py       load_cases(): *.json case files (inline sas_source or a
                  sas_path reference next to the JSON).
 tracking.py      log_report(): one row per (run, case, metric) appended to a
@@ -280,6 +286,61 @@ default. Getting it wrong is loud rather than silent: a `LiveValidator` built
 for one target and handed to a pipeline prompting for another logs a WARNING at
 construction, because every item would otherwise fail `language_compliance` and
 — with `validation_retries` on — burn the whole retry budget.
+
+### Spark SQL table names — `session_variables`
+
+A Spark SQL suite adds `session_variables`. The Spark SQL instructions ask for
+every permanent table (one outside WORK, or a database table) to be named
+through Databricks SQL session variables, so its catalog and schema are set in
+one place:
+
+```sql
+DECLARE OR REPLACE VARIABLE MART_PREFIX STRING DEFAULT 'catalog_name.mart';
+DECLARE OR REPLACE VARIABLE DEMO_TABLE STRING DEFAULT CONCAT(session.MART_PREFIX, '.demo_table');
+CREATE OR REPLACE TABLE IDENTIFIER(session.DEMO_TABLE) AS SELECT ...;
+```
+
+`table_names.check_table_names` reads each answer's translated SQL in order.
+
+- **Passes:** an `IDENTIFIER(...)` whose variables are declared earlier in the
+  same answer. When the clause is a single variable, that variable must be
+  built from another variable, its library's prefix. A qualified
+  `DECLARE ... session.x` (or `VAR session.x`) declares `x`.
+- **Fails:**
+  - a literal `catalog.schema.table` or `lib.table`, including in statements
+    sqlglot reads only as commands: `OPTIMIZE`, `VACUUM`,
+    `CREATE TABLE ... DEEP CLONE`, `MSCK REPAIR TABLE`, and others naming a
+    `TABLE`;
+  - `IDENTIFIER('a.b.c')`;
+  - a variable used before it is declared, or never given a value. A
+    `SET x = ...` without `VAR` gives none (Spark rejects it on a variable)
+    and is reported itself;
+  - any of these in the query a variable's value reads
+    (`SET VAR n = (SELECT ... FROM t)`, a `DECLARE ... DEFAULT (SELECT ...)`);
+  - a permanent write (CREATE TABLE, INSERT, MERGE, UPDATE, DELETE, COPY INTO,
+    DROP TABLE, …) to an unqualified literal name, inside a `WHILE ... DO`
+    block too — a `CREATE TABLE` or a permanent `CREATE VIEW` too when a
+    temporary view already has that name;
+  - an `IDENTIFIER(...)` where Databricks takes none: `OPTIMIZE`, `VACUUM`,
+    the new name of `RENAME TO`, a `CLONE` source. Those statements are built
+    from the variables and run through `EXECUTE IMMEDIATE`;
+  - a stored view's query (`CREATE VIEW` or `ALTER VIEW ... AS`) or a
+    persisted SQL function's body that reads a session variable. Databricks
+    keeps that text, which may not read one, so it too is created through
+    `EXECUTE IMMEDIATE` — the fix given for a name such a body hard-codes,
+    too.
+- **Ignored:** temporary views, named literally or through a variable
+  (`CREATE TEMP VIEW IDENTIFIER(session.V)`, until `V` changes), and CTEs, a
+  temporary view's or function's body, `read_files`, `system` and
+  `information_schema`, Spark's `global_temp` views, and
+  ``delta.`/path` `` file reads. So is the text an `EXECUTE IMMEDIATE` runs:
+  it is a string, so a name hard-coded inside it is not caught.
+
+The score is the share of permanent-table references that pass. `details`
+lists what fails, which is what the retry note quotes to the model. An answer
+that names no permanent table is skipped. `dataset_fidelity` counts a table
+named through a variable: it matches the quoted `'.member'` suffix in the
+`CONCAT` too.
 
 ## Run history
 

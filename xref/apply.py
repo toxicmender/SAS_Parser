@@ -47,6 +47,7 @@ Logger name: ``xref.apply``.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -55,7 +56,7 @@ import app_config
 from .rewrite import (
     rewrite_python,
     rewrite_python_paths,
-    rewrite_sql,
+    rewrite_sql_cells,
     rewrite_sql_paths,
 )
 
@@ -134,18 +135,92 @@ def apply_post(
     tables, PySpark the ``ast`` module. Paths never need sqlglot — see
     :func:`~xref.rewrite.rewrite_sql_paths`.
     """
-    if not mappings or not code.strip():
-        return code
+    return _post(code, language, mappings, on_failure=on_failure)[0]
+
+
+def _is_sql(language: str) -> bool:
     from target_language import resolve_target_language
 
-    datasets = mappings.dataset_mapping
-    paths = mappings.by_path
-    target = resolve_target_language(language)
-    if target.sqlglot_dialect is not None:
-        out = rewrite_sql(code, datasets, on_failure=on_failure)
-        return rewrite_sql_paths(out, paths)
-    out = rewrite_python(code, datasets, on_failure=on_failure)
-    return rewrite_python_paths(out, paths, on_failure=on_failure)
+    return resolve_target_language(language).sqlglot_dialect is not None
+
+
+def _post(
+    code: str, language: str, mappings: "XrefMappings", *, on_failure: str | None = None
+) -> tuple[str, list[str]]:
+    """:func:`apply_post`, and the mapping keys of the names session
+    variables held that it remapped."""
+    if not mappings or not code.strip():
+        return code, []
+    if _is_sql(language):
+        (out,), remapped = rewrite_sql_cells(
+            [code], mappings.dataset_mapping, on_failure=on_failure
+        )
+        return rewrite_sql_paths(out, mappings.by_path), remapped
+    out = rewrite_python(code, mappings.dataset_mapping, on_failure=on_failure)
+    return rewrite_python_paths(out, mappings.by_path, on_failure=on_failure), []
+
+
+def apply_post_cells(
+    cells: Sequence[tuple[str, str]],
+    mappings: "XrefMappings",
+    *,
+    on_failure: str | None = None,
+) -> tuple[list[str], list[str]]:
+    """
+    One item's code *cells* — ``(source, language)``, in the order they run —
+    post-rewritten, and the mapping keys of the names session variables held
+    that were remapped.
+
+    The SQL cells are rewritten together
+    (:func:`~xref.rewrite.rewrite_sql_cells`): a prefix variable declared in
+    one cell builds the table names of the next, so a cell read alone would
+    miss them. Each other cell is rewritten as :func:`apply_post` would.
+    """
+    out = [source for source, _ in cells]
+    if not mappings:
+        return out, []
+    sql_at = [i for i, (_, language) in enumerate(cells) if _is_sql(language)]
+    remapped: list[str] = []
+    if sql_at:
+        rewritten, remapped = rewrite_sql_cells(
+            [out[i] for i in sql_at], mappings.dataset_mapping, on_failure=on_failure
+        )
+        for i, source in zip(sql_at, rewritten):
+            out[i] = rewrite_sql_paths(source, mappings.by_path)
+    for i, (source, language) in enumerate(cells):
+        if i not in sql_at:
+            out[i] = apply_post(source, language, mappings, on_failure=on_failure)
+    return out, remapped
+
+
+def only_post_names(
+    baseline: str,
+    rewritten: str,
+    mappings: "XrefMappings",
+    remapped: Iterable[str] = (),
+) -> list[str]:
+    """Source names — dataset *and* path — the post pass reached that
+    *baseline* had not: each mapping whose target appears in *rewritten* but
+    not in *baseline*, and the *remapped* names session variables held, whose
+    targets are split across a prefix and a suffix and never appear whole."""
+    checked = {**mappings.dataset_mapping, **mappings.by_path}
+    found = {
+        source
+        for source, target in checked.items()
+        if target in rewritten and target not in baseline
+    }
+    return sorted(found | set(remapped))
+
+
+def warn_only_post(only_post: list[str]) -> None:
+    """Report the names only the post pass reached, if any."""
+    if only_post:
+        logger.warning(
+            f"apply_both: {len(only_post)} mapping(s) were only reached by the "
+            f"post pass ({', '.join(only_post[:5])}"
+            f"{', ...' if len(only_post) > 5 else ''}); those names escaped the "
+            f"SAS-side substitution"
+        )
 
 
 @dataclass
@@ -196,28 +271,18 @@ def apply_both(
 
     Both mapping namespaces are checked, since either can escape: a dataset
     name the metadata extraction missed, or a path with no XREF row when
-    :func:`xref.pre.rewrite_source_text` swept the source.
+    :func:`xref.pre.rewrite_source_text` swept the source. So are the names
+    session variables held (:func:`only_post_names`).
     """
     baseline = pre_code if pre_code is not None else code
-    rewritten = apply_post(code, language, mappings, on_failure=on_failure)
-    checked = {**mappings.dataset_mapping, **mappings.by_path}
-    only_post = [
-        source
-        for source, target in checked.items()
-        if target in rewritten and target not in baseline
-    ]
-    if only_post:
-        logger.warning(
-            f"apply_both: {len(only_post)} mapping(s) were only reached by the "
-            f"post pass ({', '.join(sorted(only_post)[:5])}"
-            f"{', ...' if len(only_post) > 5 else ''}); those names escaped the "
-            f"SAS-side substitution"
-        )
+    rewritten, remapped = _post(code, language, mappings, on_failure=on_failure)
+    only_post = only_post_names(baseline, rewritten, mappings, remapped)
+    warn_only_post(only_post)
     return BothResult(
         code=rewritten,
         pre_applied=pre_code is not None,
         post_changed=rewritten != code,
-        only_post=sorted(only_post),
+        only_post=only_post,
     )
 
 

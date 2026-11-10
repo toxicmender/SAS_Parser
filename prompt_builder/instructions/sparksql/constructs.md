@@ -1,8 +1,10 @@
 ## [when: proc:sql] PROC SQL to Spark SQL
 PROC SQL is the closest SAS construct to Spark SQL — translate the query
 almost directly, then adjust for these differences:
-- Drop `quit;`, the `noprint`/`feedback` options, and any `CREATE TABLE ...
-  AS` libref prefix; write `CREATE OR REPLACE TEMP VIEW name AS SELECT ...`.
+- Drop `quit;` and the `noprint`/`feedback` options. A `CREATE TABLE ... AS`
+  into WORK becomes `CREATE OR REPLACE TEMP VIEW name AS SELECT ...`; one into a
+  permanent library `CREATE OR REPLACE TABLE IDENTIFIER(session.NAME) AS
+  SELECT ...`, through its session variable.
 - SAS `CALCULATED col` (referencing a select-list alias in the same query)
   is not valid in Spark; repeat the expression or wrap the SELECT in a CTE /
   subquery and reference the alias in the outer query.
@@ -30,7 +32,10 @@ replacing matched values and — for `UPDATE` — leaving a column untouched whe
 the transaction's value is *missing*. That is an upsert:
 
 ```sql
-MERGE INTO master AS m
+DECLARE OR REPLACE VARIABLE MYLIB_PREFIX STRING DEFAULT 'catalog_name.mylib';
+DECLARE OR REPLACE VARIABLE MASTER STRING DEFAULT CONCAT(session.MYLIB_PREFIX, '.master');
+
+MERGE INTO IDENTIFIER(session.MASTER) AS m
 USING txn AS t ON m.key = t.key
 WHEN MATCHED THEN UPDATE SET
   m.amt  = COALESCE(t.amt,  m.amt),   -- missing in txn leaves master's value

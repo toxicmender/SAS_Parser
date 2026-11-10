@@ -19,7 +19,9 @@ dependencies = [
     "pydantic>=2.13.4",
     "pymupdf>=1.28.0",
     "python-dotenv>=1.0",
-    "sqlglot>=25",
+    # 30 is the first release that reads a Databricks DECLARE as a statement;
+    # the Spark SQL session-variable check and the XREF post-rewrite need it.
+    "sqlglot>=30",
     # llm_client.tokens and memory.turns count tokens with it directly (it
     # already arrives via langchain-openai; declared so that stays true).
     "tiktoken>=0.7",

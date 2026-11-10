@@ -12,8 +12,9 @@ CREATE FOREIGN CATALOG edwprod USING CONNECTION oracle_prod
   OPTIONS (database 'EDWPRO');
 ```
 
-Once the foreign catalog exists, `edwprod.fr_dm_pro.accounts` is queried like any
-other three-level name and the SAS libref maps onto its **schema**.
+Once the foreign catalog exists, the SAS libref maps onto one of its
+**schemas**: its prefix variable holds `'edwprod.fr_dm_pro'`, and its tables are
+variables built from that prefix like any other.
 
 ⚠️ **Do not emit the `CREATE CONNECTION`.** It carries a credential, and the SAS
 it would come from almost always spells that credential as a macro variable
@@ -35,8 +36,8 @@ assumption once and keep it consistent:
 
 - **Ingested** — the table is in the lakehouse. Read it directly; emit no
   connection, no foreign catalog, and no load.
-- **Federated** — the table stays remote. Read it through the foreign catalog's
-  three-level name; emit no load.
+- **Federated** — the table stays remote. Read it through a variable built from
+  the foreign catalog's schema; emit no load.
 
 Either way the translation contains **no credentials and no ingestion of data
 that already exists**. If which one applies cannot be determined from the SAS,

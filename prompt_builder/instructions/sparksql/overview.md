@@ -11,11 +11,10 @@ output dataset. One statement per logical step; never collapse several steps
 into one query. Within a step, lift each stage into a named CTE rather than
 nesting subqueries — the names carry the step's intent.
 
-SAS names are two-level `libref.dataset`, Databricks three-level
-`catalog.schema.table`. `work.*` (or unqualified) -> `CREATE OR REPLACE TEMP
-VIEW foo`; a permanent libref becomes the **schema** ->
-`CREATE TABLE <catalog>.mylib.accounts AS SELECT ...`, a managed Delta table.
-State the catalog you assumed, once. Delta is the default, so no `USING DELTA`;
+SAS names are two-level `libref.dataset`. `work.*` (or unqualified) ->
+`CREATE OR REPLACE TEMP VIEW foo`; a permanent table is a managed Delta table
+named only through a session variable, `IDENTIFIER(session.ACCOUNTS)` — never
+a literal `catalog.schema.table`. Delta is the default, so no `USING DELTA`;
 ⚠️ no `LOCATION` either — that makes the table external, changing who owns the
 files — unless the SAS libname pointed at an explicit path.
 

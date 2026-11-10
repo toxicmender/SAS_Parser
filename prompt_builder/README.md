@@ -500,8 +500,12 @@ on that axis:
   `unclosed_block`, `includes`, `physical_paths` and `remote_paths` (the item
   names a filesystem place or a remote service, known or not),
   `wildcard_paths` and `unresolved_paths` (it names a wildcard, or a place not
-  known before the job runs), `defines_macros`, `invokes_macros`,
-  `produces_macrovars`, `automatic_vars`.
+  known before the job runs), `permanent_tables` (it names a table outside
+  WORK: a dataset it reads, writes or drops in another library — or one a
+  name mapping already renamed to `catalog.schema.table` — a library it
+  assigns, or a database table; a `%LET` value that only looks like a dataset
+  does not count), `defines_macros`, `invokes_macros`, `produces_macrovars`,
+  `automatic_vars`.
 
 So `## [when: proc:sql] [kind: PROC_STEP] [meta: symput_hazard] [lang: sparksql]
 Rule` fires only for a SparkSQL run whose item is a PROC step that uses PROC SQL
@@ -577,14 +581,19 @@ project's conventions before relying on it.
 
 > ⚠️ **The shipped slice targets Databricks**, not open-source Spark. It uses
 > `QUALIFY`, SQL scripting (`FOR`/`WHILE`/`SIGNAL`), `EXECUTE IMMEDIATE`,
-> `UNPIVOT` and three-level `catalog.schema.table` names, none of which
-> open-source Spark has — a non-Databricks deployment needs those rules
-> rewritten. The directory is named `sparksql/` because that is the target key
+> `UNPIVOT`, session variables read through `IDENTIFIER(...)`, and three-level
+> `catalog.schema.table` names, which open-source Spark lacks or has only in
+> recent releases — a non-Databricks deployment needs those rules rewritten. The directory is named `sparksql/` because that is the target key
 > `databrickssql` folds to (see `target_language`); the two are one target
 > today, so the slice must commit to one of them.
 
-The shipped slice holds only guidance that is true of the *languages* —
-nothing about how your shop wants its SQL to look. House rules (parameterising
+The shipped slice holds guidance that is true of the *languages*, with one
+convention on top: Spark SQL names every permanent table through session
+variables (`sparksql/table_names.md`, scoped `[meta: permanent_tables]`) —
+a prefix per SAS library and a variable per table, so a table's catalog and
+schema are set in one place — and the `session_variables` validation metric
+checks generated code for it. Beyond that, nothing about how your shop wants
+its SQL to look. House rules (parameterising
 hardcoded filters, leaving physical layout alone, emitting reconciliation
 queries) are illustrated in
 [`docs/instruction-examples/site-policy.md`](../docs/instruction-examples/site-policy.md),

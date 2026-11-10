@@ -4,9 +4,11 @@ to resolve to. It produces no rows, so it usually translates to **no
 statement at all**; what it does is fix how every later `mylib.table` name is
 written. Resolve it and say so in Mapping rather than emitting DDL for it.
 
-`libname mylib '/mnt/data';` -> the libref becomes the **schema** in
-`<catalog>.mylib.<table>`. Name the catalog you assumed once, and use it
-consistently for every table in the translation.
+`libname mylib '/mnt/data';` -> the libref becomes the **schema**, held with the
+catalog you assumed in the library's prefix variable,
+`DECLARE OR REPLACE VARIABLE MYLIB_PREFIX STRING DEFAULT 'catalog_name.mylib';`.
+Every table of the library is a variable built from it (see the session-variable
+rule), so the catalog is named once, there.
 
 ⚠️ Do not emit `CREATE SCHEMA` unless the SAS creates the library. A `LIBNAME`
 pointing at an existing directory asserts the location already exists; a
@@ -24,8 +26,9 @@ lakehouse:
   answers. **Federate** it (a Lakehouse Federation foreign catalog) when the
   data should stay where it is and be queried in place. **Hydrate** it (the
   table has been copied into the lakehouse ahead of the run) when it should be
-  ingested — then the libref is an ordinary schema and `edwprod.accounts` reads
-  as `<catalog>.edwprod.accounts` like any other table. ⚠️ Say which one you
+  ingested — then the libref is an ordinary schema with a prefix of its own,
+  and `edwprod.accounts` is `CONCAT(session.EDWPROD_PREFIX, '.accounts')` like
+  any other table. ⚠️ Say which one you
   assumed, and flag it either way: the connection, the credentials, and the
   federate-or-ingest decision are the operator's, not the translation's. Never
   emit the connection itself — `user=`/`pass=` in the SAS are usually macro

@@ -1,0 +1,561 @@
+"""Whether generated Spark SQL names its permanent tables through session variables.
+
+The Spark SQL instructions (``prompt_builder/instructions/sparksql/``) ask the
+model to name every permanent table — one in a SAS library other than WORK,
+or a database table — through Databricks SQL session variables, so that the
+catalog and schema a table lands in are set in one place:
+
+    DECLARE OR REPLACE VARIABLE MART_PREFIX STRING DEFAULT 'catalog_name.mart';
+    DECLARE OR REPLACE VARIABLE DEMO_TABLE STRING
+        DEFAULT CONCAT(session.MART_PREFIX, '.demo_table');
+    CREATE OR REPLACE TABLE IDENTIFIER(session.DEMO_TABLE) AS SELECT ... ;
+
+A session variable needs Databricks Runtime 14.1 or above ("DECLARE
+VARIABLE"); the IDENTIFIER clause takes it wherever a name goes, the target
+of CREATE, INSERT, MERGE, UPDATE, DELETE, COPY INTO and DROP included
+("IDENTIFIER clause"). :func:`check_table_names` reads one answer's SQL, in
+order, and judges each table reference the convention covers:
+
+- a reference through ``IDENTIFIER(...)`` passes when every variable it reads
+  is declared earlier in the answer, and when it is one variable, that
+  variable's value is built from another (its library's prefix) rather than
+  being a literal name;
+- a literal qualified name (``main.sales.orders``, ``mart.orders``) fails,
+  in the query a variable's value reads (``SET VAR n = (SELECT ...)``) too;
+- ``SET x = ...`` without ``VAR`` gives a session variable no value — Spark
+  rejects it — and fails;
+- an unqualified literal written as a permanent table fails — the target of
+  CREATE TABLE (or a view that is not temporary), INSERT, MERGE, UPDATE,
+  DELETE, COPY INTO, DROP TABLE, TRUNCATE or ALTER, at the top level or in a
+  scripting block (``WHILE ... DO``);
+- a stored view whose query reads a session variable fails: Databricks
+  keeps a stored view's text, and "Temporary variables cannot be referenced
+  within ... the body of a persisted view" ("DECLARE VARIABLE"), so such a
+  view is created with EXECUTE IMMEDIATE and its names resolved.
+
+OPTIMIZE and VACUUM, which sqlglot reads only as commands, are judged by the
+table they name.
+
+What is not a permanent table is left alone: temporary views (a WORK dataset,
+named literally or through a variable) and the CTEs and views a query reads by
+a bare name, table functions
+(``read_files``), Databricks' own ``system`` catalog and
+``information_schema``, Spark's ``global_temp`` views, and a file read in place
+(``delta.`/Volumes/...```).
+
+Logger name: ``validation.table_names``.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+from target_language import (
+    SPARKSQL,
+    mask_identifier_clauses,
+    session_variable,
+    unqualify_declared_names,
+)
+
+if TYPE_CHECKING:  # sqlglot is imported where a parse needs it
+    from sqlglot import exp
+
+logger = logging.getLogger(__name__)
+
+_DIALECT = SPARKSQL.sqlglot_dialect or "databricks"
+
+# The file formats Spark reads a path in place with: `delta.`/Volumes/...``.
+_PATH_FORMATS = frozenset(
+    {"delta", "parquet", "csv", "json", "orc", "avro", "text", "binaryfile"}
+)
+
+# A DECLARE sqlglot still reads only as a command once its names are
+# unqualified (target_language.unqualify_declared_names) is one whose default
+# it cannot parse: its names, after the optional keywords.
+_DECLARE_NAMES_RE = re.compile(
+    r"\s*(?:OR\s+REPLACE\s+)?(?:VAR(?:IABLE)?\s+)?(?P<names>[\w.]+(?:\s*,\s*[\w.]+)*)",
+    re.IGNORECASE,
+)
+
+# What a statement creates, alters or drops when it is no table: a schema or a
+# catalog names no table, and neither does a function.
+_NOT_TABLES = frozenset({"SCHEMA", "DATABASE", "CATALOG", "FUNCTION"})
+
+# A table name as written in a command's text: dotted parts, each a word or a
+# backquoted name (`main`.`mart`.t, delta.`/Volumes/...`).
+_NAME = r"(?:`[^`]*`|\w+)(?:\s*\.\s*(?:`[^`]*`|\w+))*"
+
+# The Delta maintenance commands sqlglot reads only as commands, and the table
+# each names first: `OPTIMIZE main.mart.t FULL`, `VACUUM t RETAIN 168 HOURS`.
+# Neither takes an IDENTIFIER clause.
+_TABLE_COMMANDS = frozenset({"OPTIMIZE", "VACUUM"})
+_COMMAND_TABLE_RE = re.compile(rf"\s*(?:TABLE\s+)?(?P<name>{_NAME})", re.IGNORECASE)
+# A CREATE sqlglot reads only as a command: `CREATE TABLE t DEEP CLONE s`.
+_CLONE_RE = re.compile(
+    rf"\s*(?:OR\s+REPLACE\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?P<target>{_NAME})"
+    rf"\s+(?:SHALLOW\s+|DEEP\s+)?CLONE\s+(?P<source>{_NAME})",
+    re.IGNORECASE,
+)
+# Any other command: the tables it names after TABLE (`MSCK REPAIR TABLE t`).
+_TABLE_KEYWORD_RE = re.compile(rf"\bTABLE\s+(?P<name>{_NAME})", re.IGNORECASE)
+
+# What a fix says, by whether the place takes an IDENTIFIER clause.
+_USE_IDENTIFIER = "declare it as a session variable and write IDENTIFIER(session.<VAR>)"
+_USE_EXECUTE = (
+    "build the statement from the table's session variable and run it with "
+    "EXECUTE IMMEDIATE"
+)
+
+# The value of a variable whose DECLARE default sqlglot could not read: it has
+# one, so it is not "never given a value", but nothing here can judge it.
+_UNREADABLE = object()
+
+
+@dataclass
+class TableNameCheck:
+    """What :func:`check_table_names` found in one answer.
+
+    Attributes
+    ----------
+    checked
+        The table references the convention covers.
+    problems
+        One line per reference that breaks it, in the answer's order, saying
+        what to change.
+    unparsed
+        Blocks sqlglot could not read; ``target_syntax`` reports why.
+    """
+
+    checked: int = 0
+    problems: list[str] = field(default_factory=list)
+    unparsed: int = 0
+
+
+_variable = session_variable
+
+
+def _variables(expression: object) -> list[str]:
+    """Every session variable *expression* reads, in order."""
+    from sqlglot import exp
+
+    if not isinstance(expression, exp.Expr):
+        return []
+    found = [_variable(c) for c in expression.find_all(exp.Column)]
+    return [name for name in found if name]
+
+
+def _clause_variable(clause: str) -> str | None:
+    """The session variable an IDENTIFIER clause reads whole
+    (``IDENTIFIER(session.T)``), or ``None``."""
+    import sqlglot
+
+    try:
+        expression = sqlglot.parse_one(clause[clause.index("(") + 1 : clause.rindex(")")], read=_DIALECT)
+    except Exception:  # sqlglot raises several unrelated types
+        return None
+    return _variable(expression)
+
+
+def _command_text(statement: exp.Command) -> str:
+    """What follows a command's keyword, as written: sqlglot keeps it as a
+    string literal."""
+    from sqlglot import exp
+
+    rest = statement.expression
+    return str(rest.this) if isinstance(rest, exp.Literal) else str(rest or "")
+
+
+def _declared_name(node: object) -> str:
+    """The variable name a DECLARE item names, its ``session.`` dropped."""
+    return str(getattr(node, "name", node)).rsplit(".", 1)[-1].upper()
+
+
+def _kind(statement: exp.Expr) -> str:
+    """What *statement* creates, alters or drops (``TABLE``, ``VIEW``, ...)."""
+    return str(statement.args.get("kind") or "").upper()
+
+
+def _target_table(statement: exp.Expr) -> exp.Table | None:
+    """The table *statement* writes, when it writes one."""
+    from sqlglot import exp
+
+    if isinstance(statement, exp.TruncateTable):
+        node = statement.expressions[0] if statement.expressions else None
+    elif isinstance(statement, (exp.Insert, exp.Merge, exp.Update, exp.Delete, exp.Copy)):
+        node = statement.this
+    elif isinstance(statement, (exp.Create, exp.Alter)) and _kind(statement) in ("TABLE", "VIEW", ""):
+        node = statement.this
+    elif isinstance(statement, exp.Drop) and _kind(statement) == "TABLE":
+        node = statement.this
+    else:
+        return None
+    if isinstance(node, exp.Schema):
+        node = node.this
+    return node if isinstance(node, exp.Table) else None
+
+
+def _temporary(statement: exp.Expr) -> bool:
+    """Whether *statement* creates something temporary (``CREATE TEMPORARY
+    VIEW``, ``CREATE TEMPORARY FUNCTION``)."""
+    from sqlglot import exp
+
+    properties = statement.args.get("properties")
+    return bool(
+        properties and any(isinstance(p, exp.TemporaryProperty) for p in properties.expressions)
+    )
+
+
+def _temporary_view(statement: exp.Expr) -> bool:
+    """Whether *statement* creates a temporary view: a WORK dataset."""
+    from sqlglot import exp
+
+    return isinstance(statement, exp.Create) and _kind(statement) == "VIEW" and _temporary(statement)
+
+
+def _view_bodies(statement: exp.Expr) -> list[exp.Expr]:
+    """The queries a ``CREATE VIEW`` or an ``ALTER VIEW ... AS`` stores."""
+    from sqlglot import exp
+
+    if isinstance(statement, exp.Create):
+        return [statement.expression] if isinstance(statement.expression, exp.Expr) else []
+    actions = statement.args.get("actions") or []
+    return [action for action in actions if isinstance(action, exp.Query)]
+
+
+class _Answer:
+    """One answer's session variables as its statements declare and set them."""
+
+    def __init__(self) -> None:
+        # Declared variable -> the expression it holds (None until it has one).
+        self.values: dict[str, object | None] = {}
+        self.temp_views: set[str] = set()
+        # The variables a temporary view is named through, until they change.
+        self.temp_view_variables: set[str] = set()
+        # The IDENTIFIER clauses of the block being read, by placeholder.
+        self.identifiers: dict[str, str] = {}
+        self.result = TableNameCheck()
+
+    def declare(self, names: Iterable[str], default: object | None) -> None:
+        for name in names:
+            self.values[name] = default
+            self.temp_view_variables.discard(name)
+
+    def set(self, name: str, value: object) -> None:
+        if name in self.values:  # SET VAR on no variable gives it no value
+            self.values[name] = value
+            self.temp_view_variables.discard(name)
+
+    def _temp_view(self, target: exp.Table) -> None:
+        """Remember the WORK dataset a temporary view makes: by its name, or
+        by the variable an IDENTIFIER clause names it through."""
+        clause = self.identifiers.get(target.name)
+        if clause is None:
+            self.temp_views.add(target.name.lower())
+        elif (variable := _clause_variable(clause)) is not None:
+            self.temp_view_variables.add(variable)
+
+    def _work_view(self, table: exp.Table) -> bool:
+        """Whether *table* names a temporary view made earlier: a WORK dataset."""
+        clause = self.identifiers.get(table.name)
+        if clause is None:
+            return table.name.lower() in self.temp_views
+        return _clause_variable(clause) in self.temp_view_variables
+
+    def statement(self, statement: exp.Expr) -> None:
+        from sqlglot import exp
+
+        if isinstance(statement, exp.Declare):
+            for item in statement.expressions:
+                names = item.this if isinstance(item.this, list) else [item.this]
+                # sqlglot keeps `default=False` for a DECLARE with none.
+                default = item.args.get("default")
+                value = default if isinstance(default, exp.Expr) else None
+                self._reads(value)
+                self.declare(map(_declared_name, names), value)
+            return
+        if isinstance(statement, exp.Command):
+            self._command(statement.name.upper(), _command_text(statement))
+            return
+        if isinstance(statement, exp.Set):
+            for item in statement.expressions:
+                eq = item.this
+                if not (isinstance(eq, exp.EQ) and (name := _variable(eq.this))):
+                    continue
+                if item.args.get("kind") == "VARIABLE":
+                    self._reads(eq.expression)
+                    self.set(name, eq.expression)
+                elif name in self.values:
+                    # Spark refuses `SET x = ...` on a session variable
+                    # (UNSUPPORTED_FEATURE.SET_VARIABLE_USING_SET): no value.
+                    self.result.checked += 1
+                    self._problem(
+                        f"`SET {name} = ...` without VAR does not assign the session "
+                        f"variable, which Spark rejects: write SET VAR {name} = ..."
+                    )
+            return
+        if _kind(statement) == "FUNCTION":
+            self._function(statement)
+            return
+        if isinstance(statement, exp.Use) or _kind(statement) in _NOT_TABLES:
+            return  # USE CATALOG / SCHEMA, CREATE SCHEMA, ...: no table
+        target = _target_table(statement)
+        # What the statement writes, and each statement a scripting block
+        # nests (`WHILE ... DO INSERT INTO t ...; END WHILE`).
+        writes: set[int] = set()
+        work: set[int] = set()
+        for node in statement.walk():
+            written = _target_table(node)
+            if not isinstance(written, exp.Table):
+                continue
+            if _temporary_view(node):
+                # A WORK dataset: no permanent write, though its query still reads.
+                self._temp_view(written)
+                work.add(id(written))
+            else:
+                writes.add(id(written))
+        stored_view: set[int] = set()
+        if (
+            isinstance(statement, (exp.Create, exp.Alter))
+            and _kind(statement) == "VIEW"
+            and not _temporary_view(statement)
+        ):
+            # ALTER VIEW on a WORK dataset's view stores nothing; a CREATE VIEW
+            # that is not temporary stores its query whatever it is named.
+            if not (
+                isinstance(statement, exp.Alter)
+                and isinstance(target, exp.Table)
+                and self._work_view(target)
+            ):
+                stored_view = {
+                    id(table) for body in _view_bodies(statement) for table in body.find_all(exp.Table)
+                }
+        # Places that take no IDENTIFIER clause: RENAME TO's new name, a CLONE source.
+        takes_none: dict[int, str] = {}
+        if isinstance(statement, exp.Alter):
+            for action in statement.args.get("actions") or []:
+                if isinstance(action, exp.AlterRename) and isinstance(action.this, exp.Table):
+                    takes_none[id(action.this)] = "the new name of RENAME TO"
+        clone = statement.args.get("clone") if isinstance(statement, exp.Create) else None
+        if isinstance(clone, exp.Clone) and isinstance(clone.this, exp.Table):
+            takes_none[id(clone.this)] = "a CLONE source"
+        # A permanent table or view named like a WORK dataset is still permanent.
+        creates_permanent = (
+            isinstance(statement, exp.Create)
+            and _kind(statement) in ("TABLE", "VIEW")
+            and not _temporary(statement)
+        )
+        for table in statement.find_all(exp.Table):
+            if id(table) in work:
+                continue
+            if id(table) in stored_view and table.name in self.identifiers:
+                self._persisted_read(table, "a stored view's query", "CREATE VIEW")
+                continue
+            # A stored query's names are resolved with EXECUTE IMMEDIATE too.
+            where = takes_none.get(id(table)) or (
+                "a stored view's query" if id(table) in stored_view else None
+            )
+            self._table(
+                table,
+                writes=id(table) in writes or where == "the new name of RENAME TO",
+                temp_view_ok=not creates_permanent,
+                where=where,
+            )
+
+    def _reads(self, value: object) -> None:
+        """Judge the tables a variable's value reads (``SET VAR n = (SELECT
+        ... FROM t)``), before the variable takes it."""
+        from sqlglot import exp
+
+        if isinstance(value, exp.Expr):
+            for table in value.find_all(exp.Table):
+                self._table(table, writes=False)
+
+    def _persisted_read(self, table: exp.Table, body: str, statement: str) -> None:
+        self.result.checked += 1
+        self._problem(
+            f"{body} reads {self.identifiers[table.name]}: Databricks keeps "
+            f"{body}'s text, which may not read a session variable — build the "
+            f"{statement} from the variables and run it with EXECUTE IMMEDIATE"
+        )
+
+    def _function(self, statement: exp.Expr) -> None:
+        """A SQL function's body: a persisted function may not read a session
+        variable, and neither kind may name a table literally."""
+        from sqlglot import exp
+
+        if not isinstance(statement, exp.Create) or not isinstance(statement.expression, exp.Expr):
+            return
+        persisted = not _temporary(statement)
+        for table in statement.expression.find_all(exp.Table):
+            if persisted and table.name in self.identifiers:
+                self._persisted_read(table, "a SQL function's body", "CREATE FUNCTION")
+            else:
+                self._table(table, writes=False, where="a SQL function's body" if persisted else None)
+
+    def _declare_command(self, text: str) -> None:
+        """A DECLARE whose default sqlglot cannot parse: its variables exist,
+        holding a value this check cannot judge."""
+        names = _DECLARE_NAMES_RE.match(text)
+        if names is not None:
+            names_declared = re.split(r"\s*,\s*", names["names"])
+            self.declare(map(_declared_name, names_declared), _UNREADABLE)
+
+    def _command(self, keyword: str, text: str) -> None:
+        """A statement sqlglot keeps as its keyword and raw text. After
+        ``OPTIMIZE`` and the like, sqlglot's tokenizer keeps the text as one
+        string, so its IDENTIFIER clauses were not masked with the block's:
+        they are masked here. A ``CREATE ... CLONE`` was masked with the
+        block, so its placeholders stay readable."""
+        if keyword == "DECLARE":
+            self._declare_command(text)
+            return
+        masked, clauses = mask_identifier_clauses(text, _DIALECT)
+        saved, self.identifiers = self.identifiers, {**self.identifiers, **clauses}
+        try:
+            if keyword in _TABLE_COMMANDS:
+                found = _COMMAND_TABLE_RE.match(masked)
+                if found is not None and masked.lstrip()[:1] not in "'\"":  # '/path': a file
+                    self._named(found["name"], writes=True, where=keyword)
+            elif keyword == "CREATE":
+                if (clone := _CLONE_RE.match(masked)) is not None:
+                    self._named(clone["target"], writes=True)
+                    self._named(clone["source"], writes=False, where="a CLONE source")
+            else:
+                for found in _TABLE_KEYWORD_RE.finditer(masked):
+                    self._named(found["name"], writes=False)
+        finally:
+            self.identifiers = saved
+
+    def _named(self, spelled: str, *, writes: bool, where: str | None = None) -> None:
+        """A table a command's text names, judged as a table."""
+        from sqlglot import exp
+
+        self._table(exp.to_table(spelled, dialect=_DIALECT), writes=writes, where=where)
+
+    def _table(
+        self,
+        table: exp.Table,
+        *,
+        writes: bool,
+        temp_view_ok: bool = True,
+        where: str | None = None,
+    ) -> None:
+        """Judge one table reference. *where* names a place that takes no
+        IDENTIFIER clause over a session variable (``OPTIMIZE``, a ``CLONE``
+        source, a stored query), so its fix is EXECUTE IMMEDIATE;
+        *temp_view_ok* is False where a write to a temporary view's name is
+        still a permanent table (``CREATE TABLE``)."""
+        from sqlglot import exp
+
+        if not isinstance(table.this, exp.Identifier):
+            return  # a table function: read_files(...)
+        name, db, catalog = table.name, table.db, table.catalog
+        fix = _USE_IDENTIFIER if where is None else _USE_EXECUTE
+        if name in self.identifiers:
+            if temp_view_ok and self._work_view(table):
+                return  # a WORK dataset, named through its variable
+            self.result.checked += 1
+            if where is not None:
+                self._problem(f"{where} takes no IDENTIFIER: {_USE_EXECUTE}")
+            else:
+                self._identifier(self.identifiers[name])
+            return
+        if db or catalog:
+            if catalog.lower() == "system" or db.lower() == "information_schema":
+                return
+            if not catalog and db.lower() == "global_temp":
+                return  # Spark's global temporary views
+            if db.lower() in _PATH_FORMATS and ("/" in name or ":" in name):
+                return  # a file read in place: a path, not a table
+            self.result.checked += 1
+            spelled = ".".join(p for p in (catalog, db, name) if p)
+            self._problem(f"hard-coded table name `{spelled}`: {fix}")
+            return
+        if writes and (name.lower() not in self.temp_views or not temp_view_ok):
+            self.result.checked += 1
+            literal_fix = (
+                "write IDENTIFIER(session.<VAR>), or CREATE OR REPLACE TEMP VIEW "
+                "for a WORK dataset"
+                if where is None
+                else _USE_EXECUTE
+            )
+            self._problem(
+                f"`{name}` is written as a permanent table by a literal name: {literal_fix}"
+            )
+
+    def _identifier(self, clause: str) -> None:
+        import sqlglot
+
+        inner = clause[clause.index("(") + 1 : clause.rindex(")")]
+        try:
+            expression = sqlglot.parse_one(inner, read=_DIALECT)
+        except Exception:  # sqlglot raises several unrelated types
+            self._problem(f"{clause} could not be read")
+            return
+        variables = _variables(expression)
+        if not variables:
+            self._problem(
+                f"{clause} hard-codes the name: put it in a session variable"
+            )
+            return
+        undeclared = [v for v in variables if v not in self.values]
+        if undeclared:
+            self._problem(
+                f"`session.{undeclared[0]}` is not declared before it is used in "
+                f"this answer: DECLARE OR REPLACE VARIABLE it first"
+            )
+            return
+        if len(variables) == 1 and _variable(expression) == variables[0]:
+            name = variables[0]
+            value = self.values[name]
+            prefixes = [v for v in _variables(value) if v != name]
+            if value is None:
+                self._problem(f"`{name}` is never given a value")
+            elif value is _UNREADABLE:
+                self._problem(
+                    f"`{name}`'s DEFAULT could not be read: build it as "
+                    f"CONCAT(session.<LIBREF>_PREFIX, '.<table>')"
+                )
+            elif not prefixes:
+                self._problem(
+                    f"`{name}` holds a literal name: build it from its "
+                    f"library's prefix, CONCAT(session.<LIBREF>_PREFIX, "
+                    f"'.<table>')"
+                )
+            elif undeclared := [v for v in prefixes if v not in self.values]:
+                self._problem(
+                    f"`{name}` is built from `session.{undeclared[0]}`, which "
+                    f"is not declared in this answer"
+                )
+
+    def _problem(self, line: str) -> None:
+        self.result.problems.append(line)
+
+
+def check_table_names(blocks: Iterable[str]) -> TableNameCheck:
+    """How one answer's SQL *blocks* name their permanent tables, read in
+    order: a variable is usable once a block before it, or a statement
+    earlier in its own, has declared it (see the module docstring)."""
+    import sqlglot
+
+    answer = _Answer()
+    for block in blocks:
+        masked, identifiers = mask_identifier_clauses(block, _DIALECT)
+        try:
+            statements = sqlglot.parse(
+                unqualify_declared_names(masked, _DIALECT), read=_DIALECT
+            )
+        except Exception:  # sqlglot raises several unrelated types
+            answer.result.unparsed += 1
+            continue
+        answer.identifiers = identifiers
+        for statement in statements:
+            if statement is not None:
+                answer.statement(statement)
+    if answer.result.problems and logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"check_table_names: {answer.result.problems}")
+    return answer.result

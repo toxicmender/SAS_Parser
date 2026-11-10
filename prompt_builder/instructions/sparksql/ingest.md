@@ -9,7 +9,10 @@ repeatability:
   when the result feeds straight into a query.
 
 ```sql
-COPY INTO main.stage.customers
+DECLARE OR REPLACE VARIABLE STAGE_PREFIX STRING DEFAULT 'catalog_name.stage';
+DECLARE OR REPLACE VARIABLE CUSTOMERS STRING DEFAULT CONCAT(session.STAGE_PREFIX, '.customers');
+
+COPY INTO IDENTIFIER(session.CUSTOMERS)
 FROM '/Volumes/main/stage/landing/customers/'
 FILEFORMAT = CSV
 FORMAT_OPTIONS ('header' = 'true', 'delimiter' = ',', 'inferSchema' = 'true');
@@ -30,10 +33,10 @@ instead of `DOUBLE` breaks every arithmetic downstream.
 ⚠️ **A source that was hydrated ahead of the run needs no ingestion at all.**
 Where the data has already been copied into the lakehouse — a `LIBNAME` on a
 database engine, or a SAS library migrated as tables — the translation reads
-`<catalog>.<schema>.<table>` directly and emits **no** `COPY INTO` and no
-`read_files`. Emitting a load for data that is already there re-ingests it, and
-against `COPY INTO`'s idempotence tracking the two disagree about what has been
-loaded. Ingest only what the SAS itself reads from a *file*.
+the table directly, through its session variable, and emits **no** `COPY INTO`
+and no `read_files`. Emitting a load for data that is already there re-ingests
+it, and against `COPY INTO`'s idempotence tracking the two disagree about what
+has been loaded. Ingest only what the SAS itself reads from a *file*.
 
 `PROC EXPORT` writes a dataset out. Prefer leaving the data as a table and
 letting the consumer read it; where a file genuinely must be produced, write to
